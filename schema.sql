@@ -3,7 +3,7 @@
 -- Generated from the live theforge.db schema.
 -- Used by itzamna_setup.py to create new installations.
 --
--- Tables: 19, Views: 5, Triggers: 1, Indexes: 7
+-- Tables: 20, Views: 7, Triggers: 1, Indexes: 9
 
 -- ============================================================
 -- TABLES
@@ -262,6 +262,23 @@ CREATE TABLE writing_style (
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
+CREATE TABLE agent_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    project_id INTEGER,
+    role TEXT NOT NULL,
+    model TEXT NOT NULL,
+    turns_used INTEGER DEFAULT 0,
+    duration_s REAL DEFAULT 0,
+    cost_usd REAL DEFAULT 0,
+    success INTEGER DEFAULT 0,
+    outcome TEXT,
+    output_tail TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+
 -- ============================================================
 -- INDEXES
 -- ============================================================
@@ -273,6 +290,8 @@ CREATE INDEX idx_projects_status ON projects(status);
 CREATE INDEX idx_components_project ON components(project_id);
 CREATE INDEX idx_xref_source ON cross_references(source_table, source_id);
 CREATE INDEX idx_xref_target ON cross_references(target_table, target_id);
+CREATE INDEX idx_agent_runs_project ON agent_runs(project_id);
+CREATE INDEX idx_agent_runs_role ON agent_runs(role);
 
 -- ============================================================
 -- TRIGGERS
@@ -330,3 +349,30 @@ CREATE VIEW v_content_alerts AS
 SELECT * FROM content_tickler
 WHERE needs_content = 1
    OR posts_remaining <= alert_threshold;
+
+CREATE VIEW v_cost_by_project AS
+SELECT
+    p.codename,
+    COUNT(ar.id) as total_runs,
+    SUM(ar.turns_used) as total_turns,
+    ROUND(SUM(ar.duration_s), 1) as total_duration_s,
+    ROUND(SUM(ar.cost_usd), 4) as total_cost_usd,
+    SUM(CASE WHEN ar.success = 1 THEN 1 ELSE 0 END) as successful_runs,
+    SUM(CASE WHEN ar.success = 0 THEN 1 ELSE 0 END) as failed_runs
+FROM agent_runs ar
+JOIN projects p ON ar.project_id = p.id
+GROUP BY p.codename
+ORDER BY total_cost_usd DESC;
+
+CREATE VIEW v_cost_by_role AS
+SELECT
+    ar.role,
+    COUNT(ar.id) as total_runs,
+    SUM(ar.turns_used) as total_turns,
+    ROUND(SUM(ar.duration_s), 1) as total_duration_s,
+    ROUND(SUM(ar.cost_usd), 4) as total_cost_usd,
+    ROUND(AVG(ar.cost_usd), 4) as avg_cost_per_run,
+    SUM(CASE WHEN ar.success = 1 THEN 1 ELSE 0 END) as successful_runs
+FROM agent_runs ar
+GROUP BY ar.role
+ORDER BY total_cost_usd DESC;

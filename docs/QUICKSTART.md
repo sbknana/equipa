@@ -32,11 +32,30 @@ The wizard will:
 3. Create a fresh database with the full schema
 4. Copy orchestrator, prompts, and security skills
 5. Generate `forge_config.json` and `mcp_config.json`
-6. Verify everything works
+6. Generate `.mcp.json` (Claude Code MCP integration)
+7. Generate `CLAUDE.md` (Claude Code context — commands, queries, roles)
+8. Verify everything works (9 automated checks)
 
 ---
 
-## Step 2: Add Your First Project
+## Step 2: Open Claude Code
+
+```bash
+cd ~/ForgeTeam   # or wherever you installed
+claude
+```
+
+Claude now has MCP access to the database and full context about all ForgeTeam commands. You can talk to it naturally:
+
+> "Show me all projects"
+> "Add a new project called MyApp"
+> "Create a todo task for MyApp: Set up the project README"
+
+---
+
+## Step 3: Add Your First Project
+
+Ask Claude, or use the CLI directly:
 
 ```bash
 python forge_orchestrator.py --add-project "MyApp" --project-dir "C:\path\to\myapp"
@@ -46,9 +65,9 @@ This creates a project entry in the database and registers the directory in your
 
 ---
 
-## Step 3: Create a Task
+## Step 4: Create a Task
 
-Using Claude with MCP (recommended):
+Ask Claude (recommended — it has MCP access):
 > "Create a todo task for MyApp: Set up the project README"
 
 Or via direct SQL:
@@ -63,7 +82,7 @@ conn.commit()
 
 ---
 
-## Step 4: Run Your First Agent
+## Step 5: Run Your First Agent
 
 Single developer agent:
 ```bash
@@ -77,7 +96,7 @@ python forge_orchestrator.py --task 1 --dev-test -y
 
 ---
 
-## Step 5: Watch It Work
+## Step 6: Watch It Work
 
 The orchestrator will:
 1. Read the task from the database
@@ -90,6 +109,7 @@ The orchestrator will:
 
 ## What's Next?
 
+- **Use Claude Code** to manage projects, tasks, and decisions — it has full MCP access
 - **Add more projects:** `--add-project` for each codebase
 - **Goal-driven mode:** `--goal "Add dark mode" --goal-project 1` for autonomous planning
 - **Auto-run:** `--auto-run` to scan all projects and dispatch work by priority

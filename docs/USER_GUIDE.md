@@ -42,7 +42,11 @@ The wizard guides you through:
 3. Database creation (empty, with full schema)
 4. File copying (orchestrator, prompts, skills)
 5. Config file generation (`forge_config.json`, `mcp_config.json`)
-6. Installation verification
+6. Claude Code MCP integration (`.mcp.json`)
+7. Claude Code context generation (`CLAUDE.md`)
+8. Installation verification (9 automated checks)
+
+After setup, open Claude Code in the install directory and it has full MCP access to the database plus context about all commands.
 
 ### Manual Installation
 
@@ -52,6 +56,8 @@ If you prefer manual setup:
 2. Create a database: `python -c "import sqlite3; sqlite3.connect('theforge.db').executescript(open('schema.sql').read())"`
 3. Create `forge_config.json` (see Configuration Reference below)
 4. Create `mcp_config.json` pointing to your database
+5. Create `.mcp.json` (same format as `mcp_config.json`) for Claude Code MCP access
+6. Create `CLAUDE.md` with project context (or copy from an existing installation)
 
 ---
 
@@ -327,13 +333,43 @@ Priorities: `critical`, `high`, `medium`, `low`
 
 ## MCP Setup
 
-ForgeTeam agents use MCP (Model Context Protocol) to access the database. The `mcp_config.json` file tells each agent how to connect.
+ForgeTeam uses MCP (Model Context Protocol) in two ways:
 
-### How It Works
+1. **Agent MCP** (`mcp_config.json`) — passed to orchestrator-spawned agents so they can access the database
+2. **User MCP** (`.mcp.json`) — gives your own Claude Code sessions direct database access
+
+Both are generated automatically by the Itzamna setup wizard.
+
+### How Agent MCP Works
 
 1. The orchestrator passes `--mcp-config mcp_config.json` to each `claude -p` invocation
 2. Claude Code starts the MCP server (`uvx mcp-server-sqlite`)
 3. The agent can read/write the database using MCP tools: `read_query`, `write_query`, `list_tables`, etc.
+
+### How User MCP Works (`.mcp.json`)
+
+The setup wizard generates `.mcp.json` in your install directory. When you run `claude` from that directory, Claude Code auto-detects it and connects to the database. You can then:
+
+- Query projects, tasks, decisions, and session notes
+- Create tasks and update statuses
+- Log decisions and session summaries
+- Run orchestrator commands via Bash
+
+The wizard also generates a `CLAUDE.md` in the install directory that gives Claude full context about available commands, common SQL queries, agent roles, and database tables.
+
+### `.mcp.json` Format
+
+```json
+{
+    "mcpServers": {
+        "itzamna": {
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["mcp-server-sqlite", "--db-path", "/path/to/theforge.db"]
+        }
+    }
+}
+```
 
 ### Verifying MCP
 
@@ -343,24 +379,6 @@ uvx mcp-server-sqlite --db-path /path/to/theforge.db
 ```
 
 If this command starts without error, MCP is working.
-
-### Using with Claude Code Sessions
-
-You can also use MCP in your own Claude Code sessions. Add to your project's `.mcp.json`:
-
-```json
-{
-    "mcpServers": {
-        "theforge": {
-            "type": "stdio",
-            "command": "uvx",
-            "args": ["mcp-server-sqlite", "--db-path", "/path/to/theforge.db"]
-        }
-    }
-}
-```
-
-Then Claude can query the database directly in your coding sessions.
 
 ---
 

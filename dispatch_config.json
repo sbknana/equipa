@@ -1,0 +1,9 @@
+{
+    "max_concurrent": 4,
+    "model": "sonnet",
+    "max_turns": 25,
+    "max_tasks_per_project": 5,
+    "skip_projects": [],
+    "priority_boost": {},
+    "only_projects": []
+}

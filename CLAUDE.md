@@ -10,7 +10,8 @@ Itzamna is the portable installer and onboarding system for the ForgeTeam multi-
 **What it does:**
 - Guided setup: prerequisites check, install path selection, DB creation
 - SQLite database creation with the full Itzamna schema (empty, ready to use)
-- MCP server configuration
+- MCP server configuration (`mcp_config.json` for agents)
+- Claude Code integration (`.mcp.json` for user sessions + `CLAUDE.md` for context)
 - Config file generation (replacing all hardcoded paths)
 - Custom agent role creation (drop a markdown file, it just works)
 - Project registration (`--add-project`)
@@ -32,6 +33,7 @@ ForgeTeam is currently hardcoded to one developer's Google Drive paths, project 
 - Custom agents: drop a `.md` prompt file in the prompts directory, orchestrator auto-discovers it
 - Itzamna DB schema is the canonical DDL extracted from the live database
 - MCP server setup handled by installer (generates `mcp_config.json` pointing to user's DB)
+- Claude Code integration: `.mcp.json` gives user sessions MCP access; `CLAUDE.md` provides full context (commands, queries, roles)
 - Stdlib only — no pip dependencies for the installer
 
 ---
@@ -47,7 +49,7 @@ Itzamna is the installer/distribution layer for **ForgeTeam** (project_id: 21). 
 | File | Purpose |
 |------|---------|
 | `CLAUDE.md` | This file — project context |
-| `itzamna_setup.py` | Interactive setup wizard (~350 lines) |
+| `itzamna_setup.py` | Interactive setup wizard (9 steps, ~550 lines) |
 | `schema.sql` | Canonical database DDL (19 tables, 5 views, 1 trigger, 7 indexes) |
 | `docs/QUICKSTART.md` | 5-minute getting started guide |
 | `docs/USER_GUIDE.md` | Full user documentation (~300 lines) |

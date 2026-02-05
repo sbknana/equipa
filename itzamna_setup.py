@@ -5,9 +5,12 @@ Interactive setup script that creates a fresh ForgeTeam installation:
 - Checks prerequisites (Python, git, gh, claude, uvx)
 - Creates directory structure
 - Creates a fresh database with the full Itzamna schema
-- Copies ForgeTeam files (orchestrator, prompts, skills, config)
+- Copies bundled ForgeTeam files (orchestrator, prompts, skills, config)
 - Generates forge_config.json and mcp_config.json
 - Verifies the installation
+
+All required ForgeTeam files are bundled in this repo — no external
+dependencies on other repos needed.
 
 Usage:
     python itzamna_setup.py
@@ -30,8 +33,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_FILE = SCRIPT_DIR / "schema.sql"
-# Source ForgeTeam directory (sibling of Itzamna in the dev layout)
-SOURCE_DIR = SCRIPT_DIR.parent / "ForgeTeam"
+# Source ForgeTeam files (bundled in this repo for standalone operation)
+SOURCE_DIR = SCRIPT_DIR
 
 BANNER = r"""
   ___  _
@@ -259,9 +262,17 @@ def step_copy_files(base_path):
     """Copy ForgeTeam files to the install directory."""
     print_header("Step 4: Copy ForgeTeam Files")
 
-    if not SOURCE_DIR.exists():
-        print(f"  WARNING: Source directory not found at {SOURCE_DIR}")
-        print("  Skipping file copy. You'll need to copy files manually.")
+    # All source files are bundled in this repo (SOURCE_DIR = SCRIPT_DIR)
+    missing = []
+    for name in ["forge_orchestrator.py", "dispatch_config.json"]:
+        if not (SOURCE_DIR / name).exists():
+            missing.append(name)
+    if not (SOURCE_DIR / "prompts").exists():
+        missing.append("prompts/")
+    if missing:
+        print(f"  ERROR: Missing bundled files: {', '.join(missing)}")
+        print(f"  Expected in: {SOURCE_DIR}")
+        print("  Re-clone the Itzamna repo to restore them.")
         return False
 
     # Files to copy
@@ -296,7 +307,10 @@ def step_copy_files(base_path):
     if src_skills.exists():
         dest_skills = base_path / "skills" / "security"
         if dest_skills.exists():
-            shutil.rmtree(str(dest_skills))
+            if dest_skills.is_symlink():
+                dest_skills.unlink()  # safe: remove symlink only, not target
+            else:
+                shutil.rmtree(str(dest_skills))
         shutil.copytree(str(src_skills), str(dest_skills))
         skill_count = sum(1 for _ in dest_skills.rglob("*.md"))
         print(f"  Copied: skills/security/ ({skill_count} files)")
@@ -364,9 +378,177 @@ def step_generate_mcp_config(base_path, db_path):
     return mcp_path
 
 
+def step_generate_dot_mcp(base_path, db_path):
+    """Generate .mcp.json so Claude Code sessions can access the DB directly."""
+    print_header("Step 7: Claude Code MCP Integration")
+
+    dot_mcp = {
+        "mcpServers": {
+            "itzamna": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "mcp-server-sqlite",
+                    "--db-path",
+                    str(db_path),
+                ],
+            }
+        }
+    }
+
+    dot_mcp_path = base_path / ".mcp.json"
+    with open(dot_mcp_path, "w", encoding="utf-8") as f:
+        json.dump(dot_mcp, f, indent=2)
+    print(f"  Created: {dot_mcp_path}")
+    print(f"  Claude Code sessions in this directory now have MCP access to the DB.")
+    print(f"  You can ask Claude to query projects, create tasks, etc.")
+
+    return dot_mcp_path
+
+
+def step_generate_claude_md(base_path, db_path):
+    """Generate CLAUDE.md so Claude Code knows how to use ForgeTeam."""
+    print_header("Step 8: Claude Code Context (CLAUDE.md)")
+
+    orch = base_path / "forge_orchestrator.py"
+
+    claude_md = f"""# CLAUDE.md — ForgeTeam Installation
+
+## What This Is
+
+This is a ForgeTeam installation — a multi-agent AI orchestration system.
+You have MCP access to the Itzamna database via the `itzamna` MCP server.
+
+## Database Location
+
+`{db_path}`
+
+## Available MCP Tools
+
+Use the `itzamna` MCP server to read and write the database:
+- `read_query` — Run SELECT queries
+- `write_query` — Run INSERT, UPDATE, DELETE queries
+- `list_tables` — List all tables
+- `describe_table` — Get schema for a table
+
+## Common Queries
+
+```sql
+-- List all projects
+SELECT id, name, codename, status FROM projects;
+
+-- List tasks for a project
+SELECT id, title, status, priority FROM tasks WHERE project_id = ? ORDER BY priority;
+
+-- Add a task
+INSERT INTO tasks (project_id, title, description, status, priority)
+VALUES (?, 'Task title', 'Description', 'todo', 'medium');
+
+-- Update task status
+UPDATE tasks SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE id = ?;
+
+-- Project dashboard
+SELECT * FROM v_project_dashboard;
+
+-- Recent session notes
+SELECT summary, next_steps, session_date FROM session_notes
+WHERE project_id = ? ORDER BY session_date DESC LIMIT 3;
+
+-- Log a decision
+INSERT INTO decisions (project_id, topic, decision, rationale)
+VALUES (?, 'Topic', 'What was decided', 'Why');
+
+-- Add a session note
+INSERT INTO session_notes (project_id, summary, next_steps)
+VALUES (?, 'What happened', 'What to do next');
+```
+
+## Orchestrator Commands
+
+Run these via Bash:
+
+```bash
+# Add a new project
+python "{orch}" --add-project "ProjectName" --project-dir "/path/to/code"
+
+# Run a specific task (Dev+Test loop)
+python "{orch}" --task <ID> --dev-test -y
+
+# Auto-pick next todo task for a project
+python "{orch}" --project <ID> --dev-test -y
+
+# Goal-driven mode (autonomous planning + execution)
+python "{orch}" --goal "Your goal here" --goal-project <ID> -y
+
+# Auto-run: scan all projects, prioritize, dispatch
+python "{orch}" --auto-run --dry-run
+python "{orch}" --auto-run -y
+
+# Security review
+python "{orch}" --task <ID> --role security-reviewer -y
+
+# See all options
+python "{orch}" --help
+```
+
+## Agent Roles & Permission Tiers
+
+Each agent role has a specific permission tier that controls what tools it can use.
+All roles use `--permission-mode dontAsk` (auto-deny unless whitelisted).
+
+| Role | File | Job | Can Edit Files | DB Write | Bash Access |
+|------|------|-----|:-:|:-:|---|
+| Developer | `developer.md` | Write code, fix bugs | Yes | Yes | Build tools, git |
+| Tester | `tester.md` | Run tests, report failures | **No** | **No** | Test runners only |
+| Planner | `planner.md` | Break goals into tasks | **No** | Yes (tasks) | Explore only |
+| Evaluator | `evaluator.md` | Verify goal completion | **No** | Yes (tasks) | Explore only |
+| SecurityReviewer | `security-reviewer.md` | Code security review | **No** | **No** | Scanning tools only |
+
+Custom agents: drop a new `.md` file in `prompts/` and it auto-discovers.
+
+### Extending Permissions
+
+Add `role_permissions` to `forge_config.json` to grant extra tools per role:
+
+```json
+"role_permissions": {{
+    "developer": {{
+        "extra_allowed_tools": ["Bash(cargo *)"],
+        "extra_disallowed_tools": []
+    }}
+}}
+```
+
+## Key Tables
+
+| Table | Purpose |
+|-------|---------|
+| `projects` | Project metadata (name, codename, status) |
+| `tasks` | Work items (title, status, priority) |
+| `decisions` | Architectural decisions with rationale |
+| `open_questions` | Unresolved questions and blockers |
+| `session_notes` | Session summaries and next steps |
+
+## Developer Context
+
+- On **Windows**, never use `&&` in batch files (use separate lines)
+- All projects built for **TheForge, LLC** — include proper attribution
+- AI Credit: "Vibe coded with Claude"
+"""
+
+    claude_md_path = base_path / "CLAUDE.md"
+    with open(claude_md_path, "w", encoding="utf-8") as f:
+        f.write(claude_md)
+    print(f"  Created: {claude_md_path}")
+    print(f"  Claude Code now has full context about ForgeTeam commands,")
+    print(f"  database queries, and agent roles.")
+
+    return claude_md_path
+
+
 def step_verify(base_path, db_path):
     """Verify the installation."""
-    print_header("Step 7: Verification")
+    print_header("Step 9: Verification")
 
     checks_passed = 0
     checks_total = 0
@@ -385,8 +567,8 @@ def step_verify(base_path, db_path):
     # 2. Database schema objects
     checks_total += 1
     counts = count_db_objects(db_path)
-    # Expect: 19 tables (+ sqlite_sequence = 20), 5 views, 1 trigger, 7 indexes
-    if counts["table"] >= 19 and counts["view"] >= 5:
+    # Expect: 20 tables (+ sqlite_sequence = 21), 7 views, 1 trigger, 9 indexes
+    if counts["table"] >= 20 and counts["view"] >= 7:
         print(f"  [+] Schema objects: {counts['table']} tables, "
               f"{counts['view']} views, {counts['trigger']} triggers, "
               f"{counts['index']} indexes")
@@ -458,6 +640,29 @@ def step_verify(base_path, db_path):
     else:
         print("  [X] forge_orchestrator.py --help: file not found")
 
+    # 8. .mcp.json exists and is valid
+    checks_total += 1
+    dot_mcp_path = base_path / ".mcp.json"
+    try:
+        with open(dot_mcp_path, "r") as f:
+            dot_mcp = json.load(f)
+        if "mcpServers" in dot_mcp:
+            print("  [+] .mcp.json: valid (Claude Code MCP integration)")
+            checks_passed += 1
+        else:
+            print("  [X] .mcp.json: missing mcpServers key")
+    except Exception as exc:
+        print(f"  [X] .mcp.json: FAILED ({exc})")
+
+    # 9. CLAUDE.md exists
+    checks_total += 1
+    claude_md_path = base_path / "CLAUDE.md"
+    if claude_md_path.exists() and claude_md_path.stat().st_size > 100:
+        print("  [+] CLAUDE.md: present (Claude Code context)")
+        checks_passed += 1
+    else:
+        print("  [X] CLAUDE.md: not found or empty")
+
     print(f"\n  Result: {checks_passed}/{checks_total} checks passed")
     return checks_passed == checks_total
 
@@ -472,15 +677,18 @@ def step_next_steps(base_path, db_path):
     print()
     print("  NEXT STEPS:")
     print()
-    print("  1. Add your first project:")
+    print("  1. Open Claude Code in your install directory:")
+    print(f"     cd \"{base_path}\"")
+    print(f"     claude")
+    print(f"     Claude now has MCP access to the DB and knows all the commands.")
+    print()
+    print("  2. Or use the CLI directly:")
     print(f'     python "{orch}" --add-project "MyProject" --project-dir "C:\\path\\to\\project"')
     print()
-    print("  2. Create a task (via MCP or direct SQL):")
-    print(f'     python -c "import sqlite3; c=sqlite3.connect(r\'{db_path}\'); '
-          f"c.execute(\\\"INSERT INTO tasks (project_id, title, status) "
-          f"VALUES (1, 'First task', 'todo')\\\"); c.commit()\"")
+    print("  3. Create a task (ask Claude, or use direct SQL):")
+    print(f"     \"Add a todo task for MyProject: Set up the README\"")
     print()
-    print("  3. Run your first Dev+Test loop:")
+    print("  4. Run your first Dev+Test loop:")
     print(f'     python "{orch}" --task 1 --dev-test -y')
     print()
     print("  DOCUMENTATION:")
@@ -507,6 +715,8 @@ def main():
     step_copy_files(base_path)
     step_generate_config(base_path, db_path)
     step_generate_mcp_config(base_path, db_path)
+    step_generate_dot_mcp(base_path, db_path)
+    step_generate_claude_md(base_path, db_path)
     all_ok = step_verify(base_path, db_path)
     step_next_steps(base_path, db_path)
 
