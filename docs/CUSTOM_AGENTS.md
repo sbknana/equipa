@@ -106,8 +106,10 @@ While not strictly enforced, every agent prompt should include:
 | **Role** | What this agent is and what it does |
 | **Responsibilities** | Specific tasks the agent should perform |
 | **Output Format** | JSON structure for structured parsing |
-| **Tool Permissions** | What tools the agent can use |
+| **Tool Guidance** | What tools the agent should and shouldn't use |
 | **Constraints** | What the agent must NOT do |
+
+> **Note on tool permissions:** All agents run with `--permission-mode bypassPermissions`, which gives them full tool access. The "Tool Guidance" section in your prompt is *advisory* — it tells the agent what it should and shouldn't do, but it's not enforced by the CLI. Well-written prompts are effective at keeping agents in their lane, but they're not a security boundary.
 
 ---
 
@@ -157,6 +159,23 @@ Always include `RESULT:` followed by your JSON output.
 
 ---
 
+## Custom Turn Limits and Models
+
+You can configure per-role turn limits and models for custom agents in `dispatch_config.json`:
+
+```json
+{
+    "max_turns_documentation_writer": 15,
+    "model_documentation_writer": "haiku"
+}
+```
+
+The key pattern is `max_turns_{role}` and `model_{role}`, where `{role}` is the filename stem with hyphens replaced by underscores.
+
+If no per-role config exists, the agent uses the global `max_turns` and `model` defaults.
+
+---
+
 ## Tips
 
 - **Keep prompts focused.** One agent, one job. Don't try to make a do-everything agent.
@@ -165,3 +184,4 @@ Always include `RESULT:` followed by your JSON output.
 - **Test with `--dry-run` first.** See the prompt size and structure before running.
 - **Use `--role your-agent` to select it.** The filename stem is the role name.
 - **Check `_common.md` for overlap.** Don't repeat rules that are already shared.
+- **Tool guidance is advisory.** Agents run with full permissions — your prompt controls behavior, not the CLI.

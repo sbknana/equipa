@@ -10,10 +10,11 @@ Complete reference for installing, configuring, and using ForgeTeam — a multi-
 2. [Configuration Reference](#configuration-reference)
 3. [CLI Modes](#cli-modes)
 4. [Agent Roles](#agent-roles)
-5. [Project Management](#project-management)
-6. [MCP Setup](#mcp-setup)
-7. [Database Structure](#database-structure)
-8. [Troubleshooting](#troubleshooting)
+5. [Smart Features](#smart-features)
+6. [Project Management](#project-management)
+7. [MCP Setup](#mcp-setup)
+8. [Database Structure](#database-structure)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -90,29 +91,44 @@ This file overrides all hardcoded paths in the orchestrator. If absent, the orch
 
 ### dispatch_config.json
 
-Controls auto-run mode behavior.
+Controls agent behavior across all modes — model selection, turn limits, concurrency, and more. Loaded globally at startup.
 
 ```json
 {
     "max_concurrent": 4,
     "model": "sonnet",
     "max_turns": 25,
+    "max_turns_developer": 50,
+    "max_turns_tester": 20,
+    "max_turns_security_reviewer": 40,
     "max_tasks_per_project": 5,
     "skip_projects": [],
     "priority_boost": {},
-    "only_projects": []
+    "only_projects": [],
+    "security_review": true,
+    "model_tester": "haiku",
+    "model_epic": "opus"
 }
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_concurrent` | 4 | Max projects running in parallel |
-| `model` | sonnet | Default Claude model |
-| `max_turns` | 25 | Max conversation turns per agent |
-| `max_tasks_per_project` | 5 | Cap tasks per project per run |
-| `skip_projects` | [] | Project IDs/codenames to exclude |
-| `priority_boost` | {} | Manual priority overrides |
+| `max_concurrent` | 4 | Max projects/tasks running in parallel |
+| `model` | sonnet | Default Claude model for all agents |
+| `max_turns` | 25 | Default max turns per agent (base, before complexity scaling) |
+| `max_turns_developer` | 50 | Turn limit for Developer agents |
+| `max_turns_tester` | 20 | Turn limit for Tester agents |
+| `max_turns_security_reviewer` | 40 | Turn limit for Security Reviewer agents |
+| `max_tasks_per_project` | 5 | Cap tasks per project per auto-run |
+| `skip_projects` | [] | Project IDs/codenames to exclude from auto-run |
+| `priority_boost` | {} | Manual priority overrides: `{"myproject": 100}` |
 | `only_projects` | [] | Whitelist (empty = all projects) |
+| `security_review` | false | Auto-run security review after successful dev-test |
+| `security_review_tools` | "all" | Which ClaudeStick tools security reviewer can use |
+| `model_{role}` | — | Per-role model override (e.g. `model_tester: "haiku"`) |
+| `model_{complexity}` | — | Per-complexity model override (e.g. `model_epic: "opus"`) |
+
+See [Model Tiering](#model-tiering) and [Adaptive Complexity](#adaptive-complexity) for details.
 
 ### mcp_config.json
 
@@ -169,6 +185,25 @@ Flow per cycle:
 2. Tester agent runs tests (read-only)
 3. If tests pass → done. If tests fail → feed failures back to Developer
 4. After 3 cycles or no progress → mark task blocked
+
+The orchestrator manages task status — it marks tasks `done` or `blocked` based on test outcomes. Agents don't need to update the database themselves.
+
+### Parallel Tasks Mode
+
+Run multiple independent tasks concurrently within a project.
+
+```bash
+# Comma-separated IDs
+python forge_orchestrator.py --tasks 109,110,111 --dev-test -y
+
+# Range syntax
+python forge_orchestrator.py --tasks 109-114 --dev-test -y
+
+# Preview first
+python forge_orchestrator.py --tasks 109-114 --dev-test --dry-run
+```
+
+All tasks must belong to the same project. Each runs a full Dev+Test loop. Concurrency is controlled by `max_concurrent` (default 4). Per-task output is buffered and printed when each task completes.
 
 ### Manager Mode (Goal-Driven)
 
@@ -243,8 +278,12 @@ score = (critical * 10) + (high * 5) + (medium * 2) + (low * 1)
 Register a new project in the database and config.
 
 ```bash
-python forge_orchestrator.py --add-project "MyApp" --project-dir "C:\code\myapp"
+python forge_orchestrator.py --add-project "MyApp" --project-dir "/path/to/myapp"
 ```
+
+This:
+1. Creates a row in the `projects` table with status `active`
+2. Adds the project directory to `forge_config.json`
 
 ### Setup Repos Mode
 
@@ -259,16 +298,6 @@ python forge_orchestrator.py --setup-repos -y
 python forge_orchestrator.py --setup-repos-project 1 -y
 ```
 
-### Cost Report Mode
-
-View agent cost summary across all projects and roles.
-
-```bash
-python forge_orchestrator.py --cost-report
-```
-
-Shows two tables: cost per project (runs, turns, duration, cost, pass/fail) and cost per role (runs, average cost, total cost).
-
 ### Common Options
 
 | Option | Default | Description |
@@ -276,8 +305,12 @@ Shows two tables: cost per project (runs, turns, duration, cost, pass/fail) and 
 | `--model` | sonnet | Claude model (sonnet, opus, haiku) |
 | `--max-turns` | 25 | Max agent conversation turns |
 | `--retries` | 3 | Max retry attempts on failure |
+| `--tasks` | — | Comma-separated or range of task IDs for parallel execution |
+| `--dev-test` | — | Enable Dev+Tester iteration loop |
+| `--security-review` | — | Run security review after dev-test (overrides config) |
+| `--dispatch-config` | dispatch_config.json | Path to custom dispatch config |
 | `--dry-run` | — | Show plan without executing |
-| `--yes` / `-y` | — | Skip confirmation prompts |
+| `--yes` / `-y` | — | Skip confirmation prompts (auto-enabled for non-TTY) |
 
 ---
 
@@ -293,7 +326,7 @@ Shows two tables: cost per project (runs, turns, duration, cost, pass/fail) and 
 | Evaluator | `evaluator.md` | Verify goal completion, create follow-ups | Read only | Explore only | Read + Write (tasks) |
 | SecurityReviewer | `security-reviewer.md` | 4-phase code security review | Read only | Scanning tools only | Read only |
 
-All roles use `--permission-mode dontAsk` with explicit `--allowedTools` and `--disallowedTools` flags. Permission overrides are configurable per-role in `forge_config.json` via the `role_permissions` key.
+Agents run with `--permission-mode bypassPermissions`. The access restrictions above are enforced via prompt instructions and MCP configuration (read-only DB for testers, no write tools for planners, etc.), not by the CLI permission system.
 
 ### Shared Rules (`_common.md`)
 
@@ -305,7 +338,81 @@ All agents receive the `_common.md` rules prepended to their role prompt. This i
 
 ### Custom Agents
 
-Drop a `.md` file in `prompts/` and it's automatically discovered. See [CUSTOM_AGENTS.md](CUSTOM_AGENTS.md) for details.
+Drop a `.md` file in `prompts/` and it's automatically discovered by `_discover_roles()` at startup. The filename stem becomes the role name. See [CUSTOM_AGENTS.md](CUSTOM_AGENTS.md) for details.
+
+---
+
+## Smart Features
+
+### Checkpoint/Resume
+
+When an agent times out or hits its turn limit, ForgeTeam saves the agent's output to `.forge-checkpoints/`. The next time you run that task, the orchestrator loads the checkpoint and injects it as context — the new agent picks up where the last one left off.
+
+```
+  [Checkpoint] Loaded checkpoint from attempt #1 (4200 chars). Agent will continue from there.
+```
+
+- Checkpoints are saved automatically on `PROCESS_TIMEOUT` (1200s) or `error_max_turns`
+- Checkpoints are cleared automatically when a task succeeds (tests pass or no-tests accepted)
+- Large checkpoints are truncated to 8000 chars to avoid prompt bloat
+- Multiple checkpoint attempts chain: attempt 1 → timeout → attempt 2 → timeout → attempt 3
+
+### Adaptive Complexity
+
+Tasks can have a `complexity` level that scales turn limits:
+
+| Complexity | Turn Multiplier | Example |
+|:----------:|:---------------:|---------|
+| `simple` | 0.5x | Fix a typo, update a config |
+| `medium` | 1.0x | Add a new endpoint, write tests |
+| `complex` | 1.5x | Refactor auth system, add WebSocket support |
+| `epic` | 2.0x | Build an ML pipeline, full-stack feature |
+
+Set complexity explicitly:
+```sql
+UPDATE tasks SET complexity = 'epic' WHERE id = 42;
+```
+
+Or leave it unset — ForgeTeam infers from description length:
+- Under 100 chars → `simple`
+- 100-400 chars → `medium`
+- 400-800 chars → `complex`
+- Over 800 chars → `epic`
+
+The multiplier is applied to the role's base turns. A developer (base 50) on an `epic` task gets 100 turns. A tester (base 20) on a `simple` task gets 10 (minimum 10).
+
+### Model Tiering
+
+Assign different Claude models per agent role or per task complexity via `dispatch_config.json`:
+
+```json
+{
+    "model": "sonnet",
+    "model_tester": "haiku",
+    "model_epic": "opus"
+}
+```
+
+Priority chain (first match wins):
+1. Per-complexity: `model_epic`, `model_complex`, `model_simple`
+2. Per-role: `model_developer`, `model_tester`, `model_security_reviewer`
+3. CLI `--model` flag
+4. Global `model` in dispatch config
+5. Default (`sonnet`)
+
+This lets you save money on simple tasks (Haiku for testers) while throwing compute at complex ones (Opus for epic tasks).
+
+### Auto Dependency Install
+
+Before the first Dev+Test cycle, the orchestrator checks for:
+- `pyproject.toml` or `requirements.txt` → creates a venv and runs `pip install`
+- `package.json` → runs `npm install`
+
+This prevents agents from wasting turns on dependency setup.
+
+### Auto-Yes for Non-Interactive
+
+When stdin is not a TTY (e.g., `nohup`, SSH pipes, cron), `--yes` is automatically enabled. No more hung processes waiting for confirmation.
 
 ---
 
@@ -336,10 +443,12 @@ Remove the entry from `forge_config.json`'s `project_dirs` manually.
 Tasks have four statuses:
 - `todo` — Ready to be picked up
 - `in_progress` — Currently being worked on
-- `done` — Completed
-- `blocked` — Stuck, needs intervention
+- `done` — Completed (set by the orchestrator on success)
+- `blocked` — Stuck, needs intervention (set by the orchestrator on failure)
 
 Priorities: `critical`, `high`, `medium`, `low`
+
+Complexity (optional): `simple`, `medium`, `complex`, `epic`
 
 ---
 
@@ -403,7 +512,7 @@ The database has 20 tables organized into these groups:
 | Table | Purpose |
 |-------|---------|
 | `projects` | Project metadata (name, codename, status, summary) |
-| `tasks` | Work items (title, status, priority, blocked_by) |
+| `tasks` | Work items (title, status, priority, complexity, blocked_by) |
 | `decisions` | Architectural decisions with rationale |
 | `open_questions` | Unresolved questions and blockers |
 | `session_notes` | Session summaries and next steps |
@@ -471,11 +580,11 @@ The project's codename doesn't match any entry in `PROJECT_DIRS` or `forge_confi
 
 **Fix:** Register the project with `--add-project` or add it manually to `forge_config.json`'s `project_dirs`.
 
-### Agent times out (600s)
+### Agent times out (1200s)
 
-The task is too complex for a single agent turn.
+The task took longer than the 20-minute wall-clock timeout.
 
-**Fix:** Break the task into smaller pieces. Use Manager mode (`--goal`) for large tasks — the Planner will decompose them automatically.
+**Fix:** ForgeTeam automatically saves a checkpoint on timeout. Simply re-run the same task — the agent will resume from where it left off. For recurring timeouts, tag the task as `epic` complexity to give it more turns, or break it into smaller tasks.
 
 ### "No todo tasks found"
 
@@ -491,6 +600,7 @@ Auto-run or `--project` mode found no tasks with status `todo`.
 1. Ensure `uv` is installed: `pip install uv`
 2. Test manually: `uvx mcp-server-sqlite --db-path /path/to/theforge.db`
 3. Check `mcp_config.json` has the correct database path
+4. On Linux, use the absolute path: `/home/user/.local/bin/uvx`
 
 ### Tests fail but code looks correct
 

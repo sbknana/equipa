@@ -57,7 +57,13 @@ The `dispatch_config.json` defaults are conservative:
     "max_concurrent": 4,
     "model": "sonnet",
     "max_turns": 25,
-    "max_tasks_per_project": 5
+    "max_turns_developer": 50,
+    "max_turns_tester": 20,
+    "max_turns_security_reviewer": 40,
+    "max_tasks_per_project": 5,
+    "security_review": true,
+    "model_tester": "haiku",
+    "model_epic": "opus"
 }
 ```
 
@@ -69,13 +75,23 @@ These work well on a 16 GB machine with 8 cores.
 
 | Field | Default | What It Controls |
 |-------|---------|-----------------|
-| `max_concurrent` | 4 | Max projects running in parallel during auto-run |
+| `max_concurrent` | 4 | Max agents running in parallel during auto-run |
 | `model` | sonnet | Default model for all agents (sonnet, opus, haiku) |
-| `max_turns` | 25 | Max conversation turns per agent invocation |
+| `max_turns` | 25 | Base conversation turns per agent invocation |
+| `max_turns_developer` | 50 | Turn limit for Developer agents |
+| `max_turns_tester` | 20 | Turn limit for Tester agents |
+| `max_turns_security_reviewer` | 40 | Turn limit for Security Reviewer agents |
 | `max_tasks_per_project` | 5 | Prevents one project from consuming all agent time |
+| `security_review` | true | Run security audit after successful dev-test loops |
 | `skip_projects` | [] | Project IDs or codenames to never auto-run |
 | `priority_boost` | {} | Manual priority overrides: `{"myproject": 100}` |
 | `only_projects` | [] | Whitelist mode — if non-empty, only these projects run |
+| `model_tester` | *(none)* | Override model for Tester agents (e.g., `"haiku"`) |
+| `model_developer` | *(none)* | Override model for Developer agents |
+| `model_epic` | *(none)* | Override model for epic-complexity tasks (e.g., `"opus"`) |
+| `model_simple` | *(none)* | Override model for simple-complexity tasks |
+
+Per-role turn limits are adjusted by task complexity (simple: 0.5x, medium: 1.0x, complex: 1.5x, epic: 2.0x). Model priority: complexity model > role model > CLI `--model` > config `model`.
 
 ### Tuning Tips
 
@@ -86,7 +102,7 @@ These work well on a 16 GB machine with 8 cores.
 
 **Decrease `max_concurrent` if:**
 - You see system slowdowns during runs
-- Agents are timing out (600s default)
+- Agents are timing out (1200s default)
 - RAM usage exceeds 80%
 
 **Adjust `max_tasks_per_project` if:**
@@ -96,6 +112,22 @@ These work well on a 16 GB machine with 8 cores.
 **Use `priority_boost` to:**
 - Force a specific project to the top of the queue
 - Deprioritize projects you're not actively working on (negative values)
+
+---
+
+## Parallel Tasks Mode (Within a Project)
+
+The `--tasks` flag runs multiple tasks concurrently within a single project:
+
+```bash
+# Run 3 tasks in parallel with dev-test loops
+python forge_orchestrator.py --tasks 109,110,111 --dev-test -y
+
+# Range syntax
+python forge_orchestrator.py --tasks 109-114 --dev-test -y
+```
+
+This respects `max_concurrent` from dispatch_config.json. Each task spawns its own agent process. Use `--dry-run` to preview what would run.
 
 ---
 

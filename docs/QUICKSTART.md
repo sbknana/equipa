@@ -102,8 +102,9 @@ The orchestrator will:
 1. Read the task from the database
 2. Load the project context (recent decisions, open questions, last session)
 3. Spawn a Developer agent with MCP access to the database
-4. The agent writes code, updates the task status, and logs session notes
+4. The agent writes code and logs session notes
 5. (If `--dev-test`) Spawn a Tester agent to validate, loop if tests fail
+6. The orchestrator updates the task status based on outcomes (agents don't manage their own status)
 
 ---
 
