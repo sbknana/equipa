@@ -10,5 +10,11 @@
     "priority_boost": {},
     "only_projects": [],
     "security_review": true,
-    "security_review_tools": "all"
+    "security_review_tools": "all",
+
+    "_comment_model_tiering": "Per-role and per-complexity model overrides (all optional)",
+    "model_tester": "haiku",
+
+    "_comment_complexity_models": "Override model by task complexity (all optional)",
+    "model_epic": "opus"
 }

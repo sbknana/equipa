@@ -69,7 +69,7 @@ ROLE_PROMPTS = {
 DEFAULT_MODEL = "sonnet"
 DEFAULT_MAX_TURNS = 25
 DEFAULT_MAX_RETRIES = 3
-PROCESS_TIMEOUT = 600  # 10 minutes
+PROCESS_TIMEOUT = 1200  # 20 minutes
 
 # Per-role turn limits (used when dispatch config or CLI doesn't specify)
 DEFAULT_ROLE_TURNS = {
@@ -78,6 +78,26 @@ DEFAULT_ROLE_TURNS = {
     "security-reviewer": 40,
     "planner": 25,
     "evaluator": 25,
+}
+
+# Checkpoint/Resume: save agent output on timeout for continuation
+CHECKPOINT_DIR = Path(__file__).parent / ".forge-checkpoints"
+
+# Complexity multipliers applied to per-role turn limits
+COMPLEXITY_MULTIPLIERS = {
+    "simple": 0.5,
+    "medium": 1.0,
+    "complex": 1.5,
+    "epic": 2.0,
+}
+
+# Default model per role (overridden by dispatch_config)
+DEFAULT_ROLE_MODELS = {
+    "developer": "sonnet",
+    "tester": "sonnet",
+    "security-reviewer": "sonnet",
+    "planner": "sonnet",
+    "evaluator": "sonnet",
 }
 
 # Dev+Tester loop constants
@@ -601,26 +621,187 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     return prompt
 
 
-def get_role_turns(role, args, config=None):
-    """Resolve max turns for a given role.
+def get_task_complexity(task):
+    """Resolve task complexity.
+
+    Checks the task's 'complexity' field first (set in DB), then infers from
+    description length as a fallback.
+
+    Returns one of: 'simple', 'medium', 'complex', 'epic'
+    """
+    # Explicit complexity in the task record
+    explicit = ((task or {}).get("complexity") or "").strip().lower()
+    if explicit in COMPLEXITY_MULTIPLIERS:
+        return explicit
+
+    # Infer from description length
+    desc = (task or {}).get("description", "") or ""
+    desc_len = len(desc)
+    if desc_len < 100:
+        return "simple"
+    elif desc_len < 400:
+        return "medium"
+    elif desc_len < 800:
+        return "complex"
+    else:
+        return "epic"
+
+
+def get_role_turns(role, args, config=None, task=None):
+    """Resolve max turns for a given role, adjusted by task complexity.
 
     Priority: dispatch config per-role > CLI --max-turns (if non-default) > DEFAULT_ROLE_TURNS
+    Then applies complexity multiplier from the task.
     """
     # Check dispatch config for per-role overrides (e.g. "max_turns_developer": 50)
     effective_config = config or getattr(args, "dispatch_config", None)
+    base_turns = None
     if effective_config:
         role_key = role.replace("-", "_")  # security-reviewer -> security_reviewer
         config_key = f"max_turns_{role_key}"
         if config_key in effective_config:
-            return effective_config[config_key]
+            base_turns = effective_config[config_key]
 
-    # If CLI specified a non-default value, use it for all roles
-    cli_turns = getattr(args, "max_turns", DEFAULT_MAX_TURNS)
-    if cli_turns != DEFAULT_MAX_TURNS:
-        return cli_turns
+    if base_turns is None:
+        # If CLI specified a non-default value, use it for all roles
+        cli_turns = getattr(args, "max_turns", DEFAULT_MAX_TURNS)
+        if cli_turns != DEFAULT_MAX_TURNS:
+            base_turns = cli_turns
+        else:
+            # Fall back to per-role defaults
+            base_turns = DEFAULT_ROLE_TURNS.get(role, DEFAULT_MAX_TURNS)
 
-    # Fall back to per-role defaults
-    return DEFAULT_ROLE_TURNS.get(role, DEFAULT_MAX_TURNS)
+    # Apply complexity multiplier
+    if task:
+        complexity = get_task_complexity(task)
+        multiplier = COMPLEXITY_MULTIPLIERS.get(complexity, 1.0)
+        adjusted = int(base_turns * multiplier)
+        # Enforce minimum of 10 turns
+        return max(10, adjusted)
+
+    return base_turns
+
+
+def get_role_model(role, args, config=None, task=None):
+    """Resolve model for a given role and task complexity.
+
+    Priority:
+      1. dispatch config per-complexity (e.g. model_epic, model_complex)
+      2. dispatch config per-role (e.g. model_developer, model_tester)
+      3. CLI --model
+      4. dispatch config global model
+      5. DEFAULT_ROLE_MODELS
+    """
+    effective_config = config or getattr(args, "dispatch_config", None)
+
+    if effective_config and task:
+        # Check complexity-based model override
+        complexity = get_task_complexity(task)
+        complexity_key = f"model_{complexity}"
+        if complexity_key in effective_config:
+            return effective_config[complexity_key]
+
+    if effective_config:
+        # Check role-based model override
+        role_key = role.replace("-", "_")
+        role_model_key = f"model_{role_key}"
+        if role_model_key in effective_config:
+            return effective_config[role_model_key]
+
+    # CLI override
+    cli_model = getattr(args, "model", DEFAULT_MODEL)
+    if cli_model != DEFAULT_MODEL:
+        return cli_model
+
+    # Config global model
+    if effective_config and "model" in effective_config:
+        return effective_config["model"]
+
+    return DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
+
+
+# --- Checkpoint/Resume ---
+
+def save_checkpoint(task_id, attempt, output_text, role="developer"):
+    """Save agent output to a checkpoint file for resume on retry.
+
+    Returns the checkpoint file path.
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"task_{task_id}_{role}_attempt_{attempt}.txt"
+    filepath = CHECKPOINT_DIR / filename
+    try:
+        filepath.write_text(output_text, encoding="utf-8")
+    except OSError as e:
+        print(f"  [Checkpoint] WARNING: Failed to save checkpoint: {e}")
+        return None
+    return filepath
+
+
+def load_checkpoint(task_id, role="developer"):
+    """Load the most recent checkpoint for a task+role.
+
+    Returns (checkpoint_text, attempt_number) or (None, 0) if no checkpoint exists.
+    """
+    if not CHECKPOINT_DIR.exists():
+        return None, 0
+
+    # Find all checkpoints for this task+role, sorted by attempt number
+    pattern = f"task_{task_id}_{role}_attempt_*.txt"
+    checkpoints = sorted(CHECKPOINT_DIR.glob(pattern))
+    if not checkpoints:
+        return None, 0
+
+    latest = checkpoints[-1]
+    try:
+        text = latest.read_text(encoding="utf-8")
+    except OSError:
+        return None, 0
+
+    # Extract attempt number from filename
+    stem = latest.stem  # e.g. task_124_developer_attempt_2
+    try:
+        attempt = int(stem.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        attempt = 0
+
+    return text, attempt
+
+
+def clear_checkpoints(task_id, role=None):
+    """Remove checkpoint files for a completed task."""
+    if not CHECKPOINT_DIR.exists():
+        return
+    if role:
+        pattern = f"task_{task_id}_{role}_attempt_*.txt"
+    else:
+        pattern = f"task_{task_id}_*_attempt_*.txt"
+    for f in CHECKPOINT_DIR.glob(pattern):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def build_checkpoint_context(checkpoint_text, attempt):
+    """Build context string from a checkpoint for the next agent attempt."""
+    # Truncate very long checkpoints to avoid blowing up the prompt
+    max_chars = 8000
+    if len(checkpoint_text) > max_chars:
+        checkpoint_text = (
+            checkpoint_text[:max_chars]
+            + f"\n\n[... truncated, {len(checkpoint_text) - max_chars} chars omitted ...]"
+        )
+
+    return (
+        f"## Previous Attempt (#{attempt}) — Continue From Here\n\n"
+        f"A previous agent worked on this task but ran out of turns or timed out. "
+        f"Here is what they accomplished. **Do NOT repeat work that is already done.** "
+        f"Pick up where they left off.\n\n"
+        f"### Previous Agent Output:\n```\n{checkpoint_text}\n```\n\n"
+        f"**IMPORTANT:** Review the project files to see what was already implemented. "
+        f"Focus only on what remains to be done."
+    )
 
 
 # --- CLI Command Building ---
@@ -667,12 +848,19 @@ async def run_agent(cmd):
                 timeout=PROCESS_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            # Try to capture any partial output before killing
             process.kill()
-            await process.communicate()
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=5,
+                )
+                partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            except Exception:
+                partial_text = ""
             duration = time.time() - start_time
             return {
                 "success": False,
-                "result_text": "",
+                "result_text": partial_text,
                 "num_turns": 0,
                 "duration": duration,
                 "cost": None,
@@ -1039,13 +1227,15 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
     """Run the Developer + Tester iteration loop.
 
     Flow per cycle:
-    1. Run Developer agent (with any prior compaction/failure context)
-    2. Check if Developer marked task blocked -> exit
-    3. Track FILES_CHANGED for progress detection
-    4. Run Tester agent
-    5. Parse Tester output:
-       - pass -> exit, success
-       - no-tests -> exit, accept Developer result
+    1. Check for checkpoint from a previous timed-out attempt
+    2. Run Developer agent (with checkpoint + compaction/failure context)
+    3. On timeout/max_turns -> save checkpoint for future resume
+    4. Check if Developer marked task blocked -> exit
+    5. Track FILES_CHANGED for progress detection
+    6. Run Tester agent
+    7. Parse Tester output:
+       - pass -> clear checkpoints, exit success
+       - no-tests -> clear checkpoints, exit accept
        - blocked -> exit
        - fail -> feed failures to next Developer cycle
 
@@ -1058,6 +1248,26 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
     no_progress_count = 0    # consecutive cycles with no FILES_CHANGED
     total_cost = 0.0
     total_duration = 0.0
+    task_id = task["id"]
+
+    # Resolve model and turns using adaptive tiering
+    complexity = get_task_complexity(task)
+    dev_model = get_role_model("developer", args, task=task)
+    tester_model = get_role_model("tester", args, task=task)
+    dev_turns_limit = get_role_turns("developer", args, task=task)
+    tester_turns_limit = get_role_turns("tester", args, task=task)
+
+    log(f"  Task complexity: {complexity}", output)
+    log(f"  Developer: model={dev_model}, max_turns={dev_turns_limit}", output)
+    log(f"  Tester: model={tester_model}, max_turns={tester_turns_limit}", output)
+
+    # Check for checkpoint from a previous timed-out attempt
+    checkpoint_text, prev_attempt = load_checkpoint(task_id, role="developer")
+    if checkpoint_text:
+        checkpoint_context = build_checkpoint_context(checkpoint_text, prev_attempt)
+        compaction_history.append(checkpoint_context)
+        log(f"  [Checkpoint] Loaded checkpoint from attempt #{prev_attempt} "
+            f"({len(checkpoint_text)} chars). Agent will continue from there.", output)
 
     for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
         log(f"\n{'=' * 50}", output)
@@ -1074,9 +1284,8 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             task, project_context, project_dir,
             role="developer", extra_context=extra_context,
         )
-        dev_turns = get_role_turns("developer", args)
         dev_cmd = build_cli_command(
-            dev_prompt, project_dir, dev_turns, args.model, role="developer",
+            dev_prompt, project_dir, dev_turns_limit, dev_model, role="developer",
         )
 
         dev_result = await run_agent(dev_cmd)
@@ -1084,10 +1293,25 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         if dev_result.get("cost"):
             total_cost += dev_result["cost"]
 
-        # Check for timeout
-        if any("timed out" in e for e in dev_result.get("errors", [])):
-            log(f"  [Cycle {cycle}] Developer timed out.", output)
-            return dev_result, cycle, "developer_timeout"
+        # Check for timeout or max_turns — save checkpoint for resume
+        is_timeout = any("timed out" in e for e in dev_result.get("errors", []))
+        is_max_turns = any("max turns" in e for e in dev_result.get("errors", []))
+
+        if is_timeout or is_max_turns:
+            reason = "timed out" if is_timeout else "hit max turns"
+            log(f"  [Cycle {cycle}] Developer {reason}.", output)
+
+            # Save checkpoint for future resume
+            result_text = dev_result.get("result_text", "")
+            if result_text:
+                attempt_num = prev_attempt + cycle
+                cp_path = save_checkpoint(task_id, attempt_num, result_text, role="developer")
+                if cp_path:
+                    log(f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}", output)
+                    log(f"  [Checkpoint] Next run of this task will auto-resume from here.", output)
+
+            outcome = "developer_timeout" if is_timeout else "developer_max_turns"
+            return dev_result, cycle, outcome
 
         # Check for agent failure
         if not dev_result["success"]:
@@ -1109,15 +1333,15 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
         # Progress detection: check FILES_CHANGED marker + turn-based heuristic
         files_changed = parse_developer_output(dev_result.get("result_text", ""))
-        dev_turns = dev_result.get("num_turns", 0)
+        dev_turns_used = dev_result.get("num_turns", 0)
 
         # Consider it progress if: FILES_CHANGED has items, OR dev used 3+ turns
         # (agents often do work but forget to output the marker)
-        made_progress = bool(files_changed) or dev_turns >= 3
+        made_progress = bool(files_changed) or dev_turns_used >= 3
 
         if not made_progress:
             no_progress_count += 1
-            log(f"  [Cycle {cycle}] No progress detected ({dev_turns} turns, no files marker) "
+            log(f"  [Cycle {cycle}] No progress detected ({dev_turns_used} turns, no files marker) "
                 f"({no_progress_count}/{NO_PROGRESS_LIMIT} consecutive).", output)
             if no_progress_count >= NO_PROGRESS_LIMIT:
                 log(f"  [Cycle {cycle}] No progress for {NO_PROGRESS_LIMIT} cycles. "
@@ -1129,7 +1353,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
                 log(f"  [Cycle {cycle}] Developer changed {len(files_changed)} file(s): "
                     f"{', '.join(files_changed[:5])}", output)
             else:
-                log(f"  [Cycle {cycle}] Developer used {dev_turns} turns "
+                log(f"  [Cycle {cycle}] Developer used {dev_turns_used} turns "
                     f"(no FILES_CHANGED marker, but counting as progress).", output)
 
         # --- Tester Phase ---
@@ -1138,9 +1362,8 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         tester_prompt = build_system_prompt(
             task, project_context, project_dir, role="tester",
         )
-        tester_turns = get_role_turns("tester", args)
         tester_cmd = build_cli_command(
-            tester_prompt, project_dir, tester_turns, args.model, role="tester",
+            tester_prompt, project_dir, tester_turns_limit, tester_model, role="tester",
         )
 
         tester_result = await run_agent(tester_cmd)
@@ -1169,13 +1392,14 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
         if test_outcome == "pass":
             log(f"  [Cycle {cycle}] All tests passed!", output)
-            # Combine cost/duration into the result we return
+            clear_checkpoints(task_id)  # success — no need for checkpoints
             tester_result["cost"] = total_cost
             tester_result["duration"] = total_duration
             return tester_result, cycle, "tests_passed"
 
         elif test_outcome == "no-tests":
             log(f"  [Cycle {cycle}] No tests found. Accepting Developer result.", output)
+            clear_checkpoints(task_id)  # success — no need for checkpoints
             dev_result["cost"] = total_cost
             dev_result["duration"] = total_duration
             return dev_result, cycle, "no_tests"
@@ -1237,9 +1461,10 @@ async def run_security_review(task, project_dir, project_context, args, output=N
         security_task, project_context, project_dir,
         role="security-reviewer",
     )
-    sec_turns = get_role_turns("security-reviewer", args)
+    sec_turns = get_role_turns("security-reviewer", args, task=task)
+    sec_model = get_role_model("security-reviewer", args, task=task)
     sec_cmd = build_cli_command(
-        sec_prompt, project_dir, sec_turns, args.model, role="security-reviewer",
+        sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
     )
 
     sec_result = await run_agent(sec_cmd)
@@ -2417,6 +2642,14 @@ DEFAULT_DISPATCH_CONFIG = {
     "skip_projects": [],
     "priority_boost": {},
     "only_projects": [],
+    # Per-role model overrides (optional in config file)
+    # "model_developer": "sonnet",
+    # "model_tester": "haiku",
+    # "model_security_reviewer": "sonnet",
+    # Per-complexity model overrides (optional in config file)
+    # "model_simple": "haiku",
+    # "model_complex": "sonnet",
+    # "model_epic": "opus",
 }
 
 
@@ -2447,6 +2680,11 @@ def load_dispatch_config(filepath):
     # Merge loaded values over defaults
     for key in DEFAULT_DISPATCH_CONFIG:
         if key in data:
+            config[key] = data[key]
+
+    # Also merge any extra keys not in defaults (model_developer, model_epic, etc.)
+    for key in data:
+        if key not in config:
             config[key] = data[key]
 
     return config
@@ -2959,6 +3197,9 @@ async def async_main():
         print(f"WARNING: --dev-test mode ignores --role ('{args.role}'). "
               f"Loop uses Developer + Tester automatically.")
 
+    # Load dispatch config globally so model tiering and adaptive turns work in all modes
+    args.dispatch_config = load_dispatch_config(args.dispatch_config)
+
     # --- Add project mode ---
     if args.add_project:
         if not args.project_dir:
@@ -2973,7 +3214,7 @@ async def async_main():
 
     # --- Auto-run mode (Phase 5) ---
     if args.auto_run:
-        dispatch_config = load_dispatch_config(args.dispatch_config)
+        dispatch_config = args.dispatch_config
 
         # CLI overrides
         if args.max_concurrent is not None:
@@ -3175,26 +3416,42 @@ async def async_main():
     project_context = fetch_project_context(task.get("project_id", 0))
 
     # Show task info
+    complexity = get_task_complexity(task)
     mode_label = "Dev+Test loop" if args.dev_test else f"{args.role} (single agent)"
     print(f"\nTask #{task['id']}: {task['title']}")
     print(f"Project: {task.get('project_name', 'Unknown')}")
     print(f"Priority: {task.get('priority', 'medium')}")
+    print(f"Complexity: {complexity}")
     print(f"Mode: {mode_label}")
     print(f"Directory: {project_dir}")
-    print(f"Model: {args.model}")
-    print(f"Max turns: {args.max_turns}")
 
     if args.dev_test:
+        dev_model = get_role_model("developer", args, task=task)
+        dev_turns = get_role_turns("developer", args, task=task)
+        tester_model = get_role_model("tester", args, task=task)
+        tester_turns = get_role_turns("tester", args, task=task)
+        print(f"Developer: model={dev_model}, turns={dev_turns}")
+        print(f"Tester: model={tester_model}, turns={tester_turns}")
         print(f"Max cycles: {MAX_DEV_TEST_CYCLES}")
         print(f"Compaction: Dev >= {DEV_COMPACTION_THRESHOLD} turns, "
               f"Tester >= {TESTER_COMPACTION_THRESHOLD} turns")
+        # Check for checkpoint
+        cp_text, cp_attempt = load_checkpoint(task['id'], role="developer")
+        if cp_text:
+            print(f"Checkpoint: Found from attempt #{cp_attempt} ({len(cp_text)} chars) — will auto-resume")
     else:
+        role_model = get_role_model(args.role, args, task=task)
+        role_turns = get_role_turns(args.role, args, task=task)
+        print(f"Model: {role_model}")
+        print(f"Max turns: {role_turns}")
         print(f"Max retries: {args.retries}")
 
     if args.dry_run:
         # Build a sample prompt to show size
         system_prompt = build_system_prompt(task, project_context, project_dir, role="developer")
-        cmd = build_cli_command(system_prompt, project_dir, get_role_turns("developer", args), args.model, role="developer")
+        dry_model = get_role_model("developer", args, task=task)
+        dry_turns = get_role_turns("developer", args, task=task)
+        cmd = build_cli_command(system_prompt, project_dir, dry_turns, dry_model, role="developer")
 
         print(f"\n--- DRY RUN ---")
         print(f"System prompt: {len(system_prompt)} chars")
@@ -3237,14 +3494,9 @@ async def async_main():
         # Optional security review after successful dev-test
         security_review_enabled = args.security_review
         if security_review_enabled is None:
-            # Check dispatch config
-            try:
-                with open(Path(__file__).parent / "dispatch_config.json") as f:
-                    import json
-                    dc = json.load(f)
-                    security_review_enabled = dc.get("security_review", False)
-            except Exception:
-                security_review_enabled = False
+            # Check dispatch config (already loaded globally on args)
+            dc = getattr(args, "dispatch_config", None) or {}
+            security_review_enabled = dc.get("security_review", False)
 
         if security_review_enabled and outcome in ("tests_passed", "no_tests"):
             sec_result = await run_security_review(task, project_dir, project_context, args)
@@ -3257,13 +3509,14 @@ async def async_main():
         print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
 
     else:
-        # Single-agent mode (Phase 1 — unchanged)
+        # Single-agent mode (Phase 1 — with model tiering)
         system_prompt = build_system_prompt(
             task, project_context, project_dir, role=args.role,
         )
-        role_turns = get_role_turns(args.role, args)
+        role_turns = get_role_turns(args.role, args, task=task)
+        role_model = get_role_model(args.role, args, task=task)
         cmd = build_cli_command(
-            system_prompt, project_dir, role_turns, args.model, role=args.role,
+            system_prompt, project_dir, role_turns, role_model, role=args.role,
         )
         print(f"System prompt: {len(system_prompt)} chars")
 
