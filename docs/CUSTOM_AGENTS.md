@@ -16,6 +16,22 @@ Each agent role is a markdown file in the `prompts/` directory. When the orchest
 
 The `_discover_roles()` function scans `prompts/` at startup and automatically registers any `.md` file (except those starting with `_`) as an available role.
 
+### Built-in Roles
+
+ForgeTeam ships with 9 built-in agent roles:
+
+| Role File | Purpose |
+|-----------|---------|
+| `developer.md` | Write code, fix bugs, implement features |
+| `tester.md` | Run unit tests and report results |
+| `planner.md` | Break goals into ordered tasks |
+| `evaluator.md` | Verify goal completion, create follow-ups |
+| `security-reviewer.md` | 4-phase code security audit |
+| `frontend-designer.md` | Create polished, production-grade UI/UX |
+| `integration-tester.md` | Deploy and test full applications end-to-end |
+| `debugger.md` | Trace errors to root cause and fix them |
+| `code-reviewer.md` | Review code quality, consistency, correctness |
+
 ---
 
 ## Creating a New Agent
