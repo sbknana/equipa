@@ -11,10 +11,14 @@
     "only_projects": [],
     "security_review": true,
     "security_review_tools": "all",
-
     "_comment_model_tiering": "Per-role and per-complexity model overrides (all optional)",
     "model_tester": "haiku",
-
     "_comment_complexity_models": "Override model by task complexity (all optional)",
-    "model_epic": "opus"
+    "model_epic": "opus",
+    "max_turns_frontend_designer": 40,
+    "max_turns_integration_tester": 30,
+    "max_turns_debugger": 35,
+    "max_turns_code_reviewer": 25,
+    "model_integration_tester": "haiku",
+    "model_code_reviewer": "haiku"
 }

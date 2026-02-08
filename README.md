@@ -166,10 +166,14 @@ python forge_orchestrator.py --auto-run -y
 | Role | Job | Can Edit Files | Can Run Builds | DB Access |
 |------|-----|:-:|:-:|:-:|
 | **Developer** | Write code, fix bugs, implement features | Yes | Yes | Read + Write |
-| **Tester** | Run tests, report failures | No | Test runners only | Read only |
+| **Tester** | Run unit tests, report failures | No | Test runners only | Read only |
 | **Planner** | Break goals into 2-8 ordered tasks | No | Explore only | Read + Write (tasks) |
 | **Evaluator** | Verify goal completion, create follow-ups | No | Explore only | Read + Write (tasks) |
 | **Security Reviewer** | 4-phase code security audit | No | Scanning tools only | Read only |
+| **Frontend Designer** | Create polished, production-grade UI/UX | Yes | Dev servers | Read + Write |
+| **Integration Tester** | Deploy, start, and test full applications end-to-end | No | Full stack | Read only |
+| **Debugger** | Trace errors to root cause, fix them, verify | Yes | Yes | Read + Write |
+| **Code Reviewer** | Review code quality, consistency, correctness | No | Linters only | Read only |
 | **Custom** | Drop a `.md` in `prompts/` — auto-discovered | Configurable | Configurable | Configurable |
 
 ## Security Model
