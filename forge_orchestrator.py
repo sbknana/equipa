@@ -101,10 +101,11 @@ DEFAULT_ROLE_MODELS = {
 }
 
 # Dev+Tester loop constants
-MAX_DEV_TEST_CYCLES = 3
+MAX_DEV_TEST_CYCLES = 5
 DEV_COMPACTION_THRESHOLD = 10    # turns before compacting developer
 TESTER_COMPACTION_THRESHOLD = 6  # turns before compacting tester
 NO_PROGRESS_LIMIT = 2            # consecutive no-change runs before blocking
+MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns/timeout
 
 # Manager mode constants (Phase 3)
 MAX_MANAGER_ROUNDS = 3       # max plan-execute-evaluate rounds
@@ -1243,6 +1244,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
     compaction_history = []  # accumulated context across cycles
     no_progress_count = 0    # consecutive cycles with no FILES_CHANGED
+    continuation_count = 0   # auto-retries when developer runs out of turns
     total_cost = 0.0
     total_duration = 0.0
     task_id = task["id"]
@@ -1303,17 +1305,30 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
         if is_timeout or is_max_turns:
             reason = "timed out" if is_timeout else "hit max turns"
-            log(f"  [Cycle {cycle}] Developer {reason}.", output)
+            continuation_count += 1
+            log(f"  [Cycle {cycle}] Developer {reason}. "
+                f"(continuation {continuation_count}/{MAX_CONTINUATIONS})", output)
 
-            # Save checkpoint for future resume
+            # Save checkpoint
             result_text = dev_result.get("result_text", "")
             if result_text:
                 attempt_num = prev_attempt + cycle
                 cp_path = save_checkpoint(task_id, attempt_num, result_text, role="developer")
                 if cp_path:
                     log(f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}", output)
-                    log(f"  [Checkpoint] Next run of this task will auto-resume from here.", output)
 
+            # Auto-continue: spawn fresh agent with checkpoint context
+            if continuation_count < MAX_CONTINUATIONS:
+                log(f"  [Auto-Continue] Spawning new developer agent to continue...", output)
+                if result_text:
+                    checkpoint_context = build_checkpoint_context(
+                        result_text, prev_attempt + cycle)
+                    compaction_history.append(checkpoint_context)
+                continue  # skip tester, go to next dev-test cycle
+
+            # All continuations exhausted
+            log(f"  [Auto-Continue] All {MAX_CONTINUATIONS} continuations exhausted. "
+                f"Marking blocked.", output)
             outcome = "developer_timeout" if is_timeout else "developer_max_turns"
             return dev_result, cycle, outcome
 
