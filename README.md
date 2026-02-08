@@ -22,9 +22,13 @@ ForgeTeam turns Claude Code into a team. Instead of one AI doing everything, you
 **You're a solo dev or small team using Claude Code.** You've got 5 projects, 30 tasks, and not enough hours. ForgeTeam fixes that:
 
 - **Persistent memory across sessions.** Decisions, task history, session notes, open questions — all stored in SQLite via MCP. No more re-explaining your project every conversation.
-- **Dev+Test loops.** Developer writes code. Tester validates. If tests fail, Developer gets the failures and tries again. Up to 3 cycles, automatically.
+- **Dev+Test loops.** Developer writes code. Tester validates. If tests fail, Developer gets the failures and tries again. Up to 3 cycles, automatically. The orchestrator handles DB status updates — agents never run out of turns before housekeeping.
+- **Parallel task execution.** Run multiple tasks concurrently with `--tasks 109-114`. Independent tasks execute in parallel (up to 4 by default), cutting batch times by 3-4x.
 - **Goal-driven autonomy.** Say "Add dark mode" and the Planner breaks it into tasks, Dev+Test executes each one, the Evaluator reviews results and creates follow-ups. Multiple rounds until the goal is complete.
 - **Auto-dispatch across all projects.** One command scans every project, prioritizes by task urgency, and runs up to 16 parallel agents. Leave it running overnight.
+- **Auto security reviews.** After every successful dev-test loop, an optional Security Reviewer agent audits the code using ClaudeStick tools and checks for zero-day vulnerabilities.
+- **Auto dependency install.** Detects `pyproject.toml` or `package.json` and installs dependencies before the first agent spawns. No more wasting turns on `pip install`.
+- **Per-role turn limits.** Developers get 50 turns, Testers get 20, Security Reviewers get 40. Configurable in `dispatch_config.json`. Agents use their budget where it matters.
 - **Zero dependencies.** Pure Python stdlib. No pip, no npm, no Docker. Just Python + Claude Code + a SQLite database.
 - **Security by default.** Role-based permission tiers — Testers can't edit files, Planners can't run builds, Security Reviewers can't write to the database. Prompt injection defenses built in.
 
@@ -88,19 +92,32 @@ Developer writes, Tester validates, loop until green.
 python forge_orchestrator.py --task 42 --dev-test -y
 ```
 
-### 3. Manager Mode (Goal-Driven)
+### 3. Parallel Tasks
+Run multiple independent tasks concurrently within a project.
+```bash
+# Comma-separated IDs
+python forge_orchestrator.py --tasks 109,110,111 --dev-test -y
+
+# Range syntax
+python forge_orchestrator.py --tasks 109-114 --dev-test -y
+
+# Preview first
+python forge_orchestrator.py --tasks 109-114 --dev-test --dry-run
+```
+
+### 4. Manager Mode (Goal-Driven)
 Give a goal. Planner creates tasks. Dev+Test executes. Evaluator reviews. Repeat.
 ```bash
 python forge_orchestrator.py --goal "Add user authentication" --goal-project 1 -y
 ```
 
-### 4. Parallel Goals
+### 5. Parallel Goals
 Run multiple goals across different projects concurrently.
 ```bash
 python forge_orchestrator.py --parallel-goals goals.json -y
 ```
 
-### 5. Auto-Run
+### 6. Auto-Run
 Scan all projects, prioritize, and dispatch agents automatically.
 ```bash
 # Preview what would run
@@ -137,7 +154,9 @@ python forge_orchestrator.py --auto-run -y
                     +-----------------+
 ```
 
-**How agents communicate:** Every agent gets MCP access to the same SQLite database. The Developer updates task status, logs decisions, and records session notes. The Tester reads the codebase and reports failures. The Planner creates tasks. The Evaluator reviews results. All through the shared database — no custom protocols, no message queues.
+**How agents communicate:** Every agent gets MCP access to the same SQLite database. The Developer logs decisions and records session notes. The Tester reads the codebase and reports failures. The Planner creates tasks. The Evaluator reviews results. All through the shared database — no custom protocols, no message queues.
+
+**Orchestrator-managed status:** Task status (done/blocked) is updated by the orchestrator based on dev-test outcomes, not by the agents themselves. This eliminates the most common failure mode — agents running out of turns before updating the database.
 
 ## Agent Roles
 
@@ -208,8 +227,25 @@ Agents access the database through [MCP](https://modelcontextprotocol.io/) (Mode
 | `forge_config.json` | Project paths, DB path, GitHub owner | Yes |
 | `mcp_config.json` | MCP server config for agents | Yes |
 | `.mcp.json` | MCP config for your own Claude sessions | Yes |
-| `dispatch_config.json` | Auto-run settings (concurrency, model, limits) | Included |
+| `dispatch_config.json` | Auto-run settings (concurrency, model, per-role turns) | Included |
 | `CLAUDE.md` | Full context for Claude Code | Yes |
+
+### dispatch_config.json
+
+```json
+{
+    "max_concurrent": 4,
+    "model": "sonnet",
+    "max_turns": 25,
+    "max_turns_developer": 50,
+    "max_turns_tester": 20,
+    "max_turns_security_reviewer": 40,
+    "max_tasks_per_project": 5,
+    "security_review": true
+}
+```
+
+Per-role turn limits let you give developers more room for complex tasks while keeping testers lean. The `security_review` flag automatically runs a security audit after every successful dev-test loop.
 
 ## Documentation
 
