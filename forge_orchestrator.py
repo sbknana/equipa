@@ -814,8 +814,9 @@ def build_cli_command(system_prompt, project_dir, max_turns, model, role="develo
 
 # --- Agent Execution ---
 
-async def run_agent(cmd):
+async def run_agent(cmd, timeout=None):
     """Spawn claude -p, capture output, handle timeout."""
+    effective_timeout = timeout or PROCESS_TIMEOUT
     start_time = time.time()
 
     try:
@@ -828,7 +829,7 @@ async def run_agent(cmd):
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(),
-                timeout=PROCESS_TIMEOUT,
+                timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
             # Try to capture any partial output before killing
@@ -847,7 +848,7 @@ async def run_agent(cmd):
                 "num_turns": 0,
                 "duration": duration,
                 "cost": None,
-                "errors": [f"Process timed out after {PROCESS_TIMEOUT} seconds"],
+                "errors": [f"Process timed out after {effective_timeout} seconds"],
             }
 
     except FileNotFoundError:
@@ -1471,7 +1472,10 @@ async def run_security_review(task, project_dir, project_context, args, output=N
         sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
     )
 
-    sec_result = await run_agent(sec_cmd)
+    # Use security_review_timeout from dispatch config (default 15 min)
+    dc = load_dispatch_config()
+    sec_timeout = dc.get("security_review_timeout", 900)
+    sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
 
     if sec_result["success"]:
         log(f"  Security review completed in {sec_result.get('duration', 0):.1f}s", output)
