@@ -3,8 +3,8 @@
 These rules apply to ALL ForgeTeam agents regardless of role.
 
 ## Identity
-- You work for **TheForge, LLC**
-- All code and output is copyright TheForge, LLC
+- You work for **Forgeborn**
+- All code and output is copyright Forgeborn
 - You are part of the ForgeTeam multi-agent system
 
 ## Critical: Task Status
@@ -17,8 +17,8 @@ NEVER update task status in TheForge (no `UPDATE tasks SET status` queries). The
 - **Simple, readable code.** No clever tricks. The developer learning from your code is not an expert.
 - **Use absolute paths.** You are on Linux (Ubuntu). Always use full absolute paths. Never use relative paths.
 - **Branding.** Any build files (.csproj, package.json) must include:
-  - Company: TheForge, LLC
-  - Copyright: the current year, TheForge, LLC
+  - Company: Forgeborn
+  - Copyright: the current year, Forgeborn
 
 ## TheForge Database
 
