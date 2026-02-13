@@ -17,7 +17,7 @@ Usage:
 
 Stdlib only — no pip dependencies required.
 
-Copyright 2026 TheForge, LLC
+Copyright 2026 Forgeborn
 """
 
 import json
@@ -84,18 +84,29 @@ def prompt_yes_no(message, default=True):
 
 def check_command(cmd, version_flag="--version"):
     """Check if a command is available and return its version string."""
-    try:
-        result = subprocess.run(
-            [cmd, version_flag],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        output = result.stdout.strip() or result.stderr.strip()
-        # Return first line only
-        return output.split("\n")[0] if output else "installed"
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+    # Try the command directly first
+    candidates = [cmd]
+    # Also check common install locations (non-interactive shells may not have full PATH)
+    if cmd in ("uvx", "uv", "claude"):
+        candidates.extend([
+            str(Path.home() / ".local" / "bin" / cmd),
+            str(Path.home() / ".cargo" / "bin" / cmd),
+            f"/usr/local/bin/{cmd}",
+        ])
+    for candidate in candidates:
+        try:
+            result = subprocess.run(
+                [candidate, version_flag],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            output = result.stdout.strip() or result.stderr.strip()
+            # Return first line only
+            return output.split("\n")[0] if output else "installed"
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return None
 
 
 def run_sql_file(db_path, sql_path):
@@ -347,15 +358,37 @@ def step_generate_config(base_path, db_path):
     return config
 
 
+def _resolve_uvx_path():
+    """Find the full path to uvx, needed because MCP subprocesses may not inherit PATH."""
+    uvx_path = shutil.which("uvx")
+    if uvx_path:
+        return str(Path(uvx_path).resolve())
+    # Common locations to check
+    candidates = [
+        Path.home() / ".local" / "bin" / "uvx",
+        Path.home() / ".cargo" / "bin" / "uvx",
+        Path("/usr/local/bin/uvx"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    # Fallback — will likely fail but gives a clear error
+    print("  WARNING: Could not find uvx. MCP server may fail to start.")
+    print("  Install uv/uvx: curl -LsSf https://astral.sh/uv/install.sh | sh")
+    return "uvx"
+
+
 def step_generate_mcp_config(base_path, db_path):
     """Generate mcp_config.json for MCP server."""
     print_header("Step 6: Generate MCP Configuration")
+
+    uvx_cmd = _resolve_uvx_path()
 
     mcp_config = {
         "mcpServers": {
             "theforge": {
                 "type": "stdio",
-                "command": "uvx",
+                "command": uvx_cmd,
                 "args": [
                     "mcp-server-sqlite",
                     "--db-path",
@@ -369,7 +402,7 @@ def step_generate_mcp_config(base_path, db_path):
     with open(mcp_path, "w", encoding="utf-8") as f:
         json.dump(mcp_config, f, indent=2)
     print(f"  Created: {mcp_path}")
-    print(f"  MCP server: uvx mcp-server-sqlite")
+    print(f"  MCP server: {uvx_cmd} mcp-server-sqlite")
     print(f"  Database: {db_path}")
 
     return mcp_path
@@ -379,11 +412,13 @@ def step_generate_dot_mcp(base_path, db_path):
     """Generate .mcp.json so Claude Code sessions can access the DB directly."""
     print_header("Step 7: Claude Code MCP Integration")
 
+    uvx_cmd = _resolve_uvx_path()
+
     dot_mcp = {
         "mcpServers": {
-            "itzamna": {
+            "theforge": {
                 "type": "stdio",
-                "command": "uvx",
+                "command": uvx_cmd,
                 "args": [
                     "mcp-server-sqlite",
                     "--db-path",
@@ -529,7 +564,7 @@ Add `role_permissions` to `forge_config.json` to grant extra tools per role:
 ## Developer Context
 
 - On **Windows**, never use `&&` in batch files (use separate lines)
-- All projects built for **TheForge, LLC** — include proper attribution
+- All projects built for **Forgeborn** — include proper attribution
 - AI Credit: "Vibe coded with Claude"
 """
 
