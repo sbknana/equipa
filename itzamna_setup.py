@@ -578,9 +578,319 @@ Add `role_permissions` to `forge_config.json` to grant extra tools per role:
     return claude_md_path
 
 
-def step_verify(base_path, db_path):
+def _find_node_path():
+    """Find the full path to node, needed for systemd services."""
+    node_path = shutil.which("node")
+    if node_path:
+        return str(Path(node_path).resolve())
+    candidates = [
+        Path("/usr/bin/node"),
+        Path("/usr/local/bin/node"),
+        Path.home() / ".nvm" / "current" / "bin" / "node",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "node"
+
+
+def _find_npx_path():
+    """Find the full path to npx, needed for systemd services."""
+    npx_path = shutil.which("npx")
+    if npx_path:
+        return str(Path(npx_path).resolve())
+    candidates = [
+        Path("/usr/bin/npx"),
+        Path("/usr/local/bin/npx"),
+        Path.home() / ".nvm" / "current" / "bin" / "npx",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "npx"
+
+
+def step_optional_sentinel(base_path, db_path):
+    """Optionally install Sentinel monitoring dashboard."""
+    print_header("Optional: Sentinel Monitoring Dashboard")
+
+    print("  Sentinel provides real-time infrastructure monitoring.")
+    print("  It monitors CPU, memory, disk, containers, services, and backups.")
+    print("  Includes a web dashboard and alert system.")
+    print()
+
+    if not prompt_yes_no("Install Sentinel?", default=True):
+        print("  Skipping Sentinel.")
+        return None
+
+    sentinel_dir = base_path / "sentinel"
+    sentinel_dir.mkdir(parents=True, exist_ok=True)
+    (sentinel_dir / "src").mkdir(exist_ok=True)
+    (sentinel_dir / "public").mkdir(exist_ok=True)
+    (sentinel_dir / "data").mkdir(exist_ok=True)
+
+    # Copy Sentinel source from bundled files
+    sentinel_src = SOURCE_DIR / "sentinel"
+    if not sentinel_src.exists():
+        # Check if Sentinel lives alongside Itzamna in the AI_Stuff directory
+        sentinel_src = SOURCE_DIR.parent / "Sentinel"
+    if not sentinel_src.exists():
+        print("  WARNING: Sentinel source not found.")
+        print(f"  Looked in: {SOURCE_DIR / 'sentinel'}")
+        print(f"  And: {SOURCE_DIR.parent / 'Sentinel'}")
+        print("  Skipping Sentinel installation.")
+        return None
+
+    # Copy source files
+    src_count = 0
+    for item in sentinel_src.rglob("*"):
+        if item.is_file() and "node_modules" not in str(item) and ".git" not in str(item):
+            rel = item.relative_to(sentinel_src)
+            dest = sentinel_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(item), str(dest))
+            src_count += 1
+    print(f"  Copied {src_count} Sentinel files.")
+
+    # Configure
+    port = prompt_input("Sentinel port", default="3002")
+
+    # Generate config.json with user's settings
+    sentinel_config = {
+        "port": int(port),
+        "collection_interval_seconds": 30,
+        "theforge_db_path": str(db_path),
+        "hosts": [
+            {
+                "name": "localhost",
+                "type": "local",
+            }
+        ],
+        "default_alerts": [
+            {"metric": "disk_percent", "operator": ">", "threshold": 90, "severity": "critical"},
+            {"metric": "memory_percent", "operator": ">", "threshold": 85, "severity": "warning"},
+            {"metric": "cpu_percent", "operator": ">", "threshold": 95, "severity": "warning"},
+            {"metric": "container_down", "operator": "==", "threshold": 0, "severity": "critical"},
+        ],
+        "retention": {
+            "metrics_full_days": 7,
+            "metrics_downsampled_days": 30,
+            "containers_days": 7,
+            "alert_history_days": 90,
+        },
+        "backups": [],
+    }
+
+    config_path = sentinel_dir / "config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(sentinel_config, f, indent=4)
+    print(f"  Created config at: {config_path}")
+
+    # npm install
+    print("  Installing Sentinel dependencies (npm install)...")
+    try:
+        result = subprocess.run(
+            ["npm", "install", "--production"],
+            cwd=str(sentinel_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print("  [+] npm install: OK")
+        else:
+            print(f"  [X] npm install failed: {result.stderr[:200]}")
+            return sentinel_dir
+    except Exception as exc:
+        print(f"  [X] npm install error: {exc}")
+        return sentinel_dir
+
+    # Generate systemd service
+    node_path = _find_node_path()
+    service_content = f"""[Unit]
+Description=Sentinel Infrastructure Monitor
+After=network.target
+
+[Service]
+Type=simple
+User={os.getenv('USER', 'user')}
+WorkingDirectory={sentinel_dir}
+ExecStart={node_path} src/server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+"""
+    service_path = sentinel_dir / "sentinel.service"
+    with open(service_path, "w", encoding="utf-8") as f:
+        f.write(service_content)
+    print(f"  Created systemd service file: {service_path}")
+
+    if prompt_yes_no("Install and start Sentinel service now?", default=True):
+        try:
+            # Copy service file and enable
+            subprocess.run(
+                ["sudo", "cp", str(service_path), "/etc/systemd/system/sentinel.service"],
+                check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True, capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "enable", "sentinel"], check=True, capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "start", "sentinel"], check=True, capture_output=True, timeout=10)
+            print(f"  [+] Sentinel running on port {port}")
+            print(f"  Dashboard: http://localhost:{port}")
+        except Exception as exc:
+            print(f"  [X] Service install failed: {exc}")
+            print(f"  Manual start: cd {sentinel_dir} && node src/server.js")
+    else:
+        print(f"  Manual start: cd {sentinel_dir} && node src/server.js")
+        print(f"  Or install service: sudo cp {service_path} /etc/systemd/system/")
+
+    return sentinel_dir
+
+
+def step_optional_forgebot(base_path, db_path):
+    """Optionally install ForgeBot Discord bot."""
+    print_header("Optional: ForgeBot Discord Bot")
+
+    print("  ForgeBot connects TheForge to Discord.")
+    print("  Slash commands: /forge-status, /forge-tasks, /forge-search, /forge-agents")
+    print("  Chat with Claude about your projects via @mention or DM.")
+    print("  Scheduled stale task alerts and morning briefings.")
+    print()
+
+    if not prompt_yes_no("Install ForgeBot?", default=True):
+        print("  Skipping ForgeBot.")
+        return None
+
+    forgebot_dir = base_path / "forgebot"
+    forgebot_dir.mkdir(parents=True, exist_ok=True)
+    (forgebot_dir / "src").mkdir(exist_ok=True)
+
+    # Copy ForgeBot source from bundled files
+    forgebot_src = SOURCE_DIR / "forgebot"
+    if not forgebot_src.exists():
+        forgebot_src = SOURCE_DIR.parent / "ForgeBot"
+    if not forgebot_src.exists():
+        print("  WARNING: ForgeBot source not found.")
+        print(f"  Looked in: {SOURCE_DIR / 'forgebot'}")
+        print(f"  And: {SOURCE_DIR.parent / 'ForgeBot'}")
+        print("  Skipping ForgeBot installation.")
+        return None
+
+    # Copy source files
+    src_count = 0
+    for item in forgebot_src.rglob("*"):
+        if item.is_file() and "node_modules" not in str(item) and ".git" not in str(item):
+            rel = item.relative_to(forgebot_src)
+            dest = forgebot_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(item), str(dest))
+            src_count += 1
+    print(f"  Copied {src_count} ForgeBot files.")
+
+    # Prompt for Discord credentials
+    print()
+    print("  ForgeBot needs a Discord bot token to connect.")
+    print("  Create one at: https://discord.com/developers/applications")
+    print("  (Bot tab > Reset Token, enable Message Content Intent)")
+    print()
+
+    discord_token = prompt_input("Discord bot token (or 'skip' to configure later)", default="skip")
+    guild_id = ""
+    alert_channel = ""
+    anthropic_key = ""
+
+    if discord_token.lower() != "skip":
+        guild_id = prompt_input("Discord server/guild ID", default="")
+        alert_channel = prompt_input("Alert channel ID (optional, for scheduled alerts)", default="")
+        anthropic_key = prompt_input("Anthropic API key (for Claude chat)", default="")
+
+    # Generate .env
+    env_content = f"""DISCORD_TOKEN={discord_token if discord_token.lower() != 'skip' else 'your_discord_bot_token_here'}
+DISCORD_GUILD_ID={guild_id}
+ANTHROPIC_API_KEY={anthropic_key}
+FORGE_DB_PATH={db_path}
+ALERT_CHANNEL_ID={alert_channel}
+"""
+    env_path = forgebot_dir / ".env"
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(env_content)
+    # Secure the .env file
+    try:
+        os.chmod(str(env_path), 0o600)
+    except OSError:
+        pass
+    print(f"  Created .env at: {env_path}")
+
+    # npm install
+    print("  Installing ForgeBot dependencies (npm install)...")
+    try:
+        result = subprocess.run(
+            ["npm", "install"],
+            cwd=str(forgebot_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print("  [+] npm install: OK")
+        else:
+            print(f"  [X] npm install failed: {result.stderr[:200]}")
+            return forgebot_dir
+    except Exception as exc:
+        print(f"  [X] npm install error: {exc}")
+        return forgebot_dir
+
+    # Generate systemd service
+    npx_path = _find_npx_path()
+    service_content = f"""[Unit]
+Description=ForgeBot Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User={os.getenv('USER', 'user')}
+WorkingDirectory={forgebot_dir}
+ExecStart={npx_path} tsx src/index.ts
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+"""
+    service_path = forgebot_dir / "forgebot.service"
+    with open(service_path, "w", encoding="utf-8") as f:
+        f.write(service_content)
+    print(f"  Created systemd service file: {service_path}")
+
+    if discord_token.lower() != "skip" and prompt_yes_no("Install and start ForgeBot service now?", default=True):
+        try:
+            subprocess.run(
+                ["sudo", "cp", str(service_path), "/etc/systemd/system/forgebot.service"],
+                check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True, capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "enable", "forgebot"], check=True, capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "start", "forgebot"], check=True, capture_output=True, timeout=10)
+            print("  [+] ForgeBot service started!")
+        except Exception as exc:
+            print(f"  [X] Service install failed: {exc}")
+            print(f"  Manual start: cd {forgebot_dir} && npm start")
+    else:
+        if discord_token.lower() == "skip":
+            print("  Configure .env with your Discord token later, then:")
+        print(f"  Manual start: cd {forgebot_dir} && npm start")
+        print(f"  Or install service: sudo cp {service_path} /etc/systemd/system/")
+
+    return forgebot_dir
+
+
+def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     """Verify the installation."""
-    print_header("Step 9: Verification")
+    print_header("Verification")
 
     checks_passed = 0
     checks_total = 0
@@ -695,17 +1005,47 @@ def step_verify(base_path, db_path):
     else:
         print("  [X] CLAUDE.md: not found or empty")
 
+    # 10. Sentinel (if installed)
+    if sentinel_dir and sentinel_dir.exists():
+        checks_total += 1
+        pkg = sentinel_dir / "package.json"
+        nm = sentinel_dir / "node_modules"
+        if pkg.exists() and nm.exists():
+            print("  [+] Sentinel: installed with dependencies")
+            checks_passed += 1
+        else:
+            print("  [X] Sentinel: missing package.json or node_modules")
+
+    # 11. ForgeBot (if installed)
+    if forgebot_dir and forgebot_dir.exists():
+        checks_total += 1
+        idx = forgebot_dir / "src" / "index.ts"
+        nm = forgebot_dir / "node_modules"
+        if idx.exists() and nm.exists():
+            print("  [+] ForgeBot: installed with dependencies")
+            checks_passed += 1
+        else:
+            print("  [X] ForgeBot: missing source or node_modules")
+
     print(f"\n  Result: {checks_passed}/{checks_total} checks passed")
     return checks_passed == checks_total
 
 
-def step_next_steps(base_path, db_path):
+def step_next_steps(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     """Print what to do next."""
     print_header("Setup Complete!")
 
     orch = base_path / "forge_orchestrator.py"
 
-    print("  Your ForgeTeam installation is ready.")
+    print("  Your Forge Platform installation is ready.")
+    print()
+    print("  INSTALLED COMPONENTS:")
+    print("    [+] ForgeTeam — Multi-agent AI orchestration")
+    print("    [+] TheForge  — Persistent context database")
+    if sentinel_dir:
+        print("    [+] Sentinel  — Infrastructure monitoring dashboard")
+    if forgebot_dir:
+        print("    [+] ForgeBot  — Discord bot interface")
     print()
     print("  NEXT STEPS:")
     print()
@@ -723,6 +1063,18 @@ def step_next_steps(base_path, db_path):
     print()
     print("  4. Run your first Dev+Test loop:")
     print(f'     python "{orch}" --task 1 --dev-test -y')
+    if sentinel_dir:
+        print()
+        print("  5. Sentinel dashboard:")
+        print(f"     http://localhost:3002  (or check config.json for port)")
+        print(f"     Manage: sudo systemctl status/restart sentinel")
+    if forgebot_dir:
+        print()
+        step_n = "6" if sentinel_dir else "5"
+        print(f"  {step_n}. ForgeBot Discord:")
+        print(f"     Manage: sudo systemctl status/restart forgebot")
+        env_path = forgebot_dir / ".env"
+        print(f"     Config: {env_path}")
     print()
     print("  DOCUMENTATION:")
     docs_dir = SCRIPT_DIR / "docs"
@@ -750,8 +1102,13 @@ def main():
     step_generate_mcp_config(base_path, db_path)
     step_generate_dot_mcp(base_path, db_path)
     step_generate_claude_md(base_path, db_path)
-    all_ok = step_verify(base_path, db_path)
-    step_next_steps(base_path, db_path)
+
+    # Optional platform components
+    sentinel_dir = step_optional_sentinel(base_path, db_path)
+    forgebot_dir = step_optional_forgebot(base_path, db_path)
+
+    all_ok = step_verify(base_path, db_path, sentinel_dir, forgebot_dir)
+    step_next_steps(base_path, db_path, sentinel_dir, forgebot_dir)
 
     sys.exit(0 if all_ok else 1)
 
