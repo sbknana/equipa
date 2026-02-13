@@ -103,7 +103,7 @@ python forge_orchestrator.py --task 42 --role documentation-writer -y
 
 The `_common.md` file contains rules that apply to ALL agents. This includes:
 
-- Branding requirements (TheForge, LLC attribution)
+- Branding requirements (Forgeborn attribution)
 - Windows-specific instructions
 - TheForge database usage patterns
 - Output format requirements

@@ -323,5 +323,5 @@ Contributions welcome. ForgeTeam is built for the vibe coding community — if y
 ---
 
 <p align="center">
-  Built by <a href="https://github.com/sbknana">TheForge, LLC</a> — vibe coded with Claude
+  Built by <a href="https://github.com/sbknana">Forgeborn</a> — vibe coded with Claude
 </p>

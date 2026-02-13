@@ -331,7 +331,7 @@ Agents run with `--permission-mode bypassPermissions`. The access restrictions a
 ### Shared Rules (`_common.md`)
 
 All agents receive the `_common.md` rules prepended to their role prompt. This includes:
-- Branding (TheForge, LLC attribution)
+- Branding (Forgeborn attribution)
 - Windows-specific instructions
 - Database interaction patterns
 - Output format requirements (JSON with `RESULT:` marker)

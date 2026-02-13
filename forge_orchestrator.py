@@ -32,7 +32,7 @@ Usage:
     python forge_orchestrator.py --task 63 --dry-run
     python forge_orchestrator.py --task 63 --model opus --max-turns 50
 
-Copyright 2026 TheForge, LLC
+Copyright 2026 Forgeborn
 """
 
 import argparse
