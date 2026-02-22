@@ -79,12 +79,7 @@ Rate each finding:
 
 ## Task Completion
 
-When done, update TheForge:
-```sql
-UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = {task_id};
-```
-
-If you find CRITICAL or HIGH issues, also insert an open question:
+If you find CRITICAL or HIGH issues, insert an open question:
 ```sql
 INSERT INTO open_questions (project_id, question, context)
 VALUES ({project_id}, 'Security: [brief description of critical finding]', 'Found during security review. See decisions table for details.');

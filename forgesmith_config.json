@@ -1,0 +1,85 @@
+{
+    "lookback_days": 7,
+    "min_sample_size": 5,
+    "max_changes_per_run": 5,
+    "max_prompt_patches_per_run": 2,
+    "blocked_task_max_hours": 24,
+    "blocked_task_max_attempts": 3,
+    "thresholds": {
+        "max_turns_hit_rate": 0.3,
+        "turn_underuse_rate": 0.4,
+        "simple_task_success_rate": 0.8,
+        "output_compliance_rate": 0.8,
+        "repeat_error_count": 3
+    },
+    "limits": {
+        "max_turns_ceiling": 75,
+        "max_turns_floor": 10,
+        "turn_increase_step": 10,
+        "turn_decrease_step": 5,
+        "max_concurrency": 8,
+        "allowed_models": [
+            "sonnet",
+            "opus"
+        ]
+    },
+    "protected_files": [
+        "_common.md",
+        "forge_orchestrator.py",
+        "forgesmith.py",
+        "forgesmith_config.json"
+    ],
+    "backup_dir": ".forgesmith-backups",
+    "max_backups": 30,
+    "rollback_threshold": -0.3,
+    "suppression_cooldown_days": 14,
+    "forgesmith_project_id": 28,
+    "rubric_definitions": {
+        "developer": {
+            "result_success": 5.5,
+            "files_changed": 3,
+            "tests_written": 3,
+            "turns_efficiency": 2.2,
+            "output_compliance": 2
+        },
+        "tester": {
+            "tests_pass": 5,
+            "edge_cases": 3,
+            "coverage_meaningful": 2,
+            "false_positives": -2
+        },
+        "code-reviewer": {
+            "issues_found": 3,
+            "actionable_feedback": 2,
+            "false_alarms": -1
+        },
+        "security-reviewer": {
+            "vulns_found": 3,
+            "severity_accuracy": 2,
+            "false_alarms": -1
+        },
+        "integration-tester": {
+            "tests_pass": 5,
+            "edge_cases": 3,
+            "coverage_meaningful": 2,
+            "false_positives": -2
+        },
+        "frontend-designer": {
+            "result_success": 5,
+            "files_changed": 3,
+            "turns_efficiency": 2,
+            "output_compliance": 2
+        },
+        "researcher": {
+            "result_success": 5,
+            "output_compliance": 3,
+            "actionable_feedback": 2
+        }
+    },
+    "rubric_evolution": {
+        "max_weight_change_pct": 10,
+        "min_sample_size": 10,
+        "evolution_lookback_days": 30
+    },
+    "rubric_version": 2
+}
