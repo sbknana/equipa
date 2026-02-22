@@ -3,7 +3,7 @@
 -- Generated from the live theforge.db schema.
 -- Used by itzamna_setup.py to create new installations.
 --
--- Tables: 20, Views: 7, Triggers: 1, Indexes: 9
+-- Tables: 28, Views: 7, Triggers: 1, Indexes: 9
 
 -- ============================================================
 -- TABLES
@@ -277,6 +277,113 @@ CREATE TABLE agent_runs (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id),
     FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+
+CREATE TABLE voice_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reply_to INTEGER,
+    metadata TEXT,
+    created_at DATETIME DEFAULT (datetime('now')),
+    processed_at DATETIME
+);
+
+CREATE TABLE api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    notes TEXT,
+    active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ForgeSmith self-improvement tables
+
+CREATE TABLE lessons_learned (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER,
+    role TEXT,
+    error_type TEXT,
+    error_signature TEXT,
+    lesson TEXT NOT NULL,
+    source TEXT DEFAULT 'forgesmith',
+    times_seen INTEGER DEFAULT 1,
+    times_injected INTEGER DEFAULT 0,
+    effectiveness_score REAL,
+    active INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE agent_episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    role TEXT,
+    task_type TEXT,
+    project_id INTEGER,
+    approach_summary TEXT,
+    turns_used INTEGER,
+    outcome TEXT,
+    error_patterns TEXT,
+    reflection TEXT,
+    q_value REAL DEFAULT 0.5,
+    created_at TEXT DEFAULT (datetime('now')),
+    times_injected INTEGER DEFAULT 0
+);
+
+CREATE TABLE forgesmith_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    agent_runs_analyzed INTEGER DEFAULT 0,
+    changes_made INTEGER DEFAULT 0,
+    summary TEXT,
+    mode TEXT DEFAULT 'auto'
+);
+
+CREATE TABLE forgesmith_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    target_file TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    rationale TEXT NOT NULL,
+    evidence TEXT,
+    effectiveness_score REAL,
+    reverted_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE rubric_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_run_id INTEGER NOT NULL,
+    task_id INTEGER,
+    project_id INTEGER,
+    role TEXT NOT NULL,
+    rubric_version INTEGER DEFAULT 1,
+    criteria_scores TEXT NOT NULL,
+    total_score REAL NOT NULL,
+    max_possible REAL NOT NULL,
+    normalized_score REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE rubric_evolution_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rubric_version INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    criterion TEXT NOT NULL,
+    old_weight REAL NOT NULL,
+    new_weight REAL NOT NULL,
+    correlation REAL NOT NULL,
+    sample_size_success INTEGER,
+    sample_size_failure INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ============================================================

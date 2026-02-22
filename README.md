@@ -32,6 +32,9 @@ ForgeTeam turns Claude Code into a team. Instead of one AI doing everything, you
 - **Checkpoint/Resume.** When an agent times out or hits its turn limit, ForgeTeam saves its progress. Next run of that task automatically picks up where it left off — no wasted work.
 - **Adaptive complexity.** Tag tasks as `simple`, `medium`, `complex`, or `epic` and ForgeTeam adjusts turn limits automatically (0.5x to 2x). No tag? It infers complexity from the task description.
 - **Model tiering.** Use Haiku for testers, Sonnet for developers, Opus for epic tasks. Per-role and per-complexity model overrides in one config file.
+- **Self-improving agents (ForgeSmith).** A nightly self-learning system that analyzes agent performance, extracts lessons from failures, auto-tunes turn limits, and patches agent prompts with targeted advice. Agents get smarter every day without manual intervention.
+- **Reflexion system.** After every task, agents reflect on what worked, what didn't, and what they'd do differently. These reflections are stored as episodes and injected into future similar tasks — giving agents "experience" to draw on.
+- **Rubric-based scoring.** Every agent run is scored against role-specific rubrics (code quality, test coverage, turn efficiency). ForgeSmith uses these scores to evolve rubric weights over time.
 - **Zero dependencies.** Pure Python stdlib. No pip, no npm, no Docker. Just Python + Claude Code + a SQLite database.
 - **Security by default.** Prompt injection defenses, safe git staging (`git add -u`), and strict MCP config isolation. Agents use the orchestrator's MCP config only.
 
@@ -59,10 +62,11 @@ python itzamna_setup.py
 The setup wizard:
 1. Checks prerequisites
 2. Asks where to install ForgeTeam
-3. Creates a fresh SQLite database (20 tables, 7 views)
-4. Copies the orchestrator, agent prompts, and security skills
+3. Creates a fresh SQLite database (28 tables, 7 views)
+4. Copies the orchestrator, ForgeSmith, agent prompts, and security skills
 5. Generates all config files (`forge_config.json`, `mcp_config.json`, `.mcp.json`, `CLAUDE.md`)
-6. Verifies everything works (9 automated checks)
+6. Sets up ForgeSmith nightly cron job for self-improvement
+7. Verifies everything works (10 automated checks)
 
 ### Your first run
 
@@ -153,7 +157,12 @@ python forge_orchestrator.py --auto-run -y
                              |
                     +--------v--------+
                     |   TheForge DB   |  SQLite via MCP
-                    |  (20 tables)    |  Tasks, decisions, sessions, research...
+                    |  (28 tables)    |  Tasks, decisions, sessions, episodes...
+                    +--------+--------+
+                             |
+                    +--------v--------+
+                    |   ForgeSmith    |  forgesmith.py (nightly cron)
+                    |  Self-learning  |  Lessons, rubrics, prompt patches
                     +-----------------+
 ```
 
@@ -200,7 +209,7 @@ SELECT * FROM v_cost_by_role;
 
 ## Database
 
-ForgeTeam's persistent memory lives in a SQLite database with 20 tables:
+ForgeTeam's persistent memory lives in a SQLite database with 28 tables:
 
 | Group | Tables |
 |-------|--------|
@@ -208,7 +217,8 @@ ForgeTeam's persistent memory lives in a SQLite database with 20 tables:
 | **Content** | social_media_posts, posting_schedule, content_tickler, writing_style |
 | **Research** | research, competitors, product_opportunities |
 | **Assets** | code_artifacts, documents, project_assets, components, build_info |
-| **System** | cross_references, reminders, agent_runs |
+| **System** | cross_references, reminders, agent_runs, voice_messages, api_keys |
+| **ForgeSmith** | lessons_learned, agent_episodes, forgesmith_runs, forgesmith_changes, rubric_scores, rubric_evolution_history |
 
 Plus 7 views for dashboards, stale task alerts, content alerts, and cost reports.
 
@@ -222,6 +232,7 @@ Agents access the database through [MCP](https://modelcontextprotocol.io/) (Mode
 | `mcp_config.json` | MCP server config for agents | Yes |
 | `.mcp.json` | MCP config for your own Claude sessions | Yes |
 | `dispatch_config.json` | Auto-run settings (concurrency, model, per-role turns) | Included |
+| `forgesmith_config.json` | ForgeSmith self-improvement settings | Included |
 | `CLAUDE.md` | Full context for Claude Code | Yes |
 
 ### dispatch_config.json
@@ -283,6 +294,44 @@ UPDATE tasks SET complexity = 'epic' WHERE id = 42;
 ```
 
 Or leave it unset — ForgeTeam infers complexity from the task description length. A developer with a base of 50 turns working on an `epic` task gets 100 turns. A tester with a base of 20 turns on a `simple` task gets 10.
+
+## ForgeSmith — Self-Improving Agents
+
+ForgeSmith is ForgeTeam's self-learning system. It runs nightly (via cron) and makes your agents better automatically.
+
+### What It Does
+
+1. **Lesson extraction** — Analyzes failed agent runs, identifies recurring errors, and distills actionable lessons. These lessons are injected into future agent prompts so the same mistakes aren't repeated.
+
+2. **Agent episodes** — After every task, agents write a reflection (what worked, what didn't, what they'd do differently). ForgeSmith stores these as episodes with Q-values. When a similar task comes up, the best episodes are injected as "past experience."
+
+3. **Prompt patching** — ForgeSmith can append targeted advice to agent prompt files (e.g., "Turn Budget Management" and "Time Management" sections in `developer.md`). Changes are backed up and can be reverted if performance drops.
+
+4. **Turn limit tuning** — If agents consistently hit their max turns, ForgeSmith increases the limit. If they consistently finish early, it decreases. Changes are logged in `forgesmith_changes`.
+
+5. **Rubric scoring** — Every agent run is scored against role-specific criteria (e.g., developers are scored on result success, files changed, tests written, turn efficiency). Rubric weights evolve over time based on correlation with success.
+
+### Running ForgeSmith
+
+```bash
+# Automatic (set up by installer as midnight cron)
+python forgesmith.py --auto
+
+# Dry run — see what it would change
+python forgesmith.py --dry-run
+
+# Manual run with verbose output
+python forgesmith.py --auto --verbose
+```
+
+### Configuration
+
+`forgesmith_config.json` controls all ForgeSmith behavior:
+- `lookback_days` — How many days of history to analyze (default: 7)
+- `min_sample_size` — Minimum runs before making changes (default: 5)
+- `rubric_definitions` — Per-role scoring criteria and weights
+- `protected_files` — Files ForgeSmith will never modify
+- `rollback_threshold` — Performance drop that triggers automatic rollback
 
 ## Documentation
 

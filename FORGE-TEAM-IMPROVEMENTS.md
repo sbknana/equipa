@@ -2,8 +2,8 @@
 
 **Author:** Claude Opus 4.6 (after extensive hands-on usage across 2 sessions)
 **Date:** 2026-02-08
-**Updated:** 2026-02-08 — All 8 priority improvements IMPLEMENTED in forge_orchestrator.py
-**Context:** Used ForgeTeam across multiple real projects and managed orchestration remotely via SSH.
+**Updated:** 2026-02-08 — 11 of 16 improvements IMPLEMENTED + 3 new research-driven features
+**Context:** Used ForgeTeam to build CryptoTrader v2 (7 dev tasks, 4 review tasks), ArrMada (6+ tasks), and managed orchestration from a remote Windows PC via SSH to Claudinator.
 
 ### Implementation Status
 | # | Issue | Status |
@@ -24,6 +24,9 @@
 | 14 | Completion notification | TODO |
 | 15 | Per-project config | TODO |
 | 16 | Auto-yes non-TTY | DONE |
+| 17 | Checkpoint/Resume on timeout | DONE |
+| 18 | Adaptive turn limits by complexity | DONE |
+| 19 | Model tiering per-role/complexity | DONE |
 
 ---
 
@@ -104,7 +107,7 @@ ForgeTeam works. It took a project from zero to a full-stack application with 84
 **Impact:** Medium — CryptoTrader Phase 1 took ~25 minutes sequential. Could have been ~8 minutes parallel.
 
 ### 7. Hardcoded Host IPs in CLI Defaults
-**Problem:** CLI files had host IPs hardcoded as defaults for service connections. The agents copy IPs from the CLAUDE.md or task description into code defaults.
+**Problem:** `data/cli.py` had `INTERNAL_HOST` hardcoded as defaults for `--questdb-host` and `--redis-url`. The agents copy IPs from the CLAUDE.md or task description into code defaults.
 
 **Root Cause:** Agents see connection details in context and helpfully(?) embed them as defaults.
 
@@ -227,4 +230,4 @@ ForgeTeam works. It took a project from zero to a full-stack application with 84
 
 ---
 
-*Generated from real-world usage across multiple projects via ForgeTeam orchestration.*
+*Generated from real-world usage building CryptoTrader v2 and ArrMada projects via ForgeTeam orchestration.*

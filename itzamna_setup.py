@@ -5,8 +5,9 @@ Interactive setup script that creates a fresh ForgeTeam installation:
 - Checks prerequisites (Python, git, gh, claude, uvx)
 - Creates directory structure
 - Creates a fresh database with the full Itzamna schema
-- Copies bundled ForgeTeam files (orchestrator, prompts, skills, config)
+- Copies bundled ForgeTeam files (orchestrator, forgesmith, prompts, skills, config)
 - Generates forge_config.json and mcp_config.json
+- Sets up ForgeSmith nightly cron job for self-improvement
 - Verifies the installation
 
 All required ForgeTeam files are bundled in this repo — no external
@@ -272,7 +273,7 @@ def step_copy_files(base_path):
 
     # All source files are bundled in this repo (SOURCE_DIR = SCRIPT_DIR)
     missing = []
-    for name in ["forge_orchestrator.py", "dispatch_config.json"]:
+    for name in ["forge_orchestrator.py", "forgesmith.py", "dispatch_config.json", "forgesmith_config.json"]:
         if not (SOURCE_DIR / name).exists():
             missing.append(name)
     if not (SOURCE_DIR / "prompts").exists():
@@ -286,7 +287,9 @@ def step_copy_files(base_path):
     # Files to copy
     copy_map = {
         "forge_orchestrator.py": SOURCE_DIR / "forge_orchestrator.py",
+        "forgesmith.py": SOURCE_DIR / "forgesmith.py",
         "dispatch_config.json": SOURCE_DIR / "dispatch_config.json",
+        "forgesmith_config.json": SOURCE_DIR / "forgesmith_config.json",
     }
 
     # Copy individual files
@@ -560,6 +563,26 @@ Add `role_permissions` to `forge_config.json` to grant extra tools per role:
 | `decisions` | Architectural decisions with rationale |
 | `open_questions` | Unresolved questions and blockers |
 | `session_notes` | Session summaries and next steps |
+| `agent_runs` | Agent execution logs with cost tracking |
+| `lessons_learned` | ForgeSmith extracted lessons from failures |
+| `agent_episodes` | Agent approach history for similar tasks |
+| `rubric_scores` | Per-run quality scores by rubric criteria |
+
+## ForgeSmith Self-Improvement
+
+ForgeSmith runs nightly and auto-tunes the agent system:
+- Extracts lessons from recurring failures
+- Adjusts turn limits based on actual usage
+- Patches agent prompts with targeted advice
+- Scores agent performance via rubric-based evaluation
+
+```bash
+# Manual run
+python "{base_path / 'forgesmith.py'}" --auto
+
+# Check what it would do (dry run)
+python "{base_path / 'forgesmith.py'}" --dry-run
+```
 
 ## Developer Context
 
@@ -576,6 +599,70 @@ Add `role_permissions` to `forge_config.json` to grant extra tools per role:
     print(f"  database queries, and agent roles.")
 
     return claude_md_path
+
+
+def step_forgesmith_cron(base_path):
+    """Set up ForgeSmith self-improvement cron job."""
+    print_header("Step 9: ForgeSmith Self-Improvement")
+
+    print("  ForgeSmith is ForgeTeam's self-learning system.")
+    print("  It analyzes agent performance and auto-tunes prompts,")
+    print("  turn limits, and model assignments nightly.")
+    print()
+
+    if not prompt_yes_no("Set up ForgeSmith nightly cron job?", default=True):
+        print("  Skipping ForgeSmith cron setup.")
+        print(f"  You can run it manually: python3 {base_path / 'forgesmith.py'} --auto")
+        return False
+
+    forgesmith_path = base_path / "forgesmith.py"
+    if not forgesmith_path.exists():
+        print(f"  WARNING: forgesmith.py not found at {forgesmith_path}")
+        print("  Skipping cron setup.")
+        return False
+
+    python_path = sys.executable
+    cron_line = f"0 0 * * * cd {base_path} && {python_path} {forgesmith_path} --auto >> {base_path / 'forgesmith.log'} 2>&1"
+
+    print(f"  Cron job: midnight daily")
+    print(f"  Command: {cron_line}")
+    print()
+
+    if prompt_yes_no("Install this cron job now?", default=True):
+        try:
+            # Get existing crontab
+            result = subprocess.run(
+                ["crontab", "-l"],
+                capture_output=True, text=True, timeout=10,
+            )
+            existing = result.stdout if result.returncode == 0 else ""
+
+            # Check if already installed
+            if "forgesmith.py" in existing:
+                print("  ForgeSmith cron job already exists. Skipping.")
+                return True
+
+            # Add new cron entry
+            new_crontab = existing.rstrip("\n") + "\n" + cron_line + "\n"
+            proc = subprocess.run(
+                ["crontab", "-"],
+                input=new_crontab, capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                print("  [+] ForgeSmith cron job installed.")
+            else:
+                print(f"  [X] Failed to install cron: {proc.stderr[:200]}")
+                print(f"  Add manually: crontab -e, then paste:")
+                print(f"  {cron_line}")
+        except Exception as exc:
+            print(f"  [X] Cron setup failed: {exc}")
+            print(f"  Add manually: crontab -e, then paste:")
+            print(f"  {cron_line}")
+    else:
+        print(f"  Add manually later: crontab -e, then paste:")
+        print(f"  {cron_line}")
+
+    return True
 
 
 def _find_node_path():
@@ -909,8 +996,8 @@ def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     # 2. Database schema objects
     checks_total += 1
     counts = count_db_objects(db_path)
-    # Expect: 20 tables (+ sqlite_sequence = 21), 7 views, 1 trigger, 9 indexes
-    if counts["table"] >= 20 and counts["view"] >= 7:
+    # Expect: 28 tables (+ sqlite_sequence = 29), 7 views, 1 trigger, 9 indexes
+    if counts["table"] >= 28 and counts["view"] >= 7:
         print(f"  [+] Schema objects: {counts['table']} tables, "
               f"{counts['view']} views, {counts['trigger']} triggers, "
               f"{counts['index']} indexes")
@@ -951,6 +1038,15 @@ def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
         checks_passed += 1
     else:
         print("  [X] forge_orchestrator.py: not found")
+
+    # 5b. ForgeSmith exists
+    checks_total += 1
+    smith_path = base_path / "forgesmith.py"
+    if smith_path.exists():
+        print("  [+] forgesmith.py: present")
+        checks_passed += 1
+    else:
+        print("  [X] forgesmith.py: not found")
 
     # 6. Prompts directory has files
     checks_total += 1
@@ -1040,12 +1136,13 @@ def step_next_steps(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     print("  Your Forge Platform installation is ready.")
     print()
     print("  INSTALLED COMPONENTS:")
-    print("    [+] ForgeTeam — Multi-agent AI orchestration")
-    print("    [+] TheForge  — Persistent context database")
+    print("    [+] ForgeTeam   — Multi-agent AI orchestration")
+    print("    [+] ForgeSmith  — Self-learning agent tuning (nightly cron)")
+    print("    [+] TheForge    — Persistent context database")
     if sentinel_dir:
-        print("    [+] Sentinel  — Infrastructure monitoring dashboard")
+        print("    [+] Sentinel   — Infrastructure monitoring dashboard")
     if forgebot_dir:
-        print("    [+] ForgeBot  — Discord bot interface")
+        print("    [+] ForgeBot   — Discord bot interface")
     print()
     print("  NEXT STEPS:")
     print()
@@ -1102,6 +1199,7 @@ def main():
     step_generate_mcp_config(base_path, db_path)
     step_generate_dot_mcp(base_path, db_path)
     step_generate_claude_md(base_path, db_path)
+    step_forgesmith_cron(base_path)
 
     # Optional platform components
     sentinel_dir = step_optional_sentinel(base_path, db_path)

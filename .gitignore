@@ -44,6 +44,11 @@ tmpclaude-*
 # Logs
 *.log
 forge_orchestrator.log
+forgesmith.log
+
+# ForgeSmith runtime data
+.forgesmith-backups/
+.forge-checkpoints/
 
 # Security audit reports (contain pre-refactor vulnerability details)
 SECURITY-AUDIT-REPORT.md

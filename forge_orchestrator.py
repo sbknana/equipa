@@ -39,7 +39,7 @@ import argparse
 import asyncio
 import json
 import os
-import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -50,11 +50,18 @@ from pathlib import Path
 # Force unbuffered output so logs are visible in real-time via nohup/SSH
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+# Import ForgeSmith functions for lesson injection
+try:
+    from forgesmith import get_relevant_lessons
+except ImportError:
+    # Fallback if forgesmith is not available
+    def get_relevant_lessons(role=None, error_type=None, limit=5):
+        return []
+
 
 # --- Constants ---
 
-# Default DB path — override via forge_config.json (run itzamna_setup.py to generate)
-THEFORGE_DB = Path(__file__).parent / "theforge.db"
+THEFORGE_DB = Path(r"TheForge\theforge.db")
 MCP_CONFIG = Path(__file__).parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SKILLS_DIR = Path(__file__).parent / "skills" / "security"
@@ -71,15 +78,19 @@ ROLE_PROMPTS = {
 DEFAULT_MODEL = "sonnet"
 DEFAULT_MAX_TURNS = 25
 DEFAULT_MAX_RETRIES = 3
-PROCESS_TIMEOUT = 1200  # 20 minutes
+PROCESS_TIMEOUT = 3600  # 60 minutes
 
 # Per-role turn limits (used when dispatch config or CLI doesn't specify)
 DEFAULT_ROLE_TURNS = {
-    "developer": 50,
-    "tester": 20,
-    "security-reviewer": 40,
-    "planner": 25,
-    "evaluator": 25,
+    "developer": 40,
+    "tester": 15,
+    "security-reviewer": 30,
+    "planner": 20,
+    "evaluator": 15,
+    "frontend-designer": 35,
+    "integration-tester": 20,
+    "debugger": 30,
+    "code-reviewer": 20,
 }
 
 # Checkpoint/Resume: save agent output on timeout for continuation
@@ -93,13 +104,23 @@ COMPLEXITY_MULTIPLIERS = {
     "epic": 2.0,
 }
 
-# Default model per role (overridden by dispatch_config)
+# Dynamic turn budget settings
+DYNAMIC_BUDGET_START_RATIO = 0.8   # Start agents at 60% of their max_turns budget
+DYNAMIC_BUDGET_MIN_TURNS = 15      # Minimum starting budget regardless of ratio
+DYNAMIC_BUDGET_EXTEND_TURNS = 10   # Extra turns granted when agent reports FILES_CHANGED
+DYNAMIC_BUDGET_BLOCKED_RATIO = 0.5 # Reduce remaining budget by 50% on RESULT: blocked
+
+# Default model per role (overridden by dispatch_config per-role or per-complexity keys)
 DEFAULT_ROLE_MODELS = {
-    "developer": "sonnet",
+    "developer": "opus",
     "tester": "sonnet",
-    "security-reviewer": "sonnet",
-    "planner": "sonnet",
+    "security-reviewer": "opus",
+    "planner": "opus",
     "evaluator": "sonnet",
+    "frontend-designer": "opus",
+    "integration-tester": "sonnet",
+    "debugger": "opus",
+    "code-reviewer": "sonnet",
 }
 
 # Dev+Tester loop constants
@@ -109,15 +130,51 @@ TESTER_COMPACTION_THRESHOLD = 6  # turns before compacting tester
 NO_PROGRESS_LIMIT = 2            # consecutive no-change runs before blocking
 MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns/timeout
 
+# Early termination: detect stuck agents mid-run and kill before wasting turns
+EARLY_TERM_WARN_TURNS = 25       # turns with no Edit/Write before injecting warning
+EARLY_TERM_KILL_TURNS = 40       # turns with no Edit/Write before killing agent
+EARLY_TERM_STUCK_PHRASES = [
+    "i am unable to",
+    "i cannot",
+    "i'm unable to",
+    "i'm not able to",
+    "i don't have access",
+    "i do not have access",
+    "this is beyond my capabilities",
+    "i cannot complete this task",
+    "i'm stuck",
+    "i am stuck",
+]
+# Roles that legitimately produce no file changes (research/planning tasks)
+EARLY_TERM_EXEMPT_ROLES = {"planner", "evaluator", "security-reviewer", "code-reviewer", "researcher"}
+
 # Manager mode constants (Phase 3)
 MAX_MANAGER_ROUNDS = 3       # max plan-execute-evaluate rounds
 MAX_TASKS_PER_PLAN = 8       # planner can't create more than this
 MAX_FOLLOWUP_TASKS = 4       # evaluator can't create more than this per round
 
-# Project codenames mapped to their directories.
-# Empty by default — populated from forge_config.json (run itzamna_setup.py first,
-# then use --add-project to register projects).
-PROJECT_DIRS = {}
+# Project codenames mapped to their synced storage directories
+PROJECT_DIRS = {
+    "stampede": r"usb-duplicator",
+    "folder2flash": r"USBCopier",
+    "magnetype": r"TextToSTL-NamepalteWithMagnets",
+    "youtubedownloader": r"YouTubeDownloader",
+    "cascade pro": r"CascadePro",
+    "marketeer": r"marketeer",
+    "arrmada": r"media-server-setup",
+    "claudestick": r"claude-portable",
+    "forgemind": r"TheForge",
+    "codecourier": r"CodeCourier\CodeCourier",
+    "whydah": r"Whydah",
+    "wipestation": r"WipeStation",
+    "fellowshipfirst": r"FellowshipFirst",
+    "doge-habeus": r"DOGE-Habeus - POH-POS",
+    "hoverfly": r"Hoverfly",
+    "forgeteam": r"ForgeTeam",
+    "forgebridge": r"ForgeBridge",
+    "localllm-setup": r"LocalLLM-Setup",
+    "loupe": r"MTG-Kiosk",
+}
 
 # For sorting text-based priority values
 PRIORITY_ORDER = {
@@ -128,7 +185,7 @@ PRIORITY_ORDER = {
 }
 
 # Default GitHub owner for --setup-repos
-GITHUB_OWNER = ""
+GITHUB_OWNER = "[OWNER]"
 
 
 # --- Portable Configuration ---
@@ -338,6 +395,339 @@ def update_task_status(task_id, outcome, output=None):
         log(f"  [DB] ERROR updating task {task_id}: {e}", output)
     finally:
         conn.close()
+
+
+def record_agent_run(task, result, outcome, role="developer", model="opus",
+                     max_turns=25, cycle_number=1, continuation_count=0, output=None):
+    """Record agent execution telemetry to TheForge agent_runs table.
+
+    Never crashes the orchestrator — all errors are logged and swallowed.
+    Reads turns_allocated from result dict if available (set by dynamic budget system).
+    """
+    try:
+        task_id = task.get("id") if isinstance(task, dict) else task
+        project_id = task.get("project_id") if isinstance(task, dict) else None
+        complexity = get_task_complexity(task) if isinstance(task, dict) else None
+        success = 1 if outcome in ("tests_passed", "no_tests") else 0
+        num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
+        duration = result.get("duration", 0) if isinstance(result, dict) else 0
+        cost = result.get("cost") if isinstance(result, dict) else None
+        errors = result.get("errors", []) if isinstance(result, dict) else []
+        # Dynamic budget: read turns_allocated from result (set by run_dev_test_loop)
+        turns_allocated = result.get("turns_allocated") if isinstance(result, dict) else None
+        error_type = None
+        error_summary = None
+
+        # Early termination gets priority for error_type/error_summary
+        if isinstance(result, dict) and result.get("early_terminated"):
+            error_type = "early_terminated"
+            error_summary = result.get("early_term_reason", "early termination")[:500]
+        elif errors:
+            error_summary = errors[0][:500] if errors[0] else None
+            if "timed out" in (error_summary or "").lower():
+                error_type = "timeout"
+            elif "max_turns" in (error_summary or "").lower():
+                error_type = "max_turns"
+            elif "loop detected" in (error_summary or "").lower():
+                error_type = "loop_detected"
+            else:
+                error_type = "agent_error"
+        files_changed = result.get("files_changed_count", 0) if isinstance(result, dict) else 0
+
+        conn = get_db_connection(write=True)
+        conn.execute(
+            """INSERT INTO agent_runs
+               (task_id, project_id, role, model, complexity, num_turns,
+                max_turns_allowed, duration_seconds, cost_usd, outcome,
+                success, cycle_number, continuation_count, files_changed_count,
+                error_type, error_summary, turns_allocated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, project_id, role, model, complexity, num_turns,
+             max_turns, duration, cost, outcome,
+             success, cycle_number, continuation_count, files_changed,
+             error_type, error_summary, turns_allocated),
+        )
+        conn.commit()
+        conn.close()
+        budget_info = f", allocated={turns_allocated}" if turns_allocated else ""
+        log(f"  [Telemetry] Recorded agent run: role={role}, outcome={outcome}, "
+            f"turns={num_turns}/{max_turns}{budget_info}, duration={duration:.0f}s", output)
+    except Exception as e:
+        log(f"  [Telemetry] WARNING: Failed to record agent run: {e}", output)
+
+
+# --- Reflexion (Post-task self-reflection for learning) ---
+
+# Reflexion prompt — asks for specific, actionable self-reflection
+REFLEXION_PROMPT = (
+    "Reflect on this task. What approach did you take? What worked? "
+    "What did not? What would you do differently next time? "
+    "Be specific and concise (3-5 sentences). Reference exact files, "
+    "error messages, tools, or strategies."
+)
+
+# Initial Q-value for new episodes (neutral prior)
+INITIAL_Q_VALUE = 0.5
+
+
+def ensure_agent_episodes_table():
+    """Create agent_episodes table if it does not exist.
+
+    Idempotent — safe to call every time.
+    Also adds times_injected column if missing (for episode injection tracking).
+    """
+    try:
+        conn = get_db_connection(write=True)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                role TEXT,
+                task_type TEXT,
+                project_id INTEGER,
+                approach_summary TEXT,
+                turns_used INTEGER,
+                outcome TEXT,
+                error_patterns TEXT,
+                reflection TEXT,
+                q_value REAL DEFAULT 0.5,
+                times_injected INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # Add times_injected column if table already existed without it
+        try:
+            conn.execute("ALTER TABLE agent_episodes ADD COLUMN times_injected INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [Reflexion] WARNING: Could not ensure agent_episodes table: {e}")
+
+
+def parse_reflection(result_text):
+    """Extract REFLECTION text from agent structured output.
+
+    Looks for a REFLECTION: line and captures all text until the next
+    known section marker or end of text. Returns None if not found.
+    """
+    if not result_text:
+        return None
+
+    lines = result_text.splitlines()
+    reflection_lines = []
+    in_reflection = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("REFLECTION:"):
+            in_reflection = True
+            # Grab inline value after "REFLECTION:"
+            value = stripped.split(":", 1)[1].strip()
+            if value and value.lower() != "none":
+                reflection_lines.append(value)
+            continue
+
+        if in_reflection:
+            # Stop at next known section marker
+            if any(stripped.startswith(marker) for marker in (
+                "RESULT:", "SUMMARY:", "FILES_CHANGED:", "DECISIONS:",
+                "BLOCKERS:", "```",
+            )):
+                break
+            # Collect continuation lines (including bullet points)
+            if stripped:
+                reflection_lines.append(stripped)
+
+    reflection = " ".join(reflection_lines).strip()
+    return reflection if reflection else None
+
+
+def parse_approach_summary(result_text):
+    """Extract SUMMARY text from agent output for the episode record."""
+    if not result_text:
+        return None
+
+    for line in result_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("SUMMARY:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value if value else None
+
+    return None
+
+
+def parse_error_patterns(result):
+    """Extract error patterns from agent result for episode record."""
+    errors = result.get("errors", []) if isinstance(result, dict) else []
+    if not errors:
+        return None
+    # Deduplicate and truncate
+    unique = list(dict.fromkeys(errors))
+    return "; ".join(e[:200] for e in unique[:5])
+
+
+def compute_initial_q_value(outcome):
+    """Set initial Q-value based on task outcome.
+
+    Success starts higher (0.7), failure starts lower (0.3),
+    partial/blocked at neutral (0.5).
+    """
+    if outcome in ("tests_passed", "no_tests"):
+        return 0.7
+    elif outcome in ("developer_failed", "cycles_exhausted"):
+        return 0.3
+    else:
+        # blocked, timeout, no_progress, etc.
+        return 0.4
+
+
+def record_agent_episode(task, result, outcome, role="developer", output=None):
+    """Store a Reflexion episode in the agent_episodes table.
+
+    Extracts reflection from agent output. If no reflection found in
+    the output, records the episode with a null reflection (the
+    orchestrator will attempt a standalone reflexion call separately).
+
+    Never crashes the orchestrator — all errors are logged and swallowed.
+    """
+    try:
+        ensure_agent_episodes_table()
+
+        task_id = task.get("id") if isinstance(task, dict) else task
+        project_id = task.get("project_id") if isinstance(task, dict) else None
+        task_type = task.get("role") or role if isinstance(task, dict) else role
+        result_text = result.get("result_text", "") if isinstance(result, dict) else ""
+        num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
+
+        reflection = parse_reflection(result_text)
+        approach = parse_approach_summary(result_text)
+        error_patterns = parse_error_patterns(result)
+        q_value = compute_initial_q_value(outcome)
+
+        conn = get_db_connection(write=True)
+        conn.execute(
+            """INSERT INTO agent_episodes
+               (task_id, role, task_type, project_id, approach_summary,
+                turns_used, outcome, error_patterns, reflection, q_value)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, role, task_type, project_id, approach,
+             num_turns, outcome, error_patterns, reflection, q_value),
+        )
+        conn.commit()
+        conn.close()
+
+        if reflection:
+            # Truncate for log display
+            preview = reflection[:120] + "..." if len(reflection) > 120 else reflection
+            log(f"  [Reflexion] Recorded episode with reflection: {preview}", output)
+        else:
+            log(f"  [Reflexion] Recorded episode (no reflection in output)", output)
+
+    except Exception as e:
+        log(f"  [Reflexion] WARNING: Failed to record episode: {e}", output)
+
+
+async def run_reflexion_agent(task, result, outcome, role="developer", output=None):
+    """Spawn a lightweight agent to generate reflection when not in output.
+
+    This is a fallback — if the agent included REFLECTION: in its
+    structured output, we already have it. This function is only called
+    when parse_reflection() returned None.
+
+    Uses minimal turns (max 2) and sonnet model to keep cost low.
+    The reflection is stored back into the most recent agent_episode.
+    """
+    try:
+        task_id = task.get("id") if isinstance(task, dict) else task
+        task_title = task.get("title", "unknown") if isinstance(task, dict) else "unknown"
+        result_text = result.get("result_text", "") if isinstance(result, dict) else ""
+        num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
+
+        # Build a concise context for the reflection agent
+        # Use last 1500 chars of output to stay within prompt limits
+        output_tail = result_text[-1500:] if len(result_text) > 1500 else result_text
+
+        reflection_prompt = (
+            f"You are reflecting on a completed task.\n\n"
+            f"Task: #{task_id} - {task_title}\n"
+            f"Role: {role}\n"
+            f"Outcome: {outcome}\n"
+            f"Turns used: {num_turns}\n\n"
+            f"Agent output (tail):\n{output_tail}\n\n"
+            f"{REFLEXION_PROMPT}\n\n"
+            f"Respond with ONLY your reflection text (3-5 sentences). "
+            f"No preamble, no formatting, no markdown."
+        )
+
+        cmd = [
+            "claude",
+            "-p", reflection_prompt,
+            "--output-format", "json",
+            "--model", "sonnet",
+            "--max-turns", "2",
+            "--no-session-persistence",
+        ]
+
+        log(f"  [Reflexion] Spawning reflection agent for task #{task_id}...", output)
+        ref_result = await run_agent(cmd, timeout=60)
+
+        if not ref_result.get("success"):
+            log(f"  [Reflexion] Reflection agent failed: {ref_result.get('errors', [])}", output)
+            return
+
+        reflection_text = ref_result.get("result_text", "").strip()
+        if not reflection_text or len(reflection_text) < 20:
+            log(f"  [Reflexion] Reflection too short, discarding.", output)
+            return
+
+        # Strip any JSON wrapper if present
+        try:
+            parsed = json.loads(reflection_text)
+            if isinstance(parsed, dict) and "result" in parsed:
+                reflection_text = parsed["result"].strip()
+        except (json.JSONDecodeError, KeyError):
+            pass  # not JSON, use raw text
+
+        # Update the most recent episode for this task (subquery for portability)
+        conn = get_db_connection(write=True)
+        conn.execute(
+            """UPDATE agent_episodes SET reflection = ?
+               WHERE id = (
+                   SELECT id FROM agent_episodes
+                   WHERE task_id = ? AND reflection IS NULL
+                   ORDER BY id DESC LIMIT 1
+               )""",
+            (reflection_text, task_id),
+        )
+        conn.commit()
+        conn.close()
+
+        preview = reflection_text[:120] + "..." if len(reflection_text) > 120 else reflection_text
+        log(f"  [Reflexion] Captured reflection: {preview}", output)
+
+    except Exception as e:
+        log(f"  [Reflexion] WARNING: Standalone reflection failed: {e}", output)
+
+
+async def maybe_run_reflexion(task, result, outcome, role="developer", output=None):
+    """Record episode and optionally spawn reflection agent.
+
+    This is the main entry point for the Reflexion pattern. Call this
+    after record_agent_run() at every task completion point.
+
+    Flow:
+    1. Record the episode (extracts reflection from output if present)
+    2. If no reflection was found in output, spawn lightweight agent
+    """
+    record_agent_episode(task, result, outcome, role=role, output=output)
+
+    # Check if reflection was captured from the structured output
+    result_text = result.get("result_text", "") if isinstance(result, dict) else ""
+    if not parse_reflection(result_text):
+        await run_reflexion_agent(task, result, outcome, role=role, output=output)
 
 
 def fetch_task(task_id):
@@ -562,12 +952,237 @@ def build_task_prompt(task, project_context, project_dir):
     return "\n".join(lines)
 
 
+def format_lessons_for_injection(lessons):
+    """Format lessons_learned for injection into agent prompts.
+
+    Args:
+        lessons: List of lesson dicts from get_relevant_lessons
+
+    Returns:
+        Formatted string with lessons under "## Lessons from Previous Runs" heading
+    """
+    if not lessons:
+        return ""
+
+    lines = ["## Lessons from Previous Runs", ""]
+    for lesson in lessons:
+        # Format as bullet point with lesson text
+        lines.append(f"- {lesson['lesson']}")
+        # Add context if available (error signature, times seen)
+        if lesson.get('error_signature'):
+            lines.append(f"  (Error: {lesson['error_signature']}, seen {lesson['times_seen']}x)")
+
+    return "\n".join(lines)
+
+
+def update_lesson_injection_count(lesson_ids):
+    """Increment times_injected counter for the given lesson IDs.
+
+    Args:
+        lesson_ids: List of lesson IDs to update
+    """
+    if not lesson_ids:
+        return
+
+    try:
+        conn = sqlite3.connect(THEFORGE_DB)
+        placeholders = ",".join("?" * len(lesson_ids))
+        conn.execute(
+            f"UPDATE lessons_learned SET times_injected = times_injected + 1 WHERE id IN ({placeholders})",
+            lesson_ids
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        # Don't fail the orchestrator if lesson update fails
+        print(f"Warning: Failed to update lesson injection count: {e}")
+
+
+# --- Episode Injection (MemRL pattern) ---
+
+# Track which episode IDs were injected per task_id, so we can update q_values
+# after the task completes. Keyed by task_id, value is list of episode IDs.
+_injected_episodes_by_task = {}
+
+def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, limit=3):
+    """Fetch relevant past episodes for injection into agent prompts.
+
+    Matches by: same role + same project + optionally similar task_type.
+    Filters by q_value > min_q_value (only inject useful experiences).
+    Returns top episodes ordered by q_value descending.
+
+    Args:
+        role: Agent role (e.g. 'developer', 'tester')
+        project_id: Project ID to match episodes from
+        task_type: Optional task type for similarity matching
+        min_q_value: Minimum q_value threshold (default 0.3)
+        limit: Maximum episodes to return (default 3)
+
+    Returns:
+        List of episode dicts with id, approach_summary, outcome, reflection, q_value
+    """
+    try:
+        conn = get_db_connection()
+        # Primary match: same role + same project + q_value above threshold + has reflection
+        rows = conn.execute(
+            """SELECT id, task_id, task_type, approach_summary, outcome,
+                      reflection, q_value, turns_used
+               FROM agent_episodes
+               WHERE role = ? AND project_id = ? AND q_value > ?
+                 AND reflection IS NOT NULL AND reflection != ''
+               ORDER BY q_value DESC, created_at DESC
+               LIMIT ?""",
+            (role, project_id, min_q_value, limit),
+        ).fetchall()
+
+        episodes = [dict(r) for r in rows]
+
+        # If we got fewer than limit, try matching by role + task_type across projects
+        if len(episodes) < limit and task_type:
+            existing_ids = {e["id"] for e in episodes}
+            remaining = limit - len(episodes)
+            cross_rows = conn.execute(
+                """SELECT id, task_id, task_type, approach_summary, outcome,
+                          reflection, q_value, turns_used
+                   FROM agent_episodes
+                   WHERE role = ? AND task_type = ? AND q_value > ?
+                     AND reflection IS NOT NULL AND reflection != ''
+                   ORDER BY q_value DESC, created_at DESC
+                   LIMIT ?""",
+                (role, task_type, min_q_value, remaining + len(existing_ids)),
+            ).fetchall()
+            for r in cross_rows:
+                if dict(r)["id"] not in existing_ids and len(episodes) < limit:
+                    episodes.append(dict(r))
+                    existing_ids.add(dict(r)["id"])
+
+        conn.close()
+        return episodes
+    except Exception as e:
+        print(f"Warning: Failed to fetch relevant episodes: {e}")
+        return []
+
+
+def format_episodes_for_injection(episodes):
+    """Format agent episodes for injection into agent prompts.
+
+    Args:
+        episodes: List of episode dicts from get_relevant_episodes
+
+    Returns:
+        Formatted string under "## Past Experience" heading (2-3 sentences each)
+    """
+    if not episodes:
+        return ""
+
+    lines = ["## Past Experience", ""]
+    for ep in episodes:
+        summary = ep.get("approach_summary") or "No summary"
+        outcome = ep.get("outcome", "unknown")
+        reflection = ep.get("reflection") or "No lesson recorded"
+        # Truncate to keep injected text short
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        if len(reflection) > 150:
+            reflection = reflection[:147] + "..."
+        lines.append(
+            f"- Previous similar task: {summary}. "
+            f"Outcome: {outcome}. Lesson: {reflection}"
+        )
+
+    return "\n".join(lines)
+
+
+def update_episode_injection_count(episode_ids):
+    """Increment times_injected counter for the given episode IDs.
+
+    Args:
+        episode_ids: List of episode IDs that were injected into a prompt
+    """
+    if not episode_ids:
+        return
+
+    try:
+        ensure_agent_episodes_table()
+        conn = get_db_connection(write=True)
+        placeholders = ",".join("?" * len(episode_ids))
+        conn.execute(
+            f"UPDATE agent_episodes SET times_injected = times_injected + 1 WHERE id IN ({placeholders})",
+            episode_ids
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Failed to update episode injection count: {e}")
+
+
+def update_episode_q_values(injected_episode_ids, task_succeeded):
+    """Update q_values of previously injected episodes based on task outcome.
+
+    Implements the MemRL reward signal:
+    - If task succeeded and injected episode was useful: q_value += 0.1
+    - If task failed despite injected episode: q_value -= 0.05
+    - Q-values are bounded to [0.0, 1.0]
+
+    Args:
+        injected_episode_ids: List of episode IDs that were injected before this task
+        task_succeeded: Whether the task completed successfully
+    """
+    if not injected_episode_ids:
+        return
+
+    try:
+        conn = get_db_connection(write=True)
+        if task_succeeded:
+            delta = 0.1
+        else:
+            delta = -0.05
+
+        for ep_id in injected_episode_ids:
+            # Bounded update: clamp to [0.0, 1.0]
+            conn.execute(
+                """UPDATE agent_episodes
+                   SET q_value = MIN(1.0, MAX(0.0, q_value + ?))
+                   WHERE id = ?""",
+                (delta, ep_id),
+            )
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Failed to update episode q_values: {e}")
+
+
+def update_injected_episode_q_values_for_task(task_id, outcome, output=None):
+    """Look up which episodes were injected for a task and update their q_values.
+
+    Called after task completion. Uses the _injected_episodes_by_task tracker
+    to find which episodes were injected, then applies the MemRL reward signal.
+
+    Args:
+        task_id: The task ID that just completed
+        outcome: The task outcome string (e.g. 'tests_passed', 'developer_failed')
+        output: Optional output buffer for logging
+    """
+    ep_ids = _injected_episodes_by_task.pop(task_id, [])
+    if not ep_ids:
+        return
+
+    task_succeeded = outcome in ("tests_passed", "no_tests")
+    update_episode_q_values(ep_ids, task_succeeded)
+
+    delta = "+0.1" if task_succeeded else "-0.05"
+    log(f"  [MemRL] Updated q_values ({delta}) for {len(ep_ids)} injected episodes: {ep_ids}", output)
+
+
 def build_system_prompt(task, project_context, project_dir, role="developer",
-                        extra_context=""):
+                        extra_context="", dispatch_config=None, error_type=None):
     """Read _common.md + role prompt, replace placeholders, append task prompt.
 
     extra_context: optional string appended after the task prompt (used for
     compaction history and test failure feedback in dev-test loop).
+    dispatch_config: optional config dict for task-type-specific prompt injection.
+    error_type: optional error type to filter relevant lessons (e.g. 'timeout', 'max_turns').
     """
     common_path = PROMPTS_DIR / "_common.md"
     role_path = ROLE_PROMPTS.get(role)
@@ -593,9 +1208,49 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     prompt = template.replace("{task_id}", str(task["id"]))
     prompt = prompt.replace("{project_id}", str(task.get("project_id", "")))
 
+    # Inject lessons learned from ForgeSmith (after ForgeSmith Tuning section)
+    lessons = get_relevant_lessons(role=role, error_type=error_type, limit=3)
+    if lessons:
+        lessons_text = format_lessons_for_injection(lessons)
+        prompt = prompt + "\n\n" + lessons_text
+        # Update times_injected counter for each lesson
+        update_lesson_injection_count([l["id"] for l in lessons])
+
+    # Inject relevant past episodes (MemRL pattern)
+    task_id = task.get("id") if isinstance(task, dict) else task
+    project_id = task.get("project_id") if isinstance(task, dict) else None
+    task_type = task.get("task_type", "feature") if isinstance(task, dict) else None
+    if project_id:
+        episodes = get_relevant_episodes(
+            role=role, project_id=project_id, task_type=task_type,
+            min_q_value=0.3, limit=3,
+        )
+        if episodes:
+            episodes_text = format_episodes_for_injection(episodes)
+            prompt = prompt + "\n\n" + episodes_text
+            # Track injected episode IDs for q-value updates after task completion
+            ep_ids = [ep["id"] for ep in episodes]
+            _injected_episodes_by_task[task_id] = ep_ids
+            update_episode_injection_count(ep_ids)
+
+    # Inject task-type-specific guidance if available
+    task_type_supplement = ""
+    if dispatch_config and "task_type_prompts" in dispatch_config:
+        task_type = task.get("task_type", "feature") or "feature"
+        task_type_prompts = dispatch_config["task_type_prompts"]
+        if task_type in task_type_prompts:
+            task_type_supplement = (
+                f"\n\n## Task Type Guidance ({task_type})\n\n"
+                f"{task_type_prompts[task_type]}\n"
+            )
+
     # Append task-specific instructions
     task_prompt = build_task_prompt(task, project_context, project_dir)
     prompt = prompt + "\n\n---\n\n" + task_prompt
+
+    # Append task-type supplement after task prompt
+    if task_type_supplement:
+        prompt = prompt + task_type_supplement
 
     # Append extra context (compaction history, test failures) if provided
     if extra_context:
@@ -789,13 +1444,19 @@ def build_checkpoint_context(checkpoint_text, attempt):
 
 # --- CLI Command Building ---
 
-def build_cli_command(system_prompt, project_dir, max_turns, model, role="developer"):
-    """Build the claude CLI command as a list of arguments."""
+def build_cli_command(system_prompt, project_dir, max_turns, model, role="developer",
+                      streaming=False):
+    """Build the claude CLI command as a list of arguments.
+
+    Args:
+        streaming: If True, use stream-json output format for real-time monitoring.
+    """
+    output_format = "stream-json" if streaming else "json"
     cmd = [
         "claude",
         "-p",
         f"Execute the task described in your system prompt. Work in: {project_dir}",
-        "--output-format", "json",
+        "--output-format", output_format,
         "--model", model,
         "--max-turns", str(max_turns),
         "--no-session-persistence",
@@ -804,6 +1465,10 @@ def build_cli_command(system_prompt, project_dir, max_turns, model, role="develo
         "--add-dir", str(project_dir),
         "--permission-mode", "bypassPermissions",
     ]
+
+    # stream-json requires --verbose
+    if streaming:
+        cmd.append("--verbose")
 
     # Security reviewer gets access to the security skills directory
     if role == "security-reviewer" and SKILLS_DIR.exists():
@@ -904,6 +1569,359 @@ async def run_agent(cmd, timeout=None):
         # Output wasn't JSON, treat raw text as result
         result["result_text"] = stdout_text
         result["success"] = process.returncode == 0
+
+    return result
+
+
+# --- Early Termination (Stuck Agent Detection) ---
+
+def _check_stuck_phrases(text):
+    """Check if text contains any stuck signal phrases.
+
+    Returns the matched phrase or None.
+    """
+    text_lower = text.lower()
+    for phrase in EARLY_TERM_STUCK_PHRASES:
+        if phrase in text_lower:
+            return phrase
+    return None
+
+
+def _check_repeated_tool_calls(tool_history, window=4):
+    """Detect repeated identical tool calls within a sliding window.
+
+    Returns True if the last `window` tool calls are all identical.
+    """
+    if len(tool_history) < window:
+        return False
+    recent = tool_history[-window:]
+    return len(set(recent)) == 1
+
+
+def _detect_tool_loop(tool_history, tool_errors, warn_threshold=3, terminate_threshold=5):
+    """Detect when an agent repeats the same failing tool operation.
+
+    Tracks consecutive repetitions of the same tool signature and returns
+    the current loop status. Enhanced to consider error patterns - only
+    triggers on failed operations, not successful ones.
+
+    Args:
+        tool_history: List of tool signatures (tool_name|params)
+        tool_errors: List of error summaries (None if success, string if error)
+        warn_threshold: Number of repetitions before warning (default 3)
+        terminate_threshold: Number of repetitions before termination (default 5)
+
+    Returns:
+        tuple: (action, count, last_sig) where action is "ok", "warn", or "terminate"
+    """
+    if len(tool_history) < 2:
+        return ("ok", 0, None)
+
+    # Count consecutive occurrences of the last tool signature
+    last_sig = tool_history[-1]
+    last_error = tool_errors[-1] if tool_errors else None
+
+    # If the last operation succeeded (no error), reset the loop counter
+    # This prevents false positives when retrying after fixing a bug
+    if not last_error:
+        return ("ok", 0, last_sig)
+
+    consecutive = 1
+    consecutive_failures = 1  # count only failing operations
+
+    for i in range(len(tool_history) - 2, -1, -1):
+        if tool_history[i] == last_sig:
+            consecutive += 1
+            # Only count if this was also a failure
+            if i < len(tool_errors) and tool_errors[i]:
+                consecutive_failures += 1
+        else:
+            break
+
+    # Use consecutive_failures for triggering warnings/termination
+    if consecutive_failures >= terminate_threshold:
+        return ("terminate", consecutive_failures, last_sig)
+    elif consecutive_failures >= warn_threshold:
+        return ("warn", consecutive_failures, last_sig)
+    else:
+        return ("ok", consecutive_failures, last_sig)
+
+
+async def run_agent_streaming(cmd, role="developer", timeout=None, output=None, max_turns=None):
+    """Spawn claude -p with stream-json output for real-time stuck detection.
+
+    Monitors agent output turn-by-turn and terminates early if stuck signals
+    are detected. Only applies file-change monitoring to non-exempt roles
+    (developer, tester, debugger, etc.).
+
+    Returns the same dict format as run_agent().
+    """
+    effective_timeout = timeout or PROCESS_TIMEOUT
+    start_time = time.time()
+    is_exempt = role in EARLY_TERM_EXEMPT_ROLES
+
+    # Tracking state
+    turn_count = 0
+    turns_without_file_change = 0
+    # Scale early termination with budget — larger budgets get more reading time
+    effective_kill_turns = max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.85))
+    effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.7))
+    has_any_file_change = False
+    tool_history = []          # list of "tool_name:key_input" strings
+    tool_errors = []           # list of error strings (None if success, string if error)
+    stuck_phrase_count = 0
+    all_text_chunks = []       # accumulate assistant text for final result
+    result_data = None         # the final "result" message from stream-json
+    warning_injected = False
+    loop_warning_injected = False  # track if we've warned about loop detection
+    early_term_reason = None
+    loop_detected_details = None  # store loop details for error_summary
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
+        )
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "result_text": "",
+            "num_turns": 0,
+            "duration": 0,
+            "cost": None,
+            "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+        }
+
+    try:
+        # Read stdout line-by-line with overall timeout
+        while True:
+            elapsed = time.time() - start_time
+            remaining = effective_timeout - elapsed
+            if remaining <= 0:
+                early_term_reason = f"Process timed out after {effective_timeout} seconds"
+                break
+
+            try:
+                line_bytes = await asyncio.wait_for(
+                    process.stdout.readline(),
+                    timeout=min(remaining, 120),  # also cap per-line wait
+                )
+            except asyncio.TimeoutError:
+                early_term_reason = f"Process timed out after {effective_timeout} seconds"
+                break
+
+            if not line_bytes:
+                # EOF — process finished
+                break
+
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            # Parse stream-json message
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type", "")
+
+            # --- Handle "result" message (final) ---
+            if msg_type == "result":
+                result_data = msg
+                break
+
+            # --- Handle "assistant" messages (agent turns) ---
+            if msg_type == "assistant":
+                message = msg.get("message", {})
+                content_blocks = message.get("content", [])
+
+                for block in content_blocks:
+                    block_type = block.get("type", "")
+
+                    if block_type == "text":
+                        text = block.get("text", "")
+                        all_text_chunks.append(text)
+
+                        # Check for stuck phrases
+                        matched = _check_stuck_phrases(text)
+                        if matched:
+                            stuck_phrase_count += 1
+                            log(f"  [EarlyTerm] Stuck signal detected at turn ~{turn_count}: "
+                                f"\"{matched}\" (count: {stuck_phrase_count})", output)
+                            # 3 stuck phrases = terminate
+                            if stuck_phrase_count >= 3:
+                                early_term_reason = (
+                                    f"Agent stuck: repeated stuck phrases "
+                                    f"({stuck_phrase_count}x, last: \"{matched}\")"
+                                )
+
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name", "")
+                        tool_input = block.get("input", {})
+                        turn_count += 1
+
+                        # Track file-modifying tools
+                        if tool_name in ("Edit", "Write", "NotebookEdit"):
+                            turns_without_file_change = 0
+                            has_any_file_change = True
+                        else:
+                            if not is_exempt:
+                                turns_without_file_change += 1
+
+                        # Build tool signature for repetition detection
+                        # Use tool name + first key param for fingerprinting
+                        sig_parts = [tool_name]
+                        if tool_name == "Bash":
+                            sig_parts.append(str(tool_input.get("command", ""))[:80])
+                        elif tool_name == "Read":
+                            sig_parts.append(str(tool_input.get("file_path", "")))
+                        elif tool_name == "Grep":
+                            sig_parts.append(str(tool_input.get("pattern", "")))
+                        elif tool_name == "Glob":
+                            sig_parts.append(str(tool_input.get("pattern", "")))
+                        else:
+                            # Generic: use first key
+                            first_val = next(iter(tool_input.values()), "") if tool_input else ""
+                            sig_parts.append(str(first_val)[:80])
+
+                        tool_sig = "|".join(sig_parts)
+                        tool_history.append(tool_sig)
+
+                        # Check for loop detection (repeated failing operations)
+                        action, count, last_sig = _detect_tool_loop(
+                            tool_history,
+                            tool_errors,
+                            warn_threshold=LOOP_WARNING_THRESHOLD,
+                            terminate_threshold=LOOP_TERMINATE_THRESHOLD
+                        )
+
+                        if action == "terminate":
+                            early_term_reason = (
+                                f"Loop detected: agent repeated the same operation "
+                                f"{count} times ({tool_name})"
+                            )
+                            log(f"  [LoopDetect] {early_term_reason}", output)
+                        elif action == "warn" and not loop_warning_injected:
+                            log(f"  [LoopDetect] WARNING: Repeated operation detected "
+                                f"({count}x: {tool_name}). Try a different approach.", output)
+                            loop_warning_injected = True
+
+                        # File-change turn monitoring (non-exempt roles only)
+                        if not is_exempt and turns_without_file_change > 0:
+                            if (turns_without_file_change >= effective_warn_turns
+                                    and not warning_injected):
+                                log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
+                                    f"turns without file changes (role={role}, "
+                                    f"turn ~{turn_count})", output)
+                                warning_injected = True
+
+                            if turns_without_file_change >= effective_kill_turns:
+                                early_term_reason = (
+                                    f"Agent terminated: {turns_without_file_change} "
+                                    f"consecutive turns without file changes"
+                                )
+                                log(f"  [EarlyTerm] {early_term_reason}", output)
+
+                # If we found a reason to terminate, break out
+                if early_term_reason:
+                    break
+
+            # --- Handle "user" messages (tool results) ---
+            elif msg_type == "user":
+                message = msg.get("message", {})
+                content_blocks = message.get("content", [])
+
+                for block in content_blocks:
+                    block_type = block.get("type", "")
+
+                    if block_type == "tool_result":
+                        # Track whether this tool call resulted in an error
+                        is_error = block.get("is_error", False)
+                        content = block.get("content", "")
+
+                        # Extract error message if present
+                        error_text = None
+                        if is_error:
+                            # Content can be a string or a list of content blocks
+                            if isinstance(content, str):
+                                error_text = content[:200]  # truncate long errors
+                            elif isinstance(content, list):
+                                # Extract text from content blocks
+                                texts = []
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "text":
+                                        texts.append(c.get("text", ""))
+                                if texts:
+                                    error_text = " ".join(texts)[:200]
+
+                        tool_errors.append(error_text)
+
+    except Exception as e:
+        early_term_reason = f"Streaming monitor error: {e}"
+
+    # --- Kill process if still running ---
+    if process.returncode is None:
+        log(f"  [EarlyTerm] Killing agent process (reason: {early_term_reason})", output)
+        process.kill()
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=5)
+        except Exception:
+            pass
+
+    duration = time.time() - start_time
+
+    # --- Build result dict (same format as run_agent) ---
+    result = {
+        "success": False,
+        "result_text": "",
+        "num_turns": turn_count,
+        "duration": duration,
+        "cost": None,
+        "errors": [],
+    }
+
+    if early_term_reason:
+        result["errors"].append(early_term_reason)
+        result["early_terminated"] = True
+        result["early_term_reason"] = early_term_reason
+
+    # If we got the final result message from stream-json, use it
+    if result_data:
+        final_text = result_data.get("result", "")
+        # If final result lacks structured test markers but accumulated text has them,
+        # use the full accumulated text (tester often outputs RESULT: block mid-conversation)
+        if ("RESULT:" not in final_text and all_text_chunks
+                and any("RESULT:" in chunk for chunk in all_text_chunks)):
+            result["result_text"] = "\n".join(all_text_chunks)
+        else:
+            result["result_text"] = final_text
+        result["num_turns"] = result_data.get("num_turns", turn_count)
+        result["cost"] = result_data.get("total_cost_usd")
+
+        subtype = result_data.get("subtype", "")
+        if subtype == "error_max_turns":
+            result["success"] = True
+            result["errors"].append("Agent hit max turns limit")
+        elif result_data.get("is_error"):
+            result["errors"].append(
+                f"Agent error: {result_data.get('result', 'unknown')}")
+        else:
+            result["success"] = not bool(early_term_reason)
+    else:
+        # No result message — build text from accumulated chunks
+        result["result_text"] = "\n".join(all_text_chunks)
+
+    # Read any remaining stderr
+    try:
+        stderr_bytes = await asyncio.wait_for(process.stderr.read(), timeout=2)
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            result["errors"].append(f"stderr: {stderr_text}")
+    except Exception:
+        pass
 
     return result
 
@@ -1205,6 +2223,197 @@ async def auto_install_dependencies(project_dir, output=None):
             log(f"  [Auto-Install] npm install error: {e}", output)
 
 
+# --- Loop Detection ---
+
+# Thresholds for loop detection
+LOOP_WARNING_THRESHOLD = 3   # inject "try different approach" warning
+LOOP_TERMINATE_THRESHOLD = 5  # terminate agent early and mark blocked
+
+
+class LoopDetector:
+    """Detect when an agent repeats the same failing pattern across cycles.
+
+    Tracks fingerprints of agent output (error messages, result status,
+    blockers) and detects repetition. Legitimate retries (where the agent
+    makes changes between attempts) are excluded from repetition counts.
+
+    Usage:
+        detector = LoopDetector()
+        for cycle in ...:
+            result = await run_agent(cmd)
+            action = detector.record(result, cycle)
+            if action == "terminate":
+                break
+            elif action == "warn":
+                compaction_history.append(detector.warning_message())
+    """
+
+    def __init__(self, warning_threshold=LOOP_WARNING_THRESHOLD,
+                 terminate_threshold=LOOP_TERMINATE_THRESHOLD):
+        self.warning_threshold = warning_threshold
+        self.terminate_threshold = terminate_threshold
+        self.fingerprints = []      # ordered list of fingerprints per cycle
+        self.consecutive_same = 0   # consecutive identical fingerprints
+        self.last_fingerprint = None
+        self.warned = False         # have we injected a warning already?
+
+    def _fingerprint(self, result):
+        """Extract a normalized fingerprint from agent output.
+
+        The fingerprint captures the essential pattern of what the agent did
+        and what went wrong. It includes:
+        - The RESULT: line (success/blocked/failed)
+        - Error messages from the result dict
+        - The BLOCKERS: section content
+        - The SUMMARY: line
+
+        Files changed are used to detect legitimate retries — if files differ
+        between cycles, the repetition counter resets.
+        """
+        text = result.get("result_text", "") if isinstance(result, dict) else ""
+        errors = result.get("errors", []) if isinstance(result, dict) else []
+
+        parts = []
+
+        # Extract structured output markers
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("RESULT:"):
+                parts.append(stripped.split(":", 1)[1].strip().lower())
+            elif stripped.startswith("BLOCKERS:"):
+                blocker_val = stripped.split(":", 1)[1].strip().lower()
+                if blocker_val and blocker_val != "none":
+                    parts.append(f"blocker:{blocker_val}")
+            elif stripped.startswith("SUMMARY:"):
+                parts.append(f"summary:{stripped.split(':', 1)[1].strip().lower()}")
+
+        # Include error messages (normalized)
+        for err in errors[:3]:
+            normalized = err.lower().strip()[:200]
+            parts.append(f"error:{normalized}")
+
+        return "|".join(sorted(parts)) if parts else "empty"
+
+    def _get_files_changed(self, result):
+        """Extract FILES_CHANGED from result text for retry detection."""
+        text = result.get("result_text", "") if isinstance(result, dict) else ""
+        return parse_developer_output(text)
+
+    def record(self, result, cycle):
+        """Record a cycle result and return the recommended action.
+
+        Returns:
+            "ok"        - no loop detected, continue normally
+            "warn"      - repetition detected (>=warning_threshold), inject warning
+            "terminate" - severe repetition (>=terminate_threshold), stop the agent
+        """
+        fp = self._fingerprint(result)
+        files = self._get_files_changed(result)
+        self.fingerprints.append((cycle, fp, files))
+
+        if fp == self.last_fingerprint:
+            # Same pattern — but check if files changed (legitimate retry)
+            prev_files = self.fingerprints[-2][2] if len(self.fingerprints) >= 2 else []
+            if sorted(files) != sorted(prev_files) and files:
+                # Different files touched — this is a real retry, reset counter
+                self.consecutive_same = 1
+            else:
+                self.consecutive_same += 1
+        else:
+            self.consecutive_same = 1
+            self.last_fingerprint = fp
+
+        if self.consecutive_same >= self.terminate_threshold:
+            return "terminate"
+        elif self.consecutive_same >= self.warning_threshold and not self.warned:
+            self.warned = True
+            return "warn"
+
+        return "ok"
+
+    def warning_message(self):
+        """Build a warning to inject into the agent's next prompt context."""
+        return (
+            "## LOOP DETECTED — Try a Different Approach\n\n"
+            "The orchestrator has detected that you are repeating the same "
+            "failing pattern for multiple consecutive cycles. Your last "
+            f"{self.consecutive_same} attempts produced identical error "
+            "signatures.\n\n"
+            "**You MUST try a fundamentally different approach:**\n"
+            "- If a file edit keeps failing, try a different file or strategy\n"
+            "- If a build error persists, investigate the root cause instead of retrying\n"
+            "- If you are blocked, report it as a blocker rather than retrying\n"
+            "- If you tried approach A three times, try approach B or C\n\n"
+            "**If you repeat the same approach again, the orchestrator will "
+            "terminate your session and mark the task as blocked.**\n"
+        )
+
+    def termination_summary(self):
+        """Build an error summary string for agent_runs.error_summary."""
+        return (
+            f"Loop detected: agent repeated the same failing pattern "
+            f"{self.consecutive_same} times. Last fingerprint: "
+            f"{self.last_fingerprint[:200] if self.last_fingerprint else 'unknown'}"
+        )
+
+
+# --- Dynamic Turn Budget ---
+
+def calculate_dynamic_budget(max_turns):
+    """Calculate the starting turn budget for an agent.
+
+    Starts at DYNAMIC_BUDGET_START_RATIO of max_turns, with a floor of
+    DYNAMIC_BUDGET_MIN_TURNS to ensure agents can at least read files.
+
+    Returns (starting_budget, max_turns) tuple.
+    """
+    starting = max(DYNAMIC_BUDGET_MIN_TURNS, int(max_turns * DYNAMIC_BUDGET_START_RATIO))
+    # Don't exceed the max
+    starting = min(starting, max_turns)
+    return starting, max_turns
+
+
+def adjust_dynamic_budget(current_budget, max_turns, result_text):
+    """Adjust dynamic turn budget based on agent output.
+
+    - If FILES_CHANGED found in output: extend by DYNAMIC_BUDGET_EXTEND_TURNS (up to max)
+    - If RESULT: blocked found in output: reduce remaining by DYNAMIC_BUDGET_BLOCKED_RATIO
+    - Otherwise: no change
+
+    Returns the new budget.
+    """
+    if not result_text:
+        return current_budget
+
+    result_text_lower = result_text.lower()
+
+    # Check for RESULT: blocked — reduce budget
+    if "result: blocked" in result_text_lower or "result:blocked" in result_text_lower:
+        reduced = max(DYNAMIC_BUDGET_MIN_TURNS,
+                      int(current_budget * DYNAMIC_BUDGET_BLOCKED_RATIO))
+        return min(reduced, max_turns)
+
+    # Check for FILES_CHANGED with actual content (not "none" or empty)
+    files_changed_patterns = ["files_changed:", "files changed:"]
+    has_files_changed = False
+    for pattern in files_changed_patterns:
+        idx = result_text_lower.find(pattern)
+        if idx >= 0:
+            # Extract the value after the marker
+            after = result_text[idx + len(pattern):idx + len(pattern) + 200].strip()
+            # Consider it real if it's not "none", empty, or just whitespace
+            first_line = after.split("\n")[0].strip()
+            if first_line and first_line.lower() not in ("none", "n/a", "no files", ""):
+                has_files_changed = True
+                break
+
+    if has_files_changed:
+        extended = min(current_budget + DYNAMIC_BUDGET_EXTEND_TURNS, max_turns)
+        return extended
+
+    return current_budget
+
+
 # --- Dev+Tester Loop (Phase 2) ---
 
 async def run_dev_test_loop(task, project_dir, project_context, args, output=None):
@@ -1234,6 +2443,8 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
     total_cost = 0.0
     total_duration = 0.0
     task_id = task["id"]
+    last_error_type = None   # track last error for lesson injection
+    loop_detector = LoopDetector()  # detect repeated failing patterns
 
     # Reset status so orchestrator is authoritative
     conn = get_db_connection(write=True)
@@ -1244,17 +2455,25 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
     # Resolve model and turns using adaptive tiering
     complexity = get_task_complexity(task)
-    dev_model = get_role_model("developer", args, task=task)
+    # Use task-specified role if available, otherwise default to developer
+    task_role = getattr(task, 'role', None) or (task.get('role') if isinstance(task, dict) else None) or "developer"
+    dev_model = get_role_model(task_role, args, task=task)
     tester_model = get_role_model("tester", args, task=task)
-    dev_turns_limit = get_role_turns("developer", args, task=task)
-    tester_turns_limit = get_role_turns("tester", args, task=task)
+    dev_turns_max = get_role_turns(task_role, args, task=task)
+    tester_turns_max = get_role_turns("tester", args, task=task)
+
+    # Dynamic turn budgets: start conservative, extend on progress
+    dev_turns_allocated, _ = calculate_dynamic_budget(dev_turns_max)
+    tester_turns_allocated, _ = calculate_dynamic_budget(tester_turns_max)
 
     log(f"  Task complexity: {complexity}", output)
-    log(f"  Developer: model={dev_model}, max_turns={dev_turns_limit}", output)
-    log(f"  Tester: model={tester_model}, max_turns={tester_turns_limit}", output)
+    log(f"  Developer: model={dev_model}, budget={dev_turns_allocated}/{dev_turns_max} "
+        f"(dynamic, min={DYNAMIC_BUDGET_MIN_TURNS})", output)
+    log(f"  Tester: model={tester_model}, budget={tester_turns_allocated}/{tester_turns_max} "
+        f"(dynamic)", output)
 
     # Check for checkpoint from a previous timed-out attempt
-    checkpoint_text, prev_attempt = load_checkpoint(task_id, role="developer")
+    checkpoint_text, prev_attempt = load_checkpoint(task_id, role=task_role)
     if checkpoint_text:
         checkpoint_context = build_checkpoint_context(checkpoint_text, prev_attempt)
         compaction_history.append(checkpoint_context)
@@ -1267,23 +2486,42 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         log(f"{'=' * 50}", output)
 
         # --- Developer Phase ---
-        log(f"\n  [Cycle {cycle}] Running Developer agent...", output)
+        log(f"\n  [Cycle {cycle}] Running Developer agent "
+            f"(budget: {dev_turns_allocated}/{dev_turns_max})...", output)
 
         # Build extra context from compaction history
         extra_context = "\n\n".join(compaction_history) if compaction_history else ""
 
         dev_prompt = build_system_prompt(
             task, project_context, project_dir,
-            role="developer", extra_context=extra_context,
+            role=task_role, extra_context=extra_context,
+            dispatch_config=getattr(args, "dispatch_config", None),
+            error_type=last_error_type,
         )
+        # Use streaming mode for early termination on non-exempt roles
+        use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
         dev_cmd = build_cli_command(
-            dev_prompt, project_dir, dev_turns_limit, dev_model, role="developer",
+            dev_prompt, project_dir, dev_turns_allocated, dev_model, role=task_role,
+            streaming=use_streaming,
         )
 
-        dev_result = await run_agent(dev_cmd)
+        if use_streaming:
+            dev_result = await run_agent_streaming(
+                dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated)
+        else:
+            dev_result = await run_agent(dev_cmd)
+        # Tag result with dynamic budget info for telemetry
+        dev_result["turns_allocated"] = dev_turns_allocated
+        dev_result["turns_max"] = dev_turns_max
         total_duration += dev_result.get("duration", 0)
         if dev_result.get("cost"):
             total_cost += dev_result["cost"]
+
+        # Check for early termination
+        if dev_result.get("early_terminated"):
+            reason = dev_result.get("early_term_reason", "unknown")
+            log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
+            return dev_result, cycle, "early_terminated"
 
         # Check for timeout or max_turns — save checkpoint for resume
         is_timeout = any("timed out" in e for e in dev_result.get("errors", []))
@@ -1291,6 +2529,8 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
         if is_timeout or is_max_turns:
             reason = "timed out" if is_timeout else "hit max turns"
+            # Track error type for lesson injection on next iteration
+            last_error_type = "timeout" if is_timeout else "max_turns"
             continuation_count += 1
             log(f"  [Cycle {cycle}] Developer {reason}. "
                 f"(continuation {continuation_count}/{MAX_CONTINUATIONS})", output)
@@ -1299,7 +2539,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             result_text = dev_result.get("result_text", "")
             if result_text:
                 attempt_num = prev_attempt + cycle
-                cp_path = save_checkpoint(task_id, attempt_num, result_text, role="developer")
+                cp_path = save_checkpoint(task_id, attempt_num, result_text, role=task_role)
                 if cp_path:
                     log(f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}", output)
 
@@ -1344,6 +2584,10 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         # (agents often do work but forget to output the marker)
         made_progress = bool(files_changed) or dev_turns_used >= 3
 
+        if made_progress:
+            # Clear error type on successful progress
+            last_error_type = None
+
         if not made_progress:
             no_progress_count += 1
             log(f"  [Cycle {cycle}] No progress detected ({dev_turns_used} turns, no files marker) "
@@ -1361,20 +2605,61 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
                 log(f"  [Cycle {cycle}] Developer used {dev_turns_used} turns "
                     f"(no FILES_CHANGED marker, but counting as progress).", output)
 
+        # --- Dynamic Budget Adjustment ---
+        prev_budget = dev_turns_allocated
+        dev_turns_allocated = adjust_dynamic_budget(
+            dev_turns_allocated, dev_turns_max,
+            dev_result.get("result_text", ""))
+        if dev_turns_allocated != prev_budget:
+            log(f"  [DynBudget] Developer budget adjusted: {prev_budget} -> "
+                f"{dev_turns_allocated}/{dev_turns_max}", output)
+
+        # --- Loop Detection ---
+        loop_action = loop_detector.record(dev_result, cycle)
+        if loop_action == "terminate":
+            log(f"  [Cycle {cycle}] LOOP DETECTED: Agent repeated the same failing "
+                f"pattern {loop_detector.consecutive_same} times. Terminating early.", output)
+            # Attach loop info to the result for telemetry
+            dev_result.setdefault("errors", []).append(loop_detector.termination_summary())
+            return dev_result, cycle, "loop_detected"
+        elif loop_action == "warn":
+            log(f"  [Cycle {cycle}] Loop warning: Agent has repeated the same pattern "
+                f"{loop_detector.consecutive_same} times. Injecting 'try different approach' "
+                f"guidance.", output)
+            compaction_history.append(loop_detector.warning_message())
+            # Log the warning in error_summary for telemetry
+            dev_result.setdefault("errors", []).append(
+                f"Loop warning: agent repeated same pattern "
+                f"{loop_detector.consecutive_same} times (cycle {cycle})"
+            )
+
         # --- Tester Phase ---
-        log(f"\n  [Cycle {cycle}] Running Tester agent...", output)
+        log(f"\n  [Cycle {cycle}] Running Tester agent "
+            f"(budget: {tester_turns_allocated}/{tester_turns_max})...", output)
 
         tester_prompt = build_system_prompt(
             task, project_context, project_dir, role="tester",
+            dispatch_config=getattr(args, "dispatch_config", None),
         )
         tester_cmd = build_cli_command(
-            tester_prompt, project_dir, tester_turns_limit, tester_model, role="tester",
+            tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
+            streaming=True,
         )
 
-        tester_result = await run_agent(tester_cmd)
+        tester_result = await run_agent_streaming(
+            tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated)
+        # Tag tester result with dynamic budget info for telemetry
+        tester_result["turns_allocated"] = tester_turns_allocated
+        tester_result["turns_max"] = tester_turns_max
         total_duration += tester_result.get("duration", 0)
         if tester_result.get("cost"):
             total_cost += tester_result["cost"]
+
+        # Check for early termination (stuck tester)
+        if tester_result.get("early_terminated"):
+            reason = tester_result.get("early_term_reason", "unknown")
+            log(f"  [Cycle {cycle}] Tester early-terminated: {reason}", output)
+            return tester_result, cycle, "early_terminated"
 
         # Check for timeout
         if any("timed out" in e for e in tester_result.get("errors", [])):
@@ -1413,8 +2698,18 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             log(f"  [Cycle {cycle}] Tester is blocked (missing dependency, build error, etc.).", output)
             return tester_result, cycle, "tester_blocked"
 
+        elif (test_outcome == "unknown" and test_results["tests_run"] == 0
+              and test_results["tests_failed"] == 0):
+            # Tester couldn't produce structured output and no tests actually ran
+            log(f"  [Cycle {cycle}] Tester returned unknown with 0 tests. "
+                f"Treating as no-tests.", output)
+            clear_checkpoints(task_id)
+            dev_result["cost"] = total_cost
+            dev_result["duration"] = total_duration
+            return dev_result, cycle, "no_tests"
+
         else:
-            # test_outcome == "fail" or unknown
+            # test_outcome == "fail" (with actual test failures)
             log(f"  [Cycle {cycle}] {test_results['tests_failed']} test(s) failed.", output)
             if test_results["failure_details"]:
                 for detail in test_results["failure_details"][:5]:
@@ -1465,6 +2760,7 @@ async def run_security_review(task, project_dir, project_context, args, output=N
     sec_prompt = build_system_prompt(
         security_task, project_context, project_dir,
         role="security-reviewer",
+        dispatch_config=getattr(args, "dispatch_config", None),
     )
     sec_turns = get_role_turns("security-reviewer", args, task=task)
     sec_model = get_role_model("security-reviewer", args, task=task)
@@ -1473,7 +2769,7 @@ async def run_security_review(task, project_dir, project_context, args, output=N
     )
 
     # Use security_review_timeout from dispatch config (default 15 min)
-    dc = load_dispatch_config()
+    dc = load_dispatch_config(None)
     sec_timeout = dc.get("security_review_timeout", 900)
     sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
 
@@ -2346,22 +3642,14 @@ def _get_repo_env():
     """Build an environment dict with git and gh on the PATH."""
     env = os.environ.copy()
     extra_paths = []
-    sep = ";" if platform.system() == "Windows" else ":"
-    if platform.system() == "Windows":
-        candidates = [
-            r"C:\Program Files\Git\cmd",
-            r"C:\Program Files\GitHub CLI",
-        ]
-    else:
-        candidates = [
-            "/usr/local/bin",
-            str(Path.home() / ".local" / "bin"),
-        ]
-    for candidate in candidates:
+    for candidate in [
+        r"C:\Program Files\Git\cmd",
+        r"C:\Program Files\GitHub CLI",
+    ]:
         if os.path.isdir(candidate) and candidate not in env.get("PATH", ""):
             extra_paths.append(candidate)
     if extra_paths:
-        env["PATH"] = sep.join(extra_paths) + sep + env.get("PATH", "")
+        env["PATH"] = ";".join(extra_paths) + ";" + env.get("PATH", "")
     return env
 
 
@@ -2651,21 +3939,14 @@ def score_project(summary, config):
 # --- Auto-Run: Config Loading & Filters (Phase 5) ---
 
 DEFAULT_DISPATCH_CONFIG = {
-    "max_concurrent": 4,
+    "max_concurrent": 8,
     "model": "sonnet",
     "max_turns": 25,
-    "max_tasks_per_project": 5,
+    "max_tasks_per_project": 3,
     "skip_projects": [],
     "priority_boost": {},
     "only_projects": [],
-    # Per-role model overrides (optional in config file)
-    # "model_developer": "sonnet",
-    # "model_tester": "haiku",
-    # "model_security_reviewer": "sonnet",
-    # Per-complexity model overrides (optional in config file)
-    # "model_simple": "haiku",
-    # "model_complex": "sonnet",
-    # "model_epic": "opus",
+    "security_review": False,
 }
 
 
@@ -2840,6 +4121,21 @@ async def run_project_tasks(project_summary, config, args, output=None):
         # Orchestrator-side DB update (don't rely on agent)
         update_task_status(task_id, outcome, output=output)
 
+        # ForgeSmith telemetry
+        task_role = task.get("role") or "developer"
+        record_agent_run(
+            task, result, outcome, role=task_role,
+            model=get_role_model(task_role, task_args, task=task),
+            max_turns=get_role_turns(task_role, task_args, task=task),
+            cycle_number=cycles, output=output,
+        )
+
+        # Reflexion: record episode and capture self-reflection
+        await maybe_run_reflexion(task, result, outcome, role=task_role, output=output)
+
+        # MemRL: update q_values of episodes that were injected into this task's prompt
+        update_injected_episode_q_values_for_task(task_id, outcome, output=output)
+
         if outcome in ("tests_passed", "no_tests"):
             completed.append(task)
             log(f"  [{codename}] Task #{task_id}: COMPLETED ({outcome})", output)
@@ -2945,7 +4241,9 @@ def print_dispatch_plan(scored, config):
     print(f"\n  Max concurrent: {max_concurrent}")
     print(f"  Max tasks/project: {max_tasks}")
     print(f"  Model: {config.get('model', DEFAULT_MODEL)}")
-    print(f"  Max turns: {config.get('max_turns', DEFAULT_MAX_TURNS)}")
+    max_turns_val = config.get('max_turns', DEFAULT_MAX_TURNS)
+    start_budget, _ = calculate_dynamic_budget(max_turns_val)
+    print(f"  Max turns: {max_turns_val} (dynamic start: {start_budget})")
     print()
 
     total_tasks = 0
@@ -3188,8 +4486,13 @@ async def async_main():
                         help="Override max concurrent goals (default: from goals file or 4)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Max agent turns (default: {DEFAULT_MAX_TURNS})")
-    parser.add_argument("--role", default="developer", choices=["developer", "security-reviewer", "tester"],
-                        help="Agent role for single-agent mode (default: developer)")
+    # Dynamically discover available roles from prompts directory
+    _available_roles = sorted([
+        f.stem for f in (Path(__file__).parent / "prompts").glob("*.md")
+        if not f.name.startswith("_")
+    ]) if (Path(__file__).parent / "prompts").exists() else ["developer", "tester", "security-reviewer"]
+    parser.add_argument("--role", default="developer", choices=_available_roles,
+                        help=f"Agent role (available: {', '.join(_available_roles)}) (default: developer)")
     parser.add_argument("--retries", type=int, default=DEFAULT_MAX_RETRIES, help=f"Max retry attempts (default: {DEFAULT_MAX_RETRIES})")
     parser.add_argument("--dev-test", action="store_true", help="Enable Dev+Tester iteration loop mode")
     parser.add_argument("--security-review", action="store_true", default=None,
@@ -3404,7 +4707,7 @@ async def async_main():
 
     # --- Task/Project mode (Phase 1 & 2) ---
 
-    # Fetch task
+    # --- Fetch task ---
     if args.task:
         task = fetch_task(args.task)
         if not task:
@@ -3442,12 +4745,16 @@ async def async_main():
     print(f"Directory: {project_dir}")
 
     if args.dev_test:
-        dev_model = get_role_model("developer", args, task=task)
+        # Use task-specified role if available, otherwise default to developer
+        task_role = getattr(task, 'role', None) or (task.get('role') if isinstance(task, dict) else None) or "developer"
+        dev_model = get_role_model(task_role, args, task=task)
         dev_turns = get_role_turns("developer", args, task=task)
         tester_model = get_role_model("tester", args, task=task)
         tester_turns = get_role_turns("tester", args, task=task)
-        print(f"Developer: model={dev_model}, turns={dev_turns}")
-        print(f"Tester: model={tester_model}, turns={tester_turns}")
+        dev_budget, _ = calculate_dynamic_budget(dev_turns)
+        tester_budget, _ = calculate_dynamic_budget(tester_turns)
+        print(f"Developer: model={dev_model}, budget={dev_budget}/{dev_turns} (dynamic)")
+        print(f"Tester: model={tester_model}, budget={tester_budget}/{tester_turns} (dynamic)")
         print(f"Max cycles: {MAX_DEV_TEST_CYCLES}")
         print(f"Compaction: Dev >= {DEV_COMPACTION_THRESHOLD} turns, "
               f"Tester >= {TESTER_COMPACTION_THRESHOLD} turns")
@@ -3458,13 +4765,15 @@ async def async_main():
     else:
         role_model = get_role_model(args.role, args, task=task)
         role_turns = get_role_turns(args.role, args, task=task)
+        role_budget, _ = calculate_dynamic_budget(role_turns)
         print(f"Model: {role_model}")
-        print(f"Max turns: {role_turns}")
+        print(f"Budget: {role_budget}/{role_turns} turns (dynamic)")
         print(f"Max retries: {args.retries}")
 
     if args.dry_run:
         # Build a sample prompt to show size
-        system_prompt = build_system_prompt(task, project_context, project_dir, role="developer")
+        system_prompt = build_system_prompt(task, project_context, project_dir, role="developer",
+                                                  dispatch_config=getattr(args, "dispatch_config", None))
         dry_model = get_role_model("developer", args, task=task)
         dry_turns = get_role_turns("developer", args, task=task)
         cmd = build_cli_command(system_prompt, project_dir, dry_turns, dry_model, role="developer")
@@ -3507,6 +4816,21 @@ async def async_main():
         # Orchestrator-side DB update (don't rely on agent)
         update_task_status(task["id"], outcome)
 
+        # ForgeSmith telemetry
+        task_role = task.get("role") or "developer"
+        record_agent_run(
+            task, result, outcome, role=task_role,
+            model=get_role_model(task_role, args, task=task),
+            max_turns=get_role_turns(task_role, args, task=task),
+            cycle_number=cycles,
+        )
+
+        # Reflexion: record episode and capture self-reflection
+        await maybe_run_reflexion(task, result, outcome, role=task_role)
+
+        # MemRL: update q_values of episodes that were injected into this task's prompt
+        update_injected_episode_q_values_for_task(task["id"], outcome)
+
         # Optional security review after successful dev-test
         security_review_enabled = args.security_review
         if security_review_enabled is None:
@@ -3526,22 +4850,54 @@ async def async_main():
 
     else:
         # Single-agent mode (Phase 1 — with model tiering)
+        use_streaming = args.role not in EARLY_TERM_EXEMPT_ROLES
         system_prompt = build_system_prompt(
             task, project_context, project_dir, role=args.role,
+            dispatch_config=getattr(args, "dispatch_config", None),
         )
-        role_turns = get_role_turns(args.role, args, task=task)
+        role_turns_max = get_role_turns(args.role, args, task=task)
         role_model = get_role_model(args.role, args, task=task)
+        # Dynamic budget for single-agent mode
+        role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
+        print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
         cmd = build_cli_command(
-            system_prompt, project_dir, role_turns, role_model, role=args.role,
+            system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
+            streaming=use_streaming,
         )
         print(f"System prompt: {len(system_prompt)} chars")
 
         print(f"\nStarting {args.role} agent...")
-        result, attempts = await run_agent_with_retries(cmd, task, args.retries)
+        if use_streaming:
+            # Streaming mode with early termination — no retries (kill is intentional)
+            result = await run_agent_streaming(cmd, role=args.role)
+            attempts = 1
+        else:
+            result, attempts = await run_agent_with_retries(cmd, task, args.retries)
+
+        # Tag result with dynamic budget info for telemetry
+        result["turns_allocated"] = role_turns_allocated
+        result["turns_max"] = role_turns_max
 
         # Orchestrator-side DB update for single-agent mode
-        single_outcome = "tests_passed" if result["success"] else "developer_failed"
+        if result.get("early_terminated"):
+            single_outcome = "early_terminated"
+        elif result["success"]:
+            single_outcome = "tests_passed"
+        else:
+            single_outcome = "developer_failed"
         update_task_status(task["id"], single_outcome)
+
+        # ForgeSmith telemetry
+        record_agent_run(
+            task, result, single_outcome, role=args.role,
+            model=role_model, max_turns=role_turns_max,
+        )
+
+        # Reflexion: record episode and capture self-reflection
+        await maybe_run_reflexion(task, result, single_outcome, role=args.role)
+
+        # MemRL: update q_values of episodes that were injected into this task's prompt
+        update_injected_episode_q_values_for_task(task["id"], single_outcome)
 
         # Verify the task status in TheForge
         verified, verify_msg = verify_task_updated(task["id"])
@@ -3552,9 +4908,46 @@ async def async_main():
             print(f"  Attempts: {attempts}/{args.retries}")
 
 
+
+
 def main():
-    """Entry point that runs the async main."""
-    asyncio.run(async_main())
+    """Entry point that runs the async main.
+
+    For --project mode, loops until no more todo tasks remain.
+    For --task/--tasks mode, runs once and exits.
+    """
+    # Check sys.argv to determine if --project mode (no parse_args needed)
+    is_project_mode = "--project" in sys.argv and "--task" not in sys.argv and "--tasks" not in sys.argv
+
+    if is_project_mode:
+        # --project mode: loop through all todo tasks
+        task_count = 0
+        while True:
+            try:
+                asyncio.run(async_main())
+                task_count += 1
+                print(f"\n{'='*60}")
+                print(f"Task complete ({task_count} so far). Checking for more...")
+                print(f"{'='*60}\n")
+            except SystemExit as e:
+                if e.code == 0:
+                    # Normal exit = no more tasks
+                    print(f"\nAll done! Completed {task_count} tasks for project {args.project}.")
+                    break
+                else:
+                    # Error exit
+                    print(f"\nOrchestrator exited with code {e.code} after {task_count} tasks.")
+                    sys.exit(e.code)
+            except KeyboardInterrupt:
+                print(f"\nInterrupted after {task_count} tasks.")
+                sys.exit(0)
+            except Exception as e:
+                print(f"\nError after {task_count} tasks: {e}")
+                print("Stopping orchestrator loop.")
+                sys.exit(1)
+    else:
+        # Single task or parallel tasks mode: run once
+        asyncio.run(async_main())
 
 
 if __name__ == "__main__":
