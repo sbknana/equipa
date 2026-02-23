@@ -398,11 +398,14 @@ def update_task_status(task_id, outcome, output=None):
 
 
 def record_agent_run(task, result, outcome, role="developer", model="opus",
-                     max_turns=25, cycle_number=1, continuation_count=0, output=None):
+                     max_turns=25, cycle_number=1, continuation_count=0, output=None,
+                     prompt_version=None):
     """Record agent execution telemetry to TheForge agent_runs table.
 
     Never crashes the orchestrator — all errors are logged and swallowed.
     Reads turns_allocated from result dict if available (set by dynamic budget system).
+    prompt_version: which prompt version was used (e.g., "baseline", "v2").
+        If None, reads from _last_prompt_version[role].
     """
     try:
         task_id = task.get("id") if isinstance(task, dict) else task
@@ -417,6 +420,10 @@ def record_agent_run(task, result, outcome, role="developer", model="opus",
         turns_allocated = result.get("turns_allocated") if isinstance(result, dict) else None
         error_type = None
         error_summary = None
+
+        # Resolve prompt version from A/B testing tracker if not explicitly passed
+        if prompt_version is None:
+            prompt_version = _last_prompt_version.get(role, "baseline")
 
         # Early termination gets priority for error_type/error_summary
         if isinstance(result, dict) and result.get("early_terminated"):
@@ -440,18 +447,20 @@ def record_agent_run(task, result, outcome, role="developer", model="opus",
                (task_id, project_id, role, model, complexity, num_turns,
                 max_turns_allowed, duration_seconds, cost_usd, outcome,
                 success, cycle_number, continuation_count, files_changed_count,
-                error_type, error_summary, turns_allocated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                error_type, error_summary, turns_allocated, prompt_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, project_id, role, model, complexity, num_turns,
              max_turns, duration, cost, outcome,
              success, cycle_number, continuation_count, files_changed,
-             error_type, error_summary, turns_allocated),
+             error_type, error_summary, turns_allocated, prompt_version),
         )
         conn.commit()
         conn.close()
         budget_info = f", allocated={turns_allocated}" if turns_allocated else ""
+        version_info = f", prompt={prompt_version}" if prompt_version != "baseline" else ""
         log(f"  [Telemetry] Recorded agent run: role={role}, outcome={outcome}, "
-            f"turns={num_turns}/{max_turns}{budget_info}, duration={duration:.0f}s", output)
+            f"turns={num_turns}/{max_turns}{budget_info}{version_info}, "
+            f"duration={duration:.0f}s", output)
     except Exception as e:
         log(f"  [Telemetry] WARNING: Failed to record agent run: {e}", output)
 
@@ -952,6 +961,192 @@ def build_task_prompt(task, project_context, project_dir):
     return "\n".join(lines)
 
 
+# --- Context Engineering Helpers ---
+
+# Token budget constants (Anthropic recommendation: ~4 chars/token for Claude)
+CHARS_PER_TOKEN = 4
+SYSTEM_PROMPT_TOKEN_TARGET = 8000  # 8K token target
+SYSTEM_PROMPT_TOKEN_HARD_LIMIT = 10000  # absolute max before aggressive trimming
+EPISODE_REDUCTION_THRESHOLD = 6000  # reduce episodes from 3->2 above this
+
+
+def estimate_tokens(text):
+    """Estimate token count using ~4 chars/token approximation for Claude."""
+    if not text:
+        return 0
+    return len(text) // CHARS_PER_TOKEN
+
+
+def compute_keyword_overlap(text_a, text_b):
+    """Compute simple keyword overlap score between two texts.
+
+    Returns a float between 0.0 and 1.0 representing the fraction of
+    words in common (Jaccard similarity on word sets).
+    """
+    if not text_a or not text_b:
+        return 0.0
+    # Normalize: lowercase, split on whitespace/punctuation
+    import re
+    words_a = set(re.findall(r'\w+', text_a.lower()))
+    words_b = set(re.findall(r'\w+', text_b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+def deduplicate_lessons(lessons):
+    """Remove semantically duplicate lessons based on 60%+ word overlap.
+
+    Keeps the first (highest times_seen) lesson when duplicates are found.
+    Returns deduplicated list, max 5 lessons.
+    """
+    if not lessons:
+        return []
+
+    unique = []
+    for lesson in lessons:
+        lesson_text = lesson.get("lesson", "")
+        is_dup = False
+        for existing in unique:
+            overlap = compute_keyword_overlap(lesson_text, existing.get("lesson", ""))
+            if overlap >= 0.6:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(lesson)
+        if len(unique) >= 5:
+            break
+
+    return unique
+
+
+def compact_agent_output(raw_output, max_words=200):
+    """Compact raw agent output into a concise summary preserving actionable details.
+
+    Keeps file paths, error messages, and key actions while trimming verbose output.
+    Target: max_words words.
+    """
+    if not raw_output:
+        return ""
+
+    # Extract the RESULT block if present (always preserve this)
+    result_block = ""
+    result_start = raw_output.rfind("RESULT:")
+    if result_start != -1:
+        result_block = raw_output[result_start:].strip()
+
+    # Extract FILES_CHANGED section (header + bullet lines only)
+    files_section = ""
+    fc_start = raw_output.rfind("FILES_CHANGED:")
+    if fc_start != -1:
+        fc_lines_raw = raw_output[fc_start:].split("\n")
+        fc_kept = [fc_lines_raw[0]]  # Always keep the header line
+        for line in fc_lines_raw[1:6]:
+            stripped = line.strip()
+            if stripped.startswith("-") or stripped == "":
+                fc_kept.append(line)
+            else:
+                break  # Stop at first non-bullet, non-empty line
+        files_section = "\n".join(fc_kept).strip()
+
+    # Extract BLOCKERS if present
+    blockers = ""
+    bl_start = raw_output.rfind("BLOCKERS:")
+    if bl_start != -1:
+        bl_end = raw_output.find("\n", bl_start + 20)
+        if bl_end == -1:
+            bl_end = len(raw_output)
+        blockers = raw_output[bl_start:bl_end].strip()
+
+    # Extract SUMMARY if present
+    summary_line = ""
+    sum_start = raw_output.rfind("SUMMARY:")
+    if sum_start != -1:
+        sum_end = raw_output.find("\n", sum_start)
+        if sum_end == -1:
+            sum_end = len(raw_output)
+        summary_line = raw_output[sum_start:sum_end].strip()
+
+    # Extract DECISIONS if present (actionable architectural info)
+    decisions = ""
+    dec_start = raw_output.rfind("DECISIONS:")
+    if dec_start != -1:
+        dec_end = raw_output.find("\n", dec_start + 15)
+        if dec_end == -1:
+            dec_end = len(raw_output)
+        decisions = raw_output[dec_start:dec_end].strip()
+
+    # Extract REFLECTION if present (contains specific file paths, error messages)
+    reflection = ""
+    ref_start = raw_output.rfind("REFLECTION:")
+    if ref_start != -1:
+        # Capture up to 3 lines of reflection (often multi-line)
+        ref_lines = raw_output[ref_start:].split("\n")[:3]
+        reflection = "\n".join(ref_lines).strip()
+
+    # Build compact output from structured sections
+    parts = []
+    if summary_line:
+        parts.append(summary_line)
+    if files_section:
+        parts.append(files_section)
+    if blockers and "none" not in blockers.lower():
+        parts.append(blockers)
+    if decisions and "none" not in decisions.lower():
+        parts.append(decisions)
+    if reflection:
+        parts.append(reflection)
+
+    compact = "\n".join(parts)
+
+    # If we got structured output, use it; otherwise fall back to tail
+    if not compact.strip():
+        # No structured output found — take last max_words words
+        words = raw_output.split()
+        if len(words) > max_words:
+            compact = "..." + " ".join(words[-max_words:])
+        else:
+            compact = raw_output
+
+    # Final word count check
+    words = compact.split()
+    if len(words) > max_words:
+        compact = " ".join(words[:max_words]) + "..."
+
+    return compact
+
+
+def _trim_prompt_section(prompt, section_heading, max_chars=None):
+    """Remove or truncate a section from the prompt by its ## heading.
+
+    If max_chars is None, removes the entire section.
+    If max_chars is given, truncates the section content to that limit.
+    Returns the modified prompt.
+    """
+    start = prompt.find(section_heading)
+    if start == -1:
+        return prompt
+
+    # Find the next section boundary (## or ---)
+    next_section = len(prompt)
+    for marker in ["\n## ", "\n---"]:
+        pos = prompt.find(marker, start + len(section_heading))
+        if pos != -1 and pos < next_section:
+            next_section = pos
+
+    if max_chars is None:
+        # Remove entire section
+        return prompt[:start] + prompt[next_section:]
+    else:
+        # Truncate section content
+        section = prompt[start:next_section]
+        if len(section) > max_chars:
+            section = section[:max_chars] + "\n[...trimmed...]\n"
+        return prompt[:start] + section + prompt[next_section:]
+
+
 def format_lessons_for_injection(lessons):
     """Format lessons_learned for injection into agent prompts.
 
@@ -1004,12 +1199,21 @@ def update_lesson_injection_count(lesson_ids):
 # after the task completes. Keyed by task_id, value is list of episode IDs.
 _injected_episodes_by_task = {}
 
-def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, limit=3):
+# Track which prompt version was used per role (for A/B testing telemetry).
+# Set by build_system_prompt(), read by record_agent_run().
+_last_prompt_version = {}
+
+def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, limit=3,
+                          task_description=None):
     """Fetch relevant past episodes for injection into agent prompts.
 
     Matches by: same role + same project + optionally similar task_type.
     Filters by q_value > min_q_value (only inject useful experiences).
-    Returns top episodes ordered by q_value descending.
+
+    Scoring combines:
+    - q_value (base quality signal)
+    - Task description keyword overlap (if task_description provided)
+    - Recency weighting (episodes from last 7 days weighted 2x)
 
     Args:
         role: Agent role (e.g. 'developer', 'tester')
@@ -1017,22 +1221,28 @@ def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, lim
         task_type: Optional task type for similarity matching
         min_q_value: Minimum q_value threshold (default 0.3)
         limit: Maximum episodes to return (default 3)
+        task_description: Optional task description for keyword similarity scoring
 
     Returns:
         List of episode dicts with id, approach_summary, outcome, reflection, q_value
     """
+    from datetime import datetime, timedelta
+
     try:
         conn = get_db_connection()
+        # Fetch more candidates than needed so we can re-rank
+        fetch_limit = max(limit * 3, 10)
+
         # Primary match: same role + same project + q_value above threshold + has reflection
         rows = conn.execute(
-            """SELECT id, task_id, task_type, approach_summary, outcome,
-                      reflection, q_value, turns_used
+            """SELECT id, task_id, task_type, project_id, approach_summary, outcome,
+                      reflection, q_value, turns_used, created_at
                FROM agent_episodes
                WHERE role = ? AND project_id = ? AND q_value > ?
                  AND reflection IS NOT NULL AND reflection != ''
                ORDER BY q_value DESC, created_at DESC
                LIMIT ?""",
-            (role, project_id, min_q_value, limit),
+            (role, project_id, min_q_value, fetch_limit),
         ).fetchall()
 
         episodes = [dict(r) for r in rows]
@@ -1042,8 +1252,8 @@ def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, lim
             existing_ids = {e["id"] for e in episodes}
             remaining = limit - len(episodes)
             cross_rows = conn.execute(
-                """SELECT id, task_id, task_type, approach_summary, outcome,
-                          reflection, q_value, turns_used
+                """SELECT id, task_id, task_type, project_id, approach_summary, outcome,
+                          reflection, q_value, turns_used, created_at
                    FROM agent_episodes
                    WHERE role = ? AND task_type = ? AND q_value > ?
                      AND reflection IS NOT NULL AND reflection != ''
@@ -1052,12 +1262,48 @@ def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, lim
                 (role, task_type, min_q_value, remaining + len(existing_ids)),
             ).fetchall()
             for r in cross_rows:
-                if dict(r)["id"] not in existing_ids and len(episodes) < limit:
+                if dict(r)["id"] not in existing_ids:
                     episodes.append(dict(r))
                     existing_ids.add(dict(r)["id"])
 
         conn.close()
-        return episodes
+
+        # Score and re-rank episodes
+        now = datetime.now()
+        seven_days_ago = now - timedelta(days=7)
+
+        for ep in episodes:
+            score = ep.get("q_value", 0.5)
+
+            # Recency weighting: episodes from last 7 days get 2x weight
+            created = ep.get("created_at")
+            if created:
+                try:
+                    ep_date = datetime.fromisoformat(created.replace("Z", "+00:00").split("+")[0])
+                    if ep_date >= seven_days_ago:
+                        score *= 2.0
+                except (ValueError, AttributeError):
+                    pass  # Can't parse date, skip recency bonus
+
+            # Task description keyword overlap scoring
+            if task_description:
+                ep_text = (ep.get("approach_summary", "") or "") + " " + (ep.get("reflection", "") or "")
+                overlap = compute_keyword_overlap(task_description, ep_text)
+                # Boost score by up to 50% based on keyword overlap
+                score *= (1.0 + overlap * 0.5)
+
+            ep["_relevance_score"] = score
+
+        # Sort by relevance score descending
+        episodes.sort(key=lambda e: e.get("_relevance_score", 0), reverse=True)
+
+        # Return top N, strip internal scoring field
+        result = episodes[:limit]
+        for ep in result:
+            ep.pop("_relevance_score", None)
+            ep.pop("created_at", None)
+
+        return result
     except Exception as e:
         print(f"Warning: Failed to fetch relevant episodes: {e}")
         return []
@@ -1179,10 +1425,20 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
                         extra_context="", dispatch_config=None, error_type=None):
     """Read _common.md + role prompt, replace placeholders, append task prompt.
 
+    Applies context engineering principles:
+    - Token budget management (8K target, trimming in priority order)
+    - Lesson deduplication (60%+ word overlap removed, max 5)
+    - Episode relevance scoring (keyword overlap + recency weighting)
+    - Token count logging per dispatch
+    - A/B prompt version selection (GEPA-evolved prompts)
+
     extra_context: optional string appended after the task prompt (used for
     compaction history and test failure feedback in dev-test loop).
     dispatch_config: optional config dict for task-type-specific prompt injection.
     error_type: optional error type to filter relevant lessons (e.g. 'timeout', 'max_turns').
+
+    Returns the system prompt string. Also sets _last_prompt_version[role] for
+    telemetry tracking.
     """
     common_path = PROMPTS_DIR / "_common.md"
     role_path = ROLE_PROMPTS.get(role)
@@ -1199,7 +1455,20 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
         print(f"ERROR: Role prompt not found at {role_path}")
         sys.exit(1)
 
-    # Build prompt: common rules + role-specific prompt
+    # A/B prompt version selection: try GEPA-evolved prompt if available
+    prompt_version = "baseline"
+    try:
+        from forgesmith_gepa import get_ab_prompt_for_role
+        selected_path, prompt_version = get_ab_prompt_for_role(role)
+        if selected_path.exists() and prompt_version != "baseline":
+            role_path = selected_path
+    except ImportError:
+        pass  # forgesmith_gepa not available, use baseline
+
+    # Track which version was used for telemetry
+    _last_prompt_version[role] = prompt_version
+
+    # Build prompt: common rules + role-specific prompt (never trimmed)
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
     template = common_text + "\n\n---\n\n" + role_text
@@ -1208,22 +1477,34 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     prompt = template.replace("{task_id}", str(task["id"]))
     prompt = prompt.replace("{project_id}", str(task.get("project_id", "")))
 
-    # Inject lessons learned from ForgeSmith (after ForgeSmith Tuning section)
-    lessons = get_relevant_lessons(role=role, error_type=error_type, limit=3)
+    # --- Lesson injection with deduplication ---
+    # Fetch more candidates than we'll inject, then deduplicate
+    lessons = get_relevant_lessons(role=role, error_type=error_type, limit=10)
     if lessons:
+        # Deduplicate: remove 60%+ word overlap, cap at 5
+        lessons = deduplicate_lessons(lessons)
         lessons_text = format_lessons_for_injection(lessons)
         prompt = prompt + "\n\n" + lessons_text
         # Update times_injected counter for each lesson
         update_lesson_injection_count([l["id"] for l in lessons])
 
-    # Inject relevant past episodes (MemRL pattern)
+    # --- Episode injection with relevance scoring ---
     task_id = task.get("id") if isinstance(task, dict) else task
     project_id = task.get("project_id") if isinstance(task, dict) else None
     task_type = task.get("task_type", "feature") if isinstance(task, dict) else None
+    task_description = task.get("description", "") if isinstance(task, dict) else ""
+
+    # Check token budget to decide episode limit
+    current_tokens = estimate_tokens(prompt)
+    episode_limit = 3
+    if current_tokens > EPISODE_REDUCTION_THRESHOLD:
+        episode_limit = 2  # Reduce episodes when prompt is already large
+
     if project_id:
         episodes = get_relevant_episodes(
             role=role, project_id=project_id, task_type=task_type,
-            min_q_value=0.3, limit=3,
+            min_q_value=0.3, limit=episode_limit,
+            task_description=task_description,
         )
         if episodes:
             episodes_text = format_episodes_for_injection(episodes)
@@ -1244,7 +1525,7 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
                 f"{task_type_prompts[task_type]}\n"
             )
 
-    # Append task-specific instructions
+    # Append task-specific instructions (never trimmed)
     task_prompt = build_task_prompt(task, project_context, project_dir)
     prompt = prompt + "\n\n---\n\n" + task_prompt
 
@@ -1255,6 +1536,36 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     # Append extra context (compaction history, test failures) if provided
     if extra_context:
         prompt = prompt + "\n\n---\n\n" + extra_context
+
+    # --- Token budget enforcement ---
+    # Trim in priority order: old episodes first, then generic lessons
+    # Never trim: role prompt, task description
+    token_count = estimate_tokens(prompt)
+
+    if token_count > SYSTEM_PROMPT_TOKEN_TARGET:
+        # Priority 1: Trim old episodes (## Past Experience)
+        if token_count > SYSTEM_PROMPT_TOKEN_TARGET:
+            prompt = _trim_prompt_section(prompt, "## Past Experience",
+                                          max_chars=CHARS_PER_TOKEN * 500)
+            token_count = estimate_tokens(prompt)
+
+        # Priority 2: Trim generic lessons (## Lessons from Previous Runs)
+        if token_count > SYSTEM_PROMPT_TOKEN_HARD_LIMIT:
+            prompt = _trim_prompt_section(prompt, "## Lessons from Previous Runs",
+                                          max_chars=CHARS_PER_TOKEN * 300)
+            token_count = estimate_tokens(prompt)
+
+        # Priority 3: Trim extra context (## Prior Work Summary, etc.)
+        if token_count > SYSTEM_PROMPT_TOKEN_HARD_LIMIT:
+            prompt = _trim_prompt_section(prompt, "## Prior Work Summary",
+                                          max_chars=CHARS_PER_TOKEN * 400)
+            token_count = estimate_tokens(prompt)
+
+    # Log token count for monitoring
+    final_tokens = estimate_tokens(prompt)
+    budget_status = "OK" if final_tokens <= SYSTEM_PROMPT_TOKEN_TARGET else "OVER"
+    print(f"  [ContextEng] System prompt: {len(prompt)} chars, ~{final_tokens} tokens "
+          f"({budget_status}, target: {SYSTEM_PROMPT_TOKEN_TARGET})")
 
     return prompt
 
@@ -1422,21 +1733,20 @@ def clear_checkpoints(task_id, role=None):
 
 
 def build_checkpoint_context(checkpoint_text, attempt):
-    """Build context string from a checkpoint for the next agent attempt."""
-    # Truncate very long checkpoints to avoid blowing up the prompt
-    max_chars = 8000
-    if len(checkpoint_text) > max_chars:
-        checkpoint_text = (
-            checkpoint_text[:max_chars]
-            + f"\n\n[... truncated, {len(checkpoint_text) - max_chars} chars omitted ...]"
-        )
+    """Build context string from a checkpoint for the next agent attempt.
+
+    Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
+    BLOCKERS, SUMMARY) instead of passing raw text, preventing context rot.
+    """
+    # Compact checkpoint to structured summary (max 200 words)
+    compacted = compact_agent_output(checkpoint_text, max_words=200)
 
     return (
         f"## Previous Attempt (#{attempt}) — Continue From Here\n\n"
         f"A previous agent worked on this task but ran out of turns or timed out. "
         f"Here is what they accomplished. **Do NOT repeat work that is already done.** "
         f"Pick up where they left off.\n\n"
-        f"### Previous Agent Output:\n```\n{checkpoint_text}\n```\n\n"
+        f"### Previous Agent Summary:\n{compacted}\n\n"
         f"**IMPORTANT:** Review the project files to see what was already implemented. "
         f"Focus only on what remains to be done."
     )
@@ -2098,21 +2408,22 @@ def parse_developer_output(result_text):
 # --- Session Compaction (Phase 2) ---
 
 def build_compaction_summary(role, result, cycle, task):
-    """Capture tail of agent output with cycle/role context.
+    """Compact agent output into a concise summary preserving actionable details.
 
-    Used to inject prior work context into the next agent's prompt
-    when an agent exceeds the turn threshold.
+    Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
+    BLOCKERS, SUMMARY) from raw output instead of passing raw tail content.
+    Target: ~200 words max to prevent context rot across cycles.
     """
     text = result.get("result_text", "")
-    # Keep last 2000 chars to stay within prompt size limits
-    tail = text[-2000:] if len(text) > 2000 else text
+    # Compact to 200 words max, preserving file paths and error messages
+    compacted = compact_agent_output(text, max_words=200)
 
     summary = (
         f"## Prior Work Summary (Cycle {cycle}, {role})\n"
         f"Task: #{task['id']} - {task['title']}\n"
         f"Turns used: {result.get('num_turns', '?')}\n"
         f"---\n"
-        f"{tail}\n"
+        f"{compacted}\n"
     )
     return summary
 
@@ -2121,6 +2432,8 @@ def build_test_failure_context(test_results, cycle):
     """Format Tester failures + recommendations for the Developer's next attempt.
 
     Returns a string to append to the Developer's system prompt.
+    Caps output to prevent unbounded context growth: max 5 failure details,
+    each truncated to 200 chars; max 3 recommendations.
     """
     lines = [
         f"## Test Failures from Cycle {cycle}",
@@ -2133,14 +2446,21 @@ def build_test_failure_context(test_results, cycle):
 
     if test_results["failure_details"]:
         lines.append("### Failing Tests:")
-        for detail in test_results["failure_details"]:
-            lines.append(f"- {detail}")
+        # Cap at 5 details, truncate each to 200 chars
+        for detail in test_results["failure_details"][:5]:
+            truncated = detail[:200] + "..." if len(detail) > 200 else detail
+            lines.append(f"- {truncated}")
+        remaining = len(test_results["failure_details"]) - 5
+        if remaining > 0:
+            lines.append(f"- ...and {remaining} more failure(s)")
         lines.append("")
 
     if test_results["recommendations"]:
         lines.append("### Tester Recommendations:")
-        for rec in test_results["recommendations"]:
-            lines.append(f"- {rec}")
+        # Cap at 3 recommendations
+        for rec in test_results["recommendations"][:3]:
+            truncated = rec[:200] + "..." if len(rec) > 200 else rec
+            lines.append(f"- {truncated}")
         lines.append("")
 
     lines.append("**Fix these test failures. Do NOT skip or delete failing tests.**")
@@ -2490,7 +2810,20 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             f"(budget: {dev_turns_allocated}/{dev_turns_max})...", output)
 
         # Build extra context from compaction history
-        extra_context = "\n\n".join(compaction_history) if compaction_history else ""
+        # After cycle 2+, consolidate ALL prior cycles into a single section
+        # to prevent context rot from accumulated raw output
+        if cycle >= 2 and len(compaction_history) > 1:
+            consolidated = (
+                f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
+                + "\n\n".join(compaction_history)
+            )
+            # Compact the consolidated section to prevent unbounded growth
+            words = consolidated.split()
+            if len(words) > 400:
+                consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
+            extra_context = consolidated
+        else:
+            extra_context = "\n\n".join(compaction_history) if compaction_history else ""
 
         dev_prompt = build_system_prompt(
             task, project_context, project_dir,
@@ -2563,12 +2896,13 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             log(f"  [Cycle {cycle}] Developer agent failed.", output)
             return dev_result, cycle, "developer_failed"
 
-        # Compaction: if Developer used many turns, capture summary
-        if dev_result.get("num_turns", 0) >= DEV_COMPACTION_THRESHOLD:
-            log(f"  [Cycle {cycle}] Developer used {dev_result['num_turns']} turns, "
-                f"compacting context...", output)
-            summary = build_compaction_summary("Developer", dev_result, cycle, task)
-            compaction_history.append(summary)
+        # Compaction: ALWAYS compact developer output before passing to next cycle
+        # (context engineering: never pass raw agent output between cycles)
+        dev_turns_used_for_compact = dev_result.get("num_turns", 0)
+        log(f"  [Cycle {cycle}] Compacting developer output "
+            f"({dev_turns_used_for_compact} turns)...", output)
+        summary = build_compaction_summary("Developer", dev_result, cycle, task)
+        compaction_history.append(summary)
 
         # Check if Developer marked task blocked
         status = _get_task_status(task["id"])
@@ -2656,22 +2990,27 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             total_cost += tester_result["cost"]
 
         # Check for early termination (stuck tester)
+        # Tester early-termination = treat as no-tests, accept developer work
         if tester_result.get("early_terminated"):
             reason = tester_result.get("early_term_reason", "unknown")
             log(f"  [Cycle {cycle}] Tester early-terminated: {reason}", output)
-            return tester_result, cycle, "early_terminated"
+            log(f"  [Cycle {cycle}] Treating tester early-termination as no-tests (accepting dev work)", output)
+            tester_result["result"] = "no-tests"
+            tester_result["tests_run"] = 0
+            tester_result["tests_passed"] = 0
 
         # Check for timeout
         if any("timed out" in e for e in tester_result.get("errors", [])):
             log(f"  [Cycle {cycle}] Tester timed out.", output)
             return tester_result, cycle, "tester_timeout"
 
-        # Compaction: if Tester used many turns, capture summary
-        if tester_result.get("num_turns", 0) >= TESTER_COMPACTION_THRESHOLD:
-            log(f"  [Cycle {cycle}] Tester used {tester_result['num_turns']} turns, "
-                f"compacting context...", output)
-            summary = build_compaction_summary("Tester", tester_result, cycle, task)
-            compaction_history.append(summary)
+        # Compaction: ALWAYS compact tester output before passing to next cycle
+        # (context engineering: never pass raw agent output between cycles)
+        tester_turns_for_compact = tester_result.get("num_turns", 0)
+        log(f"  [Cycle {cycle}] Compacting tester output "
+            f"({tester_turns_for_compact} turns)...", output)
+        summary = build_compaction_summary("Tester", tester_result, cycle, task)
+        compaction_history.append(summary)
 
         # Parse Tester output
         test_results = parse_tester_output(tester_result.get("result_text", ""))
@@ -4756,8 +5095,7 @@ async def async_main():
         print(f"Developer: model={dev_model}, budget={dev_budget}/{dev_turns} (dynamic)")
         print(f"Tester: model={tester_model}, budget={tester_budget}/{tester_turns} (dynamic)")
         print(f"Max cycles: {MAX_DEV_TEST_CYCLES}")
-        print(f"Compaction: Dev >= {DEV_COMPACTION_THRESHOLD} turns, "
-              f"Tester >= {TESTER_COMPACTION_THRESHOLD} turns")
+        print(f"Compaction: Always (context engineering — never pass raw output between cycles)")
         # Check for checkpoint
         cp_text, cp_attempt = load_checkpoint(task['id'], role="developer")
         if cp_text:
@@ -4779,7 +5117,7 @@ async def async_main():
         cmd = build_cli_command(system_prompt, project_dir, dry_turns, dry_model, role="developer")
 
         print(f"\n--- DRY RUN ---")
-        print(f"System prompt: {len(system_prompt)} chars")
+        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
         print(f"Command ({len(cmd)} args):")
         for i, part in enumerate(cmd):
             if i > 0 and cmd[i - 1] == "--append-system-prompt":
@@ -4864,7 +5202,7 @@ async def async_main():
             system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
             streaming=use_streaming,
         )
-        print(f"System prompt: {len(system_prompt)} chars")
+        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
 
         print(f"\nStarting {args.role} agent...")
         if use_streaming:

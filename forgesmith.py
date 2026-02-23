@@ -4,13 +4,16 @@
 Runs nightly (or on-demand) to analyze agent telemetry and make targeted
 improvements to prompts, config, and blocked task resolution.
 
-Pipeline: COLLECT → ANALYZE → DECIDE → APPLY → LOG
+Pipeline: COLLECT → ANALYZE → DECIDE → APPLY → SIMBA → PROPOSE → EVOLVE → LOG
 
 Usage:
     python3 forgesmith.py --auto          # Full run: analyze + apply changes
     python3 forgesmith.py --dry-run       # Show proposed changes without applying
     python3 forgesmith.py --report        # JSON analysis report only
     python3 forgesmith.py --rollback RUN  # Revert all changes from a specific run
+    python3 forgesmith.py --propose       # Run OPRO proposal step only
+    python3 forgesmith.py --simba         # Run SIMBA rule generation only
+    python3 forgesmith.py --gepa          # Run GEPA prompt evolution only
 """
 
 import argparse
@@ -19,10 +22,14 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from forgesmith_simba import run_simba
+from forgesmith_gepa import run_gepa
 
 # --- Paths ---
 
@@ -89,10 +96,11 @@ def load_config():
 
 def get_db(write=False):
     """Connect to TheForge SQLite database."""
+    db_path = os.environ.get("THEFORGE_DB", THEFORGE_DB)
     if write:
-        conn = sqlite3.connect(THEFORGE_DB)
+        conn = sqlite3.connect(db_path)
     else:
-        uri = f"file:{THEFORGE_DB}?mode=ro"
+        uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1854,6 +1862,630 @@ def get_rubric_report(role=None, limit=20):
 
 
 # ============================================================
+# PHASE 4.7: PROPOSE — OPRO-style LLM-driven prompt optimization
+# ============================================================
+
+def collect_role_metrics(runs, cfg):
+    """Aggregate per-role metrics from the lookback window for OPRO context.
+
+    Returns {role: {success_rate, avg_turns, max_turns_hit_rate,
+                    total_runs, common_errors, avg_duration_s}}
+    """
+    by_role = {}
+    for r in runs:
+        role = r["role"]
+        if role not in by_role:
+            by_role[role] = {
+                "total": 0, "success": 0, "turns": [], "durations": [],
+                "max_turns_hits": 0, "errors": {},
+            }
+        info = by_role[role]
+        info["total"] += 1
+        if r["success"]:
+            info["success"] += 1
+        if r["num_turns"]:
+            info["turns"].append(r["num_turns"])
+        if r.get("duration_seconds"):
+            info["durations"].append(r["duration_seconds"])
+        if r["num_turns"] and r["max_turns_allowed"]:
+            if r["num_turns"] >= r["max_turns_allowed"] - 1:
+                info["max_turns_hits"] += 1
+        if r.get("error_summary"):
+            sig = r["error_summary"][:120].strip().lower()
+            info["errors"][sig] = info["errors"].get(sig, 0) + 1
+
+    metrics = {}
+    for role, info in by_role.items():
+        top_errors = sorted(info["errors"].items(), key=lambda x: -x[1])[:5]
+        metrics[role] = {
+            "total_runs": info["total"],
+            "success_rate": round(info["success"] / max(info["total"], 1), 2),
+            "avg_turns": round(sum(info["turns"]) / max(len(info["turns"]), 1), 1),
+            "max_turns_hit_rate": round(
+                info["max_turns_hits"] / max(info["total"], 1), 2
+            ),
+            "avg_duration_s": round(
+                sum(info["durations"]) / max(len(info["durations"]), 1), 0
+            ),
+            "common_errors": [
+                {"error": err, "count": cnt} for err, cnt in top_errors
+            ],
+        }
+    return metrics
+
+
+def collect_recent_reflections(cfg, role=None, limit=10):
+    """Fetch recent agent episode reflections for OPRO context.
+
+    Returns list of {role, task_type, outcome, reflection, turns_used}.
+    """
+    conn = get_db()
+    lookback = cfg["lookback_days"]
+    if role:
+        rows = conn.execute(
+            """SELECT role, task_type, outcome, reflection, turns_used
+               FROM agent_episodes
+               WHERE reflection IS NOT NULL
+                 AND created_at >= datetime('now', ?)
+                 AND role = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (f"-{lookback} days", role, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT role, task_type, outcome, reflection, turns_used
+               FROM agent_episodes
+               WHERE reflection IS NOT NULL
+                 AND created_at >= datetime('now', ?)
+               ORDER BY created_at DESC LIMIT ?""",
+            (f"-{lookback} days", limit),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
+    """Construct the OPRO meta-prompt for Claude to propose prompt modifications.
+
+    Provides the current prompt, metrics context, and recent reflections,
+    then asks for specific, testable modifications with rationale.
+    """
+    opro_cfg = cfg.get("opro", {})
+    max_proposals = opro_cfg.get("max_proposals_per_role", 3)
+
+    # Format metrics summary
+    role_metrics = metrics.get(role, {})
+    metrics_text = json.dumps(role_metrics, indent=2) if role_metrics else "No metrics available."
+
+    # Format reflections
+    role_reflections = [r for r in reflections if r["role"] == role]
+    if role_reflections:
+        reflections_text = "\n".join(
+            f"- [{r['outcome']}] (turns: {r['turns_used']}) {r['reflection']}"
+            for r in role_reflections[:7]
+        )
+    else:
+        reflections_text = "No reflections available for this role."
+
+    # Format lessons
+    lessons = get_relevant_lessons(role=role, limit=5)
+    if lessons:
+        lessons_text = "\n".join(
+            f"- (seen {l['times_seen']}x) {l['lesson']}" for l in lessons
+        )
+    else:
+        lessons_text = "No lessons available."
+
+    prompt = f"""You are an expert prompt engineer optimizing agent system prompts for a multi-agent software development system called ForgeTeam.
+
+## Your Task
+Analyze the current prompt for the "{role}" role and propose specific, testable modifications to improve agent performance based on the metrics and reflections provided.
+
+## Current Prompt for "{role}"
+```
+{current_prompt}
+```
+
+## Performance Metrics (last {cfg['lookback_days']} days)
+{metrics_text}
+
+## Recent Agent Reflections
+{reflections_text}
+
+## Lessons Learned
+{lessons_text}
+
+## Rules for Proposals
+1. Each proposal MUST be a specific, concrete change — not vague advice
+2. Proposals must be TESTABLE: after applying, we can measure whether the metric improved
+3. NEVER propose removing the "RESULT:" output block format, the "Output Requirements" section, or the "Output Format" section — these are critical for the orchestrator
+4. NEVER propose removing git commit requirements
+5. Focus on the biggest performance gaps shown in the metrics
+6. Prefer adding guidance or restructuring existing text over removing sections
+7. Keep proposals targeted — each should address ONE specific issue
+8. Do NOT propose changes to sections marked "(auto-tuned)" — ForgeSmith manages those
+
+## Output Format
+Respond with ONLY a JSON array of proposals. Each proposal must have these fields:
+- "target_section": Which section of the prompt to modify (e.g., "Workflow", "Developer Rules", "Handling Build Errors")
+- "action": One of "add", "replace", "reorder" (never "delete")
+- "old_text": The exact text being replaced (empty string for "add" actions)
+- "new_text": The new/replacement text
+- "rationale": Why this change should improve performance (reference specific metrics)
+- "expected_improvement": Which metric this targets and by how much (e.g., "success_rate +5%")
+- "confidence": "high", "medium", or "low"
+
+Return at most {max_proposals} proposals, ordered by expected impact (highest first).
+Respond with ONLY the JSON array, no other text."""
+
+    return prompt
+
+
+OPRO_PROTECTED_PATTERNS = [
+    r"RESULT:\s*success\s*\|\s*blocked\s*\|\s*failed",
+    r"SUMMARY:",
+    r"FILES_CHANGED:",
+    r"BLOCKERS:",
+    r"Output Requirements",
+    r"Output Format",
+    r"git\s+add.*git\s+commit",
+    r"Git Commit Requirements",
+]
+
+
+def validate_opro_proposal(proposal, current_prompt, cfg):
+    """Validate an OPRO proposal for safety.
+
+    Returns (is_valid, rejection_reason).
+    Rejects proposals that:
+    - Would delete protected sections (RESULT block, Output Requirements)
+    - Target protected files
+    - Have no concrete new_text
+    - Are too vague to be testable
+    """
+    action = proposal.get("action", "")
+    old_text = proposal.get("old_text", "")
+    new_text = proposal.get("new_text", "")
+    target = proposal.get("target_section", "")
+
+    # Action must be one of the allowed types
+    if action not in ("add", "replace", "reorder"):
+        return False, f"Invalid action '{action}' — must be add, replace, or reorder"
+
+    # new_text must be non-empty
+    if not new_text or not new_text.strip():
+        return False, "Proposal has empty new_text"
+
+    # For replace actions, old_text must exist in the current prompt
+    if action == "replace":
+        if not old_text or not old_text.strip():
+            return False, "Replace action requires non-empty old_text"
+        if old_text.strip() not in current_prompt:
+            return False, "old_text not found in current prompt — cannot apply"
+
+    # Check that new_text doesn't remove protected patterns
+    # For replace: ensure protected patterns in old_text are preserved in new_text
+    if action == "replace" and old_text:
+        for pattern in OPRO_PROTECTED_PATTERNS:
+            if re.search(pattern, old_text, re.IGNORECASE | re.DOTALL):
+                if not re.search(pattern, new_text, re.IGNORECASE | re.DOTALL):
+                    return False, f"Proposal would remove protected pattern: {pattern}"
+
+    # Reject proposals that are just vague advice (< 20 chars of actual content)
+    content_lines = [l.strip() for l in new_text.split("\n") if l.strip()]
+    if len(content_lines) < 1 or all(len(l) < 15 for l in content_lines):
+        return False, "Proposal too vague — needs concrete, specific text"
+
+    # Don't allow proposals targeting auto-tuned sections
+    if "(auto-tuned)" in new_text and "(auto-tuned)" in old_text:
+        pass  # Modifying auto-tuned content is OK if keeping the marker
+    elif "(auto-tuned)" in (old_text or "") and "(auto-tuned)" not in new_text:
+        return False, "Cannot remove auto-tuned sections — ForgeSmith manages those"
+
+    return True, None
+
+
+def call_claude_for_proposals(prompt, cfg):
+    """Call Claude CLI to generate OPRO proposals.
+
+    Uses subprocess to invoke `claude -p` with the OPRO prompt.
+    Returns the parsed JSON response or None on failure.
+    """
+    opro_cfg = cfg.get("opro", {})
+    model = opro_cfg.get("model", "sonnet")
+    timeout = opro_cfg.get("timeout_seconds", 120)
+
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "json",
+        "--model", model,
+        "--max-turns", "2",
+        "--no-session-persistence",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        log("  [OPRO] Claude call timed out")
+        return None
+    except FileNotFoundError:
+        log("  [OPRO] 'claude' command not found — cannot generate proposals")
+        return None
+
+    if result.returncode != 0:
+        log(f"  [OPRO] Claude returned non-zero exit code: {result.returncode}")
+        if result.stderr:
+            log(f"  [OPRO] stderr: {result.stderr[:200]}")
+        return None
+
+    raw = result.stdout.strip()
+    if not raw:
+        log("  [OPRO] Empty response from Claude")
+        return None
+
+    # Parse the JSON output — Claude's --output-format json wraps in {"result": "..."}
+    try:
+        outer = json.loads(raw)
+        if isinstance(outer, dict) and "result" in outer:
+            inner = outer["result"]
+        else:
+            inner = raw
+    except json.JSONDecodeError:
+        inner = raw
+
+    # The inner content should be a JSON array of proposals
+    # Try to extract JSON array from the text (Claude may include markdown fences)
+    if isinstance(inner, str):
+        # Strip markdown code fences if present
+        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", inner.strip())
+        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+        try:
+            proposals = json.loads(cleaned)
+        except json.JSONDecodeError:
+            log(f"  [OPRO] Failed to parse proposals JSON: {cleaned[:200]}")
+            return None
+    elif isinstance(inner, list):
+        proposals = inner
+    else:
+        log(f"  [OPRO] Unexpected response format: {type(inner)}")
+        return None
+
+    if not isinstance(proposals, list):
+        log(f"  [OPRO] Expected list of proposals, got {type(proposals)}")
+        return None
+
+    return proposals
+
+
+def generate_opro_proposals(runs, cfg, dry_run=False):
+    """Run the OPRO proposal phase for all roles with sufficient data.
+
+    For each role:
+    1. Collect metrics and reflections
+    2. Read current prompt
+    3. Call Claude to propose modifications
+    4. Validate proposals
+    5. Store valid proposals in forgesmith_changes
+
+    Rate limit: max 1 OPRO proposal per role per night.
+
+    Returns list of proposal dicts.
+    """
+    opro_cfg = cfg.get("opro", {})
+    if not opro_cfg.get("enabled", True):
+        log("  [OPRO] Disabled in config")
+        return []
+
+    min_runs = opro_cfg.get("min_runs_for_proposal", 5)
+    min_improvement = opro_cfg.get("min_predicted_improvement", 0.10)
+
+    # Collect metrics and reflections
+    metrics = collect_role_metrics(runs, cfg)
+    reflections = collect_recent_reflections(cfg)
+
+    # Check which roles already had an OPRO proposal today (rate limit)
+    conn = get_db()
+    today_proposals = conn.execute(
+        """SELECT DISTINCT target_file FROM forgesmith_changes
+           WHERE change_type = 'opro_proposal'
+             AND created_at >= date('now')"""
+    ).fetchall()
+    conn.close()
+    already_proposed = set()
+    for row in today_proposals:
+        # Extract role from target_file path (e.g., .../prompts/developer.md -> developer)
+        fname = Path(row["target_file"]).stem if row["target_file"] else ""
+        already_proposed.add(fname)
+
+    all_proposals = []
+
+    for role, role_metrics in metrics.items():
+        # Rate limit: 1 proposal per role per day
+        if role in already_proposed:
+            log(f"  [OPRO] Skipping {role} — already proposed today")
+            continue
+
+        # Minimum sample size
+        if role_metrics["total_runs"] < min_runs:
+            log(f"  [OPRO] Skipping {role} — only {role_metrics['total_runs']} runs "
+                f"(need {min_runs})")
+            continue
+
+        # Read current prompt
+        prompt_file = PROMPTS_DIR / f"{role}.md"
+        if not prompt_file.exists():
+            continue
+        if prompt_file.name in cfg["protected_files"]:
+            continue
+
+        current_prompt = prompt_file.read_text(encoding="utf-8")
+
+        # Build the OPRO meta-prompt
+        opro_prompt = build_opro_prompt(
+            role, current_prompt, metrics, reflections, cfg
+        )
+
+        log(f"  [OPRO] Generating proposals for role: {role} "
+            f"(success={role_metrics['success_rate']:.0%}, "
+            f"runs={role_metrics['total_runs']})")
+
+        if dry_run:
+            log(f"  [OPRO/DRY-RUN] Would call Claude for {role} proposals")
+            all_proposals.append({
+                "role": role, "proposals": [], "dry_run": True,
+                "metrics": role_metrics,
+            })
+            continue
+
+        # Call Claude
+        raw_proposals = call_claude_for_proposals(opro_prompt, cfg)
+        if not raw_proposals:
+            log(f"  [OPRO] No proposals returned for {role}")
+            continue
+
+        # Validate each proposal
+        valid_proposals = []
+        for i, prop in enumerate(raw_proposals):
+            is_valid, reason = validate_opro_proposal(prop, current_prompt, cfg)
+            if is_valid:
+                valid_proposals.append(prop)
+                log(f"  [OPRO] Proposal {i+1} for {role}: VALID — "
+                    f"{prop.get('target_section', '?')}: "
+                    f"{prop.get('rationale', '')[:80]}")
+            else:
+                log(f"  [OPRO] Proposal {i+1} for {role}: REJECTED — {reason}")
+
+        if valid_proposals:
+            all_proposals.append({
+                "role": role, "proposals": valid_proposals,
+                "metrics": role_metrics,
+            })
+
+    return all_proposals
+
+
+def apply_opro_proposals(proposals, run_id, cfg, dry_run=False):
+    """Store OPRO proposals in forgesmith_changes and optionally apply the best one.
+
+    In auto mode: applies the top-confidence proposal for each role
+    if the predicted improvement exceeds the minimum threshold.
+    In dry-run mode: stores proposals for review without applying.
+
+    Returns list of applied changes.
+    """
+    opro_cfg = cfg.get("opro", {})
+    min_improvement = opro_cfg.get("min_predicted_improvement", 0.10)
+    changes = []
+
+    for role_result in proposals:
+        role = role_result["role"]
+        role_proposals = role_result.get("proposals", [])
+
+        if not role_proposals:
+            continue
+
+        prompt_file = PROMPTS_DIR / f"{role}.md"
+        if not prompt_file.exists():
+            continue
+
+        current_prompt = prompt_file.read_text(encoding="utf-8")
+
+        # Store ALL valid proposals in DB for tracking
+        for prop in role_proposals:
+            evidence = json.dumps({
+                "metrics": role_result.get("metrics", {}),
+                "target_section": prop.get("target_section", ""),
+                "action": prop.get("action", ""),
+                "expected_improvement": prop.get("expected_improvement", ""),
+                "confidence": prop.get("confidence", "low"),
+            })
+            rationale = (
+                f"OPRO proposal for {role}: {prop.get('rationale', 'No rationale')}"
+            )
+            new_value = json.dumps({
+                "action": prop.get("action"),
+                "old_text": prop.get("old_text", ""),
+                "new_text": prop.get("new_text", ""),
+                "target_section": prop.get("target_section", ""),
+            })
+
+            if not dry_run:
+                conn = get_db(write=True)
+                conn.execute(
+                    """INSERT INTO forgesmith_changes
+                       (run_id, change_type, target_file, old_value, new_value,
+                        rationale, evidence)
+                       VALUES (?, 'opro_proposal', ?, ?, ?, ?, ?)""",
+                    (run_id, str(prompt_file),
+                     prop.get("old_text", "")[:500],
+                     new_value, rationale, evidence),
+                )
+                conn.commit()
+                conn.close()
+
+        # In auto mode, apply the top-confidence proposal
+        if not dry_run:
+            # Sort by confidence: high > medium > low
+            confidence_order = {"high": 3, "medium": 2, "low": 1}
+            sorted_props = sorted(
+                role_proposals,
+                key=lambda p: confidence_order.get(p.get("confidence", "low"), 0),
+                reverse=True,
+            )
+
+            best = sorted_props[0]
+            confidence = best.get("confidence", "low")
+
+            # Parse expected improvement percentage
+            expected = best.get("expected_improvement", "")
+            improvement_pct = _parse_improvement_pct(expected)
+
+            if confidence in ("high", "medium") and improvement_pct >= min_improvement:
+                applied = _apply_single_opro_proposal(
+                    best, role, prompt_file, current_prompt, run_id, cfg
+                )
+                if applied:
+                    changes.append(applied)
+                    log(f"  [OPRO] Applied top proposal for {role}: "
+                        f"{best.get('target_section', '?')} "
+                        f"(confidence={confidence}, expected={expected})")
+            else:
+                log(f"  [OPRO] Top proposal for {role} not applied — "
+                    f"confidence={confidence}, expected_improvement={expected} "
+                    f"(threshold={min_improvement:.0%})")
+        else:
+            for prop in role_proposals:
+                log(f"  [OPRO/DRY-RUN] {role} -> {prop.get('target_section', '?')}: "
+                    f"{prop.get('rationale', '')[:100]}")
+
+    return changes
+
+
+def _parse_improvement_pct(expected_str):
+    """Parse an expected improvement string like 'success_rate +5%' into a float (0.05).
+
+    Returns 0.0 if parsing fails.
+    """
+    if not expected_str:
+        return 0.0
+    match = re.search(r'[+-]?\s*(\d+(?:\.\d+)?)\s*%', expected_str)
+    if match:
+        return float(match.group(1)) / 100.0
+    return 0.0
+
+
+def _apply_single_opro_proposal(proposal, role, prompt_file, current_prompt, run_id, cfg):
+    """Apply a single validated OPRO proposal to a prompt file.
+
+    Returns the change dict if successful, None otherwise.
+    """
+    action = proposal.get("action", "")
+    old_text = proposal.get("old_text", "")
+    new_text = proposal.get("new_text", "")
+
+    # Backup first
+    backup_file(prompt_file, cfg)
+
+    if action == "add":
+        # Append to the end, before any ForgeSmith Tuning section
+        marker = "\n## ForgeSmith Tuning\n"
+        if marker in current_prompt:
+            parts = current_prompt.split(marker)
+            updated = parts[0].rstrip() + f"\n\n{new_text}\n" + marker + parts[1]
+        else:
+            updated = current_prompt.rstrip() + f"\n\n{new_text}\n"
+
+    elif action == "replace":
+        if old_text not in current_prompt:
+            log(f"  [OPRO] Cannot apply replace — old_text not found in {role}.md")
+            return None
+        updated = current_prompt.replace(old_text, new_text, 1)
+
+    elif action == "reorder":
+        # For reorder, new_text contains the full reordered section
+        # old_text is the section to replace
+        if old_text not in current_prompt:
+            log(f"  [OPRO] Cannot apply reorder — old_text not found in {role}.md")
+            return None
+        updated = current_prompt.replace(old_text, new_text, 1)
+
+    else:
+        return None
+
+    # Final safety check: ensure protected patterns still exist
+    for pattern in OPRO_PROTECTED_PATTERNS:
+        if re.search(pattern, current_prompt, re.IGNORECASE | re.DOTALL):
+            if not re.search(pattern, updated, re.IGNORECASE | re.DOTALL):
+                log(f"  [OPRO] SAFETY: Proposal would remove protected pattern "
+                    f"'{pattern}' — aborting")
+                return None
+
+    # Write the updated prompt
+    prompt_file.write_text(updated, encoding="utf-8")
+    log(f"  [OPRO] Applied {action} to {prompt_file.name}")
+
+    return {
+        "change_type": "opro_applied",
+        "target_file": str(prompt_file),
+        "old_value": old_text[:500] if old_text else "",
+        "new_value": new_text[:500],
+        "rationale": f"OPRO {action} for {role}: {proposal.get('rationale', '')[:200]}",
+        "run_id": run_id,
+    }
+
+
+def run_propose_only(cfg, dry_run=False):
+    """Run ONLY the OPRO proposal step (for --propose CLI flag).
+
+    Collects data, generates proposals, and optionally applies them.
+    Does NOT run the standard analysis/apply pipeline.
+    """
+    mode = "dry_run" if dry_run else "propose"
+    run_id = f"fs-opro-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+    log(f"ForgeSmith OPRO run {run_id} ({mode})")
+    log(f"{'='*60}")
+
+    # Collect runs for metrics
+    log("PHASE 1: COLLECT (for OPRO)")
+    runs = collect_agent_runs(cfg)
+    log(f"  Collected {len(runs)} agent runs")
+
+    if not runs:
+        log("  No data to analyze. Nothing to propose.")
+        return
+
+    # Generate proposals
+    log("\nPHASE 4.7: PROPOSE (OPRO)")
+    proposals = generate_opro_proposals(runs, cfg, dry_run=dry_run)
+
+    if not proposals:
+        log("  No proposals generated.")
+        if not dry_run:
+            log_run(run_id, len(runs), [], "OPRO: no proposals generated.", mode, cfg)
+        return
+
+    # Apply proposals
+    changes = apply_opro_proposals(proposals, run_id, cfg, dry_run=dry_run)
+
+    # Summary
+    total_proposals = sum(len(r.get("proposals", [])) for r in proposals)
+    log(f"\n  Generated {total_proposals} proposals for "
+        f"{len(proposals)} roles, applied {len(changes)}")
+
+    if not dry_run:
+        summary = (f"OPRO: {total_proposals} proposals for {len(proposals)} roles, "
+                   f"{len(changes)} applied")
+        log_run(run_id, len(runs), changes, summary, mode, cfg)
+
+    log(f"\n{'='*60}")
+    log(f"ForgeSmith OPRO run complete: {run_id}")
+
+
+# ============================================================
 # PHASE 5: LOG — Record the run and decisions
 # ============================================================
 
@@ -1967,6 +2599,18 @@ def run_full(cfg, dry_run=False):
         lessons_added = extract_lessons(runs, cfg)
         log(f"  {lessons_added} new lessons extracted")
 
+    # SIMBA: targeted rule generation from failure patterns
+    if not dry_run and runs:
+        log("\nPHASE 2.75: SIMBA (Targeted Rule Generation)")
+        simba_results = run_simba(cfg, dry_run=dry_run)
+        if simba_results["rules_generated"] > 0:
+            log(f"  Generated {simba_results['rules_generated']} new rules")
+            for role, detail in simba_results["details"].items():
+                if detail.get("stored", 0) > 0:
+                    log(f"    [{role}] {detail['stored']} rules stored")
+        if simba_results["rules_pruned"] > 0:
+            log(f"  Pruned {simba_results['rules_pruned']} stale rules")
+
     # Rubric scoring (auto mode only)
     if not dry_run and runs:
         log("\nPHASE 2.8: RUBRIC SCORING")
@@ -1999,6 +2643,38 @@ def run_full(cfg, dry_run=False):
         log(f"\n{'Proposed' if dry_run else 'Applied'} {len(changes)} changes:")
         for i, c in enumerate(changes, 1):
             log(f"  {i}. [{c['change_type']}] {c.get('rationale', '')[:120]}")
+
+    # OPRO-style LLM-driven proposal phase
+    opro_cfg = cfg.get("opro", {})
+    if opro_cfg.get("enabled", True) and runs:
+        log(f"\nPHASE 4.7: PROPOSE (OPRO)")
+        opro_proposals = generate_opro_proposals(runs, cfg, dry_run=dry_run)
+        if opro_proposals:
+            opro_changes = apply_opro_proposals(
+                opro_proposals, run_id, cfg, dry_run=dry_run
+            )
+            changes.extend(opro_changes)
+            total_props = sum(len(r.get("proposals", [])) for r in opro_proposals)
+            log(f"  OPRO: {total_props} proposals for {len(opro_proposals)} roles, "
+                f"{len(opro_changes)} applied")
+        else:
+            log("  OPRO: No proposals generated.")
+
+    # GEPA: DSPy-based automatic prompt evolution (weekly)
+    gepa_cfg = cfg.get("gepa", {})
+    if gepa_cfg.get("enabled", False) and runs:
+        log(f"\nPHASE 4.8: EVOLVE (GEPA)")
+        gepa_results = run_gepa(cfg, dry_run=dry_run, run_id=run_id)
+        if gepa_results.get("roles_evolved", 0) > 0:
+            log(f"  GEPA: {gepa_results['roles_evolved']} roles evolved")
+            for role, detail in gepa_results.get("details", {}).items():
+                if detail.get("evolved"):
+                    log(f"    [{role}] v{detail['version']} "
+                        f"(diff: {detail['diff_ratio']:.1%})")
+        if gepa_results.get("rollbacks", 0) > 0:
+            log(f"  GEPA: {gepa_results['rollbacks']} rollbacks (underperformers)")
+        if not gepa_results.get("roles_evolved") and not gepa_results.get("rollbacks"):
+            log("  GEPA: No evolutions or rollbacks.")
 
     # Log the run
     if not dry_run:
@@ -2042,11 +2718,33 @@ def main():
                        help="Show active lessons (optionally filter by role)")
     group.add_argument("--rubrics", nargs="?", const="all", metavar="ROLE",
                        help="Show rubric scores (optionally filter by role)")
+    group.add_argument("--propose", action="store_true",
+                       help="Run OPRO proposal step only (generate LLM-driven prompt proposals)")
+    group.add_argument("--simba", nargs="?", const="all", metavar="ROLE",
+                       help="Run SIMBA rule generation only (optionally filter by role)")
+    group.add_argument("--gepa", nargs="?", const="all", metavar="ROLE",
+                       help="Run GEPA prompt evolution only (optionally filter by role)")
 
     args = parser.parse_args()
     cfg = load_config()
 
-    if args.report:
+    if args.propose:
+        run_propose_only(cfg, dry_run=False)
+    elif args.gepa is not None:
+        role = args.gepa if args.gepa != "all" else None
+        log("ForgeSmith GEPA — DSPy Prompt Evolution")
+        log(f"{'='*60}")
+        results = run_gepa(cfg, dry_run=False, role_filter=role)
+        log(f"\n{'='*60}")
+        print(json.dumps(results, indent=2, default=str))
+    elif args.simba is not None:
+        role = args.simba if args.simba != "all" else None
+        log("ForgeSmith SIMBA — Targeted Rule Generation")
+        log(f"{'='*60}")
+        results = run_simba(cfg, dry_run=False, role_filter=role)
+        log(f"\n{'='*60}")
+        print(json.dumps(results, indent=2, default=str))
+    elif args.report:
         run_report(cfg)
     elif args.rollback:
         run_rollback(args.rollback)
