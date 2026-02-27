@@ -3,7 +3,7 @@
 ## Project Overview
 
 **TheForge project_id:** 23
-**Status:** Active - v1.0 IMPLEMENTED
+**Status:** Active - v2.1 IMPLEMENTED
 
 Itzamna is the portable installer and onboarding system for the ForgeTeam multi-agent orchestration platform. Named after the Mayan god of creation, writing, and knowledge, Itzamna makes ForgeTeam usable by anyone — not just the original developer.
 
@@ -50,9 +50,16 @@ Itzamna is the installer/distribution layer for **ForgeTeam** (project_id: 21). 
 |------|---------|
 | `CLAUDE.md` | This file — project context |
 | `itzamna_setup.py` | Interactive setup wizard (9 steps, ~550 lines) |
-| `schema.sql` | Canonical database DDL (19 tables, 5 views, 1 trigger, 7 indexes) |
+| `forge_orchestrator.py` | Main orchestrator with context engineering |
+| `forgesmith.py` | ForgeSmith self-learning pipeline (nightly cron) |
+| `forgesmith_gepa.py` | GEPA — DSPy-based automatic prompt evolution with A/B testing |
+| `forgesmith_simba.py` | SIMBA — Targeted rule generation from failure patterns |
+| `forgesmith_config.json` | ForgeSmith settings (rubrics, thresholds, limits) |
+| `dispatch_config.json` | Agent dispatch settings (models, turns, concurrency) |
+| `schema.sql` | Canonical database DDL (28 tables, 7 views) |
+| `CHANGELOG.md` | Version history and release notes |
 | `docs/QUICKSTART.md` | 5-minute getting started guide |
-| `docs/USER_GUIDE.md` | Full user documentation (~300 lines) |
+| `docs/USER_GUIDE.md` | Full user documentation (CLI, config, ForgeSmith, troubleshooting) |
 | `docs/CUSTOM_AGENTS.md` | Custom agent creation guide |
 | `docs/CONCURRENCY.md` | Benchmark results and tuning guide |
 

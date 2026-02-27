@@ -416,6 +416,128 @@ When stdin is not a TTY (e.g., `nohup`, SSH pipes, cron), `--yes` is automatical
 
 ---
 
+## ForgeSmith — Prompt Optimization
+
+ForgeSmith is ForgeTeam's self-learning pipeline. It runs nightly (via cron) and optimizes agent performance through a multi-stage process.
+
+### Pipeline
+
+```
+COLLECT → ANALYZE → LESSONS → SIMBA → RUBRICS → APPLY → GEPA → LOG
+```
+
+### SIMBA (Targeted Rule Generation)
+
+SIMBA (**S**ystematic **I**dentification of **M**istakes and **B**ehavioral **A**djustments) analyzes high-variance tasks — roles with both successes and failures — and uses Claude to generate specific improvement rules.
+
+**How it works:**
+1. Finds roles with mixed outcomes (contrast what worked vs what didn't)
+2. Identifies "hardest cases" (Q-value < 0.3, early-terminated)
+3. Claude generates up to 3 rules per role (max 200 chars each)
+4. Rules are validated for length, uniqueness (>60% overlap = rejected), and error type
+5. After 10+ injections, rules are effectiveness-scored (before vs after success rate)
+6. After 50+ injections with no improvement, rules are pruned
+
+**CLI:**
+```bash
+python forgesmith.py --simba              # All roles
+python forgesmith.py --simba developer    # Specific role
+python forgesmith_simba.py --prune        # Prune stale rules
+```
+
+### GEPA (Automatic Prompt Evolution)
+
+GEPA (**G**eneralized **E**fficient **P**rompt **A**daptation) uses DSPy to evolve entire role prompts based on agent episode history.
+
+**How it works:**
+1. Collects 60 days of episodes (minimum 20 required)
+2. DSPy reflects on failure traces and proposes instruction improvements
+3. Evolved prompts are validated (max 20% text change, protected sections preserved)
+4. Version-stamped files created (e.g., `developer_v2.md`)
+5. 50/50 A/B test: evolved vs baseline prompt
+6. After 10+ tasks per version, success rates compared
+7. Underperformers automatically rolled back
+
+**Safety rails:** Max 20% change per cycle. Protected sections (Output Format, RESULT block, Git Commit) never removed. Max 1 evolution per role per week.
+
+**Default model:** `ollama_chat/devstral-small-2:24b` (free, local). Set `ANTHROPIC_API_KEY` for Claude.
+
+**CLI:**
+```bash
+python forgesmith.py --gepa               # All roles
+python forgesmith.py --gepa developer     # Specific role
+python forgesmith_gepa.py --status        # A/B test results
+python forgesmith_gepa.py --dry-run       # Preview without applying
+```
+
+### Context Engineering
+
+The orchestrator assembles agent prompts with token-budget awareness:
+
+| Metric | Value |
+|--------|-------|
+| Target prompt size | 8,000 tokens |
+| Hard limit | 10,000 tokens |
+| Episode reduction threshold | 6,000 tokens |
+
+**What gets injected (priority order):**
+1. Common rules + role prompt (never trimmed)
+2. A/B prompt version (GEPA evolved if available)
+3. Lessons (max 5, deduplicated at 60% word overlap)
+4. Relevant episodes (2-3, scored by keyword overlap + recency)
+5. Task-type guidance (bug_fix, feature, refactor, test)
+6. Task description (never trimmed)
+7. Extra context (checkpoints, test failures)
+
+**When over budget, trimmed in order:** old episodes → generic lessons → extra context.
+
+### Rubric Scoring & Evolution
+
+Agent runs are scored against role-specific criteria. Weights evolve based on correlation with success:
+
+| Role | Key Criteria |
+|------|-------------|
+| Developer | result_success, files_changed, tests_written, turns_efficiency |
+| Tester | tests_pass, edge_cases, coverage, false_positives (negative) |
+| Security Reviewer | vulns_found, severity_accuracy, false_alarms (negative) |
+
+Weight evolution: max ±10% per criterion per cycle, requires 10+ scored runs, 30-day lookback.
+
+### ForgeSmith CLI Reference
+
+```bash
+python forgesmith.py --auto               # Full pipeline (nightly cron)
+python forgesmith.py --dry-run            # Preview changes
+python forgesmith.py --report             # JSON analysis report
+python forgesmith.py --simba [ROLE]       # SIMBA rule generation
+python forgesmith.py --gepa [ROLE]        # GEPA prompt evolution
+python forgesmith.py --propose            # OPRO proposals
+python forgesmith.py --lessons [ROLE]     # Show active lessons
+python forgesmith.py --rubrics [ROLE]     # Show rubric scores
+python forgesmith.py --rollback RUN_ID    # Revert a run's changes
+```
+
+### forgesmith_config.json Reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `lookback_days` | 7 | Days of history to analyze |
+| `min_sample_size` | 5 | Minimum runs before making changes |
+| `max_changes_per_run` | 5 | Cap on changes per run |
+| `max_prompt_patches_per_run` | 2 | Cap on prompt modifications |
+| `rollback_threshold` | -0.3 | Score triggering auto-revert |
+| `suppression_cooldown_days` | 14 | Days before retrying suppressed changes |
+| `thresholds.max_turns_hit_rate` | 0.3 | Rate above which turns are increased |
+| `thresholds.turn_underuse_rate` | 0.4 | Rate below which turns are decreased |
+| `thresholds.repeat_error_count` | 3 | Occurrences before flagging an error pattern |
+| `limits.max_turns_ceiling` | 75 | Maximum turn limit |
+| `limits.max_turns_floor` | 10 | Minimum turn limit |
+| `rubric_definitions` | (per-role) | Scoring criteria and weights |
+| `rubric_evolution` | (object) | Weight evolution settings |
+| `protected_files` | (list) | Files ForgeSmith never modifies |
+
+---
+
 ## Project Management
 
 ### Adding Projects
@@ -505,7 +627,7 @@ If this command starts without error, MCP is working.
 
 ## Database Structure
 
-The database has 20 tables organized into these groups:
+The database has 28 tables organized into these groups:
 
 ### Core Tables
 
@@ -551,6 +673,17 @@ The database has 20 tables organized into these groups:
 | `cross_references` | Links between any two records |
 | `reminders` | Scheduled reminders |
 | `agent_runs` | Agent execution log (role, model, cost, duration, outcome) |
+
+### ForgeSmith (Prompt Optimization)
+
+| Table | Purpose |
+|-------|---------|
+| `lessons_learned` | Extracted lessons and SIMBA rules with effectiveness scores |
+| `agent_episodes` | Agent execution traces with reflections and Q-values |
+| `forgesmith_runs` | ForgeSmith execution log (run ID, timestamp, changes made) |
+| `forgesmith_changes` | History of all applied changes with effectiveness scoring |
+| `rubric_scores` | Per-run rubric evaluation with criteria breakdown |
+| `rubric_evolution_history` | Audit trail of rubric weight changes |
 
 ### Views
 
