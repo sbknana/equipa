@@ -313,6 +313,58 @@ Agents don't just pass results through the orchestrator — they can leave struc
 
 ### Schema migrations with versioning
 `db_migrate.py` implements a linear migration chain (v0→v1→v2→v3) with automatic backup before migration, legacy version detection, and a `schema_migrations` audit log. This lets the database evolve safely as new features are added.
+
+---
+
+## Power User: Querying the Knowledge Base
+
+Because everything lives in SQLite and Claude has MCP access to the database, you can ask deep questions about your project history in plain English. Claude translates them to SQL behind the scenes.
+
+### Examples
+
+**Learning from failures:**
+> "What lessons have we learned from failed security reviews on Loom?"
+>
+> "Show me the top 5 error patterns across all developer runs this month"
+>
+> "Which tasks took the most dev-test cycles to complete?"
+
+**Performance insights:**
+> "How much have we spent on API costs this week, broken down by project?"
+>
+> "What's the average success rate for developer agents on TorqueDesk vs Loom?"
+>
+> "Which agent role uses the most turns relative to its budget?"
+
+**Decision archaeology:**
+> "What did we decide about the auth approach for Loom?"
+>
+> "Show me all open questions across projects, sorted by age"
+>
+> "What were the key decisions made in the last 3 sessions?"
+
+**Agent memory:**
+> "What episodes does the developer agent have for database migration tasks?"
+>
+> "Show me the highest Q-value episodes — what approaches worked best?"
+>
+> "Has ForgeSmith evolved any prompts recently? What changed?"
+
+### The tables behind these queries
+
+| Table | What it stores |
+|-------|---------------|
+| `agent_episodes` | Every agent run with outcome, reflection, approach summary, Q-value |
+| `lessons_learned` | Error patterns distilled into reusable advice, injected into future prompts |
+| `agent_messages` | Structured communication between agents (tester → developer feedback) |
+| `agent_actions` | Per-tool-call logs with input hashing for dedup detection |
+| `decisions` | Architectural and design decisions with rationale |
+| `session_notes` | Per-session summaries with next steps |
+| `simba_rules` | Behavioral rules synthesized from failure analysis |
+| `prompt_versions` | Evolved prompts with A/B test status |
+
+You never need to know these table names. Just ask Claude what you want to know.
+
 ---
 
 ## Related Documentation

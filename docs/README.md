@@ -140,6 +140,28 @@ Claude: [queries database, groups by project and priority]
 
 You never look up a task ID. You never write SQL. You just ask.
 
+### Persistent Memory
+
+The system doesn't just do work — it remembers what happened and gets smarter over time.
+
+```
+You: "What lessons have we learned from failed security reviews on Loom?"
+
+Claude: 3 lessons extracted from Loom security failures:
+
+  1. Always validate JWT expiry server-side — client-side checks
+     were bypassed in task #87 (injected into 12 future runs)
+  2. Rate-limit auth endpoints before deploying — missed in tasks
+     #91 and #103 (injected into 8 future runs)
+  3. Sanitize user input in GraphQL resolvers — XSS found twice
+     in the quest engine (injected into 5 future runs)
+
+These lessons are automatically injected into future developer
+and security reviewer prompts for Loom.
+```
+
+Every agent run, every test result, every lesson learned — stored in a 30-table SQLite database that agents query automatically. The system builds institutional knowledge about *your* projects.
+
 ---
 
 ## How It Works
