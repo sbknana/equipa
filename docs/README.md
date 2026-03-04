@@ -180,7 +180,7 @@ python forge_orchestrator.py --task 42 --security
 - **Security scanning** — Dedicated security review agent with SARIF parsing for static analysis results
 - **Arena mode** — Adversarial testing where agents try to break and fix each other's work
 - **Database migrations** — Schema evolves safely with automatic backups and versioned migrations
-- **Zero external dependencies** — Pure Python, SQLite database, runs anywhere
+- **Zero pip dependencies** — Pure Python stdlib, SQLite database. Requires Python 3.10+, Claude Code CLI, git, and uvx as runtime prerequisites
 
 ## Installation
 

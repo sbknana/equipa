@@ -288,7 +288,7 @@ erDiagram
 ## Key Design Decisions
 
 ### SQLite as the sole data store
-Everything — tasks, episodes, lessons, messages, rules, prompt versions, migration history — lives in a single SQLite database. This is intentional: zero dependencies, trivially portable, and easy to back up. The system is designed for single-machine orchestration, not distributed deployment.
+Everything — tasks, episodes, lessons, messages, rules, prompt versions, migration history — lives in a single SQLite database. This is intentional: zero pip dependencies (stdlib only), trivially portable, and easy to back up. The system is designed for single-machine orchestration, not distributed deployment.
 
 ### Dev-Test Loop with dynamic budgets
 Rather than running one agent and hoping for the best, the orchestrator cycles between Developer and Tester agents. The turn budget is dynamic — `calculate_dynamic_budget()` and `adjust_dynamic_budget()` adapt based on task complexity and intermediate results. This prevents both premature termination and runaway loops.
