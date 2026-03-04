@@ -3556,12 +3556,116 @@ async def run_security_review(task, project_dir, project_context, args, output=N
             log(f"  WARNING: Found {critical_count} CRITICAL and {high_count} HIGH severity findings", output)
         else:
             log(f"  No critical or high severity findings", output)
+
+        # Feed security findings back into developer lessons
+        project_id = task.get("project_id")
+        findings = _extract_security_findings(result_text)
+        if findings:
+            count = _create_security_lessons(findings, project_id)
+            if count > 0:
+                log(f"  Created {count} developer lesson(s) from security findings", output)
     else:
         log(f"  Security review agent failed.", output)
         for err in sec_result.get("errors", []):
             log(f"    Error: {err[:200]}", output)
 
     return sec_result
+
+
+def _extract_security_findings(result_text):
+    """Extract individual CRITICAL and HIGH severity findings from security review output.
+
+    Looks for lines containing severity markers and extracts the finding description.
+    Returns a list of (severity, description) tuples.
+    """
+    findings = []
+    if not result_text:
+        return findings
+
+    lines = result_text.split("\n")
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        line_upper = line_stripped.upper()
+
+        # Match lines that contain severity ratings like "CRITICAL:", "HIGH:",
+        # "**CRITICAL**", "- CRITICAL:", "[CRITICAL]", etc.
+        severity = None
+        if "CRITICAL" in line_upper and any(
+            p in line_upper for p in ("CRITICAL:", "CRITICAL**", "[CRITICAL]", "CRITICAL —", "CRITICAL -")
+        ):
+            severity = "CRITICAL"
+        elif "HIGH" in line_upper and any(
+            p in line_upper for p in ("HIGH:", "HIGH**", "[HIGH]", "HIGH —", "HIGH -")
+        ):
+            severity = "HIGH"
+
+        if severity:
+            # Extract the finding text — everything after the severity marker
+            desc = line_stripped
+            # Strip common prefixes: bullets, markdown bold, brackets
+            for prefix in ("- ", "* ", "• "):
+                if desc.startswith(prefix):
+                    desc = desc[len(prefix):]
+
+            # If the line is very short, grab the next line too for context
+            if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
+                desc = desc + " " + lines[i + 1].strip()
+
+            # Cap length for lesson storage
+            if len(desc) > 500:
+                desc = desc[:497] + "..."
+
+            findings.append((severity, desc))
+
+    return findings
+
+
+def _create_security_lessons(findings, project_id=None):
+    """Insert security findings as developer lessons so they get injected into future dev prompts.
+
+    Lessons are created with role='developer' and source='security-reviewer' so the existing
+    get_relevant_lessons(role='developer') pipeline picks them up automatically.
+    Deduplicates by error_signature to avoid flooding the lessons table.
+    """
+    conn = get_db_connection(write=True)
+    created = 0
+
+    for severity, description in findings:
+        # Build a signature for dedup — normalize to lowercase, strip punctuation
+        sig = re.sub(r'[^\w\s]', '', description.lower())[:200]
+
+        # Check if a similar lesson already exists
+        existing = conn.execute(
+            """SELECT id FROM lessons_learned
+               WHERE error_signature = ? AND source = 'security-reviewer' AND active = 1""",
+            (sig,),
+        ).fetchone()
+
+        if existing:
+            # Bump times_seen instead of creating a duplicate
+            conn.execute(
+                """UPDATE lessons_learned
+                   SET times_seen = times_seen + 1, updated_at = datetime('now')
+                   WHERE id = ?""",
+                (existing["id"],),
+            )
+        else:
+            # Create a developer-facing lesson from the security finding
+            lesson_text = (
+                f"Security review found {severity} issue: {description}. "
+                f"Check for this pattern in future code and prevent it proactively."
+            )
+            conn.execute(
+                """INSERT INTO lessons_learned
+                   (project_id, role, error_type, error_signature, lesson, source, times_seen)
+                   VALUES (?, 'developer', 'security', ?, ?, 'security-reviewer', 1)""",
+                (project_id, sig, lesson_text),
+            )
+            created += 1
+
+    conn.commit()
+    conn.close()
+    return created
 
 
 # --- Manager Mode: Planner & Evaluator (Phase 3) ---
