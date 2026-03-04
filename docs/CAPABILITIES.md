@@ -1,6 +1,6 @@
 # Itzamna: Multi-Agent AI Orchestration Platform
 
-Itzamna is a self-improving, multi-agent orchestration platform that coordinates specialized AI agents through the full software development lifecycle -- planning, coding, testing, security review, and debugging. It learns from every run, evolves its own prompts, and maintains zero external dependencies. Built in pure Python on SQLite, it runs anywhere with no infrastructure requirements.
+Itzamna is a self-improving, multi-agent orchestration platform that coordinates specialized AI agents through the full software development lifecycle -- planning, coding, testing, security review, and debugging. It learns from every run, evolves its own prompts, and requires zero pip dependencies. Built in pure Python stdlib on SQLite, it runs anywhere Python and Claude Code are installed.
 
 ---
 
@@ -326,14 +326,14 @@ Read-only roles (planner, evaluator, code-reviewer, researcher) can run on local
 
 | Property | Detail |
 |----------|--------|
-| **Zero pip dependencies** | Core platform is stdlib-only Python. No `requirements.txt` for the orchestrator, installer, or migration system |
+| **Zero pip dependencies** | Core platform is stdlib-only Python. No `requirements.txt`. Requires Python 3.10+, Claude Code CLI, git, and uvx as runtime prerequisites |
 | **SQLite-based** | Single-file database. Trivially portable, trivially backupable. No database server required |
 | **Cross-platform** | Runs on Linux and Windows. Tested on Ubuntu 24.04 and Windows 10/11 |
 | **CLI-first** | Every operation available from the command line. No web UI required (dashboard is terminal-based) |
 | **Checkpoint resilience** | Long-running tasks save checkpoints. Interrupted work resumes from the last saved state |
 | **Loop detection** | Deterministic fingerprinting of agent output detects stuck loops. File changes reset the counter -- progress is recognized |
 | **Dynamic budgets** | Turn budgets adapt based on task complexity and intermediate results. Prevents both premature termination and runaway loops |
-| **28-table schema** | Full relational model covering projects, tasks, episodes, lessons, messages, actions, rules, prompt versions, rubric scores, and migration history |
+| **30-table schema** | Full relational model covering projects, tasks, episodes, lessons, messages, actions, rules, prompt versions, rubric scores, and migration history |
 | **Reproducible benchmarks** | Migration benchmarks generate realistic test data, run the full chain, and verify zero data loss |
 | **Arena mode** | Adversarial testing system that stress-tests agents and exports results as LoRA fine-tuning data |
 
