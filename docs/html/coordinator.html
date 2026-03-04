@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>COORDINATOR - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item active">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>Coordinator Mode — The Recommended Way to Use ForgeTeam</h1>
+
+<p>> Stop memorizing CLI commands. Just talk.</p>
+
+<p>Coordinator Mode turns Claude Code into a natural language dispatcher for ForgeTeam. You describe what you want in plain English. Claude handles the rest — planning, task creation, agent dispatch, monitoring, and error recovery.</p>
+
+<p>This is the most powerful way to use ForgeTeam. Period.</p>
+
+<hr>
+
+<h2>What Is Coordinator Mode?</h2>
+
+<p>Traditional workflow: you read docs, write CLI commands, manage tasks manually, check logs yourself.</p>
+
+<p>Coordinator Mode: you talk to Claude Code like a project manager. Claude does the busywork.</p>
+
+<ul><li>You say what you want in plain English</li>
+<li>Claude creates tasks in the ForgeTeam database</li>
+<li>Claude dispatches the orchestrator to assign agents</li>
+<li>Agents (Developer, Tester, Security Reviewer, etc.) do the actual implementation</li>
+<li>Claude monitors progress and reports back</li>
+<li>If something fails, Claude creates follow-up tasks and re-dispatches</li>
+</ul>
+<p>Why is this better? Because Claude can:</p>
+<ul><li>Plan multi-step workflows and identify dependencies</li>
+<li>Split work into parallel tasks automatically</li>
+<li>Pick the right agent roles for each task</li>
+<li>Handle error recovery without you babysitting</li>
+<li>Maintain context across the entire session</li>
+</ul>
+<hr>
+
+<h2>How It Works</h2>
+
+<p>The flow is simple:</p>
+
+<pre><code class="language-text">You describe what you want
+        |
+        v
+<p>Claude breaks it into tasks</p>
+        |
+        v
+<p>Claude writes tasks to the ForgeTeam database</p>
+        |
+        v
+<p>Claude dispatches the orchestrator</p>
+        |
+        v
+<p>Agents pick up tasks and do the work</p>
+        |
+        v
+<p>Claude monitors, reports, and handles failures</p>
+</code></pre>
+
+<h3>Step by step:</h3>
+
+<p>1. <strong>You talk.</strong> "Build me a login page with OAuth." That's it.</p>
+<p>2. <strong>Claude plans.</strong> It analyzes your request, checks your project structure, and breaks the work into discrete tasks.</p>
+<p>3. <strong>Claude creates tasks.</strong> Each task gets written to the ForgeTeam SQLite database with a clear title, description, and assigned role.</p>
+<p>4. <strong>Claude dispatches.</strong> It runs the orchestrator, pointing it at the new tasks. Independent tasks run in parallel.</p>
+<p>5. <strong>Agents work.</strong> Developer writes code. Tester validates. Security Reviewer checks for vulnerabilities. Each agent operates in its own Claude Code session.</p>
+<p>6. <strong>Claude reports.</strong> As tasks complete, Claude tells you what happened. Files changed, tests passed, issues found.</p>
+<p>7. <strong>Claude recovers.</strong> If an agent fails or a test breaks, Claude creates a follow-up task and re-dispatches. You don't have to intervene.</p>
+
+<hr>
+
+<h2>Setup</h2>
+
+<p>1. Install ForgeTeam normally via <code>itzamna_setup.py</code></p>
+<p>2. The installer generates a <code>.claude/CLAUDE.md</code> file in your project directory — this teaches Claude Code how to be the coordinator</p>
+<p>3. Open Claude Code in your project directory</p>
+<p>4. Start talking</p>
+
+<p>That's it. No extra config. No flags. The generated CLAUDE.md gives Claude all the context it needs about your project structure, the database location, and how to dispatch agents.</p>
+
+<hr>
+
+<h2>Example Conversations</h2>
+
+<h3>Example 1: Simple Feature</h3>
+
+<pre><code class="language-text">You: "Add a dark mode toggle to the settings page"
+
+<p>Claude: I'll create a task for that. Let me check your project structure first...</p>
+
+<p>[Reads your codebase, finds Settings.tsx]</p>
+<p>[Creates task in DB: "Add dark mode toggle to settings page"]</p>
+<p>[Dispatches developer agent]</p>
+<p>[Developer writes the code, creates tests]</p>
+<p>[Tester validates]</p>
+
+<p>Claude: Done. Dark mode toggle added to src/components/Settings.tsx.</p>
+<p>Uses your existing theme context. Toggle persists to localStorage.</p>
+<p>All 3 tests passing.</p>
+</code></pre>
+
+<p>One sentence from you. Full implementation with tests.</p>
+
+<h3>Example 2: Multi-Task Feature</h3>
+
+<pre><code class="language-text">You: "Build me user authentication with Google OAuth"
+
+<p>Claude: That's a multi-step feature. Let me plan it out:</p>
+
+  1. Set up OAuth provider configuration
+  2. Create login/callback routes
+  3. Add session management middleware
+  4. Build the login UI component
+  5. Write integration tests
+
+<p>[Creates 5 tasks in DB with proper descriptions]</p>
+<p>[Dispatches orchestrator with --tasks 100-104]</p>
+<p>[Tasks 1-3 run in parallel — no dependencies between them]</p>
+<p>[Task 4 waits for task 2 — needs the routes]</p>
+<p>[Task 5 waits for all — needs everything wired up]</p>
+
+<p>Claude: All 5 tasks complete.</p>
+<ul><li>OAuth config in src/config/auth.ts</li>
+<li>Routes at /auth/google and /auth/callback</li>
+<li>Session middleware using signed cookies</li>
+<li>Login button component with Google branding</li>
+<li>8 integration tests, all passing</li>
+</ul>
+<p>Want me to run a security review on the auth flow?</p>
+</code></pre>
+
+<p>Claude identified the dependencies automatically. Tasks 1-3 ran in parallel. Total wall-clock time is way less than running them sequentially.</p>
+
+<h3>Example 3: Bug Fix</h3>
+
+<pre><code class="language-text">You: "Users are getting 500 errors on the checkout page"
+
+<p>Claude: Let me investigate. I'll start with a debugger task...</p>
+
+<p>[Creates task: "Debug 500 errors on checkout page"]</p>
+<p>[Dispatches debugger agent]</p>
+<p>[Debugger analyzes error logs, traces the stack, finds the root cause]</p>
+
+<p>Claude: Found it. Null pointer in calculateTotal() when the cart has a</p>
+<p>discounted item with no original price. Creating a fix task...</p>
+
+<p>[Creates task: "Fix null pointer in calculateTotal for discounted items"]</p>
+<p>[Dispatches developer agent]</p>
+<p>[Developer fixes the bug, adds edge case tests]</p>
+<p>[Tester validates the fix]</p>
+
+<p>Claude: Fixed. The issue was in src/utils/cart.ts line 47.</p>
+<p>Added null check for originalPrice. 4 new test cases covering</p>
+<p>discount edge cases. All passing.</p>
+</code></pre>
+
+<p>Debug, fix, and test — all from one sentence.</p>
+
+<h3>Example 4: Code Review</h3>
+
+<pre><code class="language-text">You: "Review the auth module for security issues"
+
+<p>Claude: I'll dispatch a security reviewer.</p>
+
+<p>[Creates task: "Security review of auth module"]</p>
+<p>[Dispatches security-reviewer agent]</p>
+
+<p>Claude: Security review complete. 2 findings:</p>
+
+  MEDIUM: Session tokens not rotated after privilege escalation
+  LOW: CSRF token missing on the logout endpoint
+
+<p>Want me to create fix tasks for these?</p>
+</code></pre>
+
+<h3>Example 5: Parallel Work</h3>
+
+<pre><code class="language-text">You: "Add input validation to all API endpoints and write API docs"
+
+<p>Claude: Those are independent — I'll run them in parallel.</p>
+
+<p>[Creates task 1: "Add input validation to API endpoints"]</p>
+<p>[Creates task 2: "Generate API documentation"]</p>
+<p>[Dispatches both simultaneously]</p>
+
+<p>Claude: Both done.</p>
+<ul><li>Validation added to 12 endpoints using zod schemas</li>
+<li>API docs generated at docs/api.md</li>
+</ul></code></pre>
+
+<hr>
+
+<h2>What Claude Runs Behind the Scenes</h2>
+
+<p>You don't need to know these commands — Claude handles them. But if you're curious:</p>
+
+<h3>Creating tasks</h3>
+
+<pre><code class="language-sql">INSERT INTO tasks (project_id, title, description, status, assigned_role)
+<p>VALUES (?, 'Add dark mode toggle', 'Implement...', 'todo', 'developer');</p>
+</code></pre>
+
+<h3>Dispatching a single task</h3>
+
+<pre><code class="language-bash">python3 forge_orchestrator.py --task 105 --dev-test -y
+</code></pre>
+
+<h3>Dispatching multiple tasks in parallel</h3>
+
+<pre><code class="language-bash">python3 forge_orchestrator.py --tasks 100-104 --dev-test -y
+</code></pre>
+
+<h3>Checking task status</h3>
+
+<pre><code class="language-sql">SELECT id, title, status, assigned_role
+<p>FROM tasks</p>
+<p>WHERE project_id = ? AND status != 'done'</p>
+<p>ORDER BY id;</p>
+</code></pre>
+
+<h3>Reading agent output</h3>
+
+<p>Claude checks the orchestrator logs and task results in the database to report back to you.</p>
+
+<hr>
+
+<h2>Available Agent Roles</h2>
+
+<p>Claude picks the right role automatically, but you can request specific ones:</p>
+
+<table><tr><td>Role</td><td>What It Does</td></tr>
+<tr><td>------</td><td>-------------</td></tr>
+<tr><td><code>developer</code></td><td>Writes code. Your bread and butter.</td></tr>
+<tr><td><code>tester</code></td><td>Writes and runs tests.</td></tr>
+<tr><td><code>debugger</code></td><td>Investigates bugs, traces issues, finds root causes.</td></tr>
+<tr><td><code>code-reviewer</code></td><td>Reviews code for quality, patterns, best practices.</td></tr>
+<tr><td><code>security-reviewer</code></td><td>Checks for vulnerabilities, auth issues, injection risks.</td></tr>
+<tr><td><code>planner</code></td><td>Breaks down complex features into task lists.</td></tr>
+<tr><td><code>evaluator</code></td><td>Assesses implementations against requirements.</td></tr>
+<tr><td><code>frontend-designer</code></td><td>UI/UX focused development.</td></tr>
+<tr><td><code>integration-tester</code></td><td>Tests how components work together.</td></tr>
+</table>
+<p>You can ask for specific roles:</p>
+
+<ul><li>"Run a security review on the payment module"</li>
+<li>"Have a code reviewer look at my PR"</li>
+<li>"Get a planner to break down the notification system"</li>
+</ul>
+<hr>
+
+<h2>Tips for Getting the Best Results</h2>
+
+<strong>Be specific about what you want.</strong>
+<ul><li>Good: "Add Google OAuth login with session cookies"</li>
+<li>Bad: "Add auth"</li>
+</ul>
+<strong>Mention the tech stack when it matters.</strong>
+<ul><li>Good: "Add rate limiting using Express middleware and Redis"</li>
+<li>Bad: "Add rate limiting"</li>
+</ul>
+<strong>Let Claude plan big features.</strong>
+<p>For anything with more than 2-3 moving parts, just describe the end goal. Claude will break it down better than manual task creation because it can read your codebase and understand what already exists.</p>
+
+<strong>Ask for parallel work.</strong>
+<p>If you have independent tasks, mention them together. Claude will dispatch them simultaneously.</p>
+
+<strong>Use the right role for the job.</strong>
+<ul><li>Bugs? Debugger first, then developer.</li>
+<li>Security concerns? Security reviewer.</li>
+<li>Quality check? Code reviewer.</li>
+<li>Not sure how to approach something? Planner.</li>
+</ul>
+<strong>Give context when you have it.</strong>
+<ul><li>"The 500 error started after yesterday's deploy"</li>
+<li>"It only happens when the user has a discount code"</li>
+<li>"The component should match the existing Card pattern in the design system"</li>
+</ul>
+<hr>
+
+<h2>When NOT to Use Coordinator Mode</h2>
+
+<p>Coordinator Mode is powerful, but it's overkill for some things. Use Claude Code directly for:</p>
+
+<ul><li><strong>Quick one-line fixes.</strong> Just ask Claude to edit the file. No need to spin up an agent for a typo.</li>
+<li><strong>Research and exploration.</strong> "How does the auth flow work?" — Claude can search the codebase and answer directly.</li>
+<li><strong>Configuration changes.</strong> Editing a config file doesn't need an agent pipeline.</li>
+<li><strong>Database queries.</strong> Claude can query your database directly.</li>
+<li><strong>Reading/understanding code.</strong> Claude can read and explain code without dispatching anyone.</li>
+</ul>
+<p>Rule of thumb: if the change is under 5 lines and doesn't need testing, just do it directly.</p>
+
+<hr>
+
+<h2>Troubleshooting</h2>
+
+<strong>Agents keep failing on a task</strong>
+<ul><li>The task description is probably too vague. Ask Claude to rewrite it with more detail.</li>
+<li>Check if the task requires context the agent doesn't have (API keys, external service access).</li>
+</ul>
+<strong>Tests won't pass</strong>
+<ul><li>Ask Claude to dispatch a debugger agent to analyze the test failures.</li>
+<li>"Why are the tests failing on task 105? Run a debugger."</li>
+</ul>
+<strong>Agent produced wrong output</strong>
+<ul><li>Ask Claude to review what the agent did and create a correction task.</li>
+<li>"Task 103 used the wrong database schema. Fix it."</li>
+</ul>
+<strong>Want to retry a task</strong>
+<ul><li>"Re-run task 105 with a fresh developer agent"</li>
+<li>Claude will reset the task status and re-dispatch.</li>
+</ul>
+<strong>Orchestrator won't start</strong>
+<ul><li>Check that ForgeTeam is installed correctly: <code>python3 forge_orchestrator.py --help</code></li>
+<li>Verify the database path is correct in your project's CLAUDE.md.</li>
+</ul>
+<strong>Tasks stuck in 'in_progress'</strong>
+<ul><li>Ask Claude to check the orchestrator logs.</li>
+<li>"What happened to task 107? It's been running for a while."</li>
+</ul>
+<hr>
+
+<h2>How This Compares to Manual Mode</h2>
+
+<table><tr><td>Manual Mode</td><td>Coordinator Mode</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><strong>Task creation</strong></td><td>You write SQL or use CLI</td><td>Claude does it</td></tr>
+<tr><td><strong>Dispatching</strong></td><td>You run orchestrator commands</td><td>Claude does it</td></tr>
+<tr><td><strong>Monitoring</strong></td><td>You check logs</td><td>Claude does it</td></tr>
+<tr><td><strong>Error recovery</strong></td><td>You diagnose and retry</td><td>Claude does it</td></tr>
+<tr><td><strong>Parallelism</strong></td><td>You figure out dependencies</td><td>Claude does it</td></tr>
+<tr><td><strong>Role selection</strong></td><td>You pick the agent role</td><td>Claude does it</td></tr>
+</table>
+<p>Manual mode still works. It's documented in the User Guide. But for most workflows, Coordinator Mode is faster, easier, and produces better results because Claude can see the full picture.</p>
+
+<hr>
+
+<h2>Summary</h2>
+
+<p>1. Install ForgeTeam</p>
+<p>2. Open Claude Code in your project</p>
+<p>3. Tell it what you want</p>
+<p>4. Let it handle the rest</p>
+
+<p>That's Coordinator Mode. The agents do the work. Claude does the coordination. You just talk.</p>
+
+<hr>
+
+<em>Built by Forgeborn. Vibe coded with Claude.</em>
+<em>Copyright 2026 Forgeborn. All rights reserved.</em>
+
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>

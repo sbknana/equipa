@@ -231,7 +231,7 @@ def step_install_path():
 
 
 def step_database(base_path):
-    """Set up the database."""
+    """Set up the database — create fresh, upgrade existing, or skip if current."""
     print_header("Step 3: Database Setup")
 
     db_name = prompt_input("Database filename", default="theforge.db")
@@ -240,14 +240,46 @@ def step_database(base_path):
     db_path = Path(db_dir).resolve() / db_name
 
     if db_path.exists():
-        print(f"\n  WARNING: Database already exists at {db_path}")
-        if prompt_yes_no("Delete and recreate?"):
-            db_path.unlink()
-        else:
-            print("  Keeping existing database.")
+        # --- Existing database: check version and offer upgrade ---
+        from db_migrate import get_effective_version, run_migrations, CURRENT_VERSION
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            db_version = get_effective_version(conn)
+        finally:
+            conn.close()
+
+        if db_version >= CURRENT_VERSION:
+            print(f"\n  Database is up to date (v{db_version}).")
+            print(f"  Location: {db_path}")
             return db_path
 
-    # Check for schema file
+        # Upgrade needed
+        print(f"\n  Existing database found at {db_path}")
+        print(f"  Detected schema version: v{db_version} (current is v{CURRENT_VERSION})")
+        print()
+
+        if prompt_yes_no(f"Upgrade database from v{db_version} to v{CURRENT_VERSION}?"):
+            success, from_ver, to_ver = run_migrations(db_path)
+            if success:
+                counts = count_db_objects(db_path)
+                print(f"  Schema objects after upgrade:")
+                print(f"    Tables:   {counts['table']}")
+                print(f"    Views:    {counts['view']}")
+                print(f"    Indexes:  {counts['index']}")
+                print(f"    Triggers: {counts['trigger']}")
+                return db_path
+            else:
+                print(f"  Migration failed at v{to_ver}. Check the backup file")
+                print(f"  and error messages above.")
+                if not prompt_yes_no("Continue setup with the current database?", default=False):
+                    sys.exit(1)
+                return db_path
+        else:
+            print("  Keeping existing database without upgrade.")
+            return db_path
+
+    # --- New database: create from schema.sql ---
     if not SCHEMA_FILE.exists():
         print(f"  ERROR: Schema file not found at {SCHEMA_FILE}")
         print("  Cannot create database without schema.sql.")
@@ -996,8 +1028,8 @@ def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     # 2. Database schema objects
     checks_total += 1
     counts = count_db_objects(db_path)
-    # Expect: 28 tables (+ sqlite_sequence = 29), 7 views, 1 trigger, 9 indexes
-    if counts["table"] >= 28 and counts["view"] >= 7:
+    # Expect: 30 tables (+ sqlite_sequence + schema_migrations), 7 views, 1 trigger, 11 indexes
+    if counts["table"] >= 30 and counts["view"] >= 7:
         print(f"  [+] Schema objects: {counts['table']} tables, "
               f"{counts['view']} views, {counts['trigger']} triggers, "
               f"{counts['index']} indexes")

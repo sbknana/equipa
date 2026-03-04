@@ -3,7 +3,7 @@
 -- Generated from the live theforge.db schema.
 -- Used by itzamna_setup.py to create new installations.
 --
--- Tables: 28, Views: 7, Triggers: 1, Indexes: 9
+-- Tables: 30, Views: 7, Triggers: 1, Indexes: 11
 
 -- ============================================================
 -- TABLES
@@ -274,6 +274,7 @@ CREATE TABLE agent_runs (
     success INTEGER DEFAULT 0,
     outcome TEXT,
     output_tail TEXT,
+    prompt_version TEXT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id),
     FOREIGN KEY (project_id) REFERENCES projects(id)
@@ -523,3 +524,9 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_actions_task ON agent_actions(task_id, cycle_number);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_tool ON agent_actions(tool_name, success);
+
+-- ============================================================
+-- VERSION STAMP
+-- ============================================================
+-- Marks fresh installs as v3. Migrations handle upgrades from older versions.
+PRAGMA user_version = 3;

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>README - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item active">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <p align="center">
+  <img src="ItzamnaIcon.png" alt="ForgeTeam" width="200">
+</p>
+
+<h2>Table of Contents</h2>
+
+  - <a href="#what-is-this">What is this?</a>
+  - <a href="#screenshots">Screenshots</a>
+    - <a href="#dashboard-overview">Dashboard Overview</a>
+    - <a href="#task-dispatch">Task Dispatch</a>
+    - <a href="#performance-analytics">Performance Analytics</a>
+    - <a href="#forgesmith-self-improvement">Forgesmith Self-Improvement</a>
+  - <a href="#quick-start">Quick Start</a>
+  - <a href="#how-to-use">How to Use</a>
+    - <a href="#planning-work">Planning Work</a>
+    - <a href="#running-tasks">Running Tasks</a>
+<ul><li><a href="#single-task">Single task</a></li>
+<li><a href="#auto-dispatch-across-all-projects">Auto-dispatch across all projects</a></li>
+<li><a href="#parallel-tasks">Parallel tasks</a></li>
+</ul>    - <a href="#checking-progress">Checking Progress</a>
+    - <a href="#performance-reports">Performance Reports</a>
+    - <a href="#self-improvement-with-forgesmith">Self-Improvement with Forgesmith</a>
+<ul><li><a href="#see-what-forgesmith-would-change-dry-run">See what Forgesmith would change (dry run)</a></li>
+<li><a href="#apply-improvements">Apply improvements</a></li>
+</ul>    - <a href="#security-reviews">Security Reviews</a>
+  - <a href="#features">Features</a>
+  - <a href="#installation">Installation</a>
+    - <a href="#prerequisites">Prerequisites</a>
+    - <a href="#guided-setup-recommended">Guided Setup (Recommended)</a>
+    - <a href="#manual-setup">Manual Setup</a>
+<ul><li><a href="#1-clone-the-repository">1. Clone the repository</a></li>
+<li><a href="#2-initialize-the-database">2. Initialize the database</a></li>
+<li><a href="#3-run-migrations-to-latest-version">3. Run migrations to latest version</a></li>
+<li><a href="#4-copy-the-example-config-and-edit-it">4. Copy the example config and edit it</a></li>
+<li><a href="#edit-configjson-with-your-paths-and-preferences">Edit config.json with your paths and preferences</a></li>
+<li><a href="#5-verify-everything-works">5. Verify everything works</a></li>
+</ul>  - <a href="#configuration">Configuration</a>
+    - <a href="#key-configuration-options">Key Configuration Options</a>
+    - <a href="#dispatch-configuration">Dispatch Configuration</a>
+    - <a href="#ollama-local-models">Ollama (Local Models)</a>
+  - <a href="#tech-stack">Tech Stack</a>
+  - <a href="#license">License</a>
+  - <a href="#related-documentation">Related Documentation</a>
+
+<h1 align="center">ForgeTeam</h1>
+
+<p align="center">
+  <strong>A multi-agent AI system that manages your entire software development workflow — planning, coding, testing, reviewing, and learning from every run.</strong>
+</p>
+
+<p align="center">
+  <em>Named after Itzamna, the Mayan god of creation, writing, and knowledge</em>
+</p>
+
+<hr>
+
+<img src="screenshots/dashboard.png" alt="ForgeTeam Dashboard" style="max-width:100%;border-radius:8px;margin:1em 0;">
+
+<h2>What is this?</h2>
+
+<p>ForgeTeam is an AI-powered development team that works on your codebase autonomously. It assigns tasks to specialized AI agents — a planner breaks down goals, a developer writes code, a tester validates it, and a reviewer checks quality — all coordinated through a central orchestrator. Over time, ForgeTeam learns from its successes and failures, automatically tuning its own prompts and strategies to get better at working on <em>your</em> projects.</p>
+
+<p>Think of it as a self-improving AI dev team that remembers what worked, avoids past mistakes, and handles the full development cycle from task planning to code review.</p>
+
+<h2>Screenshots</h2>
+
+<h3>Dashboard Overview</h3>
+<img src="screenshots/dashboard.png" alt="Dashboard" style="max-width:100%;border-radius:8px;margin:1em 0;">
+<em>The dashboard gives you a bird's-eye view of all your projects — task completion rates, blocked items, session activity, and priority breakdowns.</em>
+
+<h3>Task Dispatch</h3>
+<img src="screenshots/dispatch.png" alt="Dispatch" style="max-width:100%;border-radius:8px;margin:1em 0;">
+<em>The auto-dispatch view shows which projects have pending work, scores them by priority, and runs agents in parallel across your codebase.</em>
+
+<h3>Performance Analytics</h3>
+<img src="screenshots/analytics.png" alt="Analytics" style="max-width:100%;border-radius:8px;margin:1em 0;">
+<em>Track completion rates by project, complexity, and priority. See throughput trends over time and identify bottlenecks.</em>
+
+<h3>Forgesmith Self-Improvement</h3>
+<img src="screenshots/forgesmith.png" alt="Forgesmith" style="max-width:100%;border-radius:8px;margin:1em 0;">
+<em>Forgesmith analyzes past agent runs and automatically proposes configuration changes, prompt patches, and new lessons learned.</em>
+
+<h2>Quick Start</h2>
+
+<strong>1. Run the guided installer:</strong>
+<pre><code class="language-bash">python itzamna_setup.py
+</code></pre>
+
+<strong>2. The installer walks you through everything:</strong> prerequisites check, database creation, config generation, and optional components. Just answer the prompts.
+
+<strong>3. Run your first task:</strong>
+<pre><code class="language-bash">python forge_orchestrator.py --task &lt;task_id&gt;
+</code></pre>
+
+<strong>4. Or let ForgeTeam pick what to work on automatically:</strong>
+<pre><code class="language-bash">python forge_orchestrator.py --dispatch
+</code></pre>
+
+<strong>5. Check results on the dashboard:</strong>
+<pre><code class="language-bash">python forge_dashboard.py
+</code></pre>
+
+<p>That's it. The installer handles database setup, config files, and MCP integration for you.</p>
+
+<h2>How to Use</h2>
+
+<h3>Planning Work</h3>
+<p>Give ForgeTeam a high-level goal and it breaks it down into concrete tasks:</p>
+<pre><code class="language-bash">python forge_orchestrator.py --plan --goal "Add user authentication to the API"
+</code></pre>
+<p>The planner agent creates prioritized, dependency-aware tasks in your database.</p>
+
+<h3>Running Tasks</h3>
+<p>Run a specific task by ID, or let the dispatcher choose the highest-priority work:</p>
+<pre><code class="language-bash"># Single task
+<p>python forge_orchestrator.py --task 42</p>
+
+<h1>Auto-dispatch across all projects</h1>
+<p>python forge_orchestrator.py --dispatch</p>
+
+<h1>Parallel tasks</h1>
+<p>python forge_orchestrator.py --tasks 42,43,44</p>
+</code></pre>
+
+<p>Each task goes through a <strong>dev→test loop</strong>: the developer agent writes code, the tester agent validates it, and they iterate until tests pass or the budget is exhausted.</p>
+
+<h3>Checking Progress</h3>
+<p>The dashboard shows you everything at a glance:</p>
+<pre><code class="language-bash">python forge_dashboard.py
+</code></pre>
+<p>You'll see task completion rates, blocked items, open questions from agents, and session activity over time.</p>
+
+<h3>Performance Reports</h3>
+<p>Dive deeper into how your agents are performing:</p>
+<pre><code class="language-bash">python analyze_performance.py --days 30
+</code></pre>
+
+<h3>Self-Improvement with Forgesmith</h3>
+<p>ForgeTeam gets smarter over time. Forgesmith analyzes completed runs and:</p>
+<ul><li>Extracts lessons from failures</li>
+<li>Tunes agent prompts automatically</li>
+<li>Adjusts configuration (max turns, model selection)</li>
+<li>Prunes strategies that aren't working</li>
+</ul>
+<pre><code class="language-bash"># See what Forgesmith would change (dry run)
+<p>python forgesmith.py --dry-run</p>
+
+<h1>Apply improvements</h1>
+<p>python forgesmith.py</p>
+</code></pre>
+
+<h3>Security Reviews</h3>
+<p>Run a dedicated security review on any task:</p>
+<pre><code class="language-bash">python forge_orchestrator.py --task 42 --security
+</code></pre>
+
+<h2>Features</h2>
+
+<ul><li><strong>Autonomous dev→test loops</strong> — Developer and tester agents iterate until the code actually works, not just compiles</li>
+<li><strong>Persistent project memory</strong> — Every run is recorded as an episode; agents learn from past successes and failures</li>
+<li><strong>Smart task dispatch</strong> — Automatically prioritizes work across multiple projects based on urgency, complexity, and dependencies</li>
+<li><strong>Self-improving prompts</strong> — Forgesmith (SIMBA + GEPA) evolves agent prompts based on real performance data</li>
+<li><strong>Lesson learning</strong> — Automatically extracts and injects relevant lessons from past failures into future runs</li>
+<li><strong>Loop detection</strong> — Catches agents that get stuck repeating the same actions and terminates gracefully</li>
+<li><strong>Early termination</strong> — Detects stuck phrases and repeated tool calls, saving time and API costs</li>
+<li><strong>Inter-agent messaging</strong> — Agents communicate findings, blockers, and context to each other across cycles</li>
+<li><strong>Checkpoint & resume</strong> — Long-running tasks can be paused and resumed without losing progress</li>
+<li><strong>Rubric-based scoring</strong> — Every run is scored on multiple dimensions, enabling data-driven improvement</li>
+<li><strong>Multi-model support</strong> — Works with Claude Code, Ollama (local models), and configurable model selection per role</li>
+<li><strong>Security scanning</strong> — Dedicated security review agent with SARIF parsing for static analysis results</li>
+<li><strong>Arena mode</strong> — Adversarial testing where agents try to break and fix each other's work</li>
+<li><strong>Database migrations</strong> — Schema evolves safely with automatic backups and versioned migrations</li>
+<li><strong>Zero external dependencies</strong> — Pure Python, SQLite database, runs anywhere</li>
+</ul>
+<h2>Installation</h2>
+
+<h3>Prerequisites</h3>
+<ul><li><strong>Python 3.10+</strong></li>
+<li><strong>Claude Code CLI</strong> (<code>claude</code> command available in PATH)</li>
+<li><strong>SQLite 3</strong> (included with Python)</li>
+<li><strong>Git</strong> (for repository management features)</li>
+<li><strong>GitHub CLI</strong> (<code>gh</code>) — optional, for automated repo setup</li>
+</ul>
+<h3>Guided Setup (Recommended)</h3>
+<pre><code class="language-bash">git clone &lt;repo-url&gt; forgeteam
+<p>cd forgeteam</p>
+<p>python itzamna_setup.py</p>
+</code></pre>
+
+<p>The installer will:</p>
+<p>1. Check all prerequisites</p>
+<p>2. Let you choose an install path</p>
+<p>3. Create and initialize the SQLite database</p>
+<p>4. Copy all necessary files</p>
+<p>5. Generate configuration files</p>
+<p>6. Set up MCP integration for Claude Code</p>
+<p>7. Optionally configure Sentinel (monitoring) and ForgeBot (automation)</p>
+
+<h3>Manual Setup</h3>
+<pre><code class="language-bash"># 1. Clone the repository
+<p>git clone &lt;repo-url&gt; forgeteam</p>
+<p>cd forgeteam</p>
+
+<h1>2. Initialize the database</h1>
+<p>sqlite3 forge.db &lt; schema.sql</p>
+
+<h1>3. Run migrations to latest version</h1>
+<p>python db_migrate.py</p>
+
+<h1>4. Copy the example config and edit it</h1>
+<p>cp config.example.json config.json</p>
+<h1>Edit config.json with your paths and preferences</h1>
+
+<h1>5. Verify everything works</h1>
+<p>python forge_dashboard.py</p>
+</code></pre>
+
+<h2>Configuration</h2>
+
+<p>ForgeTeam uses a JSON configuration file (<code>config.json</code>) and an optional dispatch configuration (<code>dispatch_config.json</code>).</p>
+
+<h3>Key Configuration Options</h3>
+
+<table><tr><td>Setting</td><td>What it does</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>db_path</code></td><td>Path to your SQLite database</td></tr>
+<tr><td><code>project_dir</code></td><td>Root directory for your projects</td></tr>
+<tr><td><code>max_turns</code></td><td>Maximum dev→test iterations per task</td></tr>
+<tr><td><code>model</code></td><td>Default AI model for agents</td></tr>
+<tr><td><code>checkpoint_dir</code></td><td>Where to store task checkpoints</td></tr>
+<tr><td><code>forgesmith.lookback_days</code></td><td>How far back Forgesmith looks for patterns</td></tr>
+<tr><td><code>forgesmith.dry_run</code></td><td>Preview changes without applying them</td></tr>
+</table>
+<h3>Dispatch Configuration</h3>
+<p>The dispatch config (<code>dispatch_config.json</code>) controls:</p>
+<ul><li>Which model each agent role uses</li>
+<li>Per-role system prompts</li>
+<li>Provider selection (Claude, Ollama)</li>
+<li>Task type routing and filtering</li>
+<li>Concurrency limits for parallel dispatch</li>
+</ul>
+<h3>Ollama (Local Models)</h3>
+<p>To use local models via Ollama, set the provider in your dispatch config:</p>
+<pre><code class="language-json">{
+  "provider": "ollama",
+  "ollama_base_url": "http://localhost:11434",
+  "ollama_model": "codellama:34b"
+}
+</code></pre>
+
+<h2>Tech Stack</h2>
+
+<ul><li><strong>Python</strong> — Core orchestrator, all tooling, no framework dependencies</li>
+<li><strong>SQLite</strong> — All persistent state: tasks, episodes, lessons, metrics, messages</li>
+<li><strong>Claude Code CLI</strong> — Primary AI backend for agent execution</li>
+<li><strong>Ollama</strong> — Optional local model support</li>
+<li><strong>DSPy</strong> — Used by Forgesmith GEPA for prompt evolution</li>
+<li><strong>SARIF</strong> — Standard format for security analysis findings</li>
+<li><strong>QLoRA/PEFT</strong> — Optional fine-tuning pipeline for training custom models on ForgeTeam data</li>
+</ul>
+<h2>License</h2>
+
+<p>See <a href="LICENSE">LICENSE</a> for details.</p>
+<hr>
+
+<h2>Related Documentation</h2>
+
+<ul><li><a href="ARCHITECTURE.md">Architecture</a></li>
+<li><a href="API.md">Api</a></li>
+<li><a href="DEPLOYMENT.md">Deployment</a></li>
+<li><a href="CONTRIBUTING.md">Contributing</a></li>
+</ul>
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>

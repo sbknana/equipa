@@ -1,0 +1,4402 @@
+{
+  "name": "Itzamna",
+  "framework": "unknown",
+  "language": "unknown",
+  "routes": [],
+  "components": [],
+  "functions": [
+    {
+      "name": "main",
+      "file": "train_qlora_peft.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "train_qlora.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_task_type_field_exists",
+      "file": "test_task_type_routing_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_dispatch_config_prompts",
+      "file": "test_task_type_routing_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_orchestrator_injection_logic",
+      "file": "test_task_type_routing_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prompt_content_requirements",
+      "file": "test_task_type_routing_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_task_type_routing_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_task_type_field_exists",
+      "file": "test_task_type_routing.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_dispatch_config_has_all_prompts",
+      "file": "test_task_type_routing.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prompt_content_matches_spec",
+      "file": "test_task_type_routing.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_orchestrator_injection_logic",
+      "file": "test_task_type_routing.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_task_type_routing.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_database_schema",
+      "file": "test_task_665_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_dispatch_config",
+      "file": "test_task_665_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_orchestrator_integration",
+      "file": "test_task_665_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_task_665_verification.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "run_tests",
+      "file": "test_rubric_scoring.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_extracts_result_and_summary",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_extracts_blockers",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_ignores_none_blockers",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_includes_errors",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_limits_errors_to_three",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_empty_result",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_record_ok_for_different_fingerprints",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_warning_at_threshold",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_terminate_at_threshold",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_warning_only_issued_once",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_files_changed_resets_counter",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_same_files_does_not_reset",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_no_files_changed_does_not_reset",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_alternating_patterns_no_loop",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_warning_message_content",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_termination_summary_content",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_custom_thresholds",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_fingerprint_is_sorted_deterministic",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_reset_after_success",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_ok",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_warn",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_terminate",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_empty",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_broken_by_different",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_ok_when_last_succeeds",
+      "file": "test_loop_detection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "setup_test_data",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_relevant_lessons_by_role",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_relevant_lessons_by_role_and_error",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_relevant_lessons_limit",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_lessons_for_injection",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_update_lesson_injection_count",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_build_system_prompt_with_lessons",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_only_active_lessons",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_times_injected_tracking",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "run_all_tests",
+      "file": "test_lessons_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db_connection",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "setup_simba_test_data",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "cleanup_simba_test_data",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_constants_have_expected_values",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_find_high_variance_episodes",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_high_variance_requires_reflection",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_find_hardest_cases",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_build_simba_prompt_structure",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_build_simba_prompt_empty_sections",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_build_simba_prompt_truncation",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_valid",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_too_long",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_too_short",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_empty",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_invalid_error_type",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_valid_error_types",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_not_dict",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_duplicate_detection",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_validate_rule_different_enough",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_success",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_timeout",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_not_found",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_nonzero_exit",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_empty_response",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_malformed_json",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_markdown_fences",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_call_claude_for_rules_model_config",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_store_rules_dry_run",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_store_rules_actual_write",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_store_rules_caps_at_max",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_store_rules_rejects_duplicates",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_store_rules_unique_signature",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_evaluate_simba_rules_needs_minimum_samples",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prune_stale_rules_dry_run",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prune_stale_rules_actual",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prune_keeps_effective_rules",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_prune_threshold",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_existing_simba_rules_all",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_existing_simba_rules_by_role",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_run_simba_full_pipeline_mocked",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_run_simba_skips_insufficient_episodes",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_run_simba_returns_expected_structure",
+      "file": "test_forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db_connection",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "setup_test_data",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_relevant_episodes_basic",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_q_value_filtering",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_project_filtering",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_reflection_required",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_episodes_for_injection",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_update_episode_injection_count",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_update_episode_q_values_success",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_update_episode_q_values_failure",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_q_value_bounds",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_build_system_prompt_with_episodes",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_update_injected_episode_q_values_for_task",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_cross_project_fallback",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "run_all_tests",
+      "file": "test_episode_injection.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_detects_each",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_case_insensitive",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_returns_none_for_clean_text",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_partial_match",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_returns_first_match",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_repeated_tools_detects_4_identical",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_repeated_tools_no_detection_for_varied",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_repeated_tools_short_history",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_repeated_tools_only_checks_last_window",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_repeated_tools_custom_window",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_constants_values",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_exempt_roles_contains_expected",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_stuck_phrases_list_not_empty",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_integrates_with_early_term",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_detect_tool_loop_warn_at_3",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_early_termination.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "make_temp_db",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "setup_test_db",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "teardown_test_db",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "db_path"
+      ]
+    },
+    {
+      "name": "test_ensure_creates_table",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_ensure_is_idempotent",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_post_inserts_message",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_post_multiple_messages",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_read_returns_unread_for_role",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_read_filters_by_task",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_read_respects_max_cycle",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_read_returns_ordered_by_cycle_and_id",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_read_returns_empty_list_for_no_messages",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_mark_read_prevents_re_reading",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_mark_read_sets_correct_cycle",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_mark_read_only_affects_target_role",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_mark_read_only_affects_target_task",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_empty_list",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_json_content",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_plain_text_content",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_multiple_messages",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_handles_missing_keys",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_format_handles_non_dict_json",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_end_to_end_post_read_format_mark",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_agent_messages.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "_make_temp_db",
+      "file": "test_agent_actions.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_timeout",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_file_not_found",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_permission",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_syntax",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_import",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_test_failure",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_unknown",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_classify_error_empty",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_ensure_agent_actions_table_creates_table",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_ensure_agent_actions_table_idempotent",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_log_agent_action_inserts_record",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_log_agent_action_failure_record",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_log_agent_action_never_crashes",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_bulk_log_agent_actions_inserts_all",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_bulk_log_agent_actions_empty_list",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_bulk_log_agent_actions_never_crashes",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_action_summary_all_cycles",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_action_summary_specific_cycle",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_action_summary_no_data",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_action_summary_isolates_tasks",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "test_get_action_summary_never_crashes",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "make_conv",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "system",
+        "user",
+        "assistant"
+      ]
+    },
+    {
+      "name": "chash",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "is_quality",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text",
+        "min_len",
+        "max_len"
+      ]
+    },
+    {
+      "name": "detect_sys",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "proc_code_feedback",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "mx"
+      ]
+    },
+    {
+      "name": "proc_code_instr",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "mx"
+      ]
+    },
+    {
+      "name": "proc_python",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "mx"
+      ]
+    },
+    {
+      "name": "proc_swe",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "mx"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "prepare_training_data.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "safe_path",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "relative_path"
+      ]
+    },
+    {
+      "name": "is_safe_read_command",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "command"
+      ]
+    },
+    {
+      "name": "is_blocked_command",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "command"
+      ]
+    },
+    {
+      "name": "exec_read_file",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "exec_list_directory",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "exec_search_files",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "exec_grep",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "exec_bash",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args",
+        "allow_write"
+      ]
+    },
+    {
+      "name": "exec_write_file",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "exec_edit_file",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir",
+        "args"
+      ]
+    },
+    {
+      "name": "ollama_chat",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_url",
+        "model",
+        "messages",
+        "tools",
+        "timeout"
+      ]
+    },
+    {
+      "name": "check_ollama_health",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_url"
+      ]
+    },
+    {
+      "name": "list_ollama_models",
+      "file": "ollama_agent.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_url"
+      ]
+    },
+    {
+      "name": "print_header",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "print_step",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "num",
+        "text"
+      ]
+    },
+    {
+      "name": "prompt_input",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "message",
+        "default"
+      ]
+    },
+    {
+      "name": "prompt_yes_no",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "message",
+        "default"
+      ]
+    },
+    {
+      "name": "check_command",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cmd",
+        "version_flag"
+      ]
+    },
+    {
+      "name": "run_sql_file",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "db_path",
+        "sql_path"
+      ]
+    },
+    {
+      "name": "count_db_objects",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_welcome",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "step_prerequisites",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "step_install_path",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "step_database",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path"
+      ]
+    },
+    {
+      "name": "step_copy_files",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path"
+      ]
+    },
+    {
+      "name": "step_generate_config",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "_resolve_uvx_path",
+      "file": "itzamna_setup.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "step_generate_mcp_config",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_generate_dot_mcp",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_generate_claude_md",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_forgesmith_cron",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path"
+      ]
+    },
+    {
+      "name": "_find_node_path",
+      "file": "itzamna_setup.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "_find_npx_path",
+      "file": "itzamna_setup.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "step_optional_sentinel",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_optional_forgebot",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path"
+      ]
+    },
+    {
+      "name": "step_verify",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path",
+        "sentinel_dir",
+        "forgebot_dir"
+      ]
+    },
+    {
+      "name": "step_next_steps",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "base_path",
+        "db_path",
+        "sentinel_dir",
+        "forgebot_dir"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "itzamna_setup.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "log",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "msg"
+      ]
+    },
+    {
+      "name": "find_high_variance_episodes",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "lookback_days"
+      ]
+    },
+    {
+      "name": "find_hardest_cases",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "lookback_days"
+      ]
+    },
+    {
+      "name": "get_existing_simba_rules",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role"
+      ]
+    },
+    {
+      "name": "build_simba_prompt",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "successes",
+        "failures",
+        "hardest_cases",
+        "existing_rules"
+      ]
+    },
+    {
+      "name": "call_claude_for_rules",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "prompt",
+        "cfg"
+      ]
+    },
+    {
+      "name": "validate_rule",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "rule",
+        "existing_rules"
+      ]
+    },
+    {
+      "name": "store_rules",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "rules",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "evaluate_simba_rules",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "prune_stale_rules",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "dry_run"
+      ]
+    },
+    {
+      "name": "run_simba",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg",
+        "dry_run",
+        "role_filter"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "forgesmith_simba.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "log",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "msg"
+      ]
+    },
+    {
+      "name": "collect_episodes_for_role",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "lookback_days"
+      ]
+    },
+    {
+      "name": "episodes_to_dspy_examples",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "episodes"
+      ]
+    },
+    {
+      "name": "gepa_metric",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "gold",
+        "pred",
+        "trace",
+        "pred_name",
+        "pred_trace"
+      ]
+    },
+    {
+      "name": "run_gepa_for_role",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "episodes",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "calculate_diff_ratio",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "old_text",
+        "new_text"
+      ]
+    },
+    {
+      "name": "check_protected_sections",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "old_text",
+        "new_text"
+      ]
+    },
+    {
+      "name": "validate_evolved_prompt",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "current_prompt",
+        "evolved_prompt"
+      ]
+    },
+    {
+      "name": "get_current_prompt_version",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role"
+      ]
+    },
+    {
+      "name": "store_evolved_prompt",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "get_ab_prompt_for_role",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role"
+      ]
+    },
+    {
+      "name": "_should_rollback",
+      "file": "forgesmith_gepa.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "role",
+        "version"
+      ]
+    },
+    {
+      "name": "rollback_evolved_prompt",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "version"
+      ]
+    },
+    {
+      "name": "get_ab_test_status",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role"
+      ]
+    },
+    {
+      "name": "ensure_prompt_version_column",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "run_gepa",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg",
+        "dry_run",
+        "role_filter",
+        "run_id"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_task_info",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "task_id"
+      ]
+    },
+    {
+      "name": "parse_summary_blocks",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_db_updates",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_cost_data",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_max_turns_info",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_model_info",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_max_turns_values",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "parse_complexity",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "content"
+      ]
+    },
+    {
+      "name": "get_log_timestamp",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "log_path"
+      ]
+    },
+    {
+      "name": "backfill",
+      "file": "forgesmith_backfill.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "load_config",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "log",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "msg"
+      ]
+    },
+    {
+      "name": "collect_agent_runs",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "collect_blocked_tasks",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "collect_previous_changes",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "run_id"
+      ]
+    },
+    {
+      "name": "get_suppressed_changes",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "extract_lessons",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "_generate_lesson",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "error_sig",
+        "info"
+      ]
+    },
+    {
+      "name": "get_relevant_lessons",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "error_type",
+        "limit"
+      ]
+    },
+    {
+      "name": "analyze_max_turns_hit",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "analyze_turn_underuse",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "analyze_model_downgrade",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "analyze_repeat_errors",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "analyze_blocked_tasks",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "blocked_tasks",
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "run_analysis",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "backup_file",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filepath",
+        "cfg"
+      ]
+    },
+    {
+      "name": "apply_config_change",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "key",
+        "old_val",
+        "new_val",
+        "rationale",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "apply_prompt_patch",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "patch_text",
+        "rationale",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "apply_blocked_resolution",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "finding",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "apply_changes",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "_build_error_patch",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "error_sig",
+        "count"
+      ]
+    },
+    {
+      "name": "_get_rubric_score_delta",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "runs",
+        "change_time"
+      ]
+    },
+    {
+      "name": "evaluate_previous_changes",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "rollback_change",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "change"
+      ]
+    },
+    {
+      "name": "ensure_rubric_scores_table",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "_get_agent_run_output",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "agent_run_id"
+      ]
+    },
+    {
+      "name": "_parse_result_block",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "_score_developer",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "run",
+        "parsed_output",
+        "cfg"
+      ]
+    },
+    {
+      "name": "_score_tester",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "run",
+        "parsed_output",
+        "cfg"
+      ]
+    },
+    {
+      "name": "_score_reviewer",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "run",
+        "parsed_output",
+        "cfg"
+      ]
+    },
+    {
+      "name": "_score_generic",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "run",
+        "parsed_output",
+        "cfg"
+      ]
+    },
+    {
+      "name": "compute_rubric_score",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "run",
+        "cfg"
+      ]
+    },
+    {
+      "name": "score_completed_runs",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "analyze_rubric_correlations",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "ensure_rubric_evolution_table",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "evolve_rubric_weights",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "_get_correlation_sample_sizes",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "get_rubric_report",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "limit"
+      ]
+    },
+    {
+      "name": "collect_role_metrics",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg"
+      ]
+    },
+    {
+      "name": "collect_recent_reflections",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg",
+        "role",
+        "limit"
+      ]
+    },
+    {
+      "name": "build_opro_prompt",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "current_prompt",
+        "metrics",
+        "reflections",
+        "cfg"
+      ]
+    },
+    {
+      "name": "validate_opro_proposal",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "proposal",
+        "current_prompt",
+        "cfg"
+      ]
+    },
+    {
+      "name": "call_claude_for_proposals",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "prompt",
+        "cfg"
+      ]
+    },
+    {
+      "name": "generate_opro_proposals",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "runs",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "apply_opro_proposals",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "proposals",
+        "run_id",
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "_parse_improvement_pct",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "expected_str"
+      ]
+    },
+    {
+      "name": "_apply_single_opro_proposal",
+      "file": "forgesmith.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "proposal",
+        "role",
+        "prompt_file",
+        "current_prompt",
+        "run_id",
+        "cfg"
+      ]
+    },
+    {
+      "name": "run_propose_only",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "log_run",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "run_id",
+        "runs_analyzed",
+        "changes",
+        "summary",
+        "mode",
+        "cfg"
+      ]
+    },
+    {
+      "name": "run_report",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg"
+      ]
+    },
+    {
+      "name": "run_full",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "cfg",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "run_rollback",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "run_id_to_revert"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "forgesmith.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_provider",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "dispatch_config"
+      ]
+    },
+    {
+      "name": "get_ollama_model",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "dispatch_config"
+      ]
+    },
+    {
+      "name": "get_ollama_base_url",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "dispatch_config"
+      ]
+    },
+    {
+      "name": "load_config",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "_discover_roles",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "_handle_add_project",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "name",
+        "project_dir"
+      ]
+    },
+    {
+      "name": "log",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "msg",
+        "output"
+      ]
+    },
+    {
+      "name": "get_db_connection",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "write"
+      ]
+    },
+    {
+      "name": "update_task_status",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "outcome",
+        "output"
+      ]
+    },
+    {
+      "name": "ensure_agent_episodes_table",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "ensure_agent_messages_table",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "post_agent_message",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "cycle",
+        "from_role",
+        "to_role",
+        "msg_type",
+        "content"
+      ]
+    },
+    {
+      "name": "read_agent_messages",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "to_role",
+        "max_cycle"
+      ]
+    },
+    {
+      "name": "mark_messages_read",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "to_role",
+        "cycle_number"
+      ]
+    },
+    {
+      "name": "format_messages_for_prompt",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "messages"
+      ]
+    },
+    {
+      "name": "ensure_agent_actions_table",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "classify_error",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "error_text"
+      ]
+    },
+    {
+      "name": "bulk_log_agent_actions",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "action_log",
+        "task_id",
+        "run_id",
+        "cycle",
+        "role"
+      ]
+    },
+    {
+      "name": "get_action_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "cycle"
+      ]
+    },
+    {
+      "name": "parse_reflection",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "parse_approach_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "parse_error_patterns",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result"
+      ]
+    },
+    {
+      "name": "compute_initial_q_value",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "outcome"
+      ]
+    },
+    {
+      "name": "record_agent_episode",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task",
+        "result",
+        "outcome",
+        "role",
+        "output"
+      ]
+    },
+    {
+      "name": "run_reflexion_agent",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "task",
+        "result",
+        "outcome",
+        "role",
+        "output"
+      ]
+    },
+    {
+      "name": "maybe_run_reflexion",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "task",
+        "result",
+        "outcome",
+        "role",
+        "output"
+      ]
+    },
+    {
+      "name": "fetch_task",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id"
+      ]
+    },
+    {
+      "name": "fetch_next_todo",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_id"
+      ]
+    },
+    {
+      "name": "fetch_project_context",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_id"
+      ]
+    },
+    {
+      "name": "_get_task_status",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "task_id"
+      ]
+    },
+    {
+      "name": "fetch_project_info",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_id"
+      ]
+    },
+    {
+      "name": "fetch_tasks_by_ids",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_ids"
+      ]
+    },
+    {
+      "name": "build_task_prompt",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task",
+        "project_context",
+        "project_dir"
+      ]
+    },
+    {
+      "name": "estimate_tokens",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "compute_keyword_overlap",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "text_a",
+        "text_b"
+      ]
+    },
+    {
+      "name": "deduplicate_lessons",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "lessons"
+      ]
+    },
+    {
+      "name": "compact_agent_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "raw_output",
+        "max_words"
+      ]
+    },
+    {
+      "name": "_trim_prompt_section",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "prompt",
+        "section_heading",
+        "max_chars"
+      ]
+    },
+    {
+      "name": "format_lessons_for_injection",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "lessons"
+      ]
+    },
+    {
+      "name": "update_lesson_injection_count",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "lesson_ids"
+      ]
+    },
+    {
+      "name": "format_episodes_for_injection",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "episodes"
+      ]
+    },
+    {
+      "name": "update_episode_injection_count",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "episode_ids"
+      ]
+    },
+    {
+      "name": "update_episode_q_values",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "injected_episode_ids",
+        "task_succeeded"
+      ]
+    },
+    {
+      "name": "update_injected_episode_q_values_for_task",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "outcome",
+        "output"
+      ]
+    },
+    {
+      "name": "get_task_complexity",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task"
+      ]
+    },
+    {
+      "name": "get_role_turns",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "args",
+        "config",
+        "task"
+      ]
+    },
+    {
+      "name": "get_role_model",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "args",
+        "config",
+        "task"
+      ]
+    },
+    {
+      "name": "save_checkpoint",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "attempt",
+        "output_text",
+        "role"
+      ]
+    },
+    {
+      "name": "load_checkpoint",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "role"
+      ]
+    },
+    {
+      "name": "clear_checkpoints",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "role"
+      ]
+    },
+    {
+      "name": "build_checkpoint_context",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "checkpoint_text",
+        "attempt"
+      ]
+    },
+    {
+      "name": "run_agent",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "cmd",
+        "timeout"
+      ]
+    },
+    {
+      "name": "_check_stuck_phrases",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "text"
+      ]
+    },
+    {
+      "name": "_check_repeated_tool_calls",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "tool_history",
+        "window"
+      ]
+    },
+    {
+      "name": "_detect_tool_loop",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "tool_history",
+        "tool_errors",
+        "warn_threshold",
+        "terminate_threshold"
+      ]
+    },
+    {
+      "name": "validate_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result"
+      ]
+    },
+    {
+      "name": "run_agent_with_retries",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "cmd",
+        "task",
+        "max_retries"
+      ]
+    },
+    {
+      "name": "parse_tester_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "parse_developer_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "build_compaction_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "role",
+        "result",
+        "cycle",
+        "task"
+      ]
+    },
+    {
+      "name": "build_test_failure_context",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "test_results",
+        "cycle"
+      ]
+    },
+    {
+      "name": "auto_install_dependencies",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "project_dir",
+        "output"
+      ]
+    },
+    {
+      "name": "calculate_dynamic_budget",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "max_turns"
+      ]
+    },
+    {
+      "name": "adjust_dynamic_budget",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "current_budget",
+        "max_turns",
+        "result_text"
+      ]
+    },
+    {
+      "name": "run_dev_test_loop",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "task",
+        "project_dir",
+        "project_context",
+        "args",
+        "output"
+      ]
+    },
+    {
+      "name": "run_security_review",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "task",
+        "project_dir",
+        "project_context",
+        "args",
+        "output"
+      ]
+    },
+    {
+      "name": "build_planner_prompt",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "goal",
+        "project_id",
+        "project_dir",
+        "project_context"
+      ]
+    },
+    {
+      "name": "parse_planner_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "parse_evaluator_output",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result_text"
+      ]
+    },
+    {
+      "name": "verify_task_updated",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id"
+      ]
+    },
+    {
+      "name": "print_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task",
+        "result",
+        "verified",
+        "verify_msg"
+      ]
+    },
+    {
+      "name": "print_dev_test_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task",
+        "result",
+        "cycles",
+        "outcome",
+        "verified",
+        "verify_msg"
+      ]
+    },
+    {
+      "name": "resolve_project_dir",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task"
+      ]
+    },
+    {
+      "name": "load_goals_file",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filepath"
+      ]
+    },
+    {
+      "name": "validate_goals",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "goals"
+      ]
+    },
+    {
+      "name": "run_single_goal",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "goal_entry",
+        "semaphore",
+        "index",
+        "defaults",
+        "args"
+      ]
+    },
+    {
+      "name": "run_parallel_goals",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "resolved_goals",
+        "defaults",
+        "args"
+      ]
+    },
+    {
+      "name": "print_parallel_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "results"
+      ]
+    },
+    {
+      "name": "check_gh_installed",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "detect_project_language",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "project_dir"
+      ]
+    },
+    {
+      "name": "_get_repo_env",
+      "file": "forge_orchestrator.py",
+      "exported": false,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "setup_single_repo",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "codename",
+        "project_dir",
+        "owner",
+        "dry_run"
+      ]
+    },
+    {
+      "name": "setup_all_repos",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "args"
+      ]
+    },
+    {
+      "name": "scan_pending_work",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "score_project",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "summary",
+        "config"
+      ]
+    },
+    {
+      "name": "load_dispatch_config",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filepath"
+      ]
+    },
+    {
+      "name": "apply_dispatch_filters",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "work",
+        "config",
+        "args"
+      ]
+    },
+    {
+      "name": "run_project_tasks",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "project_summary",
+        "config",
+        "args",
+        "output"
+      ]
+    },
+    {
+      "name": "run_project_dispatch",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "project_summary",
+        "semaphore",
+        "config",
+        "args"
+      ]
+    },
+    {
+      "name": "run_auto_dispatch",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "scored",
+        "config",
+        "args"
+      ]
+    },
+    {
+      "name": "print_dispatch_plan",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "scored",
+        "config"
+      ]
+    },
+    {
+      "name": "print_dispatch_summary",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "results"
+      ]
+    },
+    {
+      "name": "parse_task_ids",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_str"
+      ]
+    },
+    {
+      "name": "run_parallel_tasks",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": [
+        "task_ids",
+        "args"
+      ]
+    },
+    {
+      "name": "async_main",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": true,
+      "params": []
+    },
+    {
+      "name": "main",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "load_config",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "script_dir"
+      ]
+    },
+    {
+      "name": "connect_db",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "config"
+      ]
+    },
+    {
+      "name": "parse_checkpoint_filename",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filename"
+      ]
+    },
+    {
+      "name": "parse_checkpoint_file",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filepath"
+      ]
+    },
+    {
+      "name": "load_all_checkpoints",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "checkpoints_dir"
+      ]
+    },
+    {
+      "name": "query_task_summary",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "query_tasks_per_day",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "days"
+      ]
+    },
+    {
+      "name": "query_project_completion",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "query_priority_breakdown",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "query_blocked_tasks",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "query_open_questions",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "query_session_activity",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "days"
+      ]
+    },
+    {
+      "name": "analyze_checkpoints",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "checkpoints"
+      ]
+    },
+    {
+      "name": "_bar_chart_html",
+      "file": "forge_dashboard.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "data",
+        "label_key",
+        "value_key",
+        "max_val",
+        "color",
+        "suffix"
+      ]
+    },
+    {
+      "name": "_stacked_bar_html",
+      "file": "forge_dashboard.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "projects"
+      ]
+    },
+    {
+      "name": "_table_html",
+      "file": "forge_dashboard.py",
+      "exported": false,
+      "async": false,
+      "params": [
+        "headers",
+        "rows"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "forge_dashboard.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "log",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "msg",
+        "output"
+      ]
+    },
+    {
+      "name": "get_db",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "create_task",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "title",
+        "description",
+        "role",
+        "complexity",
+        "task_type"
+      ]
+    },
+    {
+      "name": "get_task_status",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "task_id"
+      ]
+    },
+    {
+      "name": "get_episodes_since",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "start_time"
+      ]
+    },
+    {
+      "name": "dispatch_task",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "task_id",
+        "role"
+      ]
+    },
+    {
+      "name": "check_convergence",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "phase_id",
+        "iteration"
+      ]
+    },
+    {
+      "name": "build_fix_description",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "phase",
+        "role_findings"
+      ]
+    },
+    {
+      "name": "run_phase",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "phase",
+        "conn",
+        "dry_run",
+        "max_iterations",
+        "cooldown"
+      ]
+    },
+    {
+      "name": "export_lora_data",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "forge_arena.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "get_db_version",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "set_db_version",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "version"
+      ]
+    },
+    {
+      "name": "detect_legacy_version",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_effective_version",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "backup_database",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "db_path"
+      ]
+    },
+    {
+      "name": "ensure_schema_migrations_table",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "log_migration",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "from_ver",
+        "to_ver",
+        "description"
+      ]
+    },
+    {
+      "name": "migrate_v0_to_v1",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "migrate_v1_to_v2",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "migrate_v2_to_v3",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "run_migrations",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "db_path",
+        "silent"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "db_migrate.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "load_config",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "script_dir"
+      ]
+    },
+    {
+      "name": "connect_db",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "config"
+      ]
+    },
+    {
+      "name": "parse_checkpoint_filename",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filename"
+      ]
+    },
+    {
+      "name": "parse_checkpoint_file",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "filepath"
+      ]
+    },
+    {
+      "name": "load_all_checkpoints",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "checkpoints_dir"
+      ]
+    },
+    {
+      "name": "get_task_stats",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "project_id"
+      ]
+    },
+    {
+      "name": "get_completion_rates_by_project",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_completion_rates_by_priority",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_completion_rates_by_complexity",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_time_to_complete_by_complexity",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_task_throughput_by_date",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "days"
+      ]
+    },
+    {
+      "name": "get_blocked_tasks_detail",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_open_questions_summary",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "get_session_activity",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "days"
+      ]
+    },
+    {
+      "name": "get_decisions_count_by_project",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn"
+      ]
+    },
+    {
+      "name": "analyze_checkpoints",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "checkpoints"
+      ]
+    },
+    {
+      "name": "build_report",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "conn",
+        "checkpoints_dir",
+        "project_id",
+        "days"
+      ]
+    },
+    {
+      "name": "print_summary",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "report"
+      ]
+    },
+    {
+      "name": "main",
+      "file": "analyze_performance.py",
+      "exported": true,
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "load_sarif",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "path"
+      ]
+    },
+    {
+      "name": "save_sarif",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "sarif",
+        "path",
+        "indent"
+      ]
+    },
+    {
+      "name": "validate_version",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "sarif"
+      ]
+    },
+    {
+      "name": "normalize_path",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "uri",
+        "base_path"
+      ]
+    },
+    {
+      "name": "safe_get",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "data",
+        "*keys",
+        "default"
+      ]
+    },
+    {
+      "name": "extract_location",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result"
+      ]
+    },
+    {
+      "name": "iter_results",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "sarif"
+      ]
+    },
+    {
+      "name": "extract_findings",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "sarif"
+      ]
+    },
+    {
+      "name": "filter_by_level",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings",
+        "*levels"
+      ]
+    },
+    {
+      "name": "filter_by_file",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings",
+        "pattern"
+      ]
+    },
+    {
+      "name": "filter_by_rule",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings",
+        "*rule_ids"
+      ]
+    },
+    {
+      "name": "sort_by_severity",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings",
+        "reverse"
+      ]
+    },
+    {
+      "name": "group_by_file",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "group_by_rule",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "count_by_level",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "count_by_rule",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "compute_fingerprint",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "result",
+        "include_message"
+      ]
+    },
+    {
+      "name": "deduplicate",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "merge_sarif_files",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "*paths"
+      ]
+    },
+    {
+      "name": "get_rules",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "sarif"
+      ]
+    },
+    {
+      "name": "to_csv_rows",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    },
+    {
+      "name": "summary",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "async": false,
+      "params": [
+        "findings"
+      ]
+    }
+  ],
+  "classes": [
+    {
+      "name": "TestRubricScoring",
+      "file": "test_rubric_scoring.py",
+      "exported": true,
+      "methods": [
+        "setUp",
+        "tearDown",
+        "_setup_schema",
+        "test_rubric_definitions_in_config",
+        "test_rubric_scores_table_creation",
+        "test_score_developer_success",
+        "test_score_developer_failure",
+        "test_score_tester_pass",
+        "test_score_reviewer",
+        "test_compute_rubric_score_integration",
+        "test_score_completed_runs",
+        "test_rubric_evolution_config",
+        "test_analyze_rubric_correlations",
+        "test_effectiveness_evaluation_uses_rubric_scores"
+      ]
+    },
+    {
+      "name": "TestRubricEvolution",
+      "file": "test_rubric_scoring.py",
+      "exported": true,
+      "methods": [
+        "setUp",
+        "tearDown",
+        "test_evolve_rubric_weights_increases_predictive_criteria",
+        "test_rubric_evolution_history_recorded"
+      ]
+    },
+    {
+      "name": "_NoCloseConnection",
+      "file": "test_agent_actions.py",
+      "exported": true,
+      "methods": [
+        "__getattr__",
+        "close",
+        "real_close"
+      ]
+    },
+    {
+      "name": "RolePromptModule",
+      "file": "forgesmith_gepa.py",
+      "exported": true,
+      "methods": [
+        "forward"
+      ]
+    },
+    {
+      "name": "LoopDetector",
+      "file": "forge_orchestrator.py",
+      "exported": true,
+      "methods": [
+        "_fingerprint",
+        "_get_files_changed",
+        "record",
+        "warning_message",
+        "termination_summary"
+      ]
+    },
+    {
+      "name": "Finding",
+      "file": "skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py",
+      "exported": true,
+      "methods": []
+    }
+  ],
+  "exports": [],
+  "apiEndpoints": [],
+  "scripts": {},
+  "dependencies": {},
+  "devDependencies": {},
+  "context": {
+    "hasClaudeMd": true,
+    "hasReadme": true,
+    "claudeMdSummary": "# CLAUDE.md — Itzamna\n\n## Project Overview\n\n**TheForge project_id:** 23\n**Status:** Active - v2.1 IMPLEMENTED\n\nItzamna is the portable installer and onboarding system for the ForgeTeam multi-agent orchestration platform. Named after the Mayan god of creation, writing, and knowledge, Itzamna makes ForgeTeam usable by anyone — not just the original developer.\n\n**What it does:**\n- Guided setup: prerequisites check, install path selection, DB creation\n...",
+    "readmeSummary": "<p align=\"center\">\r\n  <img src=\"ItzamnaIcon.png\" alt=\"ForgeTeam\" width=\"200\">\r\n</p>\r\n\r\n<h1 align=\"center\">ForgeTeam</h1>\r\n\r\n<p align=\"center\">\r\n  <strong>Multi-agent AI orchestrator for Claude Code</strong><br>\r\n  Zero dependencies. Persistent project memory. Dev+Test loops that actually work.\r\n</p>\r\n\r\n<p align=\"center\">\r\n  <em>Named after Itzamna, the Mayan god of creation, writing, and knowledge</em>\r\n</p>\r\n\r\n---\r\n\r\n..."
+  },
+  "scannedAt": "2026-03-04T16:26:51.491Z",
+  "athenaVersion": "1.0.0"
+}

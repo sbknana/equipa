@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item active">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>API.md — Itzamna / ForgeTeam</h1>
+
+<h2>Table of Contents</h2>
+
+<ul><li><a href="#apimd-itzamna-forgeteam">API.md — Itzamna / ForgeTeam</a></li>
+</ul>  - <a href="#overview">Overview</a>
+  - <a href="#architecture">Architecture</a>
+  - <a href="#cli-entry-points">CLI Entry Points</a>
+    - <a href="#forge_orchestratorpy">forge_orchestrator.py</a>
+<ul><li><a href="#run-a-single-task">Run a single task</a></li>
+<li><a href="#run-multiple-tasks-in-parallel">Run multiple tasks in parallel</a></li>
+<li><a href="#auto-dispatch-across-projects">Auto-dispatch across projects</a></li>
+<li><a href="#plan-from-a-goal">Plan from a goal</a></li>
+<li><a href="#run-parallel-goals-from-a-file">Run parallel goals from a file</a></li>
+<li><a href="#setup-repositories">Setup repositories</a></li>
+</ul>    - <a href="#forgesmithpy">forgesmith.py</a>
+<ul><li><a href="#full-analysis-apply-changes">Full analysis + apply changes</a></li>
+<li><a href="#dry-run-analyze-without-applying">Dry run — analyze without applying</a></li>
+<li><a href="#propose-only-mode-opro-prompt-optimization">Propose-only mode (OPRO prompt optimization)</a></li>
+<li><a href="#generate-report">Generate report</a></li>
+<li><a href="#rollback-a-previous-change">Rollback a previous change</a></li>
+</ul>    - <a href="#forgesmith_simbapy">forgesmith_simba.py</a>
+<ul><li><a href="#run-simba-rule-generation">Run SIMBA rule generation</a></li>
+<li><a href="#dry-run">Dry run</a></li>
+<li><a href="#filter-by-role">Filter by role</a></li>
+</ul>    - <a href="#forgesmith_gepapy">forgesmith_gepa.py</a>
+<ul><li><a href="#run-gepa-prompt-evolution">Run GEPA prompt evolution</a></li>
+<li><a href="#dry-run">Dry run</a></li>
+<li><a href="#filter-by-role">Filter by role</a></li>
+</ul>    - <a href="#forge_arenapy">forge_arena.py</a>
+    - <a href="#forge_dashboardpy">forge_dashboard.py</a>
+    - <a href="#analyze_performancepy">analyze_performance.py</a>
+<ul><li><a href="#full-report">Full report</a></li>
+<li><a href="#filter-by-project">Filter by project</a></li>
+<li><a href="#limit-time-range">Limit time range</a></li>
+</ul>    - <a href="#db_migratepy">db_migrate.py</a>
+<ul><li><a href="#run-all-pending-migrations">Run all pending migrations</a></li>
+<li><a href="#silent-mode">Silent mode</a></li>
+</ul>    - <a href="#itzamna_setuppy">itzamna_setup.py</a>
+  - <a href="#internal-python-apis">Internal Python APIs</a>
+    - <a href="#database-connection">Database Connection</a>
+<ul><li><a href="#forge_orchestratorpy">forge_orchestrator.py</a></li>
+</ul>    - <a href="#task-management">Task Management</a>
+    - <a href="#agent-messaging-system">Agent Messaging System</a>
+    - <a href="#agent-actions-telemetry">Agent Actions (Telemetry)</a>
+    - <a href="#agent-episodes-reinforcement-learning-memory">Agent Episodes (Reinforcement Learning Memory)</a>
+    - <a href="#lessons-learned-system">Lessons Learned System</a>
+    - <a href="#loop-detection">Loop Detection</a>
+    - <a href="#early-termination">Early Termination</a>
+<ul><li><a href="#constants-inferred-from-tests">Constants (inferred from tests)</a></li>
+</ul>    - <a href="#ollama-integration-local-llm-client">Ollama Integration (Local LLM Client)</a>
+    - <a href="#file-operations-sandboxed">File Operations (Sandboxed)</a>
+    - <a href="#rubric-scoring">Rubric Scoring</a>
+    - <a href="#simba-rules-engine">SIMBA Rules Engine</a>
+    - <a href="#sarif-security-helpers">SARIF Security Helpers</a>
+    - <a href="#database-migration">Database Migration</a>
+  - <a href="#error-handling">Error Handling</a>
+    - <a href="#error-classification">Error Classification</a>
+    - <a href="#loop-detection-states">Loop Detection States</a>
+    - <a href="#agent-retry-strategy">Agent Retry Strategy</a>
+  - <a href="#database-schema">Database Schema</a>
+  - <a href="#configuration">Configuration</a>
+    - <a href="#dispatch-configuration">Dispatch Configuration</a>
+  - <a href="#adding-api-endpoints">Adding API Endpoints</a>
+  - <a href="#related-documentation">Related Documentation</a>
+
+<h2>Overview</h2>
+
+<strong>ForgeTeam</strong> is a multi-agent AI orchestration platform for Claude Code. It is <strong>not a web API service</strong> — it is a collection of CLI tools, orchestration scripts, and SQLite-backed utilities that coordinate AI agents for software development tasks.
+
+<p>There are <strong>no HTTP/REST API endpoints, GraphQL schemas, or tRPC procedures</strong> detected in this project. ForgeTeam operates through:</p>
+
+<ul><li><strong>CLI entry points</strong> (Python scripts invoked from the command line)</li>
+<li><strong>SQLite database</strong> for persistent state, episodes, lessons, and agent messages</li>
+<li><strong>Inter-agent messaging</strong> via database-backed message passing</li>
+<li><strong>Ollama integration</strong> for local LLM inference (HTTP client, not server)</li>
+</ul>
+<p>This document describes the <strong>internal programmatic interfaces</strong> — the key function-level APIs that developers integrating with or extending ForgeTeam will use.</p>
+
+<hr>
+
+<h2>Architecture</h2>
+
+<pre><code class="language-text">┌─────────────────────────────────────────────────┐
+<p>│                 CLI Entry Points                 │</p>
+<p>│  forge_orchestrator.py  forgesmith.py  etc.      │</p>
+<p>├─────────────────────────────────────────────────┤</p>
+<p>│              Internal Python APIs                │</p>
+<p>│  Orchestration │ Episodes │ Lessons │ Messaging  │</p>
+<p>├─────────────────────────────────────────────────┤</p>
+<p>│              SQLite Database Layer               │</p>
+<p>│  Tasks │ Projects │ Agent Episodes │ Actions     │</p>
+<p>└─────────────────────────────────────────────────┘</p>
+</code></pre>
+
+<hr>
+
+<h2>CLI Entry Points</h2>
+
+<h3>forge_orchestrator.py</h3>
+
+<p>The primary orchestrator for dispatching tasks to AI agents.</p>
+
+<pre><code class="language-bash"># Run a single task
+<p>python forge_orchestrator.py --task &lt;task_id&gt;</p>
+
+<h1>Run multiple tasks in parallel</h1>
+<p>python forge_orchestrator.py --tasks "101,102,103"</p>
+
+<h1>Auto-dispatch across projects</h1>
+<p>python forge_orchestrator.py --dispatch</p>
+
+<h1>Plan from a goal</h1>
+<p>python forge_orchestrator.py --goal "Implement user authentication"</p>
+
+<h1>Run parallel goals from a file</h1>
+<p>python forge_orchestrator.py --goals-file goals.json</p>
+
+<h1>Setup repositories</h1>
+<p>python forge_orchestrator.py --setup-repos</p>
+</code></pre>
+
+<table><tr><td>Argument</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>--task <id></code></td><td>Run a single task by ID</td></tr>
+<tr><td><code>--tasks <ids></code></td><td>Comma-separated task IDs for parallel execution</td></tr>
+<tr><td><code>--dispatch</code></td><td>Auto-dispatch mode — scans pending work and dispatches</td></tr>
+<tr><td><code>--goal <text></code></td><td>Plan and execute a single goal</td></tr>
+<tr><td><code>--goals-file <path></code></td><td>JSON file with multiple goals for parallel execution</td></tr>
+<tr><td><code>--setup-repos</code></td><td>Initialize git repositories for projects</td></tr>
+<tr><td><code>--dry-run</code></td><td>(inferred) Preview without making changes</td></tr>
+</table>
+<hr>
+
+<h3>forgesmith.py</h3>
+
+<p>The self-improvement engine — analyzes agent performance and evolves configuration.</p>
+
+<pre><code class="language-bash"># Full analysis + apply changes
+<p>python forgesmith.py</p>
+
+<h1>Dry run — analyze without applying</h1>
+<p>python forgesmith.py --dry-run</p>
+
+<h1>Propose-only mode (OPRO prompt optimization)</h1>
+<p>python forgesmith.py --propose-only</p>
+
+<h1>Generate report</h1>
+<p>python forgesmith.py --report</p>
+
+<h1>Rollback a previous change</h1>
+<p>python forgesmith.py --rollback &lt;run_id&gt;</p>
+</code></pre>
+
+<table><tr><td>Argument</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>--dry-run</code></td><td>Analyze and propose changes without applying (inferred)</td></tr>
+<tr><td><code>--propose-only</code></td><td>Run OPRO prompt optimization proposals only (inferred)</td></tr>
+<tr><td><code>--report</code></td><td>Generate performance report (inferred)</td></tr>
+<tr><td><code>--rollback <run_id></code></td><td>Revert changes from a specific run (inferred)</td></tr>
+</table>
+<hr>
+
+<h3>forgesmith_simba.py</h3>
+
+<p>SIMBA (Self-Improving Model-Based Advisor) — generates rules from agent episode data.</p>
+
+<pre><code class="language-bash"># Run SIMBA rule generation
+<p>python forgesmith_simba.py</p>
+
+<h1>Dry run</h1>
+<p>python forgesmith_simba.py --dry-run</p>
+
+<h1>Filter by role</h1>
+<p>python forgesmith_simba.py --role developer</p>
+</code></pre>
+
+<table><tr><td>Argument</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>--dry-run</code></td><td>Generate rules without storing (inferred)</td></tr>
+<tr><td><code>--role <role></code></td><td>Only generate rules for a specific role (inferred)</td></tr>
+</table>
+<hr>
+
+<h3>forgesmith_gepa.py</h3>
+
+<p>GEPA (Generative Episode Prompt Adaptation) — evolves system prompts using DSPy-style optimization.</p>
+
+<pre><code class="language-bash"># Run GEPA prompt evolution
+<p>python forgesmith_gepa.py</p>
+
+<h1>Dry run</h1>
+<p>python forgesmith_gepa.py --dry-run</p>
+
+<h1>Filter by role</h1>
+<p>python forgesmith_gepa.py --role developer</p>
+</code></pre>
+
+<table><tr><td>Argument</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>--dry-run</code></td><td>Evolve prompts without storing (inferred)</td></tr>
+<tr><td><code>--role <role></code></td><td>Only evolve prompts for a specific role (inferred)</td></tr>
+</table>
+<hr>
+
+<h3>forge_arena.py</h3>
+
+<p>Adversarial self-play arena for testing and improving agent capabilities.</p>
+
+<pre><code class="language-bash">python forge_arena.py
+</code></pre>
+
+<hr>
+
+<h3>forge_dashboard.py</h3>
+
+<p>Performance dashboard and reporting.</p>
+
+<pre><code class="language-bash">python forge_dashboard.py
+</code></pre>
+
+<hr>
+
+<h3>analyze_performance.py</h3>
+
+<p>Detailed performance analysis and reporting.</p>
+
+<pre><code class="language-bash"># Full report
+<p>python analyze_performance.py</p>
+
+<h1>Filter by project</h1>
+<p>python analyze_performance.py --project &lt;project_id&gt;</p>
+
+<h1>Limit time range</h1>
+<p>python analyze_performance.py --days 30</p>
+</code></pre>
+
+<table><tr><td>Argument</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>--project <id></code></td><td>Filter analysis to a specific project (inferred)</td></tr>
+<tr><td><code>--days <n></code></td><td>Limit analysis to the last N days (inferred)</td></tr>
+</table>
+<hr>
+
+<h3>db_migrate.py</h3>
+
+<p>Database schema migration tool.</p>
+
+<pre><code class="language-bash"># Run all pending migrations
+<p>python db_migrate.py</p>
+
+<h1>Silent mode</h1>
+<p>python db_migrate.py --silent</p>
+</code></pre>
+
+<hr>
+
+<h3>itzamna_setup.py</h3>
+
+<p>Guided interactive setup wizard.</p>
+
+<pre><code class="language-bash">python itzamna_setup.py
+</code></pre>
+
+<hr>
+
+<h2>Internal Python APIs</h2>
+
+<h3>Database Connection</h3>
+
+<p>All modules use a consistent SQLite connection pattern.</p>
+
+<pre><code class="language-python"># forge_orchestrator.py
+<p>def get_db_connection(write: bool) -&gt; sqlite3.Connection</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>write</code></td><td><code>bool</code></td><td>If <code>True</code>, opens with write access; <code>False</code> for read-only</td></tr>
+</table>
+<strong>Returns:</strong> <code>sqlite3.Connection</code>
+
+<hr>
+
+<h3>Task Management</h3>
+
+<h4>Fetch a Task</h4>
+
+<pre><code class="language-python">def fetch_task(task_id: int) -&gt; dict
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>The task ID to retrieve</td></tr>
+</table>
+<strong>Returns:</strong> Task dictionary with fields including <code>id</code>, <code>title</code>, <code>description</code>, <code>status</code>, <code>project_id</code>, <code>priority</code>, <code>complexity</code> (inferred).
+
+<h4>Fetch Next TODO Task</h4>
+
+<pre><code class="language-python">def fetch_next_todo(project_id: int) -&gt; dict | None
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>project_id</code></td><td><code>int</code></td><td>Project to search for pending tasks</td></tr>
+</table>
+<strong>Returns:</strong> Next unstarted task or <code>None</code>.
+
+<h4>Update Task Status</h4>
+
+<pre><code class="language-python">def update_task_status(task_id: int, outcome: str, output: str) -&gt; None
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Task to update</td></tr>
+<tr><td><code>outcome</code></td><td><code>str</code></td><td>Result status (e.g., <code>"done"</code>, <code>"failed"</code>, <code>"blocked"</code>) (inferred)</td></tr>
+<tr><td><code>output</code></td><td><code>str</code></td><td>Agent output text</td></tr>
+</table>
+<hr>
+
+<h3>Agent Messaging System</h3>
+
+<p>Inter-agent communication via database-backed message passing.</p>
+
+<h4>Post a Message</h4>
+
+<pre><code class="language-python">def post_agent_message(
+    task_id: int, cycle: int, from_role: str,
+    to_role: str, msg_type: str, content: str
+<p>) -&gt; None</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Associated task</td></tr>
+<tr><td><code>cycle</code></td><td><code>int</code></td><td>Dev-test cycle number</td></tr>
+<tr><td><code>from_role</code></td><td><code>str</code></td><td>Sender role (e.g., <code>"developer"</code>, <code>"tester"</code>)</td></tr>
+<tr><td><code>to_role</code></td><td><code>str</code></td><td>Recipient role</td></tr>
+<tr><td><code>msg_type</code></td><td><code>str</code></td><td>Message type (e.g., <code>"test_results"</code>, <code>"feedback"</code>) (inferred)</td></tr>
+<tr><td><code>content</code></td><td><code>str</code></td><td>Message body (may be JSON)</td></tr>
+</table>
+<h4>Read Messages</h4>
+
+<pre><code class="language-python">def read_agent_messages(
+    task_id: int, to_role: str, max_cycle: int
+<p>) -&gt; list[dict]</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Associated task</td></tr>
+<tr><td><code>to_role</code></td><td><code>str</code></td><td>Recipient role to filter by</td></tr>
+<tr><td><code>max_cycle</code></td><td><code>int</code></td><td>Only return messages up to this cycle</td></tr>
+</table>
+<strong>Returns:</strong> List of unread message dicts, ordered by cycle and ID.
+
+<h4>Mark Messages Read</h4>
+
+<pre><code class="language-python">def mark_messages_read(
+    task_id: int, to_role: str, cycle_number: int
+<p>) -&gt; None</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Associated task</td></tr>
+<tr><td><code>to_role</code></td><td><code>str</code></td><td>Role whose messages to mark</td></tr>
+<tr><td><code>cycle_number</code></td><td><code>int</code></td><td>Mark messages read up to this cycle</td></tr>
+</table>
+<h4>Format Messages for Prompt Injection</h4>
+
+<pre><code class="language-python">def format_messages_for_prompt(messages: list[dict]) -&gt; str
+</code></pre>
+
+<strong>Returns:</strong> Formatted string suitable for including in agent system prompts.
+
+<hr>
+
+<h3>Agent Actions (Telemetry)</h3>
+
+<h4>Log an Action</h4>
+
+<pre><code class="language-python">def log_agent_action(action: dict) -&gt; None  # (inferred signature)
+</code></pre>
+
+<h4>Bulk Log Actions</h4>
+
+<pre><code class="language-python">def bulk_log_agent_actions(
+    action_log: list, task_id: int,
+    run_id: str, cycle: int, role: str
+<p>) -&gt; None</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>action_log</code></td><td><code>list</code></td><td>List of action records</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Associated task</td></tr>
+<tr><td><code>run_id</code></td><td><code>str</code></td><td>Unique run identifier</td></tr>
+<tr><td><code>cycle</code></td><td><code>int</code></td><td>Dev-test cycle number</td></tr>
+<tr><td><code>role</code></td><td><code>str</code></td><td>Agent role</td></tr>
+</table>
+<em>This function is designed to never crash — errors are silently caught.</em> (inferred)
+
+<h4>Get Action Summary</h4>
+
+<pre><code class="language-python">def get_action_summary(task_id: int, cycle: int = None) -&gt; dict
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task_id</code></td><td><code>int</code></td><td>Task to summarize</td></tr>
+<tr><td><code>cycle</code></td><td><code>int \</td><td>None</code></td><td>Specific cycle, or all cycles if <code>None</code></td></tr>
+</table>
+<strong>Returns:</strong> Summary dict with action counts and statistics (inferred).
+
+<h4>Classify Errors</h4>
+
+<pre><code class="language-python">def classify_error(error_text: str) -&gt; str
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>error_text</code></td><td><code>str</code></td><td>Raw error output</td></tr>
+</table>
+<strong>Returns:</strong> One of: <code>"timeout"</code>, <code>"file_not_found"</code>, <code>"permission"</code>, <code>"syntax"</code>, <code>"import"</code>, <code>"test_failure"</code>, <code>"unknown"</code> (inferred from tests).
+
+<hr>
+
+<h3>Agent Episodes (Reinforcement Learning Memory)</h3>
+
+<h4>Record an Episode</h4>
+
+<pre><code class="language-python">def record_agent_episode(
+    task: dict, result: str, outcome: str,
+    role: str, output: str
+<p>) -&gt; None</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>task</code></td><td><code>dict</code></td><td>Task object</td></tr>
+<tr><td><code>result</code></td><td><code>str</code></td><td>Agent result text</td></tr>
+<tr><td><code>outcome</code></td><td><code>str</code></td><td>Success/failure outcome</td></tr>
+<tr><td><code>role</code></td><td><code>str</code></td><td>Agent role</td></tr>
+<tr><td><code>output</code></td><td><code>str</code></td><td>Full agent output</td></tr>
+</table>
+<h4>Get Relevant Episodes for Injection</h4>
+
+<pre><code class="language-python">def get_relevant_episodes(
+    role: str, project_id: int = None,
+    limit: int = 5
+<p>) -&gt; list[dict]  # (inferred signature)</p>
+</code></pre>
+
+<p>Episodes are filtered by Q-value and optionally by project, with cross-project fallback (inferred from tests).</p>
+
+<h4>Format Episodes for Injection</h4>
+
+<pre><code class="language-python">def format_episodes_for_injection(episodes: list[dict]) -&gt; str
+</code></pre>
+
+<strong>Returns:</strong> Formatted string for system prompt injection.
+
+<h4>Update Q-Values</h4>
+
+<pre><code class="language-python">def update_episode_q_values(
+    injected_episode_ids: list[int],
+    task_succeeded: bool
+<p>) -&gt; None</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>injected_episode_ids</code></td><td><code>list[int]</code></td><td>Episode IDs that were injected into the prompt</td></tr>
+<tr><td><code>task_succeeded</code></td><td><code>bool</code></td><td>Whether the task using these episodes succeeded</td></tr>
+</table>
+<p>Q-values are bounded (inferred from tests) and updated based on task outcome.</p>
+
+<hr>
+
+<h3>Lessons Learned System</h3>
+
+<h4>Get Relevant Lessons</h4>
+
+<pre><code class="language-python">def get_relevant_lessons(
+    role: str, error_type: str = None,
+    limit: int = 5
+<p>) -&gt; list[dict]</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>role</code></td><td><code>str</code></td><td>Agent role to find lessons for</td></tr>
+<tr><td><code>error_type</code></td><td><code>str \</td><td>None</code></td><td>Optional error type filter</td></tr>
+<tr><td><code>limit</code></td><td><code>int</code></td><td>Maximum lessons to return</td></tr>
+</table>
+<strong>Returns:</strong> List of active lesson dicts, filtered by role and optionally error type.
+
+<h4>Format Lessons for Injection</h4>
+
+<pre><code class="language-python">def format_lessons_for_injection(lessons: list[dict]) -&gt; str
+</code></pre>
+
+<strong>Returns:</strong> Formatted string for system prompt injection.
+
+<h4>Update Lesson Injection Count</h4>
+
+<pre><code class="language-python">def update_lesson_injection_count(lesson_ids: list[int]) -&gt; None
+</code></pre>
+
+<p>Tracks how many times each lesson has been injected.</p>
+
+<hr>
+
+<h3>Loop Detection</h3>
+
+<p>The <code>LoopDetector</code> class prevents agents from getting stuck in repetitive behavior.</p>
+
+<pre><code class="language-python">class LoopDetector:
+    def __init__(self, warn_threshold: int = 3, terminate_threshold: int = 5):
+        ...
+
+    def record(self, result: dict) -&gt; str:
+        """Returns 'ok', 'warn', or 'terminate'"""
+
+    def warning_message(self) -&gt; str:
+        """Human-readable warning about detected loop"""
+
+    def termination_summary(self) -&gt; str:
+        """Summary when terminating due to loop"""
+</code></pre>
+
+<table><tr><td>Method</td><td>Returns</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>record(result)</code></td><td><code>"ok"</code> \</td><td><code>"warn"</code> \</td><td><code>"terminate"</code></td><td>Record a tool result and check for loops</td></tr>
+<tr><td><code>warning_message()</code></td><td><code>str</code></td><td>Warning text when loop detected</td></tr>
+<tr><td><code>termination_summary()</code></td><td><code>str</code></td><td>Summary text when loop causes termination</td></tr>
+</table>
+<p>The detector fingerprints results, tracks repeated identical fingerprints, and resets when files change (inferred from tests).</p>
+
+<hr>
+
+<h3>Early Termination</h3>
+
+<pre><code class="language-python"># Constants (inferred from tests)
+<p>STUCK_PHRASES: list[str]  # Non-empty list of phrases indicating stuck agents</p>
+<p>EXEMPT_ROLES: set[str]    # Roles exempt from early termination</p>
+</code></pre>
+
+<h4>Detect Stuck Phrases</h4>
+
+<pre><code class="language-python">def detect_stuck_phrases(text: str) -&gt; str | None  # (inferred)
+</code></pre>
+
+<p>Case-insensitive detection. Returns the matched phrase or <code>None</code>.</p>
+
+<h4>Detect Repeated Tools</h4>
+
+<pre><code class="language-python">def detect_repeated_tools(
+    history: list, window: int = 4
+<p>) -&gt; bool  # (inferred)</p>
+</code></pre>
+
+<p>Detects when the last N tool calls are identical.</p>
+
+<hr>
+
+<h3>Ollama Integration (Local LLM Client)</h3>
+
+<h4>Health Check</h4>
+
+<pre><code class="language-python">def check_ollama_health(base_url: str) -&gt; bool
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>base_url</code></td><td><code>str</code></td><td>Ollama server URL (e.g., <code>http://localhost:11434</code>)</td></tr>
+</table>
+<strong>Returns:</strong> <code>True</code> if Ollama is responsive.
+
+<h4>List Models</h4>
+
+<pre><code class="language-python">def list_ollama_models(base_url: str) -&gt; list
+</code></pre>
+
+<strong>Returns:</strong> List of available models on the Ollama server.
+
+<h4>Chat Completion</h4>
+
+<pre><code class="language-python">def ollama_chat(
+    base_url: str, model: str, messages: list,
+    tools: list = None, timeout: int = None
+<p>) -&gt; dict</p>
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>base_url</code></td><td><code>str</code></td><td>Ollama server URL</td></tr>
+<tr><td><code>model</code></td><td><code>str</code></td><td>Model name</td></tr>
+<tr><td><code>messages</code></td><td><code>list</code></td><td>Chat messages in OpenAI format (inferred)</td></tr>
+<tr><td><code>tools</code></td><td><code>list \</td><td>None</code></td><td>Tool definitions for function calling (inferred)</td></tr>
+<tr><td><code>timeout</code></td><td><code>int \</td><td>None</code></td><td>Request timeout in seconds</td></tr>
+</table>
+<strong>Returns:</strong> Chat completion response dict (inferred).
+
+<hr>
+
+<h3>File Operations (Sandboxed)</h3>
+
+<p>All file operations in <code>ollama_agent.py</code> are sandboxed to a project directory.</p>
+
+<pre><code class="language-python">def safe_path(project_dir: str, relative_path: str) -&gt; str
+</code></pre>
+
+<p>Validates that the resolved path stays within <code>project_dir</code>.</p>
+
+<table><tr><td>Function</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>exec_read_file(project_dir, args)</code></td><td>Read a file's contents</td></tr>
+<tr><td><code>exec_list_directory(project_dir, args)</code></td><td>List directory contents</td></tr>
+<tr><td><code>exec_search_files(project_dir, args)</code></td><td>Search for files by pattern</td></tr>
+<tr><td><code>exec_grep(project_dir, args)</code></td><td>Grep for text in files</td></tr>
+<tr><td><code>exec_bash(project_dir, args, allow_write)</code></td><td>Execute a bash command</td></tr>
+<tr><td><code>exec_write_file(project_dir, args)</code></td><td>Write content to a file</td></tr>
+<tr><td><code>exec_edit_file(project_dir, args)</code></td><td>Edit a file with patches</td></tr>
+</table>
+<pre><code class="language-python">def is_safe_read_command(command: str) -&gt; bool
+<p>def is_blocked_command(command: str) -&gt; bool</p>
+</code></pre>
+
+<hr>
+
+<h3>Rubric Scoring</h3>
+
+<pre><code class="language-python">def compute_rubric_score(run: dict, cfg: dict) -&gt; dict
+</code></pre>
+
+<table><tr><td>Parameter</td><td>Type</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td><td>---</td></tr>
+<tr><td><code>run</code></td><td><code>dict</code></td><td>Agent run data</td></tr>
+<tr><td><code>cfg</code></td><td><code>dict</code></td><td>Configuration with rubric definitions</td></tr>
+</table>
+<strong>Returns:</strong> Scored rubric dict (inferred).
+
+<pre><code class="language-python">def score_completed_runs(runs: list, cfg: dict) -&gt; list
+<p>def analyze_rubric_correlations(cfg: dict) -&gt; dict</p>
+<p>def evolve_rubric_weights(cfg: dict) -&gt; None</p>
+<p>def get_rubric_report(role: str, limit: int) -&gt; dict</p>
+</code></pre>
+
+<hr>
+
+<h3>SIMBA Rules Engine</h3>
+
+<pre><code class="language-python">def find_high_variance_episodes(lookback_days: int) -&gt; list
+<p>def find_hardest_cases(lookback_days: int) -&gt; list</p>
+<p>def get_existing_simba_rules(role: str = None) -&gt; list</p>
+<p>def build_simba_prompt(role, successes, failures, hardest_cases, existing_rules) -&gt; str</p>
+<p>def call_claude_for_rules(prompt: str, cfg: dict) -&gt; list</p>
+<p>def validate_rule(rule: dict, existing_rules: list) -&gt; tuple  # (inferred)</p>
+<p>def store_rules(role: str, rules: list, dry_run: bool) -&gt; None</p>
+<p>def evaluate_simba_rules() -&gt; dict</p>
+<p>def prune_stale_rules(dry_run: bool) -&gt; None</p>
+<p>def run_simba(cfg: dict, dry_run: bool, role_filter: str = None) -&gt; dict</p>
+</code></pre>
+
+<h4>Rule Validation</h4>
+
+<p>Rules are validated for:</p>
+<ul><li>Minimum and maximum length (inferred)</li>
+<li>Valid error types (inferred)</li>
+<li>Non-empty content (inferred)</li>
+<li>Duplicate detection via similarity checking (inferred)</li>
+<li>Must be a <code>dict</code> type (inferred)</li>
+</ul>
+<hr>
+
+<h3>SARIF Security Helpers</h3>
+
+<p>Utility library for parsing SARIF (Static Analysis Results Interchange Format) files.</p>
+
+<pre><code class="language-python">from sarif_helpers import *
+</code></pre>
+
+<h4>Loading & Saving</h4>
+
+<pre><code class="language-python">def load_sarif(path: str) -&gt; dict
+<p>def save_sarif(sarif: dict, path: str, indent: int = 2) -&gt; None</p>
+</code></pre>
+
+<h4>Querying Findings</h4>
+
+<pre><code class="language-python">def extract_findings(sarif: dict) -&gt; list[Finding]
+<p>def filter_by_level(findings: list, *levels: str) -&gt; list</p>
+<p>def filter_by_file(findings: list, pattern: str) -&gt; list</p>
+<p>def filter_by_rule(findings: list, *rule_ids: str) -&gt; list</p>
+<p>def sort_by_severity(findings: list, reverse: bool = True) -&gt; list</p>
+</code></pre>
+
+<h4>Grouping & Counting</h4>
+
+<pre><code class="language-python">def group_by_file(findings: list) -&gt; dict[str, list]
+<p>def group_by_rule(findings: list) -&gt; dict[str, list]</p>
+<p>def count_by_level(findings: list) -&gt; dict[str, int]</p>
+<p>def count_by_rule(findings: list) -&gt; dict[str, int]</p>
+</code></pre>
+
+<h4>Deduplication & Merging</h4>
+
+<pre><code class="language-python">def deduplicate(findings: list) -&gt; list
+<p>def merge_sarif_files(*paths: str) -&gt; dict</p>
+<p>def compute_fingerprint(result: dict, include_message: bool = False) -&gt; str</p>
+</code></pre>
+
+<h4>Export</h4>
+
+<pre><code class="language-python">def to_csv_rows(findings: list) -&gt; list[list]
+<p>def summary(findings: list) -&gt; str</p>
+</code></pre>
+
+<hr>
+
+<h3>Database Migration</h3>
+
+<pre><code class="language-python">def run_migrations(db_path: str, silent: bool = False) -&gt; None
+</code></pre>
+
+<table><tr><td>Migration</td><td>Description</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>v0 → v1</code></td><td>Initial schema setup (inferred)</td></tr>
+<tr><td><code>v1 → v2</code></td><td>Schema additions (inferred)</td></tr>
+<tr><td><code>v2 → v3</code></td><td>Latest schema changes (inferred)</td></tr>
+</table>
+<p>Migrations are tracked in a <code>schema_migrations</code> table. Database is automatically backed up before migration.</p>
+
+<hr>
+
+<h2>Error Handling</h2>
+
+<h3>Error Classification</h3>
+
+<p>The system classifies errors into known categories for pattern analysis:</p>
+
+<table><tr><td>Category</td><td>Trigger Pattern (inferred)</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>timeout</code></td><td>Timeout-related errors</td></tr>
+<tr><td><code>file_not_found</code></td><td>Missing file errors</td></tr>
+<tr><td><code>permission</code></td><td>Permission denied errors</td></tr>
+<tr><td><code>syntax</code></td><td>Syntax errors in code</td></tr>
+<tr><td><code>import</code></td><td>Import/module errors</td></tr>
+<tr><td><code>test_failure</code></td><td>Test assertion failures</td></tr>
+<tr><td><code>unknown</code></td><td>All other errors</td></tr>
+</table>
+<h3>Loop Detection States</h3>
+
+<table><tr><td>State</td><td>Meaning</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>ok</code></td><td>No loop detected, continue normally</td></tr>
+<tr><td><code>warn</code></td><td>Potential loop detected (default: 3 identical fingerprints), warning injected</td></tr>
+<tr><td><code>terminate</code></td><td>Confirmed loop (default: 5 identical fingerprints), agent is terminated</td></tr>
+</table>
+<p>Warning is issued only once per loop. Counter resets when files change (new files modified) or when a different fingerprint is recorded.</p>
+
+<h3>Agent Retry Strategy</h3>
+
+<pre><code class="language-python">async def run_agent_with_retries(
+    cmd: str, task: dict, max_retries: int
+<p>) -&gt; str</p>
+</code></pre>
+
+<p>Agents are retried with checkpoint recovery on failure. Checkpoints save intermediate state:</p>
+
+<pre><code class="language-python">def save_checkpoint(task_id, attempt, output_text, role) -&gt; None
+<p>def load_checkpoint(task_id, role) -&gt; str | None</p>
+<p>def clear_checkpoints(task_id, role) -&gt; None</p>
+</code></pre>
+
+<hr>
+
+<h2>Database Schema</h2>
+
+<p>The SQLite database contains the following tables (inferred from code):</p>
+
+<table><tr><td>Table</td><td>Purpose</td></tr>
+<tr><td>---</td><td>---</td></tr>
+<tr><td><code>tasks</code></td><td>Task definitions, status, and metadata</td></tr>
+<tr><td><code>projects</code></td><td>Project information and directories</td></tr>
+<tr><td><code>agent_episodes</code></td><td>Reinforcement learning memory with Q-values</td></tr>
+<tr><td><code>agent_messages</code></td><td>Inter-agent communication</td></tr>
+<tr><td><code>agent_actions</code></td><td>Telemetry and action logging</td></tr>
+<tr><td><code>lessons</code></td><td>Extracted lessons with injection tracking</td></tr>
+<tr><td><code>rubric_scores</code></td><td>Performance scoring results</td></tr>
+<tr><td><code>rubric_evolution</code></td><td>Rubric weight evolution history (inferred)</td></tr>
+<tr><td><code>schema_migrations</code></td><td>Migration tracking</td></tr>
+<tr><td><code>simba_rules</code></td><td>SIMBA-generated rules (inferred)</td></tr>
+<tr><td><code>forgesmith_runs</code></td><td>Self-improvement run history (inferred)</td></tr>
+<tr><td><code>prompt_versions</code></td><td>GEPA prompt evolution history (inferred)</td></tr>
+</table>
+<hr>
+
+<h2>Configuration</h2>
+
+<p>Configuration is loaded from a config file (inferred):</p>
+
+<pre><code class="language-python">def load_config() -&gt; dict   # forgesmith.py
+<p>def load_config() -&gt; dict   # forge_orchestrator.py</p>
+</code></pre>
+
+<h3>Dispatch Configuration</h3>
+
+<pre><code class="language-python">def load_dispatch_config(filepath: str) -&gt; dict
+</code></pre>
+
+<p>Controls how tasks are dispatched across projects, including:</p>
+<ul><li>Provider selection per role (inferred)</li>
+<li>Model selection per role (inferred)</li>
+<li>Task type routing with role-specific prompts (inferred from tests)</li>
+<li>Ollama base URL configuration (inferred)</li>
+</ul>
+<hr>
+
+<h2>Adding API Endpoints</h2>
+
+<p>This project currently operates as a CLI toolkit. To add HTTP API endpoints, consider:</p>
+
+<p>1. <strong>FastAPI wrapper</strong>: Create <code>api.py</code> with FastAPI routes wrapping existing functions</p>
+   <pre><code class="language-python">   from fastapi import FastAPI
+   app = FastAPI()
+
+   @app.get("/tasks/{task_id}")
+   async def get_task(task_id: int):
+       return fetch_task(task_id)
+
+   @app.post("/tasks/{task_id}/dispatch")
+   async def dispatch(task_id: int):
+       # Wrap dispatch logic
+       ...
+   </code></pre>
+
+<p>2. <strong>MCP Server</strong>: The project already references MCP configuration (<code>step_generate_mcp_config</code>), suggesting Model Context Protocol integration is planned or available.</p>
+
+<p>3. <strong>Dashboard API</strong>: <code>forge_dashboard.py</code> contains query functions that could be exposed as read-only endpoints.</p>
+<hr>
+
+<h2>Related Documentation</h2>
+
+<ul><li><a href="README.md">Readme</a></li>
+<li><a href="ARCHITECTURE.md">Architecture</a></li>
+<li><a href="DEPLOYMENT.md">Deployment</a></li>
+<li><a href="CONTRIBUTING.md">Contributing</a></li>
+</ul>
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>
