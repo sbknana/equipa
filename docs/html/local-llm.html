@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LOCAL_LLM - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item active">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>Local LLM Support</h1>
+
+<p>Run ForgeTeam agents on local models via Ollama. No API key needed.</p>
+
+<hr>
+
+<h2>Why Local LLMs?</h2>
+
+<ul><li><strong>No API costs.</strong> Review and planning roles burn tokens fast. Local is free.</li>
+<li><strong>Privacy.</strong> Your code never leaves your machine. Period.</li>
+<li><strong>Works offline.</strong> No internet? No problem.</li>
+<li><strong>Good enough for read-only roles.</strong> Planner, evaluator, code-reviewer, security-reviewer, researcher.. they read and analyze. They don't need frontier models.</li>
+</ul>
+<p>Save your Claude tokens for the roles that actually write code.</p>
+
+<hr>
+
+<h2>Prerequisites</h2>
+
+<ul><li><strong>Ollama</strong> installed — <a href="https://ollama.com">https://ollama.com</a></li>
+<li>A model with <strong>tool-calling support</strong> (Qwen 3.5 recommended)</li>
+<li><strong>16GB+ RAM</strong> for 27B models, <strong>8GB</strong> for 9B models</li>
+</ul>
+<hr>
+
+<h2>Quick Start</h2>
+
+<pre><code class="language-bash"># Install Ollama
+<p>curl -fsSL https://ollama.com/install.sh | sh</p>
+
+<h1>Pull a model</h1>
+<p>ollama pull qwen3.5:27b    # Full power (16GB RAM)</p>
+<p>ollama pull qwen3.5:9b     # Lighter (8GB RAM)</p>
+
+<h1>Optional: Pull the Forgeborn fine-tuned model (when available)</h1>
+<p>ollama pull forgeborn/forgeteam-qwen3.5-9b</p>
+
+<h1>Verify it's there</h1>
+<p>ollama list</p>
+</code></pre>
+
+<p>That's it. Ollama runs as a service automatically after install.</p>
+
+<hr>
+
+<h2>Configuration</h2>
+
+<h3>Provider Settings in dispatch_config.json</h3>
+
+<p>The config file controls which provider each role uses. Mix and match freely.</p>
+
+<pre><code class="language-json">{
+    "provider": "claude",
+    "provider_planner": "ollama",
+    "provider_evaluator": "ollama",
+    "provider_code_reviewer": "ollama",
+    "provider_researcher": "ollama",
+    "ollama_base_url": "http://localhost:11434",
+    "ollama_model": "qwen3.5:27b",
+    "ollama_model_planner": "qwen3.5:27b"
+}
+</code></pre>
+
+<h3>What Each Field Does</h3>
+
+<table><tr><td>Field</td><td>Purpose</td></tr>
+<tr><td>-------</td><td>---------</td></tr>
+<tr><td><code>provider</code></td><td>Global default. <code>claude</code> or <code>ollama</code>. Everything falls back to this.</td></tr>
+<tr><td><code>provider_{role}</code></td><td>Per-role override. Set a specific role to use a different provider.</td></tr>
+<tr><td><code>ollama_base_url</code></td><td>Where Ollama is running. Localhost by default, or point it at a remote machine.</td></tr>
+<tr><td><code>ollama_model</code></td><td>Default model for all Ollama roles.</td></tr>
+<tr><td><code>ollama_model_{role}</code></td><td>Per-role model override. Run your planner on 27B and reviewer on 9B if you want.</td></tr>
+</table>
+<p>The cascade: role-specific setting > global setting > hardcoded default.</p>
+
+<h3>CLI Override</h3>
+
+<pre><code class="language-bash"># Force ALL agents to use Ollama for this run
+<p>python3 forge_orchestrator.py --task 42 --dev-test --provider ollama -y</p>
+
+<h1>Use whatever dispatch_config.json says (default behavior)</h1>
+<p>python3 forge_orchestrator.py --task 42 --dev-test -y</p>
+</code></pre>
+
+<p>The <code>--provider</code> flag overrides everything in the config. Useful for testing.</p>
+
+<hr>
+
+<h2>Recommended Role Mapping</h2>
+
+<table><tr><td>Role</td><td>Provider</td><td>Why</td></tr>
+<tr><td>------</td><td>----------</td><td>-----</td></tr>
+<tr><td>Developer</td><td>Claude</td><td>Writes code. Needs the best quality.</td></tr>
+<tr><td>Tester</td><td>Claude</td><td>Writes tests. Quality matters here too.</td></tr>
+<tr><td>Debugger</td><td>Claude</td><td>Complex multi-file reasoning. Don't cheap out.</td></tr>
+<tr><td>Frontend Designer</td><td>Claude</td><td>Design quality is visible to users.</td></tr>
+<tr><td>Planner</td><td>Ollama</td><td>Read-only analysis. Local models handle this fine.</td></tr>
+<tr><td>Evaluator</td><td>Ollama</td><td>Read-only scoring against criteria. Straightforward.</td></tr>
+<tr><td>Code Reviewer</td><td>Ollama</td><td>Read-only review. Pattern matching, not generation.</td></tr>
+<tr><td>Security Reviewer</td><td>Ollama</td><td>Read-only audit. Checklist-driven work.</td></tr>
+<tr><td>Researcher</td><td>Ollama</td><td>Read-only research. Summarization and analysis.</td></tr>
+</table>
+<strong>The rule is simple:</strong> if it writes code, use Claude. If it reads and reports, use Ollama.
+
+<hr>
+
+<h2>How It Works</h2>
+
+<code>ollama_agent.py</code> implements a tool-calling agent loop using Ollama's native OpenAI-compatible API.
+
+<ul><li><strong>Zero external dependencies.</strong> Uses Python's built-in <code>urllib</code>. No pip install needed.</li>
+<li><strong>Read-only roles</strong> get: <code>read_file</code>, <code>list_directory</code>, <code>search_files</code>, <code>grep</code>, <code>bash</code> (read-only)</li>
+<li><strong>Write roles</strong> also get: <code>write_file</code>, <code>edit_file</code>, <code>bash_write</code></li>
+<li><strong>All file operations are sandboxed</strong> to the project directory. Can't escape it.</li>
+</ul>
+<p>The agent loop is the same structure as the Claude agent — send a message, check for tool calls, execute them, feed results back. Just a different backend.</p>
+
+<hr>
+
+<h2>Supported Models</h2>
+
+<p>Any Ollama model with tool-calling support works. Here's what we've tested:</p>
+
+<table><tr><td>Model</td><td>RAM</td><td>Notes</td></tr>
+<tr><td>-------</td><td>-----</td><td>-------</td></tr>
+<tr><td><code>qwen3.5:27b</code></td><td>16GB</td><td>Best quality. Recommended default.</td></tr>
+<tr><td><code>qwen3.5:9b</code></td><td>8GB</td><td>Good balance of speed and quality.</td></tr>
+<tr><td><code>qwen2.5-coder:32b</code></td><td>20GB</td><td>Code-specialized. Great for code review.</td></tr>
+<tr><td><code>deepseek-coder-v2:16b</code></td><td>10GB</td><td>Code-specialized, lighter weight.</td></tr>
+</table>
+<p>Bigger models = better results but slower. For read-only roles, even 9B models do solid work.</p>
+
+<hr>
+
+<h2>Remote Ollama</h2>
+
+<p>Don't want to run models on your dev machine? Point at a different box.</p>
+
+<h3>Via Config</h3>
+
+<pre><code class="language-json">{
+    "ollama_base_url": "http://INTERNAL_HOST:11434"
+}
+</code></pre>
+
+<h3>Via Environment Variable</h3>
+
+<pre><code class="language-bash">export OLLAMA_BASE_URL=http://INTERNAL_HOST:11434
+</code></pre>
+
+<p>The environment variable takes priority over the config file. Useful for per-session overrides.</p>
+
+<p>Make sure the remote machine has Ollama running and the port is open. Default port is 11434.</p>
+
+<hr>
+
+<h2>Troubleshooting</h2>
+
+<strong>"Cannot connect to Ollama"</strong>
+<p>Ollama isn't running. Start it with <code>ollama serve</code>. On Linux it usually auto-starts as a systemd service. Check with <code>systemctl status ollama</code>.</p>
+
+<strong>Model too slow</strong>
+<p>Try a smaller model. Drop from 27B to 9B. The quality difference for read-only roles is smaller than you'd think.</p>
+
+<strong>Tool calls not working</strong>
+<p>Your model doesn't support tool calling. Stick to models that do: Qwen 3.5, Llama 3.x, Mistral. Older models won't work.</p>
+
+<strong>Out of memory</strong>
+<p>Your model is too big for your RAM. Use a smaller variant or a more aggressively quantized version (Q4 instead of Q8). Check available RAM with <code>free -h</code>.</p>
+
+<strong>Agent hangs or loops</strong>
+<p>Some models get stuck in reasoning loops. Set a timeout in your config or try a different model. Qwen 3.5 is the most reliable we've tested.</p>
+
+<hr>
+
+<h2>What's Next</h2>
+
+<ul><li><strong>Forgeborn fine-tuned models</strong> — QLoRA-trained on ForgeTeam task data for better role performance</li>
+<li><strong>Automatic fallback</strong> — If Ollama fails, fall back to Claude automatically</li>
+<li><strong>Performance benchmarks</strong> — Track local vs. Claude quality per role</li>
+</ul>
+<hr>
+
+<em>Copyright 2026 Forgeborn. Vibe coded with Claude.</em>
+
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>

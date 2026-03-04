@@ -719,7 +719,8 @@ def get_ab_test_status(role=None):
 def ensure_prompt_version_column():
     """Add prompt_version column to agent_runs if it doesn't exist.
 
-    This is idempotent — safe to call multiple times.
+    Safety net — column is added by migration 3 (db_migrate.py).
+    This function provides defense-in-depth for standalone ForgeSmith runs.
     """
     conn = get_db(write=True)
     try:

@@ -506,8 +506,9 @@ INITIAL_Q_VALUE = 0.5
 def ensure_agent_episodes_table():
     """Create agent_episodes table if it does not exist.
 
-    Idempotent — safe to call every time.
-    Also adds times_injected column if missing (for episode injection tracking).
+    Safety net — schema is primarily managed by db_migrate.py.
+    This function provides defense-in-depth if the orchestrator runs
+    without the setup wizard.
     """
     try:
         conn = get_db_connection(write=True)
@@ -528,11 +529,6 @@ def ensure_agent_episodes_table():
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
-        # Add times_injected column if table already existed without it
-        try:
-            conn.execute("ALTER TABLE agent_episodes ADD COLUMN times_injected INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
         conn.commit()
         conn.close()
     except Exception as e:
@@ -542,7 +538,10 @@ def ensure_agent_episodes_table():
 # --- Inter-Agent Message Channel ---
 
 def ensure_agent_messages_table():
-    """Create agent_messages table if it does not exist. Idempotent."""
+    """Create agent_messages table if it does not exist.
+
+    Safety net — schema is primarily managed by db_migrate.py.
+    """
     try:
         conn = get_db_connection(write=True)
         conn.execute("""
@@ -656,7 +655,7 @@ def format_messages_for_prompt(messages):
 def ensure_agent_actions_table():
     """Create agent_actions table if it does not exist.
 
-    Idempotent — safe to call every time.
+    Safety net — schema is primarily managed by db_migrate.py.
     """
     try:
         conn = get_db_connection(write=True)

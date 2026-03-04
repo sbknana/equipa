@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEPLOYMENT - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item active">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>DEPLOYMENT.md — Itzamna (ForgeTeam)</h1>
+
+<h2>Table of Contents</h2>
+
+<ul><li><a href="#deploymentmd-itzamna-forgeteam">DEPLOYMENT.md — Itzamna (ForgeTeam)</a></li>
+</ul>  - <a href="#tldr">TL;DR</a>
+<ul><li><a href="#follow-the-interactive-prompts-it-handles-db-config-and-file-placement">Follow the interactive prompts — it handles DB, config, and file placement</a></li>
+<li><a href="#then-run-your-first-task">Then run your first task:</a></li>
+</ul>  - <a href="#prerequisites">Prerequisites</a>
+    - <a href="#verify-prerequisites">Verify prerequisites</a>
+  - <a href="#step-by-step-setup">Step-by-Step Setup</a>
+    - <a href="#1-clone-the-repository">1. Clone the repository</a>
+    - <a href="#2-run-the-interactive-installer">2. Run the interactive installer</a>
+    - <a href="#3-alternative-manual-database-setup">3. (Alternative) Manual database setup</a>
+<ul><li><a href="#create-the-database-directory">Create the database directory</a></li>
+<li><a href="#run-the-schema-the-setup-script-normally-does-this-but-you-can-do-it-manually">Run the schema — the setup script normally does this, but you can do it manually:</a></li>
+<li><a href="#run-migrations-to-ensure-youre-at-the-latest-version">Run migrations to ensure you're at the latest version</a></li>
+</ul>    - <a href="#4-verify-the-database">4. Verify the database</a>
+<ul><li><a href="#should-report-current-schema-version-and-apply-any-pending-migrations">Should report current schema version and apply any pending migrations</a></li>
+</ul>    - <a href="#5-run-a-smoke-test">5. Run a smoke test</a>
+<ul><li><a href="#scan-for-pending-work-across-all-projects">Scan for pending work across all projects</a></li>
+<li><a href="#or-run-the-test-suite">Or run the test suite</a></li>
+</ul>    - <a href="#6-run-your-first-task">6. Run your first task</a>
+<ul><li><a href="#run-a-specific-task-by-id">Run a specific task by ID</a></li>
+<li><a href="#run-with-devtest-loop">Run with dev+test loop</a></li>
+<li><a href="#run-with-a-specific-role">Run with a specific role</a></li>
+</ul>  - <a href="#environment-variables">Environment Variables</a>
+<ul><li><a href="#set-your-api-key">Set your API key</a></li>
+</ul>  - <a href="#running-in-production">Running in Production</a>
+    - <a href="#option-a-cron-based-scheduling-recommended">Option A: Cron-based scheduling (recommended)</a>
+<ul><li><a href="#edit-crontab">Edit crontab</a></li>
+<li><a href="#run-forgesmith-analysis-every-6-hours">Run ForgeSmith analysis every 6 hours</a></li>
+<li><a href="#run-simba-rule-generation-daily">Run SIMBA rule generation daily</a></li>
+<li><a href="#run-dispatch-scan-every-30-minutes">Run dispatch scan every 30 minutes</a></li>
+</ul>    - <a href="#option-b-systemd-service">Option B: systemd service</a>
+<ul><li><a href="#etcsystemdsystemforgeteam-dispatchservice">/etc/systemd/system/forgeteam-dispatch.service</a></li>
+<li><a href="#etcsystemdsystemforgeteam-dispatchtimer">/etc/systemd/system/forgeteam-dispatch.timer</a></li>
+</ul>    - <a href="#option-c-run-commands-directly">Option C: Run commands directly</a>
+<ul><li><a href="#full-orchestration-for-a-task">Full orchestration for a task</a></li>
+<li><a href="#auto-dispatch-across-all-projects">Auto-dispatch across all projects</a></li>
+<li><a href="#parallel-goal-execution">Parallel goal execution</a></li>
+<li><a href="#run-forgesmith-analysis-dry-run-first">Run ForgeSmith analysis (dry run first!)</a></li>
+<li><a href="#run-forgesmith-simba-rule-generation">Run ForgeSmith SIMBA rule generation</a></li>
+<li><a href="#run-forgesmith-gepa-prompt-evolution">Run ForgeSmith GEPA prompt evolution</a></li>
+<li><a href="#backfill-episode-data-from-logs">Backfill episode data from logs</a></li>
+<li><a href="#performance-dashboard">Performance dashboard</a></li>
+<li><a href="#performance-analysis-report">Performance analysis report</a></li>
+<li><a href="#database-migrations">Database migrations</a></li>
+<li><a href="#forgearena-adversarial-testing">ForgeArena adversarial testing</a></li>
+</ul>  - <a href="#docker">Docker</a>
+<ul><li><a href="#install-system-dependencies">Install system dependencies</a></li>
+<li><a href="#install-nodejs-for-claude-code-cli">Install Node.js (for Claude Code CLI)</a></li>
+<li><a href="#install-claude-code-cli">Install Claude Code CLI</a></li>
+<li><a href="#set-up-working-directory">Set up working directory</a></li>
+<li><a href="#copy-project-files">Copy project files</a></li>
+<li><a href="#install-python-dependencies-if-any-requirements-file-exists">Install Python dependencies (if any requirements file exists)</a></li>
+<li><a href="#create-data-directory">Create data directory</a></li>
+<li><a href="#environment">Environment</a></li>
+<li><a href="#run-setup-non-interactively-or-start-with-a-specific-command">Run setup non-interactively or start with a specific command</a></li>
+<li><a href="#build">Build</a></li>
+<li><a href="#run-with-api-key-and-persistent-data-volume">Run with API key and persistent data volume</a></li>
+<li><a href="#run-interactive-setup">Run interactive setup</a></li>
+<li><a href="#run-a-specific-task">Run a specific task</a></li>
+</ul>  - <a href="#troubleshooting">Troubleshooting</a>
+    - <a href="#anthropic_api_key-not-set"><code>ANTHROPIC_API_KEY</code> not set</a>
+<ul><li><a href="#or-add-to-your-shell-profile">Or add to your shell profile:</a></li>
+</ul>    - <a href="#claude-code-cli-not-found">Claude Code CLI not found</a>
+<ul><li><a href="#verify">Verify:</a></li>
+<li><a href="#if-installed-but-not-found-check-your-path">If installed but not found, check your PATH:</a></li>
+</ul>    - <a href="#database-locked-concurrent-access-errors">Database locked / concurrent access errors</a>
+<ul><li><a href="#sqlite-doesnt-handle-heavy-concurrent-writes-well">SQLite doesn't handle heavy concurrent writes well</a></li>
+<li><a href="#ensure-only-one-dispatch-process-runs-at-a-time">Ensure only one dispatch process runs at a time</a></li>
+<li><a href="#check-for-stuck-processes">Check for stuck processes:</a></li>
+<li><a href="#kill-stale-ones-if-needed">Kill stale ones if needed:</a></li>
+</ul>    - <a href="#database-schema-out-of-date">Database schema out of date</a>
+<ul><li><a href="#this-will-detect-the-current-version-and-apply-all-pending-migrations">This will detect the current version and apply all pending migrations</a></li>
+</ul>    - <a href="#port-in-use-ollama">Port in use (Ollama)</a>
+<ul><li><a href="#start-ollama-if-its-not-running">Start Ollama if it's not running:</a></li>
+<li><a href="#or-check-if-something-else-is-on-that-port">Or check if something else is on that port:</a></li>
+<li><a href="#use-a-custom-url">Use a custom URL:</a></li>
+</ul>    - <a href="#permission-denied-on-project-directories">Permission denied on project directories</a>
+<ul><li><a href="#ensure-the-running-user-has-readwrite-access-to-project-directories">Ensure the running user has read/write access to project directories</a></li>
+<li><a href="#for-the-database">For the database:</a></li>
+</ul>    - <a href="#tests-failing">Tests failing</a>
+<ul><li><a href="#run-the-full-test-suite-to-identify-issues">Run the full test suite to identify issues:</a></li>
+<li><a href="#run-individual-test-files">Run individual test files:</a></li>
+</ul>    - <a href="#forgesmith-changes-seem-wrong">ForgeSmith changes seem wrong</a>
+<ul><li><a href="#always-dry-run-first-to-preview-changes">Always dry-run first to preview changes:</a></li>
+<li><a href="#check-the-forgesmith-run-history">Check the ForgeSmith run history:</a></li>
+<li><a href="#rollback-a-specific-run">Rollback a specific run:</a></li>
+</ul>    - <a href="#no-tasks-found-when-running-dispatch">"No tasks found" when running dispatch</a>
+<ul><li><a href="#check-what-work-is-available">Check what work is available:</a></li>
+<li><a href="#verify-tasks-exist-in-the-database">Verify tasks exist in the database:</a></li>
+</ul>    - <a href="#checkpoint-recovery-after-crash">Checkpoint recovery after crash</a>
+<ul><li><a href="#the-orchestrator-will-detect-and-resume-from-the-last-checkpoint-automatically">The orchestrator will detect and resume from the last checkpoint automatically</a></li>
+<li><a href="#to-force-a-fresh-start-discard-checkpoints">To force a fresh start (discard checkpoints):</a></li>
+</ul>  - <a href="#related-documentation">Related Documentation</a>
+
+<h2>TL;DR</h2>
+
+<pre><code class="language-bash">git clone &lt;your-repo-url&gt; &amp;&amp; cd itzamna
+<p>python3 itzamna_setup.py</p>
+<h1>Follow the interactive prompts — it handles DB, config, and file placement</h1>
+<h1>Then run your first task:</h1>
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt;</p>
+</code></pre>
+
+<h2>Prerequisites</h2>
+
+<table><tr><td>Tool</td><td>Minimum Version</td><td>Required?</td><td>Install</td></tr>
+<tr><td>------</td><td>----------------</td><td>-----------</td><td>---------</td></tr>
+<tr><td><strong>Python</strong></td><td>3.10+</td><td>✅ Yes</td><td><a href="https://www.python.org/downloads/">python.org</a></td></tr>
+<tr><td><strong>SQLite3</strong></td><td>3.35+</td><td>✅ Yes</td><td>Usually bundled with Python; <code>sqlite3 --version</code></td></tr>
+<tr><td><strong>Claude Code CLI</strong> (<code>claude</code>)</td><td>Latest</td><td>✅ Yes</td><td><code>npm install -g @anthropic-ai/claude-code</code></td></tr>
+<tr><td><strong>Git</strong></td><td>2.30+</td><td>✅ Yes</td><td><a href="https://git-scm.com/downloads">git-scm.com</a></td></tr>
+<tr><td><strong>Node.js / npm</strong></td><td>18+</td><td>✅ Yes (for Claude Code)</td><td><a href="https://nodejs.org/">nodejs.org</a></td></tr>
+<tr><td><strong>GitHub CLI</strong> (<code>gh</code>)</td><td>2.0+</td><td>⚠️ Optional (for repo setup)</td><td><a href="https://cli.github.com/">cli.github.com</a></td></tr>
+<tr><td><strong>Ollama</strong></td><td>Latest</td><td>⚠️ Optional (local models)</td><td><a href="https://ollama.com/download">ollama.com</a></td></tr>
+<tr><td><strong>DSPy</strong></td><td>Latest</td><td>⚠️ Optional (GEPA prompt evolution)</td><td><code>pip install dspy-ai</code></td></tr>
+</table>
+<h3>Verify prerequisites</h3>
+
+<pre><code class="language-bash">python3 --version        # 3.10+
+<p>sqlite3 --version        # 3.35+</p>
+<p>claude --version         # Should return a version</p>
+<p>git --version            # 2.30+</p>
+<p>node --version           # 18+</p>
+</code></pre>
+
+<h2>Step-by-Step Setup</h2>
+
+<h3>1. Clone the repository</h3>
+
+<pre><code class="language-bash">git clone &lt;your-repo-url&gt;
+<p>cd itzamna</p>
+</code></pre>
+
+<h3>2. Run the interactive installer</h3>
+
+<p>The project ships with a guided setup wizard that handles everything:</p>
+
+<pre><code class="language-bash">python3 itzamna_setup.py
+</code></pre>
+
+<p>This will walk you through:</p>
+<ul><li>Prerequisites verification</li>
+<li>Install path selection</li>
+<li>SQLite database creation (runs schema SQL files)</li>
+<li>Configuration file generation</li>
+<li>MCP config setup</li>
+<li>CLAUDE.md generation</li>
+<li>Optional Sentinel and ForgeBot setup</li>
+<li>Optional ForgeSmith cron scheduling</li>
+</ul>
+<h3>3. (Alternative) Manual database setup</h3>
+
+<p>If you prefer manual setup or the wizard fails at the DB step:</p>
+
+<pre><code class="language-bash"># Create the database directory
+<p>mkdir -p ~/.forgeteam</p>
+
+<h1>Run the schema — the setup script normally does this, but you can do it manually:</h1>
+<p>sqlite3 ~/.forgeteam/forge.db &lt; schema.sql</p>
+
+<h1>Run migrations to ensure you're at the latest version</h1>
+<p>python3 db_migrate.py</p>
+</code></pre>
+
+<h3>4. Verify the database</h3>
+
+<pre><code class="language-bash">python3 db_migrate.py
+<h1>Should report current schema version and apply any pending migrations</h1>
+</code></pre>
+
+<h3>5. Run a smoke test</h3>
+
+<pre><code class="language-bash"># Scan for pending work across all projects
+<p>python3 forge_orchestrator.py --scan</p>
+
+<h1>Or run the test suite</h1>
+<p>python3 -m pytest test_loop_detection.py test_early_termination.py test_agent_messages.py test_agent_actions.py -v</p>
+</code></pre>
+
+<h3>6. Run your first task</h3>
+
+<pre><code class="language-bash"># Run a specific task by ID
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt;</p>
+
+<h1>Run with dev+test loop</h1>
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt; --dev-test</p>
+
+<h1>Run with a specific role</h1>
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt; --role developer</p>
+</code></pre>
+
+<h2>Environment Variables</h2>
+
+<table><tr><td>Variable</td><td>Description</td><td>Example</td><td>Required?</td></tr>
+<tr><td>----------</td><td>-------------</td><td>---------</td><td>-----------</td></tr>
+<tr><td><code>ANTHROPIC_API_KEY</code></td><td>API key for Claude / Anthropic calls</td><td><code>sk-ant-...</code></td><td>✅ Yes</td></tr>
+<tr><td><code>FORGE_DB_PATH</code></td><td>Override path to the SQLite database</td><td><code>~/.forgeteam/forge.db</code></td><td>❌ No (defaults set by config)</td></tr>
+<tr><td><code>FORGE_CONFIG_PATH</code></td><td>Override path to config file</td><td><code>~/.forgeteam/config.json</code></td><td>❌ No</td></tr>
+<tr><td><code>OLLAMA_BASE_URL</code></td><td>Base URL for local Ollama instance</td><td><code>http://localhost:11434</code></td><td>❌ No (only if using Ollama)</td></tr>
+<tr><td><code>OLLAMA_MODEL</code></td><td>Default Ollama model name</td><td><code>codellama:34b</code></td><td>❌ No</td></tr>
+<tr><td><code>GITHUB_TOKEN</code></td><td>GitHub token for <code>gh</code> CLI operations</td><td><code>ghp_...</code></td><td>❌ No (only for repo setup)</td></tr>
+</table>
+<p>> <strong>Note:</strong> Most configuration is managed through config files generated by <code>itzamna_setup.py</code>, not environment variables. The API key is the critical one to set.</p>
+
+<pre><code class="language-bash"># Set your API key
+<p>export ANTHROPIC_API_KEY="sk-ant-your-key-here"</p>
+</code></pre>
+
+<h2>Running in Production</h2>
+
+<h3>Option A: Cron-based scheduling (recommended)</h3>
+
+<p>The setup wizard can configure ForgeSmith cron jobs automatically. To do it manually:</p>
+
+<pre><code class="language-bash"># Edit crontab
+<p>crontab -e</p>
+
+<h1>Run ForgeSmith analysis every 6 hours</h1>
+<p>0 <em>/6 </em> <em> </em> cd /path/to/itzamna &amp;&amp; python3 forgesmith.py --full &gt;&gt; /var/log/forgesmith.log 2&gt;&amp;1</p>
+
+<h1>Run SIMBA rule generation daily</h1>
+<p>0 2 <em> </em> * cd /path/to/itzamna &amp;&amp; python3 forgesmith_simba.py &gt;&gt; /var/log/forgesmith-simba.log 2&gt;&amp;1</p>
+
+<h1>Run dispatch scan every 30 minutes</h1>
+<em>/30 </em> <em> </em> * cd /path/to/itzamna &amp;&amp; python3 forge_orchestrator.py --dispatch &gt;&gt; /var/log/forge-dispatch.log 2&gt;&amp;1
+</code></pre>
+
+<h3>Option B: systemd service</h3>
+
+<pre><code class="language-ini"># /etc/systemd/system/forgeteam-dispatch.service
+<p>[Unit]</p>
+<p>Description=ForgeTeam Auto-Dispatch</p>
+<p>After=network.target</p>
+
+<p>[Service]</p>
+<p>Type=oneshot</p>
+<p>User=your-user</p>
+<p>WorkingDirectory=/path/to/itzamna</p>
+<p>Environment=ANTHROPIC_API_KEY=sk-ant-your-key-here</p>
+<p>ExecStart=/usr/bin/python3 forge_orchestrator.py --dispatch</p>
+<p>StandardOutput=append:/var/log/forgeteam-dispatch.log</p>
+<p>StandardError=append:/var/log/forgeteam-dispatch.log</p>
+
+<p>[Install]</p>
+<p>WantedBy=multi-user.target</p>
+</code></pre>
+
+<pre><code class="language-ini"># /etc/systemd/system/forgeteam-dispatch.timer
+<p>[Unit]</p>
+<p>Description=Run ForgeTeam dispatch every 30 minutes</p>
+
+<p>[Timer]</p>
+<p>OnCalendar=*:0/30</p>
+<p>Persistent=true</p>
+
+<p>[Install]</p>
+<p>WantedBy=timers.target</p>
+</code></pre>
+
+<pre><code class="language-bash">sudo systemctl daemon-reload
+<p>sudo systemctl enable --now forgeteam-dispatch.timer</p>
+<p>sudo systemctl status forgeteam-dispatch.timer</p>
+</code></pre>
+
+<h3>Option C: Run commands directly</h3>
+
+<pre><code class="language-bash"># Full orchestration for a task
+<p>python3 forge_orchestrator.py --task 42 --dev-test</p>
+
+<h1>Auto-dispatch across all projects</h1>
+<p>python3 forge_orchestrator.py --dispatch</p>
+
+<h1>Parallel goal execution</h1>
+<p>python3 forge_orchestrator.py --goals goals.json --parallel 3</p>
+
+<h1>Run ForgeSmith analysis (dry run first!)</h1>
+<p>python3 forgesmith.py --full --dry-run</p>
+<p>python3 forgesmith.py --full</p>
+
+<h1>Run ForgeSmith SIMBA rule generation</h1>
+<p>python3 forgesmith_simba.py --dry-run</p>
+<p>python3 forgesmith_simba.py</p>
+
+<h1>Run ForgeSmith GEPA prompt evolution</h1>
+<p>python3 forgesmith_gepa.py --dry-run</p>
+<p>python3 forgesmith_gepa.py</p>
+
+<h1>Backfill episode data from logs</h1>
+<p>python3 forgesmith_backfill.py</p>
+
+<h1>Performance dashboard</h1>
+<p>python3 forge_dashboard.py</p>
+
+<h1>Performance analysis report</h1>
+<p>python3 analyze_performance.py --days 30</p>
+
+<h1>Database migrations</h1>
+<p>python3 db_migrate.py</p>
+
+<h1>ForgeArena adversarial testing</h1>
+<p>python3 forge_arena.py --dry-run</p>
+</code></pre>
+
+<h2>Docker</h2>
+
+<pre><code class="language-dockerfile">FROM python:3.12-slim
+
+<h1>Install system dependencies</h1>
+<p>RUN apt-get update &amp;&amp; apt-get install -y \</p>
+    sqlite3 \
+    git \
+    curl \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<h1>Install Node.js (for Claude Code CLI)</h1>
+<p>RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \</p>
+    &amp;&amp; apt-get install -y nodejs \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<h1>Install Claude Code CLI</h1>
+<p>RUN npm install -g @anthropic-ai/claude-code</p>
+
+<h1>Set up working directory</h1>
+<p>WORKDIR /app</p>
+
+<h1>Copy project files</h1>
+<p>COPY . .</p>
+
+<h1>Install Python dependencies (if any requirements file exists)</h1>
+<p>RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi</p>
+
+<h1>Create data directory</h1>
+<p>RUN mkdir -p /data</p>
+
+<h1>Environment</h1>
+<p>ENV FORGE_DB_PATH=/data/forge.db</p>
+<p>ENV PYTHONUNBUFFERED=1</p>
+
+<h1>Run setup non-interactively or start with a specific command</h1>
+<p>ENTRYPOINT ["python3"]</p>
+<p>CMD ["forge_orchestrator.py", "--help"]</p>
+</code></pre>
+
+<pre><code class="language-bash"># Build
+<p>docker build -t forgeteam .</p>
+
+<h1>Run with API key and persistent data volume</h1>
+<p>docker run -it \</p>
+  -e ANTHROPIC_API_KEY="sk-ant-your-key-here" \
+  -v forgeteam-data:/data \
+  -v /path/to/your/projects:/projects \
+  forgeteam forge_orchestrator.py --scan
+
+<h1>Run interactive setup</h1>
+<p>docker run -it \</p>
+  -e ANTHROPIC_API_KEY="sk-ant-your-key-here" \
+  -v forgeteam-data:/data \
+  forgeteam itzamna_setup.py
+
+<h1>Run a specific task</h1>
+<p>docker run -it \</p>
+  -e ANTHROPIC_API_KEY="sk-ant-your-key-here" \
+  -v forgeteam-data:/data \
+  -v /path/to/your/projects:/projects \
+  forgeteam forge_orchestrator.py --task 42 --dev-test
+</code></pre>
+
+<h2>Troubleshooting</h2>
+
+<h3><code>ANTHROPIC_API_KEY</code> not set</h3>
+
+<pre><code class="language-text">Error: API key not configured
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash">export ANTHROPIC_API_KEY="sk-ant-your-key-here"
+<h1>Or add to your shell profile:</h1>
+<p>echo 'export ANTHROPIC_API_KEY="sk-ant-your-key-here"' &gt;&gt; ~/.bashrc</p>
+<p>source ~/.bashrc</p>
+</code></pre>
+
+<h3>Claude Code CLI not found</h3>
+
+<pre><code class="language-text">FileNotFoundError: claude command not found
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash">npm install -g @anthropic-ai/claude-code
+<h1>Verify:</h1>
+<p>claude --version</p>
+<h1>If installed but not found, check your PATH:</h1>
+<p>which claude || echo "Not in PATH"</p>
+</code></pre>
+
+<h3>Database locked / concurrent access errors</h3>
+
+<pre><code class="language-text">sqlite3.OperationalError: database is locked
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash"># SQLite doesn't handle heavy concurrent writes well
+<h1>Ensure only one dispatch process runs at a time</h1>
+<h1>Check for stuck processes:</h1>
+<p>ps aux | grep forge_orchestrator</p>
+<h1>Kill stale ones if needed:</h1>
+<p>kill &lt;PID&gt;</p>
+</code></pre>
+
+<h3>Database schema out of date</h3>
+
+<pre><code class="language-text">Error: table X has no column named Y
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash">python3 db_migrate.py
+<h1>This will detect the current version and apply all pending migrations</h1>
+</code></pre>
+
+<h3>Port in use (Ollama)</h3>
+
+<pre><code class="language-text">Error: Connection refused on localhost:11434
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash"># Start Ollama if it's not running:
+<p>ollama serve</p>
+<h1>Or check if something else is on that port:</h1>
+<p>lsof -i :11434</p>
+<h1>Use a custom URL:</h1>
+<p>export OLLAMA_BASE_URL="http://localhost:11435"</p>
+</code></pre>
+
+<h3>Permission denied on project directories</h3>
+
+<pre><code class="language-text">PermissionError: [Errno 13] Permission denied
+</code></pre>
+
+<strong>Fix:</strong>
+<pre><code class="language-bash"># Ensure the running user has read/write access to project directories
+<p>chmod -R u+rw /path/to/your/project</p>
+<h1>For the database:</h1>
+<p>chmod 664 ~/.forgeteam/forge.db</p>
+</code></pre>
+
+<h3>Tests failing</h3>
+
+<pre><code class="language-bash"># Run the full test suite to identify issues:
+<p>python3 -m pytest test_*.py -v</p>
+
+<h1>Run individual test files:</h1>
+<p>python3 test_loop_detection.py</p>
+<p>python3 test_early_termination.py</p>
+<p>python3 test_agent_messages.py</p>
+<p>python3 test_agent_actions.py</p>
+<p>python3 test_lessons_injection.py</p>
+<p>python3 test_episode_injection.py</p>
+<p>python3 test_forgesmith_simba.py</p>
+<p>python3 test_rubric_scoring.py</p>
+<p>python3 test_task_type_routing.py</p>
+</code></pre>
+
+<h3>ForgeSmith changes seem wrong</h3>
+
+<pre><code class="language-bash"># Always dry-run first to preview changes:
+<p>python3 forgesmith.py --full --dry-run</p>
+
+<h1>Check the ForgeSmith run history:</h1>
+<p>python3 forgesmith.py --report</p>
+
+<h1>Rollback a specific run:</h1>
+<p>python3 forgesmith.py --rollback &lt;RUN_ID&gt;</p>
+</code></pre>
+
+<h3>"No tasks found" when running dispatch</h3>
+
+<pre><code class="language-bash"># Check what work is available:
+<p>python3 forge_orchestrator.py --scan</p>
+
+<h1>Verify tasks exist in the database:</h1>
+<p>sqlite3 ~/.forgeteam/forge.db "SELECT id, title, status FROM tasks WHERE status = 'todo' LIMIT 10;"</p>
+</code></pre>
+
+<h3>Checkpoint recovery after crash</h3>
+
+<p>ForgeTeam automatically saves checkpoints during long-running tasks. If a task crashes mid-execution:</p>
+
+<pre><code class="language-bash"># The orchestrator will detect and resume from the last checkpoint automatically
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt;</p>
+
+<h1>To force a fresh start (discard checkpoints):</h1>
+<p>rm -rf checkpoints/&lt;TASK_ID&gt;_*</p>
+<p>python3 forge_orchestrator.py --task &lt;TASK_ID&gt;</p>
+</code></pre>
+<hr>
+
+<h2>Related Documentation</h2>
+
+<ul><li><a href="README.md">Readme</a></li>
+<li><a href="ARCHITECTURE.md">Architecture</a></li>
+<li><a href="API.md">Api</a></li>
+<li><a href="CONTRIBUTING.md">Contributing</a></li>
+</ul>
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>

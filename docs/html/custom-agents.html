@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CUSTOM_AGENTS - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item active">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>Custom Agent Creation Guide</h1>
+
+<p>ForgeTeam agents are defined by markdown prompt files. Creating a new agent is as simple as dropping a <code>.md</code> file in the <code>prompts/</code> directory.</p>
+
+<hr>
+
+<h2>How Agent Roles Work</h2>
+
+<p>Each agent role is a markdown file in the <code>prompts/</code> directory. When the orchestrator spawns an agent, it:</p>
+
+<p>1. Reads <code>_common.md</code> (shared rules for all agents)</p>
+<p>2. Reads the role-specific <code>.md</code> file (e.g., <code>developer.md</code>)</p>
+<p>3. Prepends the common rules to the role prompt</p>
+<p>4. Adds the task-specific instructions</p>
+<p>5. Passes everything as the system prompt to <code>claude -p</code></p>
+
+<p>The <code>_discover_roles()</code> function scans <code>prompts/</code> at startup and automatically registers any <code>.md</code> file (except those starting with <code>_</code>) as an available role.</p>
+
+<h3>Built-in Roles</h3>
+
+<p>ForgeTeam ships with 9 built-in agent roles:</p>
+
+<table><tr><td>Role File</td><td>Purpose</td></tr>
+<tr><td>-----------</td><td>---------</td></tr>
+<tr><td><code>developer.md</code></td><td>Write code, fix bugs, implement features</td></tr>
+<tr><td><code>tester.md</code></td><td>Run unit tests and report results</td></tr>
+<tr><td><code>planner.md</code></td><td>Break goals into ordered tasks</td></tr>
+<tr><td><code>evaluator.md</code></td><td>Verify goal completion, create follow-ups</td></tr>
+<tr><td><code>security-reviewer.md</code></td><td>4-phase code security audit</td></tr>
+<tr><td><code>frontend-designer.md</code></td><td>Create polished, production-grade UI/UX</td></tr>
+<tr><td><code>integration-tester.md</code></td><td>Deploy and test full applications end-to-end</td></tr>
+<tr><td><code>debugger.md</code></td><td>Trace errors to root cause and fix them</td></tr>
+<tr><td><code>code-reviewer.md</code></td><td>Review code quality, consistency, correctness</td></tr>
+</table>
+<hr>
+
+<h2>Creating a New Agent</h2>
+
+<h3>1. Create the Prompt File</h3>
+
+<p>Create a new <code>.md</code> file in your <code>prompts/</code> directory:</p>
+
+<pre><code class="language-text">prompts/documentation-writer.md
+</code></pre>
+
+<p>The filename stem becomes the role name: <code>documentation-writer</code>.</p>
+
+<h3>2. Write the Prompt</h3>
+
+<p>Your prompt file should include these sections:</p>
+
+<pre><code class="language-markdown"># Documentation Writer Agent
+
+<h2>Role</h2>
+<p>You are a documentation writer for TheForge projects. Your job is to create</p>
+<p>and update project documentation based on the current codebase.</p>
+
+<h2>Responsibilities</h2>
+<ul><li>Read the codebase to understand architecture and features</li>
+<li>Create/update README.md, API docs, and user guides</li>
+<li>Follow the project's existing documentation style</li>
+<li>Keep docs accurate and concise</li>
+</ul>
+<h2>Output Format</h2>
+<p>Your response MUST be valid JSON with this structure:</p>
+
+{
+    "status": "done" | "blocked",
+    "summary": "What you did",
+    "files_changed": ["list", "of", "files"],
+    "notes": "Any additional context"
+}
+
+<p>Always include <code>RESULT:</code> followed by your JSON output.</p>
+
+<h2>Tool Permissions</h2>
+<ul><li>Read: YES (read any file)</li>
+<li>Write: YES (create/edit documentation files only)</li>
+<li>Edit: YES (documentation files only)</li>
+<li>Bash: YES (read-only commands like ls, find, grep)</li>
+<li>TheForge MCP: YES (read project context, update task status)</li>
+</ul>
+<h2>Constraints</h2>
+<ul><li>NEVER modify source code files</li>
+<li>NEVER delete existing documentation without replacement</li>
+<li>ALWAYS check existing docs before creating new ones</li>
+<li>Keep documentation concise — avoid boilerplate</li>
+</ul></code></pre>
+
+<h3>3. Use Your Agent</h3>
+
+<p>The new role is automatically discovered at startup:</p>
+
+<pre><code class="language-bash">python forge_orchestrator.py --task 42 --role documentation-writer -y
+</code></pre>
+
+<hr>
+
+<h2>The <code>_common.md</code> File</h2>
+
+<p>The <code>_common.md</code> file contains rules that apply to ALL agents. This includes:</p>
+
+<ul><li>Branding requirements (Forgeborn attribution)</li>
+<li>Windows-specific instructions</li>
+<li>TheForge database usage patterns</li>
+<li>Output format requirements</li>
+<li>Safety constraints</li>
+</ul>
+<p>When you create a custom agent, these rules are automatically prepended to your prompt. You don't need to repeat them.</p>
+
+<hr>
+
+<h2>Required Sections</h2>
+
+<p>While not strictly enforced, every agent prompt should include:</p>
+
+<table><tr><td>Section</td><td>Purpose</td></tr>
+<tr><td>---------</td><td>---------</td></tr>
+<tr><td><strong>Role</strong></td><td>What this agent is and what it does</td></tr>
+<tr><td><strong>Responsibilities</strong></td><td>Specific tasks the agent should perform</td></tr>
+<tr><td><strong>Output Format</strong></td><td>JSON structure for structured parsing</td></tr>
+<tr><td><strong>Tool Guidance</strong></td><td>What tools the agent should and shouldn't use</td></tr>
+<tr><td><strong>Constraints</strong></td><td>What the agent must NOT do</td></tr>
+</table>
+<p>> <strong>Note on tool permissions:</strong> All agents run with <code>--permission-mode bypassPermissions</code>, which gives them full tool access. The "Tool Guidance" section in your prompt is <em>advisory</em> — it tells the agent what it should and shouldn't do, but it's not enforced by the CLI. Well-written prompts are effective at keeping agents in their lane, but they're not a security boundary.</p>
+
+<hr>
+
+<h2>Example: API Reviewer Agent</h2>
+
+<pre><code class="language-markdown"># API Reviewer Agent
+
+<h2>Role</h2>
+<p>You review API endpoints for consistency, completeness, and best practices.</p>
+
+<h2>Responsibilities</h2>
+<ul><li>Check all API endpoints follow REST conventions</li>
+<li>Verify request/response schemas are documented</li>
+<li>Flag missing error handling or validation</li>
+<li>Check authentication/authorization on all endpoints</li>
+<li>Report findings as tasks in TheForge</li>
+</ul>
+<h2>Output Format</h2>
+{
+    "status": "done" | "blocked",
+    "summary": "Review summary",
+    "findings": [
+        {
+            "severity": "high" | "medium" | "low",
+            "endpoint": "/api/resource",
+            "issue": "Description of the issue",
+            "recommendation": "What to fix"
+        }
+    ]
+}
+
+<p>Always include <code>RESULT:</code> followed by your JSON output.</p>
+
+<h2>Tool Permissions</h2>
+<ul><li>Read: YES</li>
+<li>Write: NO</li>
+<li>Edit: NO</li>
+<li>Bash: YES (read-only)</li>
+<li>TheForge MCP: YES</li>
+</ul>
+<h2>Constraints</h2>
+<ul><li>NEVER modify any code</li>
+<li>NEVER skip endpoints — review all of them</li>
+<li>Report findings even if minor</li>
+</ul></code></pre>
+
+<hr>
+
+<h2>Custom Turn Limits and Models</h2>
+
+<p>You can configure per-role turn limits and models for custom agents in <code>dispatch_config.json</code>:</p>
+
+<pre><code class="language-json">{
+    "max_turns_documentation_writer": 15,
+    "model_documentation_writer": "haiku"
+}
+</code></pre>
+
+<p>The key pattern is <code>max_turns_{role}</code> and <code>model_{role}</code>, where <code>{role}</code> is the filename stem with hyphens replaced by underscores.</p>
+
+<p>If no per-role config exists, the agent uses the global <code>max_turns</code> and <code>model</code> defaults.</p>
+
+<hr>
+
+<h2>Tips</h2>
+
+<ul><li><strong>Keep prompts focused.</strong> One agent, one job. Don't try to make a do-everything agent.</li>
+<li><strong>Be explicit about output format.</strong> The orchestrator parses JSON from agent output.</li>
+<li><strong>Set clear boundaries.</strong> Specify what the agent can and cannot do.</li>
+<li><strong>Test with <code>--dry-run</code> first.</strong> See the prompt size and structure before running.</li>
+<li><strong>Use <code>--role your-agent</code> to select it.</strong> The filename stem is the role name.</li>
+<li><strong>Check <code>_common.md</code> for overlap.</strong> Don't repeat rules that are already shared.</li>
+<li><strong>Tool guidance is advisory.</strong> Agents run with full permissions — your prompt controls behavior, not the CLI.</li>
+</ul>
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>

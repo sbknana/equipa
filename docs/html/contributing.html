@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CONTRIBUTING - Itzamna</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh;
+    }
+    .sidebar {
+      width: 260px; background: #161b22; border-right: 1px solid #30363d;
+      padding: 1rem 0; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 1rem 1.25rem; font-size: 1.1rem; font-weight: 700;
+      border-bottom: 1px solid #30363d; margin-bottom: 0.5rem;
+      color: #58a6ff;
+    }
+    .nav-item {
+      display: block; padding: 0.5rem 1.25rem; color: #c9d1d9;
+      text-decoration: none; font-size: 0.9rem;
+      border-left: 3px solid transparent; transition: all 0.15s;
+    }
+    .nav-item:hover { background: #1f6feb33; }
+    .nav-item.active {
+      background: #1f6feb33; border-left-color: #58a6ff; font-weight: 600;
+    }
+    .content {
+      margin-left: 260px; padding: 2rem 3rem; max-width: 900px; width: 100%;
+    }
+    h1 { font-size: 2rem; margin: 0.5em 0; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5rem; margin: 1.5em 0 0.5em; border-bottom: 1px solid #30363d; padding-bottom: 0.2em; }
+    h3 { font-size: 1.25rem; margin: 1.2em 0 0.4em; }
+    h4 { font-size: 1.1rem; margin: 1em 0 0.3em; }
+    p { margin: 0.6em 0; line-height: 1.6; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      background: #1c2128; padding: 0.2em 0.4em; border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em;
+    }
+    pre {
+      background: #1c2128; padding: 1em; border-radius: 8px;
+      overflow-x: auto; margin: 1em 0; border: 1px solid #30363d;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      border-collapse: collapse; width: 100%; margin: 1em 0;
+    }
+    td, th {
+      border: 1px solid #30363d; padding: 0.5em 0.75em; text-align: left;
+    }
+    tr:nth-child(even) { background: #1c2128; }
+    ul { padding-left: 1.5em; margin: 0.5em 0; }
+    li { margin: 0.3em 0; line-height: 1.5; }
+    hr { border: none; border-top: 1px solid #30363d; margin: 2em 0; }
+    img { border: 1px solid #30363d; }
+    .mermaid { margin: 1.5em 0; }
+    .footer {
+      margin-top: 4em; padding-top: 1em; border-top: 1px solid #30363d;
+      font-size: 0.8em; opacity: 0.6;
+    }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">Itzamna</div>
+    <a href="api.html" class="nav-item">API</a>
+          <a href="architecture.html" class="nav-item">ARCHITECTURE</a>
+          <a href="concurrency.html" class="nav-item">CONCURRENCY</a>
+          <a href="contributing.html" class="nav-item active">CONTRIBUTING</a>
+          <a href="coordinator.html" class="nav-item">COORDINATOR</a>
+          <a href="custom-agents.html" class="nav-item">CUSTOM_AGENTS</a>
+          <a href="deployment.html" class="nav-item">DEPLOYMENT</a>
+          <a href="local-llm.html" class="nav-item">LOCAL_LLM</a>
+          <a href="quickstart.html" class="nav-item">QUICKSTART</a>
+          <a href="readme.html" class="nav-item">README</a>
+          <a href="training.html" class="nav-item">TRAINING</a>
+          <a href="user-guide.html" class="nav-item">USER_GUIDE</a>
+          <a href="diagrams.html" class="nav-item">DIAGRAMS</a>
+  </nav>
+  <main class="content">
+    <h1>Contributing to Itzamna (ForgeTeam)</h1>
+
+<h2>Table of Contents</h2>
+
+<ul><li><a href="#contributing-to-itzamna-forgeteam">Contributing to Itzamna (ForgeTeam)</a></li>
+</ul>  - <a href="#welcome">Welcome</a>
+  - <a href="#development-setup">Development Setup</a>
+    - <a href="#prerequisites">Prerequisites</a>
+    - <a href="#getting-started">Getting Started</a>
+    - <a href="#project-structure">Project Structure</a>
+  - <a href="#code-style">Code Style</a>
+    - <a href="#general-conventions">General Conventions</a>
+    - <a href="#documentation">Documentation</a>
+    - <a href="#database-conventions">Database Conventions</a>
+    - <a href="#naming-patterns">Naming Patterns</a>
+  - <a href="#making-changes">Making Changes</a>
+    - <a href="#branch-naming">Branch Naming</a>
+    - <a href="#commit-messages">Commit Messages</a>
+    - <a href="#working-with-the-database">Working with the Database</a>
+  - <a href="#testing">Testing</a>
+    - <a href="#running-tests">Running Tests</a>
+<ul><li><a href="#run-individual-test-suites">Run individual test suites</a></li>
+</ul>    - <a href="#running-all-tests">Running All Tests</a>
+<ul><li><a href="#run-all-test-files">Run all test files</a></li>
+</ul>    - <a href="#what-to-test">What to Test</a>
+    - <a href="#test-patterns-in-this-project">Test Patterns in This Project</a>
+  - <a href="#pull-request-process">Pull Request Process</a>
+    - <a href="#before-submitting">Before Submitting</a>
+    - <a href="#pr-description">PR Description</a>
+    - <a href="#review-expectations">Review Expectations</a>
+  - <a href="#issue-reporting">Issue Reporting</a>
+    - <a href="#bug-reports">Bug Reports</a>
+    - <a href="#feature-requests">Feature Requests</a>
+    - <a href="#labels">Labels</a>
+  - <a href="#code-of-conduct">Code of Conduct</a>
+  - <a href="#related-documentation">Related Documentation</a>
+
+<h2>Welcome</h2>
+
+<p>Thank you for your interest in contributing to Itzamna! Whether you're fixing a bug, improving documentation, adding a new feature, or enhancing the multi-agent orchestration system, your contribution is valued. ForgeTeam is a community-driven project, and we're glad you're here.</p>
+
+<p>This guide will help you get set up and contributing effectively.</p>
+
+<hr>
+
+<h2>Development Setup</h2>
+
+<h3>Prerequisites</h3>
+
+<p>Itzamna requires the following tools. The setup wizard (<code>itzamna_setup.py</code>) will verify most of these for you:</p>
+
+<ul><li><strong>Python 3.10+</strong></li>
+<li><strong>SQLite3</strong> (ships with Python, but the CLI tool is useful for debugging)</li>
+<li><strong>Claude Code</strong> (for agent orchestration)</li>
+<li><strong>Git</strong></li>
+</ul>
+<h3>Getting Started</h3>
+
+<p>1. <strong>Fork and clone the repository:</strong></p>
+
+   <pre><code class="language-bash">   git clone https://github.com/&lt;your-username&gt;/itzamna.git
+   cd itzamna
+   </code></pre>
+
+<p>2. <strong>Run the setup wizard</strong> to initialize the database and configuration:</p>
+
+   <pre><code class="language-bash">   python itzamna_setup.py
+   </code></pre>
+
+   This will walk you through prerequisites checks, install path selection, database creation, config generation, and optional components (Sentinel, ForgeBot).
+
+<p>3. <strong>Run database migrations</strong> (if working on an existing install):</p>
+
+   <pre><code class="language-bash">   python db_migrate.py
+   </code></pre>
+
+<p>4. <strong>Verify the setup:</strong></p>
+
+   The setup wizard includes a verification step. You can also check the database manually:
+
+   <pre><code class="language-bash">   sqlite3 &lt;your-db-path&gt; ".tables"
+   </code></pre>
+
+<h3>Project Structure</h3>
+
+<table><tr><td>Path</td><td>Purpose</td></tr>
+<tr><td>------</td><td>---------</td></tr>
+<tr><td><code>forge_orchestrator.py</code></td><td>Core multi-agent orchestrator — the heart of ForgeTeam</td></tr>
+<tr><td><code>forgesmith.py</code></td><td>Self-improvement engine: analysis, lessons, rubric scoring</td></tr>
+<tr><td><code>forgesmith_simba.py</code></td><td>SIMBA rule generation from high-variance episodes</td></tr>
+<tr><td><code>forgesmith_gepa.py</code></td><td>Genetic-evolutionary prompt optimization (GEPA)</td></tr>
+<tr><td><code>forgesmith_backfill.py</code></td><td>Backfill historical episode data</td></tr>
+<tr><td><code>forge_arena.py</code></td><td>Adversarial testing arena</td></tr>
+<tr><td><code>forge_dashboard.py</code></td><td>Performance dashboard</td></tr>
+<tr><td><code>analyze_performance.py</code></td><td>Performance analytics and reporting</td></tr>
+<tr><td><code>ollama_agent.py</code></td><td>Local Ollama model integration</td></tr>
+<tr><td><code>itzamna_setup.py</code></td><td>Guided installer/setup wizard</td></tr>
+<tr><td><code>db_migrate.py</code></td><td>Database schema migrations</td></tr>
+<tr><td><code>prepare_training_data.py</code></td><td>Training data preparation for fine-tuning</td></tr>
+<tr><td><code>train_qlora.py</code> / <code>train_qlora_peft.py</code></td><td>QLoRA fine-tuning scripts</td></tr>
+<tr><td><code>skills/</code></td><td>Modular skill definitions (e.g., SARIF parsing)</td></tr>
+<tr><td><code>test_*.py</code></td><td>Test files</td></tr>
+</table>
+<hr>
+
+<h2>Code Style</h2>
+
+<h3>General Conventions</h3>
+
+<ul><li><strong>Python</strong> is the primary language. Follow <a href="https://peps.python.org/pep-0008/">PEP 8</a> conventions.</li>
+<li>Use <strong>snake_case</strong> for functions and variables, <strong>PascalCase</strong> for classes.</li>
+<li>Keep functions focused — this codebase favors many small, well-named functions over large monolithic ones.</li>
+<li>Use <strong>type hints</strong> where practical, especially for function signatures.</li>
+<li>Prefer <strong>f-strings</strong> for string formatting.</li>
+</ul>
+<h3>Documentation</h3>
+
+<ul><li>All public functions should have clear, descriptive names. Docstrings are encouraged for non-trivial logic.</li>
+<li>Update <code>CLAUDE.md</code> if your change affects project behavior, configuration, or the orchestration pipeline.</li>
+<li>SQL schema changes must include a corresponding migration in <code>db_migrate.py</code>.</li>
+</ul>
+<h3>Database Conventions</h3>
+
+<ul><li>All database access should use the <code>get_db()</code> or <code>get_db_connection()</code> patterns established in the codebase.</li>
+<li>Use the <code>write=True</code> parameter when performing writes.</li>
+<li>Table creation functions should be idempotent (use <code>CREATE TABLE IF NOT EXISTS</code>).</li>
+<li>Schema changes require a new migration version in <code>db_migrate.py</code>.</li>
+</ul>
+<h3>Naming Patterns</h3>
+
+<ul><li>Test files: <code>test_<module_name>.py</code></li>
+<li>Test functions: <code>test_<what_is_being_tested>()</code></li>
+<li>Helper/setup functions in tests: <code>setup_test_data()</code>, <code>cleanup_<em>()</code>, <code>make_</em>()</code> prefixes</li>
+<li>Configuration loading: <code>load_config()</code> pattern</li>
+<li>Database connections: <code>get_db()</code> or <code>get_db_connection()</code> pattern</li>
+</ul>
+<hr>
+
+<h2>Making Changes</h2>
+
+<h3>Branch Naming</h3>
+
+<p>Use descriptive branch names with a prefix indicating the type of work:</p>
+
+<table><tr><td>Prefix</td><td>Use For</td></tr>
+<tr><td>--------</td><td>---------</td></tr>
+<tr><td><code>feat/</code></td><td>New features (<code>feat/ollama-streaming</code>)</td></tr>
+<tr><td><code>fix/</code></td><td>Bug fixes (<code>fix/loop-detection-threshold</code>)</td></tr>
+<tr><td><code>docs/</code></td><td>Documentation changes (<code>docs/contributing-guide</code>)</td></tr>
+<tr><td><code>refactor/</code></td><td>Code restructuring (<code>refactor/episode-injection</code>)</td></tr>
+<tr><td><code>test/</code></td><td>Test additions or fixes (<code>test/simba-validation</code>)</td></tr>
+<tr><td><code>schema/</code></td><td>Database schema changes (<code>schema/add-q-value-index</code>)</td></tr>
+</table>
+<h3>Commit Messages</h3>
+
+<p>Write clear, descriptive commit messages:</p>
+
+<pre><code class="language-text">&lt;type&gt;: &lt;short summary&gt;
+
+<p>&lt;optional longer description&gt;</p>
+</code></pre>
+
+<strong>Examples:</strong>
+
+<pre><code class="language-text">feat: add cross-project episode fallback for injection
+
+<p>When no project-specific episodes are found, the system now</p>
+<p>falls back to cross-project episodes with reduced Q-value weight.</p>
+</code></pre>
+
+<pre><code class="language-text">fix: loop detector resets counter when files change
+
+<p>The LoopDetector._get_files_changed check was not properly</p>
+<p>resetting the repetition counter on new file modifications.</p>
+</code></pre>
+
+<pre><code class="language-text">schema: add prompt_version column to agent_episodes
+
+<p>Migration v3: adds prompt_version tracking for GEPA A/B testing.</p>
+<p>Includes backfill for existing rows.</p>
+</code></pre>
+
+<h3>Working with the Database</h3>
+
+<p>If your change involves schema modifications:</p>
+
+<p>1. Add a new migration function in <code>db_migrate.py</code> following the pattern <code>migrate_vN_to_vN+1(conn)</code>.</p>
+<p>2. Update the migration chain in <code>run_migrations()</code>.</p>
+<p>3. Make sure the migration is idempotent and safe to re-run.</p>
+<p>4. Test the migration against both fresh databases and existing ones.</p>
+
+<hr>
+
+<h2>Testing</h2>
+
+<h3>Running Tests</h3>
+
+<p>The project uses standalone test scripts (no external test framework required). Each test file has a <code>main()</code> function that runs its tests:</p>
+
+<pre><code class="language-bash"># Run individual test suites
+<p>python test_loop_detection.py</p>
+<p>python test_early_termination.py</p>
+<p>python test_agent_messages.py</p>
+<p>python test_agent_actions.py</p>
+<p>python test_episode_injection.py</p>
+<p>python test_lessons_injection.py</p>
+<p>python test_forgesmith_simba.py</p>
+<p>python test_rubric_scoring.py</p>
+<p>python test_task_type_routing.py</p>
+<p>python test_task_type_routing_verification.py</p>
+<p>python test_task_665_verification.py</p>
+</code></pre>
+
+<h3>Running All Tests</h3>
+
+<pre><code class="language-bash"># Run all test files
+<p>for f in test_*.py; do echo "=== $f ===" &amp;&amp; python "$f"; done</p>
+</code></pre>
+
+<h3>What to Test</h3>
+
+<ul><li><strong>New features:</strong> Add corresponding test functions in the relevant <code>test_*.py</code> file, or create a new test file if the feature is a new module.</li>
+<li><strong>Bug fixes:</strong> Add a regression test that would have caught the bug.</li>
+<li><strong>Database changes:</strong> Test both the migration path and the new functionality.</li>
+<li><strong>Edge cases:</strong> The existing tests demonstrate good patterns — test empty inputs, boundary values, error conditions, and idempotency.</li>
+</ul>
+<h3>Test Patterns in This Project</h3>
+
+<p>Tests in Itzamna follow consistent patterns:</p>
+
+<pre><code class="language-python">def test_your_feature():
+    """Test that your feature does the expected thing."""
+    # Setup
+    # ... arrange test data ...
+
+    # Execute
+    result = function_under_test(input_data)
+
+    # Verify
+    assert result == expected, f"Expected {expected}, got {result}"
+    print("  ✓ test_your_feature passed")
+</code></pre>
+
+<ul><li>Tests use <code>assert</code> statements with descriptive failure messages.</li>
+<li>Each test prints a checkmark on success for clear visual feedback.</li>
+<li>Setup/teardown helpers create and clean up temporary databases when needed.</li>
+<li>Tests are self-contained — no shared mutable state between test functions.</li>
+</ul>
+<hr>
+
+<h2>Pull Request Process</h2>
+
+<h3>Before Submitting</h3>
+
+<p>1. <strong>Run all tests</strong> and confirm they pass.</p>
+<p>2. <strong>Test your change manually</strong> if it affects the orchestrator, dashboard, or setup wizard.</p>
+<p>3. <strong>Check for regressions</strong> — if you modified <code>forge_orchestrator.py</code>, run the full test suite since many modules depend on it.</p>
+<p>4. <strong>Update documentation</strong> — if your change affects behavior described in <code>CLAUDE.md</code> or the README, update those files.</p>
+
+<h3>PR Description</h3>
+
+<p>Include in your pull request:</p>
+
+<ul><li><strong>What</strong> the change does (concise summary)</li>
+<li><strong>Why</strong> the change is needed (bug report link, feature request, or rationale)</li>
+<li><strong>How</strong> it works (brief technical explanation for non-trivial changes)</li>
+<li><strong>Testing</strong> — what tests you added or ran</li>
+<li><strong>Migration notes</strong> — if the change requires database migration or configuration updates</li>
+</ul>
+<h3>Review Expectations</h3>
+
+<ul><li>PRs will be reviewed for correctness, test coverage, and consistency with existing patterns.</li>
+<li>Database schema changes and orchestrator modifications receive extra scrutiny since they affect the entire system.</li>
+<li>Small, focused PRs are easier to review and more likely to be merged quickly.</li>
+<li>Expect constructive feedback — we're all here to make ForgeTeam better.</li>
+</ul>
+<hr>
+
+<h2>Issue Reporting</h2>
+
+<h3>Bug Reports</h3>
+
+<p>When filing a bug, please include:</p>
+
+<p>1. <strong>Description:</strong> What happened vs. what you expected.</p>
+<p>2. <strong>Steps to reproduce:</strong> Minimal steps to trigger the bug.</p>
+<p>3. <strong>Environment:</strong> Python version, OS, database schema version (check with <code>python db_migrate.py</code>).</p>
+<p>4. <strong>Logs/output:</strong> Relevant error messages or orchestrator output.</p>
+<p>5. <strong>Database state:</strong> If relevant, the task status or episode data involved.</p>
+
+<h3>Feature Requests</h3>
+
+<p>For feature requests, please describe:</p>
+
+<p>1. <strong>The problem</strong> you're trying to solve.</p>
+<p>2. <strong>Your proposed solution</strong> (if you have one).</p>
+<p>3. <strong>Alternatives considered</strong> and why they don't work.</p>
+<p>4. <strong>Which components</strong> would be affected (orchestrator, forgesmith, dashboard, etc.).</p>
+
+<h3>Labels</h3>
+
+<ul><li><code>bug</code> — Something isn't working correctly</li>
+<li><code>enhancement</code> — New feature or improvement</li>
+<li><code>documentation</code> — Documentation improvements</li>
+<li><code>schema</code> — Database schema changes</li>
+<li><code>forgesmith</code> — Related to the self-improvement engine</li>
+<li><code>orchestrator</code> — Related to the core agent orchestration</li>
+</ul>
+<hr>
+
+<h2>Code of Conduct</h2>
+
+<p>We are committed to providing a welcoming, inclusive, and harassment-free experience for everyone. All contributors are expected to:</p>
+
+<ul><li><strong>Be respectful</strong> and constructive in all interactions.</li>
+<li><strong>Be collaborative</strong> — assume good intent, offer help, and accept feedback gracefully.</li>
+<li><strong>Be inclusive</strong> — welcome newcomers and support contributors of all experience levels.</li>
+<li><strong>Focus on the work</strong> — technical disagreements are fine; personal attacks are not.</li>
+</ul>
+<p>If you experience or witness unacceptable behavior, please report it to the project maintainers. We take all reports seriously and will respond promptly.</p>
+
+<hr>
+
+<p>Thank you for contributing to Itzamna! Every improvement — whether it's a typo fix, a new test, or a major feature — helps make ForgeTeam better for everyone. 🏗️</p>
+<hr>
+
+<h2>Related Documentation</h2>
+
+<ul><li><a href="README.md">Readme</a></li>
+<li><a href="ARCHITECTURE.md">Architecture</a></li>
+<li><a href="API.md">Api</a></li>
+<li><a href="DEPLOYMENT.md">Deployment</a></li>
+</ul>
+    <div class="footer">
+      Generated by Athena &mdash; &copy; 2026 TheForge, LLC
+    </div>
+  </main>
+</body>
+</html>
