@@ -5,8 +5,7 @@
 <h1 align="center">ForgeTeam</h1>
 
 <p align="center">
-  <strong>Multi-agent AI orchestrator for Claude Code</strong><br>
-  Zero dependencies. Persistent project memory. Dev+Test loops that actually work.
+  <strong>Tell Claude what you want built. Agents do the rest.</strong>
 </p>
 
 <p align="center">
@@ -15,581 +14,306 @@
 
 ---
 
-ForgeTeam turns Claude Code into a team. Instead of one AI doing everything, you get specialized agents — Developer, Tester, Planner, Evaluator, Security Reviewer — that collaborate on your codebase through a shared database. Give it a goal like "Add user authentication" and walk away. It plans the work, writes the code, tests it, evaluates the results, and loops until it's done.
+## What is this?
 
-## Why ForgeTeam?
+ForgeTeam is an AI-powered development team you control through conversation. You talk to Claude in plain English. Claude manages everything else — planning, task creation, agent dispatch, progress tracking, error recovery, and reporting.
 
-**You're a solo dev or small team using Claude Code.** You've got 5 projects, 30 tasks, and not enough hours. ForgeTeam fixes that:
+No CLI commands to memorize. No task IDs to look up. No SQL to write. You make decisions. Claude handles execution.
 
-- **Persistent memory across sessions.** Decisions, task history, session notes, open questions — all stored in SQLite via MCP. No more re-explaining your project every conversation.
-- **Dev+Test loops.** Developer writes code. Tester validates. If tests fail, Developer gets the failures and tries again. Up to 3 cycles, automatically. The orchestrator handles DB status updates — agents never run out of turns before housekeeping.
-- **Parallel task execution.** Run multiple tasks concurrently with `--tasks 109-114`. Independent tasks execute in parallel (up to 4 by default), cutting batch times by 3-4x.
-- **Goal-driven autonomy.** Say "Add dark mode" and the Planner breaks it into tasks, Dev+Test executes each one, the Evaluator reviews results and creates follow-ups. Multiple rounds until the goal is complete.
-- **Auto-dispatch across all projects.** One command scans every project, prioritizes by task urgency, and runs up to 16 parallel agents. Leave it running overnight.
-- **Auto security reviews.** After every successful dev-test loop, an optional Security Reviewer agent audits the code using ClaudeStick tools and checks for zero-day vulnerabilities.
-- **Auto dependency install.** Detects `pyproject.toml` or `package.json` and installs dependencies before the first agent spawns. No more wasting turns on `pip install`.
-- **Per-role turn limits.** Developers get 50 turns, Testers get 20, Security Reviewers get 40. Configurable in `dispatch_config.json`. Agents use their budget where it matters.
-- **Checkpoint/Resume.** When an agent times out or hits its turn limit, ForgeTeam saves its progress. Next run of that task automatically picks up where it left off — no wasted work.
-- **Adaptive complexity.** Tag tasks as `simple`, `medium`, `complex`, or `epic` and ForgeTeam adjusts turn limits automatically (0.5x to 2x). No tag? It infers complexity from the task description.
-- **Model tiering.** Use Haiku for testers, Sonnet for developers, Opus for epic tasks. Per-role and per-complexity model overrides in one config file.
-- **Self-improving agents (ForgeSmith).** A nightly self-learning pipeline that analyzes agent performance, extracts lessons from failures, auto-tunes turn limits, and patches agent prompts with targeted advice. Includes DSPy-based prompt evolution (GEPA) and failure-pattern rule generation (SIMBA). Agents get smarter every day without manual intervention.
-- **Automatic prompt evolution (GEPA).** DSPy's GEPA optimizer reflects on failure traces and evolves role prompts automatically. Evolved prompts are A/B tested against baselines — underperformers are rolled back automatically. Max 20% change per cycle to prevent drift.
-- **Targeted rule generation (SIMBA).** Contrasts successful vs failed episodes to generate specific improvement rules using Claude. Rules are effectiveness-scored and pruned if they don't improve outcomes after 50+ injections.
-- **Context engineering.** Token-budget-aware prompt assembly with relevance-scored episode injection, lesson deduplication, and priority-based trimming. Keeps system prompts under 10K tokens without losing critical context.
-- **Reflexion system.** After every task, agents reflect on what worked, what didn't, and what they'd do differently. These reflections are stored as episodes with Q-values and injected into future similar tasks — giving agents "experience" to draw on.
-- **Rubric-based scoring.** Every agent run is scored against role-specific rubrics (code quality, test coverage, turn efficiency). ForgeSmith uses these scores to evolve rubric weights over time.
-- **Zero dependencies.** Pure Python stdlib. No pip, no npm, no Docker. Just Python + Claude Code + a SQLite database.
-- **Security by default.** Prompt injection defenses, safe git staging (`git add -u`), and strict MCP config isolation. Agents use the orchestrator's MCP config only.
-- **Local LLM support.** Run read-only agents (planner, evaluator, code-reviewer, researcher) on local models via Ollama. Zero API cost for review roles. Developer and tester still use Claude for quality.
-- **Inter-agent messaging.** Agents post structured messages to each other across dev-test cycles. Tester tells Developer exactly what failed. Developer reads those messages at the start of the next cycle.
-- **Per-tool action logging.** Every tool call is logged with input hashes, output sizes, and error classification. ForgeSmith uses this for fine-grained performance analysis.
+---
 
-## Coordinator Mode (Recommended)
+## See It in Action
 
-**The most powerful way to use ForgeTeam is through Claude Code as a natural language coordinator.** Instead of memorizing CLI commands, you talk to Claude in plain English. Claude creates tasks, dispatches agents, monitors results, and reports back.
+### Simple Feature
+
+```
+You: "Add a dark mode toggle to the settings page"
+
+Claude: I'll create a task for that. Let me check your project structure...
+
+[Reads your codebase, finds Settings.tsx]
+[Creates task in DB: "Add dark mode toggle to settings page"]
+[Dispatches developer agent]
+[Developer writes the code, creates tests]
+[Tester validates]
+
+Claude: Done. Dark mode toggle added to src/components/Settings.tsx.
+Uses your existing theme context. Toggle persists to localStorage.
+All 3 tests passing.
+```
+
+One sentence from you. Full implementation with tests.
+
+### Multi-Step Feature
 
 ```
 You: "Build me user authentication with Google OAuth"
 
 Claude: That's a multi-step feature. Let me plan it out:
+
   1. Set up OAuth provider configuration
   2. Create login/callback routes
   3. Add session management middleware
   4. Build the login UI component
   5. Write integration tests
 
-Creating 5 tasks... Dispatching orchestrator...
-[Tasks 1-3 running in parallel]
-[Task 4 waiting for dependencies]
-...
-All 5 tasks complete. Tests passing. Here's what was built: [summary]
+[Creates 5 tasks in DB with proper descriptions]
+[Tasks 1-3 run in parallel — no dependencies]
+[Task 4 waits for task 2 — needs the routes]
+[Task 5 waits for all — needs everything wired up]
+
+Claude: All 5 tasks complete.
+- OAuth config in src/config/auth.ts
+- Routes at /auth/google and /auth/callback
+- Session middleware using signed cookies
+- Login button component with Google branding
+- 8 integration tests, all passing
+
+Want me to run a security review on the auth flow?
 ```
 
-The setup wizard generates a `.claude/CLAUDE.md` file that teaches Claude how to be the coordinator for your installation. Just open Claude Code and start talking.
+Claude identified the dependencies automatically. Independent tasks ran in parallel.
 
-See **[docs/COORDINATOR.md](docs/COORDINATOR.md)** for the full guide with examples.
+### Bug Fix
 
-## Local LLM Support
+```
+You: "Users are getting 500 errors on the checkout page"
 
-ForgeTeam supports running agents on local models via **Ollama**. Read-only roles (planner, evaluator, code-reviewer, security-reviewer, researcher) work well on local models. Developer and tester should stay on Claude for code quality.
+Claude: Let me investigate. I'll start with a debugger task...
 
-```bash
-# Install Ollama and pull a model
-ollama pull qwen3.5:27b
+[Dispatches debugger agent]
+[Debugger analyzes error logs, traces the stack, finds root cause]
 
-# Configure in dispatch_config.json
-# provider_planner: "ollama"
-# provider_code_reviewer: "ollama"
+Claude: Found it. Null pointer in calculateTotal() when the cart has a
+discounted item with no original price. Creating a fix task...
 
-# Or force all agents to use Ollama
-python forge_orchestrator.py --task 42 --dev-test --provider ollama -y
+[Dispatches developer agent]
+[Developer fixes the bug, adds edge case tests]
+[Tester validates the fix]
+
+Claude: Fixed. The issue was in src/utils/cart.ts line 47.
+Added null check for originalPrice. 4 new test cases covering
+discount edge cases. All passing.
 ```
 
-See **[docs/LOCAL_LLM.md](docs/LOCAL_LLM.md)** for complete setup and configuration.
+Debug, fix, and test — all from one sentence.
+
+### Security Review
+
+```
+You: "Review the auth module for security issues"
+
+Claude: I'll dispatch a security reviewer.
+
+[Dispatches security-reviewer with Trail of Bits tooling]
+
+Claude: Security review complete. 2 findings:
+
+  MEDIUM: Session tokens not rotated after privilege escalation
+  LOW: CSRF token missing on the logout endpoint
+
+Want me to create fix tasks for these?
+```
+
+### Project Management
+
+```
+You: "What's the status of our Loom project?"
+
+Claude: Here's where Loom stands:
+  - 12 tasks done, 3 in progress, 2 blocked
+  - Last session: implemented world generation system
+  - Open question: how to handle offline save conflicts
+  - Next steps: integrate quest engine with dialogue system
+```
+
+```
+You: "What tasks are outstanding across all projects?"
+
+Claude: [queries database, groups by project and priority]
+
+  TorqueDesk (3 high priority):
+    - Implement invoice re-open workflow
+    - Add tech time tracking with punch in/out
+    ...
+```
+
+You never look up a task ID. You never write SQL. You just ask.
+
+---
+
+## How It Works
+
+```
+You describe what you want
+        |
+        v
+Claude breaks it into tasks
+        |
+        v
+Claude dispatches specialized agents
+        |
+        v
+Agents do the work (dev → test → security review)
+        |
+        v
+Claude reports results and handles failures
+```
+
+### The Agent Roster
+
+Claude picks the right agent automatically, but you can request specific ones:
+
+| Role | What It Does |
+|------|-------------|
+| **Developer** | Writes code. Your bread and butter. |
+| **Tester** | Writes and runs tests. Validates everything. |
+| **Debugger** | Investigates bugs, traces issues, finds root causes. |
+| **Security Reviewer** | Deep audit with Trail of Bits tooling (Semgrep, CodeQL). |
+| **Code Reviewer** | Quality, patterns, best practices. |
+| **Planner** | Breaks complex features into task lists. |
+| **Frontend Designer** | UI/UX focused development. |
+| **Evaluator** | Assesses implementations against requirements. |
+| **Integration Tester** | Tests how components work together. |
+
+"Run a security review on the payment module" — Claude dispatches the right agent with the right tools. You don't need to know which CLI flags to pass.
+
+---
 
 ## Quick Start
+
+**1. Run the guided installer:**
+```bash
+python itzamna_setup.py
+```
+
+**2. The installer handles everything:** prerequisites, database, config, MCP integration. Just answer the prompts.
+
+**3. Open Claude Code in your ForgeTeam directory and start talking:**
+```bash
+cd ~/ForgeTeam
+claude
+```
+
+> "Show me all active projects"
+>
+> "Add a new project called MyApp with the code at ~/myapp"
+>
+> "Create a task for MyApp: set up the database schema"
+>
+> "Work on that task"
+
+That's it. Claude knows the database, the orchestrator, and the config. Just tell it what you want.
+
+---
+
+## Tips for Best Results
+
+**Be specific about what you want.**
+- Good: "Add Google OAuth login with session cookies"
+- Bad: "Add auth"
+
+**Mention the tech stack when it matters.**
+- Good: "Add rate limiting using Express middleware and Redis"
+- Bad: "Add rate limiting"
+
+**Let Claude plan big features.** For anything with 2+ moving parts, describe the end goal. Claude will break it down better than manual task creation because it can read your codebase and understand what already exists.
+
+**Ask for parallel work.** Mention independent tasks together. Claude will dispatch them simultaneously.
+
+**Give context when you have it.**
+- "The 500 error started after yesterday's deploy"
+- "It only happens when the user has a discount code"
+- "Match the existing Card pattern in the design system"
+
+---
+
+## When to Skip the Agents
+
+Not everything needs a full agent pipeline. Use Claude Code directly for:
+
+- **Quick fixes** — Typos, one-liner changes. Just ask Claude to edit the file.
+- **Research** — "How does the auth flow work?" Claude reads the code and answers.
+- **Config changes** — Editing a config file doesn't need a dev-test loop.
+- **Database queries** — Claude queries the DB directly via MCP.
+
+Rule of thumb: if the change is under 5 lines and doesn't need testing, just do it directly.
+
+---
+
+## Features
+
+- **Conversational interface** — Talk to Claude in plain English. No commands, no task IDs.
+- **Autonomous dev-test loops** — Developer and tester iterate until the code works
+- **Persistent project memory** — Agents learn from past successes and failures on *your* projects
+- **Self-improving prompts** — ForgeSmith evolves agent behavior based on real outcomes
+- **Security pipeline** — Trail of Bits tooling with auto-dispatch after dev-test
+- **Inter-agent messaging** — Agents share findings, blockers, and context across cycles
+- **Loop detection** — Catches stuck agents and terminates gracefully
+- **Multi-model support** — Claude Code, Ollama (local models), configurable per role
+- **Database migrations** — Schema evolves safely with automatic backups, zero data loss
+- **Checkpoint/resume** — Interrupted tasks pick up where they left off
+- **Adaptive complexity** — Turn budgets scale with task difficulty
+- **Zero pip dependencies** — Pure Python stdlib. Requires Python 3.10+, Claude Code CLI, git, and uvx
+
+---
+
+## Installation
 
 ### Prerequisites
 
 | Tool | Install |
 |------|---------|
-| Python 3.10+ | [python.org](https://www.python.org/downloads/) |
+| Python 3.10+ | [python.org](https://python.org) |
 | Claude Code CLI | `npm install -g @anthropic-ai/claude-code` |
-| git | [git-scm.com](https://git-scm.com/) |
-| uvx / uv | [docs.astral.sh/uv](https://docs.astral.sh/uv/) |
+| git | [git-scm.com](https://git-scm.com) |
+| uvx / uv | [docs.astral.sh/uv](https://docs.astral.sh/uv) |
 
 You also need a **Claude Pro/Max subscription** or **Anthropic API key**.
 
-### Install (5 minutes)
-
+### Guided Setup (Recommended)
 ```bash
-git clone https://github.com/[owner]/Itzamna.git
-cd Itzamna
+git clone <repo-url> forgeteam
+cd forgeteam
 python itzamna_setup.py
 ```
 
-The setup wizard:
-1. Checks prerequisites
-2. Asks where to install ForgeTeam
-3. Creates a fresh SQLite database (28 tables, 7 views)
-4. Copies the orchestrator, ForgeSmith, agent prompts, and security skills
-5. Generates all config files (`forge_config.json`, `mcp_config.json`, `.mcp.json`, `CLAUDE.md`)
-6. Sets up ForgeSmith nightly cron job for self-improvement
-7. Verifies everything works (10 automated checks)
+The installer walks you through: prerequisites check, database creation, config generation, MCP integration, and optional components (Sentinel monitoring, ForgeBot Discord bot).
 
-### Your first run
+### Manual Setup
 
-```bash
-cd ~/ForgeTeam   # wherever you installed
+See [ORCHESTRATOR.md](docs/ORCHESTRATOR.md) for manual installation and CLI usage.
 
-# Register a project
-python forge_orchestrator.py --add-project "MyApp" --project-dir "/path/to/myapp"
+---
 
-# Create a task (use Claude with MCP, or direct SQL)
-# Then run Dev+Test
-python forge_orchestrator.py --task 1 --dev-test -y
-```
+## Coordinator vs Manual Mode
 
-That's it. The Developer agent writes code, the Tester validates, and they loop until tests pass.
+| | Coordinator Mode | Manual Mode |
+|---|---|---|
+| **Task creation** | Claude does it | You write SQL or CLI commands |
+| **Dispatching** | Claude does it | You run orchestrator commands |
+| **Monitoring** | Claude does it | You check logs |
+| **Error recovery** | Claude does it | You diagnose and retry |
+| **Parallelism** | Claude figures out dependencies | You manage dependencies |
+| **Role selection** | Claude picks the right agent | You specify the role |
 
-## Modes of Operation
+Manual mode works and is fully documented in [ORCHESTRATOR.md](docs/ORCHESTRATOR.md). But for most workflows, Coordinator Mode is faster, easier, and produces better results.
 
-### 1. Single Agent
-Run one agent on one task.
-```bash
-python forge_orchestrator.py --task 42 -y
-python forge_orchestrator.py --task 42 --role tester -y
-python forge_orchestrator.py --task 42 --role security-reviewer -y
-```
+---
 
-### 2. Dev+Test Loop
-Developer writes, Tester validates, loop until green.
-```bash
-python forge_orchestrator.py --task 42 --dev-test -y
-```
+## Related Documentation
 
-### 3. Parallel Tasks
-Run multiple independent tasks concurrently within a project.
-```bash
-# Comma-separated IDs
-python forge_orchestrator.py --tasks 109,110,111 --dev-test -y
-
-# Range syntax
-python forge_orchestrator.py --tasks 109-114 --dev-test -y
-
-# Preview first
-python forge_orchestrator.py --tasks 109-114 --dev-test --dry-run
-```
-
-### 4. Manager Mode (Goal-Driven)
-Give a goal. Planner creates tasks. Dev+Test executes. Evaluator reviews. Repeat.
-```bash
-python forge_orchestrator.py --goal "Add user authentication" --goal-project 1 -y
-```
-
-### 5. Parallel Goals
-Run multiple goals across different projects concurrently.
-```bash
-python forge_orchestrator.py --parallel-goals goals.json -y
-```
-
-### 6. Auto-Run
-Scan all projects, prioritize, and dispatch agents automatically.
-```bash
-# Preview what would run
-python forge_orchestrator.py --auto-run --dry-run
-
-# Run it
-python forge_orchestrator.py --auto-run -y
-```
-
-## Architecture
-
-```
-                    +-----------------+
-                    |  forge_config   |  Your projects, paths, settings
-                    +--------+--------+
-                             |
-                    +--------v--------+
-                    |  Orchestrator   |  forge_orchestrator.py
-                    |  (pure Python)  |  Context engineering, token budgets,
-                    |                 |  A/B prompt selection, episode injection
-                    +--------+--------+
-                             |
-              +--------------+--------------+
-              |              |              |
-     +--------v---+  +------v------+  +----v-------+
-     |  Developer  |  |   Tester    |  |  Planner   |  ...agents
-     |  (claude)   |  |  (claude)   |  |  (claude)  |
-     +--------+----+  +------+------+  +----+-------+
-              |              |              |
-              +--------------+--------------+
-                             |
-                    +--------v--------+
-                    |   TheForge DB   |  SQLite via MCP
-                    |  (28 tables)    |  Tasks, decisions, episodes, lessons...
-                    +--------+--------+
-                             |
-        +--------------------+--------------------+
-        |                    |                    |
-  +-----v------+    +-------v-------+    +-------v-------+
-  |  ForgeSmith |    |     SIMBA     |    |     GEPA      |
-  | forgesmith  |    | forgesmith_   |    | forgesmith_   |
-  |   .py       |    |  simba.py     |    |  gepa.py      |
-  | Lessons,    |    | Targeted rule |    | DSPy prompt   |
-  | rubrics,    |    | generation    |    | evolution +   |
-  | turn tuning |    | via Claude    |    | A/B testing   |
-  +-------------+    +---------------+    +---------------+
-```
-
-**Pipeline order:** COLLECT → ANALYZE → LESSONS → SIMBA → RUBRICS → APPLY → GEPA → LOG
-
-**How agents communicate:** Every agent gets MCP access to the same SQLite database. The Developer logs decisions and records session notes. The Tester reads the codebase and reports failures. The Planner creates tasks. The Evaluator reviews results. All through the shared database — no custom protocols, no message queues.
-
-**Orchestrator-managed status:** Task status (done/blocked) is updated by the orchestrator based on dev-test outcomes, not by the agents themselves. This eliminates the most common failure mode — agents running out of turns before updating the database.
-
-## Agent Roles
-
-| Role | Job | Can Edit Files | Can Run Builds | DB Access |
-|------|-----|:-:|:-:|:-:|
-| **Developer** | Write code, fix bugs, implement features | Yes | Yes | Read + Write |
-| **Tester** | Run unit tests, report failures | No | Test runners only | Read only |
-| **Planner** | Break goals into 2-8 ordered tasks | No | Explore only | Read + Write (tasks) |
-| **Evaluator** | Verify goal completion, create follow-ups | No | Explore only | Read + Write (tasks) |
-| **Security Reviewer** | 4-phase code security audit | No | Scanning tools only | Read only |
-| **Frontend Designer** | Create polished, production-grade UI/UX | Yes | Dev servers | Read + Write |
-| **Integration Tester** | Deploy, start, and test full applications end-to-end | No | Full stack | Read only |
-| **Debugger** | Trace errors to root cause, fix them, verify | Yes | Yes | Read + Write |
-| **Code Reviewer** | Review code quality, consistency, correctness | No | Linters only | Read only |
-| **Custom** | Drop a `.md` in `prompts/` — auto-discovered | Configurable | Configurable | Configurable |
-
-## Security Model
-
-ForgeTeam takes a defense-in-depth approach:
-
-- **`--permission-mode bypassPermissions`** — agents run in a controlled sandbox with orchestrator-managed tool access
-- **Prompt injection defense** — database content is sanitized before injection into prompts (XML tag escaping, injection pattern filtering)
-- **Safe git staging** — `git add -u` instead of `git add .` to prevent accidental secret exposure
-- **Strict MCP config** — agents use the orchestrator's MCP config only, ignoring project-level overrides
-- **Orchestrator-managed status** — agents can't mark their own tasks done; the orchestrator decides based on test outcomes
-
-## Cost Tracking
-
-Every agent run is logged to the `agent_runs` table with model, duration, turns, and estimated cost:
-
-```sql
--- Cost per project
-SELECT * FROM v_cost_by_project;
-
--- Cost per role
-SELECT * FROM v_cost_by_role;
-```
-
-## Database
-
-ForgeTeam's persistent memory lives in a SQLite database with 28 tables:
-
-| Group | Tables |
-|-------|--------|
-| **Core** | projects, tasks, decisions, open_questions, session_notes |
-| **Content** | social_media_posts, posting_schedule, content_tickler, writing_style |
-| **Research** | research, competitors, product_opportunities |
-| **Assets** | code_artifacts, documents, project_assets, components, build_info |
-| **System** | cross_references, reminders, agent_runs, voice_messages, api_keys |
-| **ForgeSmith** | lessons_learned, agent_episodes, forgesmith_runs, forgesmith_changes, rubric_scores, rubric_evolution_history |
-
-Plus 7 views for dashboards, stale task alerts, content alerts, and cost reports.
-
-Agents access the database through [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) via `mcp-server-sqlite`. No custom database code — just standard SQL through a standard protocol.
-
-## Configuration
-
-| File | Purpose | Generated by setup? |
-|------|---------|:---:|
-| `forge_config.json` | Project paths, DB path, GitHub owner | Yes |
-| `mcp_config.json` | MCP server config for agents | Yes |
-| `.mcp.json` | MCP config for your own Claude sessions | Yes |
-| `dispatch_config.json` | Auto-run settings (concurrency, model, per-role turns) | Included |
-| `forgesmith_config.json` | ForgeSmith self-improvement settings | Included |
-| `CLAUDE.md` | Full context for Claude Code | Yes |
-
-### dispatch_config.json
-
-```json
-{
-    "max_concurrent": 4,
-    "model": "sonnet",
-    "max_turns": 25,
-    "max_turns_developer": 50,
-    "max_turns_tester": 20,
-    "max_turns_security_reviewer": 40,
-    "max_tasks_per_project": 5,
-    "security_review": true,
-    "model_tester": "haiku",
-    "model_epic": "opus"
-}
-```
-
-**Per-role turn limits** let you give developers more room for complex tasks while keeping testers lean. The `security_review` flag automatically runs a security audit after every successful dev-test loop.
-
-**Model tiering** lets you assign different models per role or per task complexity. Keys follow the pattern `model_{role}` or `model_{complexity}`:
-
-| Key | Effect |
-|-----|--------|
-| `model_developer` | Model for Developer agents |
-| `model_tester` | Model for Tester agents (default: `haiku`) |
-| `model_security_reviewer` | Model for Security Review agents |
-| `model_simple` | Model for simple-complexity tasks |
-| `model_complex` | Model for complex-complexity tasks |
-| `model_epic` | Model for epic-complexity tasks (default: `opus`) |
-
-Priority: complexity model > role model > CLI `--model` > global `model`.
-
-## Checkpoint/Resume
-
-When an agent times out or hits its turn limit, ForgeTeam saves its output to `.forge-checkpoints/`. The next time you run that task, the orchestrator automatically loads the checkpoint and tells the agent to continue where the previous attempt left off.
-
-```
-  [Checkpoint] Loaded checkpoint from attempt #1 (4200 chars). Agent will continue from there.
-```
-
-This eliminates the biggest source of wasted work — complex tasks that need more than one agent session to complete. Checkpoints are automatically cleared when a task succeeds.
-
-## Adaptive Complexity
-
-Tasks can have a `complexity` level that adjusts turn limits and model selection:
-
-| Complexity | Turn Multiplier | Example |
-|:----------:|:---------------:|---------|
-| `simple` | 0.5x | Fix a typo, update a config |
-| `medium` | 1.0x | Add a new endpoint, write tests |
-| `complex` | 1.5x | Refactor auth system, add WebSocket support |
-| `epic` | 2.0x | Build an ML pipeline, full-stack feature |
-
-Set complexity explicitly in the database:
-```sql
-UPDATE tasks SET complexity = 'epic' WHERE id = 42;
-```
-
-Or leave it unset — ForgeTeam infers complexity from the task description length. A developer with a base of 50 turns working on an `epic` task gets 100 turns. A tester with a base of 20 turns on a `simple` task gets 10.
-
-## ForgeSmith — Self-Improving Agents
-
-ForgeSmith is ForgeTeam's self-learning pipeline. It runs nightly (via cron) and makes your agents better automatically through a multi-stage optimization process.
-
-### Pipeline Overview
-
-```
-COLLECT → ANALYZE → LESSONS → SIMBA → RUBRICS → APPLY → GEPA → LOG
-```
-
-| Stage | What It Does |
-|-------|-------------|
-| **Collect** | Gather agent runs, blocked tasks, and previous change results |
-| **Analyze** | Detect max-turns hits, turn underuse, model downgrades, repeat errors |
-| **Lessons** | Extract recurring error patterns into reusable lessons |
-| **SIMBA** | Generate targeted improvement rules from failure analysis |
-| **Rubrics** | Score agent runs and evolve rubric weights |
-| **Apply** | Execute config/prompt changes (turn limits, model swaps, patches) |
-| **GEPA** | Evolve role prompts using DSPy with A/B testing |
-| **Log** | Record the run and all changes for auditing |
-
-### Lesson Extraction
-
-Analyzes failed agent runs, identifies recurring errors (3+ occurrences), and distills actionable lessons. Lessons are stored in `lessons_learned` with an `error_signature` for deduplication. At prompt-build time, the orchestrator injects the most relevant lessons (max 5, deduplicated at 60% word overlap).
-
-### Agent Episodes (Reflexion + MemRL)
-
-After every task, agents write a reflection. ForgeSmith stores these as episodes with Q-values (reinforcement learning signal). When a similar task comes up:
-
-1. The orchestrator scores episodes by **keyword overlap** with the new task description
-2. **Recency weighting** favors recent episodes
-3. **Q-value filtering** excludes episodes below 0.3
-4. Top 2-3 episodes are injected as "past experience"
-5. After the task completes, Q-values are updated: +0.1 on success, -0.05 on failure
-
-### SIMBA — Targeted Rule Generation
-
-**S**ystematic **I**dentification of **M**istakes and **B**ehavioral **A**djustments. SIMBA goes beyond generic lesson extraction by using Claude to analyze high-variance tasks — roles that have both successes AND failures on similar work.
-
-**How it works:**
-1. Finds roles with mixed outcomes (high variance = most useful for learning)
-2. Identifies the "hardest cases" (Q-value < 0.3, early-terminated)
-3. Builds a contrast prompt: "Here's what worked vs what didn't"
-4. Claude generates up to 3 specific rules per role (max 200 chars each)
-5. Rules are validated (length, uniqueness, error type) and stored with unique signatures
-
-**Rule lifecycle:**
-- Rules are injected into agent prompts automatically
-- After 10+ injections, effectiveness is scored (before vs after success rate)
-- After 50+ injections with no improvement, rules are pruned (deactivated)
-- Max 3 active SIMBA rules per role at any time
-
-```bash
-# Run SIMBA standalone
-python forgesmith.py --simba
-
-# SIMBA for a specific role
-python forgesmith.py --simba developer
-
-# Prune stale rules
-python forgesmith_simba.py --prune
-```
-
-### GEPA — Automatic Prompt Evolution
-
-**G**eneralized **E**fficient **P**rompt **A**daptation. Uses DSPy's GEPA optimizer to evolve entire role prompts based on historical episode data. This is the most powerful optimization — it rewrites the prompt instructions themselves.
-
-**How it works:**
-1. Collects 60 days of episodes for a role (minimum 20 required)
-2. Converts episodes to DSPy Examples (input: task description, output: success/failure)
-3. GEPA reflects on failure traces and proposes instruction improvements
-4. Evolved prompts are validated against safety rails
-5. Version-stamped files are created (e.g., `developer_v2.md`)
-6. A/B testing: 50/50 split between evolved and baseline prompts
-7. After 10+ tasks on each version, success rates are compared
-8. Underperforming versions are automatically rolled back
-
-**Safety rails:**
-- Max 20% text change per evolution cycle
-- Protected sections never removed (Output Format, RESULT block, Git Commit Requirements)
-- Minimum prompt length ≥ 70% of original
-- Max 1 evolution per role per week
-- Automatic rollback if evolved version underperforms baseline
-
-**Default model:** `ollama_chat/devstral-small-2:24b` (free, local). Set `ANTHROPIC_API_KEY` to use Claude instead.
-
-```bash
-# Run GEPA standalone
-python forgesmith.py --gepa
-
-# GEPA for a specific role
-python forgesmith.py --gepa developer
-
-# Check A/B test status
-python forgesmith_gepa.py --status
-
-# Dry run
-python forgesmith_gepa.py --dry-run
-```
-
-### Context Engineering
-
-The orchestrator's `build_system_prompt()` function assembles agent prompts with token-budget awareness. This ensures agents get the most relevant context without exceeding limits.
-
-**Token budget targets:**
-| Metric | Value |
-|--------|-------|
-| Target prompt size | 8,000 tokens |
-| Hard limit | 10,000 tokens |
-| Episode reduction threshold | 6,000 tokens (switch from 3→2 episodes) |
-| Token estimation | ~4 chars per token |
-
-**Assembly order (never trimmed → first trimmed):**
-1. Common rules + role prompt (never trimmed)
-2. A/B prompt version selection (GEPA evolved if available)
-3. Lesson injection (max 5, deduplicated)
-4. Episode injection (relevance-scored, 2-3 based on budget)
-5. Task-type guidance (bug_fix, feature, refactor, test)
-6. Task description and instructions (never trimmed)
-7. Extra context (checkpoint history, test failures)
-
-**Priority trim order** (when over budget):
-1. Old episodes (`## Past Experience`, max 500 tokens)
-2. Generic lessons (`## Lessons from Previous Runs`, max 300 tokens)
-3. Extra context (`## Prior Work Summary`, max 400 tokens)
-
-### Rubric Scoring
-
-Every agent run is scored against role-specific criteria:
-
-| Role | Criteria |
-|------|----------|
-| **Developer** | result_success (5.5), files_changed (3), tests_written (3), turns_efficiency (2.2), output_compliance (2) |
-| **Tester** | tests_pass (5), edge_cases (3), coverage_meaningful (2), false_positives (-2) |
-| **Security Reviewer** | vulns_found (3), severity_accuracy (2), false_alarms (-1) |
-
-Weights evolve automatically: ForgeSmith correlates each criterion with actual task success, then adjusts weights by up to ±10% per cycle. Evolution requires 10+ scored runs and looks back 30 days.
-
-### Turn Limit Tuning
-
-- If >30% of runs hit max turns → increase limit by 10 (ceiling: 75)
-- If <40% of budget used → decrease limit by 5 (floor: 10)
-- Changes logged in `forgesmith_changes` with effectiveness tracking
-
-### Running ForgeSmith
-
-```bash
-# Full pipeline (nightly cron)
-python forgesmith.py --auto
-
-# Dry run — see what would change
-python forgesmith.py --dry-run
-
-# JSON analysis report only
-python forgesmith.py --report
-
-# Run specific phases
-python forgesmith.py --simba              # SIMBA only
-python forgesmith.py --gepa               # GEPA only
-python forgesmith.py --propose            # OPRO proposals only
-
-# Inspect current state
-python forgesmith.py --lessons            # Show active lessons
-python forgesmith.py --rubrics            # Show rubric scores
-
-# Rollback a specific run
-python forgesmith.py --rollback RUN_ID
-```
-
-### ForgeSmith Configuration
-
-`forgesmith_config.json` controls all ForgeSmith behavior:
-
-```json
-{
-    "lookback_days": 7,
-    "min_sample_size": 5,
-    "max_changes_per_run": 5,
-    "max_prompt_patches_per_run": 2,
-    "blocked_task_max_hours": 24,
-    "blocked_task_max_attempts": 3,
-    "thresholds": {
-        "max_turns_hit_rate": 0.3,
-        "turn_underuse_rate": 0.4,
-        "simple_task_success_rate": 0.8,
-        "repeat_error_count": 3
-    },
-    "limits": {
-        "max_turns_ceiling": 75,
-        "max_turns_floor": 10,
-        "turn_increase_step": 10,
-        "turn_decrease_step": 5
-    },
-    "rubric_definitions": { "..." },
-    "rubric_evolution": {
-        "max_weight_change_pct": 10,
-        "min_sample_size": 10,
-        "evolution_lookback_days": 30
-    },
-    "protected_files": ["_common.md", "forge_orchestrator.py", "forgesmith.py"],
-    "rollback_threshold": -0.3,
-    "suppression_cooldown_days": 14
-}
-```
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `lookback_days` | 7 | Days of history to analyze |
-| `min_sample_size` | 5 | Minimum runs before making changes |
-| `max_changes_per_run` | 5 | Cap on changes per ForgeSmith run |
-| `max_prompt_patches_per_run` | 2 | Cap on prompt file modifications |
-| `rollback_threshold` | -0.3 | Score below which changes are auto-reverted |
-| `suppression_cooldown_days` | 14 | Days before retrying a suppressed change |
-| `rubric_definitions` | (per-role) | Scoring criteria and weights |
-| `protected_files` | (list) | Files ForgeSmith will never modify |
-
-## Documentation
-
-| Doc | Description |
+| Doc | What's in it |
 |-----|-------------|
-| [Quick Start](docs/QUICKSTART.md) | 5-minute getting started guide |
-| [User Guide](docs/USER_GUIDE.md) | Full reference — all CLI modes, config, troubleshooting |
-| [Custom Agents](docs/CUSTOM_AGENTS.md) | Create new agent roles with a markdown file |
-| [Concurrency](docs/CONCURRENCY.md) | Benchmark results (16 parallel agents) and tuning |
+| [Capabilities](docs/CAPABILITIES.md) | Architecture deep dive, ForgeSmith, security pipeline, benchmarks |
+| [Orchestrator](docs/ORCHESTRATOR.md) | CLI commands, flags, manual setup, advanced usage |
+| [Architecture](docs/ARCHITECTURE.md) | System design, data flow, key decisions |
+| [Quick Start](docs/QUICKSTART.md) | Step-by-step getting started guide |
+| [User Guide](docs/USER_GUIDE.md) | Comprehensive usage documentation |
+| [Custom Agents](docs/CUSTOM_AGENTS.md) | How to create your own agent roles |
+| [API Reference](docs/API.md) | Module-level API documentation |
 
-## Concurrency
-
-ForgeTeam was benchmarked at 16 concurrent multi-turn agents with zero throttling on Claude Max. The local machine is the bottleneck, not the API:
-
-| Machine | Recommended `max_concurrent` |
-|---------|:---:|
-| 8 GB RAM | 2-3 |
-| 16 GB RAM | 4-6 |
-| 32 GB RAM | 8-12 |
-| 64 GB+ RAM | 12-16 |
-
-See [CONCURRENCY.md](docs/CONCURRENCY.md) for full benchmark data.
+---
 
 ## Contributing
 
@@ -608,5 +332,7 @@ Contributions welcome. ForgeTeam is built for the vibe coding community — if y
 ---
 
 <p align="center">
-  Built by <a href="https://github.com/[owner]">Forgeborn</a> — vibe coded with Claude
+  <strong>Built by Forgeborn</strong><br>
+  Vibe coded with Claude<br>
+  <em>&copy; 2026 Forgeborn</em>
 </p>
