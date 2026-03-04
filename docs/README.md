@@ -5,39 +5,13 @@
 ## Table of Contents
 
   - [What is this?](#what-is-this)
+  - [How It Actually Works](#how-it-actually-works)
   - [Screenshots](#screenshots)
-    - [Dashboard Overview](#dashboard-overview)
-    - [Task Dispatch](#task-dispatch)
-    - [Performance Analytics](#performance-analytics)
-    - [Forgesmith Self-Improvement](#forgesmith-self-improvement)
   - [Quick Start](#quick-start)
-  - [How to Use](#how-to-use)
-    - [Planning Work](#planning-work)
-    - [Running Tasks](#running-tasks)
-- [Single task](#single-task)
-- [Auto-dispatch across all projects](#auto-dispatch-across-all-projects)
-- [Parallel tasks](#parallel-tasks)
-    - [Checking Progress](#checking-progress)
-    - [Performance Reports](#performance-reports)
-    - [Self-Improvement with Forgesmith](#self-improvement-with-forgesmith)
-- [See what Forgesmith would change (dry run)](#see-what-forgesmith-would-change-dry-run)
-- [Apply improvements](#apply-improvements)
-    - [Security Reviews](#security-reviews)
   - [Features](#features)
+  - [CLI Reference](#cli-reference)
   - [Installation](#installation)
-    - [Prerequisites](#prerequisites)
-    - [Guided Setup (Recommended)](#guided-setup-recommended)
-    - [Manual Setup](#manual-setup)
-- [1. Clone the repository](#1-clone-the-repository)
-- [2. Initialize the database](#2-initialize-the-database)
-- [3. Run migrations to latest version](#3-run-migrations-to-latest-version)
-- [4. Copy the example config and edit it](#4-copy-the-example-config-and-edit-it)
-- [Edit config.json with your paths and preferences](#edit-configjson-with-your-paths-and-preferences)
-- [5. Verify everything works](#5-verify-everything-works)
   - [Configuration](#configuration)
-    - [Key Configuration Options](#key-configuration-options)
-    - [Dispatch Configuration](#dispatch-configuration)
-    - [Ollama (Local Models)](#ollama-local-models)
   - [Tech Stack](#tech-stack)
   - [License](#license)
   - [Related Documentation](#related-documentation)
@@ -58,9 +32,58 @@
 
 ## What is this?
 
-ForgeTeam is an AI-powered development team that works on your codebase autonomously. It assigns tasks to specialized AI agents — a planner breaks down goals, a developer writes code, a tester validates it, and a reviewer checks quality — all coordinated through a central orchestrator. Over time, ForgeTeam learns from its successes and failures, automatically tuning its own prompts and strategies to get better at working on *your* projects.
+ForgeTeam is an AI-powered development team that works on your codebase. You talk to Claude in plain English. Claude manages everything else — querying the database, creating tasks, dispatching agents, tracking progress, and reporting results. You make decisions; Claude handles execution.
 
-Think of it as a self-improving AI dev team that remembers what worked, avoids past mistakes, and handles the full development cycle from task planning to code review.
+No CLI commands to memorize. No task IDs to look up. No SQL to write. Just conversation.
+
+## How It Actually Works
+
+ForgeTeam is designed to be used through **natural language conversation with Claude**. Claude has full access to the project database via MCP and knows how to use every tool in the system. Here's what that looks like in practice:
+
+### You talk. Claude works.
+
+> **You:** "What's the status of our Loom project?"
+>
+> **Claude:** *queries the database, pulls recent session notes, checks open tasks and blockers, and gives you a full status report*
+
+> **You:** "What tasks are currently outstanding?"
+>
+> **Claude:** *runs the query, groups by project and priority, highlights blocked items and stale tasks*
+
+> **You:** "Work on the next high-priority Loom task"
+>
+> **Claude:** *finds the highest-priority pending task, dispatches a developer agent, monitors the dev-test loop, and reports results when done*
+
+> **You:** "Add a task for Loom: implement dark mode toggle"
+>
+> **Claude:** *creates the task in the database with the right project ID, sets priority, confirms it's ready*
+
+> **You:** "Run a security review on what we just shipped"
+>
+> **Claude:** *dispatches the security-reviewer agent with Trail of Bits tooling, reports findings with severity ratings*
+
+> **You:** "How much have we spent on agent runs this month?"
+>
+> **Claude:** *queries cost tracking views, breaks down by project and role, shows trends*
+
+### What's happening under the hood
+
+When you ask Claude to "work on the next Loom task," here's what actually happens — all automatically:
+
+1. Claude queries the database for pending tasks on the Loom project
+2. Scores them by priority and dependencies
+3. Loads the project context (last session notes, open questions, lessons learned)
+4. Dispatches a developer agent with the full context
+5. The developer writes code; a tester agent validates it
+6. They iterate until tests pass (or the budget runs out)
+7. If security review is enabled, a security agent audits the changes
+8. Claude records the episode, updates the task status, and reports back to you
+
+You see: "Task done, tests passing, here's what changed." Claude handled 8 steps behind the scenes.
+
+### The CLI still exists — you just don't need it
+
+Everything Claude does conversationally can also be done from the command line. The CLI is there for automation (cron jobs, CI/CD pipelines, scripted workflows) and for advanced users who want direct control. But for day-to-day development work, you never touch it.
 
 ## Screenshots
 
@@ -89,34 +112,46 @@ python itzamna_setup.py
 
 **2. The installer walks you through everything:** prerequisites check, database creation, config generation, and optional components. Just answer the prompts.
 
-**3. Run your first task:**
+**3. Open Claude Code in your ForgeTeam directory:**
 ```bash
-python forge_orchestrator.py --task <task_id>
+cd ~/ForgeTeam
+claude
 ```
 
-**4. Or let ForgeTeam pick what to work on automatically:**
-```bash
-python forge_orchestrator.py --dispatch
-```
+**4. Start talking:**
+> "Show me all active projects"
+>
+> "Add a new project called MyApp with the code at /home/user/myapp"
+>
+> "Create a task for MyApp: set up the database schema"
+>
+> "Work on that task"
 
-**5. Check results on the dashboard:**
-```bash
-python forge_dashboard.py
-```
+That's it. Claude knows the database, the orchestrator, the config — everything. Just tell it what you want.
 
-That's it. The installer handles database setup, config files, and MCP integration for you.
+## Features
 
-## How to Use
+- **Conversational interface** — Talk to Claude in plain English. No commands to memorize, no task IDs to track
+- **Autonomous dev-test loops** — Developer and tester agents iterate until the code works, not just compiles
+- **Persistent project memory** — Every run is recorded; agents learn from past successes and failures on *your* projects
+- **Smart task dispatch** — Automatically prioritizes work across multiple projects
+- **Self-improving prompts** — ForgeSmith evolves agent prompts based on real performance data
+- **Security pipeline** — Trail of Bits tooling (Semgrep, CodeQL) with auto-dispatch after dev-test
+- **Inter-agent messaging** — Agents share findings, blockers, and context with each other
+- **Loop detection** — Catches stuck agents and terminates gracefully
+- **Checkpoint and resume** — Long tasks can be paused and resumed
+- **Multi-model support** — Claude Code, Ollama (local models), configurable per role
+- **Database migrations** — Schema evolves safely with automatic backups and zero data loss
+- **Zero pip dependencies** — Pure Python stdlib, SQLite database. Requires Python 3.10+, Claude Code CLI, git, and uvx as runtime prerequisites
 
-### Planning Work
-Give ForgeTeam a high-level goal and it breaks it down into concrete tasks:
-```bash
-python forge_orchestrator.py --plan --goal "Add user authentication to the API"
-```
-The planner agent creates prioritized, dependency-aware tasks in your database.
+## CLI Reference
+
+The CLI is the engine under the hood. You rarely need it directly, but it's there for automation and scripting.
+
+<details>
+<summary>Click to expand CLI commands</summary>
 
 ### Running Tasks
-Run a specific task by ID, or let the dispatcher choose the highest-priority work:
 ```bash
 # Single task
 python forge_orchestrator.py --task 42
@@ -128,59 +163,36 @@ python forge_orchestrator.py --dispatch
 python forge_orchestrator.py --tasks 42,43,44
 ```
 
-Each task goes through a **dev→test loop**: the developer agent writes code, the tester agent validates it, and they iterate until tests pass or the budget is exhausted.
-
-### Checking Progress
-The dashboard shows you everything at a glance:
+### Planning
 ```bash
-python forge_dashboard.py
-```
-You'll see task completion rates, blocked items, open questions from agents, and session activity over time.
-
-### Performance Reports
-Dive deeper into how your agents are performing:
-```bash
-python analyze_performance.py --days 30
+python forge_orchestrator.py --plan --goal "Add user authentication to the API"
 ```
 
-### Self-Improvement with Forgesmith
-ForgeTeam gets smarter over time. Forgesmith analyzes completed runs and:
-- Extracts lessons from failures
-- Tunes agent prompts automatically
-- Adjusts configuration (max turns, model selection)
-- Prunes strategies that aren't working
-
+### Security Review
 ```bash
-# See what Forgesmith would change (dry run)
+python forge_orchestrator.py --task 42 --security
+```
+
+### ForgeSmith Self-Improvement
+```bash
+# Dry run — see what would change
 python forgesmith.py --dry-run
 
 # Apply improvements
 python forgesmith.py
 ```
 
-### Security Reviews
-Run a dedicated security review on any task:
+### Dashboard
 ```bash
-python forge_orchestrator.py --task 42 --security
+python forge_dashboard.py
 ```
 
-## Features
+### Database Migration
+```bash
+python db_migrate.py /path/to/theforge.db
+```
 
-- **Autonomous dev→test loops** — Developer and tester agents iterate until the code actually works, not just compiles
-- **Persistent project memory** — Every run is recorded as an episode; agents learn from past successes and failures
-- **Smart task dispatch** — Automatically prioritizes work across multiple projects based on urgency, complexity, and dependencies
-- **Self-improving prompts** — Forgesmith (SIMBA + GEPA) evolves agent prompts based on real performance data
-- **Lesson learning** — Automatically extracts and injects relevant lessons from past failures into future runs
-- **Loop detection** — Catches agents that get stuck repeating the same actions and terminates gracefully
-- **Early termination** — Detects stuck phrases and repeated tool calls, saving time and API costs
-- **Inter-agent messaging** — Agents communicate findings, blockers, and context to each other across cycles
-- **Checkpoint & resume** — Long-running tasks can be paused and resumed without losing progress
-- **Rubric-based scoring** — Every run is scored on multiple dimensions, enabling data-driven improvement
-- **Multi-model support** — Works with Claude Code, Ollama (local models), and configurable model selection per role
-- **Security scanning** — Dedicated security review agent with SARIF parsing for static analysis results
-- **Arena mode** — Adversarial testing where agents try to break and fix each other's work
-- **Database migrations** — Schema evolves safely with automatic backups and versioned migrations
-- **Zero pip dependencies** — Pure Python stdlib, SQLite database. Requires Python 3.10+, Claude Code CLI, git, and uvx as runtime prerequisites
+</details>
 
 ## Installation
 
@@ -237,7 +249,7 @@ ForgeTeam uses a JSON configuration file (`config.json`) and an optional dispatc
 |---|---|
 | `db_path` | Path to your SQLite database |
 | `project_dir` | Root directory for your projects |
-| `max_turns` | Maximum dev→test iterations per task |
+| `max_turns` | Maximum dev-test iterations per task |
 | `model` | Default AI model for agents |
 | `checkpoint_dir` | Where to store task checkpoints |
 | `forgesmith.lookback_days` | How far back Forgesmith looks for patterns |
@@ -263,13 +275,12 @@ To use local models via Ollama, set the provider in your dispatch config:
 
 ## Tech Stack
 
-- **Python** — Core orchestrator, all tooling, no framework dependencies
+- **Python** — Core orchestrator, all tooling, stdlib only
 - **SQLite** — All persistent state: tasks, episodes, lessons, metrics, messages
 - **Claude Code CLI** — Primary AI backend for agent execution
 - **Ollama** — Optional local model support
-- **DSPy** — Used by Forgesmith GEPA for prompt evolution
+- **DSPy** — Used by ForgeSmith GEPA for prompt evolution (optional)
 - **SARIF** — Standard format for security analysis findings
-- **QLoRA/PEFT** — Optional fine-tuning pipeline for training custom models on ForgeTeam data
 
 ## License
 
@@ -278,6 +289,7 @@ See [LICENSE](LICENSE) for details.
 
 ## Related Documentation
 
+- [Capabilities](CAPABILITIES.md)
 - [Architecture](ARCHITECTURE.md)
 - [Api](API.md)
 - [Deployment](DEPLOYMENT.md)

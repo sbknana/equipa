@@ -1,11 +1,14 @@
 # Itzamna: Multi-Agent AI Orchestration Platform
 
-Itzamna is a self-improving, multi-agent orchestration platform that coordinates specialized AI agents through the full software development lifecycle -- planning, coding, testing, security review, and debugging. It learns from every run, evolves its own prompts, and requires zero pip dependencies. Built in pure Python stdlib on SQLite, it runs anywhere Python and Claude Code are installed.
+Itzamna is a self-improving, multi-agent orchestration platform that you control through natural conversation. Tell Claude what you want done -- it handles task management, agent dispatch, progress tracking, and reporting. You make decisions; the system handles execution.
+
+Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Python and Claude Code are installed.
 
 ---
 
 ## Table of Contents
 
+- [Conversational Development](#conversational-development)
 - [Multi-Agent Orchestration](#multi-agent-orchestration)
 - [ForgeSmith Self-Improvement Engine](#forgesmith-self-improvement-engine)
 - [Security Pipeline](#security-pipeline)
@@ -17,9 +20,36 @@ Itzamna is a self-improving, multi-agent orchestration platform that coordinates
 
 ---
 
+## Conversational Development
+
+The primary interface to Itzamna is **natural language conversation with Claude**. Claude has MCP access to the full project database and knows how to use every tool in the system. You never need to memorize CLI commands, look up task IDs, or write SQL.
+
+### What it looks like in practice
+
+| You say | What happens behind the scenes |
+|---------|-------------------------------|
+| "What's the status of our Loom project?" | Claude queries project dashboard, recent sessions, open tasks, and blockers |
+| "What tasks are outstanding?" | Claude pulls all pending/in-progress tasks, groups by project and priority |
+| "Work on the next high-priority Loom task" | Claude finds the task, loads project context, dispatches developer + tester agents, reports results |
+| "Add a task for Loom: implement dark mode" | Claude creates the task with correct project ID and priority |
+| "Run a security review on what we just shipped" | Claude dispatches security-reviewer with Trail of Bits tooling |
+| "How much have we spent this month?" | Claude queries cost tracking views, breaks down by project and role |
+| "What did we decide about the auth approach?" | Claude searches the decisions table and returns the rationale |
+| "Update TheForge with what we did today" | Claude logs session notes, updates task statuses, records decisions |
+
+### You make decisions. Claude manages everything else.
+
+The entire project management layer -- task creation, prioritization, context loading, agent dispatch, progress tracking, session logging, and reporting -- is handled conversationally. You stay focused on **what** to build. The system handles **how** to coordinate the work.
+
+### The CLI still exists
+
+Everything above can also be done from the command line for automation (cron jobs, CI/CD, scripted workflows). But for day-to-day work, you never touch it. See [CLI Reference](#cli-reference) in the README.
+
+---
+
 ## Multi-Agent Orchestration
 
-Itzamna dispatches work to **9 specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
+Under the hood, Itzamna dispatches work to **9 specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
 
 | Role | Purpose | Default Model | Turn Budget |
 |------|---------|---------------|-------------|
@@ -39,11 +69,9 @@ The core execution loop pairs a Developer agent with a Tester agent. The develop
 
 ### Goal-Driven Autonomous Mode
 
-Pass a high-level goal and Itzamna decomposes it into concrete tasks, prioritizes them by dependency and complexity, and dispatches agents automatically.
+Tell Claude your goal in plain English and it decomposes the work into concrete tasks, prioritizes them by dependency and complexity, and dispatches agents automatically.
 
-```bash
-python forge_orchestrator.py --goal "Add JWT authentication to the API" --goal-project 1 -y
-```
+> "Add JWT authentication to the API" --> Planner creates 5 tasks --> Developer + Tester work through each one --> Security reviewer audits the result
 
 ### Auto-Run Scanning
 
