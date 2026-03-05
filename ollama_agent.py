@@ -207,7 +207,7 @@ SAFE_COMMAND_PREFIXES = [
     "ls", "cat", "head", "tail", "find", "grep", "rg", "wc", "file",
     "git status", "git log", "git diff", "git show", "git branch",
     "echo", "pwd", "which", "type", "env", "printenv",
-    "python -c", "python3 -c", "node -e",
+    # python -c/node -e removed: arbitrary code execution risk
     "npm list", "pip list", "pip show", "go version",
     "test ", "[", "stat", "du ", "df ",
 ]
@@ -230,7 +230,9 @@ def safe_path(project_dir, relative_path):
 
 def is_safe_read_command(command):
     """Check if a shell command is safe (read-only)."""
-    stripped = command.strip().lstrip("sudo ")
+    stripped = command.strip()
+    if stripped.startswith("sudo "):
+        stripped = stripped[5:].lstrip()
     return any(stripped.startswith(prefix) for prefix in SAFE_COMMAND_PREFIXES)
 
 
@@ -545,7 +547,10 @@ def run_ollama_agent(system_prompt, project_dir, role="developer",
     result_text = "\n".join(all_text)
 
     # Check for RESULT: block in output (Project Pombal convention)
-    success = "RESULT:" in result_text or turn_count < max_turns
+    # Success = agent produced a structured result AND didn't exhaust turns
+    has_result_block = "RESULT:" in result_text
+    within_budget = turn_count < max_turns
+    success = has_result_block and within_budget
 
     print(f"  [Ollama] Completed: {turn_count} turns, {duration:.1f}s, "
           f"{'success' if success else 'max turns hit'}")

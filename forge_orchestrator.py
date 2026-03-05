@@ -62,7 +62,7 @@ except ImportError:
 
 # --- Constants ---
 
-THEFORGE_DB = Path(__file__).parent / "theforge.db"
+THEFORGE_DB = Path(os.environ.get("THEFORGE_DB", Path(__file__).parent / "theforge.db"))
 MCP_CONFIG = Path(__file__).parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SKILLS_BASE_DIR = Path(__file__).parent / "skills"
@@ -115,7 +115,7 @@ COMPLEXITY_MULTIPLIERS = {
 }
 
 # Dynamic turn budget settings
-DYNAMIC_BUDGET_START_RATIO = 0.8   # Start agents at 60% of their max_turns budget
+DYNAMIC_BUDGET_START_RATIO = 0.8   # Start agents at 80% of their max_turns budget
 DYNAMIC_BUDGET_MIN_TURNS = 15      # Minimum starting budget regardless of ratio
 DYNAMIC_BUDGET_EXTEND_TURNS = 10   # Extra turns granted when agent reports FILES_CHANGED
 DYNAMIC_BUDGET_BLOCKED_RATIO = 0.5 # Reduce remaining budget by 50% on RESULT: blocked
@@ -382,8 +382,7 @@ def get_db_connection(write=False):
         write: If True, open in read-write mode. Default is read-only.
     """
     if not THEFORGE_DB.exists():
-        print(f"ERROR: TheForge database not found at {THEFORGE_DB}")
-        sys.exit(1)
+        raise FileNotFoundError(f"TheForge database not found at {THEFORGE_DB}")
 
     if write:
         conn = sqlite3.connect(str(THEFORGE_DB))
@@ -918,7 +917,7 @@ def record_agent_episode(task, result, outcome, role="developer", output=None):
 
         task_id = task.get("id") if isinstance(task, dict) else task
         project_id = task.get("project_id") if isinstance(task, dict) else None
-        task_type = task.get("role") or role if isinstance(task, dict) else role
+        task_type = task.get("task_type") or task.get("role") or role if isinstance(task, dict) else role
         result_text = result.get("result_text", "") if isinstance(result, dict) else ""
         num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
 
@@ -5831,7 +5830,13 @@ def main():
             except SystemExit as e:
                 if e.code == 0:
                     # Normal exit = no more tasks
-                    print(f"\nAll done! Completed {task_count} tasks for project {args.project}.")
+                    # Extract project name from sys.argv since we don't have parsed args here
+                    project_name = ""
+                    for i, arg in enumerate(sys.argv):
+                        if arg == "--project" and i + 1 < len(sys.argv):
+                            project_name = sys.argv[i + 1]
+                            break
+                    print(f"\nAll done! Completed {task_count} tasks for project {project_name}.")
                     break
                 else:
                     # Error exit
