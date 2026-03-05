@@ -36,7 +36,7 @@ from forgesmith_gepa import run_gepa
 SCRIPT_DIR = Path(__file__).resolve().parent
 THEFORGE_DB = os.environ.get(
     "THEFORGE_DB",
-    "theforge.db",
+    str(Path(__file__).resolve().parent / "theforge.db"),
 )
 DISPATCH_CONFIG = SCRIPT_DIR / "dispatch_config.json"
 PROMPTS_DIR = SCRIPT_DIR / "prompts"

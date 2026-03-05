@@ -62,7 +62,7 @@ except ImportError:
 
 # --- Constants ---
 
-THEFORGE_DB = Path("theforge.db")
+THEFORGE_DB = Path(__file__).parent / "theforge.db"
 MCP_CONFIG = Path(__file__).parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SKILLS_DIR = Path(__file__).parent / "skills" / "security"

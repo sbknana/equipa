@@ -18,7 +18,7 @@ from pathlib import Path
 
 THEFORGE_DB = os.environ.get(
     "THEFORGE_DB",
-    "theforge.db",
+    str(Path(__file__).resolve().parent / "theforge.db"),
 )
 
 # All known log locations
