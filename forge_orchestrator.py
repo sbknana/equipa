@@ -59,6 +59,25 @@ except ImportError:
     def get_relevant_lessons(role=None, error_type=None, limit=5):
         return []
 
+# Import lesson sanitization (PM-24, PM-28, PM-33)
+try:
+    from lesson_sanitizer import (
+        sanitize_lesson_content,
+        sanitize_error_signature,
+        validate_lesson_structure,
+        wrap_lessons_in_task_input,
+    )
+except ImportError:
+    # Fallback stubs — no sanitization if module unavailable
+    def sanitize_lesson_content(text):
+        return text or ""
+    def sanitize_error_signature(sig):
+        return sig or ""
+    def validate_lesson_structure(text):
+        return bool(text)
+    def wrap_lessons_in_task_input(text):
+        return text or ""
+
 
 # --- Constants ---
 
@@ -878,14 +897,219 @@ def parse_approach_summary(result_text):
     return None
 
 
-def parse_error_patterns(result):
-    """Extract error patterns from agent result for episode record."""
-    errors = result.get("errors", []) if isinstance(result, dict) else []
-    if not errors:
+def classify_agent_failure(outcome, result, result_text=""):
+    """Classify an agent failure into structured categories from the error-recovery skill.
+
+    Uses outcome, error messages, result text (including RESULT/BLOCKERS/REFLECTION),
+    and turn count to assign one or more failure classes.
+
+    Failure classes (from error-recovery skill + orchestrator patterns):
+        analysis_paralysis  — Agent spent all turns reading/exploring without writing code
+        build_failure       — Build, compile, or syntax errors prevented completion
+        test_failure        — Tests failed after agent changes
+        import_error        — Missing imports, modules, or dependency issues
+        timeout             — Agent process timed out (wall-clock limit)
+        wrong_approach      — Agent took a fundamentally wrong approach, looped, or was blocked
+        environment_error   — Permission denied, file not found, connection refused
+        max_turns           — Agent ran out of turns (may overlap with other classes)
+
+    Returns a JSON-serializable dict with:
+        failure_class: str — primary failure classification
+        secondary_classes: list[str] — additional applicable classes (may be empty)
+        confidence: str — "high", "medium", or "low"
+        signals: list[str] — evidence strings that led to classification
+        raw_errors: list[str] — deduplicated error messages (max 5, truncated)
+    """
+    if not isinstance(result, dict):
+        result = {}
+
+    errors = result.get("errors", [])
+    unique_errors = list(dict.fromkeys(errors))[:5]
+    truncated_errors = [e[:200] for e in unique_errors]
+
+    num_turns = result.get("num_turns", 0)
+    early_terminated = result.get("early_terminated", False)
+    early_term_reason = result.get("early_term_reason", "")
+
+    lower_errors = " ".join(e.lower() for e in unique_errors)
+    lower_result = result_text.lower() if result_text else ""
+    lower_reason = early_term_reason.lower()
+
+    signals = []
+    classes_detected = []
+
+    # --- Analysis Paralysis ---
+    # Key signal: "consecutive turns without file changes" in early_term_reason
+    if "consecutive turns without file changes" in lower_reason:
+        classes_detected.append("analysis_paralysis")
+        signals.append(f"early_term: {early_term_reason[:120]}")
+    elif "40 consecutive" in lower_errors or "without file changes" in lower_errors:
+        classes_detected.append("analysis_paralysis")
+        signals.append("error mentions consecutive turns without file changes")
+    # Also detect from result text: agent stuck exploring
+    if (not classes_detected
+            and num_turns >= 30
+            and "files_changed: none" in lower_result):
+        classes_detected.append("analysis_paralysis")
+        signals.append(f"high turn count ({num_turns}) with no files changed")
+
+    # --- Timeout ---
+    if "timed out" in lower_reason or "timed out" in lower_errors:
+        classes_detected.append("timeout")
+        signals.append("process timed out")
+    elif outcome == "tester_timeout":
+        classes_detected.append("timeout")
+        signals.append("tester timeout outcome")
+
+    # --- Max Turns ---
+    if ("max_turns" in lower_errors or "max turns" in lower_errors
+            or outcome == "developer_max_turns"
+            or "error_max_turns" in lower_errors):
+        classes_detected.append("max_turns")
+        signals.append("agent hit max turns limit")
+
+    # --- Build Failure ---
+    build_keywords = ["syntaxerror", "compileerror", "build failed", "build error",
+                      "cannot find module", "type error", "typeerror"]
+    for kw in build_keywords:
+        if kw in lower_errors or kw in lower_result:
+            if "build_failure" not in classes_detected:
+                classes_detected.append("build_failure")
+                signals.append(f"build/compile signal: {kw}")
+            break
+
+    # --- Import / Dependency Error ---
+    import_keywords = ["modulenotfounderror", "importerror", "no module named",
+                       "module not found", "cannot resolve", "dependency",
+                       "missing package", "version conflict"]
+    for kw in import_keywords:
+        if kw in lower_errors or kw in lower_result:
+            if "import_error" not in classes_detected:
+                classes_detected.append("import_error")
+                signals.append(f"import/dependency signal: {kw}")
+            break
+
+    # --- Test Failure ---
+    test_keywords = ["assertionerror", "test failed", "tests failed",
+                     "assertion failed", "expected", "pytest"]
+    if outcome in ("cycles_exhausted", "tester_failed"):
+        classes_detected.append("test_failure")
+        signals.append(f"outcome indicates test failure: {outcome}")
+    else:
+        for kw in test_keywords:
+            if kw in lower_errors:
+                if "test_failure" not in classes_detected:
+                    classes_detected.append("test_failure")
+                    signals.append(f"test failure signal: {kw}")
+                break
+
+    # --- Environment Error ---
+    env_keywords = ["permission denied", "connection refused", "eacces",
+                    "econnrefused", "no such file or directory"]
+    for kw in env_keywords:
+        if kw in lower_errors:
+            if "environment_error" not in classes_detected:
+                classes_detected.append("environment_error")
+                signals.append(f"environment signal: {kw}")
+            break
+
+    # --- Wrong Approach / Loop ---
+    if "loop detected" in lower_reason or "repeated the same operation" in lower_reason:
+        classes_detected.append("wrong_approach")
+        signals.append(f"loop detection: {early_term_reason[:120]}")
+    elif "stuck" in lower_reason and "repeated" in lower_reason:
+        classes_detected.append("wrong_approach")
+        signals.append(f"stuck agent: {early_term_reason[:120]}")
+    elif outcome == "no_progress":
+        classes_detected.append("wrong_approach")
+        signals.append("no progress across multiple cycles")
+    elif "result: blocked" in lower_result and "result: failed" in lower_result:
+        if "wrong_approach" not in classes_detected:
+            classes_detected.append("wrong_approach")
+            signals.append("agent reported both blocked and failed")
+
+    # --- Determine primary class ---
+    # Priority order: analysis_paralysis > timeout > build > import > test > env > wrong_approach > max_turns
+    priority_order = [
+        "analysis_paralysis", "timeout", "build_failure", "import_error",
+        "test_failure", "environment_error", "wrong_approach", "max_turns",
+    ]
+
+    if not classes_detected:
+        # Fallback: if we have errors but couldn't classify, mark as unknown
+        if unique_errors:
+            primary = "unknown"
+            signals.append("unclassified error(s) present")
+            confidence = "low"
+        else:
+            # No errors and no classification — shouldn't be called for success
+            return None
+    else:
+        # Pick primary by priority
+        primary = "unknown"
+        for cls in priority_order:
+            if cls in classes_detected:
+                primary = cls
+                break
+
+        secondary = [c for c in classes_detected if c != primary]
+
+        # Confidence based on signal strength
+        if len(signals) >= 2:
+            confidence = "high"
+        elif early_terminated or outcome in ("cycles_exhausted", "no_progress"):
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+    if not classes_detected:
+        secondary = []
+    else:
+        secondary = [c for c in classes_detected if c != primary]
+        if not classes_detected:
+            confidence = "low"
+
+    return {
+        "failure_class": primary,
+        "secondary_classes": secondary,
+        "confidence": confidence,
+        "signals": signals[:5],
+        "raw_errors": truncated_errors,
+    }
+
+
+def parse_error_patterns(result, outcome=None, result_text=None):
+    """Extract and classify error patterns from agent result for episode record.
+
+    Produces structured JSON with failure classification when the agent failed.
+    Falls back to raw error string for backward compatibility if classification
+    yields nothing.
+
+    Args:
+        result: Agent result dict with 'errors', 'early_terminated', etc.
+        outcome: Task outcome string (e.g., 'early_terminated', 'no_progress').
+        result_text: Full agent output text for deeper signal extraction.
+
+    Returns:
+        JSON string with failure classification, or None if no errors.
+    """
+    if not isinstance(result, dict):
         return None
-    # Deduplicate and truncate
-    unique = list(dict.fromkeys(errors))
-    return "; ".join(e[:200] for e in unique[:5])
+
+    errors = result.get("errors", [])
+    rt = result_text or result.get("result_text", "")
+
+    # Attempt structured classification
+    classification = classify_agent_failure(outcome, result, rt)
+    if classification:
+        return json.dumps(classification)
+
+    # Fallback: raw error join (backward compat for edge cases)
+    if errors:
+        unique = list(dict.fromkeys(errors))
+        return "; ".join(e[:200] for e in unique[:5])
+
+    return None
 
 
 def compute_initial_q_value(outcome):
@@ -923,7 +1147,7 @@ def record_agent_episode(task, result, outcome, role="developer", output=None):
 
         reflection = parse_reflection(result_text)
         approach = parse_approach_summary(result_text)
-        error_patterns = parse_error_patterns(result)
+        error_patterns = parse_error_patterns(result, outcome=outcome, result_text=result_text)
         q_value = compute_initial_q_value(outcome)
 
         conn = get_db_connection(write=True)
@@ -938,12 +1162,25 @@ def record_agent_episode(task, result, outcome, role="developer", output=None):
         conn.commit()
         conn.close()
 
+        # Log failure classification if present
+        failure_class_info = ""
+        if error_patterns:
+            try:
+                parsed = json.loads(error_patterns)
+                fc = parsed.get("failure_class", "unknown")
+                conf = parsed.get("confidence", "?")
+                secondary = parsed.get("secondary_classes", [])
+                sec_str = f" +{','.join(secondary)}" if secondary else ""
+                failure_class_info = f" [class={fc}{sec_str}, conf={conf}]"
+            except (json.JSONDecodeError, TypeError):
+                pass  # legacy plain-text format
+
         if reflection:
             # Truncate for log display
             preview = reflection[:120] + "..." if len(reflection) > 120 else reflection
-            log(f"  [Reflexion] Recorded episode with reflection: {preview}", output)
+            log(f"  [Reflexion] Recorded episode{failure_class_info} with reflection: {preview}", output)
         else:
-            log(f"  [Reflexion] Recorded episode (no reflection in output)", output)
+            log(f"  [Reflexion] Recorded episode{failure_class_info} (no reflection in output)", output)
 
     except Exception as e:
         log(f"  [Reflexion] WARNING: Failed to record episode: {e}", output)
@@ -1460,24 +1697,35 @@ def _trim_prompt_section(prompt, section_heading, max_chars=None):
 def format_lessons_for_injection(lessons):
     """Format lessons_learned for injection into agent prompts.
 
+    Sanitizes each lesson's content before formatting to prevent prompt
+    injection (PM-24, PM-28). Wraps the entire output in <task-input> tags
+    so agents treat lesson content as data, not instructions.
+
     Args:
         lessons: List of lesson dicts from get_relevant_lessons
 
     Returns:
-        Formatted string with lessons under "## Lessons from Previous Runs" heading
+        Formatted string with lessons wrapped in <task-input> tags.
     """
     if not lessons:
         return ""
 
     lines = ["## Lessons from Previous Runs", ""]
     for lesson in lessons:
-        # Format as bullet point with lesson text
-        lines.append(f"- {lesson['lesson']}")
-        # Add context if available (error signature, times seen)
+        # Sanitize lesson text before injecting into prompt
+        safe_lesson = sanitize_lesson_content(lesson['lesson'])
+        if not safe_lesson:
+            continue
+        lines.append(f"- {safe_lesson}")
+        # Sanitize error signature context too
         if lesson.get('error_signature'):
-            lines.append(f"  (Error: {lesson['error_signature']}, seen {lesson['times_seen']}x)")
+            safe_sig = sanitize_error_signature(lesson['error_signature'])
+            lines.append(f"  (Error: {safe_sig}, seen {lesson['times_seen']}x)")
 
-    return "\n".join(lines)
+    formatted = "\n".join(lines)
+
+    # Wrap in task-input tags so agents treat this as data (PM-24)
+    return wrap_lessons_in_task_input(formatted)
 
 
 def update_lesson_injection_count(lesson_ids):
@@ -3646,13 +3894,21 @@ def _create_security_lessons(findings, project_id=None):
     Lessons are created with role='developer' and source='security-reviewer' so the existing
     get_relevant_lessons(role='developer') pipeline picks them up automatically.
     Deduplicates by error_signature to avoid flooding the lessons table.
+
+    Sanitizes finding descriptions before storage (PM-33) since they originate
+    from agent output which could contain prompt-injection payloads.
     """
     conn = get_db_connection(write=True)
     created = 0
 
     for severity, description in findings:
+        # Sanitize the agent-produced description before storing (PM-33)
+        safe_description = sanitize_lesson_content(description)
+        if not safe_description:
+            continue
+
         # Build a signature for dedup — normalize to lowercase, strip punctuation
-        sig = re.sub(r'[^\w\s]', '', description.lower())[:200]
+        sig = re.sub(r'[^\w\s]', '', safe_description.lower())[:200]
 
         # Check if a similar lesson already exists
         existing = conn.execute(
@@ -3672,9 +3928,13 @@ def _create_security_lessons(findings, project_id=None):
         else:
             # Create a developer-facing lesson from the security finding
             lesson_text = (
-                f"Security review found {severity} issue: {description}. "
+                f"Security review found {severity} issue: {safe_description}. "
                 f"Check for this pattern in future code and prevent it proactively."
             )
+            # Validate structure before inserting
+            if not validate_lesson_structure(lesson_text):
+                continue
+            lesson_text = sanitize_lesson_content(lesson_text)
             conn.execute(
                 """INSERT INTO lessons_learned
                    (project_id, role, error_type, error_signature, lesson, source, times_seen)
