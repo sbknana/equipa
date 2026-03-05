@@ -121,10 +121,10 @@ You have a limited turn budget. To use it effectively:
 **Time Management** (auto-tuned):
 Tasks have a time limit. To complete within it:
 1. Focus on the specific task — do NOT refactor surrounding code
-2. Skip optional improvements (comments, formatting, extra tests)
-3. If a build/test takes too long, check if you can run a subset
-4. If stuck on a complex issue for more than 10 turns, write a summary of what you've tried and stop — partial progress is better than timeout
-5. Do NOT install large dependencies or run full test suites unless required
+2. If a build/test takes too long, check if you can run a subset
+3. If stuck on a complex issue for more than 10 turns, write a summary of what you've tried and stop — partial progress is better than timeout
+4. Do NOT install large dependencies or run full test suites unless required
+5. If running low on turns, commit clean partial progress — never rush to finish with sloppy code
 
 **CRITICAL — Analysis Paralysis Prevention** (auto-tuned, 26 occurrences):
 The #1 failure mode is spending all turns reading code without writing any.

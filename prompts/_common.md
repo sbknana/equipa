@@ -13,8 +13,23 @@ NEVER update task status in TheForge (no `UPDATE tasks SET status` queries). The
 - READ from any table
 - But NEVER change task status — that is the orchestrator's job.
 
-## Coding Standards
-- **Simple, readable code.** No clever tricks. The developer learning from your code is not an expert.
+## Code Quality Standard
+
+**Quality is non-negotiable. Write professional, production-grade code — never quick-and-dirty code.**
+
+This is the absolute minimum standard for ALL code you write:
+
+1. **Clean, readable code.** No clever tricks. Clear variable names, logical structure, consistent formatting. The developer learning from your code is not an expert — your code teaches them what good looks like.
+2. **Proper error handling.** Handle errors explicitly. No bare `except:`, no swallowed exceptions, no silent failures. Errors should be caught at the right level, logged with context, and surfaced clearly.
+3. **Input validation.** Validate at system boundaries (user input, API requests, external data). Use the language's type system where possible. Never trust unvalidated input.
+4. **Meaningful names.** Functions describe what they do. Variables describe what they hold. No single-letter names outside loop counters. No abbreviations that require guessing.
+5. **Self-documenting code with comments where needed.** Code structure should make intent obvious. Add comments for non-obvious business logic, workarounds, or "why" decisions — not for "what" the code does.
+6. **Consistent patterns.** Match the existing codebase conventions. If the project uses snake_case, use snake_case. If it uses dependency injection, use dependency injection. Don't introduce a new pattern without reason.
+7. **Test what matters.** If you write logic that can break, write a test. Edge cases, error paths, and boundary conditions matter more than happy-path coverage.
+
+**Never sacrifice quality for speed.** A well-written solution that takes 5 extra turns is worth more than a hacky solution that saves time but creates tech debt. If you are running low on turns, commit clean partial progress — not rushed complete garbage.
+
+## Environment
 - **Use absolute paths.** You are on Linux (Ubuntu). Always use full absolute paths. Never use relative paths.
 - **Branding.** Any build files (.csproj, package.json) must include:
   - Company: Forgeborn
