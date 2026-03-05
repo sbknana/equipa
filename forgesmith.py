@@ -30,6 +30,16 @@ from pathlib import Path
 
 from forgesmith_simba import run_simba
 from forgesmith_gepa import run_gepa
+from forgesmith_impact import (
+    run_impact_analysis,
+    log_impact_assessment,
+    ensure_impact_assessment_column,
+)
+from lesson_sanitizer import (
+    sanitize_lesson_content,
+    sanitize_error_signature,
+    validate_lesson_structure,
+)
 
 # --- Paths ---
 
@@ -270,13 +280,16 @@ def extract_lessons(runs, cfg):
         else:
             # Create new lesson based on error pattern
             lesson = _generate_lesson(sig, info)
-            if lesson:
+            if lesson and validate_lesson_structure(lesson):
+                # Sanitize the lesson content before storage
+                lesson = sanitize_lesson_content(lesson)
+                safe_sig = sanitize_error_signature(sig)
                 conn.execute(
                     """INSERT INTO lessons_learned
                        (role, error_type, error_signature, lesson, times_seen)
                        VALUES (?, ?, ?, ?, ?)""",
                     (list(info["roles"])[0] if len(info["roles"]) == 1 else None,
-                     info["error_type"], sig, lesson, info["count"]),
+                     info["error_type"], safe_sig, lesson, info["count"]),
                 )
                 lessons_added += 1
 
@@ -286,7 +299,12 @@ def extract_lessons(runs, cfg):
 
 
 def _generate_lesson(error_sig, info):
-    """Generate an actionable lesson from an error pattern."""
+    """Generate an actionable lesson from an error pattern.
+
+    The else branch embeds agent-controlled error_sig text into the lesson.
+    We sanitize it to prevent prompt-injection content from flowing into
+    future agent prompts via the lesson pipeline (PM-28).
+    """
     sig_lower = error_sig.lower()
 
     if "max turns" in sig_lower:
@@ -317,11 +335,15 @@ def _generate_lesson(error_sig, info):
             "match the style, and validate with a build before marking complete."
         )
     else:
-        return (
-            f"Recurring error ({info['count']}x): {error_sig[:200]}. "
-            f"Affected roles: {', '.join(info['roles'])}. "
+        # Sanitize the agent-controlled error_sig before embedding (PM-28)
+        safe_sig = sanitize_error_signature(error_sig)
+        safe_roles = ', '.join(info['roles'])
+        lesson = (
+            f"Recurring error ({info['count']}x): {safe_sig}. "
+            f"Affected roles: {safe_roles}. "
             f"Try a fundamentally different approach if previous attempts failed."
         )
+        return lesson
 
 
 def get_relevant_lessons(role=None, error_type=None, limit=5):
@@ -584,14 +606,43 @@ def backup_file(filepath, cfg):
 
 
 def apply_config_change(key, old_val, new_val, rationale, run_id, cfg, dry_run=False):
-    """Modify a value in dispatch_config.json."""
+    """Modify a value in dispatch_config.json.
+
+    Runs change-impact analysis before applying. HIGH-risk changes are
+    blocked from auto-apply and logged for manual review.
+    """
     target = str(DISPATCH_CONFIG)
+
+    # Run impact analysis before applying
+    assessment = run_impact_analysis(
+        "config_tune", target, str(old_val), str(new_val), rationale=rationale
+    )
 
     if dry_run:
         log(f"  [DRY-RUN] Would change {key}: {old_val} -> {new_val}")
         return {"change_type": "config_tune", "target_file": target,
                 "old_value": str(old_val), "new_value": str(new_val),
-                "rationale": rationale, "run_id": run_id}
+                "rationale": rationale, "run_id": run_id,
+                "impact_assessment": assessment}
+
+    if assessment["blocked"]:
+        log(f"  [BLOCKED] Config change {key}: {old_val} -> {new_val} "
+            f"— HIGH risk, requires manual approval")
+        # Record the blocked change in DB for review
+        conn = get_db(write=True)
+        conn.execute(
+            """INSERT INTO forgesmith_changes
+               (run_id, change_type, target_file, old_value, new_value,
+                rationale, evidence, impact_assessment)
+               VALUES (?, 'config_tune', ?, ?, ?, ?, ?, ?)""",
+            (run_id, target, str(old_val), str(new_val),
+             f"[BLOCKED] {rationale}",
+             f"ForgeSmith auto-tune at {datetime.now().isoformat()}",
+             json.dumps(assessment, default=str)),
+        )
+        conn.commit()
+        conn.close()
+        return None
 
     # Backup
     backup_file(DISPATCH_CONFIG, cfg)
@@ -606,21 +657,24 @@ def apply_config_change(key, old_val, new_val, rationale, run_id, cfg, dry_run=F
 
     log(f"  [APPLIED] {key}: {old_val} -> {new_val}")
 
-    # Record change in DB
+    # Record change in DB with impact assessment
     conn = get_db(write=True)
     conn.execute(
         """INSERT INTO forgesmith_changes
-           (run_id, change_type, target_file, old_value, new_value, rationale, evidence)
-           VALUES (?, 'config_tune', ?, ?, ?, ?, ?)""",
+           (run_id, change_type, target_file, old_value, new_value,
+            rationale, evidence, impact_assessment)
+           VALUES (?, 'config_tune', ?, ?, ?, ?, ?, ?)""",
         (run_id, target, str(old_val), str(new_val), rationale,
-         f"ForgeSmith auto-tune at {datetime.now().isoformat()}"),
+         f"ForgeSmith auto-tune at {datetime.now().isoformat()}",
+         json.dumps(assessment, default=str)),
     )
     conn.commit()
     conn.close()
 
     return {"change_type": "config_tune", "target_file": target,
             "old_value": str(old_val), "new_value": str(new_val),
-            "rationale": rationale, "run_id": run_id}
+            "rationale": rationale, "run_id": run_id,
+            "impact_assessment": assessment}
 
 
 def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
@@ -628,6 +682,8 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
 
     ONLY appends to the bottom. Never touches the main prompt body.
     Protected files (_common.md) are never modified.
+    Runs change-impact analysis before applying. HIGH-risk changes are
+    blocked from auto-apply and logged for manual review.
     """
     prompt_file = PROMPTS_DIR / f"{role}.md"
     if not prompt_file.exists():
@@ -640,11 +696,36 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
 
     target = str(prompt_file)
 
+    # Run impact analysis before applying
+    assessment = run_impact_analysis(
+        "prompt_patch", target, "", patch_text, rationale=rationale
+    )
+
     if dry_run:
         log(f"  [DRY-RUN] Would patch prompt for {role}: {patch_text[:80]}...")
         return {"change_type": "prompt_patch", "target_file": target,
                 "old_value": "", "new_value": patch_text,
-                "rationale": rationale, "run_id": run_id}
+                "rationale": rationale, "run_id": run_id,
+                "impact_assessment": assessment}
+
+    if assessment["blocked"]:
+        log(f"  [BLOCKED] Prompt patch for {role} — HIGH risk, "
+            f"requires manual approval")
+        # Record the blocked change in DB for review
+        conn = get_db(write=True)
+        conn.execute(
+            """INSERT INTO forgesmith_changes
+               (run_id, change_type, target_file, old_value, new_value,
+                rationale, evidence, impact_assessment)
+               VALUES (?, 'prompt_patch', ?, '', ?, ?, ?, ?)""",
+            (run_id, target, patch_text,
+             f"[BLOCKED] {rationale}",
+             f"ForgeSmith prompt patch at {datetime.now().isoformat()}",
+             json.dumps(assessment, default=str)),
+        )
+        conn.commit()
+        conn.close()
+        return None
 
     # Backup
     backup_file(prompt_file, cfg)
@@ -671,21 +752,24 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
 
     log(f"  [APPLIED] Prompt patch for {role}")
 
-    # Record change
+    # Record change with impact assessment
     conn = get_db(write=True)
     conn.execute(
         """INSERT INTO forgesmith_changes
-           (run_id, change_type, target_file, old_value, new_value, rationale, evidence)
-           VALUES (?, 'prompt_patch', ?, '', ?, ?, ?)""",
+           (run_id, change_type, target_file, old_value, new_value,
+            rationale, evidence, impact_assessment)
+           VALUES (?, 'prompt_patch', ?, '', ?, ?, ?, ?)""",
         (run_id, target, patch_text, rationale,
-         f"ForgeSmith prompt patch at {datetime.now().isoformat()}"),
+         f"ForgeSmith prompt patch at {datetime.now().isoformat()}",
+         json.dumps(assessment, default=str)),
     )
     conn.commit()
     conn.close()
 
     return {"change_type": "prompt_patch", "target_file": target,
             "old_value": "", "new_value": patch_text,
-            "rationale": rationale, "run_id": run_id}
+            "rationale": rationale, "run_id": run_id,
+            "impact_assessment": assessment}
 
 
 def apply_blocked_resolution(finding, run_id, cfg, dry_run=False):
@@ -1967,11 +2051,12 @@ def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     else:
         reflections_text = "No reflections available for this role."
 
-    # Format lessons
+    # Format lessons — sanitize before injection into meta-prompt (PM-28)
     lessons = get_relevant_lessons(role=role, limit=5)
     if lessons:
         lessons_text = "\n".join(
-            f"- (seen {l['times_seen']}x) {l['lesson']}" for l in lessons
+            f"- (seen {l['times_seen']}x) {sanitize_lesson_content(l['lesson'])}"
+            for l in lessons
         )
     else:
         lessons_text = "No lessons available."
