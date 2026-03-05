@@ -65,7 +65,16 @@ except ImportError:
 THEFORGE_DB = Path(__file__).parent / "theforge.db"
 MCP_CONFIG = Path(__file__).parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-SKILLS_DIR = Path(__file__).parent / "skills" / "security"
+SKILLS_BASE_DIR = Path(__file__).parent / "skills"
+
+# Per-role skill directories (loaded via --add-dir when role has skills)
+ROLE_SKILLS = {
+    "security-reviewer": SKILLS_BASE_DIR / "security",
+    "developer": SKILLS_BASE_DIR / "developer",
+    "tester": SKILLS_BASE_DIR / "tester",
+    "code-reviewer": SKILLS_BASE_DIR / "code-reviewer",
+    "debugger": SKILLS_BASE_DIR / "debugger",
+}
 
 # Role prompt files (prepended with _common.md automatically)
 ROLE_PROMPTS = {
@@ -2082,9 +2091,10 @@ def build_cli_command(system_prompt, project_dir, max_turns, model, role="develo
     if streaming:
         cmd.append("--verbose")
 
-    # Security reviewer gets access to the security skills directory
-    if role == "security-reviewer" and SKILLS_DIR.exists():
-        cmd.extend(["--add-dir", str(SKILLS_DIR)])
+    # Load role-specific skills directory if it exists
+    skills_dir = ROLE_SKILLS.get(role)
+    if skills_dir and skills_dir.exists():
+        cmd.extend(["--add-dir", str(skills_dir)])
 
     return cmd
 
@@ -2356,6 +2366,11 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                 message = msg.get("message", {})
                 content_blocks = message.get("content", [])
 
+                # Track whether THIS assistant message contains any file changes
+                # (an assistant message = one API turn, may contain multiple tool calls)
+                turn_has_file_change = False
+                turn_has_tool_calls = False
+
                 for block in content_blocks:
                     block_type = block.get("type", "")
 
@@ -2380,6 +2395,7 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                         tool_name = block.get("name", "")
                         tool_input = block.get("input", {})
                         turn_count += 1
+                        turn_has_tool_calls = True
 
                         # Record action entry for action logging
                         try:
@@ -2398,11 +2414,16 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
 
                         # Track file-modifying tools
                         if tool_name in ("Edit", "Write", "NotebookEdit"):
-                            turns_without_file_change = 0
+                            turn_has_file_change = True
                             has_any_file_change = True
-                        else:
-                            if not is_exempt:
-                                turns_without_file_change += 1
+
+                # After processing all blocks in this assistant message,
+                # update the file-change counter ONCE per API turn (not per tool call)
+                if turn_has_tool_calls and not is_exempt:
+                    if turn_has_file_change:
+                        turns_without_file_change = 0
+                    else:
+                        turns_without_file_change += 1
 
                         # Build tool signature for repetition detection
                         # Use tool name + first key param for fingerprinting

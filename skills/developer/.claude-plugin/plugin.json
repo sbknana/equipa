@@ -1,0 +1,8 @@
+{
+  "name": "pombal-developer-skills",
+  "version": "1.0.0",
+  "description": "Developer agent skills for Project Pombal — codebase navigation, implementation planning, and error recovery.",
+  "author": {
+    "name": "Forgeborn"
+  }
+}

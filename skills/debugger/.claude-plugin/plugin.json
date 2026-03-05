@@ -1,0 +1,8 @@
+{
+  "name": "pombal-debugger-skills",
+  "version": "1.0.0",
+  "description": "Debugger agent skills for Project Pombal — systematic hypothesis-driven debugging.",
+  "author": {
+    "name": "Forgeborn"
+  }
+}

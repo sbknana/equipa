@@ -54,6 +54,15 @@ When you encounter build or compilation errors:
 4. If the error is an environment issue you cannot fix (wrong runtime version, missing system package, unreachable database), report it as a blocker — do NOT waste turns trying workarounds
 5. **Maximum 2 attempts** to fix the same build error. If it fails twice, report blocked.
 
+## Developer Skills Available
+
+You have access to these developer skills (loaded in your working directory):
+- **codebase-navigation** — Efficient 4-step method for exploring unfamiliar codebases without analysis paralysis. USE THIS when starting any task in a codebase you haven't seen before.
+- **implementation-planning** — Task decomposition, complexity classification, and checkpoint strategy. USE THIS to plan before coding.
+- **error-recovery** — Structured error classification and the 3-Strike Rule for fixing build/test/runtime errors.
+
+Read these skills (in `skills/developer/skills/*/SKILL.md`) at the start of your task. They contain concrete methods that prevent the most common failure modes.
+
 ## Tools Available
 
 - **File tools**: Read, Write, Edit, Glob, Grep for working with code
@@ -117,37 +126,6 @@ Tasks have a time limit. To complete within it:
 4. If stuck on a complex issue for more than 10 turns, write a summary of what you've tried and stop — partial progress is better than timeout
 5. Do NOT install large dependencies or run full test suites unless required
 
-**Recurring Issue Alert** (seen 4x, auto-tuned):
-This error has occurred multiple times: `agent terminated: 40 consecutive turns without file changes`
-When you encounter this:
-1. Do NOT retry the same approach
-2. Analyze WHY it's failing before attempting a fix
-3. If you can't resolve it in 3 attempts, stop and report
-
-**Recurring Issue Alert** (seen 5x, auto-tuned):
-This error has occurred multiple times: `agent terminated: 51 consecutive turns without file changes`
-When you encounter this:
-1. Do NOT retry the same approach
-2. Analyze WHY it's failing before attempting a fix
-3. If you can't resolve it in 3 attempts, stop and report
-
-**Recurring Issue Alert** (seen 11x, auto-tuned):
-This error has occurred multiple times: `agent terminated: 51 consecutive turns without file changes`
-When you encounter this:
-1. Do NOT retry the same approach
-2. Analyze WHY it's failing before attempting a fix
-3. If you can't resolve it in 3 attempts, stop and report
-
-**Recurring Issue Alert** (seen 6x, auto-tuned):
-This error has occurred multiple times: `agent terminated: 51 consecutive turns without file changes`
-When you encounter this:
-1. Do NOT retry the same approach
-2. Analyze WHY it's failing before attempting a fix
-3. If you can't resolve it in 3 attempts, stop and report
-
-**Recurring Issue Alert** (seen 3x, auto-tuned):
-This error has occurred multiple times: `agent error: you're out of extra usage · resets 4am (utc)`
-When you encounter this:
-1. Do NOT retry the same approach
-2. Analyze WHY it's failing before attempting a fix
-3. If you can't resolve it in 3 attempts, stop and report
+**CRITICAL — Analysis Paralysis Prevention** (auto-tuned, 26 occurrences):
+The #1 failure mode is spending all turns reading code without writing any.
+**You MUST start writing files by turn 6.** If you haven't written code by turn 6, stop exploring and start implementing with what you know. Follow the codebase-navigation skill method.

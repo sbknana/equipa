@@ -1,0 +1,8 @@
+{
+  "name": "pombal-code-reviewer-skills",
+  "version": "1.0.0",
+  "description": "Code reviewer agent skills for Project Pombal — architecture review and change impact analysis.",
+  "author": {
+    "name": "Forgeborn"
+  }
+}

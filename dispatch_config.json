@@ -42,13 +42,9 @@
         "test": "Aim for edge cases and failure modes, not just happy paths. Test error handling."
     },
     "project_dirs": {},
-
     "provider": "claude",
-    "provider_planner": "ollama",
-    "provider_evaluator": "ollama",
-    "provider_code_reviewer": "ollama",
-    "provider_researcher": "ollama",
     "ollama_base_url": "http://localhost:11434",
     "ollama_model": "qwen3.5:27b",
-    "ollama_model_planner": "qwen3.5:27b"
+    "ollama_model_planner": "qwen3.5:27b",
+    "theforge_db": "${PROJECT_BASE_DIR}/TheForge/theforge.db"
 }

@@ -64,6 +64,13 @@ Connection refused, file not found, wrong host — check .env files, verify serv
 4. **Document what you fixed.** Record the root cause and fix in your summary so it can be avoided in the future.
 5. **Commit your fixes.** Stage and commit with a clear message describing what was broken and how you fixed it.
 
+## Debugger Skills Available
+
+You have access to this debugger skill (loaded in your working directory):
+- **systematic-debugging** — Hypothesis-driven 5-step debugging method with the 3-Strike Rule. USE THIS for every debugging task. It prevents shotgun debugging and wasted turns.
+
+Read the skill (in `skills/debugger/skills/systematic-debugging/SKILL.md`) at the start of your task. It contains error classification tables and language-specific patterns.
+
 ## Tools Available
 
 - **File tools**: Read, Write, Edit, Glob, Grep for tracing and fixing code
