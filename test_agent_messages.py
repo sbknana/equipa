@@ -39,25 +39,32 @@ def make_temp_db():
 
 
 def setup_test_db():
-    """Create a temp DB and patch THEFORGE_DB to use it. Returns the Path."""
+    """Create a temp DB and patch THEFORGE_DB to use it.
+
+    Returns:
+        Tuple of (db_path, original_db_path) so the caller can restore after.
+    """
+    original_db = forge_orchestrator.THEFORGE_DB
     db_path = make_temp_db()
     forge_orchestrator.THEFORGE_DB = db_path
-    return db_path
+    return db_path, original_db
 
 
-def teardown_test_db(db_path):
-    """Clean up the temp DB file."""
+def teardown_test_db(db_path, original_db=None):
+    """Clean up the temp DB file and restore the original THEFORGE_DB path."""
     try:
         db_path.unlink(missing_ok=True)
     except Exception:
         pass
+    if original_db is not None:
+        forge_orchestrator.THEFORGE_DB = original_db
 
 
 # --- Tests for ensure_agent_messages_table ---
 
 def test_ensure_creates_table():
     """Test that ensure_agent_messages_table creates the table."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.ensure_agent_messages_table()
         conn = sqlite3.connect(str(db_path))
@@ -67,12 +74,12 @@ def test_ensure_creates_table():
         conn.close()
         assert len(tables) == 1, f"expected 1 table, found {len(tables)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_ensure_is_idempotent():
     """Test that calling ensure twice does not error."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.ensure_agent_messages_table()
         forge_orchestrator.ensure_agent_messages_table()  # second call should not raise
@@ -83,14 +90,14 @@ def test_ensure_is_idempotent():
         conn.close()
         assert len(tables) == 1, "table should exist exactly once after two ensure calls"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 # --- Tests for post_agent_message ---
 
 def test_post_inserts_message():
     """Test that post_agent_message inserts a row."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(
             task_id=100, cycle=1, from_role="tester", to_role="developer",
@@ -110,12 +117,12 @@ def test_post_inserts_message():
         assert row["content"] == '{"tests_failed": 3}'
         assert row["read_by_cycle"] is None, "new messages should be unread"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_post_multiple_messages():
     """Test posting multiple messages for the same task."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(100, 2, "tester", "developer", "test_passed", '{"b":2}')
@@ -126,14 +133,14 @@ def test_post_multiple_messages():
         conn.close()
         assert count == 3, f"expected 3 messages, got {count}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 # --- Tests for read_agent_messages ---
 
 def test_read_returns_unread_for_role():
     """Test that read_agent_messages returns only messages addressed to the specified role."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(100, 1, "developer", "tester", "code_notes", '{"b":2}')
@@ -146,12 +153,12 @@ def test_read_returns_unread_for_role():
         assert len(tester_msgs) == 1, f"tester should get 1 message, got {len(tester_msgs)}"
         assert tester_msgs[0]["from_role"] == "developer"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_read_filters_by_task():
     """Test that read_agent_messages only returns messages for the specified task."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(200, 1, "tester", "developer", "test_failures", '{"b":2}')
@@ -165,12 +172,12 @@ def test_read_filters_by_task():
         msgs_999 = forge_orchestrator.read_agent_messages(999, "developer")
         assert len(msgs_999) == 0, f"task 999 should get 0 messages, got {len(msgs_999)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_read_respects_max_cycle():
     """Test that max_cycle filters out messages from later cycles."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"c1":1}')
         forge_orchestrator.post_agent_message(100, 2, "tester", "developer", "test_failures", '{"c2":2}')
@@ -181,12 +188,12 @@ def test_read_respects_max_cycle():
         cycles = [m["cycle_number"] for m in msgs]
         assert 3 not in cycles, "cycle 3 should be filtered out"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_read_returns_ordered_by_cycle_and_id():
     """Test that messages are ordered by cycle_number ASC, id ASC."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 2, "tester", "developer", "test_failures", '{"second":2}')
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"first":1}')
@@ -198,25 +205,25 @@ def test_read_returns_ordered_by_cycle_and_id():
         assert msgs[1]["cycle_number"] == 2
         assert msgs[2]["cycle_number"] == 2
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_read_returns_empty_list_for_no_messages():
     """Test that read returns empty list when no messages exist."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.ensure_agent_messages_table()
         msgs = forge_orchestrator.read_agent_messages(999, "developer")
         assert msgs == [], f"expected empty list, got {msgs}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 # --- Tests for mark_messages_read ---
 
 def test_mark_read_prevents_re_reading():
     """Test that mark_messages_read makes messages invisible to subsequent reads."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "code_notes", '{"b":2}')
@@ -232,12 +239,12 @@ def test_mark_read_prevents_re_reading():
         msgs_after = forge_orchestrator.read_agent_messages(100, "developer")
         assert len(msgs_after) == 0, f"expected 0 messages after mark, got {len(msgs_after)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_mark_read_sets_correct_cycle():
     """Test that mark_messages_read sets read_by_cycle to the given cycle number."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.mark_messages_read(100, "developer", cycle_number=3)
@@ -248,12 +255,12 @@ def test_mark_read_sets_correct_cycle():
         conn.close()
         assert row["read_by_cycle"] == 3, f"expected read_by_cycle=3, got {row['read_by_cycle']}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_mark_read_only_affects_target_role():
     """Test that mark_messages_read only marks messages for the specified role."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(100, 1, "developer", "tester", "code_notes", '{"b":2}')
@@ -265,12 +272,12 @@ def test_mark_read_only_affects_target_role():
         tester_msgs = forge_orchestrator.read_agent_messages(100, "tester")
         assert len(tester_msgs) == 1, f"tester should still have 1 unread message, got {len(tester_msgs)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 def test_mark_read_only_affects_target_task():
     """Test that mark_messages_read only marks messages for the specified task."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         forge_orchestrator.post_agent_message(100, 1, "tester", "developer", "test_failures", '{"a":1}')
         forge_orchestrator.post_agent_message(200, 1, "tester", "developer", "test_failures", '{"b":2}')
@@ -281,7 +288,7 @@ def test_mark_read_only_affects_target_task():
         msgs_200 = forge_orchestrator.read_agent_messages(200, "developer")
         assert len(msgs_200) == 1, f"task 200 should still have 1 unread, got {len(msgs_200)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 # --- Tests for format_messages_for_prompt ---
@@ -372,7 +379,7 @@ def test_format_handles_non_dict_json():
 
 def test_end_to_end_post_read_format_mark():
     """End-to-end: post → read → format → mark → re-read returns empty."""
-    db_path = setup_test_db()
+    db_path, original_db = setup_test_db()
     try:
         # Post messages
         forge_orchestrator.post_agent_message(
@@ -404,7 +411,7 @@ def test_end_to_end_post_read_format_mark():
         msgs_after = forge_orchestrator.read_agent_messages(42, "developer")
         assert len(msgs_after) == 0, f"expected 0 after mark, got {len(msgs_after)}"
     finally:
-        teardown_test_db(db_path)
+        teardown_test_db(db_path, original_db)
 
 
 # --- Main ---
