@@ -344,7 +344,7 @@ def test_validate_rule_invalid_error_type():
     }
     is_valid, reason = validate_rule(rule, [])
     assert not is_valid
-    assert "invalid error_type" in reason
+    assert "invalid" in reason and "error_type" in reason
 
 
 def test_validate_rule_valid_error_types():

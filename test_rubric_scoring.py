@@ -282,8 +282,10 @@ class TestRubricScoring(unittest.TestCase):
 
         scores = forgesmith._score_tester(run, parsed, cfg)
 
-        # Tests passed, should get full tests_pass score
-        self.assertEqual(scores["tests_pass"], 5)
+        # Tests passed, should get full tests_pass score (from config)
+        tester_rubric = cfg.get("rubric_definitions", {}).get("tester", {})
+        expected_tests_pass = tester_rubric.get("tests_pass", 5)
+        self.assertEqual(scores["tests_pass"], expected_tests_pass)
 
         # 12 tests should get full edge_cases score
         self.assertGreater(scores["edge_cases"], 0)
