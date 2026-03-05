@@ -2581,10 +2581,10 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
             try:
                 line_bytes = await asyncio.wait_for(
                     process.stdout.readline(),
-                    timeout=min(remaining, 120),  # also cap per-line wait
+                    timeout=min(remaining, 300),  # per-line wait (300s for compiles/large writes)
                 )
             except asyncio.TimeoutError:
-                early_term_reason = f"Process timed out after {effective_timeout} seconds"
+                early_term_reason = f"No output for 300s (overall timeout: {effective_timeout}s)"
                 break
 
             if not line_bytes:
@@ -2663,6 +2663,15 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                         if tool_name in ("Edit", "Write", "NotebookEdit"):
                             turn_has_file_change = True
                             has_any_file_change = True
+                        elif tool_name == "Bash":
+                            # Bash commands that create/modify files count too
+                            cmd = tool_input.get("command", "")
+                            if any(kw in cmd for kw in [
+                                "git commit", "git add", "go build", "npm run build",
+                                "mkdir", "cp ", "mv ", "touch ", "tee ", "> ",
+                            ]):
+                                turn_has_file_change = True
+                                has_any_file_change = True
 
                 # After processing all blocks in this assistant message,
                 # update the file-change counter ONCE per API turn (not per tool call)
@@ -2807,6 +2816,9 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
         "errors": [],
     }
 
+    # Track whether agent made file changes (Write/Edit tool calls observed)
+    result["has_file_changes"] = has_any_file_change
+
     if early_term_reason:
         result["errors"].append(early_term_reason)
         result["early_terminated"] = True
@@ -2837,6 +2849,12 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
     else:
         # No result message — build text from accumulated chunks
         result["result_text"] = "\n".join(all_text_chunks)
+        # If agent made file changes but crashed before emitting result,
+        # treat as partial success (the work exists on disk)
+        if has_any_file_change and not early_term_reason:
+            result["success"] = True
+            result["errors"].append("No result message from agent (process exited), "
+                                    "but file changes detected — treating as partial success")
 
     # Read any remaining stderr
     try:
@@ -3569,8 +3587,15 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
 
         # Check for agent failure
         if not dev_result["success"]:
-            log(f"  [Cycle {cycle}] Developer agent failed.", output)
-            return dev_result, cycle, "developer_failed"
+            # If agent made file changes despite "failure", give it credit
+            # and proceed to tester (the work exists on disk even if stream broke)
+            if dev_result.get("has_file_changes"):
+                log(f"  [Cycle {cycle}] Developer agent reported failure but made file changes. "
+                    f"Proceeding to tester.", output)
+                dev_result["success"] = True  # Override — work exists on disk
+            else:
+                log(f"  [Cycle {cycle}] Developer agent failed.", output)
+                return dev_result, cycle, "developer_failed"
 
         # Compaction: ALWAYS compact developer output before passing to next cycle
         # (context engineering: never pass raw agent output between cycles)
@@ -4481,6 +4506,11 @@ def print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg):
         print(tail.encode("ascii", errors="replace").decode("ascii"))
 
     print("\n" + "=" * 60)
+
+
+def _is_git_repo(path):
+    """Check if a directory is a git repository."""
+    return (Path(path) / ".git").exists()
 
 
 def resolve_project_dir(task):
@@ -5540,15 +5570,75 @@ async def run_parallel_tasks(task_ids, args):
             print("Aborted.")
             return
 
+    # Create per-task git worktrees for filesystem isolation
+    worktree_dirs = {}
+    worktree_base = Path(project_dir) / ".forge-worktrees"
+    use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
+
+    if use_worktrees:
+        worktree_base.mkdir(exist_ok=True)
+        for t in tasks:
+            branch_name = f"forge-task-{t['id']}"
+            wt_path = worktree_base / f"task-{t['id']}"
+            try:
+                # Clean up stale worktree if exists
+                if wt_path.exists():
+                    subprocess.run(["git", "worktree", "remove", "--force", str(wt_path)],
+                                   cwd=project_dir, capture_output=True)
+                # Create worktree from current HEAD
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                    cwd=project_dir, capture_output=True, check=True,
+                )
+                worktree_dirs[t["id"]] = str(wt_path)
+                print(f"  [Isolation] Task #{t['id']} -> {wt_path.name}")
+            except subprocess.CalledProcessError as e:
+                # Fallback: if worktree creation fails, try without -b (branch may exist)
+                try:
+                    subprocess.run(["git", "branch", "-D", branch_name],
+                                   cwd=project_dir, capture_output=True)
+                    subprocess.run(
+                        ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                        cwd=project_dir, capture_output=True, check=True,
+                    )
+                    worktree_dirs[t["id"]] = str(wt_path)
+                    print(f"  [Isolation] Task #{t['id']} -> {wt_path.name} (retry)")
+                except Exception:
+                    print(f"  [Isolation] WARNING: Could not create worktree for task #{t['id']}, using shared dir")
+
     async def run_one_task(task):
         output = []
+        # Use worktree if available, otherwise shared project_dir
+        task_dir = worktree_dirs.get(task["id"], project_dir)
         async with semaphore:
             log(f"\n[Task #{task['id']}] Starting: {task['title']}", output)
             result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, args, output=output,
+                task, task_dir, project_context, args, output=output,
             )
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
+
+            # Merge worktree changes back to main branch
+            if task["id"] in worktree_dirs and outcome in ("tests_passed", "no_tests"):
+                try:
+                    wt_path = worktree_dirs[task["id"]]
+                    branch_name = f"forge-task-{task['id']}"
+                    # Merge the task branch back into the main branch
+                    merge_result = subprocess.run(
+                        ["git", "merge", "--no-edit", branch_name],
+                        cwd=project_dir, capture_output=True, text=True,
+                    )
+                    if merge_result.returncode == 0:
+                        log(f"  [Isolation] Merged task #{task['id']} changes back to main", output)
+                    else:
+                        log(f"  [Isolation] Merge conflict for task #{task['id']}: "
+                            f"{merge_result.stderr[:200]}", output)
+                        # Abort the merge on conflict
+                        subprocess.run(["git", "merge", "--abort"],
+                                       cwd=project_dir, capture_output=True)
+                except Exception as e:
+                    log(f"  [Isolation] Merge error for task #{task['id']}: {e}", output)
+
             return {
                 "task": task,
                 "result": result,
@@ -5602,6 +5692,23 @@ async def run_parallel_tasks(task_ids, args):
     if total_cost > 0:
         print(f"Cost: ${total_cost:.4f}")
     print(f"{'#' * 60}")
+
+    # Clean up worktrees
+    if use_worktrees:
+        for task_id, wt_path in worktree_dirs.items():
+            try:
+                branch_name = f"forge-task-{task_id}"
+                subprocess.run(["git", "worktree", "remove", "--force", wt_path],
+                               cwd=project_dir, capture_output=True)
+                subprocess.run(["git", "branch", "-D", branch_name],
+                               cwd=project_dir, capture_output=True)
+            except Exception:
+                pass
+        # Clean up worktree base dir if empty
+        try:
+            worktree_base.rmdir()
+        except OSError:
+            pass
 
 
 # --- Main ---
