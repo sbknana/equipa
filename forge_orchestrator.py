@@ -78,6 +78,14 @@ except ImportError:
     def wrap_lessons_in_task_input(text):
         return text or ""
 
+# Import post-task quality scorer
+try:
+    from rubric_quality_scorer import score_and_store as quality_score_and_store
+except ImportError:
+    def quality_score_and_store(result_text, files_changed, role, agent_run_id,
+                                task_id, project_id, db_path=None):
+        return None
+
 
 # --- Constants ---
 
@@ -514,6 +522,60 @@ def record_agent_run(task, result, outcome, role="developer", model="opus",
             f"duration={duration:.0f}s", output)
     except Exception as e:
         log(f"  [Telemetry] WARNING: Failed to record agent run: {e}", output)
+
+
+def _get_latest_agent_run_id(task_id):
+    """Get the most recently inserted agent_run ID for a task.
+
+    Returns the ID or None if not found. Never raises.
+    """
+    try:
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id FROM agent_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        return row["id"] if row else None
+    except Exception:
+        return None
+
+
+def run_quality_scoring(task, result, outcome, role, output=None):
+    """Run post-task quality scoring and store results.
+
+    Called after record_agent_run() on successful outcomes. Extracts
+    result_text and FILES_CHANGED from the result dict, scores them,
+    and stores scores in rubric_scores.
+
+    Never crashes the orchestrator — all errors are logged and swallowed.
+    """
+    try:
+        task_id = task.get("id") if isinstance(task, dict) else task
+        project_id = task.get("project_id") if isinstance(task, dict) else None
+
+        agent_run_id = _get_latest_agent_run_id(task_id)
+        if not agent_run_id:
+            log(f"  [Quality] No agent_run_id found for task {task_id}", output)
+            return
+
+        result_text = result.get("result_text", "") if isinstance(result, dict) else ""
+        files_changed = parse_developer_output(result_text)
+
+        score_result = quality_score_and_store(
+            result_text=result_text,
+            files_changed=files_changed,
+            role=role,
+            agent_run_id=agent_run_id,
+            task_id=task_id,
+            project_id=project_id,
+        )
+        if score_result:
+            log(f"  [Quality] Scored run {agent_run_id}: "
+                f"{score_result['total_score']:.1f}/{score_result['max_possible']:.0f} "
+                f"({score_result['normalized_score']:.0%})", output)
+    except Exception as e:
+        log(f"  [Quality] WARNING: Quality scoring failed: {e}", output)
 
 
 # --- Reflexion (Post-task self-reflection for learning) ---
@@ -5317,6 +5379,10 @@ async def run_project_tasks(project_summary, config, args, output=None):
             cycle_number=cycles, output=output,
         )
 
+        # Post-task quality scoring (on success only)
+        if outcome in ("tests_passed", "no_tests"):
+            run_quality_scoring(task, result, outcome, role=task_role, output=output)
+
         # Reflexion: record episode and capture self-reflection
         await maybe_run_reflexion(task, result, outcome, role=task_role, output=output)
 
@@ -6109,6 +6175,10 @@ async def async_main():
             cycle_number=cycles,
         )
 
+        # Post-task quality scoring (on success only)
+        if outcome in ("tests_passed", "no_tests"):
+            run_quality_scoring(task, result, outcome, role=task_role)
+
         # Reflexion: record episode and capture self-reflection
         await maybe_run_reflexion(task, result, outcome, role=task_role)
 
@@ -6176,6 +6246,10 @@ async def async_main():
             task, result, single_outcome, role=args.role,
             model=role_model, max_turns=role_turns_max,
         )
+
+        # Post-task quality scoring (on success only)
+        if single_outcome in ("tests_passed", "no_tests"):
+            run_quality_scoring(task, result, single_outcome, role=args.role)
 
         # Reflexion: record episode and capture self-reflection
         await maybe_run_reflexion(task, result, single_outcome, role=args.role)
