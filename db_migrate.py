@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 3
+CURRENT_VERSION = 4
 
 
 # ============================================================
@@ -382,11 +382,28 @@ def migrate_v2_to_v3(conn):
         pass  # Column already exists
 
 
+def migrate_v3_to_v4(conn):
+    """Add impact_assessment column to forgesmith_changes (v3.0 -> v4.0).
+
+    Stores JSON impact analysis results (affected roles, task types, risk level)
+    for each ForgeSmith change. HIGH-risk changes are blocked from auto-apply.
+    """
+    try:
+        conn.execute(
+            "ALTER TABLE forgesmith_changes "
+            "ADD COLUMN impact_assessment TEXT DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
     2: ("ForgeSmith + agent tracking (v1 -> v2)", migrate_v1_to_v2),
     3: ("Agent messaging + action logging (v2 -> v3)", migrate_v2_to_v3),
+    4: ("Impact assessment for ForgeSmith changes (v3 -> v4)", migrate_v3_to_v4),
 }
 
 

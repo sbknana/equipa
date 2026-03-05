@@ -148,9 +148,28 @@ def episodes_to_dspy_examples(episodes):
         outcome = ep.get("outcome", "unknown")
         is_success = outcome in SUCCESS_OUTCOMES
         reflection = ep.get("reflection") or ""
-        error_patterns = ep.get("error_patterns") or ""
+        error_patterns_raw = ep.get("error_patterns") or ""
         turns = ep.get("turns_used") or 0
         q_value = ep.get("q_value", 0.5)
+
+        # Extract structured failure class from JSON error_patterns if available
+        failure_class = ""
+        error_patterns_display = error_patterns_raw[:300]
+        try:
+            parsed_ep = json.loads(error_patterns_raw) if error_patterns_raw else None
+            if isinstance(parsed_ep, dict) and "failure_class" in parsed_ep:
+                failure_class = parsed_ep["failure_class"]
+                secondary = parsed_ep.get("secondary_classes", [])
+                signals = parsed_ep.get("signals", [])
+                # Build a concise display for feedback
+                parts = [failure_class]
+                if secondary:
+                    parts[0] += f" +{','.join(secondary)}"
+                if signals:
+                    parts.append(signals[0][:100])
+                error_patterns_display = ": ".join(parts)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
         example = dspy.Example(
             task_description=task_desc[:500],
@@ -160,7 +179,8 @@ def episodes_to_dspy_examples(episodes):
             # Metadata for GEPA feedback
             outcome=outcome,
             reflection=reflection[:500],
-            error_patterns=error_patterns[:300],
+            error_patterns=error_patterns_display,
+            failure_class=failure_class,
             turns_used=str(turns),
             q_value=str(round(q_value, 2)),
         ).with_inputs("task_description", "task_type")
@@ -217,7 +237,11 @@ def gepa_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
     feedback_parts = []
     if not actual_success:
         outcome = gold.outcome
-        feedback_parts.append(f"Task FAILED with outcome: {outcome}")
+        failure_class = getattr(gold, "failure_class", "")
+        if failure_class:
+            feedback_parts.append(f"Task FAILED — failure class: {failure_class} (outcome: {outcome})")
+        else:
+            feedback_parts.append(f"Task FAILED with outcome: {outcome}")
         if gold.error_patterns:
             feedback_parts.append(f"Error patterns: {gold.error_patterns}")
         if gold.reflection:

@@ -357,6 +357,7 @@ CREATE TABLE forgesmith_changes (
     evidence TEXT,
     effectiveness_score REAL,
     reverted_at TEXT,
+    impact_assessment TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

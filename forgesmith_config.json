@@ -40,7 +40,11 @@
             "files_changed": 3,
             "tests_written": 3,
             "turns_efficiency": 2.0,
-            "output_compliance": 2
+            "output_compliance": 2,
+            "dependency_direction": 2,
+            "separation_of_concerns": 2,
+            "error_handling": 2,
+            "naming_consistency": 2
         },
         "tester": {
             "tests_pass": 5.5,

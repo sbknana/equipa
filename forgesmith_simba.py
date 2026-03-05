@@ -74,6 +74,77 @@ def log(msg):
 
 
 # ============================================================
+# Failure Classification Helpers
+# ============================================================
+
+# Valid failure classes produced by classify_agent_failure() in forge_orchestrator.py
+FAILURE_CLASSES = (
+    "analysis_paralysis", "build_failure", "test_failure", "import_error",
+    "timeout", "wrong_approach", "environment_error", "max_turns", "unknown",
+)
+
+
+def extract_failure_class(episode):
+    """Extract structured failure classification from an episode's error_patterns.
+
+    Returns a dict with failure_class, secondary_classes, confidence, signals,
+    raw_errors — or None if error_patterns is empty or not valid JSON.
+
+    Handles both new structured JSON format and legacy plain-text format.
+    """
+    raw = episode.get("error_patterns")
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "failure_class" in parsed:
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Legacy plain-text: infer a basic classification from the raw string
+    lower = raw.lower()
+    if "without file changes" in lower or "analysis paralysis" in lower:
+        return {"failure_class": "analysis_paralysis", "secondary_classes": [],
+                "confidence": "low", "signals": ["inferred from legacy text"], "raw_errors": [raw[:200]]}
+    if "timed out" in lower:
+        return {"failure_class": "timeout", "secondary_classes": [],
+                "confidence": "low", "signals": ["inferred from legacy text"], "raw_errors": [raw[:200]]}
+    if "max_turns" in lower or "max turns" in lower:
+        return {"failure_class": "max_turns", "secondary_classes": [],
+                "confidence": "low", "signals": ["inferred from legacy text"], "raw_errors": [raw[:200]]}
+
+    return None
+
+
+def format_failure_info(episode):
+    """Format failure information for prompt, using structured class if available.
+
+    Returns a string like:
+        'analysis_paralysis (high): 35 consecutive turns without file changes'
+    or falls back to raw error_patterns text.
+    """
+    classification = extract_failure_class(episode)
+    if classification:
+        fc = classification["failure_class"]
+        conf = classification.get("confidence", "?")
+        signals = classification.get("signals", [])
+        secondary = classification.get("secondary_classes", [])
+
+        parts = [f"{fc} ({conf})"]
+        if secondary:
+            parts[0] += f" +{','.join(secondary)}"
+        if signals:
+            parts.append(signals[0][:150])
+        return ": ".join(parts)
+
+    # Fallback to raw text
+    raw = episode.get("error_patterns") or "N/A"
+    return raw[:200]
+
+
+# ============================================================
 # STEP 1: Identify high-variance tasks and failure patterns
 # ============================================================
 
@@ -184,21 +255,23 @@ def build_simba_prompt(role, successes, failures, hardest_cases, existing_rules)
   Reflection: {(ep['reflection'] or 'N/A')[:300]}
 """
 
-    # Format failure episodes (up to 8)
+    # Format failure episodes (up to 8) with structured failure classification
     failure_text = ""
     for ep in failures[:8]:
+        failure_info = format_failure_info(ep)
         failure_text += f"""
 - Task #{ep['task_id']} ({ep['outcome']}, {ep['turns_used']} turns, q={ep['q_value']:.1f}):
-  Error: {(ep.get('error_patterns') or 'N/A')[:200]}
+  Failure: {failure_info}
   Reflection: {(ep['reflection'] or 'N/A')[:300]}
 """
 
-    # Format hardest cases (up to 5)
+    # Format hardest cases (up to 5) with structured failure classification
     hardest_text = ""
     for ep in hardest_cases[:5]:
+        failure_info = format_failure_info(ep)
         hardest_text += f"""
 - Task #{ep['task_id']} ({ep['turns_used']} turns, q={ep['q_value']:.2f}):
-  Error: {(ep.get('error_patterns') or 'N/A')[:200]}
+  Failure: {failure_info}
   Reflection: {(ep['reflection'] or 'N/A')[:300]}
 """
 
@@ -232,18 +305,20 @@ Requirements for each rule:
 2. MUST be specific and actionable (not generic advice like "plan better")
 3. MUST reference concrete behaviors observed in the data (e.g., "When exploring a codebase, use parallel Read calls instead of sequential ones to avoid burning turns")
 4. MUST NOT duplicate any existing rules listed above
-5. Each rule MUST include an error_type from: timeout, max_turns, early_terminated, agent_error, test_failure
+5. Each rule MUST include a failure_class from: analysis_paralysis, build_failure, test_failure, import_error, timeout, wrong_approach, environment_error, max_turns
 
 Respond with ONLY a JSON array of objects, each with:
 - "rule": the rule text (1-2 sentences, max 200 chars)
-- "error_type": which failure pattern this addresses
+- "failure_class": which failure class this addresses (from list above)
+- "error_type": same as failure_class (for backward compatibility)
 - "rationale": why this rule would help (1 sentence)
 
 Example:
 [
   {{
     "rule": "When task description mentions 'sync' or 'diff', limit exploration to 10 turns then start writing code with what you know.",
-    "error_type": "early_terminated",
+    "failure_class": "analysis_paralysis",
+    "error_type": "analysis_paralysis",
     "rationale": "Sync tasks caused 40+ turn exploration loops in 4 of 5 failed episodes."
   }}
 ]
@@ -351,11 +426,17 @@ def validate_rule(rule, existing_rules):
     if len(text) < 20:
         return False, f"too short ({len(text)} chars, min 20)"
 
-    error_type = rule.get("error_type", "")
-    valid_types = {"timeout", "max_turns", "early_terminated", "agent_error",
-                   "test_failure"}
+    # Accept failure_class (new) or error_type (legacy) — prefer failure_class
+    error_type = rule.get("failure_class") or rule.get("error_type", "")
+    valid_types = {
+        # New failure classes from error-recovery skill
+        "analysis_paralysis", "build_failure", "test_failure", "import_error",
+        "timeout", "wrong_approach", "environment_error", "max_turns",
+        # Legacy types (backward compat for existing stored rules)
+        "early_terminated", "agent_error",
+    }
     if error_type not in valid_types:
-        return False, f"invalid error_type: {error_type}"
+        return False, f"invalid failure_class/error_type: {error_type}"
 
     # Check for duplicates against existing rules
     text_lower = text.lower()
@@ -397,7 +478,8 @@ def store_rules(role, rules, dry_run=False):
             continue
 
         text = rule["rule"].strip()
-        error_type = rule["error_type"]
+        # Prefer failure_class (new), fall back to error_type (legacy)
+        error_type = rule.get("failure_class") or rule.get("error_type", "unknown")
         rationale = rule.get("rationale", "")
 
         if dry_run:
