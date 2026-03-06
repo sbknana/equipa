@@ -2,7 +2,7 @@
 
 Project Pombal is a self-improving, multi-agent orchestration platform that you control through natural conversation. Tell Claude what you want done -- it handles task management, agent dispatch, progress tracking, and reporting. You make decisions; the system handles execution.
 
-Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Python and Claude Code are installed.
+Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Python and an MCP-compatible AI coding tool are installed.
 
 ---
 
@@ -330,9 +330,20 @@ prompts/
 - Provider selection per role (Claude API, local Ollama)
 - Task-type-specific prompt guidance (bug fix, feature, refactor, test)
 
-### MCP Server Integration
+### Multi-Tool MCP Integration
 
-Project Pombal generates MCP configuration during setup, giving AI agents direct database access for querying task status, reading episodes, and updating results.
+Project Pombal auto-detects and configures MCP for all major AI coding tools during setup:
+
+| Tool | Config Location | Detection |
+|------|----------------|-----------|
+| **Claude Code** | `.mcp.json` (project root) | `claude --version` |
+| **Roo Code** | `~/.roo/mcp.json` | Extension directory |
+| **Cline** | `~/cline_mcp_settings.json` | Extension directory |
+| **Cursor** | `.cursor/mcp.json` (project root) | `cursor --version` |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | Config directory |
+| **Continue.dev** | `~/.continue/config.yaml` | Config directory |
+
+The installer detects which tools are installed, prompts for confirmation, and merges the MCP server entry into each tool's config. Existing configurations are preserved — Project Pombal only adds its own server entry.
 
 ### Local LLM Support via Ollama
 
@@ -354,7 +365,8 @@ Read-only roles (planner, evaluator, code-reviewer, researcher) can run on local
 
 | Property | Detail |
 |----------|--------|
-| **Zero pip dependencies** | Core platform is stdlib-only Python. No `requirements.txt`. Requires Python 3.10+, Claude Code CLI, git, and uvx as runtime prerequisites |
+| **Zero pip dependencies** | Core platform is stdlib-only Python. No `requirements.txt`. Requires Python 3.10+, an MCP-compatible AI coding tool, git, and uvx as runtime prerequisites |
+| **Multi-tool MCP support** | Auto-configures Claude Code, Roo Code, Cline, Cursor, Windsurf, and Continue.dev. Detects installed tools and merges config non-destructively |
 | **SQLite-based** | Single-file database. Trivially portable, trivially backupable. No database server required |
 | **Cross-platform** | Runs on Linux and Windows. Tested on Ubuntu 24.04 and Windows 10/11 |
 | **CLI-first** | Every operation available from the command line. No web UI required (dashboard is terminal-based) |

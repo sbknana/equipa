@@ -412,25 +412,160 @@ def _resolve_uvx_path():
     return "uvx"
 
 
+def _build_mcp_server_entry(uvx_cmd, db_path):
+    """Build the universal MCP server entry for Project Pombal."""
+    return {
+        "command": uvx_cmd,
+        "args": [
+            "mcp-server-sqlite",
+            "--db-path",
+            str(db_path),
+        ],
+    }
+
+
+def _get_ai_tool_configs():
+    """Return MCP config file paths for all supported AI coding tools.
+
+    Each entry: (name, global_config_path, is_yaml, merge_strategy)
+    merge_strategy: 'mcpServers_dict' for JSON files, 'yaml_list' for Continue.dev
+    """
+    home = Path.home()
+    is_windows = platform.system() == "Windows"
+
+    if is_windows:
+        appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        vscode_storage = appdata / "Code" / "User" / "globalStorage"
+    elif platform.system() == "Darwin":
+        vscode_storage = home / "Library" / "Application Support" / "Code" / "User" / "globalStorage"
+    else:
+        vscode_storage = home / ".config" / "Code" / "User" / "globalStorage"
+
+    tools = [
+        {
+            "name": "Claude Code",
+            "detect_cmd": "claude",
+            "config_path": None,  # Uses .mcp.json in project dir (handled separately)
+            "project_config": True,
+        },
+        {
+            "name": "Roo Code",
+            "detect_cmd": None,  # VS Code extension — detect by config dir
+            "config_path": vscode_storage / "rooveterinaryinc.roo-cline" / "settings" / "cline_mcp_settings.json",
+            "project_config": False,
+        },
+        {
+            "name": "Cline",
+            "detect_cmd": None,
+            "config_path": vscode_storage / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json",
+            "project_config": False,
+        },
+        {
+            "name": "Cursor",
+            "detect_cmd": None,
+            "config_path": home / ".cursor" / "mcp.json",
+            "project_config": False,
+        },
+        {
+            "name": "Windsurf",
+            "detect_cmd": None,
+            "config_path": home / ".codeium" / "windsurf" / "mcp_config.json",
+            "project_config": False,
+        },
+        {
+            "name": "Continue.dev",
+            "detect_cmd": None,
+            "config_path": home / ".continue" / "config.yaml",
+            "project_config": False,
+            "is_yaml": True,
+        },
+    ]
+    return tools
+
+
+def _detect_installed_tools(tools):
+    """Detect which AI coding tools are installed by checking config paths."""
+    detected = []
+    for tool in tools:
+        if tool.get("detect_cmd"):
+            if shutil.which(tool["detect_cmd"]):
+                detected.append(tool)
+                continue
+        if tool.get("config_path"):
+            # Check if the parent directory exists (tool has been installed at some point)
+            config_dir = tool["config_path"].parent
+            if config_dir.exists():
+                detected.append(tool)
+    return detected
+
+
+def _merge_mcp_into_json(config_path, server_entry):
+    """Merge a pombal MCP server entry into an existing JSON config file.
+
+    Creates the file if it doesn't exist. Preserves existing servers.
+    """
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    if "mcpServers" not in existing:
+        existing["mcpServers"] = {}
+
+    existing["mcpServers"]["pombal"] = server_entry
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+
+
+def _merge_mcp_into_yaml(config_path, server_entry):
+    """Merge a pombal MCP server entry into Continue.dev's config.yaml.
+
+    Uses basic string manipulation (no PyYAML dependency).
+    """
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the YAML block for the MCP server
+    yaml_block = f"""
+  - name: pombal
+    command: {server_entry['command']}
+    args:"""
+    for arg in server_entry["args"]:
+        yaml_block += f'\n      - "{arg}"'
+
+    if config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+        # Check if pombal is already configured
+        if "name: pombal" in content:
+            print("    (already configured, skipping)")
+            return
+        # Check if mcpServers section exists
+        if "mcpServers:" in content:
+            # Append to existing mcpServers section
+            content = content.replace("mcpServers:", f"mcpServers:{yaml_block}", 1)
+        else:
+            # Add new mcpServers section at end
+            content += f"\nmcpServers:{yaml_block}\n"
+        config_path.write_text(content, encoding="utf-8")
+    else:
+        config_path.write_text(f"mcpServers:{yaml_block}\n", encoding="utf-8")
+
+
 def step_generate_mcp_config(base_path, db_path):
-    """Generate mcp_config.json for MCP server."""
+    """Generate mcp_config.json for MCP server (generic/portable config)."""
     print_header("Step 6: Generate MCP Configuration")
 
     uvx_cmd = _resolve_uvx_path()
+    server_entry = _build_mcp_server_entry(uvx_cmd, db_path)
 
-    mcp_config = {
-        "mcpServers": {
-            "pombal": {
-                "type": "stdio",
-                "command": uvx_cmd,
-                "args": [
-                    "mcp-server-sqlite",
-                    "--db-path",
-                    str(db_path),
-                ],
-            }
-        }
-    }
+    mcp_config = {"mcpServers": {"pombal": server_entry}}
 
     mcp_path = base_path / "mcp_config.json"
     with open(mcp_path, "w", encoding="utf-8") as f:
@@ -443,31 +578,53 @@ def step_generate_mcp_config(base_path, db_path):
 
 
 def step_generate_dot_mcp(base_path, db_path):
-    """Generate .mcp.json so Claude Code sessions can access the DB directly."""
-    print_header("Step 7: Claude Code MCP Integration")
+    """Generate .mcp.json for Claude Code and configure other AI coding tools."""
+    print_header("Step 7: AI Coding Tool MCP Integration")
 
     uvx_cmd = _resolve_uvx_path()
+    server_entry = _build_mcp_server_entry(uvx_cmd, db_path)
 
-    dot_mcp = {
-        "mcpServers": {
-            "pombal": {
-                "type": "stdio",
-                "command": uvx_cmd,
-                "args": [
-                    "mcp-server-sqlite",
-                    "--db-path",
-                    str(db_path),
-                ],
-            }
-        }
-    }
-
+    # --- Claude Code: .mcp.json in project directory (always) ---
+    dot_mcp = {"mcpServers": {"pombal": server_entry}}
     dot_mcp_path = base_path / ".mcp.json"
     with open(dot_mcp_path, "w", encoding="utf-8") as f:
         json.dump(dot_mcp, f, indent=2)
     print(f"  Created: {dot_mcp_path}")
-    print(f"  Claude Code sessions in this directory now have MCP access to the DB.")
-    print(f"  You can ask Claude to query projects, create tasks, etc.")
+    print(f"  Claude Code sessions in this directory now have MCP access.")
+
+    # --- Detect and configure other AI coding tools ---
+    tools = _get_ai_tool_configs()
+    detected = _detect_installed_tools(tools)
+    other_tools = [t for t in detected if t["name"] != "Claude Code"]
+
+    if not other_tools:
+        print()
+        print("  No other AI coding tools detected.")
+        print("  Supported: Roo Code, Cline, Cursor, Windsurf, Continue.dev")
+        print("  If you install one later, re-run this setup or manually add")
+        print(f"  the pombal server from: {base_path / 'mcp_config.json'}")
+    else:
+        print()
+        print(f"  Detected {len(other_tools)} additional AI coding tool(s):")
+        for tool in other_tools:
+            print(f"    - {tool['name']}")
+        print()
+
+        if prompt_yes_no("Configure MCP access for detected tools?", default=True):
+            for tool in other_tools:
+                try:
+                    config_path = tool["config_path"]
+                    if tool.get("is_yaml"):
+                        _merge_mcp_into_yaml(config_path, server_entry)
+                    else:
+                        _merge_mcp_into_json(config_path, server_entry)
+                    print(f"  [+] {tool['name']}: configured at {config_path}")
+                except Exception as exc:
+                    print(f"  [X] {tool['name']}: failed — {exc}")
+                    print(f"      Manual: copy pombal server from mcp_config.json")
+        else:
+            print("  Skipping. You can manually copy the pombal server config from:")
+            print(f"    {base_path / 'mcp_config.json'}")
 
     return dot_mcp_path
 
@@ -1123,6 +1280,26 @@ def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     except Exception as exc:
         print(f"  [X] .mcp.json: FAILED ({exc})")
 
+    # 8b. Check other AI tool MCP configs
+    tools = _get_ai_tool_configs()
+    for tool in tools:
+        if tool["name"] == "Claude Code" or not tool.get("config_path"):
+            continue
+        config_path = tool["config_path"]
+        if config_path.exists():
+            try:
+                if tool.get("is_yaml"):
+                    content = config_path.read_text(encoding="utf-8")
+                    if "name: pombal" in content:
+                        print(f"  [+] {tool['name']}: pombal MCP configured")
+                else:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if cfg.get("mcpServers", {}).get("pombal"):
+                        print(f"  [+] {tool['name']}: pombal MCP configured")
+            except Exception:
+                pass  # Tool config exists but pombal not in it — that's fine
+
     # 9. CLAUDE.md exists
     checks_total += 1
     claude_md_path = base_path / "CLAUDE.md"
@@ -1177,10 +1354,10 @@ def step_next_steps(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     print()
     print("  NEXT STEPS:")
     print()
-    print("  1. Open Claude Code in your install directory:")
+    print("  1. Open your AI coding tool in the install directory:")
     print(f"     cd \"{base_path}\"")
-    print(f"     claude")
-    print(f"     Claude now has MCP access to the DB and knows all the commands.")
+    print(f"     claude  (or open in Cursor, Roo Code, Cline, Windsurf, Continue)")
+    print(f"     Your AI tool now has MCP access to the DB and knows the commands.")
     print()
     print("  2. Or use the CLI directly:")
     example_path = r"C:\path\to\project" if platform.system() == "Windows" else "/path/to/project"
