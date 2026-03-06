@@ -358,10 +358,15 @@ Read-only roles (planner, evaluator, code-reviewer, researcher) can run on local
 | **SQLite-based** | Single-file database. Trivially portable, trivially backupable. No database server required |
 | **Cross-platform** | Runs on Linux and Windows. Tested on Ubuntu 24.04 and Windows 10/11 |
 | **CLI-first** | Every operation available from the command line. No web UI required (dashboard is terminal-based) |
+| **Git worktree isolation** | Parallel tasks run in isolated branches. Merged on success, preserved on failure -- no work lost |
+| **Per-role skills** | Specialized skills loaded per agent role at task start. Concrete methods, checklists, and decision tables |
+| **Quality scoring** | 5-dimension post-task quality scoring with role-specific weights, stored in DB for ForgeSmith analysis |
+| **Failure classification** | Structured taxonomy (`analysis_paralysis`, `build_failure`, `timeout`, etc.) feeds targeted SIMBA/GEPA improvements |
+| **Change-impact analysis** | Blast-radius assessment blocks HIGH-risk ForgeSmith mutations from auto-apply |
 | **Checkpoint resilience** | Long-running tasks save checkpoints. Interrupted work resumes from the last saved state |
 | **Loop detection** | Deterministic fingerprinting of agent output detects stuck loops. File changes reset the counter -- progress is recognized |
 | **Dynamic budgets** | Turn budgets adapt based on task complexity and intermediate results. Prevents both premature termination and runaway loops |
-| **30-table schema** | Full relational model covering projects, tasks, episodes, lessons, messages, actions, rules, prompt versions, rubric scores, and migration history |
+| **30+ table schema** | Full relational model covering projects, tasks, episodes, lessons, messages, actions, rules, prompt versions, rubric scores, and migration history |
 | **Reproducible benchmarks** | Migration benchmarks generate realistic test data, run the full chain, and verify zero data loss |
 | **Arena mode** | Adversarial testing system that stress-tests agents and exports results as LoRA fine-tuning data |
 

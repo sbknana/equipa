@@ -271,8 +271,13 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 
 - **Conversational interface** — Talk to Claude in plain English. No commands, no task IDs.
 - **Autonomous dev-test loops** — Developer and tester iterate until the code works
+- **Per-role agent skills** — Specialized skills per role: codebase navigation, error recovery, systematic debugging, architecture review
+- **Git worktree isolation** — Parallel tasks run in isolated branches, merged on success, preserved on failure
+- **Post-task quality scoring** — 5-dimension quality scorer with role-specific weights
 - **Persistent project memory** — Agents learn from past successes and failures on *your* projects
 - **Self-improving prompts** — ForgeSmith evolves agent behavior based on real outcomes
+- **Failure classification** — Structured taxonomy for targeted improvements
+- **Change-impact analysis** — Blast-radius assessment before applying prompt mutations
 - **Security pipeline** — Trail of Bits tooling with auto-dispatch after dev-test
 - **Inter-agent messaging** — Agents share findings, blockers, and context across cycles
 - **Loop detection** — Catches stuck agents and terminates gracefully
@@ -295,8 +300,8 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 
 ### Guided Setup (Recommended)
 ```bash
-git clone <repo-url> forgeteam
-cd forgeteam
+git clone <repo-url> project-pombal
+cd project-pombal
 python pombal_setup.py
 ```
 

@@ -3,99 +3,84 @@
 ## Project Overview
 
 **TheForge project_id:** 23
-**Status:** Active - v2.1 IMPLEMENTED
+**Status:** Active - v3.1
 
-Project Pombal is the portable installer and onboarding system for the Project Pombal multi-agent orchestration platform. Named after the Marquis of Pombal who rebuilt Lisbon after the 1755 earthquake, Project Pombal makes the agent system usable by anyone — not just the original developer.
+Project Pombal is a multi-agent AI orchestration platform. You talk to Claude in plain English. Claude manages task creation, agent dispatch, progress tracking, error recovery, and reporting. Named after the Marquis de Pombal who rebuilt Lisbon after the 1755 earthquake.
 
-**What it does:**
-- Guided setup: prerequisites check, install path selection, DB creation
-- SQLite database creation with the full Project Pombal schema (empty, ready to use)
-- MCP server configuration (`mcp_config.json` for agents)
-- Claude Code integration (`.mcp.json` for user sessions + `CLAUDE.md` for context)
-- Config file generation (replacing all hardcoded paths)
-- Custom agent role creation (drop a markdown file, it just works)
-- Project registration (`--add-project`)
-- Quick start guide + full user guide
-- Concurrency benchmarks and limits documentation
-
-**Why it exists:**
-The orchestrator is currently hardcoded to one developer's synced storage paths, project mappings, and DB location. Project Pombal extracts all of that into a portable, configurable system that anyone can install and use.
+**Core:** Pure Python stdlib. Zero pip dependencies. SQLite-based. 30+ table schema.
 
 ---
 
-## Key Architecture Decisions
+## File Map
 
-- Installer is a Python script (same language as Project Pombal, no additional dependencies)
-- All configuration stored in `forge_config.json`
-- `forge_orchestrator.py` refactored with `load_config()` to read `forge_config.json` at startup (required — no hardcoded paths)
-- `_discover_roles()` dynamically scans `prompts/` directory for agent role `.md` files
-- `--add-project` CLI command registers new projects in the DB and config
-- Custom agents: drop a `.md` prompt file in the prompts directory, orchestrator auto-discovers it
-- Project Pombal DB schema is the canonical DDL extracted from the live database
-- MCP server setup handled by installer (generates `mcp_config.json` pointing to user's DB)
-- Claude Code integration: `.mcp.json` gives user sessions MCP access; `CLAUDE.md` provides full context (commands, queries, roles)
-- Stdlib only — no pip dependencies for the installer
-
----
-
-## Parent Project
-
-Project Pombal is the installer/distribution layer for **Project Pombal** (project_id: 21). The orchestrator is the engine; Project Pombal makes it installable.
-
----
-
-## Important Files
-
+### Core Orchestration
 | File | Purpose |
 |------|---------|
-| `CLAUDE.md` | This file — project context |
-| `pombal_setup.py` | Interactive setup wizard (9 steps, ~550 lines) |
-| `forge_orchestrator.py` | Main orchestrator with context engineering |
-| `forgesmith.py` | ForgeSmith self-learning pipeline (nightly cron) |
-| `forgesmith_gepa.py` | GEPA — DSPy-based automatic prompt evolution with A/B testing |
-| `forgesmith_simba.py` | SIMBA — Targeted rule generation from failure patterns |
-| `forgesmith_config.json` | ForgeSmith settings (rubrics, thresholds, limits) |
-| `dispatch_config.json` | Agent dispatch settings (models, turns, concurrency) |
-| `schema.sql` | Canonical database DDL (28 tables, 7 views) |
-| `CHANGELOG.md` | Version history and release notes |
-| `docs/QUICKSTART.md` | 5-minute getting started guide |
-| `docs/USER_GUIDE.md` | Full user documentation (CLI, config, ForgeSmith, troubleshooting) |
-| `docs/CUSTOM_AGENTS.md` | Custom agent creation guide |
-| `docs/CONCURRENCY.md` | Benchmark results and tuning guide |
+| `forge_orchestrator.py` | Main orchestrator — task dispatch, dev-test loops, agent management (~5900 lines) |
+| `ollama_agent.py` | Local LLM agent runner via Ollama |
+| `pombal_setup.py` | Interactive setup wizard |
+| `schema.sql` | Canonical database DDL (30 tables, 7 views) |
+| `db_migrate.py` | Database migrations (v0 through v4) with backup and version detection |
+| `dispatch_config.json` | Agent dispatch settings (models, turns, concurrency, providers) |
+
+### ForgeSmith Self-Improvement
+| File | Purpose |
+|------|---------|
+| `forgesmith.py` | Core analysis engine — lessons, config tuning, effectiveness scoring |
+| `forgesmith_gepa.py` | GEPA — DSPy-based prompt evolution with A/B testing |
+| `forgesmith_simba.py` | SIMBA — Rule synthesis from failure patterns |
+| `forgesmith_impact.py` | Blast-radius assessment before applying prompt mutations |
+| `forgesmith_config.json` | Rubric definitions, thresholds, evolution settings |
+| `rubric_quality_scorer.py` | Post-task quality scoring (5 dimensions, role-specific weights) |
+| `lesson_sanitizer.py` | Security invariant checks on lesson extraction |
+| `forgesmith_backfill.py` | Backfill episode data from historical logs |
+
+### Agent Prompts and Skills
+| Directory | Purpose |
+|-----------|---------|
+| `prompts/` | Role prompts: `_common.md` (shared), plus per-role `.md` files |
+| `skills/developer/` | Codebase navigation, implementation planning, error recovery |
+| `skills/tester/` | Framework detection, test generation |
+| `skills/debugger/` | Systematic debugging (hypothesis-driven 5-step) |
+| `skills/code-reviewer/` | Architecture review, change-impact analysis |
+| `skills/security/` | 7 Trail of Bits security skills |
+
+### Training and Analysis
+| File | Purpose |
+|------|---------|
+| `forge_arena.py` | Adversarial testing arena for training data generation |
+| `forge_dashboard.py` | Terminal-based performance dashboard |
+| `analyze_performance.py` | Historical performance reporting |
+| `prepare_training_data.py` | Convert arena results to fine-tuning format |
+| `train_qlora.py` | QLoRA fine-tuning (manual implementation) |
+| `train_qlora_peft.py` | QLoRA fine-tuning (PEFT/Hugging Face) |
+| `benchmark_migrations.py` | Migration correctness benchmarks |
+
+### 9 Agent Roles
+`developer`, `tester`, `planner`, `evaluator`, `security-reviewer`, `frontend-designer`, `integration-tester`, `debugger`, `code-reviewer`
 
 ---
 
-## Common Commands
+## Key Commands
 
 ```bash
-# Run the setup wizard
-python pombal_setup.py
-
-# After installation, from the install directory:
-
-# Add a project
-python forge_orchestrator.py --add-project "MyApp" --project-dir "/path/to/myapp"
-
-# Run a task
-python forge_orchestrator.py --task 1 --dev-test -y
-
-# Goal-driven mode
-python forge_orchestrator.py --goal "Add feature X" --goal-project 1 -y
-
-# Auto-run all projects
-python forge_orchestrator.py --auto-run --dry-run
+python pombal_setup.py                                    # Setup wizard
+python forge_orchestrator.py --task 42 --dev-test -y      # Single task
+python forge_orchestrator.py --tasks 42,43,44 --dev-test -y  # Parallel tasks
+python forge_orchestrator.py --dispatch -y                # Auto-dispatch all
+python forge_orchestrator.py --goal "Add feature X" --goal-project 1 -y  # Goal mode
+python forgesmith.py --auto                               # Run ForgeSmith
+python db_migrate.py theforge.db                          # Run migrations
 ```
 
 ---
 
-## Changes Made to Project Pombal
+## Architecture Decisions
 
-The following changes were made to `forge_orchestrator.py` for portability:
-
-1. **`import os`** — Added missing import (used in `_get_repo_env()`)
-2. **`load_config()`** — Reads `forge_config.json` at startup, overrides hardcoded paths
-3. **`_discover_roles()`** — Dynamically scans `prompts/` for agent role `.md` files
-4. **`--add-project`** — CLI command to register new projects in DB + config
-5. **`_handle_add_project()`** — Implementation of the add-project command
-
-All changes are platform-independent. `forge_config.json` is required — run `pombal_setup.py` to generate it.
+- **SQLite only** — Single-file DB, zero dependencies, trivially portable
+- **Dev-test loop** — Developer + Tester iterate until tests pass or budget exhausted
+- **Git worktree isolation** — Parallel tasks get isolated branches, merged on success
+- **Episodic memory with Q-values** — RL-style learning without training infrastructure
+- **Three-tier self-improvement** — ForgeSmith (rule-based) + GEPA (prompt evolution) + SIMBA (rule synthesis)
+- **Skills system** — Per-role skills loaded at task start, teaching concrete methods
+- **Quality standard** — Non-negotiable 7-point code quality standard for all agents

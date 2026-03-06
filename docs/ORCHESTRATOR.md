@@ -93,7 +93,7 @@ Terminal-based view of task completion rates, blocked items, agent performance, 
 ## Database Migration
 
 ```bash
-# Detect version and apply pending migrations
+# Detect version and apply pending migrations (v0 through v4)
 python db_migrate.py /path/to/theforge.db
 
 # Run the migration benchmark (reproducible demo)

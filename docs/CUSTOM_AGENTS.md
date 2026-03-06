@@ -192,6 +192,47 @@ If no per-role config exists, the agent uses the global `max_turns` and `model` 
 
 ---
 
+## Adding Skills to Your Agent
+
+Skills are specialized knowledge loaded into agent prompts at task start. They teach concrete methods that prevent common failure modes.
+
+### Built-in Skills
+
+| Role | Skills |
+|------|--------|
+| `developer` | Codebase navigation (4-step method), implementation planning (complexity classification), error recovery (3-Strike Rule) |
+| `tester` | Framework detection, test generation (mocking patterns) |
+| `debugger` | Systematic debugging (hypothesis-driven 5-step) |
+| `code-reviewer` | Architecture review (5-point checklist), change-impact analysis (blast radius) |
+| `security-reviewer` | 7 Trail of Bits skills (static analysis, audit context, variant analysis, etc.) |
+
+### Creating Skills for Custom Agents
+
+1. Create a directory: `skills/your-role/skills/skill-name/`
+2. Add `SKILL.md` with the skill content
+3. Optionally add `references/` for supporting material
+4. Reference the skill in your agent prompt: `Read the skill in skills/your-role/skills/skill-name/SKILL.md`
+
+Skills are markdown files loaded into the system prompt — instructions, not code.
+
+---
+
+## Quality Standard
+
+All agents automatically receive a non-negotiable 7-point quality standard via `_common.md`:
+
+1. Clean, readable code — no clever tricks
+2. Proper error handling — no swallowed exceptions
+3. Input validation at system boundaries
+4. Meaningful names — no abbreviations
+5. Self-documenting code with comments where needed
+6. Consistent patterns matching the existing codebase
+7. Test what matters — edge cases and error paths
+
+This standard cannot be overridden by custom agent prompts.
+
+---
+
 ## Tips
 
 - **Keep prompts focused.** One agent, one job. Don't try to make a do-everything agent.

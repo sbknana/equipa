@@ -251,37 +251,35 @@ erDiagram
 
 ```
 .
-├── forge_orchestrator.py         # Core orchestrator — task dispatch, dev-test loops, agent management
+├── forge_orchestrator.py         # Core orchestrator — task dispatch, dev-test loops, worktree isolation
 ├── forgesmith.py                 # Self-improvement engine — analyzes runs, extracts lessons, proposes changes
-├── forgesmith_gepa.py            # Genetic/Evolutionary Prompt Adaptation — evolves system prompts with A/B testing
-├── forgesmith_simba.py           # Rule synthesis — generates behavioral rules from hard cases
+├── forgesmith_gepa.py            # GEPA — evolves system prompts with A/B testing (DSPy-based)
+├── forgesmith_simba.py           # SIMBA — generates behavioral rules from hard cases
+├── forgesmith_impact.py          # Blast-radius assessment before applying prompt mutations
 ├── forgesmith_backfill.py        # Backfills episode data from historical logs
+├── rubric_quality_scorer.py      # Post-task 5-dimension quality scoring with DB storage
+├── lesson_sanitizer.py           # Security invariant checks on lesson extraction
 ├── forge_dashboard.py            # Terminal dashboard — task stats, project completion, activity
 ├── forge_arena.py                # Adversarial testing arena — stress-tests agents, exports LoRA data
 ├── pombal_setup.py               # Guided installer — prerequisites, DB setup, config generation
-├── db_migrate.py                 # Database schema migrations (v0→v1→v2→v3)
-├── analyze_performance.py        # Performance reporting — completion rates, throughput, checkpoint analysis
+├── db_migrate.py                 # Database schema migrations (v0→v1→v2→v3→v4)
+├── analyze_performance.py        # Performance reporting — completion rates, throughput analysis
 ├── ollama_agent.py               # Local Ollama agent — sandboxed tool execution, file operations
 ├── prepare_training_data.py      # Converts datasets into chat-format training data for fine-tuning
 ├── train_qlora.py                # QLoRA fine-tuning script (manual implementation)
 ├── train_qlora_peft.py           # QLoRA fine-tuning script (PEFT/Hugging Face)
+├── prompts/
+│   ├── _common.md                        # Shared rules for all agents (quality standard, output format)
+│   ├── developer.md                      # Developer role prompt
+│   ├── tester.md                         # Tester role prompt
+│   └── ...                               # 9 role prompts total (auto-discovered by orchestrator)
 ├── skills/
-│   └── security/
-│       └── static-analysis/
-│           └── skills/sarif-parsing/
-│               └── resources/
-│                   └── sarif_helpers.py   # SARIF security report parsing and analysis utilities
-├── tests/
-│   ├── test_agent_actions.py             # Tests for action logging and error classification
-│   ├── test_agent_messages.py            # Tests for inter-agent messaging system
-│   ├── test_early_termination.py         # Tests for stuck detection and loop termination
-│   ├── test_loop_detection.py            # Tests for LoopDetector fingerprinting and thresholds
-│   ├── test_episode_injection.py         # Tests for episodic memory retrieval and Q-value updates
-│   ├── test_lessons_injection.py         # Tests for lesson retrieval and prompt injection
-│   ├── test_forgesmith_simba.py          # Tests for SIMBA rule synthesis pipeline
-│   ├── test_rubric_scoring.py            # Tests for rubric scoring and evolution
-│   ├── test_task_type_routing.py         # Tests for task_type-based prompt dispatch
-│   └── test_task_665_verification.py     # Integration verification tests
+│   ├── developer/                        # Codebase navigation, implementation planning, error recovery
+│   ├── tester/                           # Framework detection, test generation
+│   ├── debugger/                         # Systematic debugging (hypothesis-driven 5-step)
+│   ├── code-reviewer/                    # Architecture review, change-impact analysis
+│   └── security/                         # 7 Trail of Bits security skills
+├── test_*.py                             # Test suite (12 files, ~6000 lines)
 └── CLAUDE.md                             # Project context document for AI agents
 ```
 
@@ -312,7 +310,22 @@ Long-running agent tasks save checkpoints (`save_checkpoint`/`load_checkpoint`).
 Agents don't just pass results through the orchestrator — they can leave structured messages for each other via `post_agent_message` / `read_agent_messages`. Messages are scoped by task and cycle, with read-tracking so agents don't process the same message twice. This enables richer coordination than simple output passing.
 
 ### Schema migrations with versioning
-`db_migrate.py` implements a linear migration chain (v0→v1→v2→v3) with automatic backup before migration, legacy version detection, and a `schema_migrations` audit log. This lets the database evolve safely as new features are added.
+`db_migrate.py` implements a linear migration chain (v0→v1→v2→v3→v4) with automatic backup before migration, legacy version detection, and a `schema_migrations` audit log. This lets the database evolve safely as new features are added.
+
+### Git worktree isolation for parallel tasks
+When running multiple tasks on the same project, the orchestrator creates isolated git worktrees (`forge-task-{id}` branches). Each agent works in its own directory with its own branch. On success, the branch is merged back and cleaned up. On failure or merge conflict, the branch is **preserved** for manual recovery — no work is lost.
+
+### Per-role agent skills
+Each agent role loads specialized skills from `skills/` at task start. Skills teach concrete methods (e.g., the developer's codebase-navigation skill is a 4-step method that prevents analysis paralysis). Skills are markdown files loaded into the system prompt, not code — they're instructions, not tools.
+
+### Post-task quality scoring
+`rubric_quality_scorer.py` scores every completed task across 5 dimensions with role-specific weights. Scores are stored in the database and feed into ForgeSmith's analysis for effectiveness tracking. This provides quantitative quality signals beyond pass/fail.
+
+### Failure classification taxonomy
+Agent failures are classified into a structured taxonomy (`analysis_paralysis`, `build_failure`, `test_failure`, `import_error`, `timeout`, `wrong_approach`, `environment_error`, `max_turns`) rather than generic strings. SIMBA and GEPA use this taxonomy for targeted improvements.
+
+### Change-impact analysis
+`forgesmith_impact.py` assesses the blast radius before ForgeSmith applies any prompt or config mutation. It evaluates affected roles, task types, and risk level. HIGH-risk changes are blocked from auto-apply and require manual approval.
 
 ---
 
