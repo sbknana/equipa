@@ -282,8 +282,9 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 - **Inter-agent messaging** — Agents share findings, blockers, and context across cycles
 - **Loop detection** — Catches stuck agents and terminates gracefully
 - **Multi-model support** — Claude Code, Ollama (local models), configurable per role
+- **Multi-tool MCP support** — Auto-configures Claude Code, Roo Code, Cline, Cursor, Windsurf, and Continue.dev
 - **Database migrations** — Schema evolves safely with automatic backups, zero data loss
-- **Zero pip dependencies** — Pure Python stdlib. Requires Python 3.10+, Claude Code CLI, git, and uvx
+- **Zero pip dependencies** — Pure Python stdlib. Requires Python 3.10+, an MCP-compatible AI coding tool, git, and uvx
 
 ---
 
@@ -294,7 +295,7 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 | Tool | Install |
 |------|---------|
 | Python 3.10+ | [python.org](https://python.org) |
-| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` |
+| AI coding tool | Claude Code, Cursor, Roo Code, Cline, Windsurf, or Continue.dev |
 | git | [git-scm.com](https://git-scm.com) |
 | uvx / uv | [docs.astral.sh/uv](https://docs.astral.sh/uv) |
 
