@@ -395,6 +395,27 @@ CREATE TABLE rubric_evolution_history (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Model registry for tracking ML training runs and results
+CREATE TABLE model_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    model_type TEXT NOT NULL,        -- lstm_v3, xgboost, ensemble
+    version TEXT NOT NULL,            -- v3_20260305
+    symbol_count INTEGER,
+    avg_directional_accuracy REAL,
+    median_da REAL,
+    above_50_pct REAL,
+    top_symbol TEXT,
+    top_da REAL,
+    trained_on TEXT,                  -- pc_wsl, forge-inference, claudinator
+    model_path TEXT,                  -- where the models live
+    synced_to TEXT,                   -- comma-separated: claudinator, forge-inference
+    trained_at DATETIME,
+    logged_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+
 -- ============================================================
 -- INDEXES
 -- ============================================================
@@ -408,6 +429,8 @@ CREATE INDEX idx_xref_source ON cross_references(source_table, source_id);
 CREATE INDEX idx_xref_target ON cross_references(target_table, target_id);
 CREATE INDEX idx_agent_runs_project ON agent_runs(project_id);
 CREATE INDEX idx_agent_runs_role ON agent_runs(role);
+CREATE INDEX idx_model_registry_project ON model_registry(project_id, model_type);
+CREATE INDEX idx_model_registry_version ON model_registry(version);
 
 -- ============================================================
 -- TRIGGERS
