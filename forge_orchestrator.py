@@ -207,6 +207,12 @@ COST_LIMITS = {
 }
 COST_ESTIMATE_PER_TURN = 0.15  # estimated cost per turn when actual cost is None (killed runs)
 
+# Pre-flight build check: detect build failures before agent starts
+PREFLIGHT_TIMEOUT = 60  # max seconds to wait for build check
+PREFLIGHT_SKIP_KEYWORDS = frozenset({
+    "fix", "build", "compile", "broken", "compilation", "error",
+})
+
 # Manager mode constants (Phase 3)
 MAX_MANAGER_ROUNDS = 3       # max plan-execute-evaluate rounds
 MAX_TASKS_PER_PLAN = 8       # planner can't create more than this
@@ -3598,6 +3604,149 @@ async def auto_install_dependencies(project_dir, output=None):
         except Exception as e:
             log(f"  [Auto-Install] npm install error: {e}", output)
 
+    # Go: go.mod present — download modules
+    has_go_mod = (pdir / "go.mod").exists()
+    if has_go_mod:
+        log(f"  [Auto-Install] Go project detected. Running go mod download...", output)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "go", "mod", "download",
+                cwd=str(pdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                log(f"  [Auto-Install] Go modules downloaded successfully.", output)
+            else:
+                err = stderr.decode("utf-8", errors="replace")[:200]
+                log(f"  [Auto-Install] go mod download failed (rc={proc.returncode}): {err}", output)
+        except FileNotFoundError:
+            log(f"  [Auto-Install] go not found. Skipping Go dep install.", output)
+        except Exception as e:
+            log(f"  [Auto-Install] Go install error: {e}", output)
+
+
+async def preflight_build_check(project_dir, task_description=None, output=None):
+    """Run a lightweight build check before the developer agent starts.
+
+    Detects the project language from manifest files and runs a quick build
+    command to catch pre-existing build failures. This gives the agent context
+    about the current build state before it begins working.
+
+    Args:
+        project_dir: Path to the project directory.
+        task_description: Optional task description. If it contains build-fix
+            keywords (fix, build, compile, broken), the check is skipped since
+            the task IS to fix the build.
+        output: Optional output callback for logging.
+
+    Returns:
+        Tuple of (success: bool, language: str, error_details: str).
+        success=True means either the build passed or the check was skipped.
+        language is one of: 'node', 'go', 'python', 'csharp', 'unknown'.
+        error_details contains build stderr/stdout on failure, or 'skipped' reason.
+    """
+    pdir = Path(project_dir)
+
+    # Skip if task description mentions build-fix keywords
+    if task_description:
+        desc_lower = task_description.lower()
+        for keyword in PREFLIGHT_SKIP_KEYWORDS:
+            if keyword in desc_lower:
+                log(f"  [Preflight] Skipped — task description contains '{keyword}' "
+                    f"(task is likely to fix the build)", output)
+                return (True, "unknown", f"Skipped: task description contains '{keyword}'")
+
+    # Detect language from project files
+    has_package_json = (pdir / "package.json").exists()
+    has_go_mod = (pdir / "go.mod").exists()
+    has_pyproject = (pdir / "pyproject.toml").exists()
+    has_requirements = (pdir / "requirements.txt").exists()
+    csproj_files = list(pdir.glob("*.csproj"))
+
+    # Determine language and build command
+    language = "unknown"
+    build_cmd = None
+
+    if has_package_json:
+        language = "node"
+        # Prefer tsc --noEmit for type checking, fall back to npm run build
+        tsconfig = pdir / "tsconfig.json"
+        if tsconfig.exists():
+            build_cmd = ["npx", "tsc", "--noEmit"]
+        else:
+            build_cmd = ["npm", "run", "build"]
+    elif has_go_mod:
+        language = "go"
+        build_cmd = ["go", "build", "./..."]
+    elif has_pyproject or has_requirements:
+        language = "python"
+        # Try to compile the main entry point if it exists
+        main_py = pdir / "main.py"
+        app_py = pdir / "app.py"
+        if main_py.exists():
+            build_cmd = ["python3", "-m", "py_compile", str(main_py)]
+        elif app_py.exists():
+            build_cmd = ["python3", "-m", "py_compile", str(app_py)]
+        else:
+            # No obvious entry point — skip build check but report language
+            log(f"  [Preflight] Python project detected but no main.py/app.py found. Skipping build check.", output)
+            return (True, language, "Skipped: no Python entry point found")
+    elif csproj_files:
+        language = "csharp"
+        build_cmd = ["dotnet", "build", str(csproj_files[0]), "--no-restore"]
+    else:
+        log(f"  [Preflight] No recognized project files found. Skipping build check.", output)
+        return (True, "unknown", "")
+
+    # Run the build command with timeout
+    log(f"  [Preflight] Detected {language} project. Running build check: {' '.join(build_cmd)}", output)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *build_cmd,
+            cwd=str(pdir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=PREFLIGHT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # Kill the process on timeout
+            proc.kill()
+            await proc.communicate()
+            error_msg = f"Build check timed out after {PREFLIGHT_TIMEOUT}s"
+            log(f"  [Preflight] TIMEOUT: {error_msg}", output)
+            return (False, language, error_msg)
+
+        if proc.returncode == 0:
+            log(f"  [Preflight] Build check passed ({language}).", output)
+            return (True, language, "")
+        else:
+            # Capture error output, truncate to keep context manageable
+            error_output = stderr.decode("utf-8", errors="replace")
+            stdout_output = stdout.decode("utf-8", errors="replace")
+            combined = (error_output + "\n" + stdout_output).strip()
+            # Truncate to 1000 chars to avoid bloating compaction history
+            if len(combined) > 1000:
+                combined = combined[:1000] + "\n... (truncated)"
+            log(f"  [Preflight] Build FAILED ({language}, rc={proc.returncode}). "
+                f"Error preview: {combined[:200]}", output)
+            return (False, language, combined)
+
+    except FileNotFoundError:
+        # Build tool not installed (e.g., go, dotnet, npx not on PATH)
+        error_msg = f"Build tool not found for {language}: {build_cmd[0]}"
+        log(f"  [Preflight] {error_msg}. Skipping build check.", output)
+        return (True, language, f"Skipped: {error_msg}")
+    except Exception as e:
+        # Unexpected error — don't block the task
+        error_msg = f"Preflight error: {e}"
+        log(f"  [Preflight] {error_msg}. Continuing without build check.", output)
+        return (True, language, f"Skipped: {error_msg}")
+
 
 # --- Loop Detection ---
 
@@ -3856,6 +4005,12 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
     # Auto-install deps before first cycle if needed
     await auto_install_dependencies(project_dir, output=output)
 
+    # Pre-flight build check: detect build failures before agent starts
+    task_description = task.get("description", "") if isinstance(task, dict) else ""
+    preflight_ok, preflight_lang, preflight_error = await preflight_build_check(
+        project_dir, task_description=task_description, output=output,
+    )
+
     compaction_history = []  # accumulated context across cycles
     no_progress_count = 0    # consecutive cycles with no FILES_CHANGED
     continuation_count = 0   # auto-retries when developer runs out of turns
@@ -3905,6 +4060,21 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         compaction_history.append(checkpoint_context)
         log(f"  [Checkpoint] Loaded checkpoint from attempt #{prev_attempt} "
             f"({len(checkpoint_text)} chars). Agent will continue from there.", output)
+
+    # Inject preflight build failure context so the agent knows the build state
+    if not preflight_ok and preflight_error:
+        preflight_context = (
+            f"## Pre-flight Build Check FAILED ({preflight_lang})\n\n"
+            f"The project build was checked before your session started and it **failed**.\n"
+            f"This may be a pre-existing issue or caused by recent changes.\n\n"
+            f"**Build error output:**\n```\n{preflight_error}\n```\n\n"
+            f"Take this into account when working on your task. "
+            f"If your task is unrelated to the build failure, "
+            f"focus on your task but be aware the build is broken."
+        )
+        compaction_history.append(preflight_context)
+        log(f"  [Preflight] Build failure context injected into agent history "
+            f"({len(preflight_error)} chars)", output)
 
     for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
         log(f"\n{'=' * 50}", output)

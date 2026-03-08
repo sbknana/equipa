@@ -43,6 +43,16 @@ Tests verify:
 38. Cost limits configurable via dispatch_config overrides
 39. Early termination results recorded in LoopDetector for cross-cycle learning
 40. Cost estimate for killed runs uses COST_ESTIMATE_PER_TURN ($0.15) formula
+41. Preflight detects Node.js project via package.json
+42. Preflight detects Go project via go.mod
+43. Preflight detects Python project via requirements.txt/pyproject.toml
+44. Preflight detects C# project via .csproj
+45. Preflight skipped for build-fix tasks (task description contains fix/build/compile/broken)
+46. Preflight failure returns useful error context for injection
+47. Preflight timeout constant is 60 seconds
+48. Preflight does not block task (returns tuple, never raises)
+49. Preflight returns unknown for directories with no recognized project files
+50. Preflight skip keywords contain expected build-fix keywords
 
 Copyright 2026 Forgeborn
 """
@@ -62,6 +72,7 @@ from forge_orchestrator import (
     _detect_tool_loop,
     _get_budget_message,
     _parse_early_complete,
+    preflight_build_check,
     BUDGET_CHECK_INTERVAL,
     BUDGET_HALFWAY_THRESHOLD,
     BUDGET_CRITICAL_THRESHOLD,
@@ -75,6 +86,8 @@ from forge_orchestrator import (
     LoopDetector,
     MONOLOGUE_THRESHOLD,
     MONOLOGUE_EXEMPT_TURNS,
+    PREFLIGHT_TIMEOUT,
+    PREFLIGHT_SKIP_KEYWORDS,
 )
 
 
@@ -866,6 +879,183 @@ def test_cost_estimate_for_killed_runs():
         f"killed run cost ${killed_estimate:.2f} should exceed simple limit ($3.00)"
 
 
+# --- Tests for preflight_build_check (multi-language pre-flight build) ---
+
+def test_preflight_detects_node_project():
+    """Test that preflight_build_check detects a Node.js project via package.json."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a package.json to signal Node.js project
+        pkg_json = Path(tmpdir) / "package.json"
+        pkg_json.write_text('{"name": "test", "scripts": {"build": "echo ok"}}')
+
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert language == "node", f"expected language='node', got '{language}'"
+
+
+def test_preflight_detects_go_project():
+    """Test that preflight_build_check detects a Go project via go.mod."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a go.mod to signal Go project
+        go_mod = Path(tmpdir) / "go.mod"
+        go_mod.write_text("module example.com/test\n\ngo 1.21\n")
+
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert language == "go", f"expected language='go', got '{language}'"
+
+
+def test_preflight_detects_python_project():
+    """Test that preflight_build_check detects a Python project via requirements.txt or pyproject.toml."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a requirements.txt to signal Python project
+        req = Path(tmpdir) / "requirements.txt"
+        req.write_text("flask==3.0.0\n")
+
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert language == "python", f"expected language='python', got '{language}'"
+
+    # Also test with pyproject.toml
+    with tempfile.TemporaryDirectory() as tmpdir2:
+        pyproject = Path(tmpdir2) / "pyproject.toml"
+        pyproject.write_text('[project]\nname = "test"\n')
+
+        success2, language2, error_details2 = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir2)
+        )
+        assert language2 == "python", f"expected language='python' for pyproject.toml, got '{language2}'"
+
+
+def test_preflight_detects_csharp_project():
+    """Test that preflight_build_check detects a C# project via .csproj file."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a .csproj file to signal C# project
+        csproj = Path(tmpdir) / "MyApp.csproj"
+        csproj.write_text('<Project Sdk="Microsoft.NET.Sdk">\n</Project>')
+
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert language == "csharp", f"expected language='csharp', got '{language}'"
+
+
+def test_preflight_skipped_for_build_fix_tasks():
+    """Test that preflight check is skipped when task description mentions build-fix keywords."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a package.json so it would normally detect Node.js
+        pkg_json = Path(tmpdir) / "package.json"
+        pkg_json.write_text('{"name": "test"}')
+
+        # Task descriptions that should skip preflight
+        skip_descriptions = [
+            "Fix the build errors in the CI pipeline",
+            "The project won't compile, please help",
+            "Fix broken tests and build",
+            "Resolve compilation issues",
+        ]
+        for desc in skip_descriptions:
+            success, language, error_details = asyncio.get_event_loop().run_until_complete(
+                preflight_build_check(tmpdir, task_description=desc)
+            )
+            assert success is True, \
+                f"preflight should return success=True (skipped) for task desc: '{desc}'"
+            assert "skipped" in error_details.lower(), \
+                f"error_details should mention 'skipped' for task desc: '{desc}', got '{error_details}'"
+
+
+def test_preflight_failure_injected_into_context():
+    """Test that a failed preflight returns useful error context for injection."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a package.json with a build script that will fail
+        pkg_json = Path(tmpdir) / "package.json"
+        pkg_json.write_text('{"name": "test", "scripts": {"build": "exit 1"}}')
+
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        # The build command will likely fail (no node_modules, or exit 1)
+        # Either way, we should get meaningful error details back
+        assert language == "node", f"should still detect language as 'node', got '{language}'"
+        if not success:
+            assert len(error_details) > 0, \
+                "failed preflight should include error details for context injection"
+
+
+def test_preflight_timeout_at_60s():
+    """Test that PREFLIGHT_TIMEOUT constant is set to 60 seconds."""
+    assert PREFLIGHT_TIMEOUT == 60, \
+        f"PREFLIGHT_TIMEOUT should be 60 seconds, got {PREFLIGHT_TIMEOUT}"
+
+
+def test_preflight_does_not_block_task():
+    """Test that preflight_build_check returns a tuple (not raises) even on failure."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a go.mod but no Go source files — build will fail
+        go_mod = Path(tmpdir) / "go.mod"
+        go_mod.write_text("module example.com/test\n\ngo 1.21\n")
+
+        # Should NOT raise an exception — returns a result tuple
+        result = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert isinstance(result, tuple), f"expected tuple, got {type(result)}"
+        assert len(result) == 3, f"expected 3-element tuple, got {len(result)}"
+        success, language, error_details = result
+        assert isinstance(success, bool), f"success should be bool, got {type(success)}"
+        assert isinstance(language, str), f"language should be str, got {type(language)}"
+        assert isinstance(error_details, str), f"error_details should be str, got {type(error_details)}"
+
+
+def test_preflight_unknown_project():
+    """Test that preflight_build_check handles a directory with no recognized project files."""
+    import tempfile
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Empty directory — no project files
+        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            preflight_build_check(tmpdir)
+        )
+        assert success is True, "empty dir should return success=True (nothing to check)"
+        assert language == "unknown", f"expected language='unknown', got '{language}'"
+
+
+def test_preflight_skip_keywords_exist():
+    """Test that PREFLIGHT_SKIP_KEYWORDS contains expected build-fix related keywords."""
+    assert isinstance(PREFLIGHT_SKIP_KEYWORDS, (list, tuple, set, frozenset)), \
+        f"PREFLIGHT_SKIP_KEYWORDS should be a sequence, got {type(PREFLIGHT_SKIP_KEYWORDS)}"
+    # Must contain at least these keywords
+    required = {"fix", "build", "compile", "broken"}
+    keywords_lower = {k.lower() for k in PREFLIGHT_SKIP_KEYWORDS}
+    missing = required - keywords_lower
+    assert not missing, f"PREFLIGHT_SKIP_KEYWORDS missing: {missing}"
+
+
 # --- Main ---
 
 def main():
@@ -921,6 +1111,17 @@ def main():
         test_cost_breaker_configurable_via_dispatch_config,
         test_early_term_recorded_in_loop_detector,
         test_cost_estimate_for_killed_runs,
+        # Preflight build check tests
+        test_preflight_detects_node_project,
+        test_preflight_detects_go_project,
+        test_preflight_detects_python_project,
+        test_preflight_detects_csharp_project,
+        test_preflight_skipped_for_build_fix_tasks,
+        test_preflight_failure_injected_into_context,
+        test_preflight_timeout_at_60s,
+        test_preflight_does_not_block_task,
+        test_preflight_unknown_project,
+        test_preflight_skip_keywords_exist,
     ]
 
     passed = 0
@@ -931,7 +1132,8 @@ def main():
     print(f"  Early Termination Test Suite")
     print(f"  Testing _check_stuck_phrases, _compute_output_hash,")
     print(f"  _detect_tool_loop with output hashes, dead code removal,")
-    print(f"  _parse_early_complete, _get_budget_message, _check_cost_limit")
+    print(f"  _parse_early_complete, _get_budget_message, _check_cost_limit,")
+    print(f"  preflight_build_check")
     print(f"{'=' * 60}\n")
 
     for test_fn in tests:
