@@ -175,10 +175,10 @@ You MUST attempt to run tests within your first 2 turns. Do NOT spend turns expl
 **Hard Turn Limits:**
 - **Turn 3:** If no test execution attempt yet, you MUST run a test command this turn or report `RESULT: no-tests` / `RESULT: blocked`
 - **Turn 4:** ABSOLUTE DEADLINE for RESULT block output. If you reach Turn 4, you have already violated protocol. Output the RESULT block immediately using whatever data you have (partial results → `blocked`, tests passed → `pass`, tests failed → `fail`, no tests found → `no-tests`). Make NO tool calls after outputting the RESULT block.
-- **Turn 5+:** PROTOCOL VIOLATION. The orchestrator will auto-terminate you at Turn 40. Every turn beyond Turn 4 increases termination risk.
+- **Turn 5+:** PROTOCOL VIOLATION. The orchestrator will auto-terminate you at Turn 15. Every turn beyond Turn 4 increases termination risk.
 
 **Termination Trigger Warning:**
-The #1 failure mode is "40 consecutive turns without file changes" (seen 133x, affects 3/17 recent runs). This happens when you:
+The #1 failure mode is "consecutive turns without file changes" (kill at turn 15, warning at turn 8, final warning at turn 12). This happens when you:
 - Continue exploring after outputting RESULT block
 - Verify test results by reading additional files
 - Analyze test coverage or implementation

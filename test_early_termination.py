@@ -10,8 +10,9 @@ Tests verify:
 5. _check_repeated_tool_calls returns False for varied calls
 6. _check_repeated_tool_calls handles short history gracefully
 7. EARLY_TERM_EXEMPT_ROLES includes all expected roles
-8. EARLY_TERM_WARN_TURNS and EARLY_TERM_KILL_TURNS have correct values
+8. EARLY_TERM_WARN_TURNS, EARLY_TERM_FINAL_WARN_TURNS, and EARLY_TERM_KILL_TURNS have correct values
 9. _detect_tool_loop integrates correctly with early termination thresholds
+10. Escalating warning thresholds are ordered correctly (warn < final_warn < kill)
 
 Copyright 2026 Forgeborn
 """
@@ -27,6 +28,7 @@ from forge_orchestrator import (
     _check_repeated_tool_calls,
     _detect_tool_loop,
     EARLY_TERM_WARN_TURNS,
+    EARLY_TERM_FINAL_WARN_TURNS,
     EARLY_TERM_KILL_TURNS,
     EARLY_TERM_STUCK_PHRASES,
     EARLY_TERM_EXEMPT_ROLES,
@@ -139,10 +141,11 @@ def test_repeated_tools_custom_window():
 
 def test_constants_values():
     """Test that early termination constants have expected values."""
-    assert EARLY_TERM_WARN_TURNS == 25, f"EARLY_TERM_WARN_TURNS should be 25, got {EARLY_TERM_WARN_TURNS}"
-    assert EARLY_TERM_KILL_TURNS == 40, f"EARLY_TERM_KILL_TURNS should be 40, got {EARLY_TERM_KILL_TURNS}"
-    assert EARLY_TERM_WARN_TURNS < EARLY_TERM_KILL_TURNS, \
-        f"WARN_TURNS ({EARLY_TERM_WARN_TURNS}) should be < KILL_TURNS ({EARLY_TERM_KILL_TURNS})"
+    assert EARLY_TERM_WARN_TURNS == 8, f"EARLY_TERM_WARN_TURNS should be 8, got {EARLY_TERM_WARN_TURNS}"
+    assert EARLY_TERM_FINAL_WARN_TURNS == 12, f"EARLY_TERM_FINAL_WARN_TURNS should be 12, got {EARLY_TERM_FINAL_WARN_TURNS}"
+    assert EARLY_TERM_KILL_TURNS == 15, f"EARLY_TERM_KILL_TURNS should be 15, got {EARLY_TERM_KILL_TURNS}"
+    assert EARLY_TERM_WARN_TURNS < EARLY_TERM_FINAL_WARN_TURNS < EARLY_TERM_KILL_TURNS, \
+        f"WARN_TURNS ({EARLY_TERM_WARN_TURNS}) < FINAL_WARN_TURNS ({EARLY_TERM_FINAL_WARN_TURNS}) < KILL_TURNS ({EARLY_TERM_KILL_TURNS})"
 
 
 def test_exempt_roles_contains_expected():

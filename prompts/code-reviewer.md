@@ -136,7 +136,7 @@ SUMMARY: One-line overall code quality assessment
 
 4. In your final turn, append the complete RESULT block from "Output Format" section.
 
-**WHY THIS IS CRITICAL**: The system terminates agents after 40 turns without file changes. 17% of your runs hit max turns. Writing output in turn 1 and updating frequently prevents forced termination.
+**WHY THIS IS CRITICAL**: The system terminates agents after 15 turns without file changes (warning at turn 8, final warning at turn 12). Writing output in turn 1 and updating frequently prevents forced termination.
 
 ---
 

@@ -168,8 +168,10 @@ NO_PROGRESS_LIMIT = 2            # consecutive no-change runs before blocking
 MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns/timeout
 
 # Early termination: detect stuck agents mid-run and kill before wasting turns
-EARLY_TERM_WARN_TURNS = 25       # turns with no Edit/Write before injecting warning
-EARLY_TERM_KILL_TURNS = 40       # turns with no Edit/Write before killing agent
+# Escalating warnings: first warning → final warning → kill
+EARLY_TERM_WARN_TURNS = 8        # turns with no Edit/Write before first warning
+EARLY_TERM_FINAL_WARN_TURNS = 12 # turns with no Edit/Write before final warning
+EARLY_TERM_KILL_TURNS = 15       # turns with no Edit/Write before killing agent
 EARLY_TERM_STUCK_PHRASES = [
     "i am unable to",
     "i cannot",
@@ -1005,12 +1007,12 @@ def classify_agent_failure(outcome, result, result_text=""):
     if "consecutive turns without file changes" in lower_reason:
         classes_detected.append("analysis_paralysis")
         signals.append(f"early_term: {early_term_reason[:120]}")
-    elif "40 consecutive" in lower_errors or "without file changes" in lower_errors:
+    elif "consecutive" in lower_errors and "without file changes" in lower_errors:
         classes_detected.append("analysis_paralysis")
         signals.append("error mentions consecutive turns without file changes")
     # Also detect from result text: agent stuck exploring
     if (not classes_detected
-            and num_turns >= 30
+            and num_turns >= EARLY_TERM_KILL_TURNS
             and "files_changed: none" in lower_result):
         classes_detected.append("analysis_paralysis")
         signals.append(f"high turn count ({num_turns}) with no files changed")
@@ -2600,8 +2602,13 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
     turn_count = 0
     turns_without_file_change = 0
     # Scale early termination with budget — larger budgets get more reading time
-    effective_kill_turns = max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.85))
-    effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.7))
+    # but never exceed 2x the base threshold (prevents overly generous scaling)
+    effective_kill_turns = min(
+        EARLY_TERM_KILL_TURNS * 2,
+        max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.4))
+    )
+    effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.8))
+    effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.5))
     has_any_file_change = False
     tool_history = []          # list of "tool_name:key_input" strings
     tool_errors = []           # list of error strings (None if success, string if error)
@@ -2610,6 +2617,7 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
     all_text_chunks = []       # accumulate assistant text for final result
     result_data = None         # the final "result" message from stream-json
     warning_injected = False
+    final_warning_injected = False  # track if final warning has been injected
     loop_warning_injected = False  # track if we've warned about loop detection
     early_term_reason = None
     loop_detected_details = None  # store loop details for error_summary
@@ -2782,13 +2790,25 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                             loop_warning_injected = True
 
                         # File-change turn monitoring (non-exempt roles only)
+                        # Escalating warnings: first warning → final warning → kill
                         if not is_exempt and turns_without_file_change > 0:
                             if (turns_without_file_change >= effective_warn_turns
                                     and not warning_injected):
                                 log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
                                     f"turns without file changes (role={role}, "
-                                    f"turn ~{turn_count})", output)
+                                    f"turn ~{turn_count}). Start writing code NOW.",
+                                    output)
                                 warning_injected = True
+
+                            if (turns_without_file_change >= effective_final_warn_turns
+                                    and not final_warning_injected):
+                                log(f"  [EarlyTerm] FINAL WARNING: "
+                                    f"{turns_without_file_change} turns without file "
+                                    f"changes (role={role}, turn ~{turn_count}). "
+                                    f"Agent WILL BE KILLED at turn "
+                                    f"{effective_kill_turns}. Write files immediately "
+                                    f"or commit partial progress.", output)
+                                final_warning_injected = True
 
                             if turns_without_file_change >= effective_kill_turns:
                                 early_term_reason = (
@@ -4578,17 +4598,40 @@ def _is_git_repo(path):
 def resolve_project_dir(task):
     """Find the project directory for a task's project.
 
+    Resolution order:
+    1. dispatch_config/forge_config project_dirs (exact match)
+    2. TheForge DB local_path (source of truth)
+
     Uses exact match only — no partial/substring matching to prevent
     path traversal via crafted project codenames (security finding #3).
     """
     codename = task.get("project_codename", "").lower().strip()
     project_name = task.get("project_name", "").lower().strip()
 
-    # Exact match on codename first, then project name
+    # 1. Check config file overrides first (exact match)
     if codename and codename in PROJECT_DIRS:
         return PROJECT_DIRS[codename]
     if project_name and project_name in PROJECT_DIRS:
         return PROJECT_DIRS[project_name]
+
+    # 2. Fall back to TheForge DB local_path (source of truth)
+    project_id = task.get("project_id")
+    if project_id and THEFORGE_DB:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(THEFORGE_DB)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT local_path FROM projects WHERE id = ? AND local_path IS NOT NULL",
+                (project_id,)
+            ).fetchone()
+            conn.close()
+            if row and row["local_path"]:
+                db_path = row["local_path"].rstrip("/").rstrip("\\")
+                if Path(db_path).exists():
+                    return db_path
+        except Exception as e:
+            print(f"WARNING: DB lookup for project dir failed: {e}")
 
     return None
 
