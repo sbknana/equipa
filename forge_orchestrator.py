@@ -2658,6 +2658,55 @@ def _check_cost_limit(total_cost, complexity, config_limits=None):
     return None
 
 
+def _check_git_changes(project_dir):
+    """Check if the project's git working tree has any changes (modified, staged, or untracked).
+
+    Runs `git diff --stat` and `git status --short` in the project directory.
+    Returns True if either command produces output (indicating file changes).
+
+    Args:
+        project_dir: Path to the project directory (must be a git repo).
+
+    Returns:
+        bool: True if file changes detected, False otherwise (including errors).
+    """
+    if not project_dir:
+        return False
+
+    project_dir_str = str(project_dir)
+    if not os.path.isdir(project_dir_str):
+        return False
+
+    try:
+        # Check for unstaged changes
+        diff_result = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=project_dir_str,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if diff_result.returncode == 0 and diff_result.stdout.strip():
+            return True
+
+        # Check for staged/untracked files
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=project_dir_str,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if status_result.returncode == 0 and status_result.stdout.strip():
+            return True
+
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        # If git isn't available or times out, don't false-positive
+        return False
+
+    return False
+
+
 def _parse_early_complete(text):
     """Parse an EARLY_COMPLETE: <reason> signal from agent text.
 
@@ -2855,7 +2904,7 @@ def _detect_tool_loop(tool_history, tool_errors, warn_threshold=3,
 
 async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                               max_turns=None, task_id=None, run_id=None,
-                              cycle_number=1):
+                              cycle_number=1, project_dir=None):
     """Spawn claude -p with stream-json output for real-time stuck detection.
 
     Monitors agent output turn-by-turn and terminates early if stuck signals
@@ -3202,6 +3251,18 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                             if is_error and error_text:
                                 entry["error_type"] = classify_error(error_text)
                                 entry["error_summary"] = error_text[:200]
+
+                            # After a Bash tool completes, check git for file changes.
+                            # This catches file modifications invisible to tool-name detection
+                            # (e.g., rm, sed, echo >, git commit via Bash).
+                            # Note: tool_result arrives AFTER the assistant turn counter was
+                            # already updated, so we reset turns_without_file_change directly.
+                            if entry.get("tool") == "Bash" and project_dir:
+                                if _check_git_changes(project_dir):
+                                    has_any_file_change = True
+                                    turns_without_file_change = 0
+                                    log(f"  [FileDetect] Git detected file changes "
+                                        f"via Bash command", output)
 
     except Exception as e:
         early_term_reason = f"Streaming monitor error: {e}"
@@ -3977,7 +4038,8 @@ async def dispatch_agent(cmd, role, output, max_turns, task_id, cycle,
     if use_streaming:
         return await run_agent_streaming(
             cmd, role=role, output=output, max_turns=max_turns,
-            task_id=task_id, run_id=None, cycle_number=cycle)
+            task_id=task_id, run_id=None, cycle_number=cycle,
+            project_dir=project_dir)
     else:
         return await run_agent(cmd)
 

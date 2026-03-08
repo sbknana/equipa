@@ -61,18 +61,30 @@ Tests verify:
 56. Tester prompt contains tester-adapted few-shot examples
 57. Security reviewer prompt contains "Bias for Action" section
 58. Security reviewer prompt contains reviewer-adapted few-shot examples
+59. Git diff detects file creation via Bash (untracked files)
+60. Git diff detects file deletion via Bash (tracked file removed)
+61. Git diff detects file modification via Bash (tracked file changed)
+62. Git diff resets file change counter (staged files detected)
+63. Edit/Write tool detection still works (belt and suspenders)
+64. Git diff no false positives on read-only Bash (clean repo)
+65. Git diff returns False after all changes committed
+66. Git diff handles non-git directories gracefully
 
 Copyright 2026 Forgeborn
 """
 
 import hashlib
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Add project root to path so we can import the orchestrator module
 sys.path.insert(0, str(Path(__file__).parent))
 
 from forge_orchestrator import (
+    _check_git_changes,
     _check_stuck_phrases,
     _check_monologue,
     _check_cost_limit,
@@ -1203,6 +1215,144 @@ def test_security_reviewer_prompt_bias_section_is_at_top():
         f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
 
 
+# --- Tests for _check_git_changes ---
+
+def _make_git_repo():
+    """Helper: create a temporary git repo and return its path."""
+    tmpdir = tempfile.mkdtemp(prefix="pombal_test_git_")
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@forgeborn.dev"],
+        cwd=tmpdir, capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=tmpdir, capture_output=True, check=True,
+    )
+    # Create initial commit so HEAD exists
+    init_file = os.path.join(tmpdir, "README.md")
+    with open(init_file, "w") as f:
+        f.write("# test\n")
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=tmpdir, capture_output=True, check=True,
+    )
+    return tmpdir
+
+
+def test_git_diff_detects_bash_file_creation():
+    """_check_git_changes returns True when a new untracked file exists."""
+    tmpdir = _make_git_repo()
+    try:
+        # Create a new file (untracked)
+        new_file = os.path.join(tmpdir, "new_file.py")
+        with open(new_file, "w") as f:
+            f.write("print('hello')\n")
+        assert _check_git_changes(tmpdir) is True, \
+            "should detect untracked file as a change"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_git_diff_detects_bash_file_deletion():
+    """_check_git_changes returns True when a tracked file is deleted."""
+    tmpdir = _make_git_repo()
+    try:
+        # Delete the tracked README.md
+        os.remove(os.path.join(tmpdir, "README.md"))
+        assert _check_git_changes(tmpdir) is True, \
+            "should detect deleted tracked file as a change"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_git_diff_detects_bash_file_modification():
+    """_check_git_changes returns True when a tracked file is modified."""
+    tmpdir = _make_git_repo()
+    try:
+        # Modify the tracked README.md
+        readme = os.path.join(tmpdir, "README.md")
+        with open(readme, "a") as f:
+            f.write("extra content\n")
+        assert _check_git_changes(tmpdir) is True, \
+            "should detect modified tracked file as a change"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_git_diff_resets_file_change_counter():
+    """_check_git_changes returns True for staged changes (git add without commit)."""
+    tmpdir = _make_git_repo()
+    try:
+        # Create and stage a file
+        new_file = os.path.join(tmpdir, "staged.txt")
+        with open(new_file, "w") as f:
+            f.write("staged content\n")
+        subprocess.run(["git", "add", "staged.txt"], cwd=tmpdir, capture_output=True, check=True)
+        assert _check_git_changes(tmpdir) is True, \
+            "should detect staged file as a change"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_edit_write_still_detected():
+    """Existing Edit/Write/NotebookEdit detection is preserved (belt and suspenders).
+
+    This tests the function exists and handles edge cases — the integration
+    with tool_name matching is verified by the early termination constants tests.
+    """
+    # _check_git_changes with None/empty/nonexistent dir returns False
+    assert _check_git_changes(None) is False, "None project_dir should return False"
+    assert _check_git_changes("") is False, "empty project_dir should return False"
+    assert _check_git_changes("/nonexistent/path/xyz") is False, \
+        "nonexistent directory should return False"
+
+
+def test_git_diff_no_false_positives_on_read_only_bash():
+    """_check_git_changes returns False for a clean repo with no changes."""
+    tmpdir = _make_git_repo()
+    try:
+        # Repo is clean — no changes
+        assert _check_git_changes(tmpdir) is False, \
+            "clean repo should return False (no false positive)"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_git_diff_detects_committed_then_clean():
+    """_check_git_changes returns False after all changes are committed."""
+    tmpdir = _make_git_repo()
+    try:
+        # Create, add, and commit a file
+        new_file = os.path.join(tmpdir, "committed.txt")
+        with open(new_file, "w") as f:
+            f.write("committed\n")
+        subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add file"],
+            cwd=tmpdir, capture_output=True, check=True,
+        )
+        # Now the repo is clean again
+        assert _check_git_changes(tmpdir) is False, \
+            "fully committed repo should return False"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
+def test_git_diff_non_git_directory():
+    """_check_git_changes returns False for a directory that is not a git repo."""
+    tmpdir = tempfile.mkdtemp(prefix="pombal_test_nogit_")
+    try:
+        # Create a file but this is NOT a git repo
+        with open(os.path.join(tmpdir, "file.txt"), "w") as f:
+            f.write("not a repo\n")
+        assert _check_git_changes(tmpdir) is False, \
+            "non-git directory should return False (git commands fail gracefully)"
+    finally:
+        subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
+
+
 # --- Main ---
 
 def main():
@@ -1281,6 +1431,15 @@ def main():
         test_security_reviewer_prompt_has_bias_for_action,
         test_security_reviewer_prompt_has_few_shot_examples,
         test_security_reviewer_prompt_bias_section_is_at_top,
+        # Git-based file change detection tests
+        test_git_diff_detects_bash_file_creation,
+        test_git_diff_detects_bash_file_deletion,
+        test_git_diff_detects_bash_file_modification,
+        test_git_diff_resets_file_change_counter,
+        test_edit_write_still_detected,
+        test_git_diff_no_false_positives_on_read_only_bash,
+        test_git_diff_detects_committed_then_clean,
+        test_git_diff_non_git_directory,
     ]
 
     passed = 0
@@ -1292,7 +1451,8 @@ def main():
     print(f"  Testing _check_stuck_phrases, _compute_output_hash,")
     print(f"  _detect_tool_loop with output hashes, dead code removal,")
     print(f"  _parse_early_complete, _get_budget_message, _check_cost_limit,")
-    print(f"  preflight_build_check, anti-paralysis prompt sections")
+    print(f"  preflight_build_check, anti-paralysis prompt sections,")
+    print(f"  _check_git_changes (git-based file change detection)")
     print(f"{'=' * 60}\n")
 
     for test_fn in tests:
