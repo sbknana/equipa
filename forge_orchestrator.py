@@ -191,6 +191,12 @@ EARLY_TERM_EXEMPT_ROLES = {"planner", "evaluator", "security-reviewer", "code-re
 MONOLOGUE_THRESHOLD = 3      # terminate after this many text-only turns in a row
 MONOLOGUE_EXEMPT_TURNS = 5   # do not trigger during first N turns (agent may be planning)
 
+# Budget visibility: inject remaining budget info into agent context
+# Based on BATS research — budget visibility reduces wasted turns by ~40%
+BUDGET_CHECK_INTERVAL = 5    # inject budget message every N turns
+BUDGET_HALFWAY_THRESHOLD = 0.5   # fraction of budget used to trigger HALFWAY warning
+BUDGET_CRITICAL_THRESHOLD = 0.75  # fraction of budget used to trigger CRITICAL warning
+
 # Manager mode constants (Phase 3)
 MAX_MANAGER_ROUNDS = 3       # max plan-execute-evaluate rounds
 MAX_TASKS_PER_PLAN = 8       # planner can't create more than this
@@ -2048,7 +2054,8 @@ def update_injected_episode_q_values_for_task(task_id, outcome, output=None):
 
 
 def build_system_prompt(task, project_context, project_dir, role="developer",
-                        extra_context="", dispatch_config=None, error_type=None):
+                        extra_context="", dispatch_config=None, error_type=None,
+                        max_turns=None):
     """Read _common.md + role prompt, replace placeholders, append task prompt.
 
     Applies context engineering principles:
@@ -2057,11 +2064,15 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     - Episode relevance scoring (keyword overlap + recency weighting)
     - Token count logging per dispatch
     - A/B prompt version selection (GEPA-evolved prompts)
+    - Budget visibility (max_turns info injected into prompt)
 
     extra_context: optional string appended after the task prompt (used for
     compaction history and test failure feedback in dev-test loop).
     dispatch_config: optional config dict for task-type-specific prompt injection.
     error_type: optional error type to filter relevant lessons (e.g. 'timeout', 'max_turns').
+    max_turns: optional int — the turn budget allocated for this agent run.
+        When provided, a budget visibility line is injected into the prompt so
+        the agent can make rational decisions about depth vs breadth.
 
     Returns the system prompt string. Also sets _last_prompt_version[role] for
     telemetry tracking.
@@ -2158,6 +2169,14 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     # Append task-type supplement after task prompt
     if task_type_supplement:
         prompt = prompt + task_type_supplement
+
+    # Budget visibility: tell the agent how many turns it has
+    if max_turns and max_turns > 0:
+        prompt = prompt + (
+            f"\n\nYou have {max_turns} turns for this task. "
+            f"The orchestrator will log budget updates every "
+            f"{BUDGET_CHECK_INTERVAL} turns."
+        )
 
     # Append extra context (compaction history, test failures) if provided
     if extra_context:
@@ -2542,6 +2561,52 @@ def _check_monologue(consecutive_text_only_turns, turn_count):
         return "warn"
 
     return None
+
+
+def _get_budget_message(turn_count, max_turns):
+    """Generate a budget visibility message based on current turn count.
+
+    Returns an escalating budget message at periodic intervals:
+    - Every BUDGET_CHECK_INTERVAL turns: simple status update
+    - At BUDGET_HALFWAY_THRESHOLD (50%): HALFWAY warning
+    - At BUDGET_CRITICAL_THRESHOLD (75%): CRITICAL warning
+
+    The most severe applicable message wins — if a turn triggers both
+    a periodic check and a threshold crossing, the threshold message
+    is returned (it carries the stronger signal).
+
+    Args:
+        turn_count: Current turn number (0-indexed tool calls).
+        max_turns: Maximum turns allocated for this agent run.
+
+    Returns:
+        str: Budget message to inject, or None if no message needed.
+    """
+    if not max_turns or max_turns <= 0 or turn_count <= 0:
+        return None
+
+    # Only check on interval turns
+    if turn_count % BUDGET_CHECK_INTERVAL != 0:
+        return None
+
+    remaining = max_turns - turn_count
+    fraction_used = turn_count / max_turns
+
+    if fraction_used >= BUDGET_CRITICAL_THRESHOLD:
+        return (
+            f"CRITICAL: Only {remaining} turns left out of {max_turns}. "
+            f"Write files NOW. Commit partial progress if needed."
+        )
+    elif fraction_used >= BUDGET_HALFWAY_THRESHOLD:
+        return (
+            f"HALFWAY: {turn_count}/{max_turns} turns used. "
+            f"{remaining} turns left. Prioritize writing code."
+        )
+    else:
+        return (
+            f"Budget: {turn_count}/{max_turns} turns used. "
+            f"{remaining} turns left."
+        )
 
 
 def _parse_early_complete(text):
@@ -2991,6 +3056,12 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                                     f"consecutive turns without file changes"
                                 )
                                 log(f"  [EarlyTerm] {early_term_reason}", output)
+
+                # Budget visibility: log remaining budget at intervals
+                if turn_has_tool_calls and max_turns:
+                    budget_msg = _get_budget_message(turn_count, max_turns)
+                    if budget_msg:
+                        log(f"  [Budget] {budget_msg}", output)
 
                 # Monologue detection: track consecutive text-only assistant turns
                 if turn_has_tool_calls:
@@ -3828,6 +3899,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             role=task_role, extra_context=extra_context,
             dispatch_config=getattr(args, "dispatch_config", None),
             error_type=last_error_type,
+            max_turns=dev_turns_allocated,
         )
         # Use streaming mode for early termination on non-exempt roles
         use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
@@ -4001,6 +4073,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         tester_prompt = build_system_prompt(
             task, project_context, project_dir, role="tester",
             dispatch_config=getattr(args, "dispatch_config", None),
+            max_turns=tester_turns_allocated,
         )
         tester_cmd = build_cli_command(
             tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
@@ -4149,12 +4222,13 @@ async def run_security_review(task, project_dir, project_context, args, output=N
         f"Original task description: {task['description']}"
     )
 
+    sec_turns = get_role_turns("security-reviewer", args, task=task)
     sec_prompt = build_system_prompt(
         security_task, project_context, project_dir,
         role="security-reviewer",
         dispatch_config=getattr(args, "dispatch_config", None),
+        max_turns=sec_turns,
     )
-    sec_turns = get_role_turns("security-reviewer", args, task=task)
     sec_model = get_role_model("security-reviewer", args, task=task)
     sec_cmd = build_cli_command(
         sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
@@ -6492,14 +6566,15 @@ async def async_main():
     else:
         # Single-agent mode (Phase 1 — with model tiering)
         use_streaming = args.role not in EARLY_TERM_EXEMPT_ROLES
-        system_prompt = build_system_prompt(
-            task, project_context, project_dir, role=args.role,
-            dispatch_config=getattr(args, "dispatch_config", None),
-        )
         role_turns_max = get_role_turns(args.role, args, task=task)
         role_model = get_role_model(args.role, args, task=task)
         # Dynamic budget for single-agent mode
         role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
+        system_prompt = build_system_prompt(
+            task, project_context, project_dir, role=args.role,
+            dispatch_config=getattr(args, "dispatch_config", None),
+            max_turns=role_turns_allocated,
+        )
         print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
         cmd = build_cli_command(
             system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,

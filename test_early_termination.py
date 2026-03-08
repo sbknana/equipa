@@ -30,6 +30,13 @@ Tests verify:
 25. EARLY_COMPLETE cost still tracked (result dict shape)
 26. early_completed distinct from early_terminated (success vs failure)
 27. False EARLY_COMPLETE in quoted/code text is ignored
+28. Budget message returned at periodic intervals (every 5 turns)
+29. Budget halfway warning at 50% threshold
+30. Budget critical warning at 75% threshold
+31. No budget message at turn 0 or when not on interval
+32. Budget constants have expected values
+33. Budget message includes correct remaining turn count
+34. Budget message not returned when max_turns is None
 
 Copyright 2026 Forgeborn
 """
@@ -46,7 +53,11 @@ from forge_orchestrator import (
     _check_monologue,
     _compute_output_hash,
     _detect_tool_loop,
+    _get_budget_message,
     _parse_early_complete,
+    BUDGET_CHECK_INTERVAL,
+    BUDGET_HALFWAY_THRESHOLD,
+    BUDGET_CRITICAL_THRESHOLD,
     EARLY_TERM_WARN_TURNS,
     EARLY_TERM_FINAL_WARN_TURNS,
     EARLY_TERM_KILL_TURNS,
@@ -615,6 +626,101 @@ def test_false_early_complete_in_quoted_text_ignored():
         f"unquoted EARLY_COMPLETE should parse, got '{reason}'"
 
 
+# --- Tests for _get_budget_message (budget visibility) ---
+
+def test_budget_message_at_periodic_intervals():
+    """Test that budget messages are returned every BUDGET_CHECK_INTERVAL turns."""
+    # At turn 5 of 50 (on interval), should get a periodic update
+    msg = _get_budget_message(5, 50)
+    assert msg is not None, "should return a message at turn 5 (on interval)"
+    assert "45" in msg, f"message should mention 45 remaining turns, got: {msg}"
+    assert "5" in msg, f"message should mention 5 turns used, got: {msg}"
+
+    # At turn 10 of 50 (on interval, but below halfway), should get periodic
+    msg2 = _get_budget_message(10, 50)
+    assert msg2 is not None, "should return a message at turn 10 (on interval)"
+    assert "40" in msg2, f"message should mention 40 remaining turns, got: {msg2}"
+
+
+def test_budget_halfway_warning():
+    """Test that a HALFWAY warning is returned at exactly 50% of budget."""
+    # Turn 25 of 50 = exactly 50%
+    msg = _get_budget_message(25, 50)
+    assert msg is not None, "should return a message at 50% budget"
+    assert "HALFWAY" in msg, f"message should contain 'HALFWAY', got: {msg}"
+    assert "25" in msg, f"message should mention 25 remaining turns, got: {msg}"
+
+    # Turn 20 of 40 = exactly 50%
+    msg2 = _get_budget_message(20, 40)
+    assert msg2 is not None, "should return a message at 50% of 40-turn budget"
+    assert "HALFWAY" in msg2, f"message should contain 'HALFWAY', got: {msg2}"
+
+
+def test_budget_critical_warning():
+    """Test that a CRITICAL warning is returned at 75% of budget."""
+    # Turn 38 of 50 = 76% (past critical)
+    # But 38 is not on BUDGET_CHECK_INTERVAL. Try turn 40 of 50 = 80%.
+    msg = _get_budget_message(40, 50)
+    assert msg is not None, "should return a message at 80% budget"
+    assert "CRITICAL" in msg, f"message should contain 'CRITICAL', got: {msg}"
+    assert "10" in msg, f"message should mention 10 remaining turns, got: {msg}"
+
+    # Turn 75 of 100 = exactly 75%
+    msg2 = _get_budget_message(75, 100)
+    assert msg2 is not None, "should return a message at 75% of 100-turn budget"
+    assert "CRITICAL" in msg2, f"message should contain 'CRITICAL', got: {msg2}"
+
+
+def test_budget_no_message_off_interval():
+    """Test that no budget message is returned on turns not on the check interval."""
+    # Turn 3 of 50 — not on interval (5), not at any threshold
+    msg = _get_budget_message(3, 50)
+    assert msg is None, f"should return None at turn 3 (not on interval), got: {msg}"
+
+    # Turn 7 of 50 — not on interval
+    msg2 = _get_budget_message(7, 50)
+    assert msg2 is None, f"should return None at turn 7, got: {msg2}"
+
+    # Turn 0 should return None
+    msg3 = _get_budget_message(0, 50)
+    assert msg3 is None, f"should return None at turn 0, got: {msg3}"
+
+
+def test_budget_constants_values():
+    """Test that budget visibility constants have expected values."""
+    assert BUDGET_CHECK_INTERVAL == 5, \
+        f"BUDGET_CHECK_INTERVAL should be 5, got {BUDGET_CHECK_INTERVAL}"
+    assert BUDGET_HALFWAY_THRESHOLD == 0.5, \
+        f"BUDGET_HALFWAY_THRESHOLD should be 0.5, got {BUDGET_HALFWAY_THRESHOLD}"
+    assert BUDGET_CRITICAL_THRESHOLD == 0.75, \
+        f"BUDGET_CRITICAL_THRESHOLD should be 0.75, got {BUDGET_CRITICAL_THRESHOLD}"
+    # Ensure thresholds are ordered
+    assert BUDGET_HALFWAY_THRESHOLD < BUDGET_CRITICAL_THRESHOLD, \
+        "halfway threshold must be less than critical threshold"
+
+
+def test_budget_message_correct_remaining():
+    """Test that budget messages contain the correct remaining turn count."""
+    # Turn 15 of 30 = 50% (halfway)
+    msg = _get_budget_message(15, 30)
+    assert msg is not None, "should return a message at turn 15/30"
+    assert "15" in msg, f"should mention 15 remaining turns, got: {msg}"
+
+    # Turn 20 of 80 = 25% (periodic)
+    msg2 = _get_budget_message(20, 80)
+    assert msg2 is not None, "should return a message at turn 20/80"
+    assert "60" in msg2, f"should mention 60 remaining turns, got: {msg2}"
+
+
+def test_budget_message_none_when_no_max_turns():
+    """Test that no budget message is returned when max_turns is None or 0."""
+    msg = _get_budget_message(5, None)
+    assert msg is None, f"should return None when max_turns is None, got: {msg}"
+
+    msg2 = _get_budget_message(5, 0)
+    assert msg2 is None, f"should return None when max_turns is 0, got: {msg2}"
+
+
 # --- Main ---
 
 def main():
@@ -655,6 +761,14 @@ def main():
         test_early_complete_cost_still_tracked,
         test_early_complete_distinct_from_early_terminated,
         test_false_early_complete_in_quoted_text_ignored,
+        # Budget visibility tests
+        test_budget_message_at_periodic_intervals,
+        test_budget_halfway_warning,
+        test_budget_critical_warning,
+        test_budget_no_message_off_interval,
+        test_budget_constants_values,
+        test_budget_message_correct_remaining,
+        test_budget_message_none_when_no_max_turns,
     ]
 
     passed = 0
@@ -665,7 +779,7 @@ def main():
     print(f"  Early Termination Test Suite")
     print(f"  Testing _check_stuck_phrases, _compute_output_hash,")
     print(f"  _detect_tool_loop with output hashes, dead code removal,")
-    print(f"  _parse_early_complete (agent-initiated early completion)")
+    print(f"  _parse_early_complete, _get_budget_message")
     print(f"{'=' * 60}\n")
 
     for test_fn in tests:
