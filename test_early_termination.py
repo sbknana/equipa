@@ -53,6 +53,14 @@ Tests verify:
 48. Preflight does not block task (returns tuple, never raises)
 49. Preflight returns unknown for directories with no recognized project files
 50. Preflight skip keywords contain expected build-fix keywords
+51. Developer prompt contains "Bias for Action" section
+52. Developer prompt contains "Successful Task" few-shot example
+53. Developer prompt contains "Failed Task" few-shot example
+54. Developer prompt contains "Mandatory First Actions" section
+55. Tester prompt contains "Bias for Action" section
+56. Tester prompt contains tester-adapted few-shot examples
+57. Security reviewer prompt contains "Bias for Action" section
+58. Security reviewer prompt contains reviewer-adapted few-shot examples
 
 Copyright 2026 Forgeborn
 """
@@ -1056,6 +1064,145 @@ def test_preflight_skip_keywords_exist():
     assert not missing, f"PREFLIGHT_SKIP_KEYWORDS missing: {missing}"
 
 
+# --- Tests for anti-paralysis prompt sections ---
+
+def _read_prompt(role):
+    """Helper: read a role prompt template file and return its contents."""
+    prompt_path = Path(__file__).parent / "prompts" / f"{role}.md"
+    assert prompt_path.exists(), f"prompt file not found: {prompt_path}"
+    return prompt_path.read_text(encoding="utf-8")
+
+
+def test_developer_prompt_has_bias_for_action():
+    """Test that developer prompt contains the 'Bias for Action' section."""
+    text = _read_prompt("developer")
+    assert "## CRITICAL: Bias for Action" in text, \
+        "developer prompt missing '## CRITICAL: Bias for Action' section"
+    # Check key directives are present
+    assert "first 5 tool calls" in text, \
+        "developer prompt missing 'first 5 tool calls' directive"
+    assert "40% of your turns" in text, \
+        "developer prompt missing '40% of your turns' limit"
+    assert "Wrong code you can fix is better than no code" in text, \
+        "developer prompt missing 'wrong code you can fix' directive"
+
+
+def test_developer_prompt_has_successful_example():
+    """Test that developer prompt contains the successful task few-shot example."""
+    text = _read_prompt("developer")
+    assert "## Example: Successful Task (DO THIS)" in text, \
+        "developer prompt missing successful task example"
+    assert "COMPLETED in 5 turns" in text, \
+        "developer prompt missing 'COMPLETED in 5 turns' outcome"
+    # Verify the example shows immediate editing behavior
+    assert "Turn 2: Edit the file" in text, \
+        "successful example should show editing on Turn 2"
+
+
+def test_developer_prompt_has_failed_example():
+    """Test that developer prompt contains the failed task few-shot example."""
+    text = _read_prompt("developer")
+    assert "## Example: Failed Task (DO NOT DO THIS)" in text, \
+        "developer prompt missing failed task example"
+    assert "KILLED at turn 28" in text, \
+        "developer prompt missing 'KILLED at turn 28' outcome"
+    assert "TOTAL FAILURE" in text, \
+        "developer prompt missing 'TOTAL FAILURE' label"
+    assert "zero edits made" in text, \
+        "failed example should mention 'zero edits made'"
+
+
+def test_developer_prompt_has_mandatory_first_actions():
+    """Test that developer prompt contains the 'Mandatory First Actions' section."""
+    text = _read_prompt("developer")
+    assert "## Mandatory First Actions" in text, \
+        "developer prompt missing '## Mandatory First Actions' section"
+    # Check key directives
+    assert "FIRST tool call must be Read" in text, \
+        "developer prompt missing first-action Read directive"
+    assert "SECOND tool call must be Edit or Write" in text, \
+        "developer prompt missing second-action Edit/Write directive"
+    assert "Do NOT use Glob or Grep in your first 3 turns" in text, \
+        "developer prompt missing Glob/Grep restriction"
+
+
+def test_developer_prompt_bias_section_is_at_top():
+    """Test that the Bias for Action section appears BEFORE the main agent identity."""
+    text = _read_prompt("developer")
+    bias_pos = text.find("## CRITICAL: Bias for Action")
+    identity_pos = text.find("# Project Pombal Developer Agent")
+    assert bias_pos < identity_pos, \
+        f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
+
+
+def test_tester_prompt_has_bias_for_action():
+    """Test that tester prompt contains the 'Bias for Action' section."""
+    text = _read_prompt("tester")
+    assert "## CRITICAL: Bias for Action" in text, \
+        "tester prompt missing '## CRITICAL: Bias for Action' section"
+    # Check tester-specific directives
+    assert "FIRST 2 tool calls" in text, \
+        "tester prompt missing 'FIRST 2 tool calls' directive"
+    assert "RUN tests, not to UNDERSTAND the codebase" in text, \
+        "tester prompt missing 'RUN tests' directive"
+
+
+def test_tester_prompt_has_few_shot_examples():
+    """Test that tester prompt contains adapted few-shot examples."""
+    text = _read_prompt("tester")
+    assert "## Example: Successful Test Run (DO THIS)" in text, \
+        "tester prompt missing successful test run example"
+    assert "## Example: Failed Test Run (DO NOT DO THIS)" in text, \
+        "tester prompt missing failed test run example"
+    assert "COMPLETED in 3 turns" in text, \
+        "tester prompt missing 'COMPLETED in 3 turns' outcome"
+    assert "never ran a single test" in text, \
+        "tester failed example should mention 'never ran a single test'"
+
+
+def test_tester_prompt_bias_section_is_at_top():
+    """Test that the Bias for Action section appears BEFORE the main agent identity."""
+    text = _read_prompt("tester")
+    bias_pos = text.find("## CRITICAL: Bias for Action")
+    identity_pos = text.find("# Project Pombal Tester Agent")
+    assert bias_pos < identity_pos, \
+        f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
+
+
+def test_security_reviewer_prompt_has_bias_for_action():
+    """Test that security reviewer prompt contains the 'Bias for Action' section."""
+    text = _read_prompt("security-reviewer")
+    assert "## CRITICAL: Bias for Action" in text, \
+        "security-reviewer prompt missing '## CRITICAL: Bias for Action' section"
+    # Check reviewer-specific directives
+    assert "first 5 tool calls" in text, \
+        "security-reviewer prompt missing 'first 5 tool calls' directive"
+    assert "document it RIGHT NOW" in text, \
+        "security-reviewer prompt missing 'document it RIGHT NOW' directive"
+
+
+def test_security_reviewer_prompt_has_few_shot_examples():
+    """Test that security reviewer prompt contains adapted few-shot examples."""
+    text = _read_prompt("security-reviewer")
+    assert "## Example: Successful Security Review (DO THIS)" in text, \
+        "security-reviewer prompt missing successful review example"
+    assert "## Example: Failed Security Review (DO NOT DO THIS)" in text, \
+        "security-reviewer prompt missing failed review example"
+    assert "COMPLETED in 9 turns" in text, \
+        "security-reviewer prompt missing 'COMPLETED in 9 turns' outcome"
+    assert "zero findings documented" in text, \
+        "security-reviewer failed example should mention 'zero findings documented'"
+
+
+def test_security_reviewer_prompt_bias_section_is_at_top():
+    """Test that the Bias for Action section appears BEFORE the main agent identity."""
+    text = _read_prompt("security-reviewer")
+    bias_pos = text.find("## CRITICAL: Bias for Action")
+    identity_pos = text.find("# Project Pombal SecurityReviewer Agent")
+    assert bias_pos < identity_pos, \
+        f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
+
+
 # --- Main ---
 
 def main():
@@ -1122,6 +1269,18 @@ def main():
         test_preflight_does_not_block_task,
         test_preflight_unknown_project,
         test_preflight_skip_keywords_exist,
+        # Anti-paralysis prompt section tests
+        test_developer_prompt_has_bias_for_action,
+        test_developer_prompt_has_successful_example,
+        test_developer_prompt_has_failed_example,
+        test_developer_prompt_has_mandatory_first_actions,
+        test_developer_prompt_bias_section_is_at_top,
+        test_tester_prompt_has_bias_for_action,
+        test_tester_prompt_has_few_shot_examples,
+        test_tester_prompt_bias_section_is_at_top,
+        test_security_reviewer_prompt_has_bias_for_action,
+        test_security_reviewer_prompt_has_few_shot_examples,
+        test_security_reviewer_prompt_bias_section_is_at_top,
     ]
 
     passed = 0
@@ -1133,7 +1292,7 @@ def main():
     print(f"  Testing _check_stuck_phrases, _compute_output_hash,")
     print(f"  _detect_tool_loop with output hashes, dead code removal,")
     print(f"  _parse_early_complete, _get_budget_message, _check_cost_limit,")
-    print(f"  preflight_build_check")
+    print(f"  preflight_build_check, anti-paralysis prompt sections")
     print(f"{'=' * 60}\n")
 
     for test_fn in tests:
