@@ -3,7 +3,7 @@
 Test suite for inter-agent message channel (Task #922).
 
 Tests verify:
-1. ensure_agent_messages_table creates the table idempotently
+1. ensure_schema creates the table idempotently
 2. post_agent_message inserts messages correctly
 3. read_agent_messages returns only unread messages for the correct role
 4. read_agent_messages respects max_cycle filter
@@ -47,6 +47,7 @@ def setup_test_db():
     original_db = forge_orchestrator.THEFORGE_DB
     db_path = make_temp_db()
     forge_orchestrator.THEFORGE_DB = db_path
+    forge_orchestrator._SCHEMA_ENSURED = False
     return db_path, original_db
 
 
@@ -60,13 +61,14 @@ def teardown_test_db(db_path, original_db=None):
         forge_orchestrator.THEFORGE_DB = original_db
 
 
-# --- Tests for ensure_agent_messages_table ---
+# --- Tests for ensure_schema ---
 
 def test_ensure_creates_table():
-    """Test that ensure_agent_messages_table creates the table."""
+    """Test that ensure_schema creates the table."""
     db_path, original_db = setup_test_db()
     try:
-        forge_orchestrator.ensure_agent_messages_table()
+        forge_orchestrator._SCHEMA_ENSURED = False
+        forge_orchestrator.ensure_schema()
         conn = sqlite3.connect(str(db_path))
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_messages'"
@@ -81,8 +83,9 @@ def test_ensure_is_idempotent():
     """Test that calling ensure twice does not error."""
     db_path, original_db = setup_test_db()
     try:
-        forge_orchestrator.ensure_agent_messages_table()
-        forge_orchestrator.ensure_agent_messages_table()  # second call should not raise
+        forge_orchestrator._SCHEMA_ENSURED = False
+        forge_orchestrator.ensure_schema()
+        forge_orchestrator.ensure_schema()  # second call should not raise
         conn = sqlite3.connect(str(db_path))
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_messages'"
@@ -212,7 +215,7 @@ def test_read_returns_empty_list_for_no_messages():
     """Test that read returns empty list when no messages exist."""
     db_path, original_db = setup_test_db()
     try:
-        forge_orchestrator.ensure_agent_messages_table()
+        forge_orchestrator.ensure_schema()
         msgs = forge_orchestrator.read_agent_messages(999, "developer")
         assert msgs == [], f"expected empty list, got {msgs}"
     finally:

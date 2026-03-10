@@ -32,7 +32,7 @@ from forge_orchestrator import (
     build_system_prompt,
     _injected_episodes_by_task,
     THEFORGE_DB,
-    ensure_agent_episodes_table,
+    ensure_schema,
 )
 
 
@@ -49,7 +49,7 @@ def get_db_connection(write=False):
 
 def setup_test_data():
     """Insert test episodes into agent_episodes table."""
-    ensure_agent_episodes_table()
+    ensure_schema()
 
     conn = sqlite3.connect(THEFORGE_DB)
 
@@ -508,7 +508,7 @@ def test_cross_project_fallback():
     if len(episodes) > 0:
         print(f"  Found {len(episodes)} cross-project fallback episodes")
         for ep in episodes:
-            print(f"    - Project {ep['project_id']}: {ep['approach_summary'][:50]}...")
+            print(f"    - Project {ep['project_id']}: {(ep['approach_summary'] or 'no summary')[:50]}...")
         print("✓ Cross-project fallback working")
     else:
         print("  No cross-project episodes available (expected if test data is isolated)")

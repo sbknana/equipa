@@ -207,11 +207,34 @@ COST_LIMITS = {
 }
 COST_ESTIMATE_PER_TURN = 0.15  # estimated cost per turn when actual cost is None (killed runs)
 
+
+def _accumulate_cost(result, label=None, output=None):
+    """Extract cost from an agent result, estimating if actual cost is None.
+
+    Returns the cost amount (float). Logs estimation when applicable.
+    """
+    if result.get("cost"):
+        return result["cost"]
+    num_turns = result.get("num_turns", 0)
+    if num_turns:
+        estimated = num_turns * COST_ESTIMATE_PER_TURN
+        if label and output is not None:
+            log(f"  {label} cost=None, estimating ${estimated:.2f} "
+                f"({num_turns} turns * ${COST_ESTIMATE_PER_TURN})", output)
+        return estimated
+    return 0.0
+
 # Pre-flight build check: detect build failures before agent starts
 PREFLIGHT_TIMEOUT = 60  # max seconds to wait for build check
 PREFLIGHT_SKIP_KEYWORDS = frozenset({
     "fix", "build", "compile", "broken", "compilation", "error",
 })
+
+# Auto-fix: dispatch debugger agent when preflight build check fails
+AUTOFIX_MAX_DEBUGGER_CYCLES = 2   # max debugger attempts before escalating to planner
+AUTOFIX_PLANNER_BUDGET = 15       # turns for planner to analyze build failure
+AUTOFIX_DEBUGGER_BUDGET = 25      # turns for debugger to fix the build
+AUTOFIX_COST_LIMIT = 8.0          # max USD to spend on auto-fix before giving up
 
 # Manager mode constants (Phase 3)
 MAX_MANAGER_ROUNDS = 3       # max plan-execute-evaluate rounds
@@ -620,70 +643,73 @@ REFLEXION_PROMPT = (
 INITIAL_Q_VALUE = 0.5
 
 
-def ensure_agent_episodes_table():
-    """Create agent_episodes table if it does not exist.
+_SCHEMA_ENSURED = False
+
+
+def ensure_schema():
+    """Create all agent tables if they do not exist (called once at startup).
 
     Safety net — schema is primarily managed by db_migrate.py.
-    This function provides defense-in-depth if the orchestrator runs
-    without the setup wizard.
     """
+    global _SCHEMA_ENSURED
+    if _SCHEMA_ENSURED:
+        return
     try:
         conn = get_db_connection(write=True)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS agent_episodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                role TEXT,
-                task_type TEXT,
-                project_id INTEGER,
-                approach_summary TEXT,
-                turns_used INTEGER,
-                outcome TEXT,
-                error_patterns TEXT,
-                reflection TEXT,
-                q_value REAL DEFAULT 0.5,
+                task_id INTEGER, role TEXT, task_type TEXT,
+                project_id INTEGER, approach_summary TEXT,
+                turns_used INTEGER, outcome TEXT, error_patterns TEXT,
+                reflection TEXT, q_value REAL DEFAULT 0.5,
                 times_injected INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"  [Reflexion] WARNING: Could not ensure agent_episodes table: {e}")
-
-
-# --- Inter-Agent Message Channel ---
-
-def ensure_agent_messages_table():
-    """Create agent_messages table if it does not exist.
-
-    Safety net — schema is primarily managed by db_migrate.py.
-    """
-    try:
-        conn = get_db_connection(write=True)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS agent_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL,
-                cycle_number INTEGER NOT NULL,
-                from_role TEXT NOT NULL,
-                to_role TEXT NOT NULL,
-                message_type TEXT NOT NULL,
-                content TEXT NOT NULL,
+                task_id INTEGER NOT NULL, cycle_number INTEGER NOT NULL,
+                from_role TEXT NOT NULL, to_role TEXT NOT NULL,
+                message_type TEXT NOT NULL, content TEXT NOT NULL,
                 read_by_cycle INTEGER,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL, run_id INTEGER,
+                cycle_number INTEGER NOT NULL, role TEXT NOT NULL,
+                turn_number INTEGER NOT NULL, tool_name TEXT NOT NULL,
+                tool_input_preview TEXT, input_hash TEXT,
+                output_length INTEGER, success INTEGER NOT NULL DEFAULT 1,
+                error_type TEXT, error_summary TEXT, duration_ms INTEGER,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_actions_task "
+            "ON agent_actions(task_id, cycle_number)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_actions_tool "
+            "ON agent_actions(tool_name, success)"
+        )
         conn.commit()
         conn.close()
+        _SCHEMA_ENSURED = True
     except Exception as e:
-        print(f"  [Messages] WARNING: Could not ensure agent_messages table: {e}")
+        print(f"  [Schema] WARNING: Could not ensure tables: {e}")
 
+
+# --- Inter-Agent Message Channel ---
 
 def post_agent_message(task_id, cycle, from_role, to_role, msg_type, content):
     """Insert a structured message from one agent role to another."""
     try:
-        ensure_agent_messages_table()
+        ensure_schema()
         conn = get_db_connection(write=True)
         conn.execute(
             """INSERT INTO agent_messages
@@ -700,7 +726,7 @@ def post_agent_message(task_id, cycle, from_role, to_role, msg_type, content):
 def read_agent_messages(task_id, to_role, max_cycle=None):
     """Fetch unread messages for a given role on a task."""
     try:
-        ensure_agent_messages_table()
+        ensure_schema()
         conn = get_db_connection()
         if max_cycle is not None:
             rows = conn.execute(
@@ -731,7 +757,7 @@ def read_agent_messages(task_id, to_role, max_cycle=None):
 def mark_messages_read(task_id, to_role, cycle_number):
     """Mark all unread messages for a role as consumed by a given cycle."""
     try:
-        ensure_agent_messages_table()
+        ensure_schema()
         conn = get_db_connection(write=True)
         conn.execute(
             """UPDATE agent_messages
@@ -769,44 +795,7 @@ def format_messages_for_prompt(messages):
 
 # --- Agent Action Logging ---
 
-def ensure_agent_actions_table():
-    """Create agent_actions table if it does not exist.
 
-    Safety net — schema is primarily managed by db_migrate.py.
-    """
-    try:
-        conn = get_db_connection(write=True)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL,
-                run_id INTEGER,
-                cycle_number INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                turn_number INTEGER NOT NULL,
-                tool_name TEXT NOT NULL,
-                tool_input_preview TEXT,
-                input_hash TEXT,
-                output_length INTEGER,
-                success INTEGER NOT NULL DEFAULT 1,
-                error_type TEXT,
-                error_summary TEXT,
-                duration_ms INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_actions_task "
-            "ON agent_actions(task_id, cycle_number)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_actions_tool "
-            "ON agent_actions(tool_name, success)"
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"  [ActionLog] WARNING: Could not ensure agent_actions table: {e}")
 
 
 def classify_error(error_text):
@@ -867,7 +856,7 @@ def bulk_log_agent_actions(action_log, task_id, run_id, cycle, role):
     if not action_log:
         return
     try:
-        ensure_agent_actions_table()
+        ensure_schema()
         conn = get_db_connection(write=True)
         conn.executemany(
             """INSERT INTO agent_actions
@@ -890,125 +879,76 @@ def bulk_log_agent_actions(action_log, task_id, run_id, cycle, role):
         print(f"  [ActionLog] WARNING: Failed to bulk insert actions: {e}")
 
 
-def get_action_summary(task_id, cycle=None):
-    """Get per-tool action summary for ForgeSmith analysis.
+def _extract_marker_value(text, marker, multiline=False):
+    """Extract value after a MARKER: line from structured agent output.
 
-    Returns dict: {tool_name: {count, success_count, fail_count}}
-    If cycle is None, returns summary across all cycles for the task.
+    For single-line markers, returns the value after the colon.
+    For multiline, collects continuation lines until the next known marker.
+    Returns None if not found or value is 'none'.
     """
-    try:
-        ensure_agent_actions_table()
-        conn = get_db_connection()
-        if cycle is not None:
-            rows = conn.execute(
-                """SELECT tool_name,
-                          COUNT(*) as cnt,
-                          SUM(success) as ok,
-                          COUNT(*) - SUM(success) as fail
-                   FROM agent_actions
-                   WHERE task_id = ? AND cycle_number = ?
-                   GROUP BY tool_name""",
-                (task_id, cycle),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT tool_name,
-                          COUNT(*) as cnt,
-                          SUM(success) as ok,
-                          COUNT(*) - SUM(success) as fail
-                   FROM agent_actions
-                   WHERE task_id = ?
-                   GROUP BY tool_name""",
-                (task_id,),
-            ).fetchall()
-        conn.close()
-        return {
-            row["tool_name"]: {
-                "count": row["cnt"],
-                "success_count": row["ok"],
-                "fail_count": row["fail"],
-            }
-            for row in rows
-        }
-    except Exception:
-        return {}
-
-
-def parse_reflection(result_text):
-    """Extract REFLECTION text from agent structured output.
-
-    Looks for a REFLECTION: line and captures all text until the next
-    known section marker or end of text. Returns None if not found.
-    """
-    if not result_text:
+    if not text:
         return None
-
-    lines = result_text.splitlines()
-    reflection_lines = []
-    in_reflection = False
+    section_markers = ("RESULT:", "SUMMARY:", "FILES_CHANGED:", "DECISIONS:",
+                       "BLOCKERS:", "REFLECTION:", "```")
+    lines = text.splitlines()
+    collected = []
+    in_section = False
 
     for line in lines:
         stripped = line.strip()
-
-        if stripped.startswith("REFLECTION:"):
-            in_reflection = True
-            # Grab inline value after "REFLECTION:"
+        if stripped.startswith(marker):
             value = stripped.split(":", 1)[1].strip()
+            if not multiline:
+                return value if value and value.lower() != "none" else None
+            in_section = True
             if value and value.lower() != "none":
-                reflection_lines.append(value)
+                collected.append(value)
             continue
-
-        if in_reflection:
-            # Stop at next known section marker
-            if any(stripped.startswith(marker) for marker in (
-                "RESULT:", "SUMMARY:", "FILES_CHANGED:", "DECISIONS:",
-                "BLOCKERS:", "```",
-            )):
+        if in_section:
+            if any(stripped.startswith(m) for m in section_markers if m != marker):
                 break
-            # Collect continuation lines (including bullet points)
             if stripped:
-                reflection_lines.append(stripped)
+                collected.append(stripped)
 
-    reflection = " ".join(reflection_lines).strip()
-    return reflection if reflection else None
+    result = " ".join(collected).strip()
+    return result if result else None
+
+
+def parse_reflection(result_text):
+    """Extract REFLECTION text from agent structured output."""
+    return _extract_marker_value(result_text, "REFLECTION:", multiline=True)
 
 
 def parse_approach_summary(result_text):
     """Extract SUMMARY text from agent output for the episode record."""
-    if not result_text:
-        return None
+    return _extract_marker_value(result_text, "SUMMARY:")
 
-    for line in result_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("SUMMARY:"):
-            value = stripped.split(":", 1)[1].strip()
-            return value if value else None
 
-    return None
+# Keyword patterns for failure classification — data-driven instead of if/elif chains
+_FAILURE_KEYWORD_PATTERNS = {
+    "build_failure": ["syntaxerror", "compileerror", "build failed", "build error",
+                      "cannot find module", "type error", "typeerror"],
+    "import_error": ["modulenotfounderror", "importerror", "no module named",
+                     "module not found", "cannot resolve", "dependency",
+                     "missing package", "version conflict"],
+    "test_failure": ["assertionerror", "test failed", "tests failed",
+                     "assertion failed", "expected", "pytest"],
+    "environment_error": ["permission denied", "connection refused", "eacces",
+                          "econnrefused", "no such file or directory"],
+}
+
+# Priority order for selecting primary failure class
+_FAILURE_PRIORITY = [
+    "analysis_paralysis", "timeout", "build_failure", "import_error",
+    "test_failure", "environment_error", "wrong_approach", "max_turns",
+]
 
 
 def classify_agent_failure(outcome, result, result_text=""):
-    """Classify an agent failure into structured categories from the error-recovery skill.
+    """Classify an agent failure into structured categories.
 
-    Uses outcome, error messages, result text (including RESULT/BLOCKERS/REFLECTION),
-    and turn count to assign one or more failure classes.
-
-    Failure classes (from error-recovery skill + orchestrator patterns):
-        analysis_paralysis  — Agent spent all turns reading/exploring without writing code
-        build_failure       — Build, compile, or syntax errors prevented completion
-        test_failure        — Tests failed after agent changes
-        import_error        — Missing imports, modules, or dependency issues
-        timeout             — Agent process timed out (wall-clock limit)
-        wrong_approach      — Agent took a fundamentally wrong approach, looped, or was blocked
-        environment_error   — Permission denied, file not found, connection refused
-        max_turns           — Agent ran out of turns (may overlap with other classes)
-
-    Returns a JSON-serializable dict with:
-        failure_class: str — primary failure classification
-        secondary_classes: list[str] — additional applicable classes (may be empty)
-        confidence: str — "high", "medium", or "low"
-        signals: list[str] — evidence strings that led to classification
-        raw_errors: list[str] — deduplicated error messages (max 5, truncated)
+    Returns a dict with failure_class, secondary_classes, confidence,
+    signals, and raw_errors — or None if no failure detected.
     """
     if not isinstance(result, dict):
         result = {}
@@ -1016,7 +956,6 @@ def classify_agent_failure(outcome, result, result_text=""):
     errors = result.get("errors", [])
     unique_errors = list(dict.fromkeys(errors))[:5]
     truncated_errors = [e[:200] for e in unique_errors]
-
     num_turns = result.get("num_turns", 0)
     early_terminated = result.get("early_terminated", False)
     early_term_reason = result.get("early_term_reason", "")
@@ -1024,26 +963,22 @@ def classify_agent_failure(outcome, result, result_text=""):
     lower_errors = " ".join(e.lower() for e in unique_errors)
     lower_result = result_text.lower() if result_text else ""
     lower_reason = early_term_reason.lower()
+    signals, classes_detected = [], []
 
-    signals = []
-    classes_detected = []
-
-    # --- Analysis Paralysis ---
-    # Key signal: "consecutive turns without file changes" in early_term_reason
+    # --- Special cases (need contextual logic, not just keyword matching) ---
+    # Analysis paralysis
     if "consecutive turns without file changes" in lower_reason:
         classes_detected.append("analysis_paralysis")
         signals.append(f"early_term: {early_term_reason[:120]}")
     elif "consecutive" in lower_errors and "without file changes" in lower_errors:
         classes_detected.append("analysis_paralysis")
         signals.append("error mentions consecutive turns without file changes")
-    # Also detect from result text: agent stuck exploring
-    if (not classes_detected
-            and num_turns >= EARLY_TERM_KILL_TURNS
-            and "files_changed: none" in lower_result):
+    elif (num_turns >= EARLY_TERM_KILL_TURNS
+          and "files_changed: none" in lower_result):
         classes_detected.append("analysis_paralysis")
         signals.append(f"high turn count ({num_turns}) with no files changed")
 
-    # --- Timeout ---
+    # Timeout
     if "timed out" in lower_reason or "timed out" in lower_errors:
         classes_detected.append("timeout")
         signals.append("process timed out")
@@ -1051,59 +986,28 @@ def classify_agent_failure(outcome, result, result_text=""):
         classes_detected.append("timeout")
         signals.append("tester timeout outcome")
 
-    # --- Max Turns ---
-    if ("max_turns" in lower_errors or "max turns" in lower_errors
-            or outcome == "developer_max_turns"
-            or "error_max_turns" in lower_errors):
+    # Max turns
+    if any(k in lower_errors for k in ("max_turns", "max turns", "error_max_turns")) \
+            or outcome == "developer_max_turns":
         classes_detected.append("max_turns")
         signals.append("agent hit max turns limit")
 
-    # --- Build Failure ---
-    build_keywords = ["syntaxerror", "compileerror", "build failed", "build error",
-                      "cannot find module", "type error", "typeerror"]
-    for kw in build_keywords:
-        if kw in lower_errors or kw in lower_result:
-            if "build_failure" not in classes_detected:
-                classes_detected.append("build_failure")
-                signals.append(f"build/compile signal: {kw}")
-            break
-
-    # --- Import / Dependency Error ---
-    import_keywords = ["modulenotfounderror", "importerror", "no module named",
-                       "module not found", "cannot resolve", "dependency",
-                       "missing package", "version conflict"]
-    for kw in import_keywords:
-        if kw in lower_errors or kw in lower_result:
-            if "import_error" not in classes_detected:
-                classes_detected.append("import_error")
-                signals.append(f"import/dependency signal: {kw}")
-            break
-
-    # --- Test Failure ---
-    test_keywords = ["assertionerror", "test failed", "tests failed",
-                     "assertion failed", "expected", "pytest"]
-    if outcome in ("cycles_exhausted", "tester_failed"):
-        classes_detected.append("test_failure")
-        signals.append(f"outcome indicates test failure: {outcome}")
-    else:
-        for kw in test_keywords:
-            if kw in lower_errors:
-                if "test_failure" not in classes_detected:
-                    classes_detected.append("test_failure")
-                    signals.append(f"test failure signal: {kw}")
+    # --- Keyword-driven classification (build, import, test, env) ---
+    for failure_class, keywords in _FAILURE_KEYWORD_PATTERNS.items():
+        # Test failure has special outcome-based detection
+        if failure_class == "test_failure" and outcome in ("cycles_exhausted", "tester_failed"):
+            classes_detected.append("test_failure")
+            signals.append(f"outcome indicates test failure: {outcome}")
+            continue
+        sources = [lower_errors] if failure_class == "environment_error" else [lower_errors, lower_result]
+        for kw in keywords:
+            if any(kw in s for s in sources):
+                if failure_class not in classes_detected:
+                    classes_detected.append(failure_class)
+                    signals.append(f"{failure_class} signal: {kw}")
                 break
 
-    # --- Environment Error ---
-    env_keywords = ["permission denied", "connection refused", "eacces",
-                    "econnrefused", "no such file or directory"]
-    for kw in env_keywords:
-        if kw in lower_errors:
-            if "environment_error" not in classes_detected:
-                classes_detected.append("environment_error")
-                signals.append(f"environment signal: {kw}")
-            break
-
-    # --- Wrong Approach / Loop ---
+    # Wrong approach / loop detection
     if "loop detected" in lower_reason or "repeated the same operation" in lower_reason:
         classes_detected.append("wrong_approach")
         signals.append(f"loop detection: {early_term_reason[:120]}")
@@ -1113,59 +1017,29 @@ def classify_agent_failure(outcome, result, result_text=""):
     elif outcome == "no_progress":
         classes_detected.append("wrong_approach")
         signals.append("no progress across multiple cycles")
-    elif "result: blocked" in lower_result and "result: failed" in lower_result:
-        if "wrong_approach" not in classes_detected:
-            classes_detected.append("wrong_approach")
-            signals.append("agent reported both blocked and failed")
+    elif ("result: blocked" in lower_result and "result: failed" in lower_result
+          and "wrong_approach" not in classes_detected):
+        classes_detected.append("wrong_approach")
+        signals.append("agent reported both blocked and failed")
 
-    # --- Determine primary class ---
-    # Priority order: analysis_paralysis > timeout > build > import > test > env > wrong_approach > max_turns
-    priority_order = [
-        "analysis_paralysis", "timeout", "build_failure", "import_error",
-        "test_failure", "environment_error", "wrong_approach", "max_turns",
-    ]
-
+    # --- Determine primary class and confidence ---
     if not classes_detected:
-        # Fallback: if we have errors but couldn't classify, mark as unknown
         if unique_errors:
-            primary = "unknown"
-            signals.append("unclassified error(s) present")
-            confidence = "low"
-        else:
-            # No errors and no classification — shouldn't be called for success
-            return None
-    else:
-        # Pick primary by priority
-        primary = "unknown"
-        for cls in priority_order:
-            if cls in classes_detected:
-                primary = cls
-                break
+            return {"failure_class": "unknown", "secondary_classes": [],
+                    "confidence": "low", "signals": ["unclassified error(s) present"],
+                    "raw_errors": truncated_errors}
+        return None
 
-        secondary = [c for c in classes_detected if c != primary]
+    primary = next((c for c in _FAILURE_PRIORITY if c in classes_detected), "unknown")
+    secondary = [c for c in classes_detected if c != primary]
+    confidence = ("high" if len(signals) >= 2
+                  or early_terminated
+                  or outcome in ("cycles_exhausted", "no_progress")
+                  else "medium")
 
-        # Confidence based on signal strength
-        if len(signals) >= 2:
-            confidence = "high"
-        elif early_terminated or outcome in ("cycles_exhausted", "no_progress"):
-            confidence = "high"
-        else:
-            confidence = "medium"
-
-    if not classes_detected:
-        secondary = []
-    else:
-        secondary = [c for c in classes_detected if c != primary]
-        if not classes_detected:
-            confidence = "low"
-
-    return {
-        "failure_class": primary,
-        "secondary_classes": secondary,
-        "confidence": confidence,
-        "signals": signals[:5],
-        "raw_errors": truncated_errors,
-    }
+    return {"failure_class": primary, "secondary_classes": secondary,
+            "confidence": confidence, "signals": signals[:5],
+            "raw_errors": truncated_errors}
 
 
 def parse_error_patterns(result, outcome=None, result_text=None):
@@ -1227,7 +1101,7 @@ def record_agent_episode(task, result, outcome, role="developer", output=None):
     Never crashes the orchestrator — all errors are logged and swallowed.
     """
     try:
-        ensure_agent_episodes_table()
+        ensure_schema()
 
         task_id = task.get("id") if isinstance(task, dict) else task
         project_id = task.get("project_id") if isinstance(task, dict) else None
@@ -1659,95 +1533,63 @@ def deduplicate_lessons(lessons):
     return unique
 
 
-def compact_agent_output(raw_output, max_words=200):
-    """Compact raw agent output into a concise summary preserving actionable details.
+def _extract_section(text, marker, max_lines=1):
+    """Extract a named section from structured agent output.
 
-    Keeps file paths, error messages, and key actions while trimming verbose output.
-    Target: max_words words.
+    Finds the last occurrence of 'MARKER:' and returns content.
+    For max_lines=1, returns just the header line value.
+    For max_lines>1, returns header + continuation lines.
+    For max_lines=-1 (bullet mode), returns header + bullet lines.
     """
+    start = text.rfind(marker + ":")
+    if start == -1:
+        return ""
+    lines = text[start:].split("\n")
+    if max_lines == -1:
+        # Bullet mode: header + up to 5 bullet lines
+        kept = [lines[0]]
+        for line in lines[1:6]:
+            s = line.strip()
+            if s.startswith("-") or s == "":
+                kept.append(line)
+            else:
+                break
+        return "\n".join(kept).strip()
+    if max_lines == 1:
+        return lines[0].strip()
+    return "\n".join(lines[:max_lines]).strip()
+
+
+def compact_agent_output(raw_output, max_words=200):
+    """Compact raw agent output into a concise summary preserving actionable details."""
     if not raw_output:
         return ""
 
-    # Extract the RESULT block if present (always preserve this)
-    result_block = ""
-    result_start = raw_output.rfind("RESULT:")
-    if result_start != -1:
-        result_block = raw_output[result_start:].strip()
+    sections = {
+        "SUMMARY": _extract_section(raw_output, "SUMMARY"),
+        "FILES_CHANGED": _extract_section(raw_output, "FILES_CHANGED", max_lines=-1),
+        "BLOCKERS": _extract_section(raw_output, "BLOCKERS"),
+        "DECISIONS": _extract_section(raw_output, "DECISIONS"),
+        "REFLECTION": _extract_section(raw_output, "REFLECTION", max_lines=3),
+    }
 
-    # Extract FILES_CHANGED section (header + bullet lines only)
-    files_section = ""
-    fc_start = raw_output.rfind("FILES_CHANGED:")
-    if fc_start != -1:
-        fc_lines_raw = raw_output[fc_start:].split("\n")
-        fc_kept = [fc_lines_raw[0]]  # Always keep the header line
-        for line in fc_lines_raw[1:6]:
-            stripped = line.strip()
-            if stripped.startswith("-") or stripped == "":
-                fc_kept.append(line)
-            else:
-                break  # Stop at first non-bullet, non-empty line
-        files_section = "\n".join(fc_kept).strip()
-
-    # Extract BLOCKERS if present
-    blockers = ""
-    bl_start = raw_output.rfind("BLOCKERS:")
-    if bl_start != -1:
-        bl_end = raw_output.find("\n", bl_start + 20)
-        if bl_end == -1:
-            bl_end = len(raw_output)
-        blockers = raw_output[bl_start:bl_end].strip()
-
-    # Extract SUMMARY if present
-    summary_line = ""
-    sum_start = raw_output.rfind("SUMMARY:")
-    if sum_start != -1:
-        sum_end = raw_output.find("\n", sum_start)
-        if sum_end == -1:
-            sum_end = len(raw_output)
-        summary_line = raw_output[sum_start:sum_end].strip()
-
-    # Extract DECISIONS if present (actionable architectural info)
-    decisions = ""
-    dec_start = raw_output.rfind("DECISIONS:")
-    if dec_start != -1:
-        dec_end = raw_output.find("\n", dec_start + 15)
-        if dec_end == -1:
-            dec_end = len(raw_output)
-        decisions = raw_output[dec_start:dec_end].strip()
-
-    # Extract REFLECTION if present (contains specific file paths, error messages)
-    reflection = ""
-    ref_start = raw_output.rfind("REFLECTION:")
-    if ref_start != -1:
-        # Capture up to 3 lines of reflection (often multi-line)
-        ref_lines = raw_output[ref_start:].split("\n")[:3]
-        reflection = "\n".join(ref_lines).strip()
-
-    # Build compact output from structured sections
     parts = []
-    if summary_line:
-        parts.append(summary_line)
-    if files_section:
-        parts.append(files_section)
-    if blockers and "none" not in blockers.lower():
-        parts.append(blockers)
-    if decisions and "none" not in decisions.lower():
-        parts.append(decisions)
-    if reflection:
-        parts.append(reflection)
+    if sections["SUMMARY"]:
+        parts.append(sections["SUMMARY"])
+    if sections["FILES_CHANGED"]:
+        parts.append(sections["FILES_CHANGED"])
+    for key in ("BLOCKERS", "DECISIONS"):
+        if sections[key] and "none" not in sections[key].lower():
+            parts.append(sections[key])
+    if sections["REFLECTION"]:
+        parts.append(sections["REFLECTION"])
 
     compact = "\n".join(parts)
 
-    # If we got structured output, use it; otherwise fall back to tail
     if not compact.strip():
-        # No structured output found — take last max_words words
         words = raw_output.split()
-        if len(words) > max_words:
-            compact = "..." + " ".join(words[-max_words:])
-        else:
-            compact = raw_output
+        compact = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
 
-    # Final word count check
     words = compact.split()
     if len(words) > max_words:
         compact = " ".join(words[:max_words]) + "..."
@@ -1997,7 +1839,7 @@ def update_episode_injection_count(episode_ids):
         return
 
     try:
-        ensure_agent_episodes_table()
+        ensure_schema()
         conn = get_db_connection(write=True)
         placeholders = ",".join("?" * len(episode_ids))
         conn.execute(
@@ -2404,12 +2246,21 @@ def build_checkpoint_context(checkpoint_text, attempt):
 
     return (
         f"## Previous Attempt (#{attempt}) — Continue From Here\n\n"
-        f"A previous agent worked on this task but ran out of turns or timed out. "
-        f"Here is what they accomplished. **Do NOT repeat work that is already done.** "
-        f"Pick up where they left off.\n\n"
+        f"**The previous agent ran out of turns. Start writing code IMMEDIATELY — "
+        f"do not repeat the same research.**\n\n"
+        f"**The previous agent FAILED because it spent all its time reading instead "
+        f"of writing code. DO NOT make the same mistake. You are the replacement.**\n\n"
+        f"Start writing code IMMEDIATELY. Your FIRST tool call must be Edit or Write — "
+        f"not Read, not Glob, not Grep. You have the previous agent's summary below. "
+        f"Use it to skip exploration entirely and go straight to implementation.\n\n"
         f"### Previous Agent Summary:\n{compacted}\n\n"
-        f"**IMPORTANT:** Review the project files to see what was already implemented. "
-        f"Focus only on what remains to be done."
+        f"**CRITICAL:** Do NOT repeat the previous agent's exploration. Do NOT re-read "
+        f"files they already read. Do NOT analyze the codebase from scratch. Look at "
+        f"what remains to be done and START CODING in your FIRST turn.\n\n"
+        f"**You are a SENIOR engineer. Make decisions. Write code. Ship it.** "
+        f"The orchestrator is watching — another failure means this task gets "
+        f"permanently blocked and escalated to a human. Do not be the agent that "
+        f"causes escalation."
     )
 
 
@@ -2784,6 +2635,21 @@ def _compute_output_hash(content):
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+
+# Lookup for tool signature key parameter (used by loop detection)
+_TOOL_SIG_KEY = {
+    "Bash": "command", "Read": "file_path", "Grep": "pattern",
+    "Glob": "pattern", "Edit": "file_path", "Write": "file_path",
+}
+
+
+def _build_tool_signature(tool_name, tool_input):
+    """Build a fingerprint string for loop detection."""
+    key = _TOOL_SIG_KEY.get(tool_name)
+    param = str(tool_input.get(key, "") if key else
+                next(iter(tool_input.values()), "") if tool_input else "")[:80]
+    return f"{tool_name}|{param}"
+
 def _detect_tool_loop(tool_history, tool_errors, warn_threshold=3,
                       terminate_threshold=5, tool_output_hashes=None):
     """Detect when an agent repeats the same failing tool operation.
@@ -2901,6 +2767,61 @@ def _detect_tool_loop(tool_history, tool_errors, warn_threshold=3,
 
     return ("ok", consecutive_failures, last_sig)
 
+
+
+def _build_streaming_result(turn_count, duration, has_any_file_change,
+                            early_term_reason, agent_signaled_done,
+                            early_complete_reason, result_data, all_text_chunks):
+    """Build the result dict from run_agent_streaming state."""
+    result = {
+        "success": False,
+        "result_text": "",
+        "num_turns": turn_count,
+        "duration": duration,
+        "cost": None,
+        "errors": [],
+        "has_file_changes": has_any_file_change,
+    }
+
+    if early_term_reason:
+        result["errors"].append(early_term_reason)
+        result["early_terminated"] = True
+        result["early_term_reason"] = early_term_reason
+
+    if agent_signaled_done and not early_term_reason:
+        result["early_completed"] = True
+        result["early_complete_reason"] = early_complete_reason
+
+    if result_data:
+        final_text = result_data.get("result", "")
+        if ("RESULT:" not in final_text and all_text_chunks
+                and any("RESULT:" in chunk for chunk in all_text_chunks)):
+            result["result_text"] = "\n".join(all_text_chunks)
+        else:
+            result["result_text"] = final_text
+        result["num_turns"] = result_data.get("num_turns", turn_count)
+        result["cost"] = result_data.get("total_cost_usd")
+
+        subtype = result_data.get("subtype", "")
+        if subtype == "error_max_turns":
+            result["success"] = True
+            result["errors"].append("Agent hit max turns limit")
+        elif result_data.get("is_error"):
+            result["errors"].append(
+                f"Agent error: {result_data.get('result', 'unknown')}")
+        else:
+            result["success"] = not bool(early_term_reason)
+    elif agent_signaled_done and not early_term_reason:
+        result["result_text"] = "\n".join(all_text_chunks)
+        result["success"] = True
+    else:
+        result["result_text"] = "\n".join(all_text_chunks)
+        if has_any_file_change and not early_term_reason:
+            result["success"] = True
+            result["errors"].append("No result message from agent (process exited), "
+                                    "but file changes detected — treating as partial success")
+
+    return result
 
 async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                               max_turns=None, task_id=None, run_id=None,
@@ -3088,24 +3009,7 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                     else:
                         turns_without_file_change += 1
 
-                        # Build tool signature for repetition detection
-                        # Use tool name + first key param for fingerprinting
-                        sig_parts = [tool_name]
-                        if tool_name == "Bash":
-                            sig_parts.append(str(tool_input.get("command", ""))[:80])
-                        elif tool_name == "Read":
-                            sig_parts.append(str(tool_input.get("file_path", "")))
-                        elif tool_name == "Grep":
-                            sig_parts.append(str(tool_input.get("pattern", "")))
-                        elif tool_name == "Glob":
-                            sig_parts.append(str(tool_input.get("pattern", "")))
-                        else:
-                            # Generic: use first key
-                            first_val = next(iter(tool_input.values()), "") if tool_input else ""
-                            sig_parts.append(str(first_val)[:80])
-
-                        tool_sig = "|".join(sig_parts)
-                        tool_history.append(tool_sig)
+                        tool_history.append(_build_tool_signature(tool_name, tool_input))
 
                         # Check for loop detection (repeated failing operations)
                         action, count, last_sig = _detect_tool_loop(
@@ -3134,8 +3038,10 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                                     and not warning_injected):
                                 log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
                                     f"turns without file changes (role={role}, "
-                                    f"turn ~{turn_count}). Start writing code NOW.",
-                                    output)
+                                    f"turn ~{turn_count}). WARNING: You have not "
+                                    f"written any code yet. Your job is to WRITE "
+                                    f"CODE, not read the entire codebase. Start "
+                                    f"writing NOW or you will be replaced.", output)
                                 warning_injected = True
 
                             if (turns_without_file_change >= effective_final_warn_turns
@@ -3143,17 +3049,22 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                                 log(f"  [EarlyTerm] FINAL WARNING: "
                                     f"{turns_without_file_change} turns without file "
                                     f"changes (role={role}, turn ~{turn_count}). "
-                                    f"Agent WILL BE KILLED at turn "
-                                    f"{effective_kill_turns}. Write files immediately "
-                                    f"or commit partial progress.", output)
+                                    f"FINAL WARNING: You are about to be TERMINATED "
+                                    f"for wasting budget. Write code in the NEXT "
+                                    f"TURN or a new agent takes over. Do NOT read "
+                                    f"another file. Kill threshold: "
+                                    f"{effective_kill_turns}.", output)
                                 final_warning_injected = True
 
                             if turns_without_file_change >= effective_kill_turns:
                                 early_term_reason = (
                                     f"Agent terminated: {turns_without_file_change} "
-                                    f"consecutive turns without file changes"
+                                    f"consecutive turns without file changes. "
+                                    f"Agent spent all turns reading instead of "
+                                    f"writing code — replaced with stricter agent"
                                 )
-                                log(f"  [EarlyTerm] {early_term_reason}", output)
+                                log(f"  [EarlyTerm] KILLED: {early_term_reason}",
+                                    output)
 
                 # Budget visibility: log remaining budget at intervals
                 if turn_has_tool_calls and max_turns:
@@ -3278,67 +3189,10 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
 
     duration = time.time() - start_time
 
-    # --- Build result dict (same format as run_agent) ---
-    result = {
-        "success": False,
-        "result_text": "",
-        "num_turns": turn_count,
-        "duration": duration,
-        "cost": None,
-        "errors": [],
-    }
-
-    # Track whether agent made file changes (Write/Edit tool calls observed)
-    result["has_file_changes"] = has_any_file_change
-
-    if early_term_reason:
-        result["errors"].append(early_term_reason)
-        result["early_terminated"] = True
-        result["early_term_reason"] = early_term_reason
-
-    # Agent-initiated early completion (distinct from early_terminated)
-    # early_completed = agent CHOSE to stop (success)
-    # early_terminated = orchestrator FORCED agent to stop (failure)
-    if agent_signaled_done and not early_term_reason:
-        result["early_completed"] = True
-        result["early_complete_reason"] = early_complete_reason
-
-    # If we got the final result message from stream-json, use it
-    if result_data:
-        final_text = result_data.get("result", "")
-        # If final result lacks structured test markers but accumulated text has them,
-        # use the full accumulated text (tester often outputs RESULT: block mid-conversation)
-        if ("RESULT:" not in final_text and all_text_chunks
-                and any("RESULT:" in chunk for chunk in all_text_chunks)):
-            result["result_text"] = "\n".join(all_text_chunks)
-        else:
-            result["result_text"] = final_text
-        result["num_turns"] = result_data.get("num_turns", turn_count)
-        result["cost"] = result_data.get("total_cost_usd")
-
-        subtype = result_data.get("subtype", "")
-        if subtype == "error_max_turns":
-            result["success"] = True
-            result["errors"].append("Agent hit max turns limit")
-        elif result_data.get("is_error"):
-            result["errors"].append(
-                f"Agent error: {result_data.get('result', 'unknown')}")
-        else:
-            result["success"] = not bool(early_term_reason)
-    elif agent_signaled_done and not early_term_reason:
-        # Agent signaled done but process didn't emit a result message.
-        # Use accumulated text and treat as success — the agent chose to stop.
-        result["result_text"] = "\n".join(all_text_chunks)
-        result["success"] = True
-    else:
-        # No result message — build text from accumulated chunks
-        result["result_text"] = "\n".join(all_text_chunks)
-        # If agent made file changes but crashed before emitting result,
-        # treat as partial success (the work exists on disk)
-        if has_any_file_change and not early_term_reason:
-            result["success"] = True
-            result["errors"].append("No result message from agent (process exited), "
-                                    "but file changes detected — treating as partial success")
+    result = _build_streaming_result(
+        turn_count, duration, has_any_file_change,
+        early_term_reason, agent_signaled_done,
+        early_complete_reason, result_data, all_text_chunks)
 
     # Read any remaining stderr
     try:
@@ -3420,112 +3274,85 @@ async def run_agent_with_retries(cmd, task, max_retries):
 
 # --- Output Parsers (Phase 2) ---
 
-def parse_tester_output(result_text):
-    """Parse structured output from the Tester agent.
+def _parse_structured_output(text, schema):
+    """Generic parser for structured agent output with MARKER: value lines.
 
-    Looks for RESULT, TEST_FRAMEWORK, TESTS_RUN, TESTS_FAILED,
-    FAILURE_DETAILS, and RECOMMENDATIONS lines.
-
-    Returns a dict with parsed fields.
+    Schema is a dict mapping marker names to their types:
+        str   — single-line string value
+        int   — single-line integer value
+        list  — multi-line bullet list (lines starting with "- ")
+    Returns a dict with parsed values.
     """
-    parsed = {
-        "result": "unknown",
-        "test_framework": "none",
-        "tests_run": 0,
-        "tests_passed": 0,
-        "tests_failed": 0,
-        "failure_details": [],
-        "recommendations": [],
-        "summary": "",
-    }
+    result = {}
+    for marker, typ in schema.items():
+        if typ is list:
+            result[marker.lower().replace(" ", "_")] = []
+        elif typ is int:
+            result[marker.lower().replace(" ", "_")] = 0
+        else:
+            result[marker.lower().replace(" ", "_")] = "" if marker != "RESULT" else "unknown"
 
-    if not result_text:
-        return parsed
+    if not text:
+        return result
 
-    lines = result_text.splitlines()
-    current_section = None  # tracks multi-line sections
-
-    for line in lines:
+    current_list_key = None
+    for line in text.splitlines():
         stripped = line.strip()
 
-        # Single-value fields
-        if stripped.startswith("RESULT:"):
-            parsed["result"] = stripped.split(":", 1)[1].strip().lower()
-            current_section = None
-        elif stripped.startswith("TEST_FRAMEWORK:"):
-            parsed["test_framework"] = stripped.split(":", 1)[1].strip()
-            current_section = None
-        elif stripped.startswith("TESTS_RUN:"):
-            try:
-                parsed["tests_run"] = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-            current_section = None
-        elif stripped.startswith("TESTS_PASSED:"):
-            try:
-                parsed["tests_passed"] = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-            current_section = None
-        elif stripped.startswith("TESTS_FAILED:"):
-            try:
-                parsed["tests_failed"] = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-            current_section = None
-        elif stripped.startswith("SUMMARY:"):
-            parsed["summary"] = stripped.split(":", 1)[1].strip()
-            current_section = None
+        # Check all schema markers
+        matched = False
+        for marker, typ in schema.items():
+            key = marker.lower().replace(" ", "_")
+            if stripped.startswith(marker + ":"):
+                value = stripped.split(":", 1)[1].strip()
+                if typ is int:
+                    try:
+                        result[key] = int(value)
+                    except ValueError:
+                        pass
+                elif typ is list:
+                    current_list_key = key
+                else:
+                    result[key] = value.lower() if marker == "RESULT" else value
+                if typ is not list:
+                    current_list_key = None
+                matched = True
+                break
 
-        # Multi-line sections
-        elif stripped.startswith("FAILURE_DETAILS:"):
-            current_section = "failure_details"
-        elif stripped.startswith("RECOMMENDATIONS:"):
-            current_section = "recommendations"
-
-        # Collect bullet items for multi-line sections
-        elif current_section and stripped.startswith("- "):
+        # Collect bullet items for list sections
+        if not matched and current_list_key and stripped.startswith("- "):
             item = stripped[2:].strip()
             if item.lower() != "none":
-                parsed[current_section].append(item)
+                result[current_list_key].append(item)
+        elif not matched and stripped and not stripped.startswith("-"):
+            current_list_key = None
 
+    return result
+
+
+# Schemas for structured agent output parsing
+_TESTER_SCHEMA = {
+    "RESULT": str, "TEST_FRAMEWORK": str, "TESTS_RUN": int,
+    "TESTS_PASSED": int, "TESTS_FAILED": int, "SUMMARY": str,
+    "FAILURE_DETAILS": list, "RECOMMENDATIONS": list,
+}
+
+_DEVELOPER_FILES_SCHEMA = {"FILES_CHANGED": list}
+
+
+def parse_tester_output(result_text):
+    """Parse structured output from the Tester agent."""
+    parsed = _parse_structured_output(result_text, _TESTER_SCHEMA)
+    # Backward compat: default test_framework to "none"
+    if not parsed.get("test_framework"):
+        parsed["test_framework"] = "none"
     return parsed
 
 
 def parse_developer_output(result_text):
-    """Extract FILES_CHANGED list from developer output.
-
-    Looks for a FILES_CHANGED: section with bullet items.
-    Returns a list of filenames.
-    """
-    files = []
-    if not result_text:
-        return files
-
-    lines = result_text.splitlines()
-    in_files_section = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if stripped.startswith("FILES_CHANGED:"):
-            in_files_section = True
-            # Check for inline value like "FILES_CHANGED: none"
-            value = stripped.split(":", 1)[1].strip().lower()
-            if value and value != "none":
-                files.append(value)
-            continue
-
-        if in_files_section:
-            if stripped.startswith("- "):
-                item = stripped[2:].strip()
-                if item.lower() != "none":
-                    files.append(item)
-            elif stripped and not stripped.startswith("-"):
-                # End of the section (hit a non-bullet, non-empty line)
-                in_files_section = False
-
-    return files
+    """Extract FILES_CHANGED list from developer output."""
+    parsed = _parse_structured_output(result_text, _DEVELOPER_FILES_SCHEMA)
+    return parsed.get("files_changed", [])
 
 
 # --- Session Compaction (Phase 2) ---
@@ -3592,12 +3419,28 @@ def build_test_failure_context(test_results, cycle):
     return "\n".join(lines)
 
 
-async def auto_install_dependencies(project_dir, output=None):
-    """Auto-install project dependencies if manifest exists but deps are missing.
+async def _run_install_cmd(cmd, cwd, label, output=None):
+    """Run an install command, log result. Returns True on success."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            log(f"  [Auto-Install] {label} installed successfully.", output)
+            return True
+        err = stderr.decode("utf-8", errors="replace")[:200]
+        log(f"  [Auto-Install] {label} failed (rc={proc.returncode}): {err}", output)
+    except FileNotFoundError:
+        log(f"  [Auto-Install] {cmd[0]} not found. Skipping {label}.", output)
+    except Exception as e:
+        log(f"  [Auto-Install] {label} error: {e}", output)
+    return False
 
-    Checks for pyproject.toml/requirements.txt (Python) and package.json (Node).
-    Runs install in background, logs result.
-    """
+
+async def auto_install_dependencies(project_dir, output=None):
+    """Auto-install project dependencies if manifest exists but deps are missing."""
     pdir = Path(project_dir)
 
     # Python: pyproject.toml or requirements.txt without venv
@@ -3607,109 +3450,57 @@ async def auto_install_dependencies(project_dir, output=None):
 
     if (has_pyproject or has_requirements) and not has_venv:
         log(f"  [Auto-Install] Python project without venv detected. Installing...", output)
-        try:
-            venv_path = pdir / "venv"
-            # Create venv
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "venv", str(venv_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-
-            # Install deps
-            pip_path = venv_path / "bin" / "pip"
-            if not pip_path.exists():
-                pip_path = venv_path / "Scripts" / "pip"  # Windows
-
-            if has_pyproject:
-                install_cmd = [str(pip_path), "install", "-e", f"{project_dir}[dev]"]
-            else:
-                install_cmd = [str(pip_path), "install", "-r", str(pdir / "requirements.txt")]
-
-            proc = await asyncio.create_subprocess_exec(
-                *install_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                log(f"  [Auto-Install] Python deps installed successfully.", output)
-            else:
-                err = stderr.decode("utf-8", errors="replace")[:200]
-                log(f"  [Auto-Install] Python install failed (rc={proc.returncode}): {err}", output)
-        except Exception as e:
-            log(f"  [Auto-Install] Python install error: {e}", output)
+        venv_path = pdir / "venv"
+        await _run_install_cmd(
+            [sys.executable, "-m", "venv", str(venv_path)], str(pdir), "Python venv", output)
+        pip_path = venv_path / "bin" / "pip"
+        if not pip_path.exists():
+            pip_path = venv_path / "Scripts" / "pip"
+        install_cmd = ([str(pip_path), "install", "-e", f"{project_dir}[dev]"]
+                       if has_pyproject
+                       else [str(pip_path), "install", "-r", str(pdir / "requirements.txt")])
+        await _run_install_cmd(install_cmd, str(pdir), "Python deps", output)
 
     # Node.js: package.json without node_modules
-    has_package_json = (pdir / "package.json").exists()
-    has_node_modules = (pdir / "node_modules").exists()
-
-    if has_package_json and not has_node_modules:
+    if (pdir / "package.json").exists() and not (pdir / "node_modules").exists():
         log(f"  [Auto-Install] Node.js project without node_modules detected. Installing...", output)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "npm", "install",
-                cwd=str(pdir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                log(f"  [Auto-Install] Node.js deps installed successfully.", output)
-            else:
-                err = stderr.decode("utf-8", errors="replace")[:200]
-                log(f"  [Auto-Install] npm install failed (rc={proc.returncode}): {err}", output)
-        except FileNotFoundError:
-            log(f"  [Auto-Install] npm not found. Skipping Node.js dep install.", output)
-        except Exception as e:
-            log(f"  [Auto-Install] npm install error: {e}", output)
+        await _run_install_cmd(["npm", "install"], str(pdir), "Node.js deps", output)
 
-    # Go: go.mod present — download modules
-    has_go_mod = (pdir / "go.mod").exists()
-    if has_go_mod:
+    # Go: go.mod present
+    if (pdir / "go.mod").exists():
         log(f"  [Auto-Install] Go project detected. Running go mod download...", output)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "go", "mod", "download",
-                cwd=str(pdir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                log(f"  [Auto-Install] Go modules downloaded successfully.", output)
-            else:
-                err = stderr.decode("utf-8", errors="replace")[:200]
-                log(f"  [Auto-Install] go mod download failed (rc={proc.returncode}): {err}", output)
-        except FileNotFoundError:
-            log(f"  [Auto-Install] go not found. Skipping Go dep install.", output)
-        except Exception as e:
-            log(f"  [Auto-Install] Go install error: {e}", output)
+        await _run_install_cmd(["go", "mod", "download"], str(pdir), "Go modules", output)
+
+
+def _resolve_build_command(project_dir):
+    """Resolve language and build command for a project directory.
+
+    Returns (language: str, build_cmd: list | None, skip_reason: str | None).
+    """
+    pdir = Path(project_dir)
+
+    if (pdir / "package.json").exists():
+        cmd = (["npx", "tsc", "--noEmit"] if (pdir / "tsconfig.json").exists()
+               else ["npm", "run", "build"])
+        return "node", cmd, None
+    if (pdir / "go.mod").exists():
+        return "go", ["go", "build", "./..."], None
+    if (pdir / "pyproject.toml").exists() or (pdir / "requirements.txt").exists():
+        for entry in ("main.py", "app.py"):
+            if (pdir / entry).exists():
+                return "python", ["python3", "-m", "py_compile", str(pdir / entry)], None
+        return "python", None, "no Python entry point found"
+    csproj = list(pdir.glob("*.csproj"))
+    if csproj:
+        return "csharp", ["dotnet", "build", str(csproj[0]), "--no-restore"], None
+    return "unknown", None, "no recognized project files"
 
 
 async def preflight_build_check(project_dir, task_description=None, output=None):
     """Run a lightweight build check before the developer agent starts.
 
-    Detects the project language from manifest files and runs a quick build
-    command to catch pre-existing build failures. This gives the agent context
-    about the current build state before it begins working.
-
-    Args:
-        project_dir: Path to the project directory.
-        task_description: Optional task description. If it contains build-fix
-            keywords (fix, build, compile, broken), the check is skipped since
-            the task IS to fix the build.
-        output: Optional output callback for logging.
-
-    Returns:
-        Tuple of (success: bool, language: str, error_details: str).
-        success=True means either the build passed or the check was skipped.
-        language is one of: 'node', 'go', 'python', 'csharp', 'unknown'.
-        error_details contains build stderr/stdout on failure, or 'skipped' reason.
+    Returns (success: bool, language: str, error_details: str).
     """
-    pdir = Path(project_dir)
-
     # Skip if task description mentions build-fix keywords
     if task_description:
         desc_lower = task_description.lower()
@@ -3719,63 +3510,23 @@ async def preflight_build_check(project_dir, task_description=None, output=None)
                     f"(task is likely to fix the build)", output)
                 return (True, "unknown", f"Skipped: task description contains '{keyword}'")
 
-    # Detect language from project files
-    has_package_json = (pdir / "package.json").exists()
-    has_go_mod = (pdir / "go.mod").exists()
-    has_pyproject = (pdir / "pyproject.toml").exists()
-    has_requirements = (pdir / "requirements.txt").exists()
-    csproj_files = list(pdir.glob("*.csproj"))
+    language, build_cmd, skip_reason = _resolve_build_command(project_dir)
+    if not build_cmd:
+        msg = skip_reason or ""
+        if msg:
+            log(f"  [Preflight] {language} project: {msg}. Skipping build check.", output)
+        return (True, language, f"Skipped: {msg}" if msg else "")
 
-    # Determine language and build command
-    language = "unknown"
-    build_cmd = None
-
-    if has_package_json:
-        language = "node"
-        # Prefer tsc --noEmit for type checking, fall back to npm run build
-        tsconfig = pdir / "tsconfig.json"
-        if tsconfig.exists():
-            build_cmd = ["npx", "tsc", "--noEmit"]
-        else:
-            build_cmd = ["npm", "run", "build"]
-    elif has_go_mod:
-        language = "go"
-        build_cmd = ["go", "build", "./..."]
-    elif has_pyproject or has_requirements:
-        language = "python"
-        # Try to compile the main entry point if it exists
-        main_py = pdir / "main.py"
-        app_py = pdir / "app.py"
-        if main_py.exists():
-            build_cmd = ["python3", "-m", "py_compile", str(main_py)]
-        elif app_py.exists():
-            build_cmd = ["python3", "-m", "py_compile", str(app_py)]
-        else:
-            # No obvious entry point — skip build check but report language
-            log(f"  [Preflight] Python project detected but no main.py/app.py found. Skipping build check.", output)
-            return (True, language, "Skipped: no Python entry point found")
-    elif csproj_files:
-        language = "csharp"
-        build_cmd = ["dotnet", "build", str(csproj_files[0]), "--no-restore"]
-    else:
-        log(f"  [Preflight] No recognized project files found. Skipping build check.", output)
-        return (True, "unknown", "")
-
-    # Run the build command with timeout
     log(f"  [Preflight] Detected {language} project. Running build check: {' '.join(build_cmd)}", output)
     try:
         proc = await asyncio.create_subprocess_exec(
-            *build_cmd,
-            cwd=str(pdir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            *build_cmd, cwd=str(Path(project_dir)),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=PREFLIGHT_TIMEOUT
-            )
+                proc.communicate(), timeout=PREFLIGHT_TIMEOUT)
         except asyncio.TimeoutError:
-            # Kill the process on timeout
             proc.kill()
             await proc.communicate()
             error_msg = f"Build check timed out after {PREFLIGHT_TIMEOUT}s"
@@ -3785,28 +3536,142 @@ async def preflight_build_check(project_dir, task_description=None, output=None)
         if proc.returncode == 0:
             log(f"  [Preflight] Build check passed ({language}).", output)
             return (True, language, "")
-        else:
-            # Capture error output, truncate to keep context manageable
-            error_output = stderr.decode("utf-8", errors="replace")
-            stdout_output = stdout.decode("utf-8", errors="replace")
-            combined = (error_output + "\n" + stdout_output).strip()
-            # Truncate to 1000 chars to avoid bloating compaction history
-            if len(combined) > 1000:
-                combined = combined[:1000] + "\n... (truncated)"
-            log(f"  [Preflight] Build FAILED ({language}, rc={proc.returncode}). "
-                f"Error preview: {combined[:200]}", output)
-            return (False, language, combined)
+
+        combined = (stderr.decode("utf-8", errors="replace") + "\n"
+                    + stdout.decode("utf-8", errors="replace")).strip()
+        if len(combined) > 1000:
+            combined = combined[:1000] + "\n... (truncated)"
+        log(f"  [Preflight] Build FAILED ({language}, rc={proc.returncode}). "
+            f"Error preview: {combined[:200]}", output)
+        return (False, language, combined)
 
     except FileNotFoundError:
-        # Build tool not installed (e.g., go, dotnet, npx not on PATH)
         error_msg = f"Build tool not found for {language}: {build_cmd[0]}"
         log(f"  [Preflight] {error_msg}. Skipping build check.", output)
         return (True, language, f"Skipped: {error_msg}")
     except Exception as e:
-        # Unexpected error — don't block the task
         error_msg = f"Preflight error: {e}"
         log(f"  [Preflight] {error_msg}. Continuing without build check.", output)
         return (True, language, f"Skipped: {error_msg}")
+
+
+# --- Auto-Fix Build Failure ---
+
+async def _dispatch_autofix_agent(role, task_dict, project_dir, project_context,
+                                  budget, task_id, cycle, args, output=None):
+    """Dispatch a single auto-fix agent (debugger or planner). Returns (result, cost)."""
+    dispatch_config = getattr(args, "dispatch_config", None) if args else None
+    model = get_role_model(role, args, task=task_dict)
+    streaming = role != "planner"
+    prompt = build_system_prompt(
+        task_dict, project_context, project_dir,
+        role=role, max_turns=budget, dispatch_config=dispatch_config,
+    )
+    cmd = build_cli_command(prompt, project_dir, budget, model, role=role, streaming=streaming)
+    result = await dispatch_agent(
+        cmd, role=role, output=output, max_turns=budget, task_id=task_id,
+        cycle=cycle, system_prompt=prompt, project_dir=project_dir, args=args,
+    )
+    cost = result.get("cost") or (result.get("num_turns", 0) * COST_ESTIMATE_PER_TURN)
+    return result, cost
+
+
+async def _handle_preflight_failure(task, project_dir, project_context,
+                                    preflight_lang, preflight_error, args,
+                                    output=None):
+    """Auto-dispatch debugger agent to fix a broken build before the main task.
+
+    Strategy: debugger attempts → planner analysis → guided debugger → give up.
+    Returns (fixed: bool, cost: float, summary: str).
+    """
+    task_id = task["id"]
+    total_cost = 0.0
+
+    log(f"  [AutoFix] Build broken — dispatching debugger agent", output)
+    log(f"  [AutoFix] Language: {preflight_lang}, error preview: "
+        f"{preflight_error[:200]}", output)
+
+    # --- Phase 1: Debugger attempts ---
+    for attempt in range(1, AUTOFIX_MAX_DEBUGGER_CYCLES + 1):
+        log(f"  [AutoFix] Debugger attempt {attempt}/{AUTOFIX_MAX_DEBUGGER_CYCLES}", output)
+        fix_task = {
+            "id": task_id,
+            "title": f"[AutoFix] Fix {preflight_lang} build errors",
+            "description": (
+                f"The project build is BROKEN. Your ONLY job is to make it compile clean.\n\n"
+                f"**Build error output:**\n```\n{preflight_error}\n```\n\n"
+                f"DO NOT work on any other task. DO NOT refactor. DO NOT add features.\n"
+                f"Read the error, find the broken file(s), fix them, verify the build passes.\n"
+                f"Start writing fixes IMMEDIATELY — do not read more than 3 files."
+            ),
+        }
+        _, cost = await _dispatch_autofix_agent(
+            "debugger", fix_task, project_dir, project_context,
+            AUTOFIX_DEBUGGER_BUDGET, task_id, attempt, args, output)
+        total_cost += cost
+
+        if total_cost >= AUTOFIX_COST_LIMIT:
+            log(f"  [AutoFix] Cost limit reached (${total_cost:.2f}). Giving up.", output)
+            return False, total_cost, "cost_limit_exceeded"
+
+        fixed, _, new_error = await preflight_build_check(project_dir, output=output)
+        if fixed:
+            log(f"  [AutoFix] Build FIXED by debugger (attempt {attempt}, cost: ${total_cost:.2f})", output)
+            return True, total_cost, f"debugger_fixed_attempt_{attempt}"
+
+        log(f"  [AutoFix] Debugger attempt {attempt} failed. Build still broken.", output)
+        if new_error:
+            preflight_error = new_error
+
+    # --- Phase 2: Planner analysis ---
+    log(f"  [AutoFix] Debugger failed {AUTOFIX_MAX_DEBUGGER_CYCLES}x. Escalating to planner.", output)
+    planner_task = {
+        "id": task_id,
+        "title": f"[AutoFix] Analyze build failure and write fix plan",
+        "description": (
+            f"The project build is BROKEN and a debugger agent failed to fix it "
+            f"after {AUTOFIX_MAX_DEBUGGER_CYCLES} attempts.\n\n"
+            f"**Build error output:**\n```\n{preflight_error}\n```\n\n"
+            f"Your job: 1) Analyze root cause 2) Identify EXACT files and lines "
+            f"3) Write step-by-step fix plan with specific code changes 4) Output "
+            f"as a numbered list. Do NOT fix the code — write the plan."
+        ),
+    }
+    planner_result, cost = await _dispatch_autofix_agent(
+        "planner", planner_task, project_dir, project_context,
+        AUTOFIX_PLANNER_BUDGET, task_id, AUTOFIX_MAX_DEBUGGER_CYCLES + 1, args, output)
+    total_cost += cost
+
+    if total_cost >= AUTOFIX_COST_LIMIT:
+        log(f"  [AutoFix] Cost limit reached after planner (${total_cost:.2f}). Giving up.", output)
+        return False, total_cost, "cost_limit_exceeded"
+
+    plan_text = str(planner_result.get("result") or planner_result.get("output", "No plan."))[:2000]
+
+    # --- Phase 3: Guided debugger with plan ---
+    log(f"  [AutoFix] Dispatching debugger with planner's fix plan", output)
+    guided_task = {
+        "id": task_id,
+        "title": f"[AutoFix] Fix build using analysis plan",
+        "description": (
+            f"The project build is BROKEN. A planner produced this fix plan:\n\n"
+            f"**Fix Plan:**\n{plan_text}\n\n"
+            f"**Build error output:**\n```\n{preflight_error}\n```\n\n"
+            f"Execute the plan. Fix the build. Verify it compiles. Start IMMEDIATELY."
+        ),
+    }
+    _, cost = await _dispatch_autofix_agent(
+        "debugger", guided_task, project_dir, project_context,
+        AUTOFIX_DEBUGGER_BUDGET, task_id, AUTOFIX_MAX_DEBUGGER_CYCLES + 2, args, output)
+    total_cost += cost
+
+    fixed, _, _ = await preflight_build_check(project_dir, output=output)
+    if fixed:
+        log(f"  [AutoFix] Build FIXED by guided debugger (cost: ${total_cost:.2f})", output)
+        return True, total_cost, "planner_guided_fix"
+
+    log(f"  [AutoFix] Build still broken after all attempts (cost: ${total_cost:.2f}).", output)
+    return False, total_cost, "all_attempts_failed"
 
 
 # --- Loop Detection ---
@@ -4046,6 +3911,13 @@ async def dispatch_agent(cmd, role, output, max_turns, task_id, cycle,
 
 # --- Dev+Tester Loop (Phase 2) ---
 
+
+def _apply_cost_totals(result, total_cost, total_duration):
+    """Stamp accumulated cost and duration onto a result dict."""
+    result["cost"] = total_cost
+    result["duration"] = total_duration
+    return result
+
 async def run_dev_test_loop(task, project_dir, project_context, args, output=None):
     """Run the Developer + Tester iteration loop.
 
@@ -4123,20 +3995,38 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         log(f"  [Checkpoint] Loaded checkpoint from attempt #{prev_attempt} "
             f"({len(checkpoint_text)} chars). Agent will continue from there.", output)
 
-    # Inject preflight build failure context so the agent knows the build state
+    # Auto-fix: dispatch debugger agent to fix broken builds before main task
     if not preflight_ok and preflight_error:
-        preflight_context = (
-            f"## Pre-flight Build Check FAILED ({preflight_lang})\n\n"
-            f"The project build was checked before your session started and it **failed**.\n"
-            f"This may be a pre-existing issue or caused by recent changes.\n\n"
-            f"**Build error output:**\n```\n{preflight_error}\n```\n\n"
-            f"Take this into account when working on your task. "
-            f"If your task is unrelated to the build failure, "
-            f"focus on your task but be aware the build is broken."
+        autofix_ok, autofix_cost, autofix_summary = await _handle_preflight_failure(
+            task, project_dir, project_context,
+            preflight_lang, preflight_error, args, output=output,
         )
-        compaction_history.append(preflight_context)
-        log(f"  [Preflight] Build failure context injected into agent history "
-            f"({len(preflight_error)} chars)", output)
+        total_cost += autofix_cost
+
+        if autofix_ok:
+            # Build is fixed — proceed with the original task normally
+            compaction_history.append(
+                f"## Build Auto-Fixed\n\n"
+                f"The build was broken but an auto-fix debugger agent repaired it "
+                f"(method: {autofix_summary}, cost: ${autofix_cost:.2f}).\n"
+                f"The build now passes. Proceed with your task normally."
+            )
+        else:
+            # Build is still broken — mark task blocked
+            log(f"  [AutoFix] Could not fix build. Marking task {task_id} as blocked "
+                f"(reason: build_broken, autofix: {autofix_summary})", output)
+            conn = get_db_connection(write=True)
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,)
+            )
+            conn.commit()
+            conn.close()
+            return {
+                "early_terminated": True,
+                "early_term_reason": f"build_broken ({autofix_summary})",
+                "cost": total_cost,
+                "duration": 0,
+            }, 0, "build_broken"
 
     for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
         log(f"\n{'=' * 50}", output)
@@ -4198,23 +4088,15 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         dev_result["turns_allocated"] = dev_turns_allocated
         dev_result["turns_max"] = dev_turns_max
         total_duration += dev_result.get("duration", 0)
-        if dev_result.get("cost"):
-            total_cost += dev_result["cost"]
-        elif dev_result.get("num_turns"):
-            # Estimate cost for killed/failed runs where actual cost is None
-            estimated = dev_result["num_turns"] * COST_ESTIMATE_PER_TURN
-            total_cost += estimated
-            log(f"  [Cycle {cycle}] Developer cost=None, estimating "
-                f"${estimated:.2f} ({dev_result['num_turns']} turns * "
-                f"${COST_ESTIMATE_PER_TURN})", output)
+        total_cost += _accumulate_cost(
+            dev_result, f"[Cycle {cycle}] Developer", output)
 
-        # Cost-based circuit breaker: terminate if accumulated cost exceeds limit
+        # Cost-based circuit breaker
         cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
         if cost_reason:
             log(f"  [Cycle {cycle}] {cost_reason}", output)
             loop_detector.record(dev_result, cycle)
-            dev_result["cost"] = total_cost
-            dev_result["duration"] = total_duration
+            _apply_cost_totals(dev_result, total_cost, total_duration)
             dev_result["early_terminated"] = True
             dev_result["early_term_reason"] = cost_reason
             return dev_result, cycle, "cost_limit_exceeded"
@@ -4390,22 +4272,14 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
         tester_result["turns_allocated"] = tester_turns_allocated
         tester_result["turns_max"] = tester_turns_max
         total_duration += tester_result.get("duration", 0)
-        if tester_result.get("cost"):
-            total_cost += tester_result["cost"]
-        elif tester_result.get("num_turns"):
-            # Estimate cost for killed/failed tester runs where actual cost is None
-            estimated = tester_result["num_turns"] * COST_ESTIMATE_PER_TURN
-            total_cost += estimated
-            log(f"  [Cycle {cycle}] Tester cost=None, estimating "
-                f"${estimated:.2f} ({tester_result['num_turns']} turns * "
-                f"${COST_ESTIMATE_PER_TURN})", output)
+        total_cost += _accumulate_cost(
+            tester_result, f"[Cycle {cycle}] Tester", output)
 
         # Cost-based circuit breaker after tester phase
         cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
         if cost_reason:
             log(f"  [Cycle {cycle}] {cost_reason} (after tester)", output)
-            tester_result["cost"] = total_cost
-            tester_result["duration"] = total_duration
+            _apply_cost_totals(tester_result, total_cost, total_duration)
             tester_result["early_terminated"] = True
             tester_result["early_term_reason"] = cost_reason
             return tester_result, cycle, "cost_limit_exceeded"
@@ -4451,15 +4325,13 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
                                "test_passed", msg_content)
             log(f"  [Cycle {cycle}] Posted test_passed message for {task_role}", output)
             clear_checkpoints(task_id)  # success — no need for checkpoints
-            tester_result["cost"] = total_cost
-            tester_result["duration"] = total_duration
+            _apply_cost_totals(tester_result, total_cost, total_duration)
             return tester_result, cycle, "tests_passed"
 
         elif test_outcome == "no-tests":
             log(f"  [Cycle {cycle}] No tests found. Accepting Developer result.", output)
             clear_checkpoints(task_id)  # success — no need for checkpoints
-            dev_result["cost"] = total_cost
-            dev_result["duration"] = total_duration
+            _apply_cost_totals(dev_result, total_cost, total_duration)
             return dev_result, cycle, "no_tests"
 
         elif test_outcome == "blocked":
@@ -4479,8 +4351,7 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             log(f"  [Cycle {cycle}] Tester returned unknown with 0 tests. "
                 f"Treating as no-tests.", output)
             clear_checkpoints(task_id)
-            dev_result["cost"] = total_cost
-            dev_result["duration"] = total_duration
+            _apply_cost_totals(dev_result, total_cost, total_duration)
             return dev_result, cycle, "no_tests"
 
         else:
@@ -5139,46 +5010,9 @@ def verify_task_updated(task_id):
 
 # --- Output ---
 
-def print_summary(task, result, verified, verify_msg):
-    """Print a formatted summary of the agent run."""
-    print("\n" + "=" * 60)
-    print("PROJECT POMBAL AGENT RUN SUMMARY")
-    print("=" * 60)
-
-    print(f"\nTask:      #{task['id']} - {task['title']}")
-    print(f"Project:   {task.get('project_name', 'Unknown')}")
-    print(f"Status:    {'SUCCESS' if result['success'] else 'FAILED'}")
-    print(f"Turns:     {result['num_turns']}")
-    print(f"Duration:  {result['duration']:.1f}s")
-
-    if result["cost"] is not None:
-        print(f"Cost:      ${result['cost']:.4f}")
-
-    print(f"\nDB Verify: {'PASS' if verified else 'FAIL'} - {verify_msg}")
-
-    if result["errors"]:
-        print(f"\nErrors:")
-        for err in result["errors"]:
-            # Truncate long error messages
-            if len(err) > 200:
-                err = err[:200] + "..."
-            print(f"  - {err}")
-
-    # Show tail of agent output
-    output = result.get("result_text", "")
-    if output:
-        print(f"\nAgent Output (last 500 chars):")
-        print("-" * 40)
-        tail = output[-500:] if len(output) > 500 else output
-        # Handle Windows console encoding (cp1252 can't print emoji etc.)
-        print(tail.encode("ascii", errors="replace").decode("ascii"))
-
-    print("\n" + "=" * 60)
-
-
-def print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg):
-    """Print a formatted summary of the dev-test loop run."""
-    # Map outcome reasons to human-readable messages
+def _print_task_summary(title, task, result, verified, verify_msg,
+                       cycles=None, outcome=None):
+    """Print a formatted summary of an agent run (single or dev-test)."""
     outcome_messages = {
         "tests_passed": "All tests passed",
         "no_tests": "No tests found, Developer result accepted",
@@ -5191,40 +5025,57 @@ def print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg):
         "cycles_exhausted": f"All {MAX_DEV_TEST_CYCLES} fix-test cycles used without passing",
     }
 
-    is_success = outcome in ("tests_passed", "no_tests")
+    is_success = (outcome in ("tests_passed", "no_tests") if outcome
+                  else result.get("success", False))
 
     print("\n" + "=" * 60)
-    print("PROJECT POMBAL DEV-TEST LOOP SUMMARY")
+    print(title)
     print("=" * 60)
 
     print(f"\nTask:      #{task['id']} - {task['title']}")
     print(f"Project:   {task.get('project_name', 'Unknown')}")
-    print(f"Verdict:   {'SUCCESS' if is_success else 'BLOCKED'}")
-    print(f"Cycles:    {cycles}/{MAX_DEV_TEST_CYCLES}")
-    print(f"Outcome:   {outcome_messages.get(outcome, outcome)}")
-    print(f"Duration:  {result.get('duration', 0):.1f}s total")
+    print(f"Verdict:   {'SUCCESS' if is_success else 'BLOCKED' if outcome else ('SUCCESS' if result.get('success') else 'FAILED')}")
+    if cycles is not None:
+        print(f"Cycles:    {cycles}/{MAX_DEV_TEST_CYCLES}")
+    if outcome:
+        print(f"Outcome:   {outcome_messages.get(outcome, outcome)}")
+    if not outcome:
+        print(f"Turns:     {result.get('num_turns', 0)}")
+    print(f"Duration:  {result.get('duration', 0):.1f}s{'  total' if outcome else ''}")
 
-    if result.get("cost") is not None:
-        print(f"Cost:      ${result['cost']:.4f} total")
+    cost = result.get("cost")
+    if cost is not None:
+        print(f"Cost:      ${cost:.4f}{'  total' if outcome else ''}")
 
     print(f"\nDB Verify: {'PASS' if verified else 'FAIL'} - {verify_msg}")
 
     if result.get("errors"):
-        print(f"\nErrors:")
+        print("\nErrors:")
         for err in result["errors"]:
-            if len(err) > 200:
-                err = err[:200] + "..."
-            print(f"  - {err}")
+            print(f"  - {err[:200]}{'...' if len(err) > 200 else ''}")
 
-    # Show tail of last agent output
-    output = result.get("result_text", "")
-    if output:
-        print(f"\nLast Agent Output (last 500 chars):")
+    output_text = result.get("result_text", "")
+    if output_text:
+        label = "Last Agent Output" if outcome else "Agent Output"
+        print(f"\n{label} (last 500 chars):")
         print("-" * 40)
-        tail = output[-500:] if len(output) > 500 else output
+        tail = output_text[-500:] if len(output_text) > 500 else output_text
         print(tail.encode("ascii", errors="replace").decode("ascii"))
 
     print("\n" + "=" * 60)
+
+
+def print_summary(task, result, verified, verify_msg):
+    """Print a formatted summary of a single agent run."""
+    _print_task_summary("PROJECT POMBAL AGENT RUN SUMMARY",
+                        task, result, verified, verify_msg)
+
+
+def print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg):
+    """Print a formatted summary of the dev-test loop run."""
+    _print_task_summary("PROJECT POMBAL DEV-TEST LOOP SUMMARY",
+                        task, result, verified, verify_msg,
+                        cycles=cycles, outcome=outcome)
 
 
 def _is_git_repo(path):
@@ -5476,44 +5327,80 @@ async def run_parallel_goals(resolved_goals, defaults, args):
     print_parallel_summary(results)
 
 
-def print_parallel_summary(results):
-    """Print a combined summary table for all parallel goals."""
+def _print_batch_summary(title, results, mode="goals"):
+    """Print summary for parallel goals or auto-dispatch results.
+
+    mode="goals": expects results with outcome, completed, blocked, goal keys.
+    mode="dispatch": expects results with tasks_completed, tasks_blocked, codename keys.
+    """
     print(f"\n{'#' * 60}")
-    print("PROJECT POMBAL PARALLEL GOALS SUMMARY")
+    print(title)
     print(f"{'#' * 60}")
 
-    total_cost = 0.0
-    total_duration = 0.0
+    total_completed, total_blocked = 0, 0
+    total_cost, total_duration = 0.0, 0.0
 
     for r in results:
         if isinstance(r, Exception):
             print(f"\n  [?] EXCEPTION: {r}")
             continue
 
-        is_success = r["outcome"] == "goal_complete"
-        status = "OK" if is_success else r["outcome"].upper()
-        n_completed = len(r.get("completed", []))
-        n_blocked = len(r.get("blocked", []))
-        cost = r.get("cost", 0.0)
-        duration = r.get("duration", 0.0)
+        if mode == "goals":
+            n_completed = len(r.get("completed", []))
+            n_blocked = len(r.get("blocked", []))
+            cost, duration = r.get("cost", 0.0), r.get("duration", 0.0)
+            status = "OK" if r.get("outcome") == "goal_complete" else r.get("outcome", "?").upper()
+            label = f"[{r.get('index', 0) + 1}] {r.get('project_name', '?')}"
+            print(f"\n  {label} — {status}")
+            print(f"      Goal: {r.get('goal', '')[:80]}")
+            print(f"      Rounds: {r.get('rounds', '?')}, "
+                  f"Tasks: {n_completed} done / {n_blocked} blocked, "
+                  f"Duration: {duration:.1f}s")
+        else:  # dispatch
+            n_completed = len(r.get("tasks_completed", []))
+            n_blocked = len(r.get("tasks_blocked", []))
+            cost, duration = r.get("total_cost", 0.0), r.get("total_duration", 0.0)
+            codename = r.get("codename", "?")
+            if r.get("error"):
+                print(f"\n  [{codename}] ERROR: {r['error']}")
+                total_cost += cost; total_duration += duration
+                continue
+            status = ("ALL DONE" if n_blocked == 0 and n_completed > 0
+                      else "NO TASKS" if n_completed == 0 and n_blocked == 0
+                      else "PARTIAL")
+            print(f"\n  [{codename}] {status}")
+            print(f"      Tasks: {n_completed} completed, {n_blocked} blocked "
+                  f"(of {r.get('tasks_attempted', '?')} attempted)")
+            print(f"      Duration: {duration:.1f}s")
+            for t in r.get("tasks_completed", []):
+                print(f"        + #{t['id']} {t['title']}")
+            for t in r.get("tasks_blocked", []):
+                print(f"        x #{t['id']} {t['title']}")
 
+        total_completed += n_completed
+        total_blocked += n_blocked
         total_cost += cost
         total_duration += duration
-
-        print(f"\n  [{r['index'] + 1}] {r['project_name']} — {status}")
-        print(f"      Goal: {r['goal'][:80]}")
-        print(f"      Rounds: {r.get('rounds', '?')}, "
-              f"Tasks: {n_completed} done / {n_blocked} blocked, "
-              f"Duration: {duration:.1f}s")
         if cost > 0:
             print(f"      Cost: ${cost:.4f}")
 
-    print(f"\n  TOTALS: {len(results)} goals, "
-          f"Duration: {total_duration:.1f}s")
+    print(f"\n  {'=' * 40}")
+    items = f"{len(results)} goals" if mode == "goals" else f"{total_completed} completed, {total_blocked} blocked"
+    print(f"  TOTALS: {items}")
+    print(f"  Duration: {total_duration:.1f}s")
     if total_cost > 0:
-        print(f"  Total Cost: ${total_cost:.4f}")
-
+        print(f"  Cost: ${total_cost:.4f}")
     print(f"\n{'#' * 60}")
+
+
+def print_parallel_summary(results):
+    """Print a combined summary table for all parallel goals."""
+    _print_batch_summary("PROJECT POMBAL PARALLEL GOALS SUMMARY", results, mode="goals")
+
+
+def print_dispatch_summary(results):
+    """Final report: tasks completed/blocked per project."""
+    _print_batch_summary("AUTO-RUN DISPATCH SUMMARY", results, mode="dispatch")
 
 
 # --- GitHub Repo Setup (Phase 4B) ---
@@ -5582,6 +5469,14 @@ def _get_repo_env():
     return env
 
 
+def _git_run(args_list, cwd, timeout=30):
+    """Run a git/gh command with standard options. Returns subprocess result."""
+    return subprocess.run(
+        args_list, capture_output=True, text=True,
+        cwd=str(cwd), timeout=timeout, env=_get_repo_env(),
+    )
+
+
 def setup_single_repo(codename, project_dir, owner, dry_run=False):
     """Initialize git and create a GitHub private repo for a single project.
 
@@ -5591,19 +5486,12 @@ def setup_single_repo(codename, project_dir, owner, dry_run=False):
     repo_name = codename.lower().replace(" ", "-")
 
     # Skip if already fully set up (has .git AND a remote)
-    git_dir = p / ".git"
-    has_git = git_dir.exists()
-    has_remote = False
+    has_git = (p / ".git").exists()
     if has_git:
         try:
-            result = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                capture_output=True, text=True, cwd=str(p), timeout=10,
-                env=_get_repo_env(),
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                has_remote = True
-                return True, f"Already set up (remote: {result.stdout.strip()})"
+            r = _git_run(["git", "remote", "get-url", "origin"], p, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                return True, f"Already set up (remote: {r.stdout.strip()})"
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
@@ -5611,88 +5499,49 @@ def setup_single_repo(codename, project_dir, owner, dry_run=False):
         lang = detect_project_language(project_dir)
         return True, f"DRY RUN: Would init git, detect={lang}, create {owner}/{repo_name}"
 
-    # Detect language and write .gitignore
+    # .gitignore
     lang = detect_project_language(project_dir)
     gitignore_path = p / ".gitignore"
     if not gitignore_path.exists():
         template = GITIGNORE_TEMPLATES.get(lang, GITIGNORE_TEMPLATES["default"])
         gitignore_path.write_text(template + "\n", encoding="utf-8")
         print(f"    Created .gitignore ({lang})")
-    else:
-        print(f"    .gitignore already exists, keeping it")
 
-    # git init (skip if already initialized from a prior run)
+    # git init
     if not has_git:
-        result = subprocess.run(
-            ["git", "init"],
-            capture_output=True, text=True, cwd=str(p), timeout=30,
-            env=_get_repo_env(),
-        )
-        if result.returncode != 0:
-            return False, f"git init failed: {result.stderr.strip()}"
+        r = _git_run(["git", "init"], p)
+        if r.returncode != 0:
+            return False, f"git init failed: {r.stderr.strip()}"
     else:
         print(f"    .git already exists, resuming setup")
 
-    # git add . (warnings about CRLF go to stderr but are harmless)
-    result = subprocess.run(
-        ["git", "add", "."],
-        capture_output=True, text=True, cwd=str(p), timeout=300,
-        env=_get_repo_env(),
-    )
-    if result.returncode != 0:
-        # Filter out CRLF warnings — only fail on actual errors
-        real_errors = [
-            line for line in result.stderr.strip().splitlines()
-            if not line.startswith("warning:")
-        ]
+    # git add (filter CRLF warnings)
+    r = _git_run(["git", "add", "."], p, timeout=300)
+    if r.returncode != 0:
+        real_errors = [l for l in r.stderr.strip().splitlines() if not l.startswith("warning:")]
         if real_errors:
             return False, f"git add failed: {chr(10).join(real_errors)}"
 
     # git commit
-    result = subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        capture_output=True, text=True, cwd=str(p), timeout=120,
-        env=_get_repo_env(),
-    )
-    if result.returncode != 0:
-        # Could be "nothing to commit" — that's OK
-        if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
-            print(f"    Nothing to commit (empty or already committed)")
-        else:
-            return False, f"git commit failed: {result.stderr.strip()}"
+    r = _git_run(["git", "commit", "-m", "Initial commit"], p, timeout=120)
+    if r.returncode != 0:
+        if "nothing to commit" not in (r.stdout + r.stderr):
+            return False, f"git commit failed: {r.stderr.strip()}"
+        print(f"    Nothing to commit (empty or already committed)")
 
     # gh repo create
-    result = subprocess.run(
-        ["gh", "repo", "create", f"{owner}/{repo_name}",
-         "--private", "--source=.", "--push"],
-        capture_output=True, text=True, cwd=str(p), timeout=300,
-        env=_get_repo_env(),
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if "already exists" in stderr:
-            # Repo exists, just add remote and push
+    r = _git_run(["gh", "repo", "create", f"{owner}/{repo_name}",
+                   "--private", "--source=.", "--push"], p, timeout=300)
+    if r.returncode != 0:
+        if "already exists" in r.stderr:
             print(f"    Repo already exists on GitHub, adding remote...")
-            subprocess.run(
-                ["git", "remote", "add", "origin",
-                 f"https://github.com/{owner}/{repo_name}.git"],
-                capture_output=True, text=True, cwd=str(p), timeout=10,
-                env=_get_repo_env(),
-            )
-            push_result = subprocess.run(
-                ["git", "push", "-u", "origin", "main"],
-                capture_output=True, text=True, cwd=str(p), timeout=120,
-                env=_get_repo_env(),
-            )
-            if push_result.returncode != 0:
-                # Try master branch
-                subprocess.run(
-                    ["git", "push", "-u", "origin", "master"],
-                    capture_output=True, text=True, cwd=str(p), timeout=120,
-                    env=_get_repo_env(),
-                )
+            _git_run(["git", "remote", "add", "origin",
+                       f"https://github.com/{owner}/{repo_name}.git"], p, timeout=10)
+            pr = _git_run(["git", "push", "-u", "origin", "main"], p, timeout=120)
+            if pr.returncode != 0:
+                _git_run(["git", "push", "-u", "origin", "master"], p, timeout=120)
         else:
-            return False, f"gh repo create failed: {stderr}"
+            return False, f"gh repo create failed: {r.stderr.strip()}"
 
     return True, f"Created https://github.com/{owner}/{repo_name}"
 
@@ -6203,58 +6052,7 @@ def print_dispatch_plan(scored, config):
 
 def print_dispatch_summary(results):
     """Final report: tasks completed/blocked per project."""
-    print(f"\n{'#' * 60}")
-    print("AUTO-RUN DISPATCH SUMMARY")
-    print(f"{'#' * 60}")
-
-    total_completed = 0
-    total_blocked = 0
-    total_cost = 0.0
-    total_duration = 0.0
-
-    for r in results:
-        if isinstance(r, Exception):
-            print(f"\n  [?] EXCEPTION: {r}")
-            continue
-
-        n_completed = len(r.get("tasks_completed", []))
-        n_blocked = len(r.get("tasks_blocked", []))
-        total_completed += n_completed
-        total_blocked += n_blocked
-
-        cost = r.get("total_cost", 0.0)
-        duration = r.get("total_duration", 0.0)
-        total_cost += cost
-        total_duration += duration
-
-        codename = r.get("codename", "?")
-        error = r.get("error")
-
-        if error:
-            print(f"\n  [{codename}] ERROR: {error}")
-        else:
-            status = "ALL DONE" if n_blocked == 0 and n_completed > 0 else "PARTIAL"
-            if n_completed == 0 and n_blocked == 0:
-                status = "NO TASKS"
-            print(f"\n  [{codename}] {status}")
-            print(f"      Tasks: {n_completed} completed, {n_blocked} blocked "
-                  f"(of {r.get('tasks_attempted', '?')} attempted)")
-            print(f"      Duration: {duration:.1f}s")
-            if cost > 0:
-                print(f"      Cost: ${cost:.4f}")
-
-            # List completed task titles
-            for t in r.get("tasks_completed", []):
-                print(f"        + #{t['id']} {t['title']}")
-            for t in r.get("tasks_blocked", []):
-                print(f"        x #{t['id']} {t['title']}")
-
-    print(f"\n  {'=' * 40}")
-    print(f"  TOTALS: {total_completed} completed, {total_blocked} blocked")
-    print(f"  Duration: {total_duration:.1f}s")
-    if total_cost > 0:
-        print(f"  Cost: ${total_cost:.4f}")
-    print(f"\n{'#' * 60}")
+    _print_batch_summary("AUTO-RUN DISPATCH SUMMARY", results, mode="dispatch")
 
 
 def parse_task_ids(task_str):
@@ -6477,6 +6275,18 @@ async def run_parallel_tasks(task_ids, args):
 
 
 # --- Main ---
+
+
+async def _post_task_telemetry(task, result, outcome, role, model, max_turns,
+                               cycle_number=None, output=None):
+    """Run all post-task telemetry: DB update, recording, scoring, reflexion, MemRL."""
+    update_task_status(task["id"], outcome, output=output)
+    record_agent_run(task, result, outcome, role=role, model=model,
+                     max_turns=max_turns, cycle_number=cycle_number)
+    if outcome in ("tests_passed", "no_tests"):
+        run_quality_scoring(task, result, outcome, role=role, output=output)
+    await maybe_run_reflexion(task, result, outcome, role=role, output=output)
+    update_injected_episode_q_values_for_task(task["id"], outcome, output=output)
 
 async def async_main():
     """Main entry point."""
@@ -6843,27 +6653,13 @@ async def async_main():
             task, project_dir, project_context, args,
         )
 
-        # Orchestrator-side DB update (don't rely on agent)
-        update_task_status(task["id"], outcome)
-
-        # ForgeSmith telemetry
+        # Post-task telemetry (DB update, ForgeSmith recording, quality scoring, reflexion, MemRL)
         task_role = task.get("role") or "developer"
-        record_agent_run(
+        await _post_task_telemetry(
             task, result, outcome, role=task_role,
             model=get_role_model(task_role, args, task=task),
             max_turns=get_role_turns(task_role, args, task=task),
-            cycle_number=cycles,
-        )
-
-        # Post-task quality scoring (on success only)
-        if outcome in ("tests_passed", "no_tests"):
-            run_quality_scoring(task, result, outcome, role=task_role)
-
-        # Reflexion: record episode and capture self-reflection
-        await maybe_run_reflexion(task, result, outcome, role=task_role)
-
-        # MemRL: update q_values of episodes that were injected into this task's prompt
-        update_injected_episode_q_values_for_task(task["id"], outcome)
+            cycle_number=cycles)
 
         # Optional security review after successful dev-test
         security_review_enabled = args.security_review
@@ -6913,30 +6709,18 @@ async def async_main():
         result["turns_allocated"] = role_turns_allocated
         result["turns_max"] = role_turns_max
 
-        # Orchestrator-side DB update for single-agent mode
+        # Determine outcome
         if result.get("early_terminated"):
             single_outcome = "early_terminated"
         elif result["success"]:
             single_outcome = "tests_passed"
         else:
             single_outcome = "developer_failed"
-        update_task_status(task["id"], single_outcome)
 
-        # ForgeSmith telemetry
-        record_agent_run(
+        # Post-task telemetry
+        await _post_task_telemetry(
             task, result, single_outcome, role=args.role,
-            model=role_model, max_turns=role_turns_max,
-        )
-
-        # Post-task quality scoring (on success only)
-        if single_outcome in ("tests_passed", "no_tests"):
-            run_quality_scoring(task, result, single_outcome, role=args.role)
-
-        # Reflexion: record episode and capture self-reflection
-        await maybe_run_reflexion(task, result, single_outcome, role=args.role)
-
-        # MemRL: update q_values of episodes that were injected into this task's prompt
-        update_injected_episode_q_values_for_task(task["id"], single_outcome)
+            model=role_model, max_turns=role_turns_max)
 
         # Verify the task status in TheForge
         verified, verify_msg = verify_task_updated(task["id"])
@@ -6945,8 +6729,6 @@ async def async_main():
         print_summary(task, result, verified, verify_msg)
         if attempts > 1:
             print(f"  Attempts: {attempts}/{args.retries}")
-
-
 
 
 def main():

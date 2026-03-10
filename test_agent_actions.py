@@ -2,11 +2,10 @@
 """Test suite for agent_actions structured action logging.
 
 Tests verify Task #923:
-1. ensure_agent_actions_table creates table + indexes idempotently
+1. ensure_schema creates table + indexes idempotently
 2. classify_error maps error strings to correct categories
 3. log_agent_action inserts single records correctly
 4. bulk_log_agent_actions inserts multiple records in one transaction
-5. get_action_summary returns correct per-tool aggregation
 
 Copyright 2026 Forgeborn
 """
@@ -25,8 +24,7 @@ from forge_orchestrator import (
     classify_error,
     log_agent_action,
     bulk_log_agent_actions,
-    get_action_summary,
-    ensure_agent_actions_table,
+    ensure_schema,
 )
 
 
@@ -151,11 +149,11 @@ def test_classify_error_empty():
 
 
 # ---------------------------------------------------------------------------
-# Tests for ensure_agent_actions_table()
+# Tests for ensure_schema()
 # ---------------------------------------------------------------------------
 
-def test_ensure_agent_actions_table_creates_table():
-    """ensure_agent_actions_table creates table and indexes."""
+def test_ensure_schema_creates_table():
+    """ensure_schema creates table and indexes."""
     raw_conn = sqlite3.connect(":memory:")
     raw_conn.row_factory = sqlite3.Row
     conn = _NoCloseConnection(raw_conn)
@@ -164,7 +162,7 @@ def test_ensure_agent_actions_table_creates_table():
         return conn
 
     with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        ensure_agent_actions_table()
+        ensure_schema()
 
     # Verify table exists
     tables = conn.execute(
@@ -182,8 +180,8 @@ def test_ensure_agent_actions_table_creates_table():
     conn.real_close()
 
 
-def test_ensure_agent_actions_table_idempotent():
-    """Calling ensure_agent_actions_table twice doesn't crash."""
+def test_ensure_schema_idempotent():
+    """Calling ensure_schema twice doesn't crash."""
     raw_conn = sqlite3.connect(":memory:")
     raw_conn.row_factory = sqlite3.Row
     conn = _NoCloseConnection(raw_conn)
@@ -191,9 +189,12 @@ def test_ensure_agent_actions_table_idempotent():
     def mock_get_db(write=False):
         return conn
 
+    import forge_orchestrator as _fo
+    _fo._SCHEMA_ENSURED = False
     with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        ensure_agent_actions_table()
-        ensure_agent_actions_table()  # should not raise
+        ensure_schema()
+        _fo._SCHEMA_ENSURED = False  # reset so second call also runs
+        ensure_schema()  # should not raise
 
     tables = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_actions'"
@@ -366,118 +367,12 @@ def test_bulk_log_agent_actions_never_crashes():
     broken_conn.executemany.side_effect = sqlite3.OperationalError("table locked")
 
     with patch("forge_orchestrator.get_db_connection", return_value=broken_conn):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
+        with patch("forge_orchestrator.ensure_schema"):
             # Should NOT raise
             bulk_log_agent_actions(
                 [{"turn": 1, "tool": "Read"}],
                 task_id=1, run_id=1, cycle=1, role="dev",
             )
-
-
-# ---------------------------------------------------------------------------
-# Tests for get_action_summary()
-# ---------------------------------------------------------------------------
-
-def test_get_action_summary_all_cycles():
-    """get_action_summary returns correct per-tool aggregation across all cycles."""
-    conn = _make_temp_db()
-
-    # Insert some test data
-    _insert_action(conn, 100, 5, 1, "developer", 1, "Read", success=True)
-    _insert_action(conn, 100, 5, 1, "developer", 2, "Read", success=True)
-    _insert_action(conn, 100, 5, 1, "developer", 3, "Edit", success=True)
-    _insert_action(conn, 100, 5, 2, "developer", 1, "Read", success=False,
-                   error_type="file_not_found")
-    _insert_action(conn, 100, 5, 2, "developer", 2, "Bash", success=True)
-
-    def mock_get_db(write=False):
-        return conn
-
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
-            summary = get_action_summary(task_id=100)
-
-    assert "Read" in summary
-    assert summary["Read"]["count"] == 3
-    assert summary["Read"]["success_count"] == 2
-    assert summary["Read"]["fail_count"] == 1
-
-    assert "Edit" in summary
-    assert summary["Edit"]["count"] == 1
-    assert summary["Edit"]["success_count"] == 1
-    assert summary["Edit"]["fail_count"] == 0
-
-    assert "Bash" in summary
-    assert summary["Bash"]["count"] == 1
-    conn.real_close()
-
-
-def test_get_action_summary_specific_cycle():
-    """get_action_summary filters by cycle when specified."""
-    conn = _make_temp_db()
-
-    _insert_action(conn, 100, 5, 1, "developer", 1, "Read", success=True)
-    _insert_action(conn, 100, 5, 1, "developer", 2, "Edit", success=True)
-    _insert_action(conn, 100, 5, 2, "developer", 1, "Bash", success=True)
-
-    def mock_get_db(write=False):
-        return conn
-
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
-            summary = get_action_summary(task_id=100, cycle=1)
-
-    assert "Read" in summary
-    assert "Edit" in summary
-    assert "Bash" not in summary, "Cycle 2 actions should not appear in cycle 1 summary"
-    conn.real_close()
-
-
-def test_get_action_summary_no_data():
-    """get_action_summary returns empty dict when no data exists."""
-    conn = _make_temp_db()
-
-    def mock_get_db(write=False):
-        return conn
-
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
-            summary = get_action_summary(task_id=999)
-
-    assert summary == {}
-    conn.real_close()
-
-
-def test_get_action_summary_isolates_tasks():
-    """get_action_summary only returns data for the requested task_id."""
-    conn = _make_temp_db()
-
-    _insert_action(conn, 100, 5, 1, "developer", 1, "Read", success=True)
-    _insert_action(conn, 200, 6, 1, "developer", 1, "Read", success=True)
-    _insert_action(conn, 200, 6, 1, "developer", 2, "Edit", success=True)
-
-    def mock_get_db(write=False):
-        return conn
-
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
-            summary = get_action_summary(task_id=100)
-
-    assert summary["Read"]["count"] == 1, "Should only count task 100's Read actions"
-    assert "Edit" not in summary, "Task 200's Edit should not appear"
-    conn.real_close()
-
-
-def test_get_action_summary_never_crashes():
-    """get_action_summary returns empty dict on DB errors."""
-    broken_conn = MagicMock()
-    broken_conn.execute.side_effect = sqlite3.OperationalError("no table")
-
-    with patch("forge_orchestrator.get_db_connection", return_value=broken_conn):
-        with patch("forge_orchestrator.ensure_agent_actions_table"):
-            result = get_action_summary(task_id=1)
-
-    assert result == {}
 
 
 # ---------------------------------------------------------------------------
@@ -499,19 +394,14 @@ def main():
         test_classify_error_test_failure,
         test_classify_error_unknown,
         test_classify_error_empty,
-        test_ensure_agent_actions_table_creates_table,
-        test_ensure_agent_actions_table_idempotent,
+        test_ensure_schema_creates_table,
+        test_ensure_schema_idempotent,
         test_log_agent_action_inserts_record,
         test_log_agent_action_failure_record,
         test_log_agent_action_never_crashes,
         test_bulk_log_agent_actions_inserts_all,
         test_bulk_log_agent_actions_empty_list,
         test_bulk_log_agent_actions_never_crashes,
-        test_get_action_summary_all_cycles,
-        test_get_action_summary_specific_cycle,
-        test_get_action_summary_no_data,
-        test_get_action_summary_isolates_tasks,
-        test_get_action_summary_never_crashes,
     ]
 
     passed = 0

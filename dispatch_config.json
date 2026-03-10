@@ -36,10 +36,10 @@
     "max_turns_economy-tester": 30,
     "max_turns_multiplayer-tester": 25,
     "cost_limits": {
-        "simple": 3.0,
-        "medium": 5.0,
-        "complex": 10.0,
-        "epic": 20.0
+        "simple": 5.0,
+        "medium": 12.0,
+        "complex": 20.0,
+        "epic": 40.0
     },
     "task_type_prompts": {
         "bug_fix": "Focus on reproducing the bug first. Write a failing test. Then fix. Do NOT refactor surrounding code.",
