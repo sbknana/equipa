@@ -3163,17 +3163,19 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
                                 entry["error_type"] = classify_error(error_text)
                                 entry["error_summary"] = error_text[:200]
 
-                            # After a Bash tool completes, check git for file changes.
-                            # This catches file modifications invisible to tool-name detection
-                            # (e.g., rm, sed, echo >, git commit via Bash).
+                            # After any tool completes, check git for file changes.
+                            # This catches file modifications invisible to tool-name detection:
+                            # Bash (rm, sed, echo >), MCP tools (image generation via
+                            # DALL-E/Flux/Gemini), or any future tool that writes files.
                             # Note: tool_result arrives AFTER the assistant turn counter was
                             # already updated, so we reset turns_without_file_change directly.
-                            if entry.get("tool") == "Bash" and project_dir:
+                            if project_dir:
                                 if _check_git_changes(project_dir):
                                     has_any_file_change = True
                                     turns_without_file_change = 0
+                                    tool_label = entry.get("tool", "unknown")
                                     log(f"  [FileDetect] Git detected file changes "
-                                        f"via Bash command", output)
+                                        f"via {tool_label}", output)
 
     except Exception as e:
         early_term_reason = f"Streaming monitor error: {e}"
