@@ -43,8 +43,8 @@ def is_on_claudinator() -> bool:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 BACKUP_DIR = SCRIPT_DIR / ".autoresearch-backups"
-CLAUDINATOR = "user@INTERNAL_HOST"
-SSH_KEY = os.path.expanduser("~/.ssh/SSH_KEY_NAME")
+CLAUDINATOR = "user@YOUR_HOST"
+SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 REMOTE_PROMPTS = "${PROJECT_BASE_DIR}/ProjectPombal/prompts"
 REMOTE_ORCHESTRATOR = "${PROJECT_BASE_DIR}/ProjectPombal/forge_orchestrator.py"
 # The orchestrator reads/writes its OWN copy at ProjectPombal/theforge.db.
@@ -56,7 +56,7 @@ THEFORGE_DB = REMOTE_DB
 # Value is (path, baseline_ref) — baseline_ref is a tag/commit to reset to.
 # This undoes any merged benchmark commits so agents start fresh.
 PROJECT_DIRS = {
-    39: ("${PROJECT_BASE_DIR}/ForgeArcade", "autoresearch-baseline"),
+    39: ("/path/to/your/test-project", "autoresearch-baseline"),
 }
 
 # Roles to optimize and their targets
@@ -82,37 +82,37 @@ TEST_TASK_TEMPLATES = {
         # Pool A — round 1, 4, 7...
         [
             (39, "Benchmark: Add footer component to ForgeArcade",
-             "Add a simple footer component to ${PROJECT_BASE_DIR}/ForgeArcade/src/app/layout.tsx showing 'Built by Forgeborn | © 2026'. Use Tailwind CSS. This is a SIMPLE task — one file edit, ~5 lines of code.",
+             "Add a simple footer component to /path/to/your/test-project/src/app/layout.tsx showing 'Built by Forgeborn | © 2026'. Use Tailwind CSS. This is a SIMPLE task — one file edit, ~5 lines of code.",
              "simple"),
             (39, "Benchmark: Add 404 page to ForgeArcade",
-             "Create a custom 404 page at ${PROJECT_BASE_DIR}/ForgeArcade/src/app/not-found.tsx. Show 'Page Not Found' with a link back to home. Use Tailwind CSS dark theme. This is a SIMPLE task — create one new file.",
+             "Create a custom 404 page at /path/to/your/test-project/src/app/not-found.tsx. Show 'Page Not Found' with a link back to home. Use Tailwind CSS dark theme. This is a SIMPLE task — create one new file.",
              "simple"),
             (39, "Benchmark: Add loading spinner to ForgeArcade",
-             "Create a loading.tsx file at ${PROJECT_BASE_DIR}/ForgeArcade/src/app/loading.tsx with a CSS spinner animation. Use Tailwind CSS. This is a SIMPLE task — create one new file.",
+             "Create a loading.tsx file at /path/to/your/test-project/src/app/loading.tsx with a CSS spinner animation. Use Tailwind CSS. This is a SIMPLE task — create one new file.",
              "simple"),
         ],
         # Pool B — round 2, 5, 8...
         [
             (39, "Benchmark: Add health check API to ForgeArcade",
-             "Create an API route at ${PROJECT_BASE_DIR}/ForgeArcade/src/app/api/health/route.ts that returns JSON {status: 'ok', timestamp: Date.now()}. Simple GET handler, ~10 lines.",
+             "Create an API route at /path/to/your/test-project/src/app/api/health/route.ts that returns JSON {status: 'ok', timestamp: Date.now()}. Simple GET handler, ~10 lines.",
              "simple"),
             (39, "Benchmark: Add site metadata to ForgeArcade",
-             "Update ${PROJECT_BASE_DIR}/ForgeArcade/src/app/layout.tsx to export a metadata object with title 'ForgeArcade', description 'Game collection by Forgeborn', and openGraph image placeholder. ~10 lines of code.",
+             "Update /path/to/your/test-project/src/app/layout.tsx to export a metadata object with title 'ForgeArcade', description 'Game collection by Forgeborn', and openGraph image placeholder. ~10 lines of code.",
              "simple"),
             (39, "Benchmark: Add robots.txt to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/app/robots.ts that exports a default function returning {rules: {userAgent: '*', allow: '/'}, sitemap: 'https://arcade.forgeborn.dev/sitemap.xml'}. Next.js metadata API.",
+             "Create /path/to/your/test-project/src/app/robots.ts that exports a default function returning {rules: {userAgent: '*', allow: '/'}, sitemap: 'https://your-app.example.com/sitemap.xml'}. Next.js metadata API.",
              "simple"),
         ],
         # Pool C — round 3, 6, 9...
         [
             (39, "Benchmark: Add error boundary to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/app/error.tsx as a client component ('use client') that shows 'Something went wrong' with a retry button. Use Tailwind CSS. ~20 lines.",
+             "Create /path/to/your/test-project/src/app/error.tsx as a client component ('use client') that shows 'Something went wrong' with a retry button. Use Tailwind CSS. ~20 lines.",
              "simple"),
             (39, "Benchmark: Add global-error page to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/app/global-error.tsx as a client component that wraps the html/body tags and shows a full-page error state. Use Tailwind. ~15 lines.",
+             "Create /path/to/your/test-project/src/app/global-error.tsx as a client component that wraps the html/body tags and shows a full-page error state. Use Tailwind. ~15 lines.",
              "simple"),
             (39, "Benchmark: Add sitemap to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/app/sitemap.ts that exports a default function returning an array with one entry: {url: 'https://arcade.forgeborn.dev', lastModified: new Date()}. Next.js metadata API.",
+             "Create /path/to/your/test-project/src/app/sitemap.ts that exports a default function returning an array with one entry: {url: 'https://your-app.example.com', lastModified: new Date()}. Next.js metadata API.",
              "simple"),
         ],
     ],
@@ -121,13 +121,13 @@ TEST_TASK_TEMPLATES = {
     "debugger": [
         [
             (39, "Benchmark: Fix broken import in ForgeArcade utils",
-             "The file ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/broken-util.ts has a syntax error. Create this file with a deliberate bug (missing closing bracket in the function), then fix it. The test should verify the build passes with `npx tsc --noEmit`.",
+             "The file /path/to/your/test-project/src/lib/broken-util.ts has a syntax error. Create this file with a deliberate bug (missing closing bracket in the function), then fix it. The test should verify the build passes with `npx tsc --noEmit`.",
              "simple"),
             (39, "Benchmark: Fix type error in ForgeArcade component",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/components/BrokenCard.tsx with a React component that has a type mismatch (passing number where string expected). Then fix the type error. Verify with `npx tsc --noEmit`.",
+             "Create /path/to/your/test-project/src/components/BrokenCard.tsx with a React component that has a type mismatch (passing number where string expected). Then fix the type error. Verify with `npx tsc --noEmit`.",
              "simple"),
             (39, "Benchmark: Fix missing return in ForgeArcade helper",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/score-helper.ts with a function calculateScore that is missing a return statement on one code path. Fix it so all paths return a number. Verify with `npx tsc --noEmit`.",
+             "Create /path/to/your/test-project/src/lib/score-helper.ts with a function calculateScore that is missing a return statement on one code path. Fix it so all paths return a number. Verify with `npx tsc --noEmit`.",
              "simple"),
         ],
     ],
@@ -136,13 +136,13 @@ TEST_TASK_TEMPLATES = {
     "economy-tester": [
         [
             (39, "Benchmark: Add DH balance display utility to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/dh-balance.ts with a formatBalance(amount: number) function that formats DragonHoard currency: amounts >= 1000 show as '1.2K DH', amounts >= 1000000 as '1.2M DH', otherwise just 'N DH'. Include edge cases for 0 and negative values. Export the function.",
+             "Create /path/to/your/test-project/src/lib/dh-balance.ts with a formatBalance(amount: number) function that formats DragonHoard currency: amounts >= 1000 show as '1.2K DH', amounts >= 1000000 as '1.2M DH', otherwise just 'N DH'. Include edge cases for 0 and negative values. Export the function.",
              "simple"),
             (39, "Benchmark: Add transaction validator to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/transaction-validator.ts with a validateTransaction(from: number, to: number, amount: number) function. Rules: amount must be positive, from !== to, amount must be integer (no fractional DH). Return {valid: boolean, error?: string}.",
+             "Create /path/to/your/test-project/src/lib/transaction-validator.ts with a validateTransaction(from: number, to: number, amount: number) function. Rules: amount must be positive, from !== to, amount must be integer (no fractional DH). Return {valid: boolean, error?: string}.",
              "simple"),
             (39, "Benchmark: Add price calculator to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/price-calc.ts with calculatePrice(basePrice: number, quantity: number, discount?: number) that returns total with optional percentage discount. Clamp discount to 0-100. Return 0 if quantity <= 0.",
+             "Create /path/to/your/test-project/src/lib/price-calc.ts with calculatePrice(basePrice: number, quantity: number, discount?: number) that returns total with optional percentage discount. Clamp discount to 0-100. Return 0 if quantity <= 0.",
              "simple"),
         ],
     ],
@@ -151,13 +151,13 @@ TEST_TASK_TEMPLATES = {
     "story-tester": [
         [
             (39, "Benchmark: Add dialogue formatter to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/dialogue.ts with a formatDialogue(speaker: string, text: string, mood?: 'happy'|'angry'|'neutral') function. Returns formatted string like '[Speaker (mood)]: text'. Default mood is 'neutral'. Handle empty speaker/text gracefully.",
+             "Create /path/to/your/test-project/src/lib/dialogue.ts with a formatDialogue(speaker: string, text: string, mood?: 'happy'|'angry'|'neutral') function. Returns formatted string like '[Speaker (mood)]: text'. Default mood is 'neutral'. Handle empty speaker/text gracefully.",
              "simple"),
             (39, "Benchmark: Add quest tracker types to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/lib/quest-types.ts with TypeScript interfaces: Quest {id, title, description, status: 'active'|'completed'|'failed'}, QuestStep {id, questId, description, completed: boolean}, and a QuestLog type that is Quest & {steps: QuestStep[]}.",
+             "Create /path/to/your/test-project/src/lib/quest-types.ts with TypeScript interfaces: Quest {id, title, description, status: 'active'|'completed'|'failed'}, QuestStep {id, questId, description, completed: boolean}, and a QuestLog type that is Quest & {steps: QuestStep[]}.",
              "simple"),
             (39, "Benchmark: Add lore entry component to ForgeArcade",
-             "Create ${PROJECT_BASE_DIR}/ForgeArcade/src/components/LoreEntry.tsx — a React component that takes props {title: string, content: string, category: string, discovered: boolean}. If not discovered, show title with '???' for content. Use Tailwind CSS with dark theme.",
+             "Create /path/to/your/test-project/src/components/LoreEntry.tsx — a React component that takes props {title: string, content: string, category: string, discovered: boolean}. If not discovered, show title with '???' for content. Use Tailwind CSS with dark theme.",
              "simple"),
         ],
     ],

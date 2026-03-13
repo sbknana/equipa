@@ -143,14 +143,14 @@ Don't want to run models on your dev machine? Point at a different box.
 
 ```json
 {
-    "ollama_base_url": "http://INTERNAL_HOST:11434"
+    "ollama_base_url": "http://YOUR_OLLAMA_HOST:11434"
 }
 ```
 
 ### Via Environment Variable
 
 ```bash
-export OLLAMA_BASE_URL=http://INTERNAL_HOST:11434
+export OLLAMA_BASE_URL=http://YOUR_OLLAMA_HOST:11434
 ```
 
 The environment variable takes priority over the config file. Useful for per-session overrides.

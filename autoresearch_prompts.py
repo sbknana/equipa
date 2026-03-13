@@ -379,8 +379,8 @@ def sync_to_claudinator():
     cmd = [
         "rsync", "-avz",
         str(PROMPTS_DIR) + "/",
-        "user@INTERNAL_HOST:${PROJECT_BASE_DIR}/ProjectPombal/prompts/",
-        "-e", "ssh -i ~/.ssh/SSH_KEY_NAME"
+        "user@YOUR_HOST:/path/to/ProjectPombal/prompts/",
+        "-e", "ssh -i ~/.ssh/id_ed25519"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode == 0:
