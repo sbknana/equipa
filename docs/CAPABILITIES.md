@@ -16,6 +16,7 @@ Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Pyth
 - [Inter-Agent Communication](#inter-agent-communication)
 - [Observability and Cost Tracking](#observability-and-cost-tracking)
 - [Extensibility](#extensibility)
+- [Autoresearch: Automated Prompt Optimization](#autoresearch-automated-prompt-optimization)
 - [Technical Highlights](#technical-highlights)
 
 ---
@@ -49,19 +50,24 @@ Everything above can also be done from the command line for automation (cron job
 
 ## Multi-Agent Orchestration
 
-Under the hood, Project Pombal dispatches work to **9 specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
+Under the hood, Project Pombal dispatches work to **12+ specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
 
-| Role | Purpose | Default Model | Turn Budget |
-|------|---------|---------------|-------------|
-| **Developer** | Writes code, implements features, fixes bugs | Opus | 45 |
-| **Tester** | Validates code, writes tests, verifies fixes | Sonnet | 75 |
-| **Planner** | Breaks goals into prioritized, dependency-aware tasks | Opus | 20 |
-| **Evaluator** | Scores agent output against rubrics | Sonnet | 25 |
-| **Security Reviewer** | Deep security audit with Trail of Bits tooling | Opus | 50 |
-| **Frontend Designer** | UI/UX implementation and design review | Opus | 40 |
-| **Integration Tester** | Cross-component and API testing | Sonnet | 20 |
-| **Debugger** | Root-cause analysis and targeted fixes | Opus | 30 |
-| **Code Reviewer** | Quality, style, and architecture review | Sonnet | 75 |
+| Role | Purpose | Default Model | Turn Budget | Success Rate |
+|------|---------|---------------|-------------|--------------|
+| **Developer** | Writes code, implements features, fixes bugs | Sonnet | 45 | 100% |
+| **Tester** | Validates code, writes tests, verifies fixes | Sonnet | 75 | 100% |
+| **Planner** | Breaks goals into prioritized, dependency-aware tasks | Opus | 20 | — |
+| **Evaluator** | Scores agent output against rubrics | Sonnet | 25 | — |
+| **Security Reviewer** | Deep security audit with Trail of Bits tooling | Opus | 50 | 100% |
+| **Frontend Designer** | UI/UX implementation and design review | Opus | 40 | 100% |
+| **Integration Tester** | Cross-component and API testing | Sonnet | 20 | — |
+| **Debugger** | Root-cause analysis and targeted fixes | Opus | 30 | 83.4% |
+| **Code Reviewer** | Quality, style, and architecture review | Sonnet | 75 | — |
+| **Economy Tester** | Validates economic/transaction logic | Sonnet | 30 | 100% |
+| **Story Tester** | Validates narrative/content logic | Sonnet | 30 | 100% |
+| **World Builder** | World/environment design and lore | Sonnet | 30 | — |
+
+*Success rates from autoresearch benchmarks (last 15 runs per role). Roles marked "—" are not yet benchmarked or use different evaluation criteria.*
 
 ### Dev-Test Cycle
 
@@ -361,6 +367,80 @@ Read-only roles (planner, evaluator, code-reviewer, researcher) can run on local
 
 ---
 
+## Autoresearch: Automated Prompt Optimization
+
+Autoresearch is the automated prompt optimization loop. It takes agent prompts, mutates them using Opus, benchmarks the mutations against real tasks, and keeps changes that improve success rates. Think of it as A/B testing on autopilot — but with an AI generating the variants.
+
+### How It Works
+
+1. **Collect metrics** — Pull recent success rates from the `agent_runs` table (sliding window of last 15 runs per role)
+2. **Analyze failures** — Identify the top failure patterns (early termination, timeout, cycles exhausted, etc.)
+3. **Mutate prompt** — Feed the current prompt + failure analysis to Opus, which generates a targeted rewrite
+4. **Reset project state** — Hard-reset benchmark projects to a tagged baseline (undoes previous benchmark commits)
+5. **Deploy and benchmark** — Write the mutated prompt, create benchmark tasks, dispatch agents via the orchestrator
+6. **Evaluate** — Compare round results. Keep mutations that hit the target; revert regressions
+7. **Loop** — Repeat until target success rate is reached or max rounds exhausted
+
+### Two Components
+
+| File | Role |
+|------|------|
+| `autoresearch_loop.py` | The full optimization loop — mutate, deploy, benchmark, evaluate, commit/revert |
+| `autoresearch_prompts.py` | Standalone prompt mutation generator with tiered LLM support (Ollama → Sonnet → Opus) |
+
+`autoresearch_loop.py` is the production system. It runs end-to-end on Claudinator, dispatching real agents on real tasks and measuring actual outcomes. `autoresearch_prompts.py` is the lighter tool for generating prompt mutations without running the full benchmark loop.
+
+### Current Results
+
+As of March 2026, autoresearch has optimized 7 roles:
+
+| Role | Success Rate | Target | Status |
+|------|-------------|--------|--------|
+| Developer | 100% | 80% | Hit |
+| Tester | 100% | 85% | Hit |
+| Frontend Designer | 100% | 80% | Hit |
+| Security Reviewer | 100% | 85% | Hit |
+| Economy Tester | 100% | 80% | Hit |
+| Story Tester | 100% | 80% | Hit |
+| Debugger | 83.4% | 80% | Hit |
+
+### CLI Usage
+
+```bash
+# Check current success rates for all roles
+python3 autoresearch_loop.py --status
+
+# Optimize a single role (target 80% by default)
+python3 autoresearch_loop.py --role developer --target 80
+
+# Optimize all underperforming roles
+python3 autoresearch_loop.py --all --target 80
+
+# Limit optimization rounds
+python3 autoresearch_loop.py --role debugger --max-rounds 5
+
+# Rollback a role to its last backup
+python3 autoresearch_loop.py --rollback developer
+```
+
+### How It Relates to ForgeSmith
+
+ForgeSmith and Autoresearch solve different problems at different scales:
+
+- **ForgeSmith/GEPA** — Incremental prompt evolution. Small mutations, A/B tested over weeks. Conservative. Runs on a cron schedule.
+- **Autoresearch** — Aggressive prompt search. Larger rewrites, benchmarked in hours. Runs on-demand when a role needs improvement.
+- **ForgeSmith/SIMBA** — Generates behavioral rules injected alongside prompts. Complementary to both.
+
+In practice: use Autoresearch to get a role to its target success rate, then let ForgeSmith maintain it over time.
+
+### Benchmark Task Design
+
+Each role has 3 rotating pools of benchmark tasks (rotated per round to avoid "already exists" collisions). Tasks are intentionally simple and well-scoped — the goal is to test the agent's ability to follow instructions and produce working code, not to test the model's raw intelligence.
+
+Benchmark projects are reset to a tagged baseline (`autoresearch-baseline`) between rounds via `git reset --hard`. This ensures each round starts from a clean state.
+
+---
+
 ## Technical Highlights
 
 | Property | Detail |
@@ -381,6 +461,7 @@ Read-only roles (planner, evaluator, code-reviewer, researcher) can run on local
 | **30+ table schema** | Full relational model covering projects, tasks, episodes, lessons, messages, actions, rules, prompt versions, rubric scores, and migration history |
 | **Reproducible benchmarks** | Migration benchmarks generate realistic test data, run the full chain, and verify zero data loss |
 | **Arena mode** | Adversarial testing system that stress-tests agents and exports results as LoRA fine-tuning data |
+| **Autoresearch** | Automated prompt optimization loop — mutates prompts via Opus, benchmarks against real tasks, keeps improvements. 6/7 roles at 100% success |
 
 ---
 

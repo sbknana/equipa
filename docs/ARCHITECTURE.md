@@ -6,378 +6,301 @@
   - [How It Works](#how-it-works)
   - [System Overview](#system-overview)
   - [Data Flow](#data-flow)
-    - [Typical Task Execution (Dev-Test Loop)](#typical-task-execution-dev-test-loop)
-    - [ForgeSmith Self-Improvement Cycle](#forgesmith-self-improvement-cycle)
+    - [Typical Task Execution](#typical-task-execution)
+    - [Self-Improvement Cycle (Forgesmith)](#self-improvement-cycle-forgesmith)
   - [Database](#database)
   - [Project Structure](#project-structure)
   - [Key Design Decisions](#key-design-decisions)
-    - [SQLite as the sole data store](#sqlite-as-the-sole-data-store)
-    - [Dev-Test Loop with dynamic budgets](#dev-test-loop-with-dynamic-budgets)
-    - [LoopDetector with fingerprinting](#loopdetector-with-fingerprinting)
-    - [Episodic memory with Q-values](#episodic-memory-with-q-values)
-    - [Three-tier self-improvement (ForgeSmith → GEPA → SIMBA)](#three-tier-self-improvement-forgesmith-gepa-simba)
-    - [Provider abstraction (Claude + Ollama)](#provider-abstraction-claude-ollama)
-    - [Checkpoint-based resilience](#checkpoint-based-resilience)
-    - [Inter-agent messaging](#inter-agent-messaging)
-    - [Schema migrations with versioning](#schema-migrations-with-versioning)
+    - [Pure Python stdlib, zero pip dependencies](#pure-python-stdlib-zero-pip-dependencies)
+    - [SQLite as the single source of truth](#sqlite-as-the-single-source-of-truth)
+    - [Closed-loop self-improvement](#closed-loop-self-improvement)
+    - [Aggressive early termination](#aggressive-early-termination)
+    - [Lesson sanitization as a security boundary](#lesson-sanitization-as-a-security-boundary)
+    - [Dev-test loop as the core execution pattern](#dev-test-loop-as-the-core-execution-pattern)
+    - [Multi-tier model routing](#multi-tier-model-routing)
+    - [Prompt evolution with safety rails](#prompt-evolution-with-safety-rails)
   - [Related Documentation](#related-documentation)
 
 ## How It Works
 
-Project Pombal is a multi-agent AI orchestration platform that coordinates AI agents (powered by Claude Code and optionally Ollama) to work on software development tasks. Here's how it works in plain English:
+Project Pombal is a multi-agent AI orchestration platform where you describe what you want built in plain English, and a fleet of AI agents (developer, tester, security reviewer, planner) execute the work autonomously. Here's how it works in practice:
 
-**When you set up Project Pombal**, you run `pombal_setup.py`, which walks you through a guided installation: checking prerequisites, choosing an install path, creating a SQLite database with all required tables, and generating configuration files. This is the installer — the front door to the whole system.
+**When you give Pombal a task**, the `forge_orchestrator.py` scans a SQLite database for pending work, figures out which agent role should handle it (developer, tester, security reviewer), builds a detailed prompt with relevant context (project info, past lessons learned, prior episode outcomes), and dispatches the task to Claude (or optionally a local Ollama model). The developer agent writes code, the tester agent validates it, and they iterate in a dev-test loop until the task passes or budget/turn limits are hit.
 
-**When you dispatch work**, the `forge_orchestrator.py` scans your database for pending tasks, scores and prioritizes them, then dispatches them to specialized AI agent roles. The orchestrator runs a **dev-test loop**: a Developer agent writes code, then a Tester agent validates it, cycling back and forth until the task passes or the turn budget is exhausted. There's also a Security Reviewer role that can audit code. Each role gets a tailored system prompt, relevant lessons from past experiences, and episodic memory injected into its context.
+**While agents run**, the orchestrator tracks everything: it detects stuck loops (agents repeating the same failed action), monologue behavior (agents talking instead of using tools), cost overruns, and alternating error patterns. If an agent gets stuck, the system warns it, and if it doesn't recover, terminates early. Every action, error, and outcome is logged to SQLite as "episodes" — structured records of what happened, what worked, and what didn't.
 
-**When agents run**, they execute via Claude Code CLI (or Ollama for local models). The orchestrator captures their output, parses results, classifies errors, detects stuck loops (via `LoopDetector`), and manages checkpoints so work can resume if interrupted. Agents communicate through an inter-agent messaging system stored in the database.
+**After tasks complete**, the system learns from its own history. `forgesmith.py` is the self-improvement engine: it analyzes agent runs, extracts lessons from failures, adjusts configuration (max turns, model selection), and evolves prompts. `forgesmith_gepa.py` uses DSPy-style prompt evolution to iteratively improve role-specific prompts. `forgesmith_simba.py` generates behavioral rules from high-variance episodes. These learned lessons and rules get injected back into future agent prompts, creating a feedback loop.
 
-**When tasks complete**, the orchestrator records "episodes" — structured memories of what happened, what worked, and what failed. These episodes get Q-values (reinforcement learning scores) that update based on whether similar approaches succeed or fail in the future. The system literally learns from experience.
+**The dashboard and analysis tools** (`forge_dashboard.py`, `analyze_performance.py`, `nightly_review.py`) query the database to show task completion rates, blocked work, agent performance metrics, and portfolio health — giving you visibility into what the system is doing and how well it's performing.
 
-**When ForgeSmith runs** (typically via cron), it analyzes recent agent performance and evolves the system. It has three engines:
-- **Core ForgeSmith** (`forgesmith.py`): Analyzes runs, extracts lessons, detects patterns (repeated errors, turn overuse/underuse, model mismatches), proposes config/prompt changes, and evaluates whether previous changes helped.
-- **GEPA** (`forgesmith_gepa.py`): Genetic/Evolutionary Prompt Adaptation — uses DSPy-style optimization to evolve agent system prompts, with A/B testing and rollback.
-- **SIMBA** (`forgesmith_simba.py`): Synthesizes Intelligent Meta-Behavioral Advice — analyzes high-variance and hard cases to generate new operational rules for agents.
-
-**When you check the dashboard**, `forge_dashboard.py` queries the database and checkpoint files to show task completion rates, project progress, blocked tasks, and session activity.
-
-**The Forge Arena** (`forge_arena.py`) is a structured adversarial testing system that creates challenge tasks across multiple phases to stress-test and improve agent capabilities, exporting results as LoRA fine-tuning data.
+---
 
 ## System Overview
 
 ```mermaid
 graph TD
-    Setup[pombal_setup.py<br>Guided Installer] -->|Creates| DB[(SQLite Database)]
-    Setup -->|Generates| Config[Config Files]
-
-    CLI[User / CLI] -->|dispatch / run| Orchestrator[forge_orchestrator.py<br>Task Orchestrator]
-    Orchestrator -->|Read/Write| DB
-    Orchestrator -->|Spawns| Claude[Claude Code CLI]
-    Orchestrator -->|Spawns| Ollama[Ollama Local Agent]
-    Orchestrator -->|Records| Episodes[Episodes & Actions]
-    Episodes --> DB
-
-    Cron[Cron / Manual] -->|Triggers| ForgeSmith[forgesmith.py<br>Analysis Engine]
-    ForgeSmith -->|Reads| DB
-    ForgeSmith -->|Updates| Config
-    ForgeSmith --> GEPA[forgesmith_gepa.py<br>Prompt Evolution]
-    ForgeSmith --> SIMBA[forgesmith_simba.py<br>Rule Synthesis]
-    GEPA -->|Evolves Prompts| DB
-    SIMBA -->|Stores Rules| DB
-
-    Dashboard[forge_dashboard.py] -->|Queries| DB
-    Arena[forge_arena.py<br>Adversarial Testing] -->|Creates Tasks| DB
-    Arena -->|Dispatches via| Orchestrator
+    User[User / CLI] -->|describe tasks| Orchestrator[forge_orchestrator.py]
+    Orchestrator -->|dispatch| Claude[Claude API]
+    Orchestrator -->|dispatch| Ollama[Ollama Local Models]
+    Orchestrator -->|read/write| DB[(SQLite Database<br/>30+ tables)]
+    Orchestrator -->|dev-test loop| EarlyTerm[Early Termination<br/>& Loop Detection]
+    DB -->|episode data| Forgesmith[forgesmith.py<br/>Self-Improvement]
+    Forgesmith -->|evolved prompts| GEPA[forgesmith_gepa.py<br/>Prompt Evolution]
+    Forgesmith -->|behavioral rules| SIMBA[forgesmith_simba.py<br/>Rule Generation]
+    Forgesmith -->|lessons & config| DB
+    DB -->|metrics| Dashboard[forge_dashboard.py<br/>analyze_performance.py]
+    DB -->|inject lessons/episodes| Orchestrator
 ```
+
+---
 
 ## Data Flow
 
-### Typical Task Execution (Dev-Test Loop)
+### Typical Task Execution
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Orchestrator as forge_orchestrator.py
-    participant DB as SQLite Database
-    participant Dev as Developer Agent (Claude)
-    participant Test as Tester Agent (Claude)
+    participant Orch as forge_orchestrator
+    participant DB as SQLite
+    participant Agent as Claude / Ollama
+    participant Loop as Loop Detector
 
-    User->>Orchestrator: dispatch / run task
-    Orchestrator->>DB: fetch_task() / fetch_next_todo()
-    DB-->>Orchestrator: Task details + project context
-    Orchestrator->>DB: Get relevant lessons & episodes
-    DB-->>Orchestrator: Lessons + episodes (with Q-values)
+    User->>Orch: Submit task (CLI args or dispatch)
+    Orch->>DB: fetch_task() / scan_pending_work()
+    DB-->>Orch: Task details + project context
+    Orch->>DB: get_relevant_lessons() + get_relevant_episodes()
+    DB-->>Orch: Lessons & episodes for injection
+    Orch->>Orch: build_task_prompt() with context
     
-    loop Dev-Test Cycle (up to budget)
-        Orchestrator->>Dev: Build prompt + inject context
-        Dev-->>Orchestrator: Code changes + result
-        Orchestrator->>DB: log_agent_actions()
-        Orchestrator->>Orchestrator: LoopDetector.record()
-        Orchestrator->>Test: Build test prompt + dev output
-        Test-->>Orchestrator: Test results (pass/fail)
-        Orchestrator->>DB: log_agent_actions()
-        alt Tests Pass
-            Orchestrator->>DB: update_task_status(done)
-        else Tests Fail & Budget Remaining
-            Orchestrator->>Orchestrator: build_test_failure_context()
-        end
+    loop Dev-Test Cycle
+        Orch->>Agent: Run developer agent
+        Agent-->>Orch: Code changes + result
+        Orch->>Loop: Check for stuck/monologue/loops
+        Loop-->>Orch: ok / warn / terminate
+        Orch->>Agent: Run tester agent
+        Agent-->>Orch: Test results
+        Orch->>Loop: Check test loop status
+        Loop-->>Orch: ok / warn / terminate
     end
-
-    Orchestrator->>DB: record_agent_episode()
-    Orchestrator->>DB: update_episode_q_values()
-    Orchestrator->>Orchestrator: maybe_run_reflexion()
-    Orchestrator-->>User: print_dev_test_summary()
+    
+    Orch->>DB: record_agent_episode()
+    Orch->>DB: update_task_status()
+    Orch->>DB: update_episode_q_values()
+    Orch->>DB: bulk_log_agent_actions()
+    Orch-->>User: Print summary
 ```
 
-### ForgeSmith Self-Improvement Cycle
+### Self-Improvement Cycle (Forgesmith)
 
 ```mermaid
 sequenceDiagram
-    participant Cron
+    participant Cron as Cron / Manual
     participant FS as forgesmith.py
-    participant DB as SQLite Database
+    participant DB as SQLite
     participant Claude as Claude API
     participant GEPA as forgesmith_gepa.py
     participant SIMBA as forgesmith_simba.py
 
     Cron->>FS: run_full()
     FS->>DB: collect_agent_runs()
-    DB-->>FS: Recent runs + episodes
-    FS->>FS: analyze (max_turns, errors, blocked)
+    DB-->>FS: Recent episodes & metrics
+    FS->>FS: analyze_max_turns_hit() / analyze_repeat_errors()
+    FS->>DB: extract_lessons() & store
     FS->>FS: evaluate_previous_changes()
     FS->>FS: score_completed_runs() via rubric
-    FS->>DB: apply_changes() / store lessons
-    FS->>GEPA: run_gepa() — evolve prompts
-    GEPA->>Claude: Propose evolved prompt
-    Claude-->>GEPA: New prompt candidate
-    GEPA->>DB: store_evolved_prompt() (A/B test)
-    FS->>SIMBA: run_simba() — synthesize rules
-    SIMBA->>Claude: Analyze hard cases
-    Claude-->>SIMBA: New behavioral rules
+    FS->>GEPA: run_gepa() for prompt evolution
+    GEPA->>Claude: Propose evolved prompts
+    Claude-->>GEPA: New prompt candidates
+    GEPA->>DB: store_evolved_prompt()
+    FS->>SIMBA: run_simba() for rule generation
+    SIMBA->>Claude: Analyze high-variance episodes
+    Claude-->>SIMBA: Behavioral rules
     SIMBA->>DB: store_rules()
-    SIMBA->>SIMBA: prune_stale_rules()
-    FS->>DB: log_run()
+    FS->>DB: log_run() with summary
 ```
+
+---
 
 ## Database
 
 ```mermaid
 erDiagram
+    projects ||--o{ tasks : contains
+    tasks ||--o{ agent_episodes : generates
+    tasks ||--o{ agent_actions : logs
+    tasks ||--o{ agent_messages : exchanges
+    tasks ||--o{ checkpoints : saves
+    agent_episodes ||--o{ lessons : produces
+    agent_episodes }o--|| rubric_scores : evaluated_by
+    forgesmith_runs ||--o{ forgesmith_changes : applies
+    simba_rules }o--|| agent_episodes : derived_from
+    prompt_versions }o--|| forgesmith_runs : evolved_in
+
     projects {
         int id PK
-        text codename
-        text project_dir
-        text description
-        text owner
+        string codename
+        string project_dir
+        string status
     }
     tasks {
         int id PK
         int project_id FK
-        text title
-        text description
-        text status
-        text priority
-        text complexity
-        text task_type
-        text outcome
-        text output
+        string title
+        string description
+        string status
+        string priority
+        string complexity
+        string task_type
     }
     agent_episodes {
         int id PK
         int task_id FK
-        text role
-        text outcome
-        text reflection
-        text approach_summary
-        text error_patterns
-        real q_value
+        string role
+        string outcome
+        float q_value
+        string reflection
+        string error_patterns
         int times_injected
-        int reflection_required
-        text project
     }
     agent_actions {
         int id PK
         int task_id FK
-        text run_id
+        string run_id
         int cycle
-        text role
-        text tool_name
-        text success
-        text error_type
-        text error_text
+        string role
+        string error_class
+        int success
     }
     agent_messages {
         int id PK
         int task_id FK
         int cycle
-        text from_role
-        text to_role
-        text msg_type
-        text content
+        string from_role
+        string to_role
+        string msg_type
+        string content
         int read_by_cycle
     }
-    lessons_learned {
+    lessons {
         int id PK
-        text role
-        text error_type
-        text lesson_text
-        int times_injected
+        string role
+        string error_type
+        string content
         int active
-    }
-    forgesmith_runs {
-        int id PK
-        text run_id
-        int runs_analyzed
-        text changes_json
-        text summary
-        text mode
-    }
-    simba_rules {
-        int id PK
-        text role
-        text error_type
-        text rule_text
-        text signature
-        real effectiveness
-    }
-    prompt_versions {
-        int id PK
-        text role
-        int version
-        text prompt_text
-        text run_id
-        text status
+        int times_injected
     }
     rubric_scores {
         int id PK
         int task_id FK
-        text role
-        text criteria_scores
-        real total_score
+        string role
+        float normalized_score
+        string dimensions
     }
-    schema_migrations {
+    forgesmith_runs {
+        int id PK
+        string run_id
+        string mode
+        int runs_analyzed
+        string summary
+    }
+    forgesmith_changes {
+        int id PK
+        string run_id FK
+        string change_type
+        string rationale
+    }
+    simba_rules {
+        int id PK
+        string role
+        string rule_text
+        string error_type
+        float effectiveness
+    }
+    prompt_versions {
+        int id PK
+        string role
         int version
-        text description
+        string content
+        string run_id FK
     }
-
-    projects ||--o{ tasks : "has"
-    tasks ||--o{ agent_episodes : "produces"
-    tasks ||--o{ agent_actions : "logs"
-    tasks ||--o{ agent_messages : "exchanges"
-    tasks ||--o{ rubric_scores : "scored by"
 ```
+
+---
 
 ## Project Structure
 
 ```
-.
-├── forge_orchestrator.py         # Core orchestrator — task dispatch, dev-test loops, worktree isolation
-├── forgesmith.py                 # Self-improvement engine — analyzes runs, extracts lessons, proposes changes
-├── forgesmith_gepa.py            # GEPA — evolves system prompts with A/B testing (DSPy-based)
-├── forgesmith_simba.py           # SIMBA — generates behavioral rules from hard cases
-├── forgesmith_impact.py          # Blast-radius assessment before applying prompt mutations
-├── forgesmith_backfill.py        # Backfills episode data from historical logs
-├── rubric_quality_scorer.py      # Post-task 5-dimension quality scoring with DB storage
-├── lesson_sanitizer.py           # Security invariant checks on lesson extraction
-├── forge_dashboard.py            # Terminal dashboard — task stats, project completion, activity
-├── forge_arena.py                # Adversarial testing arena — stress-tests agents, exports LoRA data
-├── pombal_setup.py               # Guided installer — prerequisites, DB setup, config generation
-├── db_migrate.py                 # Database schema migrations (v0→v1→v2→v3→v4)
-├── analyze_performance.py        # Performance reporting — completion rates, throughput analysis
-├── ollama_agent.py               # Local Ollama agent — sandboxed tool execution, file operations
-├── prepare_training_data.py      # Converts datasets into chat-format training data for fine-tuning
-├── train_qlora.py                # QLoRA fine-tuning script (manual implementation)
-├── train_qlora_peft.py           # QLoRA fine-tuning script (PEFT/Hugging Face)
-├── prompts/
-│   ├── _common.md                        # Shared rules for all agents (quality standard, output format)
-│   ├── developer.md                      # Developer role prompt
-│   ├── tester.md                         # Tester role prompt
-│   └── ...                               # 9 role prompts total (auto-discovered by orchestrator)
-├── skills/
-│   ├── developer/                        # Codebase navigation, implementation planning, error recovery
-│   ├── tester/                           # Framework detection, test generation
-│   ├── debugger/                         # Systematic debugging (hypothesis-driven 5-step)
-│   ├── code-reviewer/                    # Architecture review, change-impact analysis
-│   └── security/                         # 7 Trail of Bits security skills
-├── test_*.py                             # Test suite (12 files, ~6000 lines)
-└── CLAUDE.md                             # Project context document for AI agents
+ProjectPombal/
+├── forge_orchestrator.py        # Core orchestrator — task dispatch, dev-test loop, episode recording
+├── forgesmith.py                # Self-improvement engine — analyzes runs, extracts lessons, tunes config
+├── forgesmith_gepa.py           # GEPA prompt evolution — DSPy-style iterative prompt optimization
+├── forgesmith_simba.py          # SIMBA rule generation — behavioral rules from high-variance episodes
+├── forgesmith_impact.py         # Impact assessment — blast radius analysis for config changes
+├── forgesmith_backfill.py       # Backfill tool — retroactively parses logs into structured episodes
+├── forge_dashboard.py           # Dashboard — task summaries, checkpoint analysis, project health
+├── forge_arena.py               # Arena — automated multi-phase stress testing and LoRA data export
+├── ollama_agent.py              # Local model agent — sandboxed tool execution via Ollama
+├── lesson_sanitizer.py          # Security — strips injection attacks from lesson content
+├── rubric_quality_scorer.py     # Quality scoring — multi-dimensional rubric for agent outputs
+├── nightly_review.py            # Nightly report — portfolio stats, blockers, stale projects
+├── analyze_performance.py       # Performance analytics — completion rates, throughput, trends
+├── autoresearch_prompts.py      # Prompt optimization — OPRO-style prompt research with LLMs
+├── autoresearch_loop.py         # Optimization loop — deploy/test/measure/rollback prompt variants
+├── db_migrate.py                # Schema migrations — versioned DB upgrades with backup
+├── benchmark_migrations.py      # Migration benchmarks — validates migration correctness & speed
+├── pombal_setup.py              # Setup wizard — interactive installer for new deployments
+├── prepare_training_data.py     # Training data prep — converts episodes to fine-tuning format
+├── train_qlora_peft.py          # QLoRA training — fine-tune with PEFT/LoRA
+├── train_qlora.py               # QLoRA training — alternative training pipeline
+├── ingest_training_results.py   # Training ingestion — imports training metrics back to DB
+├── skills/                      # Skill modules
+│   └── security/
+│       └── static-analysis/
+│           └── sarif_helpers.py # SARIF parsing — load, filter, deduplicate security findings
+├── tests/
+│   ├── test_early_termination.py        # Tests for stuck detection, loop detection, budget tracking
+│   ├── test_early_termination_monologue.py  # Tests for monologue detection
+│   ├── test_loop_detection.py           # Tests for LoopDetector class
+│   ├── test_task_type_routing.py        # Tests for task type dispatch config
+│   ├── test_rubric_scoring.py           # Tests for rubric scoring system
+│   ├── test_rubric_quality_scorer.py    # Tests for quality scorer dimensions
+│   ├── test_lessons_injection.py        # Tests for lesson retrieval and injection
+│   ├── test_lesson_sanitizer.py         # Tests for sanitization and security
+│   ├── test_episode_injection.py        # Tests for episode retrieval and Q-value updates
+│   ├── test_forgesmith_simba.py         # Tests for SIMBA rule generation pipeline
+│   ├── test_agent_messages.py           # Tests for inter-agent messaging
+│   └── test_agent_actions.py            # Tests for action logging and error classification
+└── CLAUDE.md                    # Project context file for Claude
 ```
-
-## Key Design Decisions
-
-### SQLite as the sole data store
-Everything — tasks, episodes, lessons, messages, rules, prompt versions, migration history — lives in a single SQLite database. This is intentional: zero pip dependencies (stdlib only), trivially portable, and easy to back up. The system is designed for single-machine orchestration, not distributed deployment.
-
-### Dev-Test Loop with dynamic budgets
-Rather than running one agent and hoping for the best, the orchestrator cycles between Developer and Tester agents. The turn budget is dynamic — `calculate_dynamic_budget()` and `adjust_dynamic_budget()` adapt based on task complexity and intermediate results. This prevents both premature termination and runaway loops.
-
-### LoopDetector with fingerprinting
-Agents can get stuck repeating the same failing approach. `LoopDetector` creates deterministic fingerprints of agent outputs (result, blockers, errors) and tracks consecutive identical fingerprints. It issues warnings at a threshold and forces termination at a higher one. File changes reset the counter — the agent is actually making progress.
-
-### Episodic memory with Q-values
-Agent episodes aren't just logs — they're learning signals. Each episode gets a Q-value that starts from the outcome (`compute_initial_q_value`) and gets updated when similar episodes are injected into future tasks (`update_episode_q_values`). High-Q episodes get preferentially injected, creating a reinforcement learning loop without explicit training.
-
-### Three-tier self-improvement (ForgeSmith → GEPA → SIMBA)
-Self-improvement is layered. Core ForgeSmith does rule-based analysis (repeated errors → lessons, turn overuse → config changes). GEPA uses evolutionary optimization to rewrite entire system prompts with A/B testing and rollback safety. SIMBA targets the hardest cases — high-variance and low-success episodes — to synthesize specific behavioral rules. Each tier operates at a different granularity and timescale.
-
-### Provider abstraction (Claude + Ollama)
-The orchestrator supports both Claude Code (via CLI) and local Ollama models. `get_provider()`, `get_ollama_model()`, and `get_role_model()` resolve which backend to use per role, allowing cost-sensitive routing (e.g., use local models for simple tasks, Claude for complex ones).
-
-### Checkpoint-based resilience
-Long-running agent tasks save checkpoints (`save_checkpoint`/`load_checkpoint`). If a task is interrupted, the next run loads the checkpoint and builds context from it rather than starting from scratch. This is critical for multi-cycle dev-test loops that can take many minutes.
-
-### Inter-agent messaging
-Agents don't just pass results through the orchestrator — they can leave structured messages for each other via `post_agent_message` / `read_agent_messages`. Messages are scoped by task and cycle, with read-tracking so agents don't process the same message twice. This enables richer coordination than simple output passing.
-
-### Schema migrations with versioning
-`db_migrate.py` implements a linear migration chain (v0→v1→v2→v3→v4) with automatic backup before migration, legacy version detection, and a `schema_migrations` audit log. This lets the database evolve safely as new features are added.
-
-### Git worktree isolation for parallel tasks
-When running multiple tasks on the same project, the orchestrator creates isolated git worktrees (`forge-task-{id}` branches). Each agent works in its own directory with its own branch. On success, the branch is merged back and cleaned up. On failure or merge conflict, the branch is **preserved** for manual recovery — no work is lost.
-
-### Per-role agent skills
-Each agent role loads specialized skills from `skills/` at task start. Skills teach concrete methods (e.g., the developer's codebase-navigation skill is a 4-step method that prevents analysis paralysis). Skills are markdown files loaded into the system prompt, not code — they're instructions, not tools.
-
-### Post-task quality scoring
-`rubric_quality_scorer.py` scores every completed task across 5 dimensions with role-specific weights. Scores are stored in the database and feed into ForgeSmith's analysis for effectiveness tracking. This provides quantitative quality signals beyond pass/fail.
-
-### Failure classification taxonomy
-Agent failures are classified into a structured taxonomy (`analysis_paralysis`, `build_failure`, `test_failure`, `import_error`, `timeout`, `wrong_approach`, `environment_error`, `max_turns`) rather than generic strings. SIMBA and GEPA use this taxonomy for targeted improvements.
-
-### Change-impact analysis
-`forgesmith_impact.py` assesses the blast radius before ForgeSmith applies any prompt or config mutation. It evaluates affected roles, task types, and risk level. HIGH-risk changes are blocked from auto-apply and require manual approval.
 
 ---
 
-## Power User: Querying the Knowledge Base
+## Key Design Decisions
 
-Because everything lives in SQLite and Claude has MCP access to the database, you can ask deep questions about your project history in plain English. Claude translates them to SQL behind the scenes.
+### Pure Python stdlib, zero pip dependencies
+The core system uses only Python's standard library and SQLite. This eliminates dependency hell, makes deployment trivial (copy files + run setup), and ensures the system works anywhere Python runs. The only external dependencies are the AI providers themselves (Claude API, optionally Ollama).
 
-### Examples
+### SQLite as the single source of truth
+Everything lives in one SQLite database with 30+ tables: tasks, episodes, lessons, rules, config changes, rubric scores, prompt versions. This means no Redis, no Postgres, no message queues — just a single file that's easy to back up, inspect with `sqlite3`, and migrate with `db_migrate.py`. The tradeoff is concurrency, but since agent dispatch is controlled by the orchestrator, write contention is managed.
 
-**Learning from failures:**
-> "What lessons have we learned from failed security reviews on Loom?"
->
-> "Show me the top 5 error patterns across all developer runs this month"
->
-> "Which tasks took the most dev-test cycles to complete?"
+### Closed-loop self-improvement
+The system learns from its own failures through three mechanisms: **lessons** (text patterns extracted from failed runs), **episodes with Q-values** (reinforcement-learning-style scoring of past approaches), and **SIMBA rules** (behavioral guidelines generated by Claude from high-variance outcomes). These all feed back into future prompts, creating a system that genuinely improves over time.
 
-**Performance insights:**
-> "How much have we spent on API costs this week, broken down by project?"
->
-> "What's the average success rate for developer agents on TorqueDesk vs Loom?"
->
-> "Which agent role uses the most turns relative to its budget?"
+### Aggressive early termination
+Rather than letting agents burn tokens spinning in circles, the `LoopDetector` tracks fingerprints of agent actions, detects consecutive repetition (same tool + same result), alternating patterns (A-B-A-B oscillation), and monologue behavior (text-only responses without tool use). Warnings come first, then hard termination. Cost breakers scale with task complexity.
 
-**Decision archaeology:**
-> "What did we decide about the auth approach for Loom?"
->
-> "Show me all open questions across projects, sorted by age"
->
-> "What were the key decisions made in the last 3 sessions?"
+### Lesson sanitization as a security boundary
+Since lessons generated from past runs get injected into future prompts, `lesson_sanitizer.py` strips XML injection tags, role override phrases, base64 payloads, ANSI escapes, and dangerous code blocks. This prevents a compromised or adversarial output from poisoning the learning pipeline.
 
-**Agent memory:**
-> "What episodes does the developer agent have for database migration tasks?"
->
-> "Show me the highest Q-value episodes — what approaches worked best?"
->
-> "Has ForgeSmith evolved any prompts recently? What changed?"
+### Dev-test loop as the core execution pattern
+Most code tasks run through `run_dev_test_loop()`: a developer agent writes code, a tester agent validates it, and they iterate with compacted context from prior cycles. This mirrors how human developers work — write, test, fix — and the cycle count adapts dynamically based on progress signals.
 
-### The tables behind these queries
+### Multi-tier model routing
+The orchestrator routes tasks to different models based on role, complexity, and configuration. Simple tasks might use cheaper/faster models, complex tasks get the most capable model, and the dispatch config can override per-task-type. Ollama provides a local fallback for cost-sensitive or offline scenarios.
 
-| Table | What it stores |
-|-------|---------------|
-| `agent_episodes` | Every agent run with outcome, reflection, approach summary, Q-value |
-| `lessons_learned` | Error patterns distilled into reusable advice, injected into future prompts |
-| `agent_messages` | Structured communication between agents (tester → developer feedback) |
-| `agent_actions` | Per-tool-call logs with input hashing for dedup detection |
-| `decisions` | Architectural and design decisions with rationale |
-| `session_notes` | Per-session summaries with next steps |
-| `simba_rules` | Behavioral rules synthesized from failure analysis |
-| `prompt_versions` | Evolved prompts with A/B test status |
-
-You never need to know these table names. Just ask Claude what you want to know.
-
+### Prompt evolution with safety rails
+`forgesmith_gepa.py` evolves prompts using Claude itself, but with guardrails: diff ratio limits, protected section checks, validation of evolved outputs, A/B testing support, and versioned rollback. Changes are logged to the database so every prompt mutation is traceable and reversible.
 ---
 
 ## Related Documentation
