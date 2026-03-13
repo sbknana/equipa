@@ -14,7 +14,8 @@ Complete reference for installing, configuring, and using Project Pombal — a m
 6. [Project Management](#project-management)
 7. [MCP Setup](#mcp-setup)
 8. [Database Structure](#database-structure)
-9. [Troubleshooting](#troubleshooting)
+9. [Autoresearch — Automated Prompt Optimization](#autoresearch--automated-prompt-optimization)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -756,6 +757,95 @@ The agent may have hit a context limit or encountered an unexpected error.
 2. Increase max turns: `--max-turns 50`
 3. Check the task description — vague tasks produce poor results
 4. Run with `--dry-run` to inspect the system prompt size
+
+---
+
+## Autoresearch — Automated Prompt Optimization
+
+Autoresearch is the automated system for improving agent prompts. It mutates prompts using Opus, benchmarks them against real tasks, and keeps changes that improve success rates.
+
+### Checking Current Performance
+
+```bash
+# Show success rates for all roles (sliding window of last 15 runs)
+python3 autoresearch_loop.py --status
+```
+
+Output looks like:
+```
+Role                    Runs  Success  Avg Turns   Target
+----------------------------------------------------------
+developer                 15   100.0%        8.2      80%
+tester                    15   100.0%        5.1      85%
+frontend-designer         15   100.0%        7.5      80%
+security-reviewer         15   100.0%       12.3      85%
+economy-tester            15   100.0%        6.8      80%
+story-tester              15   100.0%        5.9      80%
+debugger                  15    83.4%        9.1      80%
+```
+
+### Running Optimization
+
+```bash
+# Optimize a single role
+python3 autoresearch_loop.py --role debugger --target 80
+
+# Optimize all roles below their targets
+python3 autoresearch_loop.py --all --target 80
+
+# Limit to 5 rounds (default is 10)
+python3 autoresearch_loop.py --role debugger --max-rounds 5
+```
+
+Each round takes 10-30 minutes depending on task complexity and agent turn counts. The loop prints progress as it goes — which round, which tasks passed/failed, whether the mutation was kept or reverted.
+
+### Generating Prompt Mutations Without Benchmarking
+
+If you just want to generate improved prompts without running the full benchmark loop:
+
+```bash
+# Generate mutations for all underperforming roles (via local Ollama)
+python3 autoresearch_prompts.py
+
+# Single role
+python3 autoresearch_prompts.py --role developer
+
+# Use Anthropic Sonnet instead of local Ollama
+python3 autoresearch_prompts.py --tier 2
+
+# Use Opus for highest quality mutations
+python3 autoresearch_prompts.py --tier 3
+
+# Preview without writing files
+python3 autoresearch_prompts.py --dry-run
+```
+
+### Rolling Back
+
+If a prompt mutation makes things worse:
+
+```bash
+# Rollback a single role to its last backup
+python3 autoresearch_loop.py --rollback developer
+
+# Rollback all roles (autoresearch_prompts.py version)
+python3 autoresearch_prompts.py --rollback
+```
+
+Backups are stored in `.autoresearch-backups/` with timestamps.
+
+### How It Fits Together
+
+| System | What It Does | When To Use |
+|--------|-------------|-------------|
+| **Autoresearch** | Aggressive prompt search. Large rewrites, benchmarked in hours. | A role is underperforming and needs improvement now |
+| **ForgeSmith/GEPA** | Incremental prompt evolution. Small changes, A/B tested over weeks. | Maintenance — keeping prompts tuned as projects evolve |
+| **ForgeSmith/SIMBA** | Generates behavioral rules injected alongside prompts. | Complements both — targets specific failure patterns |
+| **QLoRA Training** | Fine-tunes a local model on successful agent runs. | Want to run agents locally at zero API cost |
+
+---
+
+## Troubleshooting
 
 ### synced storage sync corruption
 

@@ -4,896 +4,518 @@
 
 - [API.md — Project Pombal](#apimd-project-pombal)
   - [Overview](#overview)
-  - [Architecture](#architecture)
   - [CLI Entry Points](#cli-entry-points)
-    - [forge_orchestrator.py](#forge_orchestratorpy)
-- [Run a single task](#run-a-single-task)
-- [Run multiple tasks in parallel](#run-multiple-tasks-in-parallel)
-- [Auto-dispatch across projects](#auto-dispatch-across-projects)
-- [Plan from a goal](#plan-from-a-goal)
-- [Run parallel goals from a file](#run-parallel-goals-from-a-file)
-- [Setup repositories](#setup-repositories)
-    - [forgesmith.py](#forgesmithpy)
-- [Full analysis + apply changes](#full-analysis-apply-changes)
-- [Dry run — analyze without applying](#dry-run-analyze-without-applying)
-- [Propose-only mode (OPRO prompt optimization)](#propose-only-mode-opro-prompt-optimization)
-- [Generate report](#generate-report)
-- [Rollback a previous change](#rollback-a-previous-change)
-    - [forgesmith_simba.py](#forgesmith_simbapy)
-- [Run SIMBA rule generation](#run-simba-rule-generation)
-- [Dry run](#dry-run)
-- [Filter by role](#filter-by-role)
-    - [forgesmith_gepa.py](#forgesmith_gepapy)
-- [Run GEPA prompt evolution](#run-gepa-prompt-evolution)
-- [Dry run](#dry-run)
-- [Filter by role](#filter-by-role)
-    - [forge_arena.py](#forge_arenapy)
-    - [forge_dashboard.py](#forge_dashboardpy)
-    - [analyze_performance.py](#analyze_performancepy)
-- [Full report](#full-report)
-- [Filter by project](#filter-by-project)
-- [Limit time range](#limit-time-range)
-    - [db_migrate.py](#db_migratepy)
-- [Run all pending migrations](#run-all-pending-migrations)
-- [Silent mode](#silent-mode)
-    - [pombal_setup.py](#pombal_setuppy)
-  - [Internal Python APIs](#internal-python-apis)
-    - [Database Connection](#database-connection)
-- [forge_orchestrator.py](#forge_orchestratorpy)
-    - [Task Management](#task-management)
+    - [Forge Orchestrator — `forge_orchestrator.py`](#forge-orchestrator-forge_orchestratorpy)
+    - [Forgesmith — `forgesmith.py`](#forgesmith-forgesmithpy)
+    - [Forgesmith SIMBA — `forgesmith_simba.py`](#forgesmith-simba-forgesmith_simbapy)
+    - [Forgesmith GEPA — `forgesmith_gepa.py`](#forgesmith-gepa-forgesmith_gepapy)
+    - [Forge Arena — `forge_arena.py`](#forge-arena-forge_arenapy)
+    - [Database Migration — `db_migrate.py`](#database-migration-db_migratepy)
+    - [Additional Tools](#additional-tools)
+  - [Internal Python Interfaces](#internal-python-interfaces)
     - [Agent Messaging System](#agent-messaging-system)
-    - [Agent Actions (Telemetry)](#agent-actions-telemetry)
-    - [Agent Episodes (Reinforcement Learning Memory)](#agent-episodes-reinforcement-learning-memory)
-    - [Lessons Learned System](#lessons-learned-system)
-    - [Loop Detection](#loop-detection)
-    - [Early Termination](#early-termination)
-- [Constants (inferred from tests)](#constants-inferred-from-tests)
-    - [Ollama Integration (Local LLM Client)](#ollama-integration-local-llm-client)
-    - [File Operations (Sandboxed)](#file-operations-sandboxed)
-    - [Rubric Scoring](#rubric-scoring)
-    - [SIMBA Rules Engine](#simba-rules-engine)
-    - [SARIF Security Helpers](#sarif-security-helpers)
-    - [Database Migration](#database-migration)
+    - [Agent Actions Logging](#agent-actions-logging)
+    - [Loop Detection — `LoopDetector` class](#loop-detection-loopdetector-class)
+    - [Lesson Injection System](#lesson-injection-system)
+    - [Episode Memory System](#episode-memory-system)
+    - [Lesson Sanitizer — `lesson_sanitizer.py`](#lesson-sanitizer-lesson_sanitizerpy)
+    - [Rubric Quality Scoring — `rubric_quality_scorer.py`](#rubric-quality-scoring-rubric_quality_scorerpy)
+    - [SARIF Helpers — `skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py`](#sarif-helpers-skillssecuritystatic-analysisskillssarif-parsingresourcessarif_helperspy)
+    - [Ollama Agent — `ollama_agent.py`](#ollama-agent-ollama_agentpy)
+  - [Database Schema (Key Tables — Inferred)](#database-schema-key-tables-inferred)
   - [Error Handling](#error-handling)
-    - [Error Classification](#error-classification)
-    - [Loop Detection States](#loop-detection-states)
-    - [Agent Retry Strategy](#agent-retry-strategy)
-  - [Database Schema](#database-schema)
+    - [Agent Error Classification](#agent-error-classification)
+    - [Early Termination Conditions](#early-termination-conditions)
+    - [Budget Awareness Messages (inferred)](#budget-awareness-messages-inferred)
   - [Configuration](#configuration)
     - [Dispatch Configuration](#dispatch-configuration)
-  - [Adding API Endpoints](#adding-api-endpoints)
+    - [Forgesmith Configuration](#forgesmith-configuration)
+  - [Adding HTTP API Endpoints](#adding-http-api-endpoints)
   - [Related Documentation](#related-documentation)
 
 ## Overview
 
-**Project Pombal** is a multi-agent AI orchestration platform for Claude Code. It is **not a web API service** — it is a collection of CLI tools, orchestration scripts, and SQLite-backed utilities that coordinate AI agents for software development tasks.
+Project Pombal is a **multi-agent AI orchestration platform** built in pure Python with SQLite as its data store. It is **not a traditional REST/GraphQL/tRPC API service**. Instead, it operates as a collection of CLI tools, orchestration scripts, and internal Python function interfaces that coordinate AI agents (developers, testers, security reviewers) to execute software development tasks.
 
-There are **no HTTP/REST API endpoints, GraphQL schemas, or tRPC procedures** detected in this project. Project Pombal operates through:
+**There are no HTTP API endpoints exposed by this project.**
 
-- **CLI entry points** (Python scripts invoked from the command line)
-- **SQLite database** for persistent state, episodes, lessons, and agent messages
-- **Inter-agent messaging** via database-backed message passing
-- **Ollama integration** for local LLM inference (HTTP client, not server)
+Pombal's "API" is an internal programmatic interface consisting of:
 
-This document describes the **internal programmatic interfaces** — the key function-level APIs that developers integrating with or extending Project Pombal will use.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                 CLI Entry Points                 │
-│  forge_orchestrator.py  forgesmith.py  etc.      │
-├─────────────────────────────────────────────────┤
-│              Internal Python APIs                │
-│  Orchestration │ Episodes │ Lessons │ Messaging  │
-├─────────────────────────────────────────────────┤
-│              SQLite Database Layer               │
-│  Tasks │ Projects │ Agent Episodes │ Actions     │
-└─────────────────────────────────────────────────┘
-```
+- **CLI entry points** (invoked via `python script.py [args]`)
+- **SQLite database operations** (the central state store)
+- **Inter-agent messaging** (via the `agent_messages` subsystem)
+- **Internal Python function interfaces** used across modules
 
 ---
 
 ## CLI Entry Points
 
-### forge_orchestrator.py
+### Forge Orchestrator — `forge_orchestrator.py`
 
-The primary orchestrator for dispatching tasks to AI agents.
+The primary entry point for dispatching and managing agent tasks.
 
-```bash
-# Run a single task
-python forge_orchestrator.py --task <task_id>
-
-# Run multiple tasks in parallel
-python forge_orchestrator.py --tasks "101,102,103"
-
-# Auto-dispatch across projects
-python forge_orchestrator.py --dispatch
-
-# Plan from a goal
-python forge_orchestrator.py --goal "Implement user authentication"
-
-# Run parallel goals from a file
-python forge_orchestrator.py --goals-file goals.json
-
-# Setup repositories
-python forge_orchestrator.py --setup-repos
-```
-
-| Argument | Description |
+| Command / Mode | Description |
 |---|---|
-| `--task <id>` | Run a single task by ID |
-| `--tasks <ids>` | Comma-separated task IDs for parallel execution |
-| `--dispatch` | Auto-dispatch mode — scans pending work and dispatches |
-| `--goal <text>` | Plan and execute a single goal |
-| `--goals-file <path>` | JSON file with multiple goals for parallel execution |
-| `--setup-repos` | Initialize git repositories for projects |
-| `--dry-run` | (inferred) Preview without making changes |
+| `python forge_orchestrator.py --task <id>` | Run a single task by ID (inferred) |
+| `python forge_orchestrator.py --dispatch` | Auto-dispatch tasks across projects based on scoring (inferred) |
+| `python forge_orchestrator.py --goals <file>` | Run parallel goals from a YAML/JSON goals file (inferred) |
+| `python forge_orchestrator.py --tasks <id,id,...>` | Run multiple tasks in parallel (inferred) |
+| `python forge_orchestrator.py --setup-repos` | Set up GitHub repos for all projects (inferred) |
+| `python forge_orchestrator.py --scan` | Scan for pending work across projects (inferred) |
 
----
+### Forgesmith — `forgesmith.py`
 
-### forgesmith.py
+The self-improvement engine that analyzes agent performance and evolves prompts/config.
 
-The self-improvement engine — analyzes agent performance and evolves configuration.
-
-```bash
-# Full analysis + apply changes
-python forgesmith.py
-
-# Dry run — analyze without applying
-python forgesmith.py --dry-run
-
-# Propose-only mode (OPRO prompt optimization)
-python forgesmith.py --propose-only
-
-# Generate report
-python forgesmith.py --report
-
-# Rollback a previous change
-python forgesmith.py --rollback <run_id>
-```
-
-| Argument | Description |
+| Command / Mode | Description |
 |---|---|
-| `--dry-run` | Analyze and propose changes without applying (inferred) |
-| `--propose-only` | Run OPRO prompt optimization proposals only (inferred) |
-| `--report` | Generate performance report (inferred) |
-| `--rollback <run_id>` | Revert changes from a specific run (inferred) |
+| `python forgesmith.py` | Run full analysis + apply changes (inferred) |
+| `python forgesmith.py --dry-run` | Analyze without applying changes (inferred) |
+| `python forgesmith.py --report` | Generate performance report only (inferred) |
+| `python forgesmith.py --rollback <run_id>` | Revert changes from a specific run (inferred) |
+| `python forgesmith.py --propose-only` | Generate O-PRO proposals without applying (inferred) |
 
----
+### Forgesmith SIMBA — `forgesmith_simba.py`
 
-### forgesmith_simba.py
+Generates behavioral rules from high-variance agent episodes.
 
-SIMBA (Self-Improving Model-Based Advisor) — generates rules from agent episode data.
-
-```bash
-# Run SIMBA rule generation
-python forgesmith_simba.py
-
-# Dry run
-python forgesmith_simba.py --dry-run
-
-# Filter by role
-python forgesmith_simba.py --role developer
-```
-
-| Argument | Description |
+| Command / Mode | Description |
 |---|---|
-| `--dry-run` | Generate rules without storing (inferred) |
-| `--role <role>` | Only generate rules for a specific role (inferred) |
+| `python forgesmith_simba.py` | Run SIMBA rule generation pipeline (inferred) |
+| `python forgesmith_simba.py --dry-run` | Preview rules without storing (inferred) |
+| `python forgesmith_simba.py --role <role>` | Filter to a specific agent role (inferred) |
 
----
+### Forgesmith GEPA — `forgesmith_gepa.py`
 
-### forgesmith_gepa.py
+Genetic/evolutionary prompt optimization for agent roles.
 
-GEPA (Generative Episode Prompt Adaptation) — evolves system prompts using DSPy-style optimization.
-
-```bash
-# Run GEPA prompt evolution
-python forgesmith_gepa.py
-
-# Dry run
-python forgesmith_gepa.py --dry-run
-
-# Filter by role
-python forgesmith_gepa.py --role developer
-```
-
-| Argument | Description |
+| Command / Mode | Description |
 |---|---|
-| `--dry-run` | Evolve prompts without storing (inferred) |
-| `--role <role>` | Only evolve prompts for a specific role (inferred) |
+| `python forgesmith_gepa.py` | Run GEPA prompt evolution (inferred) |
+| `python forgesmith_gepa.py --dry-run` | Preview evolved prompts without deploying (inferred) |
+| `python forgesmith_gepa.py --role <role>` | Evolve prompts for a specific role (inferred) |
 
----
+### Forge Arena — `forge_arena.py`
 
-### forge_arena.py
+Multi-phase testing arena for agent evaluation.
 
-Adversarial self-play arena for testing and improving agent capabilities.
-
-```bash
-python forge_arena.py
-```
-
----
-
-### forge_dashboard.py
-
-Performance dashboard and reporting.
-
-```bash
-python forge_dashboard.py
-```
-
----
-
-### analyze_performance.py
-
-Detailed performance analysis and reporting.
-
-```bash
-# Full report
-python analyze_performance.py
-
-# Filter by project
-python analyze_performance.py --project <project_id>
-
-# Limit time range
-python analyze_performance.py --days 30
-```
-
-| Argument | Description |
+| Command / Mode | Description |
 |---|---|
-| `--project <id>` | Filter analysis to a specific project (inferred) |
-| `--days <n>` | Limit analysis to the last N days (inferred) |
+| `python forge_arena.py` | Run arena evaluation phases (inferred) |
+| `python forge_arena.py --dry-run` | Simulate without dispatching tasks (inferred) |
+| `python forge_arena.py --export-lora` | Export training data for LoRA fine-tuning (inferred) |
+
+### Database Migration — `db_migrate.py`
+
+Schema migration tool for the SQLite database.
+
+| Command / Mode | Description |
+|---|---|
+| `python db_migrate.py` | Run all pending migrations |
+| `python db_migrate.py --silent` | Run migrations without output (inferred) |
+
+### Additional Tools
+
+| Script | Description |
+|---|---|
+| `pombal_setup.py` | Interactive setup wizard for new installations |
+| `forge_dashboard.py` | Terminal dashboard for task/project status |
+| `analyze_performance.py` | Performance analytics and reporting |
+| `nightly_review.py` | Automated nightly portfolio review |
+| `autoresearch_loop.py` | Automated prompt optimization loop |
+| `autoresearch_prompts.py` | O-PRO prompt research and mutation |
+| `forgesmith_backfill.py` | Backfill episode data from agent logs |
+| `forgesmith_impact.py` | Impact assessment for configuration changes |
+| `ingest_training_results.py` | Ingest fine-tuning results into the database |
+| `prepare_training_data.py` | Prepare conversation data for model training |
+| `train_qlora.py` | QLoRA training script |
+| `train_qlora_peft.py` | QLoRA training with PEFT |
+| `ollama_agent.py` | Local Ollama-based agent with sandboxed tool execution |
+| `benchmark_migrations.py` | Benchmark and verify database migrations |
 
 ---
 
-### db_migrate.py
-
-Database schema migration tool.
-
-```bash
-# Run all pending migrations
-python db_migrate.py
-
-# Silent mode
-python db_migrate.py --silent
-```
-
----
-
-### pombal_setup.py
-
-Guided interactive setup wizard.
-
-```bash
-python pombal_setup.py
-```
-
----
-
-## Internal Python APIs
-
-### Database Connection
-
-All modules use a consistent SQLite connection pattern.
-
-```python
-# forge_orchestrator.py
-def get_db_connection(write: bool) -> sqlite3.Connection
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `write` | `bool` | If `True`, opens with write access; `False` for read-only |
-
-**Returns:** `sqlite3.Connection`
-
----
-
-### Task Management
-
-#### Fetch a Task
-
-```python
-def fetch_task(task_id: int) -> dict
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | The task ID to retrieve |
-
-**Returns:** Task dictionary with fields including `id`, `title`, `description`, `status`, `project_id`, `priority`, `complexity` (inferred).
-
-#### Fetch Next TODO Task
-
-```python
-def fetch_next_todo(project_id: int) -> dict | None
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `project_id` | `int` | Project to search for pending tasks |
-
-**Returns:** Next unstarted task or `None`.
-
-#### Update Task Status
-
-```python
-def update_task_status(task_id: int, outcome: str, output: str) -> None
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | Task to update |
-| `outcome` | `str` | Result status (e.g., `"done"`, `"failed"`, `"blocked"`) (inferred) |
-| `output` | `str` | Agent output text |
-
----
+## Internal Python Interfaces
 
 ### Agent Messaging System
 
-Inter-agent communication via database-backed message passing.
+The inter-agent communication layer used by the orchestrator for multi-agent coordination.
 
-#### Post a Message
+#### `post_agent_message(task_id, cycle, from_role, to_role, msg_type, content)`
 
-```python
-def post_agent_message(
-    task_id: int, cycle: int, from_role: str,
-    to_role: str, msg_type: str, content: str
-) -> None
-```
+Post a message from one agent role to another.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `task_id` | `int` | Associated task |
-| `cycle` | `int` | Dev-test cycle number |
-| `from_role` | `str` | Sender role (e.g., `"developer"`, `"tester"`) |
-| `to_role` | `str` | Recipient role |
-| `msg_type` | `str` | Message type (e.g., `"test_results"`, `"feedback"`) (inferred) |
-| `content` | `str` | Message body (may be JSON) |
+| `task_id` | `int` | The task this message relates to |
+| `cycle` | `int` | The dev-test cycle number |
+| `from_role` | `str` | Sending role (e.g., `"developer"`, `"tester"`) |
+| `to_role` | `str` | Receiving role |
+| `msg_type` | `str` | Message type (e.g., `"test_results"`, `"feedback"`) |
+| `content` | `str` | Message content (JSON or plain text) |
 
-#### Read Messages
+#### `read_agent_messages(task_id, to_role, max_cycle)`
 
-```python
-def read_agent_messages(
-    task_id: int, to_role: str, max_cycle: int
-) -> list[dict]
-```
+Read unread messages for a given role.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `task_id` | `int` | Associated task |
-| `to_role` | `str` | Recipient role to filter by |
-| `max_cycle` | `int` | Only return messages up to this cycle |
+| `task_id` | `int` | The task to read messages for |
+| `to_role` | `str` | The role receiving messages |
+| `max_cycle` | `int` | Maximum cycle number to include |
 
-**Returns:** List of unread message dicts, ordered by cycle and ID.
+**Returns:** `list[dict]` — List of message records ordered by cycle and ID.
 
-#### Mark Messages Read
+#### `mark_messages_read(task_id, to_role, cycle_number)`
 
-```python
-def mark_messages_read(
-    task_id: int, to_role: str, cycle_number: int
-) -> None
-```
+Mark messages as read up to the given cycle.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `task_id` | `int` | Associated task |
-| `to_role` | `str` | Role whose messages to mark |
-| `cycle_number` | `int` | Mark messages read up to this cycle |
+| `task_id` | `int` | The task ID |
+| `to_role` | `str` | The role whose messages to mark read |
+| `cycle_number` | `int` | Mark all messages up to this cycle |
 
-#### Format Messages for Prompt Injection
+#### `format_messages_for_prompt(messages)`
 
-```python
-def format_messages_for_prompt(messages: list[dict]) -> str
-```
+Format message records into a string suitable for injection into agent system prompts.
 
-**Returns:** Formatted string suitable for including in agent system prompts.
+| Parameter | Type | Description |
+|---|---|---|
+| `messages` | `list[dict]` | Messages from `read_agent_messages()` |
+
+**Returns:** `str` — Formatted messages block, or empty string if no messages.
 
 ---
 
-### Agent Actions (Telemetry)
+### Agent Actions Logging
 
-#### Log an Action
+#### `classify_error(error_text)`
 
-```python
-def log_agent_action(action: dict) -> None  # (inferred signature)
-```
+Classify an error string into a known category.
 
-#### Bulk Log Actions
+| Parameter | Type | Description |
+|---|---|---|
+| `error_text` | `str` | Raw error output text |
 
-```python
-def bulk_log_agent_actions(
-    action_log: list, task_id: int,
-    run_id: str, cycle: int, role: str
-) -> None
-```
+**Returns:** `str` — One of: `"timeout"`, `"file_not_found"`, `"permission"`, `"syntax"`, `"import"`, `"test_failure"`, `"unknown"`, or `""` for empty input.
+
+#### `bulk_log_agent_actions(action_log, task_id, run_id, cycle, role)`
+
+Batch-insert agent action records. Never raises exceptions.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `action_log` | `list` | List of action records |
 | `task_id` | `int` | Associated task |
-| `run_id` | `str` | Unique run identifier |
-| `cycle` | `int` | Dev-test cycle number |
+| `run_id` | `str` | Run identifier |
+| `cycle` | `int` | Cycle number |
 | `role` | `str` | Agent role |
-
-*This function is designed to never crash — errors are silently caught.* (inferred)
-
-#### Get Action Summary
-
-```python
-def get_action_summary(task_id: int, cycle: int = None) -> dict
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | Task to summarize |
-| `cycle` | `int \| None` | Specific cycle, or all cycles if `None` |
-
-**Returns:** Summary dict with action counts and statistics (inferred).
-
-#### Classify Errors
-
-```python
-def classify_error(error_text: str) -> str
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `error_text` | `str` | Raw error output |
-
-**Returns:** One of: `"timeout"`, `"file_not_found"`, `"permission"`, `"syntax"`, `"import"`, `"test_failure"`, `"unknown"` (inferred from tests).
 
 ---
 
-### Agent Episodes (Reinforcement Learning Memory)
+### Loop Detection — `LoopDetector` class
 
-#### Record an Episode
+Detects when agents are stuck in repetitive loops.
 
-```python
-def record_agent_episode(
-    task: dict, result: str, outcome: str,
-    role: str, output: str
-) -> None
-```
+#### `LoopDetector(warn_threshold=3, terminate_threshold=5)` (inferred)
 
-| Parameter | Type | Description |
-|---|---|---|
-| `task` | `dict` | Task object |
-| `result` | `str` | Agent result text |
-| `outcome` | `str` | Success/failure outcome |
-| `role` | `str` | Agent role |
-| `output` | `str` | Full agent output |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `warn_threshold` | `int` | `3` (inferred) | Consecutive identical fingerprints before warning |
+| `terminate_threshold` | `int` | `5` (inferred) | Consecutive identical fingerprints before termination |
 
-#### Get Relevant Episodes for Injection
+#### `record(result)` → `str`
 
-```python
-def get_relevant_episodes(
-    role: str, project_id: int = None,
-    limit: int = 5
-) -> list[dict]  # (inferred signature)
-```
+Record a tool result and return loop status.
 
-Episodes are filtered by Q-value and optionally by project, with cross-project fallback (inferred from tests).
+**Returns:** One of `"ok"`, `"warn"`, or `"terminate"`.
 
-#### Format Episodes for Injection
+#### `warning_message()` → `str`
 
-```python
-def format_episodes_for_injection(episodes: list[dict]) -> str
-```
+Human-readable warning message when a loop is detected.
 
-**Returns:** Formatted string for system prompt injection.
+#### `termination_summary()` → `str`
 
-#### Update Q-Values
+Human-readable summary when a loop triggers termination.
 
-```python
-def update_episode_q_values(
-    injected_episode_ids: list[int],
-    task_succeeded: bool
-) -> None
-```
+---
+
+### Lesson Injection System
+
+#### `get_relevant_lessons(role, error_type, limit)` — `forgesmith.py`
+
+Retrieve lessons learned from past agent runs.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `injected_episode_ids` | `list[int]` | Episode IDs that were injected into the prompt |
+| `role` | `str` | Agent role to filter lessons for |
+| `error_type` | `str` | Error category to match (optional) |
+| `limit` | `int` | Maximum number of lessons to return |
+
+**Returns:** `list[dict]` — Relevant lessons sorted by relevance.
+
+#### `format_lessons_for_injection(lessons)` — `forge_orchestrator.py`
+
+Format lessons into a prompt-injectable string wrapped in `<task_input>` tags.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `lessons` | `list[dict]` | Lessons from `get_relevant_lessons()` |
+
+**Returns:** `str` — Sanitized, formatted lessons text.
+
+---
+
+### Episode Memory System
+
+#### `format_episodes_for_injection(episodes)` — `forge_orchestrator.py`
+
+Format past agent episodes for injection into agent context.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `episodes` | `list[dict]` | Episode records from the database |
+
+**Returns:** `str` — Formatted episode context.
+
+#### `update_episode_q_values(injected_episode_ids, task_succeeded)` — `forge_orchestrator.py`
+
+Update Q-values for episodes that were injected into a task's context, based on whether the task succeeded.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `injected_episode_ids` | `list[int]` | IDs of episodes that were injected |
 | `task_succeeded` | `bool` | Whether the task using these episodes succeeded |
 
-Q-values are bounded (inferred from tests) and updated based on task outcome.
+---
+
+### Lesson Sanitizer — `lesson_sanitizer.py`
+
+Security layer that sanitizes lessons before injection into agent prompts.
+
+#### `sanitize_lesson_content(text)` → `str`
+
+Strips XML injection tags, role override phrases, base64 payloads, ANSI escapes, dangerous code blocks, and enforces length limits.
+
+#### `validate_lesson_structure(text)` → `bool`
+
+Returns `True` if the lesson text has a valid structure for injection.
+
+#### `wrap_lessons_in_task_input(lessons_text)` → `str`
+
+Wraps sanitized lessons in `<task_input>` tags for safe prompt injection.
 
 ---
 
-### Lessons Learned System
+### Rubric Quality Scoring — `rubric_quality_scorer.py`
 
-#### Get Relevant Lessons
+#### `score_agent_output(result_text, files_changed, role)` → `dict`
 
-```python
-def get_relevant_lessons(
-    role: str, error_type: str = None,
-    limit: int = 5
-) -> list[dict]
-```
+Score agent output across five quality dimensions.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `role` | `str` | Agent role to find lessons for |
-| `error_type` | `str \| None` | Optional error type filter |
-| `limit` | `int` | Maximum lessons to return |
+| `result_text` | `str` | Raw agent output text |
+| `files_changed` | `list[str]` | List of files modified by the agent |
+| `role` | `str` | Agent role (`"developer"`, `"tester"`, `"security_reviewer"`) |
 
-**Returns:** List of active lesson dicts, filtered by role and optionally error type.
+**Returns:**
 
-#### Format Lessons for Injection
-
-```python
-def format_lessons_for_injection(lessons: list[dict]) -> str
+```json
+{
+  "total_score": 35,
+  "normalized_score": 0.7,
+  "max_possible": 50,
+  "dimensions": {
+    "naming_consistency": 7,
+    "code_structure": 8,
+    "test_coverage": 6,
+    "documentation": 7,
+    "error_handling": 7
+  },
+  "details": {
+    "matched_patterns": ["..."]
+  }
+}
 ```
 
-**Returns:** Formatted string for system prompt injection.
-
-#### Update Lesson Injection Count
-
-```python
-def update_lesson_injection_count(lesson_ids: list[int]) -> None
-```
-
-Tracks how many times each lesson has been injected.
+**(inferred)** All five dimensions score 0–10, max possible is 50.
 
 ---
 
-### Loop Detection
+### SARIF Helpers — `skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py`
 
-The `LoopDetector` class prevents agents from getting stuck in repetitive behavior.
+Utility library for parsing and analyzing SARIF (Static Analysis Results Interchange Format) files.
 
-```python
-class LoopDetector:
-    def __init__(self, warn_threshold: int = 3, terminate_threshold: int = 5):
-        ...
+#### Key Functions
 
-    def record(self, result: dict) -> str:
-        """Returns 'ok', 'warn', or 'terminate'"""
-
-    def warning_message(self) -> str:
-        """Human-readable warning about detected loop"""
-
-    def termination_summary(self) -> str:
-        """Summary when terminating due to loop"""
-```
-
-| Method | Returns | Description |
-|---|---|---|
-| `record(result)` | `"ok"` \| `"warn"` \| `"terminate"` | Record a tool result and check for loops |
-| `warning_message()` | `str` | Warning text when loop detected |
-| `termination_summary()` | `str` | Summary text when loop causes termination |
-
-The detector fingerprints results, tracks repeated identical fingerprints, and resets when files change (inferred from tests).
+| Function | Description |
+|---|---|
+| `load_sarif(path)` | Load a SARIF file from disk |
+| `save_sarif(sarif, path, indent)` | Write SARIF data to disk |
+| `extract_findings(sarif)` | Extract all findings as `Finding` objects |
+| `filter_by_level(findings, *levels)` | Filter findings by severity level |
+| `filter_by_file(findings, pattern)` | Filter findings by file path pattern |
+| `filter_by_rule(findings, *rule_ids)` | Filter findings by rule ID |
+| `group_by_file(findings)` | Group findings by file path |
+| `group_by_rule(findings)` | Group findings by rule ID |
+| `deduplicate(findings)` | Remove duplicate findings by fingerprint |
+| `merge_sarif_files(*paths)` | Merge multiple SARIF files into one |
+| `summary(findings)` | Generate a summary string of findings |
+| `to_csv_rows(findings)` | Convert findings to CSV-compatible rows |
 
 ---
 
-### Early Termination
+### Ollama Agent — `ollama_agent.py`
 
-```python
-# Constants (inferred from tests)
-STUCK_PHRASES: list[str]  # Non-empty list of phrases indicating stuck agents
-EXEMPT_ROLES: set[str]    # Roles exempt from early termination
-```
+Local agent interface for Ollama-hosted models with sandboxed tool execution.
 
-#### Detect Stuck Phrases
+#### `ollama_chat(base_url, model, messages, tools, timeout)`
 
-```python
-def detect_stuck_phrases(text: str) -> str | None  # (inferred)
-```
-
-Case-insensitive detection. Returns the matched phrase or `None`.
-
-#### Detect Repeated Tools
-
-```python
-def detect_repeated_tools(
-    history: list, window: int = 4
-) -> bool  # (inferred)
-```
-
-Detects when the last N tool calls are identical.
-
----
-
-### Ollama Integration (Local LLM Client)
-
-#### Health Check
-
-```python
-def check_ollama_health(base_url: str) -> bool
-```
+Send a chat completion request to a local Ollama instance.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `base_url` | `str` | Ollama server URL (e.g., `http://localhost:11434`) |
+| `model` | `str` | Model name (e.g., `qwen2.5-coder:32b`) |
+| `messages` | `list[dict]` | Conversation messages |
+| `tools` | `list[dict]` | Tool definitions |
+| `timeout` | `int` | Request timeout in seconds |
 
-**Returns:** `True` if Ollama is responsive.
+#### `check_ollama_health(base_url)` → `bool`
 
-#### List Models
+Check if the Ollama server is reachable.
 
-```python
-def list_ollama_models(base_url: str) -> list
-```
+#### `list_ollama_models(base_url)` → `list`
 
-**Returns:** List of available models on the Ollama server.
+List available models on the Ollama server.
 
-#### Chat Completion
-
-```python
-def ollama_chat(
-    base_url: str, model: str, messages: list,
-    tools: list = None, timeout: int = None
-) -> dict
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `base_url` | `str` | Ollama server URL |
-| `model` | `str` | Model name |
-| `messages` | `list` | Chat messages in OpenAI format (inferred) |
-| `tools` | `list \| None` | Tool definitions for function calling (inferred) |
-| `timeout` | `int \| None` | Request timeout in seconds |
-
-**Returns:** Chat completion response dict (inferred).
-
----
-
-### File Operations (Sandboxed)
-
-All file operations in `ollama_agent.py` are sandboxed to a project directory.
-
-```python
-def safe_path(project_dir: str, relative_path: str) -> str
-```
-
-Validates that the resolved path stays within `project_dir`.
+#### Sandboxed Tool Execution
 
 | Function | Description |
 |---|---|
-| `exec_read_file(project_dir, args)` | Read a file's contents |
+| `exec_read_file(project_dir, args)` | Read a file within the project sandbox |
 | `exec_list_directory(project_dir, args)` | List directory contents |
-| `exec_search_files(project_dir, args)` | Search for files by pattern |
-| `exec_grep(project_dir, args)` | Grep for text in files |
-| `exec_bash(project_dir, args, allow_write)` | Execute a bash command |
-| `exec_write_file(project_dir, args)` | Write content to a file |
-| `exec_edit_file(project_dir, args)` | Edit a file with patches |
+| `exec_search_files(project_dir, args)` | Search for files by name |
+| `exec_grep(project_dir, args)` | Search file contents |
+| `exec_bash(project_dir, args, allow_write)` | Execute bash commands (with write protection) |
+| `exec_write_file(project_dir, args)` | Write a file (sandboxed) |
+| `exec_edit_file(project_dir, args)` | Edit a file (sandboxed) |
 
-```python
-def is_safe_read_command(command: str) -> bool
-def is_blocked_command(command: str) -> bool
-```
+All file operations are sandboxed via `safe_path()` which prevents directory traversal. Write commands are validated via `is_blocked_command()`.
 
 ---
 
-### Rubric Scoring
+## Database Schema (Key Tables — Inferred)
 
-```python
-def compute_rubric_score(run: dict, cfg: dict) -> dict
-```
+The SQLite database (30+ tables) serves as the central state store. Key tables include:
 
-| Parameter | Type | Description |
-|---|---|---|
-| `run` | `dict` | Agent run data |
-| `cfg` | `dict` | Configuration with rubric definitions |
-
-**Returns:** Scored rubric dict (inferred).
-
-```python
-def score_completed_runs(runs: list, cfg: dict) -> list
-def analyze_rubric_correlations(cfg: dict) -> dict
-def evolve_rubric_weights(cfg: dict) -> None
-def get_rubric_report(role: str, limit: int) -> dict
-```
-
----
-
-### SIMBA Rules Engine
-
-```python
-def find_high_variance_episodes(lookback_days: int) -> list
-def find_hardest_cases(lookback_days: int) -> list
-def get_existing_simba_rules(role: str = None) -> list
-def build_simba_prompt(role, successes, failures, hardest_cases, existing_rules) -> str
-def call_claude_for_rules(prompt: str, cfg: dict) -> list
-def validate_rule(rule: dict, existing_rules: list) -> tuple  # (inferred)
-def store_rules(role: str, rules: list, dry_run: bool) -> None
-def evaluate_simba_rules() -> dict
-def prune_stale_rules(dry_run: bool) -> None
-def run_simba(cfg: dict, dry_run: bool, role_filter: str = None) -> dict
-```
-
-#### Rule Validation
-
-Rules are validated for:
-- Minimum and maximum length (inferred)
-- Valid error types (inferred)
-- Non-empty content (inferred)
-- Duplicate detection via similarity checking (inferred)
-- Must be a `dict` type (inferred)
-
----
-
-### SARIF Security Helpers
-
-Utility library for parsing SARIF (Static Analysis Results Interchange Format) files.
-
-```python
-from sarif_helpers import *
-```
-
-#### Loading & Saving
-
-```python
-def load_sarif(path: str) -> dict
-def save_sarif(sarif: dict, path: str, indent: int = 2) -> None
-```
-
-#### Querying Findings
-
-```python
-def extract_findings(sarif: dict) -> list[Finding]
-def filter_by_level(findings: list, *levels: str) -> list
-def filter_by_file(findings: list, pattern: str) -> list
-def filter_by_rule(findings: list, *rule_ids: str) -> list
-def sort_by_severity(findings: list, reverse: bool = True) -> list
-```
-
-#### Grouping & Counting
-
-```python
-def group_by_file(findings: list) -> dict[str, list]
-def group_by_rule(findings: list) -> dict[str, list]
-def count_by_level(findings: list) -> dict[str, int]
-def count_by_rule(findings: list) -> dict[str, int]
-```
-
-#### Deduplication & Merging
-
-```python
-def deduplicate(findings: list) -> list
-def merge_sarif_files(*paths: str) -> dict
-def compute_fingerprint(result: dict, include_message: bool = False) -> str
-```
-
-#### Export
-
-```python
-def to_csv_rows(findings: list) -> list[list]
-def summary(findings: list) -> str
-```
-
----
-
-### Database Migration
-
-```python
-def run_migrations(db_path: str, silent: bool = False) -> None
-```
-
-| Migration | Description |
+| Table | Purpose (inferred) |
 |---|---|
-| `v0 → v1` | Initial schema setup (inferred) |
-| `v1 → v2` | Schema additions (inferred) |
-| `v2 → v3` | Latest schema changes (inferred) |
+| `tasks` | Task definitions, status, assignments |
+| `projects` | Project metadata and configuration |
+| `agent_episodes` | Historical agent run data with Q-values |
+| `agent_lessons` | Lessons learned from past runs |
+| `agent_messages` | Inter-agent communication messages |
+| `agent_actions` | Logged agent tool invocations |
+| `rubric_scores` | Quality scores for agent outputs |
+| `simba_rules` | SIMBA-generated behavioral rules |
+| `forgesmith_changes` | Configuration change history |
+| `forgesmith_runs` | Forgesmith analysis run logs |
+| `schema_migrations` | Database migration tracking |
+| `prompt_versions` | Prompt evolution history (inferred) |
 
-Migrations are tracked in a `schema_migrations` table. Database is automatically backed up before migration.
+Database migrations are managed by `db_migrate.py` and progress through versions v0 → v1 → v2 → v3 → v4.
 
 ---
 
 ## Error Handling
 
-### Error Classification
+### Agent Error Classification
 
-The system classifies errors into known categories for pattern analysis:
+Errors from agent runs are classified into categories:
 
-| Category | Trigger Pattern (inferred) |
+| Category | Pattern (inferred) |
 |---|---|
-| `timeout` | Timeout-related errors |
-| `file_not_found` | Missing file errors |
+| `timeout` | Command exceeded time limit |
+| `file_not_found` | Referenced file does not exist |
 | `permission` | Permission denied errors |
-| `syntax` | Syntax errors in code |
-| `import` | Import/module errors |
-| `test_failure` | Test assertion failures |
-| `unknown` | All other errors |
+| `syntax` | Syntax errors in generated code |
+| `import` | Missing module/import errors |
+| `test_failure` | Test assertions failed |
+| `unknown` | Unclassifiable errors |
 
-### Loop Detection States
+### Early Termination Conditions
 
-| State | Meaning |
+The orchestrator terminates agent runs when:
+
+| Condition | Behavior |
 |---|---|
-| `ok` | No loop detected, continue normally |
-| `warn` | Potential loop detected (default: 3 identical fingerprints), warning injected |
-| `terminate` | Confirmed loop (default: 5 identical fingerprints), agent is terminated |
+| **Consecutive loop** | Same tool fingerprint repeated N times → warn then terminate |
+| **Alternating pattern** | Two-tool alternation detected at 6 cycles → terminate |
+| **Monologue detection** | 3+ consecutive text-only responses (no tool use) → terminate |
+| **Stuck phrases** | Known stuck phrases detected in output (case-insensitive) |
+| **Cost breaker** | Cumulative cost exceeds limit (scales with complexity) |
+| **Budget exhaustion** | Turn count exceeds max_turns with periodic warnings |
 
-Warning is issued only once per loop. Counter resets when files change (new files modified) or when a different fingerprint is recorded.
+### Budget Awareness Messages (inferred)
 
-### Agent Retry Strategy
-
-```python
-async def run_agent_with_retries(
-    cmd: str, task: dict, max_retries: int
-) -> str
-```
-
-Agents are retried with checkpoint recovery on failure. Checkpoints save intermediate state:
-
-```python
-def save_checkpoint(task_id, attempt, output_text, role) -> None
-def load_checkpoint(task_id, role) -> str | None
-def clear_checkpoints(task_id, role) -> None
-```
-
----
-
-## Database Schema
-
-The SQLite database contains the following tables (inferred from code):
-
-| Table | Purpose |
+| Trigger | Message Type |
 |---|---|
-| `tasks` | Task definitions, status, and metadata |
-| `projects` | Project information and directories |
-| `agent_episodes` | Reinforcement learning memory with Q-values |
-| `agent_messages` | Inter-agent communication |
-| `agent_actions` | Telemetry and action logging |
-| `lessons` | Extracted lessons with injection tracking |
-| `rubric_scores` | Performance scoring results |
-| `rubric_evolution` | Rubric weight evolution history (inferred) |
-| `schema_migrations` | Migration tracking |
-| `simba_rules` | SIMBA-generated rules (inferred) |
-| `forgesmith_runs` | Self-improvement run history (inferred) |
-| `prompt_versions` | GEPA prompt evolution history (inferred) |
+| Periodic interval | Remaining turns notification |
+| 50% turns used | Halfway warning |
+| ~80%+ turns used | Critical warning |
 
 ---
 
 ## Configuration
 
-Configuration is loaded from a config file (inferred):
-
-```python
-def load_config() -> dict   # forgesmith.py
-def load_config() -> dict   # forge_orchestrator.py
-```
-
 ### Dispatch Configuration
 
-```python
-def load_dispatch_config(filepath: str) -> dict
-```
+Loaded via `load_dispatch_config(filepath)`. Controls:
 
-Controls how tasks are dispatched across projects, including:
-- Provider selection per role (inferred)
-- Model selection per role (inferred)
-- Task type routing with role-specific prompts (inferred from tests)
-- Ollama base URL configuration (inferred)
+- Per-role model selection
+- Per-role turn limits
+- Provider selection (Claude API vs Ollama)
+- Task type routing and prompts
+- Cost limits per complexity tier
+- Concurrency settings
+
+### Forgesmith Configuration
+
+Loaded via `load_config()`. Controls:
+
+- Lookback windows for analysis
+- Thresholds for change proposals
+- Rubric definitions and weights
+- SIMBA/GEPA parameters
+- Backup retention settings
 
 ---
 
-## Adding API Endpoints
+## Adding HTTP API Endpoints
 
-This project currently operates as a CLI toolkit. To add HTTP API endpoints, consider:
+This project currently has **no HTTP API endpoints**. If you need to expose Pombal's functionality via a web API, consider:
 
-1. **FastAPI wrapper**: Create `api.py` with FastAPI routes wrapping existing functions
+1. **FastAPI wrapper**: Create a `forge_api.py` that wraps the orchestrator and database functions:
    ```python
    from fastapi import FastAPI
    app = FastAPI()
-
+   
    @app.get("/tasks/{task_id}")
    async def get_task(task_id: int):
        return fetch_task(task_id)
-
+   
    @app.post("/tasks/{task_id}/dispatch")
-   async def dispatch(task_id: int):
-       # Wrap dispatch logic
+   async def dispatch_task(task_id: int):
+       # Trigger orchestrator for this task
        ...
    ```
 
-2. **MCP Server**: The project already references MCP configuration (`step_generate_mcp_config`), suggesting Model Context Protocol integration is planned or available.
+2. **MCP Server**: The project already generates MCP configuration via `step_generate_mcp_config()` in `pombal_setup.py`, suggesting Model Context Protocol integration is a supported pattern.
 
-3. **Dashboard API**: `forge_dashboard.py` contains query functions that could be exposed as read-only endpoints.
+3. **SQLite direct access**: For read-only dashboards, query the SQLite database directly using the schema documented above.
 ---
 
 ## Related Documentation

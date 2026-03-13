@@ -1,350 +1,265 @@
+# Project Pombal
+
+## Table of Contents
+
+- [Project Pombal](#project-pombal)
+  - [What is this?](#what-is-this)
+  - [Quick Start](#quick-start)
+  - [How to Use](#how-to-use)
+    - [Describe your goal](#describe-your-goal)
+    - [Dispatch agents](#dispatch-agents)
+- [Dispatch a single task](#dispatch-a-single-task)
+- [Auto-dispatch across all projects](#auto-dispatch-across-all-projects)
+- [Run multiple tasks in parallel](#run-multiple-tasks-in-parallel)
+    - [Monitor progress](#monitor-progress)
+    - [Review the nightly report](#review-the-nightly-report)
+    - [Analyze performance](#analyze-performance)
+    - [Let the system improve itself](#let-the-system-improve-itself)
+- [Full analysis + changes](#full-analysis-changes)
+- [Dry run (see what it would change)](#dry-run-see-what-it-would-change)
+- [Just generate a report](#just-generate-a-report)
+  - [Features](#features)
+  - [Installation](#installation)
+    - [Prerequisites](#prerequisites)
+    - [Detailed Setup](#detailed-setup)
+    - [Database Migrations](#database-migrations)
+  - [Configuration](#configuration)
+    - [`forge_config.json`](#forge_configjson)
+    - [`dispatch_config.json`](#dispatch_configjson)
+    - [Forgesmith Configuration](#forgesmith-configuration)
+  - [Tech Stack](#tech-stack)
+  - [License](#license)
+  - [Related Documentation](#related-documentation)
+
+**Tell Claude what you want built. Agents do the rest.**
+
 <p align="center">
   <img src="ProjectPombal.png" alt="Project Pombal" width="200">
 </p>
 
-<h1 align="center">Project Pombal</h1>
-
-<p align="center">
-  <strong>Tell Claude what you want built. Agents do the rest.</strong>
-</p>
-
-<p align="center">
-  <em>Coordinate. Build. Ship.</em>
-</p>
-
-<p align="center">
-  <em>Named after the <a href="https://en.wikipedia.org/wiki/Marquis_of_Pombal">Marquis de Pombal</a>, who coordinated the rebuilding of Lisbon after the 1755 earthquake</em>
-</p>
-
----
+*Named after the [Marquis de Pombal](https://en.wikipedia.org/wiki/Marquis_of_Pombal), who coordinated the rebuilding of Lisbon after the 1755 earthquake.*
 
 ## What is this?
 
-Project Pombal is an AI-powered development team you control through conversation. You talk to Claude in plain English. Claude manages everything else — planning, task creation, agent dispatch, progress tracking, error recovery, and reporting.
+Project Pombal is a multi-agent AI orchestration platform. You describe what you want built in plain English, and Pombal coordinates a team of AI agents — developers, testers, and security reviewers — to actually build it. It handles task creation, dispatching work to agents, tracking progress, recovering from errors, and learning from past results to get better over time.
 
-No CLI commands to memorize. No task IDs to look up. No SQL to write. You make decisions. Claude handles execution.
-
----
-
-## See It in Action
-
-### Simple Feature
-
-```
-You: "Add a dark mode toggle to the settings page"
-
-Claude: I'll create a task for that. Let me check your project structure...
-
-[Reads your codebase, finds Settings.tsx]
-[Creates task in DB: "Add dark mode toggle to settings page"]
-[Dispatches developer agent]
-[Developer writes the code, creates tests]
-[Tester validates]
-
-Claude: Done. Dark mode toggle added to src/components/Settings.tsx.
-Uses your existing theme context. Toggle persists to localStorage.
-All 3 tests passing.
-```
-
-One sentence from you. Full implementation with tests.
-
-### Multi-Step Feature
-
-```
-You: "Build me user authentication with Google OAuth"
-
-Claude: That's a multi-step feature. Let me plan it out:
-
-  1. Set up OAuth provider configuration
-  2. Create login/callback routes
-  3. Add session management middleware
-  4. Build the login UI component
-  5. Write integration tests
-
-[Creates 5 tasks in DB with proper descriptions]
-[Tasks 1-3 run in parallel — no dependencies]
-[Task 4 waits for task 2 — needs the routes]
-[Task 5 waits for all — needs everything wired up]
-
-Claude: All 5 tasks complete.
-- OAuth config in src/config/auth.ts
-- Routes at /auth/google and /auth/callback
-- Session middleware using signed cookies
-- Login button component with Google branding
-- 8 integration tests, all passing
-
-Want me to run a security review on the auth flow?
-```
-
-Claude identified the dependencies automatically. Independent tasks ran in parallel.
-
-### Bug Fix
-
-```
-You: "Users are getting 500 errors on the checkout page"
-
-Claude: Let me investigate. I'll start with a debugger task...
-
-[Dispatches debugger agent]
-[Debugger analyzes error logs, traces the stack, finds root cause]
-
-Claude: Found it. Null pointer in calculateTotal() when the cart has a
-discounted item with no original price. Creating a fix task...
-
-[Dispatches developer agent]
-[Developer fixes the bug, adds edge case tests]
-[Tester validates the fix]
-
-Claude: Fixed. The issue was in src/utils/cart.ts line 47.
-Added null check for originalPrice. 4 new test cases covering
-discount edge cases. All passing.
-```
-
-Debug, fix, and test — all from one sentence.
-
-### Security Review
-
-```
-You: "Review the auth module for security issues"
-
-Claude: I'll dispatch a security reviewer.
-
-[Dispatches security-reviewer with Trail of Bits tooling]
-
-Claude: Security review complete. 2 findings:
-
-  MEDIUM: Session tokens not rotated after privilege escalation
-  LOW: CSRF token missing on the logout endpoint
-
-Want me to create fix tasks for these?
-```
-
-### Project Management
-
-```
-You: "What's the status of our Loom project?"
-
-Claude: Here's where Loom stands:
-  - 12 tasks done, 3 in progress, 2 blocked
-  - Last session: implemented world generation system
-  - Open question: how to handle offline save conflicts
-  - Next steps: integrate quest engine with dialogue system
-```
-
-```
-You: "What tasks are outstanding across all projects?"
-
-Claude: [queries database, groups by project and priority]
-
-  TorqueDesk (3 high priority):
-    - Implement invoice re-open workflow
-    - Add tech time tracking with punch in/out
-    ...
-```
-
-You never look up a task ID. You never write SQL. You just ask.
-
-### Persistent Memory
-
-The system doesn't just do work — it remembers what happened and gets smarter over time.
-
-```
-You: "What lessons have we learned from failed security reviews on Loom?"
-
-Claude: 3 lessons extracted from Loom security failures:
-
-  1. Always validate JWT expiry server-side — client-side checks
-     were bypassed in task #87 (injected into 12 future runs)
-  2. Rate-limit auth endpoints before deploying — missed in tasks
-     #91 and #103 (injected into 8 future runs)
-  3. Sanitize user input in GraphQL resolvers — XSS found twice
-     in the quest engine (injected into 5 future runs)
-
-These lessons are automatically injected into future developer
-and security reviewer prompts for Loom.
-```
-
-Every agent run, every test result, every lesson learned — stored in a 30-table SQLite database that agents query automatically. The system builds institutional knowledge about *your* projects.
-
----
-
-## How It Works
-
-```
-You describe what you want
-        |
-        v
-Claude breaks it into tasks
-        |
-        v
-Claude dispatches specialized agents
-        |
-        v
-Agents do the work (dev → test → security review)
-        |
-        v
-Claude reports results and handles failures
-```
-
-### The Agent Roster
-
-Claude picks the right agent automatically, but you can request specific ones:
-
-| Role | What It Does |
-|------|-------------|
-| **Developer** | Writes code. Your bread and butter. |
-| **Tester** | Writes and runs tests. Validates everything. |
-| **Debugger** | Investigates bugs, traces issues, finds root causes. |
-| **Security Reviewer** | Deep audit with Trail of Bits tooling (Semgrep, CodeQL). |
-| **Code Reviewer** | Quality, patterns, best practices. |
-| **Planner** | Breaks complex features into task lists. |
-| **Frontend Designer** | UI/UX focused development. |
-| **Evaluator** | Assesses implementations against requirements. |
-| **Integration Tester** | Tests how components work together. |
-
-"Run a security review on the payment module" — Claude dispatches the right agent with the right tools. You don't need to know which CLI flags to pass.
-
----
+It's for developers who want to use AI agents as a real workforce: plan a project, break it into tasks, and let agents execute while you review.
 
 ## Quick Start
 
-**1. Run the guided installer:**
+1. **Clone the repo**
+   ```bash
+   git clone https://github.com/your-org/ProjectPombal.git
+   cd ProjectPombal
+   ```
+
+2. **Run the setup wizard**
+   ```bash
+   python pombal_setup.py
+   ```
+   This walks you through prerequisites, database creation, config generation, and optional components. No pip installs needed — it's pure Python stdlib.
+
+3. **Create your first project and tasks** using Claude or by inserting rows into the SQLite database directly.
+
+4. **Dispatch work to agents**
+   ```bash
+   python forge_orchestrator.py --dispatch
+   ```
+
+5. **Check progress**
+   ```bash
+   python forge_dashboard.py
+   ```
+
+## How to Use
+
+### Describe your goal
+Tell Claude what you want in plain English. Pombal breaks your goal into discrete tasks with priorities, complexity estimates, and role assignments (developer, tester, security reviewer).
+
+### Dispatch agents
+Run the orchestrator to send tasks to AI agents. Pombal picks the right agent role for each task, manages retries, detects when agents get stuck in loops, and terminates unproductive runs early.
+
 ```bash
-python pombal_setup.py
+# Dispatch a single task
+python forge_orchestrator.py --task-id 42
+
+# Auto-dispatch across all projects
+python forge_orchestrator.py --dispatch
+
+# Run multiple tasks in parallel
+python forge_orchestrator.py --parallel-tasks 10,11,12
 ```
 
-**2. The installer handles everything:** prerequisites, database, config, MCP integration. Just answer the prompts.
+### Monitor progress
+The dashboard gives you a snapshot of task status, project completion, blocked work, and session activity.
 
-**3. Open Claude Code in your Project Pombal directory and start talking:**
 ```bash
-cd ~/Project Pombal
-claude
+python forge_dashboard.py
 ```
 
-> "Show me all active projects"
->
-> "Add a new project called MyApp with the code at ~/myapp"
->
-> "Create a task for MyApp: set up the database schema"
->
-> "Work on that task"
+### Review the nightly report
+Get a portfolio-level summary of what happened today, what's blocked, and what needs attention.
 
-That's it. Claude knows the database, the orchestrator, and the config. Just tell it what you want.
+```bash
+python nightly_review.py
+```
 
----
+### Analyze performance
+Deep-dive into completion rates, throughput, complexity breakdowns, and agent effectiveness.
 
-## Tips for Best Results
+```bash
+python analyze_performance.py
+```
 
-**Be specific about what you want.**
-- Good: "Add Google OAuth login with session cookies"
-- Bad: "Add auth"
+### Let the system improve itself
+**Forgesmith** is Pombal's self-improvement engine. It analyzes agent runs, extracts lessons from failures, tunes configuration, evolves prompts, and prunes what doesn't work.
 
-**Mention the tech stack when it matters.**
-- Good: "Add rate limiting using Express middleware and Redis"
-- Bad: "Add rate limiting"
+```bash
+# Full analysis + changes
+python forgesmith.py --full
 
-**Let Claude plan big features.** For anything with 2+ moving parts, describe the end goal. Claude will break it down better than manual task creation because it can read your codebase and understand what already exists.
+# Dry run (see what it would change)
+python forgesmith.py --full --dry-run
 
-**Ask for parallel work.** Mention independent tasks together. Claude will dispatch them simultaneously.
-
-**Give context when you have it.**
-- "The 500 error started after yesterday's deploy"
-- "It only happens when the user has a discount code"
-- "Match the existing Card pattern in the design system"
-
----
-
-## When to Skip the Agents
-
-Not everything needs a full agent pipeline. Use Claude Code directly for:
-
-- **Quick fixes** — Typos, one-liner changes. Just ask Claude to edit the file.
-- **Research** — "How does the auth flow work?" Claude reads the code and answers.
-- **Config changes** — Editing a config file doesn't need a dev-test loop.
-- **Database queries** — Claude queries the DB directly via MCP.
-
-Rule of thumb: if the change is under 5 lines and doesn't need testing, just do it directly.
-
----
+# Just generate a report
+python forgesmith.py --report
+```
 
 ## Features
 
-- **Conversational interface** — Talk to Claude in plain English. No commands, no task IDs.
-- **Autonomous dev-test loops** — Developer and tester iterate until the code works
-- **Per-role agent skills** — Specialized skills per role: codebase navigation, error recovery, systematic debugging, architecture review
-- **Git worktree isolation** — Parallel tasks run in isolated branches, merged on success, preserved on failure
-- **Post-task quality scoring** — 5-dimension quality scorer with role-specific weights
-- **Persistent project memory** — Agents learn from past successes and failures on *your* projects
-- **Self-improving prompts** — ForgeSmith evolves agent behavior based on real outcomes
-- **Failure classification** — Structured taxonomy for targeted improvements
-- **Change-impact analysis** — Blast-radius assessment before applying prompt mutations
-- **Security pipeline** — Trail of Bits tooling with auto-dispatch after dev-test
-- **Inter-agent messaging** — Agents share findings, blockers, and context across cycles
-- **Loop detection** — Catches stuck agents and terminates gracefully
-- **Multi-model support** — Claude Code, Ollama (local models), configurable per role
-- **Multi-tool MCP support** — Auto-configures Claude Code, Roo Code, Cline, Cursor, Windsurf, and Continue.dev
-- **Database migrations** — Schema evolves safely with automatic backups, zero data loss
-- **Zero pip dependencies** — Pure Python stdlib. Requires Python 3.10+, an MCP-compatible AI coding tool, git, and uvx
-
----
+- **Plain English task creation** — describe what you want, agents figure out how
+- **Multi-agent coordination** — developer, tester, and security reviewer agents work in cycles
+- **Smart loop detection** — detects when agents are stuck repeating themselves and terminates early
+- **Monologue detection** — catches agents that talk instead of acting
+- **Automatic retries with checkpoints** — agents resume from where they left off after failures
+- **Preflight build checks** — validates the project compiles before wasting agent turns
+- **Lessons learned database** — failures get recorded and injected into future runs so agents don't repeat mistakes
+- **Episode memory with Q-values** — past experiences are ranked by usefulness and surfaced to agents
+- **Self-evolving prompts (GEPA)** — Pombal automatically mutates and A/B tests agent prompts
+- **Autoresearch prompt optimization** — automated mutation loop that benchmarks prompt changes against real tasks, targeting per-role success rates
+- **Rule generation (SIMBA)** — analyzes failure patterns and generates reusable rules for agents
+- **Rubric-based quality scoring** — every agent output is scored on naming, structure, test coverage, documentation, and error handling
+- **Budget awareness** — agents get periodic reminders of remaining turns and cost limits
+- **Nightly portfolio review** — automated summary of progress, blockers, and stale work
+- **Inter-agent messaging** — agents can leave messages for each other across cycles
+- **Zero pip dependencies** — pure Python stdlib + SQLite. Nothing to install.
+- **Database migrations** — schema evolves safely with versioned migrations and automatic backups
+- **Local model support** — can use Ollama for local inference alongside Claude
+- **Arena mode** — run structured evaluation loops to benchmark agent configurations
+- **Training data export** — generate fine-tuning datasets from agent interactions
+- **Autoresearch benchmarking** — automated prompt optimization loop with per-role success tracking (6/7 roles at 100%)
 
 ## Installation
 
 ### Prerequisites
 
-| Tool | Install |
-|------|---------|
-| Python 3.10+ | [python.org](https://python.org) |
-| AI coding tool | Claude Code, Cursor, Roo Code, Cline, Windsurf, or Continue.dev |
-| git | [git-scm.com](https://git-scm.com) |
-| uvx / uv | [docs.astral.sh/uv](https://docs.astral.sh/uv) |
+- **Python 3.10+** (no pip packages needed)
+- **SQLite 3** (included with Python)
+- **Claude CLI** (`claude` command available in PATH) — or Ollama for local models
+- **Git** (for project management features)
+- **GitHub CLI** (`gh`) — optional, for repo setup automation
 
-### Guided Setup (Recommended)
+### Detailed Setup
+
+1. **Clone and enter the project:**
+   ```bash
+   git clone https://github.com/your-org/ProjectPombal.git
+   cd ProjectPombal
+   ```
+
+2. **Run the interactive setup:**
+   ```bash
+   python pombal_setup.py
+   ```
+   The wizard will:
+   - Check that prerequisites are installed
+   - Ask where to install (default: `~/.forge/`)
+   - Create and initialize the SQLite database (30+ tables)
+   - Copy core files to the install directory
+   - Generate `forge_config.json`, MCP config, and `CLAUDE.md`
+   - Optionally set up Forgesmith cron job, Sentinel monitoring, and ForgeBot
+
+3. **Verify the installation:**
+   ```bash
+   python forge_dashboard.py
+   ```
+
+4. **(Optional) Set up the Forgesmith cron for continuous improvement:**
+   The setup wizard offers this, or you can add it manually:
+   ```bash
+   # Run Forgesmith every 6 hours
+   0 */6 * * * cd /path/to/forge && python forgesmith.py --full >> /tmp/forgesmith.log 2>&1
+   ```
+
+### Database Migrations
+
+If upgrading from an earlier version:
 ```bash
-git clone <repo-url> project-pombal
-cd project-pombal
-python pombal_setup.py
+python db_migrate.py
 ```
+This automatically detects your current schema version, creates a backup, and applies migrations incrementally.
 
-The installer walks you through: prerequisites check, database creation, config generation, MCP integration, and optional components (Sentinel monitoring, ForgeBot Discord bot).
+## Configuration
 
-### Manual Setup
+### `forge_config.json`
+Generated by the setup wizard. Key settings:
 
-See [ORCHESTRATOR.md](ORCHESTRATOR.md) for manual installation and CLI usage.
+| Setting | Description |
+|---------|-------------|
+| `db_path` | Path to the SQLite database |
+| `project_dir` | Default working directory for agent operations |
+| `max_turns` | Default max turns per agent run |
+| `cost_limit` | Maximum cost per run (scales with task complexity) |
+| `parallel_limit` | Max concurrent agent dispatches |
 
+### `dispatch_config.json`
+Controls automatic dispatching behavior:
+
+| Setting | Description |
+|---------|-------------|
+| `provider` | Default AI provider (`claude` or `ollama`) per role |
+| `model` | Model to use per role |
+| `max_parallel` | Concurrency limit for auto-dispatch |
+| `filters` | Which projects/priorities to include |
+
+### Forgesmith Configuration
+Embedded in `forgesmith.py` config. Controls:
+- Lookback period for analysis
+- Change suppression (cooldown between similar changes)
+- GEPA prompt evolution parameters
+- SIMBA rule generation settings
+- Rubric scoring weights
+
+## Tech Stack
+
+- **Language:** Python 3.10+ (pure stdlib — zero dependencies)
+- **Database:** SQLite with 30+ table schema, versioned migrations
+- **AI Backend:** Claude CLI (primary), Ollama (local models)
+- **Self-improvement:** Forgesmith engine with GEPA (prompt evolution), SIMBA (rule generation), O-PRO (optimization proposals), Autoresearch (automated prompt benchmarking)
+- **Testing:** Custom test suite (no pytest dependency)
+- **Architecture:** Single-node orchestrator, async agent dispatch, checkpoint-based recovery
+
+## License
+
+See [LICENSE](LICENSE) for details.
 ---
 
-## Coordinator vs Manual Mode
+## Key Files
 
-| | Coordinator Mode | Manual Mode |
-|---|---|---|
-| **Task creation** | Claude does it | You write SQL or CLI commands |
-| **Dispatching** | Claude does it | You run orchestrator commands |
-| **Monitoring** | Claude does it | You check logs |
-| **Error recovery** | Claude does it | You diagnose and retry |
-| **Parallelism** | Claude figures out dependencies | You manage dependencies |
-| **Role selection** | Claude picks the right agent | You specify the role |
-
-Manual mode works and is fully documented in [ORCHESTRATOR.md](ORCHESTRATOR.md). But for most workflows, Coordinator Mode is faster, easier, and produces better results.
-
----
+| File | Purpose |
+|------|---------|
+| `forge_orchestrator.py` | Core orchestrator — task dispatch, agent management, dev-test loop |
+| `forgesmith.py` | Self-improvement engine (GEPA, SIMBA, lessons, rubrics) |
+| `autoresearch_loop.py` | Automated prompt optimization — mutates prompts via Opus, benchmarks against real tasks |
+| `autoresearch_prompts.py` | Prompt mutation generator — tiered LLM approach (Ollama/Sonnet/Opus) |
+| `dispatch_config.json` | Per-role model assignments, turn budgets, concurrency settings |
+| `forge_dashboard.py` | Terminal-based project/task dashboard |
+| `nightly_review.py` | Portfolio-level daily summary |
+| `pombal_setup.py` | Interactive setup wizard |
 
 ## Related Documentation
 
-| Doc | What's in it |
-|-----|-------------|
-| [Capabilities](CAPABILITIES.md) | Architecture deep dive, ForgeSmith, security pipeline, benchmarks |
-| [Orchestrator](ORCHESTRATOR.md) | CLI commands, flags, manual setup, advanced usage |
-| [Architecture](ARCHITECTURE.md) | System design, data flow, key decisions |
-| [Quick Start](QUICKSTART.md) | Step-by-step getting started guide |
-| [User Guide](USER_GUIDE.md) | Comprehensive usage documentation |
-| [Custom Agents](CUSTOM_AGENTS.md) | How to create your own agent roles |
-| [API Reference](API.md) | Module-level API documentation |
-
----
-
-<p align="center">
-  <strong>Built by Forgeborn</strong><br>
-  Vibe coded with Claude<br>
-  <em>&copy; 2026 Forgeborn</em>
-</p>
+- [Architecture](ARCHITECTURE.md)
+- [Api](API.md)
+- [Deployment](DEPLOYMENT.md)
+- [Contributing](CONTRIBUTING.md)

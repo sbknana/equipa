@@ -4,6 +4,15 @@ Train a local LLM that actually knows how to be an agent. Not a generic chatbot 
 
 ## Overview
 
+Project Pombal has two paths to better agent performance — and they complement each other:
+
+- **Prompt optimization (Autoresearch)** — Mutate and benchmark agent prompts until they hit target success rates. Zero training infrastructure. Works with any model. See [CAPABILITIES.md](CAPABILITIES.md#autoresearch-automated-prompt-optimization) for details.
+- **Weight optimization (QLoRA fine-tuning)** — Train a local model on successful agent executions. Requires GPU hardware. Produces a model that "thinks like an agent" from the start.
+
+Start with Autoresearch — it's free, fast, and got 6/7 roles to 100% success. Fine-tuning is for when you want to run agents on local hardware at zero API cost, or when you need performance beyond what prompt engineering can deliver.
+
+### The QLoRA Pipeline
+
 The pipeline is straightforward:
 
 1. **Forge Arena** generates training data by running agents on real tasks
