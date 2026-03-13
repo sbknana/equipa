@@ -129,6 +129,7 @@ python forgesmith.py --report
 
 - **Plain English task creation** — describe what you want, agents figure out how
 - **Multi-agent coordination** — developer, tester, and security reviewer agents work in cycles
+- **Security pipeline** — 7 Trail of Bits security skills (static analysis, variant analysis, audit context building, differential review, fix review, semgrep rule creation, sharp-edge detection) auto-dispatched after dev-test
 - **Smart loop detection** — detects when agents are stuck repeating themselves and terminates early
 - **Monologue detection** — catches agents that talk instead of acting
 - **Automatic retries with checkpoints** — agents resume from where they left off after failures

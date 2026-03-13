@@ -213,7 +213,7 @@ Claude picks the right agent automatically, but you can request specific ones:
 | **Developer** | Writes code. Your bread and butter. |
 | **Tester** | Writes and runs tests. Validates everything. |
 | **Debugger** | Investigates bugs, traces issues, finds root causes. |
-| **Security Reviewer** | Deep audit with Trail of Bits tooling (Semgrep, CodeQL). |
+| **Security Reviewer** | Deep audit with 7 Trail of Bits skills — static analysis, variant analysis, audit context building, differential review, fix validation, custom rule creation, and dangerous API detection. |
 | **Code Reviewer** | Quality, patterns, best practices. |
 | **Planner** | Breaks complex features into task lists. |
 | **Frontend Designer** | UI/UX focused development. |
@@ -296,7 +296,7 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 - **Self-improving prompts** — ForgeSmith evolves agent behavior based on real outcomes
 - **Failure classification** — Structured taxonomy for targeted improvements (analysis paralysis, build failure, etc.)
 - **Change-impact analysis** — Blast-radius assessment before applying prompt mutations
-- **Security pipeline** — Trail of Bits tooling with auto-dispatch after dev-test
+- **Security pipeline** — 7 Trail of Bits security skills: static analysis (Semgrep + CodeQL), audit context building, variant analysis, differential review, fix review, semgrep rule creation, and sharp-edge detection. Auto-dispatched after dev-test cycles.
 - **Inter-agent messaging** — Agents share findings, blockers, and context across cycles
 - **Loop detection** — Catches stuck agents and terminates gracefully
 - **Multi-model support** — Claude Code, Ollama (local models), configurable per role
