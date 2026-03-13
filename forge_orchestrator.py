@@ -2899,10 +2899,10 @@ async def run_agent_streaming(cmd, role="developer", timeout=None, output=None,
             try:
                 line_bytes = await asyncio.wait_for(
                     process.stdout.readline(),
-                    timeout=min(remaining, 300),  # per-line wait (300s for compiles/large writes)
+                    timeout=min(remaining, 600),  # per-line wait (600s for large writes, bumped from 300)
                 )
             except asyncio.TimeoutError:
-                early_term_reason = f"No output for 300s (overall timeout: {effective_timeout}s)"
+                early_term_reason = f"No output for 600s (overall timeout: {effective_timeout}s)"
                 break
 
             if not line_bytes:
@@ -6163,31 +6163,18 @@ async def run_parallel_tasks(task_ids, args):
             )
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
+            # Record telemetry (was missing from parallel path)
+            task_role = task.get("role") or "developer"
+            record_agent_run(
+                task, result, outcome, role=task_role,
+                model=get_role_model(task_role, args, task=task),
+                max_turns=get_role_turns(task_role, args, task=task),
+                cycle_number=cycles, output=output,
+            )
 
-            # Merge worktree changes back to main branch
+            # Mark for post-gather sequential merge (avoid parallel merge conflicts)
             merge_ok = False
-            if task["id"] in worktree_dirs and outcome in ("tests_passed", "no_tests"):
-                try:
-                    wt_path = worktree_dirs[task["id"]]
-                    branch_name = f"forge-task-{task['id']}"
-                    # Merge the task branch back into the main branch
-                    merge_result = subprocess.run(
-                        ["git", "merge", "--no-edit", branch_name],
-                        cwd=project_dir, capture_output=True, text=True,
-                    )
-                    if merge_result.returncode == 0:
-                        log(f"  [Isolation] Merged task #{task['id']} changes back to main", output)
-                        merge_ok = True
-                    else:
-                        log(f"  [Isolation] Merge FAILED for task #{task['id']}: "
-                            f"{merge_result.stderr[:200]}", output)
-                        log(f"  [Isolation] Branch 'forge-task-{task['id']}' PRESERVED — "
-                            f"manually merge or redispatch", output)
-                        # Abort the merge on conflict
-                        subprocess.run(["git", "merge", "--abort"],
-                                       cwd=project_dir, capture_output=True)
-                except Exception as e:
-                    log(f"  [Isolation] Merge error for task #{task['id']}: {e}", output)
+            needs_merge = task["id"] in worktree_dirs and outcome in ("tests_passed", "no_tests")
 
             return {
                 "task": task,
@@ -6196,6 +6183,7 @@ async def run_parallel_tasks(task_ids, args):
                 "outcome": outcome,
                 "output": output,
                 "merge_ok": merge_ok,
+                "needs_merge": needs_merge if 'needs_merge' in dir() else False,
             }
 
     results = await asyncio.gather(
@@ -6244,6 +6232,65 @@ async def run_parallel_tasks(task_ids, args):
         print(f"Cost: ${total_cost:.4f}")
     print(f"{'#' * 60}")
 
+    # Sequential merge — merge task branches one at a time to avoid conflicts
+    if use_worktrees:
+        merged_tasks_seq = set()
+        merge_candidates = []
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if r.get("needs_merge", False) or (r["task"]["id"] in worktree_dirs and r["outcome"] in ("tests_passed", "no_tests")):
+                merge_candidates.append(r)
+
+        for r in merge_candidates:
+            task_id = r["task"]["id"]
+            branch_name = f"forge-task-{task_id}"
+            try:
+                # Stash any uncommitted changes first
+                subprocess.run(["git", "stash"], cwd=project_dir, capture_output=True)
+                merge_result = subprocess.run(
+                    ["git", "merge", "--no-edit", branch_name],
+                    cwd=project_dir, capture_output=True, text=True,
+                )
+                if merge_result.returncode == 0:
+                    print(f"  [Isolation] Merged task #{task_id} into main")
+                    r["merge_ok"] = True
+                    merged_tasks_seq.add(task_id)
+                else:
+                    # Try rebase-then-merge for conflicts
+                    subprocess.run(["git", "merge", "--abort"],
+                                   cwd=project_dir, capture_output=True)
+                    # Attempt rebase
+                    rebase_result = subprocess.run(
+                        ["git", "rebase", "HEAD", branch_name],
+                        cwd=project_dir, capture_output=True, text=True,
+                    )
+                    if rebase_result.returncode == 0:
+                        # Try merge again after rebase
+                        merge2 = subprocess.run(
+                            ["git", "merge", "--no-edit", branch_name],
+                            cwd=project_dir, capture_output=True, text=True,
+                        )
+                        if merge2.returncode == 0:
+                            print(f"  [Isolation] Merged task #{task_id} (after rebase)")
+                            r["merge_ok"] = True
+                            merged_tasks_seq.add(task_id)
+                        else:
+                            subprocess.run(["git", "merge", "--abort"],
+                                           cwd=project_dir, capture_output=True)
+                            print(f"  [Isolation] Merge FAILED for task #{task_id} (conflict after rebase)")
+                            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                    else:
+                        subprocess.run(["git", "rebase", "--abort"],
+                                       cwd=project_dir, capture_output=True)
+                        print(f"  [Isolation] Merge FAILED for task #{task_id}: {merge_result.stderr[:200]}")
+                        print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                # Pop stash if anything was stashed
+                subprocess.run(["git", "stash", "pop"], cwd=project_dir,
+                               capture_output=True, text=True)
+            except Exception as e:
+                print(f"  [Isolation] Merge error for task #{task_id}: {e}")
+
     # Clean up worktrees — only delete branches that were successfully merged
     if use_worktrees:
         # Collect merge status from results
@@ -6260,7 +6307,7 @@ async def run_parallel_tasks(task_ids, args):
                 # Always remove the worktree directory (it's a working copy)
                 subprocess.run(["git", "worktree", "remove", "--force", wt_path],
                                cwd=project_dir, capture_output=True)
-                if task_id in merged_tasks:
+                if task_id in (merged_tasks_seq if use_worktrees else set()):
                     # Branch was merged — safe to delete
                     subprocess.run(["git", "branch", "-D", branch_name],
                                    cwd=project_dir, capture_output=True)

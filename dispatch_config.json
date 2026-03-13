@@ -1,14 +1,16 @@
 {
     "max_concurrent": 4,
-    "model": "opus",
+    "model": "sonnet",
     "max_turns": 25,
     "max_tasks_per_project": 6,
     "skip_projects": [],
     "priority_boost": {},
-    "only_projects": [],
+    "only_projects": [
+        39
+    ],
     "security_review": true,
     "security_review_timeout": 900,
-    "model_developer": "opus",
+    "model_developer": "sonnet",
     "model_tester": "sonnet",
     "model_planner": "opus",
     "model_evaluator": "sonnet",
