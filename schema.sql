@@ -1,7 +1,7 @@
--- Project Pombal Database Schema
--- Canonical DDL for creating a fresh Project Pombal/ForgeTeam database.
+-- EQUIPA Database Schema
+-- Canonical DDL for creating a fresh EQUIPA database.
 -- Generated from the live theforge.db schema.
--- Used by pombal_setup.py to create new installations.
+-- Used by equipa_setup.py to create new installations.
 --
 -- Tables: 30, Views: 7, Triggers: 1, Indexes: 11
 
