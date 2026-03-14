@@ -1,10 +1,10 @@
-# Coordinator Mode — The Recommended Way to Use Project Pombal
+# Coordinator Mode — The Recommended Way to Use EQUIPA
 
 > Stop memorizing CLI commands. Just talk.
 
-Coordinator Mode turns Claude Code into a natural language dispatcher for Project Pombal. You describe what you want in plain English. Claude handles the rest — planning, task creation, agent dispatch, monitoring, and error recovery.
+Coordinator Mode turns Claude Code into a natural language dispatcher for EQUIPA. You describe what you want in plain English. Claude handles the rest — planning, task creation, agent dispatch, monitoring, and error recovery.
 
-This is the most powerful way to use Project Pombal. Period.
+This is the most powerful way to use EQUIPA. Period.
 
 ---
 
@@ -15,7 +15,7 @@ Traditional workflow: you read docs, write CLI commands, manage tasks manually, 
 Coordinator Mode: you talk to Claude Code like a project manager. Claude does the busywork.
 
 - You say what you want in plain English
-- Claude creates tasks in the Project Pombal database
+- Claude creates tasks in the EQUIPA database
 - Claude dispatches the orchestrator to assign agents
 - Agents (Developer, Tester, Security Reviewer, etc.) do the actual implementation
 - Claude monitors progress and reports back
@@ -41,7 +41,7 @@ You describe what you want
 Claude breaks it into tasks
         |
         v
-Claude writes tasks to the Project Pombal database
+Claude writes tasks to the EQUIPA database
         |
         v
 Claude dispatches the orchestrator
@@ -57,7 +57,7 @@ Claude monitors, reports, and handles failures
 
 1. **You talk.** "Build me a login page with OAuth." That's it.
 2. **Claude plans.** It analyzes your request, checks your project structure, and breaks the work into discrete tasks.
-3. **Claude creates tasks.** Each task gets written to the Project Pombal SQLite database with a clear title, description, and assigned role.
+3. **Claude creates tasks.** Each task gets written to the EQUIPA SQLite database with a clear title, description, and assigned role.
 4. **Claude dispatches.** It runs the orchestrator, pointing it at the new tasks. Independent tasks run in parallel.
 5. **Agents work.** Developer writes code. Tester validates. Security Reviewer checks for vulnerabilities. Each agent operates in its own Claude Code session.
 6. **Claude reports.** As tasks complete, Claude tells you what happened. Files changed, tests passed, issues found.
@@ -67,7 +67,7 @@ Claude monitors, reports, and handles failures
 
 ## Setup
 
-1. Install Project Pombal normally via `pombal_setup.py`
+1. Install EQUIPA normally via `equipa_setup.py`
 2. The installer generates a `.claude/CLAUDE.md` file in your project directory — this teaches Claude Code how to be the coordinator
 3. Open Claude Code in your project directory
 4. Start talking
@@ -315,7 +315,7 @@ Rule of thumb: if the change is under 5 lines and doesn't need testing, just do 
 - Claude will reset the task status and re-dispatch.
 
 **Orchestrator won't start**
-- Check that Project Pombal is installed correctly: `python3 forge_orchestrator.py --help`
+- Check that EQUIPA is installed correctly: `python3 forge_orchestrator.py --help`
 - Verify the database path is correct in your project's CLAUDE.md.
 
 **Tasks stuck in 'in_progress'**
@@ -341,7 +341,7 @@ Manual mode still works. It's documented in the User Guide. But for most workflo
 
 ## Summary
 
-1. Install Project Pombal
+1. Install EQUIPA
 2. Open Claude Code in your project
 3. Tell it what you want
 4. Let it handle the rest

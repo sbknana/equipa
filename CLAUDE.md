@@ -18,7 +18,7 @@ EQUIPA is a multi-agent AI orchestration platform. You talk to Claude in plain E
 |------|---------|
 | `forge_orchestrator.py` | Main orchestrator — task dispatch, dev-test loops, agent management (~5900 lines) |
 | `ollama_agent.py` | Local LLM agent runner via Ollama |
-| `pombal_setup.py` | Interactive setup wizard |
+| `equipa_setup.py` | Interactive setup wizard |
 | `schema.sql` | Canonical database DDL (30 tables, 7 views) |
 | `db_migrate.py` | Database migrations (v0 through v4) with backup and version detection |
 | `dispatch_config.json` | Agent dispatch settings (models, turns, concurrency, providers) |
@@ -64,7 +64,7 @@ EQUIPA is a multi-agent AI orchestration platform. You talk to Claude in plain E
 ## Key Commands
 
 ```bash
-python pombal_setup.py                                    # Setup wizard
+python equipa_setup.py                                    # Setup wizard
 python forge_orchestrator.py --task 42 --dev-test -y      # Single task
 python forge_orchestrator.py --tasks 42,43,44 --dev-test -y  # Parallel tasks
 python forge_orchestrator.py --dispatch -y                # Auto-dispatch all

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autoresearch Prompt Optimizer for Project Pombal.
+"""Autoresearch Prompt Optimizer for EQUIPA.
 
 Uses local Ollama (via WSL) to generate OPRO-style prompt mutations based on
 agent failure telemetry. Writes improved prompts, backs up originals.
@@ -126,7 +126,7 @@ def build_opro_prompt(current_prompt: str, failure_data: dict) -> str:
 - Starts writing code early and iterates"""
 
     return f"""/no_think
-You are an expert prompt engineer optimizing AI agent prompts for a multi-agent coding system called Project Pombal.
+You are an expert prompt engineer optimizing AI agent prompts for a multi-agent coding system called EQUIPA.
 
 ## Current Performance
 - Agent role: {failure_data['role']}
@@ -379,7 +379,7 @@ def sync_to_claudinator():
     cmd = [
         "rsync", "-avz",
         str(PROMPTS_DIR) + "/",
-        "user@YOUR_HOST:/path/to/ProjectPombal/prompts/",
+        "user@YOUR_HOST:/path/to/Equipa/prompts/",
         "-e", "ssh -i ~/.ssh/id_ed25519"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

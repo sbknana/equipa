@@ -106,8 +106,8 @@ If you prefer not to use the guided installer:
 
 ```bash
 # 1. Clone the repository
-git clone <repo-url> pombal
-cd pombal
+git clone <repo-url> equipa
+cd equipa
 
 # 2. Initialize the database
 sqlite3 theforge.db < schema.sql
@@ -120,7 +120,7 @@ cp config.example.json forge_config.json
 # Edit forge_config.json with your paths
 
 # 5. Generate MCP config for Claude Code
-# (or let pombal_setup.py do it)
+# (or let equipa_setup.py do it)
 
 # 6. Verify
 python forge_orchestrator.py --help

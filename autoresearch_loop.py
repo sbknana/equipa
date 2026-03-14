@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autoresearch Loop — Automated prompt optimization for Project Pombal.
+"""Autoresearch Loop — Automated prompt optimization for EQUIPA.
 
 ATLAS-style autonomous loop:
   1. Collect recent benchmark metrics from TheForge
@@ -36,7 +36,7 @@ from pathlib import Path
 
 def is_on_claudinator() -> bool:
     """Detect if we're running on Claudinator already."""
-    return Path("${PROJECT_BASE_DIR}/ProjectPombal").exists()
+    return Path("${PROJECT_BASE_DIR}/Equipa").exists()
 
 
 # --- Config ---
@@ -45,11 +45,11 @@ PROMPTS_DIR = SCRIPT_DIR / "prompts"
 BACKUP_DIR = SCRIPT_DIR / ".autoresearch-backups"
 CLAUDINATOR = "user@YOUR_HOST"
 SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
-REMOTE_PROMPTS = "${PROJECT_BASE_DIR}/ProjectPombal/prompts"
-REMOTE_ORCHESTRATOR = "${PROJECT_BASE_DIR}/ProjectPombal/forge_orchestrator.py"
-# The orchestrator reads/writes its OWN copy at ProjectPombal/theforge.db.
+REMOTE_PROMPTS = "${PROJECT_BASE_DIR}/Equipa/prompts"
+REMOTE_ORCHESTRATOR = "${PROJECT_BASE_DIR}/Equipa/forge_orchestrator.py"
+# The orchestrator reads/writes its OWN copy at Equipa/theforge.db.
 # We MUST use the same DB so tasks and agent_runs are visible to the orchestrator.
-REMOTE_DB = "${PROJECT_BASE_DIR}/ProjectPombal/theforge.db"
+REMOTE_DB = "${PROJECT_BASE_DIR}/Equipa/theforge.db"
 THEFORGE_DB = REMOTE_DB
 
 # Project dirs that need git reset between rounds.

@@ -5,7 +5,7 @@ marker JSON files, inserts records into model_registry via TheForge SQLite,
 and moves processed markers to ./processed/.
 
 Designed to run as a nightly cron job on Claudinator:
-  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/ProjectPombal/ingest_training_results.py
+  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/Equipa/ingest_training_results.py
 
 Can also be run manually:
   python ingest_training_results.py
@@ -29,7 +29,7 @@ from pathlib import Path
 DEFAULT_RESULTS_DIR = "${PROJECT_BASE_DIR}/training-results"
 DEFAULT_DB_PATH = os.environ.get(
     "THEFORGE_DB",
-    "${PROJECT_BASE_DIR}/ProjectPombal/theforge.db",
+    "${PROJECT_BASE_DIR}/Equipa/theforge.db",
 )
 
 # Project ID for cryptotrader-v2 in TheForge
@@ -212,7 +212,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Cron setup (nightly at 6 AM):
-  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/ProjectPombal/ingest_training_results.py >> /var/log/training-ingest.log 2>&1
+  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/Equipa/ingest_training_results.py >> /var/log/training-ingest.log 2>&1
 
 Environment variables:
   THEFORGE_DB  Override the default TheForge database path

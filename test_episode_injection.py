@@ -397,7 +397,7 @@ def test_build_system_prompt_with_episodes():
 
     # Mock project context
     project_context = {
-        "title": "Project Pombal",
+        "title": "EQUIPA",
         "description": "Multi-agent orchestration system",
         "working_directory": "/home/user/projects/example",
     }

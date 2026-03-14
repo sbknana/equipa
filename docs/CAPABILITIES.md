@@ -1,6 +1,6 @@
-# Project Pombal: Multi-Agent AI Orchestration Platform
+# EQUIPA: Multi-Agent AI Orchestration Platform
 
-Project Pombal is a self-improving, multi-agent orchestration platform that you control through natural conversation. Tell Claude what you want done -- it handles task management, agent dispatch, progress tracking, and reporting. You make decisions; the system handles execution.
+EQUIPA is a self-improving, multi-agent orchestration platform that you control through natural conversation. Tell Claude what you want done -- it handles task management, agent dispatch, progress tracking, and reporting. You make decisions; the system handles execution.
 
 Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Python and an MCP-compatible AI coding tool are installed.
 
@@ -23,7 +23,7 @@ Built in pure Python stdlib on SQLite. Zero pip dependencies. Runs anywhere Pyth
 
 ## Conversational Development
 
-The primary interface to Project Pombal is **natural language conversation with Claude**. Claude has MCP access to the full project database and knows how to use every tool in the system. You never need to memorize CLI commands, look up task IDs, or write SQL.
+The primary interface to EQUIPA is **natural language conversation with Claude**. Claude has MCP access to the full project database and knows how to use every tool in the system. You never need to memorize CLI commands, look up task IDs, or write SQL.
 
 ### What it looks like in practice
 
@@ -50,7 +50,7 @@ Everything above can also be done from the command line for automation (cron job
 
 ## Multi-Agent Orchestration
 
-Under the hood, Project Pombal dispatches work to **12+ specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
+Under the hood, EQUIPA dispatches work to **12+ specialized agent roles**, each with tailored system prompts, turn budgets, model assignments, and injected context from past experience.
 
 | Role | Purpose | Default Model | Turn Budget | Success Rate |
 |------|---------|---------------|-------------|--------------|
@@ -187,7 +187,7 @@ Every agent run is recorded as an episode with a reinforcement learning Q-value.
 
 ## Security Pipeline
 
-Project Pombal's security review capability is not a checkbox -- it is a full-depth analysis pipeline built on Trail of Bits security skills.
+EQUIPA's security review capability is not a checkbox -- it is a full-depth analysis pipeline built on Trail of Bits security skills.
 
 ### 7 Security Skills
 
@@ -338,7 +338,7 @@ prompts/
 
 ### Multi-Tool MCP Integration
 
-Project Pombal auto-detects and configures MCP for all major AI coding tools during setup:
+EQUIPA auto-detects and configures MCP for all major AI coding tools during setup:
 
 | Tool | Config Location | Detection |
 |------|----------------|-----------|
@@ -349,7 +349,7 @@ Project Pombal auto-detects and configures MCP for all major AI coding tools dur
 | **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | Config directory |
 | **Continue.dev** | `~/.continue/config.yaml` | Config directory |
 
-The installer detects which tools are installed, prompts for confirmation, and merges the MCP server entry into each tool's config. Existing configurations are preserved — Project Pombal only adds its own server entry.
+The installer detects which tools are installed, prompts for confirmation, and merges the MCP server entry into each tool's config. Existing configurations are preserved — EQUIPA only adds its own server entry.
 
 ### Local LLM Support via Ollama
 

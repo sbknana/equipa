@@ -1,4 +1,4 @@
-# Project Pombal Concurrency Guide
+# EQUIPA Concurrency Guide
 
 Benchmark results and tuning recommendations for running multiple agents in parallel.
 

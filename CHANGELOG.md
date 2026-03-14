@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Project Pombal are documented here.
+All notable changes to EQUIPA are documented here.
 
 ## [3.1.0] - 2026-03-05
 
@@ -77,8 +77,8 @@ All notable changes to Project Pombal are documented here.
 
 ### Added
 
-- Initial release of Project Pombal.
-- Interactive setup wizard (`pombal_setup.py`).
+- Initial release of EQUIPA.
+- Interactive setup wizard (`equipa_setup.py`).
 - Database schema (19 tables, 5 views).
 - Agent prompt files for all roles.
 - Configuration file generation.

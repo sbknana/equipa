@@ -1,7 +1,7 @@
 {
-  "name": "pombal-tester-skills",
+  "name": "equipa-tester-skills",
   "version": "1.0.0",
-  "description": "Tester agent skills for Project Pombal — test framework detection and test generation.",
+  "description": "Tester agent skills for EQUIPA — test framework detection and test generation.",
   "author": {
     "name": "Forgeborn"
   }

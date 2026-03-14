@@ -1,8 +1,8 @@
-# Project Pombal
+# EQUIPA
 
 ## Table of Contents
 
-- [Project Pombal](#project-pombal)
+- [EQUIPA](#equipa)
   - [What is this?](#what-is-this)
   - [Quick Start](#quick-start)
   - [How to Use](#how-to-use)
@@ -34,14 +34,14 @@
 **Tell Claude what you want built. Agents do the rest.**
 
 <p align="center">
-  <img src="ProjectPombal.png" alt="Project Pombal" width="200">
+  <img src="Equipa.png" alt="EQUIPA" width="200">
 </p>
 
-*Named after the [Marquis de Pombal](https://en.wikipedia.org/wiki/Marquis_of_Pombal), who coordinated the rebuilding of Lisbon after the 1755 earthquake.*
+*Named after the [Marquis de EQUIPA](https://en.wikipedia.org/wiki/Marquis_of_EQUIPA), who coordinated the rebuilding of Lisbon after the 1755 earthquake.*
 
 ## What is this?
 
-Project Pombal is a multi-agent AI orchestration platform. You describe what you want built in plain English, and Pombal coordinates a team of AI agents — developers, testers, and security reviewers — to actually build it. It handles task creation, dispatching work to agents, tracking progress, recovering from errors, and learning from past results to get better over time.
+EQUIPA is a multi-agent AI orchestration platform. You describe what you want built in plain English, and EQUIPA coordinates a team of AI agents — developers, testers, and security reviewers — to actually build it. It handles task creation, dispatching work to agents, tracking progress, recovering from errors, and learning from past results to get better over time.
 
 It's for developers who want to use AI agents as a real workforce: plan a project, break it into tasks, and let agents execute while you review.
 
@@ -49,13 +49,13 @@ It's for developers who want to use AI agents as a real workforce: plan a projec
 
 1. **Clone the repo**
    ```bash
-   git clone https://github.com/your-org/ProjectPombal.git
-   cd ProjectPombal
+   git clone https://github.com/your-org/Equipa.git
+   cd Equipa
    ```
 
 2. **Run the setup wizard**
    ```bash
-   python pombal_setup.py
+   python equipa_setup.py
    ```
    This walks you through prerequisites, database creation, config generation, and optional components. No pip installs needed — it's pure Python stdlib.
 
@@ -74,10 +74,10 @@ It's for developers who want to use AI agents as a real workforce: plan a projec
 ## How to Use
 
 ### Describe your goal
-Tell Claude what you want in plain English. Pombal breaks your goal into discrete tasks with priorities, complexity estimates, and role assignments (developer, tester, security reviewer).
+Tell Claude what you want in plain English. EQUIPA breaks your goal into discrete tasks with priorities, complexity estimates, and role assignments (developer, tester, security reviewer).
 
 ### Dispatch agents
-Run the orchestrator to send tasks to AI agents. Pombal picks the right agent role for each task, manages retries, detects when agents get stuck in loops, and terminates unproductive runs early.
+Run the orchestrator to send tasks to AI agents. EQUIPA picks the right agent role for each task, manages retries, detects when agents get stuck in loops, and terminates unproductive runs early.
 
 ```bash
 # Dispatch a single task
@@ -112,7 +112,7 @@ python analyze_performance.py
 ```
 
 ### Let the system improve itself
-**Forgesmith** is Pombal's self-improvement engine. It analyzes agent runs, extracts lessons from failures, tunes configuration, evolves prompts, and prunes what doesn't work.
+**Forgesmith** is EQUIPA's self-improvement engine. It analyzes agent runs, extracts lessons from failures, tunes configuration, evolves prompts, and prunes what doesn't work.
 
 ```bash
 # Full analysis + changes
@@ -136,7 +136,7 @@ python forgesmith.py --report
 - **Preflight build checks** — validates the project compiles before wasting agent turns
 - **Lessons learned database** — failures get recorded and injected into future runs so agents don't repeat mistakes
 - **Episode memory with Q-values** — past experiences are ranked by usefulness and surfaced to agents
-- **Self-evolving prompts (GEPA)** — Pombal automatically mutates and A/B tests agent prompts
+- **Self-evolving prompts (GEPA)** — EQUIPA automatically mutates and A/B tests agent prompts
 - **Autoresearch prompt optimization** — automated mutation loop that benchmarks prompt changes against real tasks, targeting per-role success rates
 - **Rule generation (SIMBA)** — analyzes failure patterns and generates reusable rules for agents
 - **Rubric-based quality scoring** — every agent output is scored on naming, structure, test coverage, documentation, and error handling
@@ -164,13 +164,13 @@ python forgesmith.py --report
 
 1. **Clone and enter the project:**
    ```bash
-   git clone https://github.com/your-org/ProjectPombal.git
-   cd ProjectPombal
+   git clone https://github.com/your-org/Equipa.git
+   cd Equipa
    ```
 
 2. **Run the interactive setup:**
    ```bash
-   python pombal_setup.py
+   python equipa_setup.py
    ```
    The wizard will:
    - Check that prerequisites are installed
@@ -256,7 +256,7 @@ See [LICENSE](LICENSE) for details.
 | `dispatch_config.json` | Per-role model assignments, turn budgets, concurrency settings |
 | `forge_dashboard.py` | Terminal-based project/task dashboard |
 | `nightly_review.py` | Portfolio-level daily summary |
-| `pombal_setup.py` | Interactive setup wizard |
+| `equipa_setup.py` | Interactive setup wizard |
 
 ## Related Documentation
 

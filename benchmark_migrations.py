@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project Pombal Migration Benchmark — Reproducible Demo
+"""EQUIPA Migration Benchmark — Reproducible Demo
 
 Creates temporary databases at each schema version (v1, v2, v3) with realistic
 sample data, then runs every migration path and verifies zero data loss, backup
@@ -462,7 +462,7 @@ def _insert_v1_data(conn):
     artifacts = [
         (1, "db_migrate.py", "python",
          "def run_migrations(db_path): ...",
-         "Database migration runner", "REDACTED_LOCAL_PATH/ProjectPombal/db_migrate.py", "1.0"),
+         "Database migration runner", "REDACTED_LOCAL_PATH/Equipa/db_migrate.py", "1.0"),
         (2, "pricing-engine.ts", "typescript",
          "export function calculatePrice(card: Card): number { ... }",
          "Dynamic card pricing", "src/lib/pricing-engine.ts", "0.1"),
@@ -938,7 +938,7 @@ def create_v3_database(path):
 def create_fresh_database(path):
     """Create a fresh database from schema.sql (the real install path).
 
-    This is how pombal_setup.py creates new installations: execute the
+    This is how equipa_setup.py creates new installations: execute the
     full schema.sql which creates all 30 tables and sets user_version=3.
     Running migrations afterward should be a no-op.
     """
@@ -1094,7 +1094,7 @@ def run_benchmark(label, from_ver, to_ver, create_fn):
     result = BenchmarkResult(label, from_ver, to_ver)
 
     # Create temp DB
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False, prefix=f"pombal_bench_v{from_ver}_")
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False, prefix=f"equipa_bench_v{from_ver}_")
     tmp_path = Path(tmp.name)
     tmp.close()
 
@@ -1220,7 +1220,7 @@ def print_report(results):
 
     print()
     print("=" * width)
-    print("  Project Pombal Migration Benchmark".center(width))
+    print("  EQUIPA Migration Benchmark".center(width))
     print("=" * width)
     print()
 
@@ -1337,7 +1337,7 @@ def print_report(results):
 def main():
     """Run all migration benchmarks and print the report."""
     print()
-    print("Project Pombal Migration Benchmark")
+    print("EQUIPA Migration Benchmark")
     print(f"Target schema version: v{CURRENT_VERSION}")
     print(f"Running from: {Path(__file__).parent}")
     print()

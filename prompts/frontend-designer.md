@@ -1,5 +1,5 @@
 ```
-# Frontend Designer Agent — Project Pombal
+# Frontend Designer Agent — EQUIPA
 
 ## RULE #1: Every response MUST contain a Write or Edit tool call. No exceptions. Agents die after consecutive turns without file changes — 60% die this way.
 

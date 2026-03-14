@@ -1,6 +1,6 @@
-# Project Pombal User Guide
+# EQUIPA User Guide
 
-Complete reference for installing, configuring, and using Project Pombal — a multi-agent orchestration system for AI-assisted software development.
+Complete reference for installing, configuring, and using EQUIPA — a multi-agent orchestration system for AI-assisted software development.
 
 ---
 
@@ -34,8 +34,8 @@ Complete reference for installing, configuring, and using Project Pombal — a m
 ### Running the Installer
 
 ```bash
-cd Pombal
-python pombal_setup.py
+cd EQUIPA
+python equipa_setup.py
 ```
 
 The wizard guides you through:
@@ -347,7 +347,7 @@ Drop a `.md` file in `prompts/` and it's automatically discovered by `_discover_
 
 ### Checkpoint/Resume
 
-When an agent times out or hits its turn limit, Project Pombal saves the agent's output to `.forge-checkpoints/`. The next time you run that task, the orchestrator loads the checkpoint and injects it as context — the new agent picks up where the last one left off.
+When an agent times out or hits its turn limit, EQUIPA saves the agent's output to `.forge-checkpoints/`. The next time you run that task, the orchestrator loads the checkpoint and injects it as context — the new agent picks up where the last one left off.
 
 ```
   [Checkpoint] Loaded checkpoint from attempt #1 (4200 chars). Agent will continue from there.
@@ -374,7 +374,7 @@ Set complexity explicitly:
 UPDATE tasks SET complexity = 'epic' WHERE id = 42;
 ```
 
-Or leave it unset — Project Pombal infers from description length:
+Or leave it unset — EQUIPA infers from description length:
 - Under 100 chars → `simple`
 - 100-400 chars → `medium`
 - 400-800 chars → `complex`
@@ -419,7 +419,7 @@ When stdin is not a TTY (e.g., `nohup`, SSH pipes, cron), `--yes` is automatical
 
 ## ForgeSmith — Prompt Optimization
 
-ForgeSmith is Project Pombal's self-learning pipeline. It runs nightly (via cron) and optimizes agent performance through a multi-stage process.
+ForgeSmith is EQUIPA's self-learning pipeline. It runs nightly (via cron) and optimizes agent performance through a multi-stage process.
 
 ### Pipeline
 
@@ -577,12 +577,12 @@ Complexity (optional): `simple`, `medium`, `complex`, `epic`
 
 ## MCP Setup
 
-Project Pombal uses MCP (Model Context Protocol) in two ways:
+EQUIPA uses MCP (Model Context Protocol) in two ways:
 
 1. **Agent MCP** (`mcp_config.json`) — passed to orchestrator-spawned agents so they can access the database
 2. **User MCP** (`.mcp.json`) — gives your own Claude Code sessions direct database access
 
-Both are generated automatically by the Project Pombal setup wizard.
+Both are generated automatically by the EQUIPA setup wizard.
 
 ### How Agent MCP Works
 
@@ -606,7 +606,7 @@ The wizard also generates a `CLAUDE.md` in the install directory that gives Clau
 ```json
 {
     "mcpServers": {
-        "pombal": {
+        "equipa": {
             "type": "stdio",
             "command": "uvx",
             "args": ["mcp-server-sqlite", "--db-path", "/path/to/theforge.db"]
@@ -718,7 +718,7 @@ The project's codename doesn't match any entry in `PROJECT_DIRS` or `forge_confi
 
 The task took longer than the 20-minute wall-clock timeout.
 
-**Fix:** Project Pombal automatically saves a checkpoint on timeout. Simply re-run the same task — the agent will resume from where it left off. For recurring timeouts, tag the task as `epic` complexity to give it more turns, or break it into smaller tasks.
+**Fix:** EQUIPA automatically saves a checkpoint on timeout. Simply re-run the same task — the agent will resume from where it left off. For recurring timeouts, tag the task as `epic` complexity to give it more turns, or break it into smaller tasks.
 
 ### "No todo tasks found"
 
@@ -746,7 +746,7 @@ The Tester agent is read-only — it can't modify code.
 
 This is informational, not an error. Without a config file, the orchestrator uses its hardcoded defaults.
 
-**Fix:** Run `pombal_setup.py` to generate the config file, or create one manually (see Configuration Reference above).
+**Fix:** Run `equipa_setup.py` to generate the config file, or create one manually (see Configuration Reference above).
 
 ### Agent produces no output
 

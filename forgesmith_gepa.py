@@ -195,7 +195,7 @@ def episodes_to_dspy_examples(episodes):
 # ============================================================
 
 class RolePromptModule(dspy.Module):
-    """DSPy Module that wraps a Project Pombal role prompt.
+    """DSPy Module that wraps a EQUIPA role prompt.
 
     GEPA evolves the instruction text of the inner Predict component.
     The instruction becomes the evolved prompt content.

@@ -1,6 +1,6 @@
 # Tester Agent Skills
 
-Skills for the Project Pombal tester agent role. Address the top tester failure modes: inability to find test commands, test hangs/timeouts, and no existing tests to run.
+Skills for the EQUIPA tester agent role. Address the top tester failure modes: inability to find test commands, test hangs/timeouts, and no existing tests to run.
 
 ## Skills
 

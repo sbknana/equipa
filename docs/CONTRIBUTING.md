@@ -1,8 +1,8 @@
-# Contributing to Project Pombal
+# Contributing to EQUIPA
 
 ## Table of Contents
 
-- [Contributing to Project Pombal](#contributing-to-project-pombal)
+- [Contributing to EQUIPA](#contributing-to-equipa)
   - [Welcome](#welcome)
   - [Development Setup](#development-setup)
     - [Prerequisites](#prerequisites)
@@ -43,9 +43,9 @@
 
 ## Welcome
 
-Thank you for your interest in contributing to Project Pombal! Whether you're fixing a bug, improving documentation, adding tests, or proposing a new feature, your contributions are valued and appreciated.
+Thank you for your interest in contributing to EQUIPA! Whether you're fixing a bug, improving documentation, adding tests, or proposing a new feature, your contributions are valued and appreciated.
 
-Project Pombal is a multi-agent AI orchestration platform — pure Python stdlib, zero pip dependencies, SQLite-based. We aim to keep it that way: lean, understandable, and reliable.
+EQUIPA is a multi-agent AI orchestration platform — pure Python stdlib, zero pip dependencies, SQLite-based. We aim to keep it that way: lean, understandable, and reliable.
 
 ---
 
@@ -62,13 +62,13 @@ Project Pombal is a multi-agent AI orchestration platform — pure Python stdlib
 
 1. **Fork and clone the repository:**
    ```bash
-   git clone https://github.com/<your-username>/ProjectPombal.git
-   cd ProjectPombal
+   git clone https://github.com/<your-username>/Equipa.git
+   cd Equipa
    ```
 
 2. **Run the setup wizard** (configures database and local environment):
    ```bash
-   python pombal_setup.py
+   python equipa_setup.py
    ```
 
 3. **Initialize/migrate the database:**
@@ -94,7 +94,7 @@ Project Pombal is a multi-agent AI orchestration platform — pure Python stdlib
 
 ### Zero Dependencies Policy
 
-Project Pombal uses **only the Python standard library**. Do not introduce pip dependencies. If you need functionality from an external package, implement it using stdlib or discuss the need in an issue first.
+EQUIPA uses **only the Python standard library**. Do not introduce pip dependencies. If you need functionality from an external package, implement it using stdlib or discuss the need in an issue first.
 
 ---
 

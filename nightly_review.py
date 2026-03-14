@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project Pombal — Nightly Portfolio Review
+"""EQUIPA — Nightly Portfolio Review
 
 Runs nightly to review all projects, flag stale work, and track progress.
 Outputs a markdown report and optionally prints to stdout.
@@ -14,7 +14,7 @@ What it does:
 
 Setup (cron):
     # Run nightly at 11 PM (adjust timezone as needed)
-    0 23 * * * cd /path/to/pombal && python3 nightly_review.py
+    0 23 * * * cd /path/to/equipa && python3 nightly_review.py
 
 Usage:
     python3 nightly_review.py              # Generate review, save to file

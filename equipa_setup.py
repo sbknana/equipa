@@ -1,20 +1,20 @@
 """
-Project Pombal Setup Wizard — Portable Installer
+EQUIPA Setup Wizard — Portable Installer
 
-Interactive setup script that creates a fresh Project Pombal installation:
+Interactive setup script that creates a fresh EQUIPA installation:
 - Checks prerequisites (Python, git, gh, claude, uvx)
 - Creates directory structure
-- Creates a fresh database with the full Project Pombal schema
-- Copies bundled Project Pombal files (orchestrator, forgesmith, prompts, skills, config)
+- Creates a fresh database with the full EQUIPA schema
+- Copies bundled EQUIPA files (orchestrator, forgesmith, prompts, skills, config)
 - Generates forge_config.json and mcp_config.json
 - Sets up ForgeSmith nightly cron job for self-improvement
 - Verifies the installation
 
-All required Project Pombal files are bundled in this repo — no external
+All required EQUIPA files are bundled in this repo — no external
 dependencies on other repos needed.
 
 Usage:
-    python pombal_setup.py
+    python equipa_setup.py
 
 Stdlib only — no pip dependencies required.
 
@@ -34,7 +34,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_FILE = SCRIPT_DIR / "schema.sql"
-# Source Project Pombal files (bundled in this repo for standalone operation)
+# Source EQUIPA files (bundled in this repo for standalone operation)
 SOURCE_DIR = SCRIPT_DIR
 
 BANNER = r"""
@@ -44,7 +44,7 @@ BANNER = r"""
  |  __/ (_) | | | | | | |_) | (_| | |
  |_|   \___/|_| |_| |_|_.__/ \__,_|_|
 
- Project Pombal — Setup Wizard v1.0
+ EQUIPA — Setup Wizard v1.0
 """
 
 MIN_PYTHON = (3, 10)
@@ -144,7 +144,7 @@ def count_db_objects(db_path):
 def step_welcome():
     """Display the welcome banner."""
     print(BANNER)
-    print("  This wizard will set up a fresh Project Pombal installation.")
+    print("  This wizard will set up a fresh EQUIPA installation.")
     print("  It creates the database, copies files, and generates config.")
     print()
     if not prompt_yes_no("Ready to begin?"):
@@ -191,7 +191,7 @@ def step_prerequisites():
 
     if not all_ok:
         print("\n  WARNING: Some prerequisites are missing.")
-        print("  Project Pombal requires all of the above to function.")
+        print("  EQUIPA requires all of the above to function.")
         if not prompt_yes_no("Continue anyway?", default=False):
             print("\n  Setup cancelled. Install missing prerequisites and retry.")
             sys.exit(1)
@@ -205,7 +205,7 @@ def step_install_path():
     """Prompt user for the installation directory."""
     print_header("Step 2: Install Path")
 
-    default_base = str(Path.home() / "ProjectPombal")
+    default_base = str(Path.home() / "Equipa")
 
     base_dir = prompt_input("Install directory", default=default_base)
     base_path = Path(base_dir).resolve()
@@ -284,12 +284,12 @@ def step_database(base_path):
         print("  Cannot create database without schema.sql.")
         sys.exit(1)
 
-    print(f"  Creating Project Pombal database at: {db_path}")
+    print(f"  Creating EQUIPA database at: {db_path}")
     run_sql_file(db_path, SCHEMA_FILE)
 
     # Verify
     counts = count_db_objects(db_path)
-    print(f"  Project Pombal database created successfully:")
+    print(f"  EQUIPA database created successfully:")
     print(f"    Tables:   {counts['table']}")
     print(f"    Views:    {counts['view']}")
     print(f"    Indexes:  {counts['index']}")
@@ -299,8 +299,8 @@ def step_database(base_path):
 
 
 def step_copy_files(base_path):
-    """Copy Project Pombal files to the install directory."""
-    print_header("Step 4: Copy Project Pombal Files")
+    """Copy EQUIPA files to the install directory."""
+    print_header("Step 4: Copy EQUIPA Files")
 
     # All source files are bundled in this repo for standalone operation
     missing = []
@@ -312,7 +312,7 @@ def step_copy_files(base_path):
     if missing:
         print(f"  ERROR: Missing bundled files: {', '.join(missing)}")
         print(f"  Expected in: {SOURCE_DIR}")
-        print("  Re-clone the Project Pombal repo to restore them.")
+        print("  Re-clone the EQUIPA repo to restore them.")
         return False
 
     # Files to copy
@@ -441,7 +441,7 @@ def _resolve_uvx_path():
 
 
 def _build_mcp_server_entry(uvx_cmd, db_path):
-    """Build the universal MCP server entry for Project Pombal."""
+    """Build the universal MCP server entry for EQUIPA."""
     return {
         "command": uvx_cmd,
         "args": [
@@ -528,7 +528,7 @@ def _detect_installed_tools(tools):
 
 
 def _merge_mcp_into_json(config_path, server_entry):
-    """Merge a pombal MCP server entry into an existing JSON config file.
+    """Merge a equipa MCP server entry into an existing JSON config file.
 
     Creates the file if it doesn't exist. Preserves existing servers.
     """
@@ -546,14 +546,14 @@ def _merge_mcp_into_json(config_path, server_entry):
     if "mcpServers" not in existing:
         existing["mcpServers"] = {}
 
-    existing["mcpServers"]["pombal"] = server_entry
+    existing["mcpServers"]["equipa"] = server_entry
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2)
 
 
 def _merge_mcp_into_yaml(config_path, server_entry):
-    """Merge a pombal MCP server entry into Continue.dev's config.yaml.
+    """Merge a equipa MCP server entry into Continue.dev's config.yaml.
 
     Uses basic string manipulation (no PyYAML dependency).
     """
@@ -562,7 +562,7 @@ def _merge_mcp_into_yaml(config_path, server_entry):
 
     # Build the YAML block for the MCP server
     yaml_block = f"""
-  - name: pombal
+  - name: equipa
     command: {server_entry['command']}
     args:"""
     for arg in server_entry["args"]:
@@ -570,8 +570,8 @@ def _merge_mcp_into_yaml(config_path, server_entry):
 
     if config_path.exists():
         content = config_path.read_text(encoding="utf-8")
-        # Check if pombal is already configured
-        if "name: pombal" in content:
+        # Check if equipa is already configured
+        if "name: equipa" in content:
             print("    (already configured, skipping)")
             return
         # Check if mcpServers section exists
@@ -593,7 +593,7 @@ def step_generate_mcp_config(base_path, db_path):
     uvx_cmd = _resolve_uvx_path()
     server_entry = _build_mcp_server_entry(uvx_cmd, db_path)
 
-    mcp_config = {"mcpServers": {"pombal": server_entry}}
+    mcp_config = {"mcpServers": {"equipa": server_entry}}
 
     mcp_path = base_path / "mcp_config.json"
     with open(mcp_path, "w", encoding="utf-8") as f:
@@ -613,7 +613,7 @@ def step_generate_dot_mcp(base_path, db_path):
     server_entry = _build_mcp_server_entry(uvx_cmd, db_path)
 
     # --- Claude Code: .mcp.json in project directory (always) ---
-    dot_mcp = {"mcpServers": {"pombal": server_entry}}
+    dot_mcp = {"mcpServers": {"equipa": server_entry}}
     dot_mcp_path = base_path / ".mcp.json"
     with open(dot_mcp_path, "w", encoding="utf-8") as f:
         json.dump(dot_mcp, f, indent=2)
@@ -630,7 +630,7 @@ def step_generate_dot_mcp(base_path, db_path):
         print("  No other AI coding tools detected.")
         print("  Supported: Roo Code, Cline, Cursor, Windsurf, Continue.dev")
         print("  If you install one later, re-run this setup or manually add")
-        print(f"  the pombal server from: {base_path / 'mcp_config.json'}")
+        print(f"  the equipa server from: {base_path / 'mcp_config.json'}")
     else:
         print()
         print(f"  Detected {len(other_tools)} additional AI coding tool(s):")
@@ -649,26 +649,26 @@ def step_generate_dot_mcp(base_path, db_path):
                     print(f"  [+] {tool['name']}: configured at {config_path}")
                 except Exception as exc:
                     print(f"  [X] {tool['name']}: failed — {exc}")
-                    print(f"      Manual: copy pombal server from mcp_config.json")
+                    print(f"      Manual: copy equipa server from mcp_config.json")
         else:
-            print("  Skipping. You can manually copy the pombal server config from:")
+            print("  Skipping. You can manually copy the equipa server config from:")
             print(f"    {base_path / 'mcp_config.json'}")
 
     return dot_mcp_path
 
 
 def step_generate_claude_md(base_path, db_path):
-    """Generate CLAUDE.md so Claude Code knows how to use Project Pombal."""
+    """Generate CLAUDE.md so Claude Code knows how to use EQUIPA."""
     print_header("Step 8: Claude Code Context (CLAUDE.md)")
 
     orch = base_path / "forge_orchestrator.py"
 
-    claude_md = f"""# CLAUDE.md — Project Pombal Installation
+    claude_md = f"""# CLAUDE.md — EQUIPA Installation
 
 ## What This Is
 
-This is a Project Pombal installation — a multi-agent AI orchestration system.
-You have MCP access to the Project Pombal database via the `pombal` MCP server.
+This is a EQUIPA installation — a multi-agent AI orchestration system.
+You have MCP access to the EQUIPA database via the `equipa` MCP server.
 
 ## Database Location
 
@@ -676,7 +676,7 @@ You have MCP access to the Project Pombal database via the `pombal` MCP server.
 
 ## Available MCP Tools
 
-Use the `pombal` MCP server to read and write the database:
+Use the `equipa` MCP server to read and write the database:
 - `read_query` — Run SELECT queries
 - `write_query` — Run INSERT, UPDATE, DELETE queries
 - `list_tables` — List all tables
@@ -811,7 +811,7 @@ python "{base_path / 'forgesmith.py'}" --dry-run
     with open(claude_md_path, "w", encoding="utf-8") as f:
         f.write(claude_md)
     print(f"  Created: {claude_md_path}")
-    print(f"  Claude Code now has full context about Project Pombal commands,")
+    print(f"  Claude Code now has full context about EQUIPA commands,")
     print(f"  database queries, and agent roles.")
 
     return claude_md_path
@@ -821,7 +821,7 @@ def step_forgesmith_cron(base_path):
     """Set up ForgeSmith self-improvement cron job."""
     print_header("Step 9: ForgeSmith Self-Improvement")
 
-    print("  ForgeSmith is Project Pombal's self-learning system.")
+    print("  ForgeSmith is EQUIPA's self-learning system.")
     print("  It analyzes agent performance and auto-tunes prompts,")
     print("  turn limits, and model assignments nightly.")
     print()
@@ -935,7 +935,7 @@ def step_optional_sentinel(base_path, db_path):
     # Copy Sentinel source from bundled files
     sentinel_src = SOURCE_DIR / "sentinel"
     if not sentinel_src.exists():
-        # Check if Sentinel lives alongside Project Pombal in the AI_Stuff directory
+        # Check if Sentinel lives alongside EQUIPA in the AI_Stuff directory
         sentinel_src = SOURCE_DIR.parent / "Sentinel"
     if not sentinel_src.exists():
         print("  WARNING: Sentinel source not found.")
@@ -1318,15 +1318,15 @@ def step_verify(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
             try:
                 if tool.get("is_yaml"):
                     content = config_path.read_text(encoding="utf-8")
-                    if "name: pombal" in content:
-                        print(f"  [+] {tool['name']}: pombal MCP configured")
+                    if "name: equipa" in content:
+                        print(f"  [+] {tool['name']}: equipa MCP configured")
                 else:
                     with open(config_path, "r", encoding="utf-8") as f:
                         cfg = json.load(f)
-                    if cfg.get("mcpServers", {}).get("pombal"):
-                        print(f"  [+] {tool['name']}: pombal MCP configured")
+                    if cfg.get("mcpServers", {}).get("equipa"):
+                        print(f"  [+] {tool['name']}: equipa MCP configured")
             except Exception:
-                pass  # Tool config exists but pombal not in it — that's fine
+                pass  # Tool config exists but equipa not in it — that's fine
 
     # 9. CLAUDE.md exists
     checks_total += 1
@@ -1372,7 +1372,7 @@ def step_next_steps(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
     print("  Your Forge Platform installation is ready.")
     print()
     print("  INSTALLED COMPONENTS:")
-    print("    [+] Pombal      — Multi-agent AI orchestration")
+    print("    [+] EQUIPA      — Multi-agent AI orchestration")
     print("    [+] ForgeSmith  — Self-learning agent tuning (nightly cron)")
     print("    [+] TheForge    — Persistent context database")
     if sentinel_dir:
@@ -1425,7 +1425,7 @@ def step_next_steps(base_path, db_path, sentinel_dir=None, forgebot_dir=None):
 # --- Main ---
 
 def main():
-    """Run the Project Pombal setup wizard."""
+    """Run the EQUIPA setup wizard."""
     step_welcome()
     step_prerequisites()
     base_path = step_install_path()

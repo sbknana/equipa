@@ -1142,7 +1142,7 @@ def test_developer_prompt_bias_section_is_at_top():
     """Test that the Bias for Action section appears BEFORE the main agent identity."""
     text = _read_prompt("developer")
     bias_pos = text.find("## CRITICAL: Bias for Action")
-    identity_pos = text.find("# Project Pombal Developer Agent")
+    identity_pos = text.find("# EQUIPA Developer Agent")
     assert bias_pos < identity_pos, \
         f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
 
@@ -1176,7 +1176,7 @@ def test_tester_prompt_bias_section_is_at_top():
     """Test that the Bias for Action section appears BEFORE the main agent identity."""
     text = _read_prompt("tester")
     bias_pos = text.find("## CRITICAL: Bias for Action")
-    identity_pos = text.find("# Project Pombal Tester Agent")
+    identity_pos = text.find("# EQUIPA Tester Agent")
     assert bias_pos < identity_pos, \
         f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
 
@@ -1210,7 +1210,7 @@ def test_security_reviewer_prompt_bias_section_is_at_top():
     """Test that the Bias for Action section appears BEFORE the main agent identity."""
     text = _read_prompt("security-reviewer")
     bias_pos = text.find("## CRITICAL: Bias for Action")
-    identity_pos = text.find("# Project Pombal SecurityReviewer Agent")
+    identity_pos = text.find("# EQUIPA SecurityReviewer Agent")
     assert bias_pos < identity_pos, \
         f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"
 
@@ -1219,7 +1219,7 @@ def test_security_reviewer_prompt_bias_section_is_at_top():
 
 def _make_git_repo():
     """Helper: create a temporary git repo and return its path."""
-    tmpdir = tempfile.mkdtemp(prefix="pombal_test_git_")
+    tmpdir = tempfile.mkdtemp(prefix="equipa_test_git_")
     subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@forgeborn.dev"],
@@ -1342,7 +1342,7 @@ def test_git_diff_detects_committed_then_clean():
 
 def test_git_diff_non_git_directory():
     """_check_git_changes returns False for a directory that is not a git repo."""
-    tmpdir = tempfile.mkdtemp(prefix="pombal_test_nogit_")
+    tmpdir = tempfile.mkdtemp(prefix="equipa_test_nogit_")
     try:
         # Create a file but this is NOT a git repo
         with open(os.path.join(tmpdir, "file.txt"), "w") as f:

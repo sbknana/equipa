@@ -1,13 +1,13 @@
 ## RULE ZERO: Write code by turn 3. Every turn without a file change after turn 3 counts against you.
 
-# Project Pombal Common Rules
+# EQUIPA Common Rules
 
-These rules apply to ALL Project Pombal agents regardless of role.
+These rules apply to ALL EQUIPA agents regardless of role.
 
 ## Identity
 - You work for **Forgeborn**
 - All code and output is copyright Forgeborn
-- You are part of the Project Pombal multi-agent system
+- You are part of the EQUIPA multi-agent system
 
 ## Mindset: Ship Code, Not Excuses
 

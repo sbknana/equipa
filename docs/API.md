@@ -1,8 +1,8 @@
-# API.md — Project Pombal
+# API.md — EQUIPA
 
 ## Table of Contents
 
-- [API.md — Project Pombal](#apimd-project-pombal)
+- [API.md — EQUIPA](#apimd-equipa)
   - [Overview](#overview)
   - [CLI Entry Points](#cli-entry-points)
     - [Forge Orchestrator — `forge_orchestrator.py`](#forge-orchestrator-forge_orchestratorpy)
@@ -35,11 +35,11 @@
 
 ## Overview
 
-Project Pombal is a **multi-agent AI orchestration platform** built in pure Python with SQLite as its data store. It is **not a traditional REST/GraphQL/tRPC API service**. Instead, it operates as a collection of CLI tools, orchestration scripts, and internal Python function interfaces that coordinate AI agents (developers, testers, security reviewers) to execute software development tasks.
+EQUIPA is a **multi-agent AI orchestration platform** built in pure Python with SQLite as its data store. It is **not a traditional REST/GraphQL/tRPC API service**. Instead, it operates as a collection of CLI tools, orchestration scripts, and internal Python function interfaces that coordinate AI agents (developers, testers, security reviewers) to execute software development tasks.
 
 **There are no HTTP API endpoints exposed by this project.**
 
-Pombal's "API" is an internal programmatic interface consisting of:
+EQUIPA's "API" is an internal programmatic interface consisting of:
 
 - **CLI entry points** (invoked via `python script.py [args]`)
 - **SQLite database operations** (the central state store)
@@ -118,7 +118,7 @@ Schema migration tool for the SQLite database.
 
 | Script | Description |
 |---|---|
-| `pombal_setup.py` | Interactive setup wizard for new installations |
+| `equipa_setup.py` | Interactive setup wizard for new installations |
 | `forge_dashboard.py` | Terminal dashboard for task/project status |
 | `analyze_performance.py` | Performance analytics and reporting |
 | `nightly_review.py` | Automated nightly portfolio review |
@@ -496,7 +496,7 @@ Loaded via `load_config()`. Controls:
 
 ## Adding HTTP API Endpoints
 
-This project currently has **no HTTP API endpoints**. If you need to expose Pombal's functionality via a web API, consider:
+This project currently has **no HTTP API endpoints**. If you need to expose EQUIPA's functionality via a web API, consider:
 
 1. **FastAPI wrapper**: Create a `forge_api.py` that wraps the orchestrator and database functions:
    ```python
@@ -513,7 +513,7 @@ This project currently has **no HTTP API endpoints**. If you need to expose Pomb
        ...
    ```
 
-2. **MCP Server**: The project already generates MCP configuration via `step_generate_mcp_config()` in `pombal_setup.py`, suggesting Model Context Protocol integration is a supported pattern.
+2. **MCP Server**: The project already generates MCP configuration via `step_generate_mcp_config()` in `equipa_setup.py`, suggesting Model Context Protocol integration is a supported pattern.
 
 3. **SQLite direct access**: For read-only dashboards, query the SQLite database directly using the schema documented above.
 ---

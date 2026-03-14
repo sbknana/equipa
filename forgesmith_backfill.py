@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backfill agent_runs from historical orchestrator log files.
 
-Parses the PROJECT POMBAL AGENT RUN SUMMARY blocks and [DB] Task lines
+Parses the EQUIPA AGENT RUN SUMMARY blocks and [DB] Task lines
 from all orchestrator logs to populate the agent_runs table.
 
 Usage:
@@ -49,7 +49,7 @@ def get_task_info(conn, task_id):
 
 
 def parse_summary_blocks(content):
-    """Parse PROJECT POMBAL AGENT RUN SUMMARY blocks from log content.
+    """Parse EQUIPA AGENT RUN SUMMARY blocks from log content.
 
     Returns list of dicts with task_id, turns, duration, status.
     """

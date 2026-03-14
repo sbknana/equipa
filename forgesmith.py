@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ForgeSmith — Self-learning agent tuning system for Project Pombal.
+"""ForgeSmith — Self-learning agent tuning system for EQUIPA.
 
 Runs nightly (or on-demand) to analyze agent telemetry and make targeted
 improvements to prompts, config, and blocked task resolution.
@@ -2061,7 +2061,7 @@ def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     else:
         lessons_text = "No lessons available."
 
-    prompt = f"""You are an expert prompt engineer optimizing agent system prompts for a multi-agent software development system called Project Pombal.
+    prompt = f"""You are an expert prompt engineer optimizing agent system prompts for a multi-agent software development system called EQUIPA.
 
 ## Your Task
 Analyze the current prompt for the "{role}" role and propose specific, testable modifications to improve agent performance based on the metrics and reflections provided.
@@ -2789,7 +2789,7 @@ def run_rollback(run_id_to_revert):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ForgeSmith — Self-learning agent tuning for Project Pombal")
+        description="ForgeSmith — Self-learning agent tuning for EQUIPA")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--auto", action="store_true",
                        help="Full run: analyze + apply changes")

@@ -1,6 +1,6 @@
 # Local LLM Support
 
-Run Project Pombal agents on local models via Ollama. No API key needed.
+Run EQUIPA agents on local models via Ollama. No API key needed.
 
 ---
 
@@ -34,7 +34,7 @@ ollama pull qwen3.5:27b    # Full power (16GB RAM)
 ollama pull qwen3.5:9b     # Lighter (8GB RAM)
 
 # Optional: Pull the Forgeborn fine-tuned model (when available)
-ollama pull forgeborn/pombal-qwen3.5-9b
+ollama pull forgeborn/equipa-qwen3.5-9b
 
 # Verify it's there
 ollama list
@@ -180,7 +180,7 @@ Some models get stuck in reasoning loops. Set a timeout in your config or try a 
 
 ## What's Next
 
-- **Forgeborn fine-tuned models** — QLoRA-trained on Project Pombal task data for better role performance
+- **Forgeborn fine-tuned models** — QLoRA-trained on EQUIPA task data for better role performance
 - **Automatic fallback** — If Ollama fails, fall back to Claude automatically
 - **Performance benchmarks** — Track local vs. Claude quality per role
 

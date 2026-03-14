@@ -1,6 +1,6 @@
 # Custom Agent Creation Guide
 
-Project Pombal agents are defined by markdown prompt files. Creating a new agent is as simple as dropping a `.md` file in the `prompts/` directory.
+EQUIPA agents are defined by markdown prompt files. Creating a new agent is as simple as dropping a `.md` file in the `prompts/` directory.
 
 ---
 
@@ -18,7 +18,7 @@ The `_discover_roles()` function scans `prompts/` at startup and automatically r
 
 ### Built-in Roles
 
-Project Pombal ships with 9 built-in agent roles:
+EQUIPA ships with 9 built-in agent roles:
 
 | Role File | Purpose |
 |-----------|---------|

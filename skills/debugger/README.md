@@ -1,6 +1,6 @@
 # Debugger Agent Skills
 
-Skills for the Project Pombal debugger agent role.
+Skills for the EQUIPA debugger agent role.
 
 ## Skills
 

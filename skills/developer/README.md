@@ -1,6 +1,6 @@
 # Developer Agent Skills
 
-Skills for the Project Pombal developer agent role. These address the top failure modes observed in production: analysis paralysis (50% early termination rate), complex task stalling, and unrecoverable errors.
+Skills for the EQUIPA developer agent role. These address the top failure modes observed in production: analysis paralysis (50% early termination rate), complex task stalling, and unrecoverable errors.
 
 ## Skills
 

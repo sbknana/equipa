@@ -1,8 +1,8 @@
-# ARCHITECTURE.md — Project Pombal
+# ARCHITECTURE.md — EQUIPA
 
 ## Table of Contents
 
-- [ARCHITECTURE.md — Project Pombal](#architecturemd-project-pombal)
+- [ARCHITECTURE.md — EQUIPA](#architecturemd-equipa)
   - [How It Works](#how-it-works)
   - [System Overview](#system-overview)
   - [Data Flow](#data-flow)
@@ -23,9 +23,9 @@
 
 ## How It Works
 
-Project Pombal is a multi-agent AI orchestration platform where you describe what you want built in plain English, and a fleet of AI agents (developer, tester, security reviewer, planner) execute the work autonomously. Here's how it works in practice:
+EQUIPA is a multi-agent AI orchestration platform where you describe what you want built in plain English, and a fleet of AI agents (developer, tester, security reviewer, planner) execute the work autonomously. Here's how it works in practice:
 
-**When you give Pombal a task**, the `forge_orchestrator.py` scans a SQLite database for pending work, figures out which agent role should handle it (developer, tester, security reviewer), builds a detailed prompt with relevant context (project info, past lessons learned, prior episode outcomes), and dispatches the task to Claude (or optionally a local Ollama model). The developer agent writes code, the tester agent validates it, and they iterate in a dev-test loop until the task passes or budget/turn limits are hit.
+**When you give EQUIPA a task**, the `forge_orchestrator.py` scans a SQLite database for pending work, figures out which agent role should handle it (developer, tester, security reviewer), builds a detailed prompt with relevant context (project info, past lessons learned, prior episode outcomes), and dispatches the task to Claude (or optionally a local Ollama model). The developer agent writes code, the tester agent validates it, and they iterate in a dev-test loop until the task passes or budget/turn limits are hit.
 
 **While agents run**, the orchestrator tracks everything: it detects stuck loops (agents repeating the same failed action), monologue behavior (agents talking instead of using tools), cost overruns, and alternating error patterns. If an agent gets stuck, the system warns it, and if it doesn't recover, terminates early. Every action, error, and outcome is logged to SQLite as "episodes" — structured records of what happened, what worked, and what didn't.
 
@@ -231,7 +231,7 @@ erDiagram
 ## Project Structure
 
 ```
-ProjectPombal/
+Equipa/
 ├── forge_orchestrator.py        # Core orchestrator — task dispatch, dev-test loop, episode recording
 ├── forgesmith.py                # Self-improvement engine — analyzes runs, extracts lessons, tunes config
 ├── forgesmith_gepa.py           # GEPA prompt evolution — DSPy-style iterative prompt optimization
@@ -249,7 +249,7 @@ ProjectPombal/
 ├── autoresearch_loop.py         # Optimization loop — deploy/test/measure/rollback prompt variants
 ├── db_migrate.py                # Schema migrations — versioned DB upgrades with backup
 ├── benchmark_migrations.py      # Migration benchmarks — validates migration correctness & speed
-├── pombal_setup.py              # Setup wizard — interactive installer for new deployments
+├── equipa_setup.py              # Setup wizard — interactive installer for new deployments
 ├── prepare_training_data.py     # Training data prep — converts episodes to fine-tuning format
 ├── train_qlora_peft.py          # QLoRA training — fine-tune with PEFT/LoRA
 ├── train_qlora.py               # QLoRA training — alternative training pipeline

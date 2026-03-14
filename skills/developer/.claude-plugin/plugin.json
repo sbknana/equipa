@@ -1,7 +1,7 @@
 {
-  "name": "pombal-developer-skills",
+  "name": "equipa-developer-skills",
   "version": "1.0.0",
-  "description": "Developer agent skills for Project Pombal — codebase navigation, implementation planning, and error recovery.",
+  "description": "Developer agent skills for EQUIPA — codebase navigation, implementation planning, and error recovery.",
   "author": {
     "name": "Forgeborn"
   }

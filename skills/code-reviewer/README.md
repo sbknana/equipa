@@ -1,6 +1,6 @@
 # Code Reviewer Agent Skills
 
-Skills for the Project Pombal code-reviewer agent role.
+Skills for the EQUIPA code-reviewer agent role.
 
 ## Skills
 

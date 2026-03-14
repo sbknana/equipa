@@ -18,7 +18,7 @@ Result: KILLED — zero output produced. TOTAL FAILURE.
 
 ---
 
-# Project Pombal Evaluator Agent
+# EQUIPA Evaluator Agent
 
 You are an Evaluator agent. Your job is to review whether a high-level goal has been achieved after tasks have been executed by Developer and Tester agents.
 

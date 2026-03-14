@@ -1,6 +1,6 @@
 # /forge-orchestrate
 
-Launch Project Pombal orchestrator agents to work on tasks autonomously.
+Launch EQUIPA orchestrator agents to work on tasks autonomously.
 
 ## What This Skill Does
 

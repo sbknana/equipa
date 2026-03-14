@@ -1,5 +1,5 @@
 """
-Project Pombal Phase 5: Multi-Project Orchestration with Resource Allocation
+EQUIPA Phase 5: Multi-Project Orchestration with Resource Allocation
 
 Picks a task from TheForge, spawns Developer and Tester agents via claude -p,
 gives them MCP access to TheForge, and iterates until tests pass or max cycles hit.
@@ -357,7 +357,7 @@ def _discover_roles():
 
 
 def _handle_add_project(name, project_dir):
-    """Register a new project in the Project Pombal DB and update forge_config.json."""
+    """Register a new project in the EQUIPA DB and update forge_config.json."""
     project_dir = str(Path(project_dir).resolve())
 
     # Insert into DB
@@ -4958,7 +4958,7 @@ def print_manager_summary(goal, outcome, rounds, completed, blocked, cost, durat
     is_success = outcome == "goal_complete"
 
     log("\n" + "#" * 60, output)
-    log("PROJECT POMBAL MANAGER MODE SUMMARY", output)
+    log("EQUIPA MANAGER MODE SUMMARY", output)
     log("#" * 60, output)
 
     log(f"\nGoal:      {goal[:100]}", output)
@@ -5069,13 +5069,13 @@ def _print_task_summary(title, task, result, verified, verify_msg,
 
 def print_summary(task, result, verified, verify_msg):
     """Print a formatted summary of a single agent run."""
-    _print_task_summary("PROJECT POMBAL AGENT RUN SUMMARY",
+    _print_task_summary("EQUIPA AGENT RUN SUMMARY",
                         task, result, verified, verify_msg)
 
 
 def print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg):
     """Print a formatted summary of the dev-test loop run."""
-    _print_task_summary("PROJECT POMBAL DEV-TEST LOOP SUMMARY",
+    _print_task_summary("EQUIPA DEV-TEST LOOP SUMMARY",
                         task, result, verified, verify_msg,
                         cycles=cycles, outcome=outcome)
 
@@ -5397,7 +5397,7 @@ def _print_batch_summary(title, results, mode="goals"):
 
 def print_parallel_summary(results):
     """Print a combined summary table for all parallel goals."""
-    _print_batch_summary("PROJECT POMBAL PARALLEL GOALS SUMMARY", results, mode="goals")
+    _print_batch_summary("EQUIPA PARALLEL GOALS SUMMARY", results, mode="goals")
 
 
 def print_dispatch_summary(results):
@@ -5624,7 +5624,7 @@ def scan_pending_work():
     [
         {
             "project_id": 21,
-            "project_name": "Project Pombal",
+            "project_name": "EQUIPA",
             "codename": "forgeteam",
             "status": "active",
             "tasks": [<task dicts sorted by priority>],
@@ -6340,7 +6340,7 @@ async def _post_task_telemetry(task, result, outcome, role, model, max_turns,
 async def async_main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Project Pombal: Run AI agents on TheForge tasks"
+        description="EQUIPA: Run AI agents on TheForge tasks"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--task", type=int, help="Task ID to work on")
@@ -6357,7 +6357,7 @@ async def async_main():
     group.add_argument("--auto-run", action="store_true",
                         help="Auto-scan projects and dispatch work by priority")
     group.add_argument("--add-project", type=str, metavar="NAME",
-                        help="Register a new project in Project Pombal DB and config")
+                        help="Register a new project in EQUIPA DB and config")
 
     parser.add_argument("--project-dir", type=str, metavar="PATH",
                         help="Project directory (used with --add-project)")

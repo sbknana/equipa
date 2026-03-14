@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Project Pombal QLoRA Training Script (PEFT + TRL)
+EQUIPA QLoRA Training Script (PEFT + TRL)
 =============================================
 Fine-tunes Qwen models using QLoRA via HuggingFace PEFT + TRL.
 No Unsloth dependency — works on any CUDA GPU including Pascal (sm_61).
@@ -120,7 +120,7 @@ def main():
     }
 
     print("=" * 60)
-    print("Project Pombal QLoRA Training (PEFT + TRL)")
+    print("EQUIPA QLoRA Training (PEFT + TRL)")
     print("=" * 60)
     print(f"\nModel: {model_id}")
     print(f"LoRA rank: {config['lora_r']}, alpha: {config['lora_alpha']}")
@@ -315,7 +315,7 @@ def main():
     print(f"  1. Test: load adapter from {adapter_path}")
     print(f"  2. Merge: merge adapter with base model for deployment")
     print(f"  3. Export GGUF: use llama.cpp or AutoGGUF for Ollama deployment")
-    print(f"  4. Update Project Pombal dispatch_config.json with new model")
+    print(f"  4. Update EQUIPA dispatch_config.json with new model")
 
 
 if __name__ == "__main__":

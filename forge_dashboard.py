@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Project Pombal Agent Performance Dashboard
+EQUIPA Agent Performance Dashboard
 Copyright 2026, Forgeborn
 
-Generates a self-contained HTML report showing Project Pombal metrics:
+Generates a self-contained HTML report showing EQUIPA metrics:
   - Tasks completed/failed per day
   - Average turns per agent run
   - Model usage and cost estimates
@@ -525,7 +525,7 @@ def generate_html(task_summary, tasks_per_day, project_completion, priority_brea
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Project Pombal Agent Performance Dashboard</title>
+<title>EQUIPA Agent Performance Dashboard</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -830,7 +830,7 @@ def generate_html(task_summary, tasks_per_day, project_completion, priority_brea
   </div>
 
   <div class="footer">
-    Copyright 2026, Forgeborn | Project Pombal Agent Performance Dashboard
+    Copyright 2026, Forgeborn | EQUIPA Agent Performance Dashboard
   </div>
 
 </div>
@@ -844,7 +844,7 @@ def generate_html(task_summary, tasks_per_day, project_completion, priority_brea
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Project Pombal Agent Performance Dashboard — HTML report generator"
+        description="EQUIPA Agent Performance Dashboard — HTML report generator"
     )
     parser.add_argument("--days", type=int, default=30, help="Look-back period in days (default: 30)")
     parser.add_argument("--output", type=str, default=None, help="Write HTML to file (default: stdout)")

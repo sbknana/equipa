@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project Pombal Database Migration System.
+"""EQUIPA Database Migration System.
 
 Detects the current schema version of an existing TheForge database and applies
 incremental migrations to bring it up to the latest version. Backs up the DB
@@ -13,7 +13,7 @@ Usage:
     # Standalone
     python db_migrate.py /path/to/theforge.db
 
-    # From pombal_setup.py (called automatically)
+    # From equipa_setup.py (called automatically)
     from db_migrate import run_migrations
     success, from_ver, to_ver = run_migrations("/path/to/theforge.db")
 
@@ -524,7 +524,7 @@ def main():
         print(f"ERROR: File not found: {db_path}")
         sys.exit(1)
 
-    print(f"Project Pombal Database Migration Tool (target: v{CURRENT_VERSION})")
+    print(f"EQUIPA Database Migration Tool (target: v{CURRENT_VERSION})")
     print(f"Database: {db_path}")
     print()
 

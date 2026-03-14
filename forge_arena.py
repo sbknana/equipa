@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Forge Arena — Iterative Agent Training Loop for LoRA Data Generation.
 
-Runs Project Pombal agents through repeated improvement cycles on a project,
+Runs EQUIPA agents through repeated improvement cycles on a project,
 generating high-quality training episodes for LoRA fine-tuning.
 
 Each phase runs a full role rotation:
@@ -34,8 +34,8 @@ Usage:
     # Run DOGE-HABEAS Go blockchain rewrite
     python3 forge_arena.py --project doge-habeas
 
-    # Run Project Pombal Python rewrite
-    python3 forge_arena.py --project pombal
+    # Run EQUIPA Python rewrite
+    python3 forge_arena.py --project equipa
 
 Copyright 2026 Forgeborn
 """
@@ -74,9 +74,9 @@ PROJECT_PROFILES = {
         "dir": "",
         "language": "go",
     },
-    "pombal": {
+    "equipa": {
         "id": 23,
-        "codename": "pombal",
+        "codename": "equipa",
         "dir": "",
         "language": "python",
     },
@@ -1187,18 +1187,18 @@ Target: 2500 TPS, 500ms block time, PoH+PoS consensus via CometBFT ABCI.
 ]
 
 
-# --- POMBAL Python Rewrite Phases ---
+# --- EQUIPA Python Rewrite Phases ---
 # Portable installer rewrite with best practices.
 
-POMBAL_PHASES = [
+EQUIPA_PHASES = [
     {
         "id": 1,
         "name": "Foundation — CLI Framework, Config, Package Detection",
-        "developer_task": """Rewrite the Project Pombal portable installer foundation using Python best practices.
+        "developer_task": """Rewrite the EQUIPA portable installer foundation using Python best practices.
 
 **Requirements:**
 1. Modern Python CLI using `click` (not argparse)
-2. Config via TOML (`pombal.toml`) with schema validation via pydantic
+2. Config via TOML (`equipa.toml`) with schema validation via pydantic
 3. Package detection — scan system for: Python, Node.js, Docker, Git, Claude Code
 4. Cross-platform path handling (Windows + Linux + macOS)
 5. Rich terminal output via `rich` library (progress bars, tables, colored status)
@@ -1206,30 +1206,30 @@ POMBAL_PHASES = [
 7. Type hints on all functions (strict mypy)
 
 **Files:**
-- `src/pombal/cli.py` — Click CLI entry point
-- `src/pombal/config.py` — Pydantic config model + TOML loading
-- `src/pombal/detect.py` — Package/tool detection
-- `src/pombal/display.py` — Rich output helpers
+- `src/equipa/cli.py` — Click CLI entry point
+- `src/equipa/config.py` — Pydantic config model + TOML loading
+- `src/equipa/detect.py` — Package/tool detection
+- `src/equipa/display.py` — Rich output helpers
 - `pyproject.toml` — Project metadata, deps, scripts
 - `tests/` — pytest test suite
 
 **Acceptance criteria:**
-- `uv run pombal --help` shows commands
-- `uv run pombal detect` lists installed tools with versions
+- `uv run equipa --help` shows commands
+- `uv run equipa detect` lists installed tools with versions
 - Config loads from TOML with validation errors on bad input
 - Works on Windows and Linux
 """,
-        "tester_task": """Write pytest tests for Project Pombal foundation.
+        "tester_task": """Write pytest tests for EQUIPA foundation.
 
 **Test:** Config loading/validation, package detection (mocked), CLI help output, Rich formatting.
 Use `pytest --strict-markers -v`. Aim for 90%+ coverage.
 """,
-        "security_task": """Security review Project Pombal foundation.
+        "security_task": """Security review EQUIPA foundation.
 
 **Focus:** Config file handling (TOML injection?), subprocess calls for detection (command injection?),
 path traversal in config paths, dependency audit.
 """,
-        "review_task": """Code review Project Pombal foundation.
+        "review_task": """Code review EQUIPA foundation.
 
 **Check:** Python idioms, type hints, click best practices, pydantic model design, test quality.
 """,
@@ -1344,7 +1344,7 @@ This is the CORE differentiator.
 PROJECT_PHASES = {
     "apocrypha": PHASES,
     "doge-habeas": DOGE_HABEAS_PHASES,
-    "pombal": POMBAL_PHASES,
+    "equipa": EQUIPA_PHASES,
     "babel": BABEL_PHASES,
 }
 

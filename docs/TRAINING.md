@@ -1,10 +1,10 @@
-# Fine-Tuning Your Own Project Pombal Model
+# Fine-Tuning Your Own EQUIPA Model
 
-Train a local LLM that actually knows how to be an agent. Not a generic chatbot — a model fine-tuned on real Project Pombal task executions using QLoRA.
+Train a local LLM that actually knows how to be an agent. Not a generic chatbot — a model fine-tuned on real EQUIPA task executions using QLoRA.
 
 ## Overview
 
-Project Pombal has two paths to better agent performance — and they complement each other:
+EQUIPA has two paths to better agent performance — and they complement each other:
 
 - **Prompt optimization (Autoresearch)** — Mutate and benchmark agent prompts until they hit target success rates. Zero training infrastructure. Works with any model. See [CAPABILITIES.md](CAPABILITIES.md#autoresearch-automated-prompt-optimization) for details.
 - **Weight optimization (QLoRA fine-tuning)** — Train a local model on successful agent executions. Requires GPU hardware. Produces a model that "thinks like an agent" from the start.
@@ -223,12 +223,12 @@ Then convert:
 # Q4_K_M is a good balance of quality vs size
 python3 llama.cpp/convert_hf_to_gguf.py merged_model \
   --outtype q4_k_m \
-  --outfile pombal-9b-q4_k_m.gguf
+  --outfile equipa-9b-q4_k_m.gguf
 
 # Q5_K_M if you have the VRAM and want slightly better quality
 python3 llama.cpp/convert_hf_to_gguf.py merged_model \
   --outtype q5_k_m \
-  --outfile pombal-9b-q5_k_m.gguf
+  --outfile equipa-9b-q5_k_m.gguf
 ```
 
 ### GGUF Size Reference
@@ -245,36 +245,36 @@ python3 llama.cpp/convert_hf_to_gguf.py merged_model \
 Create a `Modelfile`:
 
 ```
-FROM ./pombal-9b-q4_k_m.gguf
+FROM ./equipa-9b-q4_k_m.gguf
 
 PARAMETER temperature 0.1
 PARAMETER num_predict 4096
 PARAMETER top_p 0.9
 
-SYSTEM You are a Project Pombal agent. Follow instructions precisely and use tools efficiently. Think step by step. Be concise in your responses.
+SYSTEM You are a EQUIPA agent. Follow instructions precisely and use tools efficiently. Think step by step. Be concise in your responses.
 ```
 
 Low temperature is intentional. Agents need to be consistent and precise, not creative.
 
 ```bash
 # Create the model
-ollama create pombal -f Modelfile
+ollama create equipa -f Modelfile
 
 # Quick test
-ollama run pombal "Hello, test"
+ollama run equipa "Hello, test"
 
 # Test with an agent-style prompt
-ollama run pombal "Review this Python function for bugs: def add(a, b): return a - b"
+ollama run equipa "Review this Python function for bugs: def add(a, b): return a - b"
 ```
 
-## Step 6: Configure Project Pombal
+## Step 6: Configure EQUIPA
 
 Update `dispatch_config.json` to use your fine-tuned model:
 
 ```json
 {
-    "ollama_model": "pombal",
-    "ollama_model_planner": "pombal"
+    "ollama_model": "equipa",
+    "ollama_model_planner": "equipa"
 }
 ```
 
@@ -282,12 +282,12 @@ You can also mix models — use the fine-tuned model for specific roles:
 
 ```json
 {
-    "ollama_model": "pombal",
+    "ollama_model": "equipa",
     "ollama_model_planner": "qwen3.5:27b",
     "role_overrides": {
-        "code-reviewer": "pombal",
-        "developer": "pombal",
-        "tester": "pombal"
+        "code-reviewer": "equipa",
+        "developer": "equipa",
+        "tester": "equipa"
     }
 }
 ```
@@ -316,13 +316,13 @@ Don't want to train your own? Use the Forgeborn pre-trained model when available
 
 ```bash
 # Via Ollama (easiest)
-ollama pull forgeborn/pombal-qwen3.5-9b
+ollama pull forgeborn/equipa-qwen3.5-9b
 
 # Or download the GGUF manually from HuggingFace
-# https://huggingface.co/Forgeborn/pombal-qwen3.5-9b
+# https://huggingface.co/Forgeborn/equipa-qwen3.5-9b
 ```
 
-The pre-trained model is fine-tuned on thousands of Project Pombal task executions across multiple projects. Good starting point even if you plan to fine-tune further on your own data.
+The pre-trained model is fine-tuned on thousands of EQUIPA task executions across multiple projects. Good starting point even if you plan to fine-tune further on your own data.
 
 ---
 
