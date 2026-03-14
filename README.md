@@ -189,9 +189,9 @@ You also need an LLM provider — Anthropic API key, Claude Pro/Max subscription
 ### Install
 
 ```bash
-git clone https://github.com/Forgeborn/equipa.git
+git clone https://github.com/sbknana/equipa.git
 cd equipa
-python pombal_setup.py
+python equipa_setup.py
 ```
 
 The setup wizard handles everything: prerequisite checks, database creation, config generation, and MCP integration. Just answer the prompts.
