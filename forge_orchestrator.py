@@ -5625,7 +5625,7 @@ def scan_pending_work():
         {
             "project_id": 21,
             "project_name": "EQUIPA",
-            "codename": "forgeteam",
+            "codename": "equipa",
             "status": "active",
             "tasks": [<task dicts sorted by priority>],
             "counts": {"critical": 0, "high": 2, "medium": 1, "low": 0},
