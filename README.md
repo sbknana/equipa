@@ -17,11 +17,13 @@
 
 ---
 
-You describe what you want in plain English. Equipa breaks it into tasks, dispatches specialized AI agents, and iterates until the work is done. Developers write code, testers validate it, security reviewers audit it with [Trail of Bits](https://github.com/trailofbits/semgrep-rules) semgrep rules — all autonomously, all in parallel.
+Software development takes dedication, perseverance, and knowledge. No tool changes that. What Equipa does is multiply your productivity — it handles the repetitive, parallelizable parts of the workflow so you can focus on the hard problems that actually need a human brain.
+
+You coordinate in natural language. Equipa breaks work into tasks, dispatches specialized AI agents, and iterates through dev-test loops. Developers write code, testers validate it, security reviewers audit it with [Trail of Bits](https://github.com/trailofbits/semgrep-rules) semgrep rules — in parallel, with persistent memory across sessions.
 
 Then it gets better at its job. A [Karpathy-inspired](https://github.com/karpathy) autoresearch loop benchmarks agent performance, mutates prompts using OPRO-style optimization, and commits or reverts based on results. Your agents tomorrow are measurably better than your agents today.
 
-No boilerplate. No manual task management. One sentence in, shipped code out.
+This is a productivity tool, not a magic wand. You still need to review the output, understand your codebase, and make the real decisions. Equipa just makes sure you're not doing the grunt work alone.
 
 ---
 
@@ -66,13 +68,13 @@ Equipa:
   "Want me to create fix tasks for these?"
 ```
 
-One sentence from you. Full implementation with tests.
+You direct. Equipa executes. You review and decide what ships.
 
 ---
 
 ## What Makes Equipa Different
 
-Most agent frameworks give you a chatbot that writes code. Equipa gives you a **development team** — with memory, specialization, and the ability to learn from its own mistakes.
+Most agent frameworks promise you can build anything with a one-liner. That's not real. Equipa gives you a **development team** — with memory, specialization, and the ability to learn from its own mistakes. You still drive. It just means you're not driving alone.
 
 **It actually improves over time.** Every agent run is recorded as a structured episode. ForgeSmith analyzes failures, extracts lessons, and injects them into future prompts. GEPA evolves prompts using DSPy-style optimization. SIMBA generates behavioral rules from high-variance outcomes. Your agents tomorrow are better than your agents today.
 
