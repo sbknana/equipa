@@ -17,7 +17,9 @@
 
 ---
 
-You describe what you want in plain English. Equipa breaks it into tasks, dispatches specialized AI agents, and iterates until the work is done. Developers write code, testers validate it, security reviewers audit it — all autonomously, all in parallel.
+You describe what you want in plain English. Equipa breaks it into tasks, dispatches specialized AI agents, and iterates until the work is done. Developers write code, testers validate it, security reviewers audit it with [Trail of Bits](https://github.com/trailofbits/semgrep-rules) semgrep rules — all autonomously, all in parallel.
+
+Then it gets better at its job. A [Karpathy-inspired](https://github.com/karpathy) autoresearch loop benchmarks agent performance, mutates prompts using OPRO-style optimization, and commits or reverts based on results. Your agents tomorrow are measurably better than your agents today.
 
 No boilerplate. No manual task management. One sentence in, shipped code out.
 
