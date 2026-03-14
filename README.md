@@ -21,7 +21,7 @@ Software development takes dedication, perseverance, and knowledge. No tool chan
 
 You coordinate in natural language. Equipa breaks work into tasks, dispatches specialized AI agents, and iterates through dev-test loops. Developers write code, testers validate it, security reviewers audit it with [Trail of Bits](https://github.com/trailofbits/semgrep-rules) semgrep rules — in parallel, with persistent memory across sessions.
 
-Then it gets better at its job. A [Karpathy-inspired](https://github.com/karpathy) autoresearch loop benchmarks agent performance, mutates prompts using OPRO-style optimization, and commits or reverts based on results. Your agents tomorrow are measurably better than your agents today.
+Then it gets better at its job. A [Karpathy-inspired](https://github.com/karpathy) autoresearch loop benchmarks agent performance, mutates prompts using OPRO-style optimization, and commits or reverts based on results. Your agents tomorrow are measurably better than your agents today. Set it on a nightly cron and it improves itself while you sleep.
 
 This is a productivity tool, not a magic wand. You still need to review the output, understand your codebase, and make the real decisions. Equipa just makes sure you're not doing the grunt work alone.
 
