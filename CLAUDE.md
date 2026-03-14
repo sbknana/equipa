@@ -1,11 +1,11 @@
-# CLAUDE.md — Project Pombal
+# CLAUDE.md — EQUIPA
 
 ## Project Overview
 
 **TheForge project_id:** 23
 **Status:** Active - v3.1
 
-Project Pombal is a multi-agent AI orchestration platform. You talk to Claude in plain English. Claude manages task creation, agent dispatch, progress tracking, error recovery, and reporting. Named after the Marquis de Pombal who rebuilt Lisbon after the 1755 earthquake.
+EQUIPA is a multi-agent AI orchestration platform. You talk to Claude in plain English. Claude manages task creation, agent dispatch, progress tracking, error recovery, and reporting. Named for the European Portuguese word for "team".
 
 **Core:** Pure Python stdlib. Zero pip dependencies. SQLite-based. 30+ table schema.
 
