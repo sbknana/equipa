@@ -55,6 +55,14 @@ def get_db_connection(write=False):
     return conn
 
 
+def setup_module(module):
+    """Pytest hook: set up test data before any test in this module."""
+    import forge_orchestrator
+    forge_orchestrator._SCHEMA_ENSURED = False
+    forge_orchestrator.ensure_schema()
+    setup_simba_test_data()
+
+
 def setup_simba_test_data():
     """Insert test episodes and lessons for SIMBA tests.
 

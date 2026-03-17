@@ -672,7 +672,16 @@ def ensure_schema():
     if _SCHEMA_ENSURED:
         return
     try:
-        conn = get_db_connection(write=True)
+        # get_db_connection raises FileNotFoundError if the DB file does not
+        # exist.  For ensure_schema that is fine in production (db_migrate.py
+        # creates the file first), but in test worktrees the DB may start
+        # empty or absent.  Fall back to sqlite3.connect (which auto-creates
+        # the file) when the DB does not exist yet.
+        try:
+            conn = get_db_connection(write=True)
+        except FileNotFoundError:
+            conn = sqlite3.connect(str(THEFORGE_DB))
+            conn.row_factory = sqlite3.Row
         conn.execute("""
             CREATE TABLE IF NOT EXISTS agent_episodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -682,6 +691,23 @@ def ensure_schema():
                 reflection TEXT, q_value REAL DEFAULT 0.5,
                 times_injected INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lessons_learned (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                role TEXT,
+                error_type TEXT,
+                error_signature TEXT,
+                lesson TEXT NOT NULL,
+                source TEXT DEFAULT 'forgesmith',
+                times_seen INTEGER DEFAULT 1,
+                times_injected INTEGER DEFAULT 0,
+                effectiveness_score REAL,
+                active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
             )
         """)
         conn.execute("""
@@ -704,6 +730,48 @@ def ensure_schema():
                 output_length INTEGER, success INTEGER NOT NULL DEFAULT 1,
                 error_type TEXT, error_summary TEXT, duration_ms INTEGER,
                 created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forgesmith_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                agent_runs_analyzed INTEGER DEFAULT 0,
+                changes_made INTEGER DEFAULT 0,
+                summary TEXT,
+                mode TEXT DEFAULT 'auto'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forgesmith_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                target_file TEXT,
+                old_value TEXT,
+                new_value TEXT,
+                rationale TEXT NOT NULL,
+                evidence TEXT,
+                effectiveness_score REAL,
+                reverted_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rubric_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_run_id INTEGER NOT NULL,
+                task_id INTEGER,
+                project_id INTEGER,
+                role TEXT NOT NULL,
+                rubric_version INTEGER DEFAULT 1,
+                criteria_scores TEXT NOT NULL,
+                total_score REAL NOT NULL,
+                max_possible REAL NOT NULL,
+                normalized_score REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
         conn.execute(

@@ -161,6 +161,8 @@ def test_ensure_schema_creates_table():
     def mock_get_db(write=False):
         return conn
 
+    import forge_orchestrator as _fo
+    _fo._SCHEMA_ENSURED = False
     with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
         ensure_schema()
 

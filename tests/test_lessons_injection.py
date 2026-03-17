@@ -24,6 +24,14 @@ from forge_orchestrator import (
 from forgesmith import get_relevant_lessons
 
 
+def setup_module(module):
+    """Pytest hook: set up test data before any test in this module."""
+    import forge_orchestrator
+    forge_orchestrator._SCHEMA_ENSURED = False
+    forge_orchestrator.ensure_schema()
+    setup_test_data()
+
+
 def setup_test_data():
     """Insert test lessons into lessons_learned table."""
     conn = sqlite3.connect(THEFORGE_DB)

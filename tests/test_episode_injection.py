@@ -47,6 +47,13 @@ def get_db_connection(write=False):
     return conn
 
 
+def setup_module(module):
+    """Pytest hook: set up test data before any test in this module."""
+    import forge_orchestrator
+    forge_orchestrator._SCHEMA_ENSURED = False
+    setup_test_data()
+
+
 def setup_test_data():
     """Insert test episodes into agent_episodes table."""
     ensure_schema()
