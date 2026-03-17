@@ -69,6 +69,12 @@ try:
     )
 except ImportError:
     # Fallback stubs — no sanitization if module unavailable
+    import logging as _sanitizer_logging
+    _sanitizer_logging.warning(
+        "SECURITY: lesson_sanitizer import failed — prompt sanitization DISABLED. "
+        "Lessons injected into agent prompts will NOT be sanitized against prompt injection."
+    )
+    del _sanitizer_logging
     def sanitize_lesson_content(text):
         return text or ""
     def sanitize_error_signature(sig):
