@@ -1751,6 +1751,11 @@ def compact_agent_output(raw_output, max_words=200):
         "REFLECTION": _extract_section(raw_output, "REFLECTION", max_lines=3),
     }
 
+    # Sanitize all extracted sections to prevent cross-agent prompt injection (PS-02)
+    for key in sections:
+        if sections[key]:
+            sections[key] = sanitize_lesson_content(sections[key])
+
     parts = []
     if sections["SUMMARY"]:
         parts.append(sections["SUMMARY"])
@@ -2431,7 +2436,8 @@ def build_checkpoint_context(checkpoint_text, attempt):
         f"Start writing code IMMEDIATELY. Your FIRST tool call must be Edit or Write — "
         f"not Read, not Glob, not Grep. You have the previous agent's summary below. "
         f"Use it to skip exploration entirely and go straight to implementation.\n\n"
-        f"### Previous Agent Summary:\n{compacted}\n\n"
+        f"### Previous Agent Summary:\n"
+        f"<task-input type=\"checkpoint\" trust=\"agent-output\">\n{compacted}\n</task-input>\n\n"
         f"**CRITICAL:** Do NOT repeat the previous agent's exploration. Do NOT re-read "
         f"files they already read. Do NOT analyze the codebase from scratch. Look at "
         f"what remains to be done and START CODING in your FIRST turn.\n\n"
