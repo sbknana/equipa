@@ -255,8 +255,9 @@ class TestRubricScoring(unittest.TestCase):
         # 38/40 = 95%, which gets 75% of weight = 0.75 * 2 = 1.5 according to code
         self.assertLess(scores["turns_efficiency"], 2)  # Not full score
 
-        # Has RESULT block, should still get output_compliance
-        self.assertEqual(scores["output_compliance"], 2)
+        # Has RESULT block, should still get output_compliance (from config)
+        dev_rubric = cfg.get("rubric_definitions", {}).get("developer", {})
+        self.assertEqual(scores["output_compliance"], dev_rubric.get("output_compliance", 2))
 
     def test_score_tester_pass(self):
         """Test scoring a tester run with passing tests."""
