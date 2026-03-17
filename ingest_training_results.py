@@ -4,8 +4,8 @@ Scans ${PROJECT_BASE_DIR}/training-results/ for unprocessed completion
 marker JSON files, inserts records into model_registry via TheForge SQLite,
 and moves processed markers to ./processed/.
 
-Designed to run as a nightly cron job on Claudinator:
-  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/Equipa/ingest_training_results.py
+Designed to run as a nightly cron job:
+  0 6 * * * /usr/bin/python3 $EQUIPA_BASE/ingest_training_results.py
 
 Can also be run manually:
   python ingest_training_results.py
@@ -25,11 +25,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Default paths
-DEFAULT_RESULTS_DIR = "${PROJECT_BASE_DIR}/training-results"
+# Default paths — resolved from env vars, fallback to script-relative
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_RESULTS_DIR = os.environ.get(
+    "TRAINING_RESULTS_DIR",
+    str(_SCRIPT_DIR.parent / "training-results"),
+)
 DEFAULT_DB_PATH = os.environ.get(
     "THEFORGE_DB",
-    "${PROJECT_BASE_DIR}/Equipa/theforge.db",
+    str(_SCRIPT_DIR / "theforge.db"),
 )
 
 # Project ID for cryptotrader-v2 in TheForge
