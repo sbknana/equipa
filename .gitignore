@@ -13,6 +13,7 @@ mcp_config.json
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Python
 __pycache__/
