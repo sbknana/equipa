@@ -20,8 +20,8 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-# Add parent dir to path to import forgesmith
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path to import forgesmith
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import forgesmith
 

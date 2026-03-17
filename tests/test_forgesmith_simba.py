@@ -20,8 +20,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from forgesmith_simba import (
     find_high_variance_episodes,

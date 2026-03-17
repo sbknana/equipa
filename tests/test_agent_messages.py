@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 # Add project root to path so we can import the orchestrator module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import forge_orchestrator
 

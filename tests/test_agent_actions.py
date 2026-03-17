@@ -17,8 +17,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from forge_orchestrator import (
     classify_error,

@@ -10,8 +10,8 @@ Copyright 2026 Forgeborn.
 import sys
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lesson_sanitizer import (
     sanitize_lesson_content,

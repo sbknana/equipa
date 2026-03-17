@@ -19,7 +19,7 @@ from pathlib import Path
 
 def test_task_type_field_exists():
     """Test that task_type field exists in tasks table with 'feature' default."""
-    db_path = Path(__file__).parent / "theforge.db"
+    db_path = Path(__file__).parent.parent / "theforge.db"
     if not db_path.exists():
         # Database not available locally, skip gracefully
         return
@@ -43,7 +43,7 @@ def test_task_type_field_exists():
 
 def test_dispatch_config_has_all_prompts():
     """Test that dispatch_config.json defines all 4 required task types."""
-    config_path = Path(__file__).parent / "dispatch_config.json"
+    config_path = Path(__file__).parent.parent / "dispatch_config.json"
     assert config_path.exists(), "dispatch_config.json not found"
 
     with open(config_path, 'r') as f:
@@ -63,7 +63,7 @@ def test_dispatch_config_has_all_prompts():
 
 def test_prompt_content_matches_spec():
     """Test that prompt content matches the acceptance criteria."""
-    config_path = Path(__file__).parent / "dispatch_config.json"
+    config_path = Path(__file__).parent.parent / "dispatch_config.json"
     with open(config_path, 'r') as f:
         config = json.load(f)
 
@@ -92,7 +92,7 @@ def test_prompt_content_matches_spec():
 
 def test_orchestrator_injection_logic():
     """Test that orchestrator has correct injection logic."""
-    orch_path = Path(__file__).parent / "forge_orchestrator.py"
+    orch_path = Path(__file__).parent.parent / "forge_orchestrator.py"
     assert orch_path.exists(), "forge_orchestrator.py not found"
 
     with open(orch_path, 'r') as f:

@@ -81,7 +81,7 @@ import tempfile
 from pathlib import Path
 
 # Add project root to path so we can import the orchestrator module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from forge_orchestrator import (
     _check_git_changes,
@@ -1080,7 +1080,9 @@ def test_preflight_skip_keywords_exist():
 
 def _read_prompt(role):
     """Helper: read a role prompt template file and return its contents."""
-    prompt_path = Path(__file__).parent / "prompts" / f"{role}.md"
+    # Prompts live at repo root: <repo>/prompts/<role>.md
+    # Tests live at: <repo>/tests/test_early_termination.py
+    prompt_path = Path(__file__).parent.parent / "prompts" / f"{role}.md"
     assert prompt_path.exists(), f"prompt file not found: {prompt_path}"
     return prompt_path.read_text(encoding="utf-8")
 

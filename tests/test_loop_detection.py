@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 # Add project root to path so we can import the orchestrator module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import the classes and functions we need to test
 from forge_orchestrator import (
