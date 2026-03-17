@@ -22,7 +22,7 @@ from pathlib import Path
 
 # --- Config ---
 
-DEFAULT_BASE_URL = "http://localhost:11434"
+DEFAULT_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_MODEL = "qwen3.5:27b"
 DEFAULT_MAX_TURNS = 25
 REQUEST_TIMEOUT = 300  # 5 minutes per LLM call

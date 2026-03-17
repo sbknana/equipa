@@ -462,7 +462,7 @@ def _insert_v1_data(conn):
     artifacts = [
         (1, "db_migrate.py", "python",
          "def run_migrations(db_path): ...",
-         "Database migration runner", "REDACTED_LOCAL_PATH/Equipa/db_migrate.py", "1.0"),
+         "Database migration runner", "db_migrate.py", "1.0"),
         (2, "pricing-engine.ts", "typescript",
          "export function calculatePrice(card: Card): number { ... }",
          "Dynamic card pricing", "src/lib/pricing-engine.ts", "0.1"),
