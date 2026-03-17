@@ -6472,6 +6472,8 @@ async def async_main():
                         help="Auto-scan projects and dispatch work by priority")
     group.add_argument("--add-project", type=str, metavar="NAME",
                         help="Register a new project in EQUIPA DB and config")
+    group.add_argument("--regenerate-manifest", action="store_true",
+                        help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
 
     parser.add_argument("--project-dir", type=str, metavar="PATH",
                         help="Project directory (used with --add-project)")
@@ -6503,8 +6505,6 @@ async def async_main():
                         help="Force provider for all agents (default: from dispatch config)")
     parser.add_argument("--dry-run", action="store_true", help="Print command without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
-    parser.add_argument("--regenerate-manifest", action="store_true",
-                        help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
 
     args = parser.parse_args()
 
