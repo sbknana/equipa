@@ -35,21 +35,22 @@ from pathlib import Path
 
 
 def is_on_claudinator() -> bool:
-    """Detect if we're running on Claudinator already."""
-    return Path("${PROJECT_BASE_DIR}/Equipa").exists()
+    """Detect if we're running on the primary server (EQUIPA_BASE exists)."""
+    equipa_base = os.environ.get("EQUIPA_BASE", str(Path(__file__).resolve().parent))
+    return Path(equipa_base).exists()
 
 
 # --- Config ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 BACKUP_DIR = SCRIPT_DIR / ".autoresearch-backups"
-CLAUDINATOR = "user@YOUR_HOST"
-SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
-REMOTE_PROMPTS = "${PROJECT_BASE_DIR}/Equipa/prompts"
-REMOTE_ORCHESTRATOR = "${PROJECT_BASE_DIR}/Equipa/forge_orchestrator.py"
+CLAUDINATOR = os.environ.get("SSH_USER", "user") + "@" + os.environ.get("CLAUDINATOR_HOST", "YOUR_HOST")
+SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY_PATH", "~/.ssh/id_ed25519"))
+REMOTE_PROMPTS = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR)) + "/prompts"
+REMOTE_ORCHESTRATOR = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR)) + "/forge_orchestrator.py"
 # The orchestrator reads/writes its OWN copy at Equipa/theforge.db.
 # We MUST use the same DB so tasks and agent_runs are visible to the orchestrator.
-REMOTE_DB = "${PROJECT_BASE_DIR}/Equipa/theforge.db"
+REMOTE_DB = os.environ.get("THEFORGE_DB", str(SCRIPT_DIR / "theforge.db"))
 THEFORGE_DB = REMOTE_DB
 
 # Project dirs that need git reset between rounds.
