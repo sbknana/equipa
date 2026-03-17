@@ -23,12 +23,7 @@
             "opus"
         ]
     },
-    "protected_files": [
-        "_common.md",
-        "forge_orchestrator.py",
-        "forgesmith.py",
-        "forgesmith_config.json"
-    ],
+    "protected_files": [],
     "backup_dir": ".forgesmith-backups",
     "max_backups": 30,
     "rollback_threshold": -0.3,
@@ -36,18 +31,18 @@
     "forgesmith_project_id": 28,
     "rubric_definitions": {
         "developer": {
-            "result_success": 17.3,
+            "result_success": 5,
             "files_changed": 3,
             "tests_written": 3,
-            "turns_efficiency": 1.4,
-            "output_compliance": 1.4,
+            "turns_efficiency": 2,
+            "output_compliance": 2,
             "dependency_direction": 2,
             "separation_of_concerns": 2,
-            "error_handling": 2.6,
-            "naming_consistency": 2.6
+            "error_handling": 2,
+            "naming_consistency": 2
         },
         "tester": {
-            "tests_pass": 7.3,
+            "tests_pass": 5,
             "edge_cases": 3,
             "coverage_meaningful": 2,
             "false_positives": -2
@@ -85,7 +80,7 @@
         "min_sample_size": 10,
         "evolution_lookback_days": 30
     },
-    "rubric_version": 15,
+    "rubric_version": 1,
     "opro": {
         "enabled": true,
         "model": "sonnet",
