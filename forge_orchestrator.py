@@ -46,6 +46,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # Force unbuffered output so logs are visible in real-time via nohup/SSH
@@ -91,6 +92,25 @@ except ImportError:
     def quality_score_and_store(result_text, files_changed, role, agent_run_id,
                                 task_id, project_id, db_path=None):
         return None
+
+
+# --- Untrusted Content Isolation ---
+# Per-prompt random delimiter prevents injected content from closing its own
+# boundary.  Generated fresh each time a prompt is built so that malicious
+# content cannot predict or spoof the marker.  See EQ-24 / EQ-10 / EQ-25.
+
+def _make_untrusted_delimiter():
+    """Return a unique, unpredictable delimiter for untrusted content markers."""
+    return f"UNTRUSTED_{uuid.uuid4().hex[:8]}"
+
+
+def wrap_untrusted(content, delimiter):
+    """Wrap *content* in unpredictable untrusted-content markers.
+
+    The delimiter is generated once per prompt build and shared across all
+    injection sites so the agent sees a single, consistent boundary token.
+    """
+    return f"<<<{delimiter}>>>\n{content}\n<<<END_{delimiter}>>>"
 
 
 # --- Constants ---
@@ -1590,8 +1610,16 @@ def fetch_tasks_by_ids(task_ids):
 
 # --- Prompt Building ---
 
-def build_task_prompt(task, project_context, project_dir):
-    """Build the task-specific instruction block."""
+def build_task_prompt(task, project_context, project_dir, delimiter=None):
+    """Build the task-specific instruction block.
+
+    Args:
+        delimiter: Unpredictable boundary token from _make_untrusted_delimiter().
+            When provided, all database-sourced content is additionally wrapped
+            in <<<DELIMITER>>> ... <<<END_DELIMITER>>> markers so agents can
+            distinguish data from instructions even if <task-input> tags are
+            spoofed by injected content.
+    """
     # Task metadata (safe — controlled by orchestrator, not user input)
     lines = [
         "## Assigned Task",
@@ -1602,49 +1630,48 @@ def build_task_prompt(task, project_context, project_dir):
         "",
     ]
 
-    # Task title and description wrapped in isolation tags (security finding #4)
-    # These come from the database and could contain injection attempts
-    lines.append('<task-input type="task-title" trust="database">')
-    lines.append(task["title"])
-    lines.append("</task-input>")
+    # Helper: wrap content in both task-input tags AND unpredictable delimiter
+    def _wrap(tag_type, content):
+        inner = wrap_untrusted(content, delimiter) if delimiter else content
+        return f'<task-input type="{tag_type}" trust="database">\n{inner}\n</task-input>'
+
+    # Task title and description — from database, could contain injection
+    lines.append(_wrap("task-title", task["title"]))
     lines.append("")
-    lines.append('<task-input type="task-description" trust="database">')
-    lines.append(task.get("description", "No description provided"))
-    lines.append("</task-input>")
+    lines.append(_wrap("task-description", task.get("description", "No description provided")))
     lines.append("")
 
     # Project context also wrapped — comes from database
     session = project_context.get("last_session")
     if session:
-        lines.append("## Recent Project Context")
-        lines.append('<task-input type="session-context" trust="database">')
-        lines.append(f"Last session ({session.get('session_date', 'unknown')}):")
-        lines.append(session.get("summary", "No summary"))
+        ctx_lines = [f"Last session ({session.get('session_date', 'unknown')}):"]
+        ctx_lines.append(session.get("summary", "No summary"))
         if session.get("next_steps"):
-            lines.append(f"Next steps: {session['next_steps']}")
-        lines.append("</task-input>")
+            ctx_lines.append(f"Next steps: {session['next_steps']}")
+        lines.append("## Recent Project Context")
+        lines.append(_wrap("session-context", "\n".join(ctx_lines)))
         lines.append("")
 
     questions = project_context.get("open_questions", [])
     if questions:
-        lines.append("## Open Questions (unresolved)")
-        lines.append('<task-input type="open-questions" trust="database">')
+        q_lines = []
         for q in questions:
-            lines.append(f"- {q['question']}")
+            q_lines.append(f"- {q['question']}")
             if q.get("context"):
-                lines.append(f"  Context: {q['context']}")
-        lines.append("</task-input>")
+                q_lines.append(f"  Context: {q['context']}")
+        lines.append("## Open Questions (unresolved)")
+        lines.append(_wrap("open-questions", "\n".join(q_lines)))
         lines.append("")
 
     decisions = project_context.get("recent_decisions", [])
     if decisions:
-        lines.append("## Recent Decisions")
-        lines.append('<task-input type="decisions" trust="database">')
+        d_lines = []
         for d in decisions:
-            lines.append(f"- {d['decision']} ({d.get('decided_at', 'unknown')})")
+            d_lines.append(f"- {d['decision']} ({d.get('decided_at', 'unknown')})")
             if d.get("rationale"):
-                lines.append(f"  Rationale: {d['rationale']}")
-        lines.append("</task-input>")
+                d_lines.append(f"  Rationale: {d['rationale']}")
+        lines.append("## Recent Decisions")
+        lines.append(_wrap("decisions", "\n".join(d_lines)))
         lines.append("")
 
     return "\n".join(lines)
@@ -1804,23 +1831,25 @@ def _trim_prompt_section(prompt, section_heading, max_chars=None):
         return prompt[:start] + section + prompt[next_section:]
 
 
-def format_lessons_for_injection(lessons):
+def format_lessons_for_injection(lessons, delimiter=None):
     """Format lessons_learned for injection into agent prompts.
 
     Sanitizes each lesson's content before formatting to prevent prompt
     injection (PM-24, PM-28). Wraps the entire output in <task-input> tags
-    so agents treat lesson content as data, not instructions.
+    AND unpredictable delimiter markers so agents treat lesson content as
+    data, not instructions.
 
     Args:
         lessons: List of lesson dicts from get_relevant_lessons
+        delimiter: Unpredictable boundary token (from _make_untrusted_delimiter)
 
     Returns:
-        Formatted string with lessons wrapped in <task-input> tags.
+        Formatted string with lessons wrapped in isolation markers.
     """
     if not lessons:
         return ""
 
-    lines = ["## Lessons from Previous Runs", ""]
+    lines = []
     for lesson in lessons:
         # Sanitize lesson text before injecting into prompt
         safe_lesson = sanitize_lesson_content(lesson['lesson'])
@@ -1835,7 +1864,16 @@ def format_lessons_for_injection(lessons):
     formatted = "\n".join(lines)
 
     # Wrap in task-input tags so agents treat this as data (PM-24)
-    return wrap_lessons_in_task_input(formatted)
+    wrapped = wrap_lessons_in_task_input(formatted)
+
+    # Add unpredictable delimiter for defense-in-depth (EQ-24)
+    if delimiter and wrapped:
+        header = "## Lessons from Previous Runs\n"
+        # The wrap_lessons_in_task_input already includes the header,
+        # so wrap the entire output with the delimiter
+        wrapped = f'<task-input type="lessons" trust="derived">\n{wrap_untrusted(wrapped, delimiter)}\n</task-input>'
+
+    return wrapped
 
 
 def update_lesson_injection_count(lesson_ids):
@@ -1977,14 +2015,16 @@ def get_relevant_episodes(role, project_id, task_type=None, min_q_value=0.3, lim
         return []
 
 
-def format_episodes_for_injection(episodes):
+def format_episodes_for_injection(episodes, delimiter=None):
     """Format agent episodes for injection into agent prompts.
 
     Args:
         episodes: List of episode dicts from get_relevant_episodes
+        delimiter: Unpredictable boundary token (from _make_untrusted_delimiter)
 
     Returns:
-        Formatted string under "## Past Experience" heading (2-3 sentences each)
+        Formatted string under "## Past Experience" heading (2-3 sentences each),
+        wrapped in untrusted content markers when delimiter is provided.
     """
     if not episodes:
         return ""
@@ -2004,7 +2044,18 @@ def format_episodes_for_injection(episodes):
             f"Outcome: {outcome}. Lesson: {reflection}"
         )
 
-    return "\n".join(lines)
+    formatted = "\n".join(lines)
+
+    # Wrap in unpredictable delimiter for defense-in-depth (EQ-24)
+    if delimiter:
+        formatted = (
+            f"## Past Experience\n\n"
+            f'<task-input type="episodes" trust="derived">\n'
+            f"{wrap_untrusted(chr(10).join(lines[2:]), delimiter)}\n"
+            f"</task-input>"
+        )
+
+    return formatted
 
 
 def update_episode_injection_count(episode_ids):
@@ -2141,6 +2192,11 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     # Track which version was used for telemetry
     _last_prompt_version[role] = prompt_version
 
+    # Generate a per-prompt unpredictable delimiter for untrusted content
+    # isolation.  This prevents injected content from spoofing or closing
+    # its own boundary markers (addresses EQ-24, EQ-10, EQ-25).
+    _untrusted_delimiter = _make_untrusted_delimiter()
+
     # Build prompt: common rules + role-specific prompt (never trimmed)
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
@@ -2156,7 +2212,7 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     if lessons:
         # Deduplicate: remove 60%+ word overlap, cap at 5
         lessons = deduplicate_lessons(lessons)
-        lessons_text = format_lessons_for_injection(lessons)
+        lessons_text = format_lessons_for_injection(lessons, delimiter=_untrusted_delimiter)
         prompt = prompt + "\n\n" + lessons_text
         # Update times_injected counter for each lesson
         update_lesson_injection_count([l["id"] for l in lessons])
@@ -2180,7 +2236,7 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
             task_description=task_description,
         )
         if episodes:
-            episodes_text = format_episodes_for_injection(episodes)
+            episodes_text = format_episodes_for_injection(episodes, delimiter=_untrusted_delimiter)
             prompt = prompt + "\n\n" + episodes_text
             # Track injected episode IDs for q-value updates after task completion
             ep_ids = [ep["id"] for ep in episodes]
@@ -2199,7 +2255,7 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
             )
 
     # Append task-specific instructions (never trimmed)
-    task_prompt = build_task_prompt(task, project_context, project_dir)
+    task_prompt = build_task_prompt(task, project_context, project_dir, delimiter=_untrusted_delimiter)
     prompt = prompt + "\n\n---\n\n" + task_prompt
 
     # Append task-type supplement after task prompt
@@ -4772,13 +4828,19 @@ def build_planner_prompt(goal, project_id, project_dir, project_context):
     prompt = template.replace("{project_id}", str(project_id))
     prompt = prompt.replace("{task_id}", "N/A")
 
+    # Per-prompt unpredictable delimiter for untrusted content isolation
+    _delim = _make_untrusted_delimiter()
+
+    # Helper: wrap content in both task-input tags AND unpredictable delimiter
+    def _wrap(tag_type, content):
+        inner = wrap_untrusted(content, _delim)
+        return f'<task-input type="{tag_type}" trust="user">\n{inner}\n</task-input>'
+
     # Append goal and project context
     lines = [
         "## Goal",
         "",
-        '<task-input type="goal" trust="user">',
-        goal,
-        "</task-input>",
+        _wrap("goal", goal),
         "",
         f"## Project Info",
         f"- **Project ID:** {project_id}",
@@ -4789,22 +4851,19 @@ def build_planner_prompt(goal, project_id, project_dir, project_context):
     # Add project context
     session = project_context.get("last_session")
     if session:
-        lines.append("## Recent Project Context")
-        lines.append('<task-input type="session-context" trust="database">')
-        lines.append(f"Last session ({session.get('session_date', 'unknown')}):")
-        lines.append(session.get("summary", "No summary"))
+        ctx_parts = [f"Last session ({session.get('session_date', 'unknown')}):"]
+        ctx_parts.append(session.get("summary", "No summary"))
         if session.get("next_steps"):
-            lines.append(f"Next steps: {session['next_steps']}")
-        lines.append("</task-input>")
+            ctx_parts.append(f"Next steps: {session['next_steps']}")
+        lines.append("## Recent Project Context")
+        lines.append(_wrap("session-context", "\n".join(ctx_parts)))
         lines.append("")
 
     questions = project_context.get("open_questions", [])
     if questions:
+        q_lines = [f"- {q['question']}" for q in questions]
         lines.append("## Open Questions (unresolved)")
-        lines.append('<task-input type="open-questions" trust="database">')
-        for q in questions:
-            lines.append(f"- {q['question']}")
-        lines.append("</task-input>")
+        lines.append(_wrap("open-questions", "\n".join(q_lines)))
         lines.append("")
 
     prompt = prompt + "\n\n---\n\n" + "\n".join(lines)
@@ -4828,12 +4887,17 @@ def build_evaluator_prompt(goal, project_id, project_dir, project_context,
     prompt = template.replace("{project_id}", str(project_id))
     prompt = prompt.replace("{task_id}", "N/A")
 
+    # Per-prompt unpredictable delimiter for untrusted content isolation
+    _delim = _make_untrusted_delimiter()
+
+    def _wrap(tag_type, content, trust="user"):
+        inner = wrap_untrusted(content, _delim)
+        return f'<task-input type="{tag_type}" trust="{trust}">\n{inner}\n</task-input>'
+
     lines = [
         "## Original Goal",
         "",
-        '<task-input type="goal" trust="user">',
-        goal,
-        "</task-input>",
+        _wrap("goal", goal),
         "",
         f"## Project Info",
         f"- **Project ID:** {project_id}",
@@ -4841,18 +4905,22 @@ def build_evaluator_prompt(goal, project_id, project_dir, project_context,
         "",
     ]
 
-    # Show completed tasks
+    # Show completed tasks — task titles/descriptions come from DB
     if completed_tasks:
-        lines.append("## Completed Tasks")
+        ct_lines = []
         for t in completed_tasks:
-            lines.append(f"- **#{t['id']}** {t['title']} — {t.get('description', 'No description')[:200]}")
+            ct_lines.append(f"- **#{t['id']}** {t['title']} — {t.get('description', 'No description')[:200]}")
+        lines.append("## Completed Tasks")
+        lines.append(_wrap("completed-tasks", "\n".join(ct_lines), trust="database"))
         lines.append("")
 
-    # Show blocked tasks
+    # Show blocked tasks — task titles/descriptions come from DB
     if blocked_tasks:
-        lines.append("## Blocked Tasks")
+        bt_lines = []
         for t in blocked_tasks:
-            lines.append(f"- **#{t['id']}** {t['title']} — {t.get('description', 'No description')[:200]}")
+            bt_lines.append(f"- **#{t['id']}** {t['title']} — {t.get('description', 'No description')[:200]}")
+        lines.append("## Blocked Tasks")
+        lines.append(_wrap("blocked-tasks", "\n".join(bt_lines), trust="database"))
         lines.append("")
 
     if not completed_tasks and not blocked_tasks:
