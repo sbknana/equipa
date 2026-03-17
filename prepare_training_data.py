@@ -12,7 +12,7 @@ Sources:
     4. sahil2801/CodeAlpaca-20k + nickrosh/Evol-Instruct-Code-80k-v1 — diverse tasks
 
 Usage:
-    REDACTED_VENV/bin/python prepare_training_data.py --max-total 100000
+    python prepare_training_data.py --max-total 100000
 """
 
 import json
@@ -299,7 +299,7 @@ def proc_swe(mx=20000):
 
 def main():
     pa = argparse.ArgumentParser(description="Prepare ForgeSmith training data")
-    pa.add_argument("--output-dir", default="REDACTED_TRAINING_DIR")
+    pa.add_argument("--output-dir", default=os.environ.get("FORGESMITH_DATA_DIR", "forgesmith_output"))
     pa.add_argument("--max-total", type=int, default=100000)
     pa.add_argument("--eval-ratio", type=float, default=0.05)
     pa.add_argument("--seed", type=int, default=42)

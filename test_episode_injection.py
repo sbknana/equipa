@@ -399,7 +399,7 @@ def test_build_system_prompt_with_episodes():
     project_context = {
         "title": "EQUIPA",
         "description": "Multi-agent orchestration system",
-        "working_directory": "/home/user/projects/example",
+        "working_directory": "/tmp/test-projects/example",
     }
 
     # Clear tracking dict before test
@@ -409,7 +409,7 @@ def test_build_system_prompt_with_episodes():
     prompt = build_system_prompt(
         task=task,
         project_context=project_context,
-        project_dir="/home/user/projects/example",
+        project_dir="/tmp/test-projects/example",
         role="developer",
     )
 
