@@ -1,0 +1,6 @@
+{
+  "_comment": "Set PROJECT_BASE_DIR env var to your project root, or use absolute paths below.",
+  "project_dirs": {
+    "myproject": "$PROJECT_BASE_DIR/MyProject"
+  }
+}

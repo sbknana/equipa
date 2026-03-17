@@ -128,6 +128,7 @@ DEFAULT_ROLE_TURNS = {
     "integration-tester": 20,
     "debugger": 30,
     "code-reviewer": 20,
+    "qa-tester": 25,
 }
 
 # Checkpoint/Resume: save agent output on timeout for continuation
@@ -158,6 +159,7 @@ DEFAULT_ROLE_MODELS = {
     "integration-tester": "sonnet",
     "debugger": "opus",
     "code-reviewer": "sonnet",
+    "qa-tester": "sonnet",
 }
 
 # Dev+Tester loop constants
@@ -324,7 +326,16 @@ def load_config():
     if "theforge_db" in cfg:
         THEFORGE_DB = Path(cfg["theforge_db"])
     if "project_dirs" in cfg:
-        PROJECT_DIRS = {k.lower(): v for k, v in cfg["project_dirs"].items()}
+        # Support PROJECT_BASE_DIR env var: if a project path starts with
+        # $PROJECT_BASE_DIR/, resolve it against the env var value.
+        base_dir = os.environ.get("PROJECT_BASE_DIR", "")
+        raw_dirs = cfg["project_dirs"]
+        resolved = {}
+        for k, v in raw_dirs.items():
+            if base_dir and v.startswith("$PROJECT_BASE_DIR/"):
+                v = v.replace("$PROJECT_BASE_DIR", base_dir, 1)
+            resolved[k.lower()] = v
+        PROJECT_DIRS = resolved
     if "github_owner" in cfg:
         GITHUB_OWNER = cfg["github_owner"]
     if "mcp_config" in cfg:

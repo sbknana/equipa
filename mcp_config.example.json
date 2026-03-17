@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "theforge": {
+      "type": "stdio",
+      "command": "REPLACE_WITH_UVX_PATH",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "theforge.db"
+      ]
+    }
+  }
+}
