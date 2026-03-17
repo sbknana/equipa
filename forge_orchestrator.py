@@ -209,6 +209,99 @@ COST_LIMITS = {
 }
 COST_ESTIMATE_PER_TURN = 0.15  # estimated cost per turn when actual cost is None (killed runs)
 
+# Skill integrity verification: SHA-256 manifest of all prompt and skill files
+SKILL_MANIFEST_FILE = Path(__file__).parent / "skill_manifest.json"
+
+
+def generate_skill_manifest():
+    """Scan all prompt and skill .md files and return a dict of {relative_path: sha256_hex}.
+
+    Used by --regenerate-manifest to create/update skill_manifest.json.
+    """
+    base_dir = Path(__file__).parent
+    manifest = {}
+
+    # Collect all .md files from prompts/ and skills/
+    for search_dir in [PROMPTS_DIR, SKILLS_BASE_DIR]:
+        if not search_dir.is_dir():
+            continue
+        for md_file in sorted(search_dir.rglob("*.md")):
+            rel_path = str(md_file.relative_to(base_dir))
+            file_hash = hashlib.sha256(md_file.read_bytes()).hexdigest()
+            manifest[rel_path] = file_hash
+
+    return manifest
+
+
+def write_skill_manifest():
+    """Generate and write skill_manifest.json to the repo root."""
+    manifest = generate_skill_manifest()
+    manifest_data = {
+        "version": 1,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "description": "SHA-256 hashes of prompt and skill files for integrity verification",
+        "files": manifest,
+    }
+    SKILL_MANIFEST_FILE.write_text(
+        json.dumps(manifest_data, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {len(manifest)} file hashes to {SKILL_MANIFEST_FILE}")
+    return manifest_data
+
+
+def verify_skill_integrity():
+    """Verify all prompt and skill files match known-good SHA-256 hashes.
+
+    Returns True if verification passes (or manifest is missing for backward compat).
+    Returns False if any file has been tampered with or is missing.
+    """
+    if not SKILL_MANIFEST_FILE.exists():
+        print("WARNING: skill_manifest.json not found — skipping integrity check "
+              "(generate with --regenerate-manifest)")
+        return True  # backward compat: missing manifest is not a blocker
+
+    try:
+        manifest_data = json.loads(SKILL_MANIFEST_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"CRITICAL: Failed to load skill_manifest.json: {e}")
+        return False
+
+    expected_files = manifest_data.get("files", {})
+    if not expected_files:
+        print("CRITICAL: skill_manifest.json contains no file entries — refusing to dispatch")
+        return False
+
+    base_dir = Path(__file__).parent
+    mismatches = []
+    missing = []
+
+    for rel_path, expected_hash in expected_files.items():
+        file_path = base_dir / rel_path
+        if not file_path.exists():
+            missing.append(rel_path)
+            continue
+        actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            mismatches.append(rel_path)
+
+    if missing:
+        print(f"CRITICAL: Skill integrity check FAILED — {len(missing)} file(s) missing:")
+        for f in missing:
+            print(f"  MISSING: {f}")
+
+    if mismatches:
+        print(f"CRITICAL: Skill integrity check FAILED — {len(mismatches)} file(s) modified:")
+        for f in mismatches:
+            print(f"  TAMPERED: {f}")
+
+    if missing or mismatches:
+        print("CRITICAL: Agent dispatch BLOCKED — skill files do not match manifest. "
+              "If changes are intentional, run: python forge_orchestrator.py --regenerate-manifest")
+        return False
+
+    return True
+
 
 def _accumulate_cost(result, label=None, output=None):
     """Extract cost from an agent result, estimating if actual cost is None.
@@ -3889,6 +3982,16 @@ async def dispatch_agent(cmd, role, output, max_turns, task_id, cycle,
 
     Returns the same result dict format regardless of provider.
     """
+    # Security: verify skill file integrity before building any agent prompt
+    if not verify_skill_integrity():
+        return {
+            "result": "blocked",
+            "output": "CRITICAL: Skill integrity verification failed — agent dispatch refused. "
+                      "Run --regenerate-manifest if changes are intentional.",
+            "cost": 0,
+            "duration": 0,
+        }
+
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
     provider_override = getattr(args, "provider", None) if args else None
 
@@ -6400,6 +6503,8 @@ async def async_main():
                         help="Force provider for all agents (default: from dispatch config)")
     parser.add_argument("--dry-run", action="store_true", help="Print command without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    parser.add_argument("--regenerate-manifest", action="store_true",
+                        help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
 
     args = parser.parse_args()
 
@@ -6419,6 +6524,11 @@ async def async_main():
 
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
+
+    # --- Regenerate skill manifest mode ---
+    if args.regenerate_manifest:
+        write_skill_manifest()
+        return
 
     # --- Add project mode ---
     if args.add_project:
