@@ -1080,7 +1080,8 @@ def test_preflight_skip_keywords_exist():
 
 def _read_prompt(role):
     """Helper: read a role prompt template file and return its contents."""
-    prompt_path = Path(__file__).parent / "prompts" / f"{role}.md"
+    # Prompt files live at repo root: prompts/<role>.md (one level above tests/)
+    prompt_path = Path(__file__).parent.parent / "prompts" / f"{role}.md"
     assert prompt_path.exists(), f"prompt file not found: {prompt_path}"
     return prompt_path.read_text(encoding="utf-8")
 
