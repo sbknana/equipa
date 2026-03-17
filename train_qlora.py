@@ -5,7 +5,7 @@ EQUIPA QLoRA Training Script
 Fine-tunes Qwen3.5 models using Unsloth for EQUIPA agent improvement.
 
 Usage:
-    # Activate env first: source REDACTED_VENV/bin/activate
+    # Activate env first: source $QLORA_ENV/bin/activate
     python3 train_qlora.py --model qwen3.5-35b-a3b  # MoE (17.5GB VRAM)
     python3 train_qlora.py --model qwen3.5-27b       # Dense (22GB VRAM)
 

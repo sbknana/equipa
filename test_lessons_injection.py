@@ -159,14 +159,14 @@ def test_build_system_prompt_with_lessons():
     project_context = {
         "title": "Test Project",
         "description": "Test project context",
-        "working_directory": "/home/user/projects/example",
+        "working_directory": "/tmp/test-projects/example",
     }
 
     # Build prompt with lessons (developer role, timeout error)
     prompt = build_system_prompt(
         task=task,
         project_context=project_context,
-        project_dir="/home/user/projects/example",
+        project_dir="/tmp/test-projects/example",
         role="developer",
         error_type="timeout",
     )

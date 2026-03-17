@@ -6,7 +6,7 @@ Fine-tunes Qwen models using QLoRA via HuggingFace PEFT + TRL.
 No Unsloth dependency — works on any CUDA GPU including Pascal (sm_61).
 
 Usage:
-    source REDACTED_VENV/bin/activate
+    source $QLORA_ENV/bin/activate  # Set QLORA_ENV to your venv path
     TORCHDYNAMO_DISABLE=1 python3 train_qlora_peft.py --model qwen3.5-9b
     TORCHDYNAMO_DISABLE=1 python3 train_qlora_peft.py --model qwen2.5-coder-7b
 
@@ -61,8 +61,8 @@ VRAM_CONFIGS = {
     },
 }
 
-TRAINING_DATA_DIR = "REDACTED_TRAINING_DIR"
-OUTPUT_DIR = "REDACTED_TRAINING_DIR/output"
+TRAINING_DATA_DIR = os.environ.get("FORGESMITH_DATA_DIR", "/tmp/forgesmith")
+OUTPUT_DIR = os.environ.get("FORGESMITH_OUTPUT_DIR", "/tmp/forgesmith/output")
 
 
 def main():

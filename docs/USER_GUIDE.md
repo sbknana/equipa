@@ -734,7 +734,7 @@ Auto-run or `--project` mode found no tasks with status `todo`.
 1. Ensure `uv` is installed: `pip install uv`
 2. Test manually: `uvx mcp-server-sqlite --db-path /path/to/theforge.db`
 3. Check `mcp_config.json` has the correct database path
-4. On Linux, use the absolute path: `uvx`
+4. On Linux, use the absolute path to `uvx` (e.g., set `UVX_PATH` env var or update `mcp_config.json`)
 
 ### Tests fail but code looks correct
 

@@ -55,7 +55,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 
 # --- Config ---
 SCRIPT_DIR = Path(__file__).parent
-THEFORGE_DB = SCRIPT_DIR.parent / "TheForge" / "theforge.db"
+THEFORGE_DB = Path(os.environ.get("THEFORGE_DB", str(SCRIPT_DIR / "theforge.db")))
 ORCHESTRATOR = SCRIPT_DIR / "forge_orchestrator.py"
 EXPORT_DIR = SCRIPT_DIR / ".arena-exports"
 LOG_DIR = SCRIPT_DIR / ".arena-logs"

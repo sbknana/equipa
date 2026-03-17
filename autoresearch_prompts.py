@@ -379,7 +379,7 @@ def sync_to_claudinator():
     ssh_user = os.environ.get("SSH_USER", "user")
     claudinator_host = os.environ.get("CLAUDINATOR_HOST")
     ssh_key = os.environ.get("SSH_KEY_PATH", "~/.ssh/id_ed25519")
-    remote_base = os.environ.get("EQUIPA_BASE", "REDACTED_EQUIPA_DIR")
+    remote_base = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR))
 
     if not claudinator_host:
         print("\n  SKIP: CLAUDINATOR_HOST not set, cannot sync remotely")

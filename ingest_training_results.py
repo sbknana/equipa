@@ -1,6 +1,6 @@
 """Training Results Auto-Ingest Script.
 
-Scans ${PROJECT_BASE_DIR}/training-results/ for unprocessed completion
+Scans the training results directory (TRAINING_RESULTS_DIR env var) for unprocessed completion
 marker JSON files, inserts records into model_registry via TheForge SQLite,
 and moves processed markers to ./processed/.
 
@@ -216,7 +216,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Cron setup (nightly at 6 AM):
-  0 6 * * * /usr/bin/python3 ${PROJECT_BASE_DIR}/Equipa/ingest_training_results.py >> /var/log/training-ingest.log 2>&1
+  0 6 * * * /usr/bin/python3 $EQUIPA_BASE/ingest_training_results.py >> /var/log/training-ingest.log 2>&1
 
 Environment variables:
   THEFORGE_DB  Override the default TheForge database path
