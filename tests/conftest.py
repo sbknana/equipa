@@ -1,25 +1,20 @@
-<<<<<<< HEAD
 #!/usr/bin/env python3
 """Shared pytest fixtures for EQUIPA test suite.
 
 Ensures database schema is created before any test runs by executing
 schema.sql with CREATE TABLE IF NOT EXISTS semantics.
-=======
-"""Shared pytest fixtures for EQUIPA test suite.
-
-Ensures database schema exists before each test module that needs it.
-Some tests create temp DBs and reset _SCHEMA_ENSURED, so this fixture
-runs at module scope to re-create tables when needed.
->>>>>>> forge-task-1504
+Some tests create temp DBs and reset _SCHEMA_ENSURED, so the module-scope
+fixture re-creates tables when needed.
 
 Copyright 2026 Forgeborn
 """
 
-<<<<<<< HEAD
 import re
 import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add parent directory (repo root) to path for imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,8 +24,8 @@ sys.path.insert(0, str(REPO_ROOT))
 def _ensure_full_schema():
     """Apply schema.sql to the test database, creating any missing tables.
 
-    Converts CREATE TABLE → CREATE TABLE IF NOT EXISTS and
-    CREATE VIEW → CREATE VIEW IF NOT EXISTS so this is idempotent.
+    Converts CREATE TABLE to CREATE TABLE IF NOT EXISTS and
+    CREATE VIEW to CREATE VIEW IF NOT EXISTS so this is idempotent.
     CREATE INDEX already uses IF NOT EXISTS in the schema file.
     """
     from forge_orchestrator import THEFORGE_DB
@@ -100,11 +95,17 @@ def pytest_configure(config):
     _ensure_full_schema()
 
 
-def pytest_collection_modifyitems(session, config, items):
-    """After collection, call setup_test_data() for modules that define it.
+@pytest.fixture(autouse=True, scope="module")
+def ensure_test_db_schema():
+    """Re-create schema per module for tests that swap THEFORGE_DB."""
+    import forge_orchestrator
 
-    This replaces the manual setup that was done in each module's run_all_tests().
-    """
+    forge_orchestrator._SCHEMA_ENSURED = False
+    forge_orchestrator.ensure_schema()
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """After collection, call setup_test_data() for modules that define it."""
     setup_modules = set()
     for item in items:
         module = item.module
@@ -114,28 +115,3 @@ def pytest_collection_modifyitems(session, config, items):
             except Exception as e:
                 print(f"  [conftest] WARNING: setup_test_data() failed for {module.__name__}: {e}")
             setup_modules.add(module)
-=======
-import sys
-from pathlib import Path
-
-import pytest
-
-# Add project root to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-
-@pytest.fixture(autouse=True, scope="module")
-def ensure_test_db_schema():
-    """Create all required tables in the test DB before each test module.
-
-    Uses module scope because some tests (test_agent_messages, test_rubric_scoring)
-    swap THEFORGE_DB to a temp path and set _SCHEMA_ENSURED = True, which prevents
-    ensure_schema() from running for subsequent modules. Resetting per-module
-    guarantees that each test file starts with a valid schema.
-    """
-    import forge_orchestrator
-
-    # Reset the flag so ensure_schema() actually creates tables
-    forge_orchestrator._SCHEMA_ENSURED = False
-    forge_orchestrator.ensure_schema()
->>>>>>> forge-task-1504
