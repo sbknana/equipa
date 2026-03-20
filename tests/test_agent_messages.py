@@ -334,7 +334,7 @@ def test_format_plain_text_content():
 
 
 def test_format_multiple_messages():
-    """Test formatting multiple messages."""
+    """Test formatting multiple messages with untrusted content markers."""
     messages = [
         {
             "from_role": "tester",
@@ -350,13 +350,16 @@ def test_format_multiple_messages():
         },
     ]
     result = forge_orchestrator.format_messages_for_prompt(messages)
-    # Header is "## Messages from Other Agents\n" (has trailing \n), then 2 message lines
-    # So split produces: header, empty line, msg1, msg2 = 4 lines
-    non_empty = [l for l in result.strip().split("\n") if l.strip()]
-    assert len(non_empty) == 3, f"expected 3 non-empty lines (header + 2 msgs), got {len(non_empty)}: {non_empty}"
-    assert non_empty[0].startswith("## Messages from Other Agents")
-    assert "cycle 1" in non_empty[1]
-    assert "cycle 2" in non_empty[2]
+    # Each message is now wrapped in <task-input> + <<<UNTRUSTED_*>>> markers
+    assert result.startswith("## Messages from Other Agents")
+    assert result.count("<task-input") == 2, "expected 2 task-input wrappers"
+    assert result.count("</task-input>") == 2
+    assert "<<<UNTRUSTED_" in result
+    assert "<<<END_UNTRUSTED_" in result
+    assert "cycle 1" in result
+    assert "cycle 2" in result
+    assert "tests_failed: 3" in result
+    assert "tests_run: 15" in result
 
 
 def test_format_handles_missing_keys():
