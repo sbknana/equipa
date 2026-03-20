@@ -973,6 +973,7 @@ def format_messages_for_prompt(messages):
     """Format agent messages into a prompt-friendly string."""
     if not messages:
         return ""
+    _delim = _make_untrusted_delimiter()
     lines = ["## Messages from Other Agents\n"]
     for msg in messages:
         from_role = msg.get("from_role", "unknown")
@@ -987,7 +988,15 @@ def format_messages_for_prompt(messages):
                 content_str = str(parsed)
         except (json.JSONDecodeError, TypeError):
             content_str = content
-        lines.append(f"**[{from_role}]** (cycle {cycle}, {msg_type}): {content_str}")
+        # Wrap inter-agent message content in untrusted markers — these come
+        # from agent_messages table and could contain prompt injection from a
+        # compromised agent (addresses EQ-24 variant for inter-agent channel).
+        wrapped = wrap_untrusted(content_str, _delim)
+        lines.append(
+            f'<task-input type="agent-message" trust="derived">\n'
+            f"**[{from_role}]** (cycle {cycle}, {msg_type}): {wrapped}\n"
+            f"</task-input>"
+        )
     return "\n".join(lines)
 
 
