@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "generated_at": "2026-03-17T18:23:50Z",
+  "generated_at": "2026-03-20T21:15:32Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
-    "prompts/_common.md": "a368925eb0c88f936fd524f0124ae2a39c4e9d3694e7690bb1458f63d541f484",
+    "prompts/_common.md": "65b011cab99954f19e4b97bc4a67fbaa4d133d9aaaca686bed8445640b28ed95",
     "prompts/code-reviewer.md": "3be97cbf2e1b741f3cc64a23a5bca97ad68c9ad1789ec66d5663b4d6a382b9fd",
     "prompts/debugger.md": "6e71bb6f1159ceff15da64e1046ddf0adb4ccecbc6905c062b28b0a41df7ad51",
     "prompts/developer.md": "a3b0899bd642784599f95cfbe62450a7b372fca7c16081e0515e2c630514eb29",
