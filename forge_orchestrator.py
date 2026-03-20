@@ -1870,13 +1870,18 @@ def format_lessons_for_injection(lessons, delimiter=None):
 
     # Wrap in task-input tags so agents treat this as data (PM-24)
     wrapped = wrap_lessons_in_task_input(formatted)
+    if not wrapped:
+        return ""
+
+    # Always prepend section heading
+    header = "## Lessons from Previous Runs\n"
 
     # Add unpredictable delimiter for defense-in-depth (EQ-24)
-    if delimiter and wrapped:
-        header = "## Lessons from Previous Runs\n"
-        # The wrap_lessons_in_task_input already includes the header,
-        # so wrap the entire output with the delimiter
-        wrapped = f'<task-input type="lessons" trust="derived">\n{wrap_untrusted(wrapped, delimiter)}\n</task-input>'
+    if delimiter:
+        # Wrap the lessons block with delimiter markers, then nest inside task-input
+        wrapped = f'{header}<task-input type="lessons" trust="derived">\n{wrap_untrusted(wrapped, delimiter)}\n</task-input>'
+    else:
+        wrapped = f'{header}{wrapped}'
 
     return wrapped
 
