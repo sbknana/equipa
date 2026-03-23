@@ -128,4 +128,59 @@ REFLECTION: What approach did you take? What worked well? What didn't work? What
 - **Async where appropriate.** Use non-blocking I/O for network calls, file operations, and database queries. Do not block the event loop.
 
 A fast language does not fix a slow algorithm. Efficiency is a requirement, not an optimization.
+## Lessons From Past Bugs
 
+These are real bugs that EQUIPA agents have shipped. Learn from them. Do not repeat them.
+
+### Multi-tenant global vs per-tenant data (GutenForge, March 2026)
+**Bug:** Holiday queries filtered `where: { businessId }` which excluded all global/seeded records (businessId=null). Easter and all holidays were invisible despite being in the DB.
+**Rule:** When a table has both global records (businessId=NULL) and per-tenant records, ALWAYS query with `OR: [{ businessId: null }, { businessId }]`. Never filter only by businessId when global records should be included.
+**Severity:** HIGH — feature appeared completely broken to users.
+
+### Review agents must save output files (Multiple projects, March 2026)
+**Bug:** Security reviewers and review agents completed tasks 1435-1439 with ZERO output files — all findings were lost.
+**Rule:** ALL review agents MUST save findings to `{REVIEW-TYPE}-{TASK_ID}.md` in the project root. A review with no output file is a failed review.
+
+### Google OAuth cross-account login (GutenForge, March 2026)
+**Bug:** Google OAuth provider without `prompt: "consent"` silently reuses the previous grant. User selects account B in the Google chooser but gets logged into account A. This is a **cross-account auth vulnerability** that cascades to Stripe billing and ALL tenant-scoped data.
+**Rule:** ALWAYS configure Google OAuth with `authorization: { params: { prompt: "consent", access_type: "offline" } }`. This forces Google to require explicit account selection and consent on every login. This is now in ForgeScaffold — never remove it.
+**Severity:** CRITICAL — users can access another user's business, billing, and data.
+
+### QA agents must clean up test data (GutenForge, March 2026)
+**Bug:** EQUIPA task 1473 (XSS QA) created a test user `test@xss.com` with a `<script>alert('xss')</script>` name in the production database. The XSS fix worked (tags rendered as text) but the junk test account was visible in the admin panel.
+**Rule:** ALL QA and testing agents MUST delete any test accounts, test data, and test records they create during testing. A test that leaves garbage in production is incomplete.
+**Severity:** MEDIUM — cosmetic in this case, but test data in production is unprofessional and confusing.
+
+### Never generate TypeScript via Python string interpolation over SSH (March 2026)
+**Bug:** Python f-strings and triple-quoted strings eat `$` signs (e.g., `$transaction` becomes `transaction`), strip quotes from string literals (e.g., `"NOT_FOUND"` becomes `NOT_FOUND`), and mangle backtick-escaped content. This caused 6+ build failures when adding admin router procedures.
+**Rule:** When generating TypeScript code programmatically: (1) Use base64 encoding to transfer code blocks over SSH, (2) Write complete files rather than string-interpolated patches, (3) Always verify the generated code compiles before committing. If you must use Python to modify TS files, use simple `str.replace()` with exact string targets — never f-strings with TypeScript syntax inside them.
+**Severity:** HIGH — causes cascading build failures and multiple fix-commit cycles.
+
+### Google OAuth: PrismaAdapter silently links multiple Google accounts to same user (March 2026)
+**Bug:** NextAuth v5 with PrismaAdapter allows multiple Google OAuth accounts to be linked to the same User record. When user A is logged in and user B signs in via Google, NextAuth creates a new Account record linking B's Google ID to A's User — instead of creating a new User. This means user B gets full access to user A's business, billing, and data.
+**Rule:** The `signIn` callback MUST check that the OAuth profile email matches the existing user email. If they differ, reject the sign-in: `return "/signin?error=AccountMismatch"`. Also configure `prompt: "consent"` on the Google provider to force re-authorization. Both fixes are now in ForgeScaffold — never remove them.
+**Severity:** CRITICAL — cross-account access to business data and Stripe billing.
+
+## State Persistence (Anti-Compaction)
+
+You MUST maintain a `.forge-state.json` file in the project root throughout your work. Update it after EVERY significant action (file edit, test run, decision made, approach change):
+
+```json
+{
+  "task_id": 123,
+  "current_step": "implementing validation in router.py",
+  "approach": "Using Pydantic for input validation",
+  "files_read": ["src/router.py", "src/models.py", "tests/test_router.py"],
+  "files_changed": ["src/router.py"],
+  "decisions": ["Using Pydantic v2 for validation", "Added custom validator for email"],
+  "tests_run": ["test_router.py - 3 passed, 1 failed on test_invalid_email"],
+  "blockers": [],
+  "next_action": "Fix failing test_invalid_email test"
+}
+```
+
+**Rules:**
+1. If `.forge-state.json` exists when you start work, **READ IT FIRST** — it contains your progress from before a context compaction. Resume from where it left off.
+2. Update the file after every file edit, test run, or decision.
+3. Delete the file when the task is fully complete.
+4. Never commit this file to git.

@@ -2267,17 +2267,31 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     if task_type_supplement:
         prompt = prompt + task_type_supplement
 
+    # Inject language-specific best practices
+    _dispatch_cfg = dispatch_config or {}
+    if _dispatch_cfg.get("features", {}).get("language_prompts", True) and project_dir:
+        lang_info = detect_project_language(project_dir)
+        lang_primary = lang_info["primary"] if isinstance(lang_info, dict) else lang_info
+        lang_prompt_path = PROMPTS_DIR / "languages" / (lang_primary + ".md")
+        if lang_prompt_path.exists():
+            try:
+                lang_text = lang_prompt_path.read_text(encoding="utf-8")
+                header = chr(10) + chr(10) + "## Language Best Practices (" + lang_primary + ")" + chr(10) + chr(10)
+                prompt = prompt + header + lang_text + chr(10)
+            except Exception:
+                pass
+
     # Budget visibility: tell the agent how many turns it has
     if max_turns and max_turns > 0:
         prompt = prompt + (
-            f"\n\nYou have {max_turns} turns for this task. "
-            f"The orchestrator will log budget updates every "
-            f"{BUDGET_CHECK_INTERVAL} turns."
+            chr(10) + chr(10) + "You have " + str(max_turns) + " turns for this task. "
+            "The orchestrator will log budget updates every "
+            + str(BUDGET_CHECK_INTERVAL) + " turns."
         )
 
     # Append extra context (compaction history, test failures) if provided
     if extra_context:
-        prompt = prompt + "\n\n---\n\n" + extra_context
+        prompt = prompt + chr(10) + chr(10) + "---" + chr(10) + chr(10) + extra_context
 
     # --- Token budget enforcement ---
     # Trim in priority order: old episodes first, then generic lessons
@@ -5698,24 +5712,32 @@ def check_gh_installed():
 def detect_project_language(project_dir):
     """Detect the primary language of a project by scanning for key files.
 
-    Returns 'python', 'dotnet', 'node', or 'default'.
+    Returns a dict: {"primary": str, "languages": list, "has_typescript": bool}
+    Primary is one of: python, typescript, javascript, go, rust, csharp, java, default.
     """
     p = Path(project_dir)
+    langs = []
 
-    # Check for .NET
-    if list(p.glob("*.csproj")) or list(p.glob("*.sln")) or list(p.glob("**/*.csproj")):
-        return "dotnet"
+    if (p / "tsconfig.json").exists():
+        langs.append("typescript")
+    if (p / "package.json").exists() and "typescript" not in langs:
+        langs.append("javascript")
+    if (p / "go.mod").exists():
+        langs.append("go")
+    if (p / "Cargo.toml").exists():
+        langs.append("rust")
+    if list(p.glob("*.csproj")) or list(p.glob("*.sln")):
+        langs.append("csharp")
+    if (p / "pom.xml").exists() or (p / "build.gradle").exists():
+        langs.append("java")
+    if ((p / "pyproject.toml").exists() or (p / "setup.py").exists()
+            or (p / "requirements.txt").exists() or (p / "Pipfile").exists()):
+        langs.append("python")
+    elif not langs and list(p.glob("*.py")):
+        langs.append("python")
 
-    # Check for Node.js
-    if (p / "package.json").exists():
-        return "node"
-
-    # Check for Python
-    if (list(p.glob("*.py")) or (p / "pyproject.toml").exists()
-            or (p / "setup.py").exists() or list(p.glob("**/*.py"))):
-        return "python"
-
-    return "default"
+    primary = langs[0] if langs else "default"
+    return {"primary": primary, "languages": langs, "has_typescript": "typescript" in langs}
 
 
 def _get_repo_env():
