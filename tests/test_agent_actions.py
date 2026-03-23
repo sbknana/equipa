@@ -161,9 +161,9 @@ def test_ensure_schema_creates_table():
     def mock_get_db(write=False):
         return conn
 
-    import forge_orchestrator as _fo
-    _fo._SCHEMA_ENSURED = False
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    import equipa.db as _db_mod
+    _db_mod._SCHEMA_ENSURED = False
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         ensure_schema()
 
     # Verify table exists
@@ -191,11 +191,11 @@ def test_ensure_schema_idempotent():
     def mock_get_db(write=False):
         return conn
 
-    import forge_orchestrator as _fo
-    _fo._SCHEMA_ENSURED = False
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    import equipa.db as _db_mod
+    _db_mod._SCHEMA_ENSURED = False
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         ensure_schema()
-        _fo._SCHEMA_ENSURED = False  # reset so second call also runs
+        _db_mod._SCHEMA_ENSURED = False  # reset so second call also runs
         ensure_schema()  # should not raise
 
     tables = conn.execute(
@@ -216,7 +216,7 @@ def test_log_agent_action_inserts_record():
     def mock_get_db(write=False):
         return conn
 
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         log_agent_action(
             task_id=100, run_id=5, cycle=1, role="developer",
             turn=3, tool_name="Read",
@@ -254,7 +254,7 @@ def test_log_agent_action_failure_record():
     def mock_get_db(write=False):
         return conn
 
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         log_agent_action(
             task_id=100, run_id=5, cycle=1, role="tester",
             turn=7, tool_name="Bash",
@@ -282,7 +282,7 @@ def test_log_agent_action_never_crashes():
     broken_conn = MagicMock()
     broken_conn.execute.side_effect = sqlite3.OperationalError("disk full")
 
-    with patch("forge_orchestrator.get_db_connection", return_value=broken_conn):
+    with patch("equipa.db.get_db_connection", return_value=broken_conn):
         # Should NOT raise
         log_agent_action(
             task_id=1, run_id=1, cycle=1, role="developer",
@@ -328,7 +328,7 @@ def test_bulk_log_agent_actions_inserts_all():
         },
     ]
 
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         bulk_log_agent_actions(action_log, task_id=50, run_id=10, cycle=2, role="developer")
 
     rows = conn.execute("SELECT * FROM agent_actions ORDER BY turn_number").fetchall()
@@ -355,7 +355,7 @@ def test_bulk_log_agent_actions_empty_list():
     def mock_get_db(write=False):
         return conn
 
-    with patch("forge_orchestrator.get_db_connection", side_effect=mock_get_db):
+    with patch("equipa.db.get_db_connection", side_effect=mock_get_db):
         bulk_log_agent_actions([], task_id=1, run_id=1, cycle=1, role="developer")
 
     rows = conn.execute("SELECT * FROM agent_actions").fetchall()
@@ -368,8 +368,8 @@ def test_bulk_log_agent_actions_never_crashes():
     broken_conn = MagicMock()
     broken_conn.executemany.side_effect = sqlite3.OperationalError("table locked")
 
-    with patch("forge_orchestrator.get_db_connection", return_value=broken_conn):
-        with patch("forge_orchestrator.ensure_schema"):
+    with patch("equipa.db.get_db_connection", return_value=broken_conn):
+        with patch("equipa.db.ensure_schema"):
             # Should NOT raise
             bulk_log_agent_actions(
                 [{"turn": 1, "tool": "Read"}],

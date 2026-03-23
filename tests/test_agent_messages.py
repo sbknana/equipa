@@ -27,6 +27,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import forge_orchestrator
+import equipa.constants as _equipa_constants
+import equipa.db as _equipa_db
 
 
 # --- Test Helpers ---
@@ -43,11 +45,16 @@ def setup_test_db():
 
     Returns:
         Tuple of (db_path, original_db_path) so the caller can restore after.
+    Patches THEFORGE_DB in all modules that cache the value at import time.
     """
     original_db = forge_orchestrator.THEFORGE_DB
     db_path = make_temp_db()
+    # Patch in all locations where the value is read
     forge_orchestrator.THEFORGE_DB = db_path
-    forge_orchestrator._SCHEMA_ENSURED = False
+    _equipa_constants.THEFORGE_DB = db_path
+    _equipa_db.THEFORGE_DB = db_path
+    # Reset schema-ensured flag in the canonical location
+    _equipa_db._SCHEMA_ENSURED = False
     return db_path, original_db
 
 
@@ -59,6 +66,8 @@ def teardown_test_db(db_path, original_db=None):
         pass
     if original_db is not None:
         forge_orchestrator.THEFORGE_DB = original_db
+        _equipa_constants.THEFORGE_DB = original_db
+        _equipa_db.THEFORGE_DB = original_db
 
 
 # --- Tests for ensure_schema ---
@@ -67,7 +76,7 @@ def test_ensure_creates_table():
     """Test that ensure_schema creates the table."""
     db_path, original_db = setup_test_db()
     try:
-        forge_orchestrator._SCHEMA_ENSURED = False
+        _equipa_db._SCHEMA_ENSURED = False
         forge_orchestrator.ensure_schema()
         conn = sqlite3.connect(str(db_path))
         tables = conn.execute(
@@ -83,7 +92,7 @@ def test_ensure_is_idempotent():
     """Test that calling ensure twice does not error."""
     db_path, original_db = setup_test_db()
     try:
-        forge_orchestrator._SCHEMA_ENSURED = False
+        _equipa_db._SCHEMA_ENSURED = False
         forge_orchestrator.ensure_schema()
         forge_orchestrator.ensure_schema()  # second call should not raise
         conn = sqlite3.connect(str(db_path))
