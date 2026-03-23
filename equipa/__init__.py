@@ -4,6 +4,7 @@ Phase 1 leaf modules: constants, checkpoints, git_ops.
 Phase 2 low-coupling modules: output, messages, parsing, monitoring.
 Phase 3 database layer: db, tasks, lessons, roles.
 Phase 4 core engine: security, prompts, reflexion, agent_runner, preflight, loops, manager.
+Phase 5 entry points: dispatch, cli.
 All public symbols are re-exported here for backward compatibility.
 
 Copyright 2026 Forgeborn
@@ -264,6 +265,38 @@ from equipa.manager import (
     run_planner_agent,
 )
 
+# --- Dispatch (equipa.dispatch) ---
+from equipa.dispatch import (
+    DEFAULT_DISPATCH_CONFIG,
+    DEFAULT_FEATURE_FLAGS,
+    apply_dispatch_filters,
+    is_feature_enabled,
+    load_dispatch_config,
+    load_goals_file,
+    parse_task_ids,
+    run_auto_dispatch,
+    run_parallel_goals,
+    run_parallel_tasks,
+    run_project_dispatch,
+    run_project_tasks,
+    run_single_goal,
+    scan_pending_work,
+    score_project,
+    validate_goals,
+)
+
+# --- CLI (equipa.cli) ---
+from equipa.cli import (
+    _handle_add_project,
+    _post_task_telemetry,
+    async_main,
+    get_ollama_base_url,
+    get_ollama_model,
+    get_provider,
+    load_config,
+    main,
+)
+
 __all__ = [
     # Constants
     "AUTOFIX_COST_LIMIT",
@@ -464,4 +497,30 @@ __all__ = [
     "run_planner_agent",
     "run_evaluator_agent",
     "run_manager_loop",
+    # Dispatch
+    "DEFAULT_FEATURE_FLAGS",
+    "DEFAULT_DISPATCH_CONFIG",
+    "is_feature_enabled",
+    "load_dispatch_config",
+    "scan_pending_work",
+    "score_project",
+    "apply_dispatch_filters",
+    "run_project_tasks",
+    "run_project_dispatch",
+    "run_auto_dispatch",
+    "load_goals_file",
+    "validate_goals",
+    "run_single_goal",
+    "run_parallel_goals",
+    "parse_task_ids",
+    "run_parallel_tasks",
+    # CLI
+    "get_provider",
+    "get_ollama_model",
+    "get_ollama_base_url",
+    "load_config",
+    "_handle_add_project",
+    "_post_task_telemetry",
+    "async_main",
+    "main",
 ]
