@@ -1,66 +1,54 @@
-# Feature Flags — Task 1587
+# Feature Flags -- Task 1587
 
 ## Summary
 
-Added the `features` section to `dispatch_config.example.json` and fixed a shallow-merge bug in `load_dispatch_config()` that would wipe unspecified feature flags when a user provided a partial override.
+Added feature flags to `dispatch_config.json` and wired them into all injection points in `build_system_prompt()` and other callsites.
 
-## Changes
+## What Was Already Done (prior work)
 
-### 1. `dispatch_config.example.json` — Added features section
+The bulk of the feature flags system was already implemented:
+
+1. **`DEFAULT_FEATURE_FLAGS`** dict (9 flags) in `forge_orchestrator.py:6110-6120`
+2. **`is_feature_enabled()`** function with fallback chain: config -> defaults -> False
+3. **`load_dispatch_config()`** with deep-merge so partial feature overrides don't wipe other flags
+4. **`dispatch_config.example.json`** already had the `features` section with all 9 flags
+5. **Test suite** at `tests/test_feature_flags.py` (14 tests covering all scenarios)
+6. **Gating in place** for: `forgesmith_lessons` (line 2235), `forgesmith_episodes` (line 2253), `quality_scoring` (line 735), `security_review` (line 7158), `anti_compaction_state` (line 4353), `gepa_ab_testing` (line 2207)
+
+## What This Task Fixed
+
+**Missing gate on `language_prompts`**: The language-specific prompt injection block in `build_system_prompt()` (lines 2293-2316) was NOT gated by the `language_prompts` feature flag. It always ran regardless of the flag value.
+
+**Fix**: Added `is_feature_enabled(dispatch_config, "language_prompts")` check to the condition on line 2295, so language detection and prompt injection only runs when the flag is enabled.
+
+## Feature Flags Reference
+
+| Flag | Default | Gated At |
+|------|---------|----------|
+| `language_prompts` | `true` | `build_system_prompt()` -- language detection + injection |
+| `hooks` | `false` | Future -- not yet implemented |
+| `mcp_health` | `false` | Future -- not yet implemented |
+| `forgesmith_lessons` | `true` | `build_system_prompt()` -- lesson injection |
+| `forgesmith_episodes` | `true` | `build_system_prompt()` -- episode injection |
+| `gepa_ab_testing` | `false` | `build_system_prompt()` -- GEPA A/B prompt variant |
+| `security_review` | `true` | `run_single_task()` + `run_security_review()` |
+| `quality_scoring` | `true` | `run_quality_scoring()` |
+| `anti_compaction_state` | `true` | Agent loop -- compaction history injection |
+
+## How to Use
+
+Toggle any feature in `dispatch_config.json`:
 
 ```json
-"features": {
-    "language_prompts": true,
-    "hooks": false,
-    "mcp_health": false,
-    "forgesmith_lessons": true,
-    "forgesmith_episodes": true,
-    "gepa_ab_testing": false,
-    "security_review": true,
-    "quality_scoring": true,
-    "anti_compaction_state": true
+{
+  "features": {
+    "language_prompts": false
+  }
 }
 ```
 
-All 9 flags are documented in the example config so users can toggle features without reading source code.
+Deep-merge means you only need to specify flags you want to override -- all others keep their defaults.
 
-### 2. `forge_orchestrator.py` — Fixed deep merge of features dict
+## Test Results
 
-**Bug found:** `load_dispatch_config()` used shallow key assignment (`config[key] = data[key]`) for the `features` dict. If a user's config contained `{"features": {"hooks": true}}`, the merge would **replace** the entire features dict, losing all 8 other default flags.
-
-**Fix:** After the initial merge loop, the features dict is explicitly deep-merged:
-```python
-if "features" in data and isinstance(data["features"], dict):
-    merged_features = dict(DEFAULT_FEATURE_FLAGS)
-    merged_features.update(data["features"])
-    config["features"] = merged_features
-```
-
-This ensures partial overrides work correctly — specifying one flag preserves all others.
-
-### 3. `tests/test_feature_flags.py` — 14 new tests
-
-| Test Class | Count | Coverage |
-|---|---|---|
-| `TestIsFeatureEnabled` | 7 | None config, config override, fallback, unknown keys, empty dict |
-| `TestDefaultFeatureFlags` | 2 | All 9 flags present with expected values |
-| `TestLoadDispatchConfigDeepMerge` | 4 | Partial override, no features key, full override, missing file |
-| `TestExampleConfigMatchesDefaults` | 1 | Example JSON matches code defaults |
-
-All 14 tests pass.
-
-## Feature Flag Injection Points (already gated)
-
-| Flag | Location | Line |
-|---|---|---|
-| `gepa_ab_testing` | `build_system_prompt()` | 2207 |
-| `forgesmith_lessons` | `build_system_prompt()` | 2235 |
-| `forgesmith_episodes` | `build_system_prompt()` | 2253 |
-| `quality_scoring` | `run_quality_scoring()` | 735 |
-| `anti_compaction_state` | agent run loop | 4328 |
-| `security_review` | post-task review | 7049 |
-| `language_prompts` | *(future — no injection point yet)* | — |
-| `hooks` | *(future — no injection point yet)* | — |
-| `mcp_health` | *(future — no injection point yet)* | — |
-
-All active features were already properly gated by `is_feature_enabled()` before this task. The three future flags (`language_prompts`, `hooks`, `mcp_health`) are defined in `DEFAULT_FEATURE_FLAGS` and ready for implementation.
+302 tests passed (including 14 feature flag tests), 0 failures.
