@@ -51,6 +51,9 @@ forgesmith.log
 .forgesmith-backups/
 .forge-checkpoints/
 
+# Agent state persistence (anti-compaction, ephemeral working state)
+.forge-state.json
+
 # Security audit reports (contain pre-refactor vulnerability details)
 SECURITY-AUDIT-REPORT.md
 

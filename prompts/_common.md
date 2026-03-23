@@ -129,3 +129,29 @@ REFLECTION: What approach did you take? What worked well? What didn't work? What
 
 A fast language does not fix a slow algorithm. Efficiency is a requirement, not an optimization.
 
+## State Persistence (Anti-Compaction)
+
+Maintain a `.forge-state.json` file in the project root. Update it after EVERY significant action (file edit, test run, decision made):
+
+```json
+{
+  "task_id": 123,
+  "current_step": "implementing validation",
+  "files_read": ["src/router.py"],
+  "files_changed": ["src/router.py"],
+  "decisions": ["Using Pydantic for validation"],
+  "tests_run": ["test_router.py - 3 passed, 1 failed"],
+  "next_action": "Fix failing test"
+}
+```
+
+If this file exists when you start work, **READ IT FIRST** — it contains your progress from before a context compaction. Resume from where you left off instead of re-reading files or re-planning.
+
+Delete `.forge-state.json` when the task is complete (after your final RESULT block).
+
+**Rules:**
+- Update the file after every Edit, Write, test run, or major decision
+- Keep entries concise — this is a checkpoint, not a log
+- The `next_action` field is the most important — it tells your post-compaction self exactly what to do next
+- Never commit this file to git — it is ephemeral working state
+

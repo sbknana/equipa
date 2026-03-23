@@ -6580,6 +6580,10 @@ async def run_parallel_tasks(task_ids, args):
         for task_id, wt_path in worktree_dirs.items():
             try:
                 branch_name = f"forge-task-{task_id}"
+                # Clean up ephemeral agent state file before removing worktree
+                state_file = Path(wt_path) / ".forge-state.json"
+                if state_file.exists():
+                    state_file.unlink()
                 # Always remove the worktree directory (it's a working copy)
                 subprocess.run(["git", "worktree", "remove", "--force", wt_path],
                                cwd=project_dir, capture_output=True)
