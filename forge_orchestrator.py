@@ -722,15 +722,18 @@ def _get_latest_agent_run_id(task_id):
         return None
 
 
-def run_quality_scoring(task, result, outcome, role, output=None):
+def run_quality_scoring(task, result, outcome, role, output=None, dispatch_config=None):
     """Run post-task quality scoring and store results.
 
     Called after record_agent_run() on successful outcomes. Extracts
     result_text and FILES_CHANGED from the result dict, scores them,
     and stores scores in rubric_scores.
 
-    Never crashes the orchestrator — all errors are logged and swallowed.
+    Gated by the quality_scoring feature flag. Never crashes the
+    orchestrator — all errors are logged and swallowed.
     """
+    if not is_feature_enabled(dispatch_config, "quality_scoring"):
+        return
     try:
         task_id = task.get("id") if isinstance(task, dict) else task
         project_id = task.get("project_id") if isinstance(task, dict) else None
@@ -2199,14 +2202,16 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
         sys.exit(1)
 
     # A/B prompt version selection: try GEPA-evolved prompt if available
+    # Gated by gepa_ab_testing feature flag
     prompt_version = "baseline"
-    try:
-        from forgesmith_gepa import get_ab_prompt_for_role
-        selected_path, prompt_version = get_ab_prompt_for_role(role)
-        if selected_path.exists() and prompt_version != "baseline":
-            role_path = selected_path
-    except ImportError:
-        pass  # forgesmith_gepa not available, use baseline
+    if is_feature_enabled(dispatch_config, "gepa_ab_testing"):
+        try:
+            from forgesmith_gepa import get_ab_prompt_for_role
+            selected_path, prompt_version = get_ab_prompt_for_role(role)
+            if selected_path.exists() and prompt_version != "baseline":
+                role_path = selected_path
+        except ImportError:
+            pass  # forgesmith_gepa not available, use baseline
 
     # Track which version was used for telemetry
     _last_prompt_version[role] = prompt_version
@@ -2226,41 +2231,45 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
     prompt = prompt.replace("{project_id}", str(task.get("project_id", "")))
 
     # --- Lesson injection with deduplication ---
-    # Fetch more candidates than we'll inject, then deduplicate
-    lessons = get_relevant_lessons(role=role, error_type=error_type, limit=10)
-    if lessons:
-        # Deduplicate: remove 60%+ word overlap, cap at 5
-        lessons = deduplicate_lessons(lessons)
-        lessons_text = format_lessons_for_injection(lessons, delimiter=_untrusted_delimiter)
-        prompt = prompt + "\n\n" + lessons_text
-        # Update times_injected counter for each lesson
-        update_lesson_injection_count([l["id"] for l in lessons])
+    # Gated by forgesmith_lessons feature flag
+    if is_feature_enabled(dispatch_config, "forgesmith_lessons"):
+        # Fetch more candidates than we'll inject, then deduplicate
+        lessons = get_relevant_lessons(role=role, error_type=error_type, limit=10)
+        if lessons:
+            # Deduplicate: remove 60%+ word overlap, cap at 5
+            lessons = deduplicate_lessons(lessons)
+            lessons_text = format_lessons_for_injection(lessons, delimiter=_untrusted_delimiter)
+            prompt = prompt + "\n\n" + lessons_text
+            # Update times_injected counter for each lesson
+            update_lesson_injection_count([l["id"] for l in lessons])
 
     # --- Episode injection with relevance scoring ---
+    # Gated by forgesmith_episodes feature flag
     task_id = task.get("id") if isinstance(task, dict) else task
     project_id = task.get("project_id") if isinstance(task, dict) else None
     task_type = task.get("task_type", "feature") if isinstance(task, dict) else None
     task_description = task.get("description", "") if isinstance(task, dict) else ""
 
-    # Check token budget to decide episode limit
-    current_tokens = estimate_tokens(prompt)
-    episode_limit = 3
-    if current_tokens > EPISODE_REDUCTION_THRESHOLD:
-        episode_limit = 2  # Reduce episodes when prompt is already large
+    if is_feature_enabled(dispatch_config, "forgesmith_episodes"):
+        # Check token budget to decide episode limit
+        current_tokens = estimate_tokens(prompt)
+        episode_limit = 3
+        if current_tokens > EPISODE_REDUCTION_THRESHOLD:
+            episode_limit = 2  # Reduce episodes when prompt is already large
 
-    if project_id:
-        episodes = get_relevant_episodes(
-            role=role, project_id=project_id, task_type=task_type,
-            min_q_value=0.3, limit=episode_limit,
-            task_description=task_description,
-        )
-        if episodes:
-            episodes_text = format_episodes_for_injection(episodes, delimiter=_untrusted_delimiter)
-            prompt = prompt + "\n\n" + episodes_text
-            # Track injected episode IDs for q-value updates after task completion
-            ep_ids = [ep["id"] for ep in episodes]
-            _injected_episodes_by_task[task_id] = ep_ids
-            update_episode_injection_count(ep_ids)
+        if project_id:
+            episodes = get_relevant_episodes(
+                role=role, project_id=project_id, task_type=task_type,
+                min_q_value=0.3, limit=episode_limit,
+                task_description=task_description,
+            )
+            if episodes:
+                episodes_text = format_episodes_for_injection(episodes, delimiter=_untrusted_delimiter)
+                prompt = prompt + "\n\n" + episodes_text
+                # Track injected episode IDs for q-value updates after task completion
+                ep_ids = [ep["id"] for ep in episodes]
+                _injected_episodes_by_task[task_id] = ep_ids
+                update_episode_injection_count(ep_ids)
 
     # Inject task-type-specific guidance if available
     task_type_supplement = ""
@@ -4313,20 +4322,26 @@ async def run_dev_test_loop(task, project_dir, project_context, args, output=Non
             message_context = ""
 
         # Build extra context from compaction history
-        # After cycle 2+, consolidate ALL prior cycles into a single section
-        # to prevent context rot from accumulated raw output
-        if cycle >= 2 and len(compaction_history) > 1:
-            consolidated = (
-                f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
-                + "\n\n".join(compaction_history)
-            )
-            # Compact the consolidated section to prevent unbounded growth
-            words = consolidated.split()
-            if len(words) > 400:
-                consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
-            extra_context = consolidated
+        # Gated by anti_compaction_state feature flag — when disabled, agents
+        # start each cycle fresh without prior cycle context
+        _dc = getattr(args, "dispatch_config", None)
+        if is_feature_enabled(_dc, "anti_compaction_state") and compaction_history:
+            # After cycle 2+, consolidate ALL prior cycles into a single section
+            # to prevent context rot from accumulated raw output
+            if cycle >= 2 and len(compaction_history) > 1:
+                consolidated = (
+                    f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
+                    + "\n\n".join(compaction_history)
+                )
+                # Compact the consolidated section to prevent unbounded growth
+                words = consolidated.split()
+                if len(words) > 400:
+                    consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
+                extra_context = consolidated
+            else:
+                extra_context = "\n\n".join(compaction_history)
         else:
-            extra_context = "\n\n".join(compaction_history) if compaction_history else ""
+            extra_context = ""
 
         # Prepend inter-agent messages if any
         if message_context:
@@ -5994,6 +6009,18 @@ def score_project(summary, config):
 
 # --- Auto-Run: Config Loading & Filters (Phase 5) ---
 
+DEFAULT_FEATURE_FLAGS = {
+    "language_prompts": True,
+    "hooks": False,
+    "mcp_health": False,
+    "forgesmith_lessons": True,
+    "forgesmith_episodes": True,
+    "gepa_ab_testing": False,
+    "security_review": True,
+    "quality_scoring": True,
+    "anti_compaction_state": True,
+}
+
 DEFAULT_DISPATCH_CONFIG = {
     "max_concurrent": 8,
     "model": "sonnet",
@@ -6003,7 +6030,22 @@ DEFAULT_DISPATCH_CONFIG = {
     "priority_boost": {},
     "only_projects": [],
     "security_review": False,
+    "features": dict(DEFAULT_FEATURE_FLAGS),
 }
+
+
+def is_feature_enabled(dispatch_config, feature_name):
+    """Check if a feature flag is enabled.
+
+    Reads from dispatch_config["features"][feature_name]. Falls back to
+    DEFAULT_FEATURE_FLAGS if the feature is not in the config.
+
+    Returns True/False. Unknown features default to False.
+    """
+    if dispatch_config is None:
+        return DEFAULT_FEATURE_FLAGS.get(feature_name, False)
+    features = dispatch_config.get("features", {})
+    return features.get(feature_name, DEFAULT_FEATURE_FLAGS.get(feature_name, False))
 
 
 def load_dispatch_config(filepath):
@@ -6034,6 +6076,13 @@ def load_dispatch_config(filepath):
     for key in DEFAULT_DISPATCH_CONFIG:
         if key in data:
             config[key] = data[key]
+
+    # Deep-merge features: user's partial features dict is overlaid on defaults
+    # so specifying e.g. {"features": {"hooks": true}} does not wipe other flags.
+    if "features" in data and isinstance(data["features"], dict):
+        merged_features = dict(DEFAULT_FEATURE_FLAGS)
+        merged_features.update(data["features"])
+        config["features"] = merged_features
 
     # Also merge any extra keys not in defaults (model_developer, model_epic, etc.)
     for key in data:
@@ -6188,7 +6237,8 @@ async def run_project_tasks(project_summary, config, args, output=None):
 
         # Post-task quality scoring (on success only)
         if outcome in ("tests_passed", "no_tests"):
-            run_quality_scoring(task, result, outcome, role=task_role, output=output)
+            run_quality_scoring(task, result, outcome, role=task_role, output=output,
+                                dispatch_config=config)
 
         # Reflexion: record episode and capture self-reflection
         await maybe_run_reflexion(task, result, outcome, role=task_role, output=output)
@@ -6603,13 +6653,14 @@ async def run_parallel_tasks(task_ids, args):
 
 
 async def _post_task_telemetry(task, result, outcome, role, model, max_turns,
-                               cycle_number=None, output=None):
+                               cycle_number=None, output=None, dispatch_config=None):
     """Run all post-task telemetry: DB update, recording, scoring, reflexion, MemRL."""
     update_task_status(task["id"], outcome, output=output)
     record_agent_run(task, result, outcome, role=role, model=model,
                      max_turns=max_turns, cycle_number=cycle_number)
     if outcome in ("tests_passed", "no_tests"):
-        run_quality_scoring(task, result, outcome, role=role, output=output)
+        run_quality_scoring(task, result, outcome, role=role, output=output,
+                            dispatch_config=dispatch_config)
     await maybe_run_reflexion(task, result, outcome, role=role, output=output)
     update_injected_episode_q_values_for_task(task["id"], outcome, output=output)
 
@@ -6991,14 +7042,19 @@ async def async_main():
             task, result, outcome, role=task_role,
             model=get_role_model(task_role, args, task=task),
             max_turns=get_role_turns(task_role, args, task=task),
-            cycle_number=cycles)
+            cycle_number=cycles,
+            dispatch_config=getattr(args, "dispatch_config", None))
 
         # Optional security review after successful dev-test
+        # CLI --security-review flag takes precedence, then dispatch config top-level key,
+        # then features.security_review flag (all must agree for review to run)
+        dc = getattr(args, "dispatch_config", None) or {}
         security_review_enabled = args.security_review
         if security_review_enabled is None:
-            # Check dispatch config (already loaded globally on args)
-            dc = getattr(args, "dispatch_config", None) or {}
             security_review_enabled = dc.get("security_review", False)
+        # Feature flag can disable even if top-level key is True
+        if not is_feature_enabled(dc, "security_review"):
+            security_review_enabled = False
 
         if security_review_enabled and outcome in ("tests_passed", "no_tests"):
             sec_result = await run_security_review(task, project_dir, project_context, args)
@@ -7052,7 +7108,8 @@ async def async_main():
         # Post-task telemetry
         await _post_task_telemetry(
             task, result, single_outcome, role=args.role,
-            model=role_model, max_turns=role_turns_max)
+            model=role_model, max_turns=role_turns_max,
+            dispatch_config=getattr(args, "dispatch_config", None))
 
         # Verify the task status in TheForge
         verified, verify_msg = verify_task_updated(task["id"])

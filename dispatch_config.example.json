@@ -43,6 +43,17 @@
         "refactor": "Ensure ALL existing tests pass before AND after changes. Make incremental changes.",
         "test": "Aim for edge cases and failure modes, not just happy paths. Test error handling."
     },
+    "features": {
+        "language_prompts": true,
+        "hooks": false,
+        "mcp_health": false,
+        "forgesmith_lessons": true,
+        "forgesmith_episodes": true,
+        "gepa_ab_testing": false,
+        "security_review": true,
+        "quality_scoring": true,
+        "anti_compaction_state": true
+    },
     "project_dirs": {},
     "provider": "claude",
     "ollama_base_url": "http://localhost:11434",
