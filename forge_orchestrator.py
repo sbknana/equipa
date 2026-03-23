@@ -5710,26 +5710,95 @@ def check_gh_installed():
 
 
 def detect_project_language(project_dir):
-    """Detect the primary language of a project by scanning for key files.
+    """Detect languages and frameworks in a project by scanning for marker files.
 
-    Returns 'python', 'dotnet', 'node', or 'default'.
+    Returns a dict with:
+        - languages: list of detected language strings
+        - frameworks: list of detected framework strings
+        - primary: the most likely primary language (string)
+
+    The primary language is chosen by a priority order that favours explicit
+    project manifests over file-extension scanning.
     """
     p = Path(project_dir)
+    languages = []
+    frameworks = []
 
-    # Check for .NET
+    # --- Language detection via marker files ---
+
+    # Python: pyproject.toml, setup.py, requirements.txt, Pipfile
+    python_markers = ["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"]
+    if any((p / m).exists() for m in python_markers) or list(p.glob("*.py")):
+        languages.append("python")
+        if (p / "pyproject.toml").exists():
+            try:
+                content = (p / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+                if "django" in content.lower():
+                    frameworks.append("django")
+                if "fastapi" in content.lower():
+                    frameworks.append("fastapi")
+                if "flask" in content.lower():
+                    frameworks.append("flask")
+            except OSError:
+                pass
+
+    # TypeScript: tsconfig.json
+    has_tsconfig = (p / "tsconfig.json").exists()
+    if has_tsconfig:
+        languages.append("typescript")
+
+    # JavaScript: package.json without tsconfig (pure JS)
+    has_package_json = (p / "package.json").exists()
+    if has_package_json and not has_tsconfig:
+        if (p / "jsconfig.json").exists() or not has_tsconfig:
+            languages.append("javascript")
+
+    # Detect Node/JS frameworks from package.json
+    if has_package_json:
+        try:
+            content = (p / "package.json").read_text(encoding="utf-8", errors="replace")
+            if '"next"' in content:
+                frameworks.append("nextjs")
+            if '"react"' in content:
+                frameworks.append("react")
+            if '"express"' in content:
+                frameworks.append("express")
+            if '"vue"' in content:
+                frameworks.append("vue")
+            if '"angular"' in content or '"@angular/core"' in content:
+                frameworks.append("angular")
+        except OSError:
+            pass
+
+    # Go: go.mod
+    if (p / "go.mod").exists():
+        languages.append("go")
+
+    # Rust: Cargo.toml
+    if (p / "Cargo.toml").exists():
+        languages.append("rust")
+
+    # C#/.NET: *.csproj, *.sln
     if list(p.glob("*.csproj")) or list(p.glob("*.sln")) or list(p.glob("**/*.csproj")):
-        return "dotnet"
+        languages.append("csharp")
+        frameworks.append("dotnet")
 
-    # Check for Node.js
-    if (p / "package.json").exists():
-        return "node"
+    # Java: pom.xml, build.gradle
+    if (p / "pom.xml").exists() or (p / "build.gradle").exists() or (p / "build.gradle.kts").exists():
+        languages.append("java")
+        if (p / "pom.xml").exists():
+            frameworks.append("maven")
+        if (p / "build.gradle").exists() or (p / "build.gradle.kts").exists():
+            frameworks.append("gradle")
 
-    # Check for Python
-    if (list(p.glob("*.py")) or (p / "pyproject.toml").exists()
-            or (p / "setup.py").exists() or list(p.glob("**/*.py"))):
-        return "python"
+    # Determine primary language (first detected wins based on priority above)
+    primary = languages[0] if languages else "default"
 
-    return "default"
+    return {
+        "languages": languages,
+        "frameworks": frameworks,
+        "primary": primary,
+    }
 
 
 def _get_repo_env():
@@ -5774,14 +5843,18 @@ def setup_single_repo(codename, project_dir, owner, dry_run=False):
             pass
 
     if dry_run:
-        lang = detect_project_language(project_dir)
-        return True, f"DRY RUN: Would init git, detect={lang}, create {owner}/{repo_name}"
+        lang_info = detect_project_language(project_dir)
+        return True, f"DRY RUN: Would init git, detect={lang_info['primary']}, create {owner}/{repo_name}"
 
     # .gitignore
-    lang = detect_project_language(project_dir)
+    lang_info = detect_project_language(project_dir)
+    lang = lang_info["primary"]
+    # Map new language keys to existing gitignore template keys
+    gitignore_key_map = {"typescript": "node", "javascript": "node", "csharp": "dotnet"}
+    gitignore_key = gitignore_key_map.get(lang, lang)
     gitignore_path = p / ".gitignore"
     if not gitignore_path.exists():
-        template = GITIGNORE_TEMPLATES.get(lang, GITIGNORE_TEMPLATES["default"])
+        template = GITIGNORE_TEMPLATES.get(gitignore_key, GITIGNORE_TEMPLATES["default"])
         gitignore_path.write_text(template + "\n", encoding="utf-8")
         print(f"    Created .gitignore ({lang})")
 
