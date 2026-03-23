@@ -6530,6 +6530,25 @@ async def run_parallel_tasks(task_ids, args):
             task_id = r["task"]["id"]
             branch_name = f"forge-task-{task_id}"
             try:
+                # Ensure we're on the default branch in the MAIN repo (not a worktree)
+                current_branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=project_dir, capture_output=True, text=True,
+                ).stdout.strip()
+                if not current_branch:
+                    # Detached HEAD — try to find default branch
+                    for candidate in ["master", "main"]:
+                        check = subprocess.run(
+                            ["git", "show-ref", "--verify", f"refs/heads/{candidate}"],
+                            cwd=project_dir, capture_output=True,
+                        )
+                        if check.returncode == 0:
+                            subprocess.run(["git", "checkout", candidate],
+                                           cwd=project_dir, capture_output=True)
+                            current_branch = candidate
+                            break
+                print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
+
                 # Capture HEAD before merge to verify it changed
                 pre_head = subprocess.run(
                     ["git", "rev-parse", "HEAD"],
