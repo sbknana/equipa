@@ -1,65 +1,61 @@
-# Task 1585: Language-Specific Agent Prompts
+# Language-Specific Agent Prompts — Task #1585 Summary
 
-## Summary
+## What Was Done
 
-Added language-specific prompt injection to EQUIPA so agents receive tailored coding guidelines based on the detected project language.
+### 1. Language Detection (detect_project_language() — line ~5752)
+The function was already implemented and detects 7 languages via marker files:
 
-## Changes Made
-
-### 1. Enhanced `detect_project_language()` (forge_orchestrator.py:5712)
-
-**Before:** Returned a plain string (`"python"`, `"dotnet"`, `"node"`, or `"default"`).
-
-**After:** Returns a dict with three keys:
-- `languages`: list of all detected languages (e.g., `["typescript", "python"]`)
-- `frameworks`: list of detected frameworks (e.g., `["nextjs", "react"]`)
-- `primary`: the first/most prominent language detected
-
-**Detected languages (7):**
 | Language | Marker Files |
 |----------|-------------|
-| python | pyproject.toml, setup.py, requirements.txt, Pipfile, *.py |
-| typescript | tsconfig.json |
-| javascript | package.json (without tsconfig.json) |
-| go | go.mod |
-| rust | Cargo.toml |
-| csharp | *.csproj, *.sln |
-| java | pom.xml, build.gradle, build.gradle.kts |
+| Python | pyproject.toml, setup.py, requirements.txt, Pipfile, *.py |
+| TypeScript | tsconfig.json |
+| JavaScript | package.json (without tsconfig.json) |
+| Go | go.mod |
+| Rust | Cargo.toml |
+| C# | *.csproj, *.sln |
+| Java | pom.xml, build.gradle, build.gradle.kts |
 
-**Detected frameworks:**
-- Python: django, fastapi, flask (from pyproject.toml)
-- JS/TS: nextjs, react, express, vue, angular (from package.json)
-- C#: dotnet (from *.csproj/*.sln)
-- Java: maven, gradle (from build files)
+Returns a dict with languages (list), frameworks (list), and primary (string).
 
-### 2. Created `prompts/languages/` Directory (4 files)
+Framework detection covers: Django, FastAPI, Flask (via pyproject.toml), Next.js, React, Express, Vue, Angular (via package.json), .NET (via csproj/sln), Maven/Gradle (via pom.xml/build.gradle).
 
-| File | Content Summary |
-|------|----------------|
-| `python.md` | PEP 8, type hints, mutable default args, bare except, async patterns, pytest idioms |
-| `typescript.md` | strict mode, `any` abuse, async correctness, React patterns (framework-conditional), null safety |
-| `go.md` | error wrapping, goroutine leaks, context.Context, defer patterns, table-driven tests |
-| `csharp.md` | async/await, IDisposable, LINQ, nullable reference types, DI patterns |
+### 2. Language Prompt Files (prompts/languages/)
 
-### 3. Injection in `build_system_prompt()` (forge_orchestrator.py:~2284)
+7 markdown files, each providing language-specific coding guidelines:
 
-After task-type supplement injection and before budget visibility:
-- Calls `detect_project_language(project_dir)` to detect the project's languages
-- For each detected language with a matching `prompts/languages/{lang}.md` file, reads and appends the prompt
-- If frameworks are detected (excluding build-system names like dotnet/maven/gradle), appends a note telling the agent to apply framework-specific patterns
-- Handles multi-language projects (e.g., a project with both Python and TypeScript)
-- Silently skips languages without a prompt file (e.g., rust, java, javascript)
+| File | Content Focus | Status |
+|------|--------------|--------|
+| python.md | PEP 8, type hints, mutable defaults, bare except, async, pytest | Pre-existing |
+| typescript.md | strict mode, any abuse, async, React patterns, null safety | Pre-existing |
+| go.md | error wrapping, goroutine leaks, context.Context, defer, table tests | Pre-existing |
+| csharp.md | async/await, IDisposable, LINQ, nullable refs, DI | Pre-existing |
+| rust.md | ownership/borrowing, Result/Error, unsafe, lifetimes, tokio | NEW |
+| java.md | null safety, try-with-resources, concurrency, Spring DI | NEW |
+| javascript.md | strict mode, JSDoc types, async, common bugs, Node.js | NEW |
 
-### 4. Updated Callers
+### 3. Prompt Injection (build_system_prompt() — lines 2293-2316)
+Already integrated. After task-type prompts, the function:
+1. Calls detect_project_language(project_dir)
+2. Iterates all detected languages
+3. Loads corresponding prompts/languages/{lang}.md if it exists
+4. Appends framework note if non-build frameworks detected (excludes dotnet/maven/gradle)
+5. Deduplicates via injected_langs set
 
-Updated `setup_single_repo()` (two call sites at lines ~5846, ~5850) to use the new dict return format, mapping new language keys to existing `GITIGNORE_TEMPLATES` keys.
+### 4. Tests (tests/test_language_detection.py)
+NEW — 43 tests covering:
+- Single language detection for all 7 languages (11 tests)
+- Multi-language and full-stack project detection (2 tests)
+- Framework detection: Django, FastAPI, Next.js, React, Vue, Angular, Express (6 tests)
+- Edge cases: empty project, JavaScript excluded when TypeScript present (3 tests)
+- Return value structure validation (3 tests)
+- Language prompt file existence and content validation (3 tests + 15 parameterized)
 
 ## Test Results
+All 331 tests pass (288 existing + 43 new) in 4.75s with 1 deprecation warning.
 
-All **288 tests passed** in 4.66s with 1 deprecation warning (pre-existing asyncio event loop warning).
-
-## LOC Impact
-
-- ~90 lines in forge_orchestrator.py (73 new detection function + 17 injection logic)
-- ~190 lines across 4 markdown files
-- Total: ~280 lines added
+## Files Changed
+- prompts/languages/rust.md — NEW
+- prompts/languages/java.md — NEW
+- prompts/languages/javascript.md — NEW
+- tests/test_language_detection.py — NEW
+- LANG-PROMPTS-1585.md — NEW (this file)
