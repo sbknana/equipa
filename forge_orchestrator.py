@@ -2292,7 +2292,8 @@ def build_system_prompt(task, project_context, project_dir, role="developer",
 
     # --- Language-specific prompt injection ---
     # Detect project language and load corresponding guidance if available
-    if project_dir:
+    # Gated by language_prompts feature flag
+    if project_dir and is_feature_enabled(dispatch_config, "language_prompts"):
         lang_info = detect_project_language(project_dir)
         lang_prompts_dir = PROMPTS_DIR / "languages"
         injected_langs = set()
