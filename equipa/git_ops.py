@@ -291,8 +291,8 @@ def setup_all_repos(args) -> None:
     NOTE: This function imports fetch_project_info from the orchestrator at
     call time to avoid circular imports during the Phase 1 split.
     """
-    # Lazy import to avoid circular dependency during monolith split
-    from forge_orchestrator import fetch_project_info
+    # Lazy import to avoid circular dependency during package split
+    from equipa.tasks import fetch_project_info
 
     # Check prerequisites (skip for dry run)
     if not args.dry_run and not check_gh_installed():

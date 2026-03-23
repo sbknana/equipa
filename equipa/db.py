@@ -193,8 +193,8 @@ def record_agent_run(
         from equipa.output import log
         from equipa.tasks import get_task_complexity
 
-        # Late import to avoid circular: _last_prompt_version lives in monolith
-        from forge_orchestrator import _last_prompt_version
+        # Late import to avoid circular dependency
+        from equipa.prompts import _last_prompt_version
 
         task_id = task.get("id") if isinstance(task, dict) else task
         project_id = task.get("project_id") if isinstance(task, dict) else None

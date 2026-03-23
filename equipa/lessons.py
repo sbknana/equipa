@@ -51,12 +51,21 @@ def format_lessons_for_injection(
         return ""
 
     # Late imports for sanitizer (may not be available)
-    from forge_orchestrator import (
-        sanitize_error_signature,
-        sanitize_lesson_content,
-        wrap_lessons_in_task_input,
-        wrap_untrusted,
-    )
+    from equipa.security import wrap_untrusted
+    try:
+        from lesson_sanitizer import (
+            sanitize_error_signature,
+            sanitize_lesson_content,
+            wrap_lessons_in_task_input,
+        )
+    except ImportError:
+        # Fallback stubs — no sanitization if module unavailable
+        def sanitize_lesson_content(text):
+            return text or ""
+        def sanitize_error_signature(sig):
+            return sig or ""
+        def wrap_lessons_in_task_input(text):
+            return text or ""
 
     lines = []
     for lesson in lessons:
@@ -256,7 +265,7 @@ def format_episodes_for_injection(
     if not episodes:
         return ""
 
-    from forge_orchestrator import wrap_untrusted
+    from equipa.security import wrap_untrusted
 
     lines = ["## Past Experience", ""]
     for ep in episodes:

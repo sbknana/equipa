@@ -100,7 +100,7 @@ def format_messages_for_prompt(messages: list[dict]) -> str:
     if not messages:
         return ""
 
-    from forge_orchestrator import _make_untrusted_delimiter, wrap_untrusted
+    from equipa.security import _make_untrusted_delimiter, wrap_untrusted
 
     _delim = _make_untrusted_delimiter()
     lines = ["## Messages from Other Agents\n"]

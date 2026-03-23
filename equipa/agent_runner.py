@@ -626,7 +626,7 @@ async def dispatch_agent(
         }
 
     # Late imports to avoid circular dependency
-    from forge_orchestrator import get_ollama_base_url, get_ollama_model, get_provider
+    from equipa.cli import get_ollama_base_url, get_ollama_model, get_provider
 
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
     provider_override = getattr(args, "provider", None) if args else None

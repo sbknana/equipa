@@ -148,16 +148,7 @@ def build_system_prompt(
     # Late imports to avoid circular dependencies with monolith during transition
     from equipa.git_ops import detect_project_language
 
-    # Lazy import — these remain in the monolith until Phase 5
-    try:
-        from forge_orchestrator import is_feature_enabled
-    except ImportError:
-        def is_feature_enabled(dc, name):
-            from equipa.constants import DEFAULT_FEATURE_FLAGS  # noqa: F811
-            if dc is None:
-                return DEFAULT_FEATURE_FLAGS.get(name, False)
-            features = dc.get("features", {})
-            return features.get(name, DEFAULT_FEATURE_FLAGS.get(name, False))
+    from equipa.dispatch import is_feature_enabled  # noqa: F811
 
     try:
         from forgesmith import get_relevant_lessons

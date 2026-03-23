@@ -83,12 +83,7 @@ def run_quality_scoring(
     Gated by the quality_scoring feature flag. Never crashes the
     orchestrator — all errors are logged and swallowed.
     """
-    # Late import — is_feature_enabled stays in monolith until Phase 5
-    try:
-        from forge_orchestrator import is_feature_enabled
-    except ImportError:
-        def is_feature_enabled(dc, name):
-            return False
+    from equipa.dispatch import is_feature_enabled
 
     try:
         from rubric_quality_scorer import score_and_store as quality_score_and_store
@@ -138,8 +133,7 @@ async def run_security_review(
     Uses the security-reviewer role with ClaudeStick tools.
     Only runs if security_review is enabled in dispatch config.
     """
-    # Late import — load_dispatch_config stays in monolith until Phase 5
-    from forge_orchestrator import load_dispatch_config
+    from equipa.dispatch import load_dispatch_config
 
     log(f"\n{'=' * 50}", output)
     log(f"  SECURITY REVIEW", output)
@@ -329,12 +323,7 @@ async def run_dev_test_loop(
 
     Returns (last_result, cycles_completed, outcome_reason) tuple.
     """
-    # Late import — is_feature_enabled stays in monolith until Phase 5
-    try:
-        from forge_orchestrator import is_feature_enabled
-    except ImportError:
-        def is_feature_enabled(dc, name):
-            return False
+    from equipa.dispatch import is_feature_enabled
 
     # Auto-install deps before first cycle if needed
     await auto_install_dependencies(project_dir, output=output)
