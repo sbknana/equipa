@@ -907,16 +907,66 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             task_id = r["task"]["id"]
             branch_name = f"forge-task-{task_id}"
             try:
-                # Stash any uncommitted changes first
-                subprocess.run(["git", "stash"], cwd=project_dir, capture_output=True)
+                # Ensure we're on the default branch in the MAIN repo
+                current_branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=project_dir, capture_output=True, text=True,
+                ).stdout.strip()
+                if not current_branch:
+                    for candidate in ["master", "main"]:
+                        check = subprocess.run(
+                            ["git", "show-ref", "--verify", f"refs/heads/{candidate}"],
+                            cwd=project_dir, capture_output=True,
+                        )
+                        if check.returncode == 0:
+                            subprocess.run(["git", "checkout", candidate],
+                                           cwd=project_dir, capture_output=True)
+                            current_branch = candidate
+                            break
+                print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
+
+                # Capture HEAD before merge to verify it changed
+                pre_head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=project_dir, capture_output=True, text=True,
+                ).stdout.strip()
+
+                # Check branch has commits ahead of HEAD
+                ahead = subprocess.run(
+                    ["git", "log", "--oneline", f"HEAD..{branch_name}"],
+                    cwd=project_dir, capture_output=True, text=True,
+                )
+                if not ahead.stdout.strip():
+                    print(f"  [Isolation] Task #{task_id}: branch '{branch_name}' has NO commits ahead of HEAD — skipping merge")
+                    continue
+
+                commits_ahead = len(ahead.stdout.strip().split(chr(10)))
+                print(f"  [Isolation] Task #{task_id}: branch '{branch_name}' has {commits_ahead} commit(s) to merge")
+
+                # Stash any uncommitted changes
+                stash_result = subprocess.run(
+                    ["git", "stash"], cwd=project_dir, capture_output=True, text=True,
+                )
+                had_stash = "Saved working directory" in stash_result.stdout
+
                 merge_result = subprocess.run(
                     ["git", "merge", "--no-edit", branch_name],
                     cwd=project_dir, capture_output=True, text=True,
                 )
-                if merge_result.returncode == 0:
-                    print(f"  [Isolation] Merged task #{task_id} into main")
+
+                # Verify HEAD actually changed
+                post_head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=project_dir, capture_output=True, text=True,
+                ).stdout.strip()
+
+                if merge_result.returncode == 0 and post_head != pre_head:
+                    print(f"  [Isolation] Merged task #{task_id} into main ({pre_head[:8]} -> {post_head[:8]})")
                     r["merge_ok"] = True
                     merged_tasks_seq.add(task_id)
+                elif merge_result.returncode == 0 and post_head == pre_head:
+                    print(f"  [Isolation] WARNING: Merge returned 0 for task #{task_id} but HEAD unchanged ({pre_head[:8]})")
+                    print(f"  [Isolation] Merge stdout: {merge_result.stdout[:200]}")
                 else:
                     # Try rebase-then-merge for conflicts
                     subprocess.run(["git", "merge", "--abort"],
@@ -946,9 +996,10 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                                        cwd=project_dir, capture_output=True)
                         print(f"  [Isolation] Merge FAILED for task #{task_id}: {merge_result.stderr[:200]}")
                         print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                # Pop stash if anything was stashed
-                subprocess.run(["git", "stash", "pop"], cwd=project_dir,
-                               capture_output=True, text=True)
+                # Pop stash only if we actually stashed something
+                if had_stash:
+                    subprocess.run(["git", "stash", "pop"], cwd=project_dir,
+                                   capture_output=True, text=True)
             except Exception as e:
                 print(f"  [Isolation] Merge error for task #{task_id}: {e}")
 
