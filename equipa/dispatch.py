@@ -32,6 +32,7 @@ from equipa.db import (
     record_agent_run,
     update_task_status,
 )
+from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import _is_git_repo
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
@@ -380,6 +381,13 @@ async def run_project_tasks(
             log(f"  [{codename}] Task #{task_id} status is '{task.get('status')}'. Skipping.", output)
             continue
 
+        # --- Lifecycle hooks: pre_dispatch ---
+        await fire_hook(
+            "pre_dispatch",
+            task_id=task_id, project_dir=project_dir, codename=codename,
+            title=task.get("title", ""),
+        )
+
         result, cycles, outcome = await run_dev_test_loop(
             task, project_dir, project_context, task_args, output=output,
         )
@@ -409,6 +417,14 @@ async def run_project_tasks(
 
         # MemRL: update q_values of episodes that were injected into this task's prompt
         update_injected_episode_q_values_for_task(task_id, outcome, output=output)
+
+        # --- Lifecycle hooks: post_task_complete ---
+        await fire_hook(
+            "post_task_complete",
+            task_id=task_id, project_dir=project_dir, codename=codename,
+            outcome=outcome, cycles=cycles,
+            cost=result.get("cost"), duration=result.get("duration", 0),
+        )
 
         if outcome in ("tests_passed", "no_tests"):
             completed.append(task)
