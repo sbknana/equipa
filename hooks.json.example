@@ -1,0 +1,20 @@
+{
+    "pre_agent_start": [
+        {
+            "command": "python hooks/preflight_build.py",
+            "timeout": 60,
+            "block_on_fail": true
+        }
+    ],
+    "post_agent_finish": [
+        {
+            "command": "python hooks/post_agent_lint.py",
+            "timeout": 60,
+            "block_on_fail": false
+        }
+    ],
+    "on_cost_warning": [],
+    "on_stuck_detected": [],
+    "pre_dispatch": [],
+    "post_task_complete": []
+}
