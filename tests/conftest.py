@@ -81,14 +81,18 @@ def _ensure_full_schema():
 
 def pytest_configure(config):
     """Ensure database schema exists before any tests collect."""
-    from equipa import db as equipa_db
+    try:
+        from equipa import db as equipa_db
 
-    # Reset ensure_schema cache so it re-runs for test DB
-    equipa_db._SCHEMA_ENSURED = False
-    equipa_db.ensure_schema()
+        # Reset ensure_schema cache so it re-runs for test DB
+        equipa_db._SCHEMA_ENSURED = False
+        equipa_db.ensure_schema()
 
-    # Apply the full schema.sql for tables not covered by ensure_schema()
-    _ensure_full_schema()
+        # Apply the full schema.sql for tables not covered by ensure_schema()
+        _ensure_full_schema()
+    except (ImportError, ModuleNotFoundError) as e:
+        print(f"  [conftest] WARNING: could not import equipa.db: {e}")
+        print("  [conftest] Schema setup skipped — tests requiring DB may fail.")
 
 
 def pytest_collection_modifyitems(session, config, items):
