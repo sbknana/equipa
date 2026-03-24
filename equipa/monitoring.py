@@ -28,6 +28,92 @@ from equipa.constants import (
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
 )
+from equipa.hooks import fire as fire_hook_sync
+
+# --- Compaction Detection Constants ---
+COMPACTION_REINTRO_PHRASES: tuple[str, ...] = (
+    "how can i help",
+    "what would you like me to",
+    "how can i assist",
+    "what can i do for you",
+    "i'd be happy to help",
+    "let me know what you'd like",
+    "what task would you like",
+    "i'm ready to help",
+)
+
+# Minimum turns without new tool calls before quality drop is flagged
+COMPACTION_STALE_TOOL_TURNS: int = 5
+
+# Minimum repeated phrase ratio (0.0-1.0) to flag repetitive output
+COMPACTION_REPETITION_THRESHOLD: float = 0.4
+
+
+# --- Compaction Signal Detection ---
+
+def detect_compaction_signals(
+    text: str,
+    turn_count: int,
+    files_read: set[str],
+    recent_tool_calls: list[str],
+    turns_since_last_tool: int,
+) -> list[dict[str, str]]:
+    """Detect signals that a context compaction may have occurred.
+
+    Returns a list of signal dicts, each with 'type' and 'detail' keys.
+    An empty list means no compaction signals detected.
+
+    Signals checked:
+    1. Agent re-introduces itself (generic help phrases)
+    2. Agent re-reads files it already read (tracked via files_read set)
+    3. Output quality drops (no new tool calls for N turns, repetitive text)
+    """
+    signals: list[dict[str, str]] = []
+    text_lower = text.lower()
+
+    # Signal 1: Agent re-introduces itself
+    for phrase in COMPACTION_REINTRO_PHRASES:
+        if phrase in text_lower:
+            signals.append({
+                "type": "reintroduction",
+                "detail": f"Agent re-introduced itself at turn {turn_count}: "
+                          f"'{phrase}'",
+            })
+            break  # One match is enough
+
+    # Signal 2: Agent re-reads already-read files
+    for tool_call in recent_tool_calls:
+        if tool_call.startswith("Read|"):
+            file_path = tool_call.split("|", 1)[1].strip()
+            if file_path in files_read:
+                signals.append({
+                    "type": "file_reread",
+                    "detail": f"Agent re-read '{file_path}' at turn "
+                              f"{turn_count} (already read earlier)",
+                })
+
+    # Signal 3: No new tool calls for several turns
+    if turns_since_last_tool >= COMPACTION_STALE_TOOL_TURNS:
+        signals.append({
+            "type": "stale_tools",
+            "detail": f"No new tool calls for {turns_since_last_tool} turns "
+                      f"at turn {turn_count}",
+        })
+
+    # Signal 4: Repetitive text output (high ratio of repeated sentences)
+    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 20]
+    if len(sentences) >= 4:
+        unique_sentences = set(s.lower() for s in sentences)
+        repetition_ratio = 1.0 - (len(unique_sentences) / len(sentences))
+        if repetition_ratio >= COMPACTION_REPETITION_THRESHOLD:
+            signals.append({
+                "type": "repetitive_output",
+                "detail": f"Repetitive text detected at turn {turn_count}: "
+                          f"{repetition_ratio:.0%} repeated sentences",
+            })
+
+    return signals
+
 
 # --- Loop Detection Constants ---
 LOOP_WARNING_THRESHOLD: int = 3   # inject "try different approach" warning
@@ -154,6 +240,10 @@ def _check_cost_limit(
     limit = limits.get(complexity, 10.0)
 
     if total_cost > limit:
+        fire_hook_sync(
+            "on_cost_warning",
+            total_cost=total_cost, limit=limit, complexity=complexity,
+        )
         return f"Cost limit exceeded: ${total_cost:.2f} > ${limit:.2f}"
 
     return None
@@ -597,9 +687,19 @@ class LoopDetector:
             self.last_fingerprint = fp
 
         if self.consecutive_same >= self.terminate_threshold:
+            fire_hook_sync(
+                "on_stuck_detected",
+                action="terminate", consecutive=self.consecutive_same,
+                cycle=cycle, fingerprint=fp,
+            )
             return "terminate"
         elif self.consecutive_same >= self.warning_threshold and not self.warned:
             self.warned = True
+            fire_hook_sync(
+                "on_stuck_detected",
+                action="warn", consecutive=self.consecutive_same,
+                cycle=cycle, fingerprint=fp,
+            )
             return "warn"
 
         return "ok"

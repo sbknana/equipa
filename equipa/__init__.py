@@ -67,9 +67,14 @@ from equipa.constants import (
 
 # --- Checkpoints (equipa.checkpoints) ---
 from equipa.checkpoints import (
+    SOFT_CHECKPOINT_INTERVAL,
+    SOFT_CHECKPOINT_TEXT_LIMIT,
+    build_compaction_recovery_context,
     clear_checkpoints,
     load_checkpoint,
+    load_soft_checkpoint,
     save_checkpoint,
+    save_soft_checkpoint,
 )
 
 # --- Git Operations (equipa.git_ops) ---
@@ -245,6 +250,22 @@ from equipa.preflight import (
     _run_install_cmd,
     auto_install_dependencies,
     preflight_build_check,
+)
+
+# --- Hooks (equipa.hooks) ---
+from equipa.hooks import (
+    LIFECYCLE_EVENTS,
+    clear_external_hooks,
+    clear_registry,
+    fire,
+    fire_async,
+    get_external_hook_count,
+    get_registered_count,
+    load_hooks_config,
+    register,
+    run_external_hook,
+    run_external_hook_async,
+    unregister,
 )
 
 # --- Loops (equipa.loops) ---
@@ -485,6 +506,19 @@ __all__ = [
     "preflight_build_check",
     "_dispatch_autofix_agent",
     "_handle_preflight_failure",
+    # Hooks
+    "LIFECYCLE_EVENTS",
+    "register",
+    "unregister",
+    "fire",
+    "fire_async",
+    "load_hooks_config",
+    "run_external_hook",
+    "run_external_hook_async",
+    "clear_registry",
+    "clear_external_hooks",
+    "get_registered_count",
+    "get_external_hook_count",
     # Loops
     "run_quality_scoring",
     "run_security_review",

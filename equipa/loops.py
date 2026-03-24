@@ -18,7 +18,14 @@ from equipa.agent_runner import (
     dispatch_agent,
     run_agent,
 )
-from equipa.checkpoints import clear_checkpoints, load_checkpoint, save_checkpoint
+from equipa.checkpoints import (
+    build_compaction_recovery_context,
+    clear_checkpoints,
+    load_checkpoint,
+    load_soft_checkpoint,
+    save_checkpoint,
+)
+from equipa.hooks import fire_async as fire_hook
 from equipa.constants import (
     COST_ESTIMATE_PER_TURN,
     COST_LIMITS,
@@ -299,6 +306,25 @@ def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | 
     return created
 
 
+def _load_forge_state_json(project_dir: str | None) -> dict | None:
+    """Load .forge-state.json from the project directory if it exists.
+
+    This file is maintained by agents during streaming to persist state
+    across context compactions. Returns the parsed dict or None.
+    """
+    if not project_dir:
+        return None
+    from pathlib import Path
+    state_file = Path(project_dir) / ".forge-state.json"
+    if not state_file.exists():
+        return None
+    try:
+        import json as _json
+        return _json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 async def run_dev_test_loop(
     task: dict[str, Any],
     project_dir: str,
@@ -424,6 +450,13 @@ async def run_dev_test_loop(
         log(f"  DEV-TEST CYCLE {cycle}/{MAX_DEV_TEST_CYCLES}", output)
         log(f"{'=' * 50}", output)
 
+        # --- Lifecycle hooks: pre_cycle ---
+        await fire_hook(
+            "pre_cycle",
+            task_id=task_id, cycle=cycle, project_dir=project_dir,
+            total_cost=total_cost,
+        )
+
         # --- Developer Phase ---
         log(f"\n  [Cycle {cycle}] Running Developer agent "
             f"(budget: {dev_turns_allocated}/{dev_turns_max})...", output)
@@ -470,6 +503,13 @@ async def run_dev_test_loop(
             streaming=use_streaming,
         )
 
+        # --- Lifecycle hooks: pre_agent_start ---
+        await fire_hook(
+            "pre_agent_start",
+            task_id=task_id, cycle=cycle, role=task_role,
+            project_dir=project_dir, model=dev_model,
+        )
+
         dev_result = await dispatch_agent(
             dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
             task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
@@ -479,6 +519,14 @@ async def run_dev_test_loop(
         total_duration += dev_result.get("duration", 0)
         total_cost += _accumulate_cost(
             dev_result, f"[Cycle {cycle}] Developer", output)
+
+        # --- Lifecycle hooks: post_agent_finish (developer) ---
+        await fire_hook(
+            "post_agent_finish",
+            task_id=task_id, cycle=cycle, role=task_role,
+            project_dir=project_dir, success=dev_result.get("success", False),
+            cost=dev_result.get("cost"), duration=dev_result.get("duration", 0),
+        )
 
         # Cost-based circuit breaker
         cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
@@ -535,10 +583,39 @@ async def run_dev_test_loop(
                 cp_path = save_checkpoint(task_id, attempt_num, result_text, role=task_role)
                 if cp_path:
                     log(f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}", output)
+                    # --- Lifecycle hooks: on_checkpoint ---
+                    await fire_hook(
+                        "on_checkpoint",
+                        task_id=task_id, cycle=cycle, attempt=attempt_num,
+                        project_dir=project_dir, checkpoint_path=str(cp_path),
+                    )
+
+            # Check for compaction signals from streaming
+            dev_compaction_count = dev_result.get("compaction_count", 0)
+            if dev_compaction_count > 0:
+                log(f"  [Compaction] {dev_compaction_count} compaction(s) "
+                    f"detected during streaming", output)
 
             if continuation_count < MAX_CONTINUATIONS:
                 log(f"  [Auto-Continue] Spawning new developer agent to continue...", output)
-                if result_text:
+
+                # Build enhanced continuation context with compaction recovery
+                if dev_compaction_count > 0:
+                    # Load soft checkpoint + .forge-state.json for richer context
+                    soft_cp = load_soft_checkpoint(task_id, role=task_role)
+                    forge_state = _load_forge_state_json(project_dir)
+
+                    if soft_cp:
+                        recovery_ctx = build_compaction_recovery_context(
+                            soft_cp, forge_state)
+                        compaction_history.append(recovery_ctx)
+                        log(f"  [Compaction] Injecting recovery context "
+                            f"from soft checkpoint + forge-state", output)
+                    elif result_text:
+                        checkpoint_context = build_checkpoint_context(
+                            result_text, prev_attempt + cycle)
+                        compaction_history.append(checkpoint_context)
+                elif result_text:
                     checkpoint_context = build_checkpoint_context(
                         result_text, prev_attempt + cycle)
                     compaction_history.append(checkpoint_context)
@@ -637,6 +714,13 @@ async def run_dev_test_loop(
             streaming=True,
         )
 
+        # --- Lifecycle hooks: pre_agent_start (tester) ---
+        await fire_hook(
+            "pre_agent_start",
+            task_id=task_id, cycle=cycle, role="tester",
+            project_dir=project_dir, model=tester_model,
+        )
+
         tester_result = await dispatch_agent(
             tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
             task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
@@ -646,6 +730,14 @@ async def run_dev_test_loop(
         total_duration += tester_result.get("duration", 0)
         total_cost += _accumulate_cost(
             tester_result, f"[Cycle {cycle}] Tester", output)
+
+        # --- Lifecycle hooks: post_agent_finish (tester) ---
+        await fire_hook(
+            "post_agent_finish",
+            task_id=task_id, cycle=cycle, role="tester",
+            project_dir=project_dir, success=tester_result.get("success", False),
+            cost=tester_result.get("cost"), duration=tester_result.get("duration", 0),
+        )
 
         # Cost-based circuit breaker after tester phase
         cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
@@ -683,6 +775,13 @@ async def run_dev_test_loop(
 
         log(f"  [Cycle {cycle}] Tester result: {test_outcome} "
             f"({test_results['tests_passed']}/{test_results['tests_run']} passed)", output)
+
+        # --- Lifecycle hooks: post_cycle ---
+        await fire_hook(
+            "post_cycle",
+            task_id=task_id, cycle=cycle, project_dir=project_dir,
+            test_outcome=test_outcome, total_cost=total_cost,
+        )
 
         if test_outcome == "pass":
             log(f"  [Cycle {cycle}] All tests passed!", output)

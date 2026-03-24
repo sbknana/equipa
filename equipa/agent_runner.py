@@ -24,6 +24,10 @@ from equipa.constants import (
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
+from equipa.checkpoints import (
+    SOFT_CHECKPOINT_INTERVAL,
+    save_soft_checkpoint,
+)
 from equipa.monitoring import (
     LOOP_TERMINATE_THRESHOLD,
     LOOP_WARNING_THRESHOLD,
@@ -36,6 +40,7 @@ from equipa.monitoring import (
     _detect_tool_loop,
     _get_budget_message,
     _parse_early_complete,
+    detect_compaction_signals,
 )
 from equipa.output import log
 from equipa.parsing import validate_output
@@ -232,6 +237,14 @@ async def run_agent_streaming(
     agent_signaled_done = False
     early_complete_reason: str | None = None
 
+    # Compaction detection state
+    files_read: set[str] = set()
+    files_changed: set[str] = set()
+    compaction_count: int = 0
+    compaction_signals_all: list[dict[str, str]] = []
+    turns_since_last_tool: int = 0
+    last_soft_checkpoint_turn: int = 0
+
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -343,10 +356,22 @@ async def run_agent_streaming(
                             "timestamp": time.time(),
                         })
 
+                        # Track files read for compaction detection
+                        if tool_name == "Read":
+                            read_path = tool_input.get("file_path", "")
+                            if read_path:
+                                files_read.add(read_path)
+                        elif tool_name in ("Glob", "Grep"):
+                            pass  # Search tools — not file reads
+
                         # Track file-modifying tools
                         if tool_name in ("Edit", "Write", "NotebookEdit"):
                             turn_has_file_change = True
                             has_any_file_change = True
+                            file_path = tool_input.get("file_path",
+                                                       tool_input.get("notebook_path", ""))
+                            if file_path:
+                                files_changed.add(file_path)
                         elif tool_name == "Bash":
                             bash_cmd = tool_input.get("command", "")
                             if any(kw in bash_cmd for kw in [
@@ -447,6 +472,69 @@ async def run_agent_streaming(
                             f"turn ~{turn_count}). Agent may be stuck reasoning "
                             f"without acting.", output)
                         monologue_warning_injected = True
+
+                # Compaction detection: check for signals after processing
+                if turn_has_tool_calls and all_text_chunks:
+                    # Build recent tool calls for this turn
+                    recent_tools = tool_history[-3:] if tool_history else []
+                    if turn_has_tool_calls:
+                        turns_since_last_tool = 0
+                    else:
+                        turns_since_last_tool += 1
+
+                    latest_text = all_text_chunks[-1] if all_text_chunks else ""
+                    signals = detect_compaction_signals(
+                        text=latest_text,
+                        turn_count=turn_count,
+                        files_read=files_read,
+                        recent_tool_calls=recent_tools,
+                        turns_since_last_tool=turns_since_last_tool,
+                    )
+                    if signals:
+                        compaction_count += 1
+                        compaction_signals_all.extend(signals)
+                        signal_types = [s["type"] for s in signals]
+                        log(f"  [Compaction] Suspected compaction at turn "
+                            f"~{turn_count} (#{compaction_count}): "
+                            f"{', '.join(signal_types)}", output)
+
+                        # Immediate soft checkpoint on compaction signal
+                        last_text = "\n".join(all_text_chunks[-3:])
+                        cp_path = save_soft_checkpoint(
+                            task_id=task_id or 0,
+                            turn_count=turn_count,
+                            files_changed=files_changed,
+                            files_read=files_read,
+                            last_result_text=last_text,
+                            compaction_count=compaction_count,
+                            compaction_signals=compaction_signals_all,
+                            role=role,
+                        )
+                        if cp_path:
+                            log(f"  [SoftCheckpoint] Saved compaction "
+                                f"checkpoint -> {cp_path.name}", output)
+                            last_soft_checkpoint_turn = turn_count
+
+                # Periodic soft checkpoint every N turns
+                if (turn_has_tool_calls
+                        and task_id
+                        and turn_count - last_soft_checkpoint_turn
+                        >= SOFT_CHECKPOINT_INTERVAL):
+                    last_text = "\n".join(all_text_chunks[-3:])
+                    cp_path = save_soft_checkpoint(
+                        task_id=task_id,
+                        turn_count=turn_count,
+                        files_changed=files_changed,
+                        files_read=files_read,
+                        last_result_text=last_text,
+                        compaction_count=compaction_count,
+                        compaction_signals=compaction_signals_all,
+                        role=role,
+                    )
+                    if cp_path:
+                        log(f"  [SoftCheckpoint] Periodic checkpoint at "
+                            f"turn {turn_count} -> {cp_path.name}", output)
+                        last_soft_checkpoint_turn = turn_count
 
                 # If we found a reason to terminate, break out
                 if early_term_reason:
@@ -555,6 +643,12 @@ async def run_agent_streaming(
 
     # Attach action_log to result for caller inspection
     result["action_log"] = action_log
+
+    # Attach compaction metadata for loop/continuation logic
+    result["compaction_count"] = compaction_count
+    result["compaction_signals"] = compaction_signals_all
+    result["files_read"] = sorted(files_read)
+    result["files_changed_set"] = sorted(files_changed)
 
     return result
 
