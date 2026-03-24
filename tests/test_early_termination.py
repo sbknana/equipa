@@ -1095,8 +1095,8 @@ def test_developer_prompt_has_bias_for_action():
     # Check key directives are present
     assert "first 5 tool calls" in text, \
         "developer prompt missing 'first 5 tool calls' directive"
-    assert "40% of your turns" in text, \
-        "developer prompt missing '40% of your turns' limit"
+    assert "TURN BUDGET" in text, \
+        "developer prompt missing 'TURN BUDGET' limit"
     assert "Wrong code you can fix is better than no code" in text, \
         "developer prompt missing 'wrong code you can fix' directive"
 
