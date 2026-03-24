@@ -58,7 +58,7 @@ Claude now has MCP access to the database and full context about all EQUIPA comm
 Ask Claude, or use the CLI directly:
 
 ```bash
-python forge_orchestrator.py --add-project "MyApp" --project-dir "C:\path\to\myapp"
+python3 -m equipa.cli --add-project "MyApp" --project-dir "/path/to/myapp"
 ```
 
 This creates a project entry in the database and registers the directory in your config.
@@ -86,12 +86,12 @@ conn.commit()
 
 Single developer agent:
 ```bash
-python forge_orchestrator.py --task 1 -y
+python3 -m equipa.cli --task 1 -y
 ```
 
 Dev+Test loop (recommended — developer writes code, tester validates):
 ```bash
-python forge_orchestrator.py --task 1 --dev-test -y
+python3 -m equipa.cli --task 1 --dev-test -y
 ```
 
 ---
@@ -116,4 +116,19 @@ The orchestrator will:
 - **Auto-run:** `--auto-run` to scan all projects and dispatch work by priority
 - **Custom agents:** Drop a `.md` file in `prompts/` — see [CUSTOM_AGENTS.md](CUSTOM_AGENTS.md)
 - **Full reference:** See [USER_GUIDE.md](USER_GUIDE.md)
+
+---
+
+## Feature Flags (Optional)
+
+EQUIPA supports optional feature flags for experimental features. Create a `feature_flags.json` file in your installation directory:
+
+```json
+{
+  "enable_experimental_features": false,
+  "verbose_logging": false
+}
+```
+
+Feature flags are checked at runtime but are not required for basic operation.
 
