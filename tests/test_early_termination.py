@@ -277,9 +277,9 @@ def test_same_input_different_output_not_flagged():
 
 def test_constants_values():
     """Test that early termination constants have expected values."""
-    assert EARLY_TERM_WARN_TURNS == 12, f"EARLY_TERM_WARN_TURNS should be 12, got {EARLY_TERM_WARN_TURNS}"
-    assert EARLY_TERM_FINAL_WARN_TURNS == 18, f"EARLY_TERM_FINAL_WARN_TURNS should be 18, got {EARLY_TERM_FINAL_WARN_TURNS}"
-    assert EARLY_TERM_KILL_TURNS == 22, f"EARLY_TERM_KILL_TURNS should be 22, got {EARLY_TERM_KILL_TURNS}"
+    assert EARLY_TERM_WARN_TURNS == 5, f"EARLY_TERM_WARN_TURNS should be 5, got {EARLY_TERM_WARN_TURNS}"
+    assert EARLY_TERM_FINAL_WARN_TURNS == 8, f"EARLY_TERM_FINAL_WARN_TURNS should be 8, got {EARLY_TERM_FINAL_WARN_TURNS}"
+    assert EARLY_TERM_KILL_TURNS == 10, f"EARLY_TERM_KILL_TURNS should be 10, got {EARLY_TERM_KILL_TURNS}"
     assert EARLY_TERM_WARN_TURNS < EARLY_TERM_FINAL_WARN_TURNS < EARLY_TERM_KILL_TURNS, \
         f"WARN_TURNS ({EARLY_TERM_WARN_TURNS}) < FINAL_WARN_TURNS ({EARLY_TERM_FINAL_WARN_TURNS}) < KILL_TURNS ({EARLY_TERM_KILL_TURNS})"
 
