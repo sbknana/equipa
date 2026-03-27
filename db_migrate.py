@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 4
+CURRENT_VERSION = 5
 
 
 # ============================================================
@@ -398,12 +398,61 @@ def migrate_v3_to_v4(conn):
         pass  # Column already exists
 
 
+def migrate_v4_to_v5(conn):
+    """Add embedding columns and lesson graph table (v4.0 -> v5.0).
+
+    Adds:
+    - embedding TEXT column to lessons_learned (for semantic search)
+    - embedding TEXT column to agent_episodes (for episode similarity)
+    - lesson_graph_edges table (for relationship mapping between lessons)
+    - Indexes on src_id and dst_id for graph traversal performance
+    """
+    # Add embedding column to lessons_learned
+    try:
+        conn.execute(
+            "ALTER TABLE lessons_learned "
+            "ADD COLUMN embedding TEXT DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add embedding column to agent_episodes
+    try:
+        conn.execute(
+            "ALTER TABLE agent_episodes "
+            "ADD COLUMN embedding TEXT DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Create lesson_graph_edges table
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS lesson_graph_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_id INTEGER NOT NULL,
+            dst_id INTEGER NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(src_id, dst_id, edge_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lesson_graph_src
+            ON lesson_graph_edges(src_id);
+        CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst
+            ON lesson_graph_edges(dst_id);
+    """)
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
     2: ("ForgeSmith + agent tracking (v1 -> v2)", migrate_v1_to_v2),
     3: ("Agent messaging + action logging (v2 -> v3)", migrate_v2_to_v3),
     4: ("Impact assessment for ForgeSmith changes (v3 -> v4)", migrate_v3_to_v4),
+    5: ("Embedding columns + lesson graph (v4 -> v5)", migrate_v4_to_v5),
 }
 
 
