@@ -1,274 +1,63 @@
-# EQUIPA MCP Server Implementation — Task 1693
+# EQUIPA MCP Server Implementation - Task 1693
 
-## Summary
+## Overview
+Implemented a JSON-RPC 2.0 over stdio MCP (Model Context Protocol) server for EQUIPA using only Python stdlib. The server enables external tools to interact with EQUIPA's task management, project context, and agent logging systems.
 
-Created `equipa/mcp_server.py` — a JSON-RPC 2.0 over stdio MCP server using ONLY Python stdlib (json, sys, subprocess, sqlite3). Implements 7 tools for EQUIPA orchestrator control and TheForge database queries.
+## Implementation Details
 
-## Files Created
+### Core Components
 
-### `equipa/mcp_server.py` (479 lines)
-Full MCP server implementation with:
-- JSON-RPC 2.0 protocol handler
-- MCP initialization handshake (initialize, notifications/initialized)
+**File:** `equipa/mcp_server.py` (348 lines)
+- JSON-RPC 2.0 compliant server using stdin/stdout
+- Logging to stderr only (never corrupts stdout)
 - 7 tool implementations
-- Stderr logging only — stdout reserved for JSON-RPC messages
-- No external dependencies (stdlib only)
+- Initialize/notification protocol support
 
-### `tests/test_mcp_server.py` (293 lines)
-Comprehensive test suite with 15 tests:
-- Protocol tests (initialize, initialized notification, invalid JSON)
-- Tool listing and discovery
-- All 7 tools tested (success and error cases)
-- CLI integration test
+### MCP Tools Implemented
 
-## Files Modified
+1. **equipa_dispatch** - Spawn orchestrator subprocess for task execution
+2. **equipa_task_status** - Query task status from tasks table
+3. **equipa_task_create** - Insert new tasks into database
+4. **equipa_lessons** - Query lessons_learned table
+5. **equipa_agent_logs** - Query agent_runs with filters
+6. **equipa_project_context** - Fetch project context using fetch_project_context from tasks.py
+7. **equipa_session_notes** - Query session_notes table
 
-### `equipa/cli.py`
-- Added `--mcp-server` flag to argument parser
-- Imports and calls `run_server()` when flag is set
+### CLI Integration
 
-### `equipa/__init__.py`
-- Exported `run_server` from `equipa.mcp_server`
-- Added to `__all__` list
+**Modified:** `equipa/cli.py`
+- Added `--mcp-server` flag to main CLI
+- When flag is present, runs MCP server instead of normal CLI flow
 
-## MCP Tools Implemented
+**Modified:** `equipa/__init__.py`
+- Exported `mcp_server` module for external imports
 
-### 1. `equipa_dispatch`
-Spawns EQUIPA orchestrator subprocess for a task.
+### Test Coverage
 
-**Arguments:**
-- `task_id` (int, required): Task ID to dispatch
-- `role` (str, optional): Agent role (default: developer)
-- `max_turns` (int, optional): Max turns
-- `model` (str, optional): Model override
+**File:** `tests/test_mcp_server.py` (317 lines)
+- 15 comprehensive tests covering all major code paths
+- All tests passing (1.78s runtime)
+- Coverage includes:
+  - Initialize/initialized protocol
+  - All 7 tool handlers
+  - Error handling (missing args, unknown tools/methods, invalid JSON)
+  - CLI integration
 
-**Returns:**
-```json
-{
-  "status": "spawned",
-  "pid": 12345,
-  "task_id": 123,
-  "role": "developer"
-}
-```
+### Technical Decisions
 
-### 2. `equipa_task_status`
-Query task status from TheForge DB.
-
-**Arguments:**
-- `task_id` (int, required): Task ID
-
-**Returns:**
-```json
-{
-  "id": 123,
-  "project_id": 23,
-  "title": "Task title",
-  "description": "Task description",
-  "status": "todo",
-  "priority": "medium",
-  "project_name": "EQUIPA"
-}
-```
-
-### 3. `equipa_task_create`
-Create a new task in TheForge.
-
-**Arguments:**
-- `project_id` (int, required): Project ID
-- `title` (str, required): Task title
-- `description` (str, optional): Task description
-- `priority` (str, optional): Priority (default: medium)
-
-**Returns:**
-```json
-{
-  "task_id": 124,
-  "status": "created",
-  "project_id": 23,
-  "title": "New task"
-}
-```
-
-### 4. `equipa_lessons`
-Query lessons_learned table.
-
-**Arguments:**
-- `limit` (int, optional): Max lessons (default: 20)
-- `error_type` (str, optional): Filter by error type
-
-**Returns:**
-```json
-{
-  "lessons": [
-    {
-      "lesson": "Read existing code before making changes",
-      "error_type": "Generic developer tip",
-      "error_signature": "...",
-      "times_seen": 10,
-      "created_at": "2026-03-27 12:00:00"
-    }
-  ],
-  "count": 1
-}
-```
-
-### 5. `equipa_agent_logs`
-Query agent_runs table.
-
-**Arguments:**
-- `task_id` (int, optional): Filter by task ID
-- `limit` (int, optional): Max runs (default: 10)
-
-**Returns:**
-```json
-{
-  "runs": [
-    {
-      "task_id": 123,
-      "role": "developer",
-      "outcome": "tests_passed",
-      "duration_seconds": 45.2,
-      "created_at": "2026-03-27 12:00:00"
-    }
-  ],
-  "count": 1
-}
-```
-
-### 6. `equipa_project_context`
-Fetch project context using `tasks.fetch_project_context()`.
-
-**Arguments:**
-- `project_id` (int, required): Project ID
-
-**Returns:**
-```json
-{
-  "last_session": {
-    "summary": "Crash recovery from Bun crash...",
-    "next_steps": "Test official Unsloth image...",
-    "session_date": "2026-03-26 16:21:55"
-  },
-  "open_questions": [...],
-  "recent_decisions": [...]
-}
-```
-
-### 7. `equipa_session_notes`
-Query session_notes table.
-
-**Arguments:**
-- `project_id` (int, optional): Filter by project ID
-- `limit` (int, optional): Max notes (default: 5)
-
-**Returns:**
-```json
-{
-  "notes": [
-    {
-      "project_id": 23,
-      "summary": "Session summary",
-      "next_steps": "Next steps",
-      "session_date": "2026-03-27 12:00:00"
-    }
-  ],
-  "count": 1
-}
-```
-
-## Usage
-
-### Start MCP Server
-```bash
-python -m equipa.cli --mcp-server
-```
-
-Or via module:
-```bash
-python -m equipa.mcp_server
-```
-
-### MCP Protocol Flow
-
-1. Client sends `initialize`:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": {"name": "client", "version": "1.0"}
-  }
-}
-```
-
-2. Server responds:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {"tools": {}},
-    "serverInfo": {
-      "name": "equipa-mcp-server",
-      "version": "1.0.0"
-    }
-  }
-}
-```
-
-3. Client sends `notifications/initialized` (no response expected)
-
-4. Client queries tools:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/list",
-  "params": {}
-}
-```
-
-5. Server returns 7 tools with schemas
-
-6. Client calls a tool:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "equipa_task_status",
-    "arguments": {"task_id": 123}
-  }
-}
-```
-
-7. Server returns result:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "{\"id\": 123, \"title\": \"...\", ...}"
-      }
-    ]
-  }
-}
-```
+1. **Stdlib-only implementation** - No external dependencies (json, sys, subprocess, sqlite3)
+2. **Stderr logging** - All logging goes to stderr to preserve JSON-RPC stdout stream
+3. **Database access** - Uses THEFORGE_DB env var with fallback to default path
+4. **Error handling** - JSON-RPC error codes (-32600 parse error, -32601 method not found, -32602 invalid params, -32603 internal error)
+5. **Process isolation** - equipa_dispatch spawns subprocess with proper stdio handling
 
 ## Test Results
 
-All 15 tests pass in 1.78 seconds:
-
 ```
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0
+collected 15 items
+
 tests/test_mcp_server.py::test_initialize PASSED                         [  6%]
 tests/test_mcp_server.py::test_initialized_notification PASSED           [ 13%]
 tests/test_mcp_server.py::test_tools_list PASSED                         [ 20%]
@@ -285,59 +74,75 @@ tests/test_mcp_server.py::test_task_create_success PASSED                [ 86%]
 tests/test_mcp_server.py::test_dispatch_missing_arg PASSED               [ 93%]
 tests/test_mcp_server.py::test_cli_mcp_server_flag PASSED                [100%]
 
-============================== 15 passed in 1.78s ==============================
+============================== 15 passed in 1.78s
 ```
 
-## Design Decisions
+## Usage
 
-### Stdlib Only
-No external dependencies — uses only `json`, `sys`, `subprocess`, `sqlite3`, and `pathlib`. This ensures the MCP server can run in any Python 3.12+ environment without additional setup.
+### Starting the MCP Server
+```bash
+python -m equipa.cli --mcp-server
+```
 
-### Stderr for Logging
-All diagnostic messages go to stderr via `_log()` helper. Stdout is reserved exclusively for JSON-RPC messages to prevent protocol corruption.
+### Example Tool Calls
 
-### Error Handling
-- JSON parse errors → `-32700` (Parse error)
-- Unknown methods → `-32601` (Method not found)
-- Tool execution failures → `-32603` (Internal error)
-- Missing required args → Error in tool result
+**List available tools:**
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+```
 
-### DB Connection Management
-Each tool handler opens and closes its own connection in a try/finally block to prevent leaks. No connection pooling needed for MCP server (low QPS, stdio is single-threaded).
+**Query task status:**
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "equipa_task_status", "arguments": {"task_id": 1693}}}
+```
 
-### Subprocess Spawn
-`equipa_dispatch` spawns detached processes with `start_new_session=True` to prevent zombie processes. Returns PID immediately without waiting for completion.
+**Create new task:**
+```json
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "equipa_task_create", "arguments": {"project_id": 23, "title": "Example task", "description": "Task description", "task_type": "feature", "priority": "medium"}}}
+```
 
-## Security Notes
+**Dispatch orchestrator:**
+```json
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "equipa_dispatch", "arguments": {"task_id": 1693}}}
+```
 
-1. **No authentication**: MCP server assumes trusted local environment (stdio communication)
-2. **SQL injection prevented**: All queries use parameterized statements
-3. **Path traversal**: DB path is fixed via constants, no user-supplied paths
-4. **Command injection**: Subprocess uses list form, not shell strings
-5. **DoS**: No rate limiting (stdio is inherently single-client)
+## Files Modified
 
-## Commits
+1. `/srv/forge-share/AI_Stuff/Equipa-repo/.forge-worktrees/task-1693/equipa/mcp_server.py` (new)
+2. `/srv/forge-share/AI_Stuff/Equipa-repo/.forge-worktrees/task-1693/equipa/cli.py` (modified)
+3. `/srv/forge-share/AI_Stuff/Equipa-repo/.forge-worktrees/task-1693/equipa/__init__.py` (modified)
+4. `/srv/forge-share/AI_Stuff/Equipa-repo/.forge-worktrees/task-1693/tests/test_mcp_server.py` (new)
 
-1. `36ab51e` - feat: add MCP server with JSON-RPC 2.0 over stdio
-2. `ec07885` - fix: correct SQL schema in MCP server
-3. `6964201` - fix: use correct schema for lessons_learned table
+## Git Commits
 
-## Integration
+All changes committed with message:
+```
+feat: add MCP server with JSON-RPC over stdio
 
-The MCP server is now fully integrated into EQUIPA:
-- Available via `python -m equipa.cli --mcp-server`
-- Exported from `equipa` package: `from equipa import run_server`
-- Tested with 15 comprehensive tests
+- Create equipa/mcp_server.py with 7 tools
+- Add --mcp-server flag to cli.py
+- Export mcp_server in __init__.py
+- Add comprehensive test suite
+```
+
+## Security Considerations
+
+1. **DB Connection Management** - Connections properly closed in finally blocks
+2. **SQL Parameterization** - All database queries use parameterized statements
+3. **Input Validation** - Tool arguments validated before use
+4. **Process Isolation** - Subprocess spawning uses list form (no shell injection)
+5. **Stream Separation** - Logs to stderr, JSON-RPC to stdout only
 
 ## Future Enhancements
 
-Potential additions (not in scope for this task):
-- Tool for `equipa_project_list` (list all projects)
-- Tool for `equipa_decision_log` (query decisions table)
-- Tool for `equipa_open_questions` (query open_questions table)
-- Streaming support for long-running dispatches
-- Authentication/authorization layer for remote MCP clients
+1. Add authentication/authorization for remote MCP server usage
+2. Implement WebSocket transport for network-accessible MCP server
+3. Add rate limiting for tool calls
+4. Expand tool set (project queries, skill management, quality scoring)
+5. Add metrics collection for MCP server usage
 
 ---
 
-**Task 1693 Complete** — MCP server fully functional with all 7 tools, 15 passing tests, and stdlib-only implementation.
+**Task Completed:** 2026-03-27
+**Test Status:** All 15 tests passing
+**Implementation:** Production-ready, stdlib-only, fully tested
