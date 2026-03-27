@@ -70,27 +70,23 @@ def write_skill_manifest() -> dict:
 def verify_skill_integrity() -> bool:
     """Verify all prompt and skill files match known-good SHA-256 hashes.
 
-    Returns True if verification passes, False if files are tampered/missing.
-    Auto-regenerates the manifest only when the manifest file itself is
-    missing or corrupt, not when the skill files have changed.
+    Returns True if verification passes, False if files are tampered/missing
+    or if the manifest is corrupt/empty.
     """
     if not SKILL_MANIFEST_FILE.exists():
-        print("WARNING: skill_manifest.json not found — auto-generating")
-        write_skill_manifest()
-        return True
+        print("ERROR: skill_manifest.json not found")
+        return False
 
     try:
         manifest_data = json.loads(SKILL_MANIFEST_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        print(f"WARNING: Failed to load skill_manifest.json: {e} — regenerating")
-        write_skill_manifest()
-        return True
+        print(f"ERROR: Failed to load skill_manifest.json: {e}")
+        return False
 
     expected_files = manifest_data.get("files", {})
     if not expected_files:
-        print("WARNING: skill_manifest.json empty — regenerating")
-        write_skill_manifest()
-        return True
+        print("ERROR: skill_manifest.json has empty files dict")
+        return False
 
     base_dir = Path(__file__).parent.parent
     mismatches: list[str] = []
