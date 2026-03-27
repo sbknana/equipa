@@ -70,28 +70,23 @@ def write_skill_manifest() -> dict:
 def verify_skill_integrity() -> bool:
     """Verify all prompt and skill files match known-good SHA-256 hashes.
 
-    Returns True if verification passes (or manifest is missing/stale).
-    Auto-regenerates the manifest when changes are detected from the
-    orchestrator (not from agents), since the security value is in
-    logging what changed, not in blocking legitimate updates.
+    Returns True if verification passes, False if files are tampered/missing
+    or if the manifest is corrupt/empty.
     """
     if not SKILL_MANIFEST_FILE.exists():
-        print("WARNING: skill_manifest.json not found — auto-generating")
-        write_skill_manifest()
-        return True
+        print("ERROR: skill_manifest.json not found")
+        return False
 
     try:
         manifest_data = json.loads(SKILL_MANIFEST_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        print(f"WARNING: Failed to load skill_manifest.json: {e} — regenerating")
-        write_skill_manifest()
-        return True
+        print(f"ERROR: Failed to load skill_manifest.json: {e}")
+        return False
 
     expected_files = manifest_data.get("files", {})
     if not expected_files:
-        print("WARNING: skill_manifest.json empty — regenerating")
-        write_skill_manifest()
-        return True
+        print("ERROR: skill_manifest.json has empty files dict")
+        return False
 
     base_dir = Path(__file__).parent.parent
     mismatches: list[str] = []
@@ -107,17 +102,16 @@ def verify_skill_integrity() -> bool:
             mismatches.append(rel_path)
 
     if missing:
-        print(f"NOTICE: Skill integrity — {len(missing)} file(s) removed since last manifest:")
+        print(f"ERROR: Skill integrity — {len(missing)} file(s) missing:")
         for f in missing:
-            print(f"  REMOVED: {f}")
+            print(f"  MISSING: {f}")
 
     if mismatches:
-        print(f"NOTICE: Skill integrity — {len(mismatches)} file(s) updated since last manifest:")
+        print(f"ERROR: Skill integrity — {len(mismatches)} file(s) tampered:")
         for f in mismatches:
-            print(f"  UPDATED: {f}")
+            print(f"  TAMPERED: {f}")
 
     if missing or mismatches:
-        print("Auto-regenerating skill manifest...")
-        write_skill_manifest()
+        return False
 
     return True

@@ -273,6 +273,8 @@ async def async_main() -> None:
                         help="Register a new project in EQUIPA DB and config")
     group.add_argument("--regenerate-manifest", action="store_true",
                         help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
+    group.add_argument("--mcp-server", action="store_true",
+                        help="Run as MCP server (JSON-RPC over stdio)")
 
     parser.add_argument("--project-dir", type=str, metavar="PATH",
                         help="Project directory (used with --add-project)")
@@ -324,6 +326,12 @@ async def async_main() -> None:
 
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
+
+    # --- MCP server mode ---
+    if args.mcp_server:
+        from equipa.mcp_server import run_server
+        run_server()
+        return
 
     # --- Regenerate skill manifest mode ---
     if args.regenerate_manifest:

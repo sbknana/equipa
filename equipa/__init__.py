@@ -315,6 +315,11 @@ from equipa.mcp_health import (
     MCPHealthMonitor,
 )
 
+# --- MCP Server (equipa.mcp_server) ---
+from equipa.mcp_server import (
+    run_server,
+)
+
 # --- CLI (equipa.cli) ---
 from equipa.cli import (
     _handle_add_project,
@@ -563,6 +568,8 @@ __all__ = [
     "MAX_BACKOFF",
     "HEALTHY_TTL",
     "MCPHealthMonitor",
+    # MCP Server
+    "run_server",
     # CLI
     "get_provider",
     "get_ollama_model",
