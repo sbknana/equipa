@@ -158,7 +158,6 @@ def _handle_equipa_task_create(args: dict) -> dict:
         title (str): Task title
         description (str): Task description
         priority (str, optional): Task priority (default: medium)
-        task_type (str, optional): Task type (default: feature)
 
     Returns:
         dict: {"task_id": int, "status": "created"}
@@ -167,7 +166,6 @@ def _handle_equipa_task_create(args: dict) -> dict:
     title = args.get("title")
     description = args.get("description", "")
     priority = args.get("priority", "medium")
-    task_type = args.get("task_type", "feature")
 
     if not project_id or not title:
         return {"error": "project_id and title required"}
@@ -176,10 +174,10 @@ def _handle_equipa_task_create(args: dict) -> dict:
     try:
         cursor = conn.execute(
             """
-            INSERT INTO tasks (project_id, title, description, priority, type, status)
-            VALUES (?, ?, ?, ?, ?, 'todo')
+            INSERT INTO tasks (project_id, title, description, priority, status)
+            VALUES (?, ?, ?, ?, 'todo')
             """,
-            (project_id, title, description, priority, task_type),
+            (project_id, title, description, priority),
         )
         conn.commit()
         task_id = cursor.lastrowid
@@ -199,31 +197,31 @@ def _handle_equipa_lessons(args: dict) -> dict:
 
     Args:
         limit (int, optional): Max lessons to return (default: 20)
-        error_pattern (str, optional): Filter by error pattern
+        error_msg (str, optional): Filter by error message
 
     Returns:
-        dict: {"lessons": [{"lesson": str, "error_pattern": str, ...}, ...]}
+        dict: {"lessons": [{"lesson": str, "error_msg": str, ...}, ...]}
     """
     limit = args.get("limit", 20)
-    error_pattern = args.get("error_pattern")
+    error_msg = args.get("error_msg")
 
     conn = _get_db_connection()
     try:
-        if error_pattern:
+        if error_msg:
             rows = conn.execute(
                 """
-                SELECT lesson, error_pattern, frequency, last_seen
+                SELECT lesson, error_msg, frequency, last_seen
                 FROM lessons_learned
-                WHERE error_pattern LIKE ?
+                WHERE error_msg LIKE ?
                 ORDER BY frequency DESC, last_seen DESC
                 LIMIT ?
                 """,
-                (f"%{error_pattern}%", limit),
+                (f"%{error_msg}%", limit),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT lesson, error_pattern, frequency, last_seen
+                SELECT lesson, error_msg, frequency, last_seen
                 FROM lessons_learned
                 ORDER BY frequency DESC, last_seen DESC
                 LIMIT ?
@@ -257,7 +255,7 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
         if task_id:
             rows = conn.execute(
                 """
-                SELECT task_id, role, outcome, cost, duration_seconds, created_at
+                SELECT task_id, role, outcome, duration_seconds, created_at
                 FROM agent_runs
                 WHERE task_id = ?
                 ORDER BY created_at DESC
@@ -268,7 +266,7 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
         else:
             rows = conn.execute(
                 """
-                SELECT task_id, role, outcome, cost, duration_seconds, created_at
+                SELECT task_id, role, outcome, duration_seconds, created_at
                 FROM agent_runs
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -386,7 +384,6 @@ TOOLS = {
                 "title": {"type": "string", "description": "Task title"},
                 "description": {"type": "string", "description": "Task description"},
                 "priority": {"type": "string", "description": "Priority (default: medium)", "default": "medium"},
-                "task_type": {"type": "string", "description": "Type (default: feature)", "default": "feature"},
             },
             "required": ["project_id", "title"],
         },
@@ -398,7 +395,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "description": "Max lessons (default: 20)", "default": 20},
-                "error_pattern": {"type": "string", "description": "Filter by error pattern"},
+                "error_msg": {"type": "string", "description": "Filter by error message"},
             },
         },
         "handler": _handle_equipa_lessons,
