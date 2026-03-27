@@ -37,6 +37,11 @@ ROLE_PROMPTS = {
     "tester": PROMPTS_DIR / "tester.md",
     "planner": PROMPTS_DIR / "planner.md",
     "evaluator": PROMPTS_DIR / "evaluator.md",
+    "frontend-designer": PROMPTS_DIR / "frontend-designer.md",
+    "integration-tester": PROMPTS_DIR / "integration-tester.md",
+    "debugger": PROMPTS_DIR / "debugger.md",
+    "code-reviewer": PROMPTS_DIR / "code-reviewer.md",
+    "qa-tester": PROMPTS_DIR / "qa-tester.md",
 }
 
 # --- Agent Defaults ---
