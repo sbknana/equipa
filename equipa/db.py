@@ -68,6 +68,7 @@ def ensure_schema() -> None:
                 project_id INTEGER, approach_summary TEXT,
                 turns_used INTEGER, outcome TEXT, error_patterns TEXT,
                 reflection TEXT, q_value REAL DEFAULT 0.5,
+                embedding TEXT,
                 times_injected INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
             )
@@ -85,6 +86,7 @@ def ensure_schema() -> None:
                 times_injected INTEGER DEFAULT 0,
                 effectiveness_score REAL,
                 active INTEGER DEFAULT 1,
+                embedding TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             )
@@ -160,6 +162,25 @@ def ensure_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_actions_tool "
             "ON agent_actions(tool_name, success)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lesson_graph_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                src_id INTEGER NOT NULL,
+                dst_id INTEGER NOT NULL,
+                edge_type TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(src_id, dst_id, edge_type)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lesson_graph_src "
+            "ON lesson_graph_edges(src_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst "
+            "ON lesson_graph_edges(dst_id)"
         )
         conn.commit()
         conn.close()
