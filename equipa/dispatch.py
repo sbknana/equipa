@@ -71,6 +71,9 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "security_review": True,
     "quality_scoring": True,
     "anti_compaction_state": True,
+    "vector_memory": False,
+    "auto_model_routing": False,
+    "knowledge_graph": False,
 }
 
 DEFAULT_DISPATCH_CONFIG: dict = {
