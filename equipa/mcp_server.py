@@ -197,33 +197,33 @@ def _handle_equipa_lessons(args: dict) -> dict:
 
     Args:
         limit (int, optional): Max lessons to return (default: 20)
-        error_msg (str, optional): Filter by error message
+        error_type (str, optional): Filter by error type
 
     Returns:
-        dict: {"lessons": [{"lesson": str, "error_msg": str, ...}, ...]}
+        dict: {"lessons": [{"lesson": str, "error_type": str, ...}, ...]}
     """
     limit = args.get("limit", 20)
-    error_msg = args.get("error_msg")
+    error_type = args.get("error_type")
 
     conn = _get_db_connection()
     try:
-        if error_msg:
+        if error_type:
             rows = conn.execute(
                 """
-                SELECT lesson, error_msg, frequency, last_seen
+                SELECT lesson, error_type, error_signature, times_seen, created_at
                 FROM lessons_learned
-                WHERE error_msg LIKE ?
-                ORDER BY frequency DESC, last_seen DESC
+                WHERE error_type LIKE ?
+                ORDER BY times_seen DESC, created_at DESC
                 LIMIT ?
                 """,
-                (f"%{error_msg}%", limit),
+                (f"%{error_type}%", limit),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT lesson, error_msg, frequency, last_seen
+                SELECT lesson, error_type, error_signature, times_seen, created_at
                 FROM lessons_learned
-                ORDER BY frequency DESC, last_seen DESC
+                ORDER BY times_seen DESC, created_at DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -395,7 +395,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "description": "Max lessons (default: 20)", "default": 20},
-                "error_msg": {"type": "string", "description": "Filter by error message"},
+                "error_type": {"type": "string", "description": "Filter by error type"},
             },
         },
         "handler": _handle_equipa_lessons,
