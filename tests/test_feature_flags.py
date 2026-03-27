@@ -9,7 +9,7 @@ Tests verify:
 4. Unknown feature names default to False
 5. load_dispatch_config deep-merges features (partial override preserves other flags)
 6. load_dispatch_config with no features key uses all defaults
-7. DEFAULT_FEATURE_FLAGS contains all 9 expected flags
+7. DEFAULT_FEATURE_FLAGS contains all 12 expected flags
 8. dispatch_config.example.json features section matches DEFAULT_FEATURE_FLAGS
 """
 
@@ -85,10 +85,13 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "security_review": True,
         "quality_scoring": True,
         "anti_compaction_state": True,
+        "vector_memory": False,
+        "auto_model_routing": False,
+        "knowledge_graph": False,
     }
 
     def test_contains_all_expected_flags(self):
-        """DEFAULT_FEATURE_FLAGS has exactly the 9 expected flags."""
+        """DEFAULT_FEATURE_FLAGS has exactly the 12 expected flags."""
         self.assertEqual(set(DEFAULT_FEATURE_FLAGS.keys()),
                          set(self.EXPECTED_FLAGS.keys()))
 
