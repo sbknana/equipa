@@ -21,6 +21,34 @@ from equipa.constants import (
 )
 
 
+def _get_git_identity() -> tuple[str | None, str | None]:
+    """Read git_author_name and git_author_email from dispatch_config.json.
+
+    Returns (name, email) tuple. Either or both may be None if not configured.
+    """
+    import json as _json
+    try:
+        from equipa.constants import THEFORGE_DB
+        config_path = Path(THEFORGE_DB).parent / "dispatch_config.json"
+        if config_path.exists():
+            data = _json.loads(config_path.read_text(encoding="utf-8"))
+            return data.get("git_author_name"), data.get("git_author_email")
+    except Exception:
+        pass
+    return None, None
+
+
+def _git_identity_args() -> list[str]:
+    """Return git -c args for author identity, or empty list if not configured."""
+    name, email = _get_git_identity()
+    args = []
+    if name:
+        args.extend(["-c", f"user.name={name}"])
+    if email:
+        args.extend(["-c", f"user.email={email}"])
+    return args
+
+
 def _is_git_repo(path: str | Path) -> bool:
     """Check if a directory is a git repository."""
     return (Path(path) / ".git").exists()
@@ -157,6 +185,23 @@ def _git_run(
     )
 
 
+def _git_commit(
+    message: str,
+    cwd: str | Path,
+    timeout: int = 120,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run git commit with EQUIPA identity from dispatch_config.
+
+    Always injects -c user.name and -c user.email if configured,
+    so commits are attributed correctly regardless of global git config.
+    """
+    cmd = ["git"] + _git_identity_args() + ["commit", "-m", message]
+    if extra_args:
+        cmd.extend(extra_args)
+    return _git_run(cmd, cwd, timeout=timeout)
+
+
 def check_gh_installed() -> bool:
     """Verify that gh CLI is installed and authenticated.
 
@@ -250,7 +295,8 @@ def setup_single_repo(
             return False, f"git add failed: {chr(10).join(real_errors)}"
 
     # git commit
-    r = _git_run(["git", "commit", "-m", "Initial commit"], p, timeout=120)
+    commit_cmd = ["git"] + _git_identity_args() + ["commit", "-m", "Initial commit"]
+    r = _git_run(commit_cmd, p, timeout=120)
     if r.returncode != 0:
         if "nothing to commit" not in (r.stdout + r.stderr):
             return False, f"git commit failed: {r.stderr.strip()}"

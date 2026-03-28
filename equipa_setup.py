@@ -390,11 +390,34 @@ def step_copy_files(base_path):
     return True
 
 
+def _get_current_git_config(key):
+    """Read a value from the current global git config. Returns None on failure."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "config", "--global", key],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
 def step_generate_config(base_path, db_path):
     """Generate forge_config.json."""
     print_header("Step 5: Generate Configuration")
 
     github_owner = prompt_input("GitHub username", default="YourGitHubUsername")
+
+    # Git identity — used for all EQUIPA git commits instead of global config
+    print("\n  Git identity for EQUIPA commits:")
+    print("  (This overrides your global git config for EQUIPA-managed repos)")
+    git_name_default = _get_current_git_config("user.name") or "Your Name"
+    git_email_default = _get_current_git_config("user.email") or "you@example.com"
+    git_author_name = prompt_input("  Git author name", default=git_name_default)
+    git_author_email = prompt_input("  Git author email", default=git_email_default)
 
     config = {
         "theforge_db": str(db_path),
@@ -408,6 +431,22 @@ def step_generate_config(base_path, db_path):
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
     print(f"  Created: {config_path}")
+
+    # Store git identity in dispatch_config.json
+    dispatch_config_path = base_path / "dispatch_config.json"
+    dispatch_config = {}
+    if dispatch_config_path.exists():
+        try:
+            dispatch_config = json.loads(dispatch_config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    dispatch_config["git_author_name"] = git_author_name
+    dispatch_config["git_author_email"] = git_author_email
+    with open(dispatch_config_path, "w", encoding="utf-8") as f:
+        json.dump(dispatch_config, f, indent=4)
+    print(f"  Git identity saved to dispatch_config.json")
+    print(f"    name:  {git_author_name}")
+    print(f"    email: {git_author_email}")
 
     # Display config
     print(f"\n  Configuration:")
