@@ -142,7 +142,7 @@ class TestEmbedAndStoreLesson:
             base_url="http://localhost:11434",
         )
         mock_conn.execute.assert_called_once_with(
-            "UPDATE lessons SET embedding = ? WHERE id = ?",
+            "UPDATE lessons_learned SET embedding = ? WHERE id = ?",
             (json.dumps([0.1, 0.2, 0.3]), 123),
         )
         mock_conn.commit.assert_called_once()
@@ -200,7 +200,7 @@ class TestEmbedAndStoreEpisode:
 
         assert result is True
         mock_conn.execute.assert_called_once_with(
-            "UPDATE episodes SET embedding = ? WHERE id = ?",
+            "UPDATE agent_episodes SET embedding = ? WHERE id = ?",
             (json.dumps([0.4, 0.5, 0.6]), 456),
         )
         mock_conn.commit.assert_called_once()
