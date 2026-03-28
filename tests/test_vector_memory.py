@@ -23,53 +23,48 @@ from equipa.lessons import get_relevant_episodes, record_agent_episode
 def test_db(tmp_path, monkeypatch):
     """Create a temporary test database."""
     db_path = tmp_path / "test.db"
-    monkeypatch.setattr("equipa.constants.THEFORGE_DB", str(db_path))
-    monkeypatch.setattr("equipa.db.THEFORGE_DB", str(db_path))
-    monkeypatch.setattr("equipa.lessons.THEFORGE_DB", str(db_path))
-    monkeypatch.setattr("equipa.embeddings.THEFORGE_DB", str(db_path))
+    monkeypatch.setattr("equipa.constants.THEFORGE_DB", db_path)
+    monkeypatch.setattr("equipa.db.THEFORGE_DB", db_path)
+    monkeypatch.setattr("equipa.lessons.THEFORGE_DB", db_path)
+    monkeypatch.setattr("equipa.embeddings.THEFORGE_DB", db_path)
 
     # Initialize schema
     ensure_schema()
 
     # Insert test data
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
 
-    # Insert project
-    conn.execute(
-        "INSERT INTO projects (id, name, path) VALUES (?, ?, ?)",
-        (23, "Test Project", "/tmp/test"),
-    )
-
-    # Insert task
-    conn.execute(
-        """INSERT INTO tasks (id, project_id, title, description, status, priority, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (1, 23, "Test Task", "Fix async endpoint", "pending", "high", datetime.now().isoformat()),
-    )
-
-    # Insert agent episodes with different characteristics
+    # Insert agent episodes with different characteristics (directly into agent_episodes)
+    # Insert episodes with project_id=23 for test retrieval
     ep1 = {
         "task_id": 1,
         "role": "developer",
+        "project_id": 23,
         "outcome": "success",
+        "q_value": 0.7,
         "reflection": "Fixed async endpoint by adding await keywords. Used asyncio.gather for parallel DB calls.",
         "embedding": json.dumps([0.8, 0.2, 0.0]),
         "created_at": datetime.now().isoformat(),
     }
 
     ep2 = {
-        "task_id": 1,
+        "task_id": 2,
         "role": "developer",
+        "project_id": 23,
         "outcome": "success",
+        "q_value": 0.6,
         "reflection": "Refactored React component to use hooks instead of class components.",
         "embedding": json.dumps([0.1, 0.9, 0.0]),
         "created_at": datetime.now().isoformat(),
     }
 
     ep3 = {
-        "task_id": 1,
+        "task_id": 3,
         "role": "tester",
+        "project_id": 23,
         "outcome": "tests_passed",
+        "q_value": 0.8,
         "reflection": "All async tests passed after fixing race condition in DB pool.",
         "embedding": json.dumps([0.7, 0.3, 0.0]),
         "created_at": datetime.now().isoformat(),
@@ -77,9 +72,9 @@ def test_db(tmp_path, monkeypatch):
 
     for ep in [ep1, ep2, ep3]:
         conn.execute(
-            """INSERT INTO agent_episodes (task_id, role, outcome, reflection, embedding, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (ep["task_id"], ep["role"], ep["outcome"], ep["reflection"], ep["embedding"], ep["created_at"]),
+            """INSERT INTO agent_episodes (task_id, role, project_id, outcome, q_value, reflection, embedding, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ep["task_id"], ep["role"], ep["project_id"], ep["outcome"], ep["q_value"], ep["reflection"], ep["embedding"], ep["created_at"]),
         )
 
     conn.commit()
@@ -247,14 +242,14 @@ class TestRecordAgentEpisodeEmbedding:
         # get_embedding should NOT have been called
         mock_get_embedding.assert_not_called()
 
-    @mock.patch("equipa.lessons.get_embedding")
+    @mock.patch("equipa.lessons.embed_and_store_episode")
     def test_embedding_failure_does_not_block_recording(
-        self, mock_get_embedding, test_db
+        self, mock_embed, test_db
     ):
         """If get_embedding fails, episode should still be recorded."""
-        mock_get_embedding.return_value = None  # Simulate Ollama failure
+        mock_embed.return_value = False  # Simulate Ollama failure
 
-        task = {"id": 1, "project_id": 23}
+        task = {"id": 999, "project_id": 23}
         result = {}
         output = [
             {"type": "text", "text": "RESULT: success\nREFLECTION: Fixed it."},
@@ -270,13 +265,13 @@ class TestRecordAgentEpisodeEmbedding:
         )
 
         # Episode should have been recorded even though embedding failed
-        conn = sqlite3.connect(THEFORGE_DB)
-        cursor = conn.execute("SELECT COUNT(*) FROM agent_episodes WHERE task_id = 1")
+        conn = sqlite3.connect(str(test_db))
+        cursor = conn.execute("SELECT COUNT(*) FROM agent_episodes WHERE task_id = 999")
         count = cursor.fetchone()[0]
         conn.close()
 
-        # Original 3 episodes + 1 new = 4
-        assert count == 4
+        # Should have 1 new episode
+        assert count == 1
 
 
 # --- End-to-End Integration Tests ---
@@ -361,12 +356,12 @@ class TestOllamaMocking:
     @mock.patch("urllib.request.urlopen")
     def test_get_embedding_mocks_urllib(self, mock_urlopen):
         """Verify urllib.request.urlopen is correctly mocked for Ollama calls."""
-        mock_response = mock.Mock()
+        mock_response = mock.MagicMock()
         mock_response.read.return_value = json.dumps(
             {"embedding": [0.1, 0.2, 0.3]}
         ).encode()
-        mock_response.__enter__.return_value = mock_response
-        mock_response.__exit__.return_value = False
+        mock_response.__enter__ = mock.Mock(return_value=mock_response)
+        mock_response.__exit__ = mock.Mock(return_value=False)
         mock_urlopen.return_value = mock_response
 
         embedding = get_embedding("test query")
