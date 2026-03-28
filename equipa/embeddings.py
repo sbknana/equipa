@@ -95,7 +95,8 @@ def embed_and_store_lesson(
         return False
 
     try:
-        conn = sqlite3.connect(str(THEFORGE_DB))
+        from equipa.db import get_db_connection
+        conn = get_db_connection(write=True)
         try:
             conn.execute(
                 "UPDATE lessons_learned SET embedding = ? WHERE id = ?",
@@ -153,7 +154,8 @@ def embed_and_store_episode(
         return False
 
     try:
-        conn = sqlite3.connect(str(THEFORGE_DB))
+        from equipa.db import get_db_connection
+        conn = get_db_connection(write=True)
         try:
             conn.execute(
                 "UPDATE agent_episodes SET embedding = ? WHERE id = ?",
