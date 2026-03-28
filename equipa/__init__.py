@@ -323,6 +323,15 @@ from equipa.routing import (
     select_model_by_complexity,
 )
 
+# --- Embeddings (equipa.embeddings) ---
+from equipa.embeddings import (
+    cosine_similarity,
+    embed_and_store_episode,
+    embed_and_store_lesson,
+    find_similar_by_embedding,
+    get_embedding,
+)
+
 # --- MCP Server (equipa.mcp_server) ---
 from equipa.mcp_server import (
     run_server,
@@ -581,6 +590,12 @@ __all__ = [
     "record_model_outcome",
     "score_complexity",
     "select_model_by_complexity",
+    # Embeddings
+    "cosine_similarity",
+    "embed_and_store_episode",
+    "embed_and_store_lesson",
+    "find_similar_by_embedding",
+    "get_embedding",
     # MCP Server
     "run_server",
     # CLI
