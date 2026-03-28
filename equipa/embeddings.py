@@ -75,6 +75,9 @@ def embed_and_store_lesson(
 ) -> bool:
     """Generate embedding for a lesson and store as JSON in lessons.embedding column.
 
+    If knowledge_graph feature is enabled, creates similarity edges to connect
+    this lesson with other semantically similar lessons in the graph.
+
     Args:
         lesson_id: Lesson ID from lessons table
         text: Text to embed (typically lesson content)
@@ -99,11 +102,31 @@ def embed_and_store_lesson(
                 (json.dumps(embedding), lesson_id),
             )
             conn.commit()
-            return True
         finally:
             conn.close()
     except Exception:
         return False
+
+    # Create similarity edges in knowledge graph (if enabled)
+    knowledge_graph_enabled = False
+    if dispatch_config:
+        try:
+            from equipa.dispatch import is_feature_enabled
+            knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
+        except ImportError:
+            pass
+
+    if knowledge_graph_enabled and embedding:
+        try:
+            from equipa import graph
+            # Create edges to similar lessons (threshold=0.8)
+            edges_created = graph.create_similarity_edges(lesson_id, embedding, threshold=0.8)
+            # Silent success — don't spam logs on every lesson storage
+        except Exception:
+            # Graph module unavailable or error — continue without graph updates
+            pass
+
+    return True
 
 
 def embed_and_store_episode(
