@@ -264,6 +264,9 @@ def resolve_project_dir(task: dict) -> str | None:
             conn.close()
             if row and row["local_path"]:
                 db_path = row["local_path"].rstrip("/").rstrip("\\")
+                # Translate Windows paths to Samba mount
+                if db_path.startswith(("Z:\\AI_Stuff", "Z:/AI_Stuff")):
+                    db_path = "/srv/forge-share/AI_Stuff" + db_path[len("Z:\\AI_Stuff"):].replace("\\", "/")
                 if Path(db_path).exists():
                     return db_path
         except Exception as e:
