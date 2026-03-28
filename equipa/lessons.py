@@ -458,7 +458,8 @@ def record_agent_episode(
                 from equipa.dispatch import is_feature_enabled
                 vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
             except ImportError:
-                pass
+                # Fallback for tests that don't have dispatch module
+                vector_memory_enabled = dispatch_config.get("features", {}).get("vector_memory", False)
 
         if vector_memory_enabled and episode_id:
             try:
