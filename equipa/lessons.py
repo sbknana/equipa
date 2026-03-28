@@ -433,6 +433,15 @@ def record_agent_episode(
         result_text = result.get("result_text", "") if isinstance(result, dict) else ""
         num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
 
+        # If result_text is empty but output is provided, extract text from output
+        if not result_text and output:
+            # Concatenate all text content from output messages
+            text_parts = []
+            for msg in output:
+                if isinstance(msg, dict) and msg.get("type") == "text":
+                    text_parts.append(msg.get("text", ""))
+            result_text = "\n".join(text_parts)
+
         reflection = parse_reflection(result_text)
         approach = parse_approach_summary(result_text)
         error_patterns = parse_error_patterns(result, outcome=outcome, result_text=result_text)
