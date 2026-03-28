@@ -227,7 +227,7 @@ def test_similarity_edges_created_on_lesson_embedding(clean_db):
 
     with patch("equipa.embeddings.get_embedding", side_effect=mock_get_embedding):
         # Embed lesson 1 (no edges yet)
-        config = {"knowledge_graph": True}
+        config = {"features": {"knowledge_graph": True}}
         result1 = embed_and_store_lesson(l1, "Lesson A text", config)
         assert result1 is True
 
@@ -259,7 +259,7 @@ def test_similarity_edges_not_created_when_disabled(clean_db):
     # Mock Ollama to return embedding
     with patch("equipa.embeddings.get_embedding", return_value=[0.5, 0.5, 0.0]):
         # Embed with knowledge_graph disabled
-        config = {"knowledge_graph": False}
+        config = {"features": {"knowledge_graph": False}}
         result = embed_and_store_lesson(lx, "Lesson X text", config)
         assert result is True
 
