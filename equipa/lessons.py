@@ -154,6 +154,7 @@ def get_relevant_episodes(
     min_q_value: float = 0.3,
     limit: int = 3,
     task_description: str | None = None,
+    dispatch_config: dict | None = None,
 ) -> list[dict]:
     """Fetch relevant past episodes for injection into agent prompts.
 
@@ -164,6 +165,7 @@ def get_relevant_episodes(
     - q_value (base quality signal)
     - Task description keyword overlap (if task_description provided)
     - Recency weighting (episodes from last 7 days weighted 2x)
+    - Vector similarity (if vector_memory feature enabled and Ollama available)
 
     Args:
         role: Agent role (e.g. 'developer', 'tester')
@@ -172,6 +174,7 @@ def get_relevant_episodes(
         min_q_value: Minimum q_value threshold (default 0.3)
         limit: Maximum episodes to return (default 3)
         task_description: Optional task description for keyword similarity scoring
+        dispatch_config: Optional config dict for feature flags and Ollama settings
 
     Returns:
         List of episode dicts with id, approach_summary, outcome, reflection, q_value
@@ -223,6 +226,29 @@ def get_relevant_episodes(
         now = datetime.now()
         seven_days_ago = now - timedelta(days=7)
 
+        # Vector similarity scoring (if enabled)
+        vector_scores: dict[int, float] = {}
+        vector_memory_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
+            except ImportError:
+                pass
+
+        if vector_memory_enabled and task_description:
+            try:
+                from equipa.embeddings import find_similar_by_embedding, cosine_similarity
+                # Find similar episodes by embedding
+                similar_episodes = find_similar_by_embedding(
+                    task_description, "episodes", top_k=20, dispatch_config=dispatch_config
+                )
+                for ep_id, sim_score in similar_episodes:
+                    vector_scores[ep_id] = sim_score
+            except Exception:
+                # Ollama down or import failed — gracefully continue without vector scoring
+                pass
+
         for ep in episodes:
             score = ep.get("q_value", 0.5)
 
@@ -239,6 +265,7 @@ def get_relevant_episodes(
                     pass  # Can't parse date, skip recency bonus
 
             # Task description keyword overlap scoring
+            keyword_score = 0.0
             if task_description:
                 ep_text = (
                     (ep.get("approach_summary", "") or "")
@@ -246,8 +273,16 @@ def get_relevant_episodes(
                     + (ep.get("reflection", "") or "")
                 )
                 overlap = compute_keyword_overlap(task_description, ep_text)
+                keyword_score = overlap
                 # Boost score by up to 50% based on keyword overlap
                 score *= (1.0 + overlap * 0.5)
+
+            # Vector similarity scoring (blended with keyword scoring)
+            ep_id = ep.get("id")
+            if ep_id in vector_scores:
+                cosine_sim = vector_scores[ep_id]
+                # Blend: 60% existing score (keyword + q_value) + 40% vector similarity
+                score = 0.6 * score + 0.4 * cosine_sim
 
             # SIMBA rule bonus: boost episodes that followed synthesized rules
             if _simba_rules:
@@ -338,12 +373,17 @@ def record_agent_episode(
     outcome: str,
     role: str = "developer",
     output: list | None = None,
+    dispatch_config: dict | None = None,
 ) -> None:
     """Store a Reflexion episode in the agent_episodes table.
 
     Extracts reflection from agent output. If no reflection found in
     the output, records the episode with a null reflection (the
     orchestrator will attempt a standalone reflexion call separately).
+
+    After INSERT, attempts to generate and store embedding if vector_memory
+    feature is enabled. Embedding generation failure does not block episode
+    recording.
 
     Never crashes the orchestrator — all errors are logged and swallowed.
     """
@@ -368,7 +408,7 @@ def record_agent_episode(
         q_value = compute_initial_q_value(outcome)
 
         conn = get_db_connection(write=True)
-        conn.execute(
+        cursor = conn.execute(
             """INSERT INTO agent_episodes
                (task_id, role, task_type, project_id, approach_summary,
                 turns_used, outcome, error_patterns, reflection, q_value)
@@ -376,8 +416,32 @@ def record_agent_episode(
             (task_id, role, task_type, project_id, approach,
              num_turns, outcome, error_patterns, reflection, q_value),
         )
+        episode_id = cursor.lastrowid
         conn.commit()
         conn.close()
+
+        # Attempt to generate and store embedding (if vector_memory enabled)
+        vector_memory_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
+            except ImportError:
+                pass
+
+        if vector_memory_enabled and episode_id:
+            try:
+                from equipa.embeddings import embed_and_store_episode
+                # Combine approach + reflection for embedding
+                ep_text = f"{approach or ''} {reflection or ''}".strip()
+                if ep_text:
+                    success = embed_and_store_episode(episode_id, ep_text, dispatch_config)
+                    if not success:
+                        # Ollama down or error — log but don't fail
+                        log("  [VectorMemory] Failed to generate episode embedding (Ollama down?)", output)
+            except Exception:
+                # Import failed or unexpected error — continue without embedding
+                pass
 
         # Log failure classification if present
         failure_class_info = ""

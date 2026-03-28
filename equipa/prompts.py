@@ -232,6 +232,7 @@ def build_system_prompt(
                 role=role, project_id=project_id, task_type=task_type,
                 min_q_value=0.3, limit=episode_limit,
                 task_description=task_description,
+                dispatch_config=dispatch_config,
             )
             if episodes:
                 episodes_text = format_episodes_for_injection(episodes, delimiter=_untrusted_delimiter)

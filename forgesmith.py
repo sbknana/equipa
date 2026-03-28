@@ -336,14 +336,25 @@ def extract_lessons(runs, cfg):
                 # Sanitize the lesson content before storage
                 lesson = sanitize_lesson_content(lesson)
                 safe_sig = sanitize_error_signature(sig)
-                conn.execute(
+                cursor = conn.execute(
                     """INSERT INTO lessons_learned
                        (role, error_type, error_signature, lesson, times_seen)
                        VALUES (?, ?, ?, ?, ?)""",
                     (list(info["roles"])[0] if len(info["roles"]) == 1 else None,
                      info["error_type"], safe_sig, lesson, info["count"]),
                 )
+                lesson_id = cursor.lastrowid
                 lessons_added += 1
+
+                # Attempt to generate and store embedding (if vector_memory enabled)
+                try:
+                    from equipa.dispatch import is_feature_enabled
+                    if is_feature_enabled(cfg, "vector_memory"):
+                        from equipa.embeddings import embed_and_store_lesson
+                        embed_and_store_lesson(lesson_id, lesson, dispatch_config=cfg)
+                except Exception:
+                    # Ollama down or import failed — continue without embedding
+                    pass
 
     conn.commit()
     conn.close()
