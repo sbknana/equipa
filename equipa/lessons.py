@@ -304,8 +304,39 @@ def get_relevant_episodes(
 
             ep["_relevance_score"] = score
 
-        # Sort by relevance score descending
-        episodes.sort(key=lambda e: e.get("_relevance_score", 0), reverse=True)
+        # Knowledge graph reranking (if enabled)
+        knowledge_graph_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
+            except ImportError:
+                pass
+
+        if knowledge_graph_enabled:
+            try:
+                from equipa import graph
+                # Build adjacency list from graph edges
+                adj = graph.get_adjacency_list()
+                if adj:
+                    # Compute PageRank scores
+                    pr_scores = graph.pagerank(adj)
+                    # Rerank episodes using graph structure (30% graph, 70% similarity)
+                    candidates = [
+                        {"id": ep["id"], "similarity": ep.get("_relevance_score", 0.0)}
+                        for ep in episodes
+                    ]
+                    reranked = graph.rerank_with_graph(candidates, pr_scores, sim_weight=0.7, graph_weight=0.3)
+                    # Rebuild episodes list in reranked order
+                    id_to_ep = {ep["id"]: ep for ep in episodes}
+                    episodes = [id_to_ep[c["id"]] for c in reranked if c["id"] in id_to_ep]
+            except Exception:
+                # Graph module unavailable or error — continue without graph reranking
+                pass
+
+        # Sort by relevance score descending (if not already reranked by graph)
+        if not knowledge_graph_enabled:
+            episodes.sort(key=lambda e: e.get("_relevance_score", 0), reverse=True)
 
         # Return top N, strip internal scoring field
         result = episodes[:limit]
@@ -537,16 +568,21 @@ def update_injected_episode_q_values_for_task(
     task_id: int,
     outcome: str,
     output: list | None = None,
+    dispatch_config: dict | None = None,
 ) -> None:
     """Look up which episodes were injected for a task and update their q_values.
 
     Called after task completion. Uses the _injected_episodes_by_task tracker
     to find which episodes were injected, then applies the MemRL reward signal.
 
+    If knowledge_graph feature is enabled, creates co-accessed edges between
+    injected episodes to track which episodes are used together.
+
     Args:
         task_id: The task ID that just completed
         outcome: The task outcome string (e.g. 'tests_passed', 'developer_failed')
         output: Optional output buffer for logging
+        dispatch_config: Optional config dict for feature flags
     """
     from equipa.output import log
 
@@ -559,3 +595,22 @@ def update_injected_episode_q_values_for_task(
 
     delta = "+0.1" if task_succeeded else "-0.05"
     log(f"  [MemRL] Updated q_values ({delta}) for {len(ep_ids)} injected episodes: {ep_ids}", output)
+
+    # Create co-accessed edges in knowledge graph (if enabled)
+    knowledge_graph_enabled = False
+    if dispatch_config:
+        try:
+            from equipa.dispatch import is_feature_enabled
+            knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
+        except ImportError:
+            pass
+
+    if knowledge_graph_enabled and len(ep_ids) >= 2:
+        try:
+            from equipa import graph
+            edges_created = graph.create_coaccessed_edges(ep_ids)
+            if edges_created > 0:
+                log(f"  [KnowledgeGraph] Created {edges_created} co-accessed edges between episodes", output)
+        except Exception:
+            # Graph module unavailable or error — continue without graph updates
+            pass
