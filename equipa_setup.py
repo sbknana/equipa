@@ -307,6 +307,11 @@ def step_copy_files(base_path):
     """Copy EQUIPA files to the install directory."""
     print_header("Step 4: Copy EQUIPA Files")
 
+    # Skip copy if installing into the source repo directory (same path)
+    if Path(base_path).resolve() == SOURCE_DIR.resolve():
+        print("  Install directory is the source repo — skipping file copy.")
+        return True
+
     # All source files are bundled in this repo for standalone operation
     missing = []
     for name in ["forge_orchestrator.py", "forgesmith.py", "dispatch_config.json", "forgesmith_config.json"]:
