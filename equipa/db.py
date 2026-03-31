@@ -410,7 +410,7 @@ def update_task_status(
     """
     from equipa.output import log
 
-    success_outcomes = ("tests_passed", "no_tests")
+    success_outcomes = ("tests_passed", "no_tests", "early_completed_no_changes")
     new_status = "done" if outcome in success_outcomes else "blocked"
 
     conn = get_db_connection(write=True)
