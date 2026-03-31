@@ -183,7 +183,7 @@ def _is_escaped_at(content: str, pos: int) -> bool:
 # ---------------------------------------------------------------------------
 
 _UNICODE_WS_RE = re.compile(
-    "[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+    "[\u00a0\u1680\u2000-\u200f\u2028\u2029\u202f\u205f\u3000\ufeff]"
 )
 
 # ---------------------------------------------------------------------------
@@ -228,12 +228,20 @@ def _check_incomplete_commands(command: str) -> BashSecurityResult:
             safe=False, check_id=CheckID.INCOMPLETE_COMMANDS,
             message="Command starts with operator (continuation line)",
         )
+    # Trailing operator: command ends with |, ;, && (incomplete, expects more)
+    if re.search(r"(?:\||&&|\|\||;)\s*$", trimmed):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.INCOMPLETE_COMMANDS,
+            message="Command ends with trailing operator (incomplete fragment)",
+        )
     return _SAFE
 
 
 def _check_jq_exploits(command: str, base_cmd: str) -> BashSecurityResult:
     """Checks 2-3: jq system() and dangerous file flags."""
-    if base_cmd != "jq":
+    # Check both base_cmd and anywhere in pipe chain
+    has_jq = base_cmd == "jq" or re.search(r"(?:^|\|)\s*jq\b", command)
+    if not has_jq:
         return _SAFE
     if re.search(r"\bsystem\s*\(", command):
         return BashSecurityResult(
@@ -248,6 +256,13 @@ def _check_jq_exploits(command: str, base_cmd: str) -> BashSecurityResult:
         return BashSecurityResult(
             safe=False, check_id=CheckID.JQ_FILE_ARGUMENTS,
             message="jq command contains file flags that could read arbitrary files",
+        )
+    # @base64d, @html, @csv, @uri, @text — jq format strings that
+    # can decode/transform data in dangerous ways
+    if re.search(r"@base64d\b", command):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.JQ_FILE_ARGUMENTS,
+            message="jq command contains @base64d which can decode hidden payloads",
         )
     return _SAFE
 
@@ -284,6 +299,13 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains empty quotes before dash (potential bypass)",
+        )
+
+    # Empty quote pairs inside a flag: -''la, -""la (splitting flag to evade filters)
+    if re.search(r"""-\w*(?:''|"")\w""", command):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
+            message="Command contains empty quotes inside flag (obfuscation)",
         )
 
     # Empty quote pairs adjacent to quoted dash: """-f"
