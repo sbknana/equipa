@@ -128,6 +128,25 @@ class PromptResult:
             f"total={static_len + dynamic_len} chars)"
         )
 
+    def __getitem__(self, key: int | slice) -> str:
+        """Support indexing and slicing (prompt[i] or prompt[i:j])."""
+        return self.full[key]
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate string methods (lower, find, split, etc.) to full prompt.
+
+        This ensures backward compatibility: existing code that calls
+        prompt.lower(), prompt.find(), prompt.strip(), etc. continues
+        to work transparently after the str→PromptResult migration.
+        """
+        full = self.full
+        attr = getattr(full, name, None)
+        if attr is not None:
+            return attr
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
 
 def build_task_prompt(
     task: dict[str, Any],

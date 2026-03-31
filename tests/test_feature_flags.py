@@ -88,10 +88,11 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "vector_memory": False,
         "auto_model_routing": False,
         "knowledge_graph": False,
+        "autoresearch": True,
     }
 
     def test_contains_all_expected_flags(self):
-        """DEFAULT_FEATURE_FLAGS has exactly the 12 expected flags."""
+        """DEFAULT_FEATURE_FLAGS has exactly the 13 expected flags."""
         self.assertEqual(set(DEFAULT_FEATURE_FLAGS.keys()),
                          set(self.EXPECTED_FLAGS.keys()))
 

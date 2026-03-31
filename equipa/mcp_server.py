@@ -252,25 +252,31 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
 
     conn = _get_db_connection()
     try:
+        # Detect available columns — schema may have duration_s (db_migrate)
+        # or duration_seconds (newer schema), and created_at may be absent.
+        col_info = conn.execute("PRAGMA table_info(agent_runs)").fetchall()
+        if not col_info:
+            return {"runs": [], "count": 0}
+        col_names = {row["name"] for row in col_info}
+
+        duration_col = "duration_seconds" if "duration_seconds" in col_names else "duration_s"
+        has_created_at = "created_at" in col_names
+        order_col = "created_at" if has_created_at else "id"
+
+        select_cols = f"task_id, role, outcome, {duration_col}"
+        if has_created_at:
+            select_cols += ", created_at"
+
         if task_id:
             rows = conn.execute(
-                """
-                SELECT task_id, role, outcome, duration_seconds, created_at
-                FROM agent_runs
-                WHERE task_id = ?
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
+                f"SELECT {select_cols} FROM agent_runs "
+                f"WHERE task_id = ? ORDER BY {order_col} DESC LIMIT ?",
                 (task_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                """
-                SELECT task_id, role, outcome, duration_seconds, created_at
-                FROM agent_runs
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
+                f"SELECT {select_cols} FROM agent_runs "
+                f"ORDER BY {order_col} DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 
