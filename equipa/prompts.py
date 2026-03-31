@@ -286,21 +286,20 @@ def build_system_prompt(
     _untrusted_delimiter = _make_untrusted_delimiter()
 
     # =========================================================================
-    # STATIC PREFIX — cacheable across tasks for the same role
-    # Contains: _common.md + role-specific prompt (with placeholder replacement)
-    # This section is identical for every task dispatched with the same role,
-    # enabling global cache scope at the API level.
+    # STATIC PREFIX — cacheable across ALL tasks for the same role
+    # Contains: _common.md + role-specific prompt (NO per-task substitution)
+    # This section is byte-identical for every task dispatched with the same
+    # role, enabling global cache scope at the API level.
+    #
+    # Per-task values ({task_id}, {project_id}) appear in role prompt SQL
+    # examples as literal placeholders.  The agent resolves them from the
+    # "## Assigned Task" block in the dynamic suffix, which already contains
+    # "Task ID: <N>" and "project_id: <N>".  Do NOT str.replace() here —
+    # that would make every dispatch unique and defeat prompt caching.
     # =========================================================================
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
-    static_template = common_text + "\n\n---\n\n" + role_text
-
-    # Replace placeholders in static section
-    # Note: {task_id} and {project_id} vary per task, so the static prefix
-    # is "per-role" cacheable — the same role+task combo will cache-hit on
-    # retries/continuations.
-    static_prefix = static_template.replace("{task_id}", str(task["id"]))
-    static_prefix = static_prefix.replace("{project_id}", str(task.get("project_id", "")))
+    static_prefix = common_text + "\n\n---\n\n" + role_text
 
     # =========================================================================
     # DYNAMIC SUFFIX — per-task content, changes every dispatch
@@ -513,11 +512,10 @@ def build_planner_prompt(
 
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
-    static_template = common_text + "\n\n---\n\n" + role_text
 
-    # Static prefix: role prompt with project_id placeholder replaced
-    static_prefix = static_template.replace("{project_id}", str(project_id))
-    static_prefix = static_prefix.replace("{task_id}", "N/A")
+    # Static prefix: byte-identical across all planner dispatches.
+    # Do NOT substitute {project_id}/{task_id} — they're in the dynamic suffix.
+    static_prefix = common_text + "\n\n---\n\n" + role_text
 
     # Per-prompt unpredictable delimiter for untrusted content isolation
     _delim = _make_untrusted_delimiter()
@@ -527,7 +525,7 @@ def build_planner_prompt(
         inner = wrap_untrusted(content, _delim)
         return f'<task-input type="{tag_type}" trust="user">\n{inner}\n</task-input>'
 
-    # Dynamic suffix: goal and project context
+    # Dynamic suffix: goal and project context (includes project_id for agent)
     lines = [
         "## Goal",
         "",
@@ -581,11 +579,10 @@ def build_evaluator_prompt(
 
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
-    static_template = common_text + "\n\n---\n\n" + role_text
 
-    # Static prefix: role prompt with project_id placeholder replaced
-    static_prefix = static_template.replace("{project_id}", str(project_id))
-    static_prefix = static_prefix.replace("{task_id}", "N/A")
+    # Static prefix: byte-identical across all evaluator dispatches.
+    # Do NOT substitute {project_id}/{task_id} — they're in the dynamic suffix.
+    static_prefix = common_text + "\n\n---\n\n" + role_text
 
     # Per-prompt unpredictable delimiter for untrusted content isolation
     _delim = _make_untrusted_delimiter()

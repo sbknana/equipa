@@ -28,8 +28,15 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from forgesmith_simba import run_simba
 from forgesmith_gepa import run_gepa
+
+# forgesmith_simba and forgesmith_impact were moved to scripts/ during
+# repo cleanup.  Add the scripts directory to sys.path so imports resolve.
+_scripts_dir = str(Path(__file__).resolve().parent / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+
+from forgesmith_simba import run_simba
 from forgesmith_impact import (
     run_impact_analysis,
     log_impact_assessment,
