@@ -66,7 +66,10 @@ class CheckID:
     CONTROL_CHARACTERS = 17
     UNICODE_WHITESPACE = 18
     HEREDOC_IN_SUBSTITUTION = 19
+    MID_WORD_HASH = 19  # shares slot with heredoc (different check context)
+    ZSH_DANGEROUS_COMMANDS = 20
     BACKSLASH_ESCAPED_OPERATORS = 21
+    COMMENT_QUOTE_DESYNC = 22
     QUOTED_NEWLINE = 23
 
 
@@ -598,6 +601,199 @@ def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
 
 
 # ---------------------------------------------------------------------------
+# Zsh dangerous commands (from ZSH_DANGEROUS_COMMANDS in bashSecurity.ts)
+# ---------------------------------------------------------------------------
+
+_ZSH_DANGEROUS_COMMANDS: frozenset[str] = frozenset([
+    "zmodload",   # Gateway to dangerous module-based attacks
+    "emulate",    # With -c flag is an eval-equivalent
+    "sysopen",    # Opens files with fine-grained control (zsh/system)
+    "sysread",    # Reads from file descriptors (zsh/system)
+    "syswrite",   # Writes to file descriptors (zsh/system)
+    "sysseek",    # Seeks on file descriptors (zsh/system)
+    "zpty",       # Executes commands on pseudo-terminals (zsh/zpty)
+    "ztcp",       # Creates TCP connections for exfiltration (zsh/net/tcp)
+    "zsocket",    # Creates Unix/TCP sockets (zsh/net/socket)
+    "mapfile",    # Associative array set via zmodload
+    "zf_rm",      # Builtin rm from zsh/files
+    "zf_mv",      # Builtin mv from zsh/files
+    "zf_ln",      # Builtin ln from zsh/files
+    "zf_chmod",   # Builtin chmod from zsh/files
+    "zf_chown",   # Builtin chown from zsh/files
+    "zf_mkdir",   # Builtin mkdir from zsh/files
+    "zf_rmdir",   # Builtin rmdir from zsh/files
+    "zf_chgrp",   # Builtin chgrp from zsh/files
+])
+
+_ZSH_PRECOMMAND_MODIFIERS: frozenset[str] = frozenset([
+    "command", "builtin", "noglob", "nocorrect",
+])
+
+
+# ---------------------------------------------------------------------------
+# Additional checks (ported from bashSecurity.ts)
+# ---------------------------------------------------------------------------
+
+def _check_shell_metacharacters(command: str, unquoted: str) -> BashSecurityResult:
+    """Check 5: Shell metacharacters (;, |, &) inside quoted find/grep args.
+
+    Detects metacharacters smuggled inside quoted arguments to find-style
+    commands (e.g., ``find . -name "foo;evil"``).
+    """
+    # Quoted args with metacharacters inside
+    if re.search(r'''(?:^|\s)["'][^"']*[;&][^"']*["'](?:\s|$)''', unquoted):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.SHELL_METACHARACTERS,
+            message="Command contains shell metacharacters (;, |, or &) in arguments",
+        )
+
+    # Find-specific patterns: -name, -path, -iname with metacharacters
+    for pattern in (
+        r'''-name\s+["'][^"']*[;|&][^"']*["']''',
+        r'''-path\s+["'][^"']*[;|&][^"']*["']''',
+        r'''-iname\s+["'][^"']*[;|&][^"']*["']''',
+        r'''-regex\s+["'][^"']*[;&][^"']*["']''',
+    ):
+        if re.search(pattern, unquoted):
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.SHELL_METACHARACTERS,
+                message="Command contains shell metacharacters in arguments",
+            )
+    return _SAFE
+
+
+def _check_mid_word_hash(command: str) -> BashSecurityResult:
+    """Check 19 (alt): Mid-word # causes parser differential.
+
+    shell-quote treats mid-word ``#`` as comment-start, but bash treats
+    it as a literal character. Detect ``\\S#`` outside ``${#`` patterns.
+    """
+    unquoted = _extract_unquoted(command)
+
+    # Also check continuation-joined version: foo\<NL>#bar
+    joined = re.sub(
+        r"\\+\n",
+        lambda m: (
+            "\\" * ((len(m.group()) - 1) - 1)
+            if (len(m.group()) - 1) % 2 == 1
+            else m.group()
+        ),
+        unquoted,
+    )
+
+    # \S immediately before # (not preceded by ${)
+    # Using a simpler approach without lookbehind for broader Python compat
+    for text in (unquoted, joined):
+        for i, ch in enumerate(text):
+            if ch != "#" or i == 0:
+                continue
+            prev = text[i - 1]
+            if prev in (" ", "\t", "\n", "\r"):
+                continue
+            # Exclude ${# (bash string-length syntax)
+            if i >= 2 and text[i - 2:i] == "${":
+                continue
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.MID_WORD_HASH,
+                message="Command contains mid-word # which is parsed differently by shell-quote vs bash",
+            )
+    return _SAFE
+
+
+def _check_zsh_dangerous_commands(command: str) -> BashSecurityResult:
+    """Check 20: Zsh-specific dangerous commands that bypass security.
+
+    Blocks ``zmodload``, ``emulate``, ``sysopen``, ``zpty``, ``ztcp``,
+    ``fc -e``, and other Zsh builtins that enable raw file/network I/O
+    or arbitrary code execution.
+    """
+    trimmed = command.strip()
+    tokens = trimmed.split()
+    base_cmd = ""
+    for token in tokens:
+        # Skip env-var assignments (VAR=value)
+        if re.match(r"^[A-Za-z_]\w*=", token):
+            continue
+        # Skip Zsh precommand modifiers
+        if token in _ZSH_PRECOMMAND_MODIFIERS:
+            continue
+        base_cmd = token
+        break
+
+    if base_cmd in _ZSH_DANGEROUS_COMMANDS:
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.ZSH_DANGEROUS_COMMANDS,
+            message=f"Command uses Zsh-specific '{base_cmd}' which can bypass security checks",
+        )
+
+    # fc -e allows executing arbitrary commands via editor
+    if base_cmd == "fc" and re.search(r"\s-\S*e", trimmed):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.ZSH_DANGEROUS_COMMANDS,
+            message="Command uses 'fc -e' which can execute arbitrary commands via editor",
+        )
+
+    return _SAFE
+
+
+def _check_comment_quote_desync(command: str) -> BashSecurityResult:
+    """Check 22: Quote characters inside # comments desync quote trackers.
+
+    In bash, everything after unquoted ``#`` is a comment — quote characters
+    inside are literal. But our quote-tracking helpers don't handle comments,
+    so ``'`` or ``"`` after ``#`` can toggle their state and hide subsequent
+    dangerous content from validation.
+    """
+    in_single = False
+    in_double = False
+    escaped = False
+
+    for i, ch in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+
+        if ch == "\\":
+            escaped = True
+            continue
+
+        if in_double:
+            if ch == '"':
+                in_double = False
+            # Single quotes inside double quotes are literal
+            continue
+
+        if ch == "'":
+            in_single = True
+            continue
+
+        if ch == '"':
+            in_double = True
+            continue
+
+        # Unquoted # — check rest of line for quote chars
+        if ch == "#":
+            line_end = command.find("\n", i)
+            comment_text = command[i + 1:line_end if line_end != -1 else len(command)]
+            if re.search(r"""['"]""", comment_text):
+                return BashSecurityResult(
+                    safe=False, check_id=CheckID.COMMENT_QUOTE_DESYNC,
+                    message="Command contains quote characters inside a # comment which can desync quote tracking",
+                )
+            # Skip to end of line (rest is comment)
+            if line_end == -1:
+                break
+            # Loop will increment past newline on next iteration
+
+    return _SAFE
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -624,16 +820,20 @@ def check_bash_command(command: str) -> BashSecurityResult:
         _check_ifs_injection(command),
         _check_proc_environ(command),
         _check_heredoc_in_substitution(command),
+        _check_comment_quote_desync(command),
+        _check_quoted_newline_comment(command),
         _check_newlines(command, unquoted),
         _check_command_substitution(unquoted),
         _check_redirections(unquoted),
         _check_dangerous_variables(unquoted),
+        _check_shell_metacharacters(command, unquoted),
         _check_obfuscated_flags(command, base_cmd),
         _check_jq_exploits(command, base_cmd),
         _check_backslash_escaped_whitespace(command),
         _check_backslash_escaped_operators(command),
+        _check_mid_word_hash(command),
         _check_brace_expansion(command, unquoted),
-        _check_quoted_newline_comment(command),
+        _check_zsh_dangerous_commands(command),
     ]
 
     for result in checks:
