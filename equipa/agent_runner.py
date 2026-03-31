@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
+import random
+import subprocess
 import time
 from typing import Any
 
@@ -46,6 +49,72 @@ from equipa.output import log
 from equipa.parsing import validate_output
 from equipa.security import verify_skill_integrity
 from equipa.tasks import verify_task_updated
+
+# Retry configuration from Claude Code withRetry.ts
+BASE_DELAY_MS = 500
+MAX_BACKOFF_MS = 32000
+MAX_529_RETRIES = 3  # After 3x 529/overloaded, fall back to cheaper model
+JITTER_FACTOR = 0.25  # 25% jitter as per Claude Code
+
+
+def get_retry_delay(attempt: int, max_delay_ms: int = MAX_BACKOFF_MS) -> float:
+    """Exponential backoff with 25% jitter (Claude Code pattern).
+
+    Args:
+        attempt: Attempt number (1-indexed)
+        max_delay_ms: Maximum delay cap in milliseconds
+
+    Returns:
+        Delay in seconds
+    """
+    base_delay = min(BASE_DELAY_MS * math.pow(2, attempt - 1), max_delay_ms)
+    jitter = random.random() * JITTER_FACTOR * base_delay
+    return (base_delay + jitter) / 1000.0  # Convert ms to seconds
+
+
+def is_overloaded_error(stderr: str, stdout: str) -> bool:
+    """Detect 529/overloaded errors from Claude CLI output.
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text (may contain JSON error)
+
+    Returns:
+        True if this is an overloaded/529 error
+    """
+    combined = f"{stderr} {stdout}".lower()
+    return any(marker in combined for marker in [
+        "529",
+        "overloaded",
+        "overloaded_error",
+        "temporarily overloaded",
+    ])
+
+
+def is_retryable_error(stderr: str, stdout: str) -> bool:
+    """Check if error is retryable (network, timeout, 429, 500-level).
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text
+
+    Returns:
+        True if error should be retried
+    """
+    combined = f"{stderr} {stdout}".lower()
+    retryable_markers = [
+        "429",
+        "rate limit",
+        "connection",
+        "timeout",
+        "econnreset",
+        "epipe",
+        "500",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(marker in combined for marker in retryable_markers)
 
 
 def build_cli_command(
@@ -88,97 +157,172 @@ def build_cli_command(
     return cmd
 
 
-async def run_agent(cmd: list[str], timeout: int | None = None) -> dict[str, Any]:
-    """Spawn claude -p, capture output, handle timeout."""
+async def run_agent(
+    cmd: list[str],
+    timeout: int | None = None,
+    max_retries: int = 10,
+    fallback_model: str | None = None,
+) -> dict[str, Any]:
+    """Spawn claude -p with retry logic, exponential backoff, and model fallback.
+
+    Implements Claude Code withRetry.ts pattern:
+    - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
+    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
+    - Retries on 429, 5xx, connection errors, timeouts
+
+    Args:
+        cmd: Command list for subprocess
+        timeout: Per-attempt timeout (default: PROCESS_TIMEOUT)
+        max_retries: Maximum retry attempts (default: 10)
+        fallback_model: Model to fall back to after 3x 529 (e.g., "sonnet")
+
+    Returns:
+        Result dict with success, result_text, num_turns, duration, cost, errors
+    """
     effective_timeout = timeout or PROCESS_TIMEOUT
     start_time = time.time()
+    consecutive_529_errors = 0
+    last_error = ""
+    model_fallback_triggered = False
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
 
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=effective_timeout,
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except asyncio.TimeoutError:
-            # Try to capture any partial output before killing
-            process.kill()
+
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=5,
+                    process.communicate(),
+                    timeout=effective_timeout,
                 )
-                partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-            except Exception:
-                partial_text = ""
-            duration = time.time() - start_time
+            except asyncio.TimeoutError:
+                # Try to capture any partial output before killing
+                process.kill()
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=5,
+                    )
+                    partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    partial_text = ""
+                duration = time.time() - start_time
+                return {
+                    "success": False,
+                    "result_text": partial_text,
+                    "num_turns": 0,
+                    "duration": duration,
+                    "cost": None,
+                    "errors": [f"Process timed out after {effective_timeout} seconds"],
+                }
+
+        except FileNotFoundError:
             return {
                 "success": False,
-                "result_text": partial_text,
+                "result_text": "",
                 "num_turns": 0,
-                "duration": duration,
+                "duration": 0,
                 "cost": None,
-                "errors": [f"Process timed out after {effective_timeout} seconds"],
+                "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
             }
 
-    except FileNotFoundError:
-        return {
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        # Parse JSON output
+        result: dict[str, Any] = {
             "success": False,
-            "result_text": "",
+            "result_text": stdout_text,
             "num_turns": 0,
-            "duration": 0,
+            "duration": time.time() - start_time,
             "cost": None,
-            "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+            "errors": [],
         }
 
-    duration = time.time() - start_time
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            result["errors"].append(f"stderr: {stderr_text}")
 
-    # Parse JSON output
-    result: dict[str, Any] = {
-        "success": False,
-        "result_text": stdout_text,
-        "num_turns": 0,
-        "duration": duration,
-        "cost": None,
-        "errors": [],
-    }
-
-    if stderr_text:
-        result["errors"].append(f"stderr: {stderr_text}")
-
-    if not stdout_text:
-        result["errors"].append("No output from agent")
-        return result
-
-    try:
-        data = json.loads(stdout_text)
-        result["result_text"] = data.get("result", stdout_text)
-        result["num_turns"] = data.get("num_turns", 0)
-        result["cost"] = data.get("cost_usd")
-
-        # Check for error subtypes
-        subtype = data.get("subtype", "")
-        if subtype == "error_max_turns":
-            # Agent ran out of turns but may have done useful work
-            result["success"] = True
-            result["errors"].append("Agent hit max turns limit")
-        elif data.get("is_error"):
-            result["success"] = False
-            result["errors"].append(f"Agent error: {data.get('result', 'unknown')}")
+        if not stdout_text:
+            result["errors"].append("No output from agent")
+            last_error = "No output from agent"
         else:
-            result["success"] = True
+            try:
+                data = json.loads(stdout_text)
+                result["result_text"] = data.get("result", stdout_text)
+                result["num_turns"] = data.get("num_turns", 0)
+                result["cost"] = data.get("cost_usd")
 
-    except json.JSONDecodeError:
-        # Output wasn't JSON, treat raw text as result
-        result["result_text"] = stdout_text
-        result["success"] = process.returncode == 0
+                # Check for error subtypes
+                subtype = data.get("subtype", "")
+                if subtype == "error_max_turns":
+                    # Agent ran out of turns but may have done useful work
+                    result["success"] = True
+                    result["errors"].append("Agent hit max turns limit")
+                elif data.get("is_error"):
+                    result["success"] = False
+                    error_msg = data.get('result', 'unknown')
+                    result["errors"].append(f"Agent error: {error_msg}")
+                    last_error = error_msg
+                else:
+                    result["success"] = True
 
+            except json.JSONDecodeError:
+                # Output wasn't JSON, treat raw text as result
+                result["result_text"] = stdout_text
+                result["success"] = process.returncode == 0
+                if not result["success"]:
+                    last_error = stdout_text[:200]
+
+        # If successful, return immediately
+        if result["success"]:
+            return result
+
+        # Check for 529/overloaded errors
+        if is_overloaded_error(stderr_text, stdout_text):
+            consecutive_529_errors += 1
+            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
+                # Trigger model fallback
+                if not model_fallback_triggered:
+                    # Find --model flag in cmd and replace
+                    for i, arg in enumerate(cmd):
+                        if arg == "--model" and i + 1 < len(cmd):
+                            original_model = cmd[i + 1]
+                            cmd[i + 1] = fallback_model
+                            model_fallback_triggered = True
+                            print(f"  [Retry] Model fallback triggered: "
+                                  f"{original_model} -> {fallback_model} "
+                                  f"(after {consecutive_529_errors}x 529 errors)")
+                            consecutive_529_errors = 0  # Reset counter for new model
+                            break
+        else:
+            consecutive_529_errors = 0  # Reset on non-529 error
+
+        # Check if error is retryable
+        if not is_retryable_error(stderr_text, stdout_text):
+            # Non-retryable error, fail immediately
+            return result
+
+        # Last attempt exhausted
+        if attempt >= max_retries:
+            result["errors"].append(
+                f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
+            )
+            return result
+
+        # Calculate retry delay with exponential backoff + jitter
+        delay_seconds = get_retry_delay(attempt)
+        print(f"  [Retry] Attempt {attempt}/{max_retries} failed "
+              f"({time.time() - attempt_start:.1f}s). "
+              f"Retrying in {delay_seconds:.1f}s... "
+              f"(error: {last_error[:80]})")
+
+        await asyncio.sleep(delay_seconds)
+
+    # Should never reach here, but fallback return
     return result
 
 
