@@ -712,11 +712,14 @@ async def dispatch_agent(
     # Security: verify skill file integrity before building any agent prompt
     if not verify_skill_integrity():
         return {
+            "success": False,
             "result": "blocked",
-            "output": "CRITICAL: Skill integrity verification failed — agent dispatch refused. "
-                      "Run --regenerate-manifest if changes are intentional.",
+            "result_text": "CRITICAL: Skill integrity verification failed — agent dispatch refused. "
+                          "Run --regenerate-manifest if changes are intentional.",
+            "num_turns": 0,
             "cost": 0,
             "duration": 0,
+            "errors": ["Skill integrity verification failed"],
         }
 
     # Late imports to avoid circular dependency
