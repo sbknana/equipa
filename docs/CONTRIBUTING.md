@@ -5,218 +5,249 @@
 - [Contributing to EQUIPA](#contributing-to-equipa)
   - [Welcome](#welcome)
   - [Development Setup](#development-setup)
-- [Clone the repo](#clone-the-repo)
-- [Make sure you have Python 3.10+](#make-sure-you-have-python-310)
-- [Set up the database](#set-up-the-database)
-- [Verify everything works](#verify-everything-works)
-    - [Database Migrations](#database-migrations)
-- [Run migrations](#run-migrations)
-- [Benchmark migrations (optional, but nice to verify)](#benchmark-migrations-optional-but-nice-to-verify)
+    - [Prerequisites](#prerequisites)
+    - [Clone and go](#clone-and-go)
+    - [Database setup](#database-setup)
+    - [Running migrations](#running-migrations)
   - [Code Style](#code-style)
-    - [The Rules](#the-rules)
-    - [Conventions](#conventions)
-    - [File Organization](#file-organization)
+    - [The basics](#the-basics)
+    - [Formatting](#formatting)
+    - [File organization](#file-organization)
+    - [Security](#security)
   - [Making Changes](#making-changes)
-    - [Branch Naming](#branch-naming)
-    - [Commit Messages](#commit-messages)
-    - [What to Keep in Mind](#what-to-keep-in-mind)
+    - [Branch naming](#branch-naming)
+    - [Commit messages](#commit-messages)
+    - [Before you push](#before-you-push)
   - [Testing](#testing)
-- [Run the full suite](#run-the-full-suite)
-- [Run a specific test file](#run-a-specific-test-file)
-- [Run a specific test](#run-a-specific-test)
-- [Some tests also have their own main() runners](#some-tests-also-have-their-own-main-runners)
-    - [What to Test](#what-to-test)
-    - [Writing Tests](#writing-tests)
+    - [Run all tests](#run-all-tests)
+    - [Run a specific test file](#run-a-specific-test-file)
+    - [Run a specific test](#run-a-specific-test)
+    - [Some tests can also run standalone](#some-tests-can-also-run-standalone)
+    - [What to test](#what-to-test)
+    - [Test database handling](#test-database-handling)
   - [Pull Request Process](#pull-request-process)
-    - [Before You Open a PR](#before-you-open-a-pr)
-    - [PR Description](#pr-description)
-    - [Review Expectations](#review-expectations)
-    - [Things That Will Get Your PR Stuck](#things-that-will-get-your-pr-stuck)
+    - [Before opening a PR](#before-opening-a-pr)
+    - [PR description](#pr-description)
+    - [Review expectations](#review-expectations)
+    - [Areas that need extra review scrutiny](#areas-that-need-extra-review-scrutiny)
   - [Issue Reporting](#issue-reporting)
     - [Bugs](#bugs)
-    - [Feature Requests](#feature-requests)
-    - [Known Issues You Don't Need to Report](#known-issues-you-dont-need-to-report)
+    - [Feature requests](#feature-requests)
+    - [Things to know before filing](#things-to-know-before-filing)
   - [Code of Conduct](#code-of-conduct)
+  - [Quick Reference](#quick-reference)
   - [Related Documentation](#related-documentation)
 
 ## Welcome
 
-Hey, thanks for checking this out. EQUIPA is a multi-agent AI orchestrator — you talk to Claude in plain English, and it dispatches AI agents to build, test, review, and secure your code. The whole thing is pure Python stdlib with zero dependencies, and we'd like to keep it that way.
+Hey, thanks for being here. EQUIPA is a multi-agent AI orchestrator — pure Python, zero dependencies, SQLite-backed. It coordinates AI agents to write, test, review, and secure code.
 
-Whether you're fixing a typo, squashing a bug, or adding a new agent role, we're glad you're here. This doc covers how to get set up and how we work together.
+The primary way people use EQUIPA is conversational: you talk to Claude, Claude runs EQUIPA behind the scenes. But the internals are what you'd be contributing to, and there's plenty to improve.
+
+We're happy to have you. Whether you're fixing a typo, adding a test, or tackling something gnarly in the self-improvement loop — it all counts.
 
 ---
 
 ## Development Setup
 
-EQUIPA has zero pip dependencies. That's intentional. The entire project runs on Python's standard library plus SQLite. Setting up is fast.
+EQUIPA has zero pip dependencies. It's pure Python stdlib. So setup is.. refreshingly boring.
+
+### Prerequisites
+
+- Python 3.10+
+- Git
+- SQLite3 (comes with Python)
+- Claude CLI (for running agents, not required for contributing code)
+
+### Clone and go
 
 ```bash
-# Clone the repo
 git clone https://github.com/your-org/equipa.git
 cd equipa
-
-# Make sure you have Python 3.10+
-python3 --version
-
-# Set up the database
-python3 equipa_setup.py
-
-# Verify everything works
-python3 -m pytest tests/ -v
 ```
 
-That's it. No virtual environment dance, no `pip install -r requirements.txt`, no Docker compose files. If you have Python 3.10+ and SQLite, you're good.
-
-**A note on how people actually use EQUIPA:** Most users don't interact with the CLI directly. They talk to Claude (the AI assistant), and Claude runs EQUIPA behind the scenes — dispatching tasks, monitoring agents, reporting results. If you're contributing, you'll use the CLI and tests directly, but keep in mind that the conversational interface is the primary way people experience this project.
-
-### Database Migrations
-
-If you're working on schema changes:
+That's it. No `pip install`, no virtual environment drama. If you want one anyway (fair), go ahead:
 
 ```bash
-# Run migrations
-python3 db_migrate.py
-
-# Benchmark migrations (optional, but nice to verify)
-python3 tools/benchmark_migrations.py
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 ```
+
+### Database setup
+
+EQUIPA uses SQLite with a 30+ table schema. The setup wizard handles this:
+
+```bash
+python equipa_setup.py
+```
+
+This walks you through database creation, config generation, and verification. If you just want to run tests, most of them create temporary databases on their own — you don't need a full setup.
+
+### Running migrations
+
+If you're working with an existing database:
+
+```bash
+python db_migrate.py
+```
+
+This handles versioned migrations (v0 through v5 currently), creates backups before migrating, and logs what it did.
 
 ---
 
 ## Code Style
 
-### The Rules
+### The basics
 
-- **Pure Python stdlib.** No external dependencies. This is non-negotiable. If you need something that isn't in the standard library, implement it yourself or find another way. The zero-dependency constraint is a core design decision, not laziness.
-- **No type-checking libraries.** We use type hints for documentation, but we don't enforce them with mypy or similar tools.
-- **SQLite for everything.** The database is the source of truth. 30+ tables. Learn the schema before making changes.
+- **Pure Python stdlib.** This is a hard rule. No pip dependencies. If you need something, write it or find it in the standard library.
+- **Type hints** are welcome but not enforced everywhere yet. New code should include them where it makes sense.
+- **Docstrings** for public functions. Don't write a novel — just say what it does and why.
 
-### Conventions
+### Formatting
 
-- Functions over classes, unless state management genuinely requires a class
-- Snake_case for everything (functions, variables, files)
-- Docstrings for public functions — keep them short and honest
-- Keep files focused. If a module is doing three different things, split it up
-- Comments should explain *why*, not *what*. The code already says what it does
+We don't currently enforce a specific formatter across the project. That said:
 
-### File Organization
+- 4-space indentation (it's Python, so..)
+- Keep lines reasonable — under 100 characters when you can
+- Use snake_case for functions and variables
+- Use PascalCase for classes
+- Constants in UPPER_SNAKE_CASE
 
-```
-equipa/           # Core package — orchestration, dispatch, routing, etc.
-skills/           # Agent skill definitions and resources
-tests/            # All tests live here
-tools/            # Dashboards, benchmarks, arena, training data prep
-forgesmith*.py    # Self-improvement system (ForgeSmith, GEPA, SIMBA)
-```
+### File organization
+
+- Core orchestration code lives in `equipa/`
+- Self-improvement systems (ForgeSmith, GEPA, SIMBA) are top-level scripts and `scripts/`
+- Agent role prompts are in `prompts/`
+- Language-specific prompts are in `prompts/languages/`
+- Skills (like SARIF parsing) are in `skills/`
+- Tests go in `tests/`
+
+### Security
+
+EQUIPA runs bash commands from AI agents, so security matters a lot. If you're touching `bash_security.py`, `security.py`, or anything in the command execution path — be extra careful. Look at the existing test coverage in `test_bash_security.py` (it's extensive) and make sure you're not opening holes.
 
 ---
 
 ## Making Changes
 
-### Branch Naming
+### Branch naming
 
-Keep it simple and descriptive:
-
-- `fix/loop-detection-false-positive`
-- `feature/ollama-model-routing`
-- `docs/update-contributing`
-- `test/add-mcp-health-coverage`
-
-### Commit Messages
-
-Write commit messages like you're explaining the change to someone who'll read it six months from now.
+Use descriptive branch names. The pattern doesn't need to be rigid, but something like:
 
 ```
-fix: early termination killing agents on legitimate complex tasks
-
-The 10-turn read threshold was too aggressive for tasks that need
-to understand large codebases before making changes. Bumped exempt
-roles and added complexity-aware thresholds.
+fix/loop-detection-false-positive
+feat/new-agent-role
+test/cost-routing-edge-cases
+docs/contributing-guide
 ```
 
-Format: `type: short description` on the first line. Types: `fix`, `feature`, `test`, `docs`, `refactor`, `perf`.
+### Commit messages
 
-Body is optional but appreciated for anything non-trivial.
+Write commit messages that explain *what* changed and *why*. The format:
 
-### What to Keep in Mind
+```
+Short summary (50 chars or less)
 
-- **Zero dependencies.** Seriously. Don't add any.
-- **The conversational model matters.** Users talk to Claude, Claude runs EQUIPA. If your change affects how tasks are created, dispatched, or reported, think about how that flows through a conversation.
-- **Agents are the users of your code.** A lot of this codebase is consumed by AI agents, not humans. Prompts, tool definitions, output parsing — these need to be clear and unambiguous because agents take things literally.
+Longer explanation if needed. What was the problem?
+What does this change? Why this approach?
+```
+
+Don't stress about conventional commits or any specific format. Just be clear.
+
+### Before you push
+
+1. Run the tests (see below)
+2. Make sure you haven't introduced any pip dependencies
+3. If you changed prompts, run `python -c "from equipa.security import verify_skill_integrity; print(verify_skill_integrity())"` to check skill integrity
+4. If you changed database schema, add a migration in `db_migrate.py`
 
 ---
 
 ## Testing
 
-EQUIPA has 334+ tests. Run them before opening a PR.
+EQUIPA has 334+ passing tests. They matter. Run them before submitting anything.
+
+### Run all tests
 
 ```bash
-# Run the full suite
-python3 -m pytest tests/ -v
-
-# Run a specific test file
-python3 -m pytest tests/test_early_termination.py -v
-
-# Run a specific test
-python3 -m pytest tests/test_loop_detection.py::test_warning_at_threshold -v
-
-# Some tests also have their own main() runners
-python3 tests/test_early_termination.py
-python3 tests/test_lesson_sanitizer.py
-python3 tests/test_agent_messages.py
+python -m pytest tests/
 ```
 
-### What to Test
+### Run a specific test file
 
-- **If you change agent behavior** — test the dispatch, routing, and output parsing
-- **If you change the database schema** — add migration tests (see `tests/test_db_migration_v5.py` for examples)
-- **If you touch ForgeSmith/GEPA/SIMBA** — test the self-improvement pipeline (see `tests/test_forgesmith_simba.py`)
-- **If you change cost routing** — the circuit breaker and complexity scoring have dedicated tests in `tests/test_cost_routing.py`
-- **If you modify early termination** — this is a big one. Lots of edge cases. See `tests/test_early_termination.py` — it's thorough for a reason
-- **If you add a new feature flag** — add it to `tests/test_feature_flags.py`
+```bash
+python -m pytest tests/test_early_termination.py
+python -m pytest tests/test_bash_security.py
+python -m pytest tests/test_loop_detection.py
+```
 
-### Writing Tests
+### Run a specific test
 
-- Use `pytest` conventions — `test_` prefix, fixtures where they help
-- Use `tmp_path` and `monkeypatch` from pytest for isolation. Don't leave test databases lying around
-- Test the failure cases too, not just the happy path. Agents fail a lot. That's normal.
-- Keep tests readable. A test name like `test_circuit_breaker_degrades_after_5_failures` tells you everything
+```bash
+python -m pytest tests/test_cost_routing.py::test_circuit_breaker_degrades_after_5_failures
+```
+
+### Some tests can also run standalone
+
+Several test files have their own `main()` or `run_all_tests()`:
+
+```bash
+python tests/test_early_termination.py
+python tests/test_lesson_sanitizer.py
+python tests/test_agent_messages.py
+python tests/test_episode_injection.py
+python tests/test_lessons_injection.py
+```
+
+### What to test
+
+- **New features:** Write tests. No exceptions.
+- **Bug fixes:** Write a test that reproduces the bug first, then fix it. The test should fail without your fix and pass with it.
+- **Prompt changes:** These are harder to test automatically, but the task type routing tests (`test_task_type_routing.py`) and prompt cache split tests (`test_prompt_cache_split.py`) verify structural integrity.
+- **Security changes:** The bash security tests are *thorough* — 100+ test cases covering obfuscation, command substitution, Unicode tricks, zsh exploits, and more. If you're touching security code, add tests for every edge case you can think of, then think of three more.
+
+### Test database handling
+
+Most tests create temporary databases using `tmp_path` or `monkeypatch`. Don't rely on a real database being present. Don't leave test databases lying around.
 
 ---
 
 ## Pull Request Process
 
-### Before You Open a PR
+### Before opening a PR
 
-1. Run the full test suite. All 334+ tests should pass
-2. If you added new functionality, add tests for it
-3. If you changed prompts or agent behavior, verify it actually works by dispatching a test task (if you can)
-4. Make sure you haven't accidentally added an external dependency
+- [ ] All tests pass (`python -m pytest tests/`)
+- [ ] No new pip dependencies introduced
+- [ ] New code has tests
+- [ ] Commit messages are clear
+- [ ] You've tested your change manually if it affects agent behavior
 
-### PR Description
+### PR description
 
 Tell us:
 
-- **What** you changed
-- **Why** you changed it
-- **How** to verify it works
-- Any **known limitations** of your approach (be honest — we'd rather know upfront)
+1. **What** does this change?
+2. **Why** does it matter?
+3. **How** did you test it?
+4. **Anything weird** the reviewer should know about?
 
-### Review Expectations
+If your PR relates to an issue, reference it. If it doesn't, that's fine too.
 
-- Someone will review your PR. We'll try to be quick but no promises on timeline
-- We'll check for: test coverage, zero-dependency compliance, code clarity, and whether the change makes sense for the conversational usage model
-- Don't take feedback personally. We're all trying to make agents less dumb
-- Small PRs get reviewed faster than big ones. If your change is huge, consider splitting it up
+### Review expectations
 
-### Things That Will Get Your PR Stuck
+- Someone will review your PR. We'll try to be quick but this is an open-source project, so patience appreciated.
+- Reviews focus on correctness, security implications, and whether the change makes EQUIPA better without making it more complicated than it needs to be.
+- Don't take feedback personally. We're all trying to make the thing better.
+- Small, focused PRs get reviewed faster than massive ones. If your change is big, consider splitting it.
 
-- Adding pip dependencies
-- Breaking existing tests
-- Changing database schema without a migration
-- Modifying agent prompts without testing them against real tasks
-- PRs with no tests for new functionality
+### Areas that need extra review scrutiny
+
+Some parts of the codebase are more sensitive than others:
+
+- **`equipa/bash_security.py`** — This is the barrier between AI agents and your filesystem. Changes here get extra scrutiny.
+- **`equipa/agent_runner.py`** — The core agent execution loop. Subtle bugs here affect everything.
+- **`forgesmith.py`, `forgesmith_gepa.py`, `forgesmith_simba.py`** — The self-improvement loop. Changes can have compounding effects over time.
+- **Database migrations** — These run on real user databases. They need to be backward-compatible and tested against every prior version.
 
 ---
 
@@ -224,49 +255,61 @@ Tell us:
 
 ### Bugs
 
-When filing a bug, include:
+Open an issue with:
 
-- What you expected to happen
-- What actually happened
-- Steps to reproduce (be specific — "it doesn't work" doesn't help)
-- Python version and OS
-- Relevant log output (agent logs live in the logs directory)
-- If it's an agent behavior issue: which role, what task type, and roughly how many turns it took before things went sideways
+- **What happened** — the actual behavior
+- **What you expected** — the behavior you wanted
+- **How to reproduce** — steps, commands, config if relevant
+- **Environment** — Python version, OS, any relevant config
+- **Logs** — if an agent misbehaved, include the relevant log output
 
-### Feature Requests
+### Feature requests
 
 We're open to ideas. Tell us:
 
-- What problem you're trying to solve
-- How you imagine the solution working
-- Whether you're willing to implement it yourself (no pressure either way)
+- What problem does this solve?
+- How do you imagine it working?
+- Are you willing to implement it? (Not required, just helpful to know)
 
-### Known Issues You Don't Need to Report
+### Things to know before filing
 
-These are things we already know about:
+EQUIPA has some known limitations that aren't bugs — they're just.. where things are right now:
 
-- **Agents get stuck on complex tasks.** Analysis paralysis is real. They'll read the same files over and over instead of making changes. We're working on it.
-- **Git worktree merges occasionally need manual intervention.** The isolation model is still being refined.
-- **Self-improvement (ForgeSmith/GEPA/SIMBA) needs 20-30 tasks before patterns emerge.** It's not magic on day one.
-- **The Tester role depends on your project having a working test suite.** If your tests are broken to begin with, the Tester can't help.
-- **Early termination kills agents at 10 turns of reading.** Some legitimate complex tasks actually need more. This is a tuning problem we're actively working on.
+- **Agents get stuck on complex tasks.** Analysis paralysis is real. If an agent burns turns reading files without acting, that's a known issue with the early termination heuristics. Currently agents get killed at 10 turns of reading-only behavior, which is sometimes too aggressive for legitimately complex tasks.
+- **Git worktree merges need manual intervention sometimes.** The worktree isolation is still being refined. Don't assume merge conflicts will resolve themselves.
+- **Self-improvement takes time.** ForgeSmith + GEPA + SIMBA need 20-30 completed tasks before patterns emerge and improvements kick in. If you just set it up, it won't seem like it's doing much yet.
+- **The Tester role needs your project to have a working test suite.** If your project doesn't have tests, the Tester agent can't do much.
+- **Cost controls kill agents.** That's by design, but sometimes legitimate expensive tasks get terminated. The cost breaker scales with complexity, but it's not perfect.
 
-If you hit one of these, you can still file an issue — especially if you have ideas for fixing it — but know that we're aware.
+If your issue is one of these — it's probably not a bug, but we're still interested in hearing about specific cases that might help us improve the heuristics.
 
 ---
 
 ## Code of Conduct
 
-Be kind. Be patient. Assume good intent.
+Be kind. Be respectful. Assume good intent.
 
-We're building tools that help developers get more done. That works best when everyone feels welcome contributing, asking questions, and making mistakes.
+We're building something together. Disagreements about code are fine — make them about the code, not the person. Help newcomers. Answer questions patiently. Remember that everyone was new once.
 
-- Treat others with respect, regardless of experience level
-- Give constructive feedback, not dismissive feedback
-- No harassment, no discrimination, no being a jerk
-- If someone's being a jerk, let the maintainers know
+Harassment, discrimination, and general jerkiness won't be tolerated. If someone makes you uncomfortable, reach out to the maintainers.
 
-This project is named after the Portuguese word for "team." Let's act like one.
+---
+
+## Quick Reference
+
+| What | Command |
+|------|---------|
+| Run all tests | `python -m pytest tests/` |
+| Run setup wizard | `python equipa_setup.py` |
+| Run migrations | `python db_migrate.py` |
+| Benchmark migrations | `python tools/benchmark_migrations.py` |
+| Performance dashboard | `python tools/forge_dashboard.py` |
+| Nightly review | `python scripts/nightly_review.py` |
+| Run ForgeSmith | `python forgesmith.py` |
+| Run SIMBA rules | `python forgesmith_simba.py` |
+| Run GEPA prompts | `python forgesmith_gepa.py` |
+
+Thanks for contributing. Seriously. Every improvement matters.
 ---
 
 ## Related Documentation
