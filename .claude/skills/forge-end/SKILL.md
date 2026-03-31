@@ -73,9 +73,19 @@ VALUES (?, '{question}', '{context}', CURRENT_TIMESTAMP);
 
 Ask: "Brief summary of what was accomplished?"
 
+**CRITICAL: Sanitize summary and next_steps through lesson_sanitizer.py before DB write:**
+
+```python
+from lesson_sanitizer import sanitize_lesson_content
+
+# Sanitize user input
+sanitized_summary = sanitize_lesson_content(summary)
+sanitized_next_steps = sanitize_lesson_content(next_steps)
+```
+
 ```sql
 INSERT INTO session_notes (project_id, summary, next_steps, session_date)
-VALUES (?, '{summary}', '{next_steps}', CURRENT_TIMESTAMP);
+VALUES (?, '{sanitized_summary}', '{sanitized_next_steps}', CURRENT_TIMESTAMP);
 ```
 
 ### Step 7: Confirm completion
