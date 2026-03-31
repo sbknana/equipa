@@ -104,10 +104,40 @@ def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
     return "\n".join(lines[:max_lines]).strip()
 
 
-def compact_agent_output(raw_output: str, max_words: int = 200) -> str:
-    """Compact raw agent output into a concise summary preserving actionable details."""
+def compact_agent_output(
+    raw_output: str,
+    max_words: int = 200,
+    agent_id: str | None = None,
+    session_dir: str | None = None,
+    persist_threshold: int = 50_000,
+) -> str:
+    """Compact raw agent output into a concise summary preserving actionable details.
+
+    If agent_id and session_dir are provided, large outputs (>50KB by default) are
+    persisted to disk before compaction, preventing context bloat.
+
+    Args:
+        raw_output: Raw agent output text
+        max_words: Maximum words in compacted output (default 200)
+        agent_id: Optional agent identifier for persistence (e.g., "developer-123-turn-5")
+        session_dir: Optional session directory path for persistence
+        persist_threshold: Size threshold in bytes for persistence (default 50KB)
+
+    Returns:
+        Compacted output, or persistence reference if output was too large
+    """
     if not raw_output:
         return ""
+
+    # Apply tool result persistence if configured
+    if agent_id and session_dir:
+        from equipa.tool_result_storage import process_agent_output
+        raw_output = process_agent_output(raw_output, agent_id, session_dir, persist_threshold)
+
+        # If output was persisted, return the reference message directly (no further compaction)
+        from equipa.tool_result_storage import is_content_already_compacted
+        if is_content_already_compacted(raw_output):
+            return raw_output
 
     # Late import to avoid circular dependency — sanitizer may not be available
     try:
