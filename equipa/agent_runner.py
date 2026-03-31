@@ -836,6 +836,93 @@ async def run_agent_with_retries(
     return result, max_retries
 
 
+async def run_agent_streaming_with_retry(
+    cmd: list[str],
+    role: str = "developer",
+    output: Any = None,
+    max_turns: int | None = None,
+    task_id: int | None = None,
+    cycle_number: int = 1,
+    project_dir: str | None = None,
+    max_retries: int = MAX_RETRIES,
+    fallback_model: str | None = "sonnet",
+) -> dict[str, Any]:
+    """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
+
+    Same retry architecture as run_agent():
+    - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
+    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
+    - Retryable errors: 429, 5xx, connection, timeout, ECONNRESET, EPIPE
+    - Non-retryable errors fail immediately
+    """
+    consecutive_529_errors = 0
+    model_fallback_triggered = False
+    last_error = ""
+
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
+
+        # Execute streaming agent
+        result = await run_agent_streaming(
+            cmd, role=role, output=output, max_turns=max_turns,
+            task_id=task_id, run_id=None, cycle_number=cycle_number,
+            project_dir=project_dir
+        )
+
+        # If successful, return immediately
+        if result.get("success"):
+            return result
+
+        # Extract error info
+        stderr_text = " ".join(result.get("errors", []))
+        stdout_text = result.get("result_text", "")
+        last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+
+        # Check for 529/overloaded errors
+        if is_overloaded_error(stderr_text, stdout_text):
+            consecutive_529_errors += 1
+            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
+                # Trigger model fallback
+                if not model_fallback_triggered:
+                    # Find --model flag in cmd and replace
+                    for i, arg in enumerate(cmd):
+                        if arg == "--model" and i + 1 < len(cmd):
+                            original_model = cmd[i + 1]
+                            cmd[i + 1] = fallback_model
+                            model_fallback_triggered = True
+                            print(f"  [Retry] Model fallback triggered: "
+                                  f"{original_model} -> {fallback_model} "
+                                  f"(after {consecutive_529_errors}x 529 errors)")
+                            consecutive_529_errors = 0  # Reset counter for new model
+                            break
+        else:
+            consecutive_529_errors = 0  # Reset on non-529 error
+
+        # Check if error is retryable
+        if not is_retryable_error(stderr_text, stdout_text):
+            # Non-retryable error, fail immediately
+            return result
+
+        # Last attempt exhausted
+        if attempt >= max_retries:
+            result["errors"].append(
+                f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
+            )
+            return result
+
+        # Calculate retry delay with exponential backoff + jitter
+        delay_seconds = get_retry_delay(attempt)
+        print(f"  [Retry] Streaming attempt {attempt}/{max_retries} failed "
+              f"({time.time() - attempt_start:.1f}s). "
+              f"Retrying in {delay_seconds:.1f}s... "
+              f"(error: {last_error[:80]})")
+
+        await asyncio.sleep(delay_seconds)
+
+    # Should never reach here, but fallback return
+    return result
+
+
 async def dispatch_agent(
     cmd: list[str],
     role: str,
@@ -892,12 +979,12 @@ async def dispatch_agent(
             max_turns=max_turns,
         )
 
-    # Default: Claude via run_agent_streaming
+    # Default: Claude via run_agent_streaming (with retry wrapper)
     use_streaming = role not in EARLY_TERM_EXEMPT_ROLES
     if use_streaming:
-        return await run_agent_streaming(
+        # Wrap streaming with retry logic
+        return await run_agent_streaming_with_retry(
             cmd, role=role, output=output, max_turns=max_turns,
-            task_id=task_id, run_id=None, cycle_number=cycle,
-            project_dir=project_dir)
+            task_id=task_id, cycle_number=cycle, project_dir=project_dir)
     else:
         return await run_agent(cmd)
