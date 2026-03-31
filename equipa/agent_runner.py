@@ -58,17 +58,30 @@ MAX_BACKOFF_MS = 32000
 MAX_529_RETRIES = 3  # After 3x 529/overloaded, fall back to cheaper model
 JITTER_FACTOR = 0.25  # 25% jitter as per Claude Code
 
+# Persistent retry mode (for unattended sessions)
+PERSISTENT_MAX_BACKOFF_MS = 5 * 60 * 1000  # 5 minutes
+PERSISTENT_RESET_CAP_MS = 6 * 60 * 60 * 1000  # 6 hours
+HEARTBEAT_INTERVAL_MS = 30_000  # 30 seconds
 
-def get_retry_delay(attempt: int, max_delay_ms: int = MAX_BACKOFF_MS) -> float:
+
+def get_retry_delay(
+    attempt: int,
+    max_delay_ms: int = MAX_BACKOFF_MS,
+    persistent: bool = False,
+) -> float:
     """Exponential backoff with 25% jitter (Claude Code pattern).
 
     Args:
         attempt: Attempt number (1-indexed)
         max_delay_ms: Maximum delay cap in milliseconds
+        persistent: If True, use persistent retry mode (higher backoff for unattended)
 
     Returns:
         Delay in seconds
     """
+    if persistent:
+        max_delay_ms = min(max_delay_ms, PERSISTENT_MAX_BACKOFF_MS)
+
     base_delay = min(BASE_DELAY_MS * math.pow(2, attempt - 1), max_delay_ms)
     jitter = random.random() * JITTER_FACTOR * base_delay
     return (base_delay + jitter) / 1000.0  # Convert ms to seconds
@@ -91,6 +104,22 @@ def is_overloaded_error(stderr: str, stdout: str) -> bool:
         "overloaded_error",
         "temporarily overloaded",
     ])
+
+
+def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
+    """Check if error is a transient capacity issue (429 or 529/overloaded).
+
+    These errors are suitable for persistent retry mode with long backoff.
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text
+
+    Returns:
+        True if this is a 429 or 529 capacity error
+    """
+    combined = f"{stderr} {stdout}".lower()
+    return any(marker in combined for marker in ["429", "rate limit", "529", "overloaded"])
 
 
 def is_retryable_error(stderr: str, stdout: str) -> bool:
@@ -164,6 +193,7 @@ async def run_agent(
     timeout: int | None = None,
     max_retries: int = 10,
     fallback_model: str | None = None,
+    persistent_retry: bool = False,
 ) -> dict[str, Any]:
     """Spawn claude -p with retry logic, exponential backoff, and model fallback.
 
@@ -171,12 +201,15 @@ async def run_agent(
     - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
     - After 3 consecutive 529/overloaded errors, fall back to cheaper model
     - Retries on 429, 5xx, connection errors, timeouts
+    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
+      with higher backoff (5 min max) and periodic heartbeats
 
     Args:
         cmd: Command list for subprocess
         timeout: Per-attempt timeout (default: PROCESS_TIMEOUT)
-        max_retries: Maximum retry attempts (default: 10)
+        max_retries: Maximum retry attempts (default: 10, ignored if persistent=True)
         fallback_model: Model to fall back to after 3x 529 (e.g., "sonnet")
+        persistent_retry: Enable persistent retry mode for unattended sessions
 
     Returns:
         Result dict with success, result_text, num_turns, duration, cost, errors
@@ -186,6 +219,7 @@ async def run_agent(
     consecutive_529_errors = 0
     last_error = ""
     model_fallback_triggered = False
+    persistent_attempt = 0
 
     for attempt in range(1, max_retries + 1):
         attempt_start = time.time()
@@ -308,7 +342,43 @@ async def run_agent(
             # Non-retryable error, fail immediately
             return result
 
-        # Last attempt exhausted
+        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        if persistent_retry and is_capacity_error:
+            persistent_attempt += 1
+            # In persistent mode, use separate attempt counter and higher backoff
+            delay_seconds = get_retry_delay(
+                persistent_attempt,
+                max_delay_ms=PERSISTENT_MAX_BACKOFF_MS,
+                persistent=True,
+            )
+            # Cap total delay at 6 hours
+            delay_ms = delay_seconds * 1000
+            if delay_ms > PERSISTENT_RESET_CAP_MS:
+                delay_ms = PERSISTENT_RESET_CAP_MS
+                delay_seconds = delay_ms / 1000.0
+
+            print(f"  [PersistentRetry] Attempt {persistent_attempt} failed "
+                  f"({time.time() - attempt_start:.1f}s). "
+                  f"Retrying in {delay_seconds:.1f}s... "
+                  f"(error: {last_error[:80]})")
+
+            # Chunk long sleeps into heartbeat intervals to show we're alive
+            remaining_ms = delay_ms
+            while remaining_ms > 0:
+                chunk_ms = min(remaining_ms, HEARTBEAT_INTERVAL_MS)
+                await asyncio.sleep(chunk_ms / 1000.0)
+                remaining_ms -= chunk_ms
+                if remaining_ms > 0:
+                    print(f"  [Heartbeat] Still retrying... "
+                          f"{remaining_ms / 1000.0:.0f}s remaining")
+
+            # Clamp attempt counter so we never exit the loop in persistent mode
+            if attempt >= max_retries:
+                attempt = max_retries
+            continue
+
+        # Last attempt exhausted (non-persistent mode)
         if attempt >= max_retries:
             result["errors"].append(
                 f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
@@ -852,6 +922,7 @@ async def run_agent_streaming_with_retry(
     project_dir: str | None = None,
     max_retries: int = 10,
     fallback_model: str | None = "sonnet",
+    persistent_retry: bool = False,
 ) -> dict[str, Any]:
     """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
 
@@ -860,10 +931,16 @@ async def run_agent_streaming_with_retry(
     - After 3 consecutive 529/overloaded errors, fall back to cheaper model
     - Retryable errors: 429, 5xx, connection, timeout, ECONNRESET, EPIPE
     - Non-retryable errors fail immediately
+    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
+      with higher backoff (5 min max) and periodic heartbeats
+
+    Args:
+        persistent_retry: Enable persistent retry mode for unattended sessions
     """
     consecutive_529_errors = 0
     model_fallback_triggered = False
     last_error = ""
+    persistent_attempt = 0
 
     for attempt in range(1, max_retries + 1):
         attempt_start = time.time()
@@ -909,7 +986,43 @@ async def run_agent_streaming_with_retry(
             # Non-retryable error, fail immediately
             return result
 
-        # Last attempt exhausted
+        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        if persistent_retry and is_capacity_error:
+            persistent_attempt += 1
+            # In persistent mode, use separate attempt counter and higher backoff
+            delay_seconds = get_retry_delay(
+                persistent_attempt,
+                max_delay_ms=PERSISTENT_MAX_BACKOFF_MS,
+                persistent=True,
+            )
+            # Cap total delay at 6 hours
+            delay_ms = delay_seconds * 1000
+            if delay_ms > PERSISTENT_RESET_CAP_MS:
+                delay_ms = PERSISTENT_RESET_CAP_MS
+                delay_seconds = delay_ms / 1000.0
+
+            print(f"  [PersistentRetry] Streaming attempt {persistent_attempt} failed "
+                  f"({time.time() - attempt_start:.1f}s). "
+                  f"Retrying in {delay_seconds:.1f}s... "
+                  f"(error: {last_error[:80]})")
+
+            # Chunk long sleeps into heartbeat intervals to show we're alive
+            remaining_ms = delay_ms
+            while remaining_ms > 0:
+                chunk_ms = min(remaining_ms, HEARTBEAT_INTERVAL_MS)
+                await asyncio.sleep(chunk_ms / 1000.0)
+                remaining_ms -= chunk_ms
+                if remaining_ms > 0:
+                    print(f"  [Heartbeat] Still retrying... "
+                          f"{remaining_ms / 1000.0:.0f}s remaining")
+
+            # Clamp attempt counter so we never exit the loop in persistent mode
+            if attempt >= max_retries:
+                attempt = max_retries
+            continue
+
+        # Last attempt exhausted (non-persistent mode)
         if attempt >= max_retries:
             result["errors"].append(
                 f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
