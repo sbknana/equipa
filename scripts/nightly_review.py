@@ -202,10 +202,29 @@ def get_upcoming_reminders(conn):
         return []
 
 
+def get_stale_decisions(conn):
+    """Decisions not validated in 60+ days."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM v_stale_decisions LIMIT 20")
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        # View might not exist — query directly
+        cur.execute("""
+            SELECT d.id, p.codename as project_name, d.topic, d.decision,
+                ROUND(julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at))) as days_since_validation
+            FROM decisions d
+            JOIN projects p ON d.project_id = p.id
+            WHERE julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) > 60
+            ORDER BY days_since_validation DESC
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
 # --- Report generation ---
 
 def generate_review(stats, accomplishments, blockers, stale_projects,
-                    stale_tasks, agent_stats, open_questions, reminders):
+                    stale_tasks, agent_stats, open_questions, reminders, stale_decisions):
     """Generate the nightly review document."""
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -265,6 +284,17 @@ def generate_review(stats, accomplishments, blockers, stale_projects,
         for q in open_questions:
             lines.append(f"- [{q['codename']}] {q['question']} — {int(q['days_open'])}d open")
 
+    # Stale decisions
+    if stale_decisions:
+        lines.extend(["", "## Stale Decisions (60+ days unvalidated)"])
+        for d in stale_decisions:
+            days = int(d.get('days_since_validation', 0))
+            topic = d.get('topic', '?')
+            decision_preview = d.get('decision', '')[:80]
+            if len(d.get('decision', '')) > 80:
+                decision_preview += "..."
+            lines.append(f"- [{d['project_name']}] {topic}: {decision_preview} — {days}d since validation")
+
     # Stale projects
     lines.extend(["", "## Stale Projects (7+ days inactive)"])
     if stale_projects:
@@ -314,12 +344,13 @@ def main():
     agent_stats = get_agent_stats(conn)
     open_questions = get_open_questions(conn)
     reminders = get_upcoming_reminders(conn)
+    stale_decisions = get_stale_decisions(conn)
 
     conn.close()
 
     # Generate review
     review = generate_review(stats, accomplishments, blockers, stale_projects,
-                             stale_tasks, agent_stats, open_questions, reminders)
+                             stale_tasks, agent_stats, open_questions, reminders, stale_decisions)
 
     # Save to file
     review_dir = Path(db_path).parent / "nightly-reviews"
