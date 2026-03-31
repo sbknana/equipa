@@ -65,7 +65,7 @@ It's pure Python with zero dependencies. Copy the files, point it at a SQLite da
 
 1. **Clone the repo and run setup:**
    ```bash
-   git clone https://github.com/your-org/equipa.git
+   git clone https://github.com/sbknana/equipa.git
    cd equipa
    python equipa_setup.py
    ```
@@ -87,6 +87,20 @@ It's pure Python with zero dependencies. Copy the files, point it at a SQLite da
 That's it. You talk, Claude orchestrates, agents do the work.
 
 ---
+
+
+---
+
+## How It Actually Works
+
+```
+You (human) ──talk to──> Claude ──dispatches──> EQUIPA Orchestrator ──spawns──> Agents
+                              <──reports back──         <──results──           (dev, test, review)
+```
+
+**You never run the orchestrator directly.** You talk to Claude. Claude reads your TheForge database (via MCP), creates tasks, and dispatches agents. When they're done, Claude tells you what happened.
+
+The only time you interact with EQUIPA directly is during initial setup (`python equipa_setup.py`). After that, everything goes through Claude.
 
 ## How to Use
 
@@ -140,22 +154,38 @@ These systems need data to work with. After 20-30 completed tasks, patterns star
 
 ## Features
 
-- **Talk to Claude, get code done** — the primary interface is conversation. No CLI to memorize, no dashboards to check. Say what you want in plain English.
-- **9 specialized agent roles** — developer, tester, security reviewer, planner, evaluator, researcher, documenter, architect, and devops. Each has language-aware prompts tuned for their job.
-- **Dev-test iteration loop** — agents retry until tests pass. The tester role runs your test suite and feeds failures back to the developer.
-- **Cost controls that actually work** — per-task cost limits, complexity-based budgets, and a circuit breaker that kills runaway agents. No surprise bills.
-- **Self-improving agents** — ForgeSmith + GEPA + SIMBA form a closed loop. Agents get better the more you use them.
-- **Episodic memory** — agents remember what worked (and what didn't) on similar tasks. Past lessons get injected into future prompts.
-- **Zero dependencies** — pure Python stdlib. No pip install, no virtual env, no package conflicts. Just Python 3.10+.
-- **Anti-compaction state persistence** — long-running tasks don't lose context when conversations get long. The system actively fights context window compression.
-- **Loop detection** — catches agents that get stuck repeating the same actions, monologuing without using tools, or alternating between two failed approaches.
-- **Language-aware prompts** — detects Python, TypeScript, Go, Rust, C#, Java projects and loads language-specific guidance.
-- **Knowledge graph for lessons** — lessons aren't just stored, they're connected. PageRank and label propagation help surface the most relevant past experience.
-- **Vector memory (optional)** — if you run Ollama locally, episodes get embeddings for semantic similarity search.
-- **MCP server built in** — registers with Claude Desktop natively. No adapter needed.
-- **Bash security layer** — command sanitization catches injection attempts, obfuscated flags, and dangerous variable expansion before agents run anything.
+### Core: You Talk, Claude Works
+- **Conversational interface** — describe what you want in plain English. Claude creates tasks, dispatches agents, and reports back. You never touch the CLI directly.
+- **Multi-agent orchestration** — developer, tester, security reviewer, code reviewer, frontend designer, planner, debugger, integration tester, and more. Claude picks the right role for the job.
+- **Dev-test loop** — agents write code, run tests, fix failures, and iterate. Up to 5 cycles per task before giving up.
 
----
+### Self-Improvement (runs automatically)
+- **ForgeSmith reflexion** — after every task, agents reflect on what worked and what didn't. Lessons are stored and injected into future prompts.
+- **GEPA (Genetic Evolutionary Prompt Architecture)** — A/B tests prompt variants overnight. Winners get promoted. Losers get retired. Your agents get better while you sleep.
+- **SIMBA (vector memory)** — embeds past episodes and retrieves the most relevant ones for each new task. Uses Ollama locally — no external API needed.
+- **MemRL (q-value learning)** — tracks which reflexion episodes actually helped and adjusts injection weights over time.
+- **Nightly scheduled job** — ForgeSmith runs on cron (Linux/WSL) or Windows Task Scheduler. Setup wizard configures it automatically for your OS.
+
+### Reliability & Recovery
+- **Autoresearch loop** — when a task fails (blocked, early-terminated, rate-limited), the orchestrator automatically cleans up, resets, and retries with a fresh agent. Up to 3 retries per task with git branch cleanup between attempts.
+- **Compaction protection** — agents maintain `.forge-state.json` with current progress. If context compaction hits mid-task, the agent resumes from where it left off instead of starting over.
+- **Soft checkpoints** — streaming monitor saves periodic checkpoints during long agent runs. If an agent is killed, the next attempt gets the checkpoint context.
+- **Retry with jitter** — API calls use exponential backoff (500ms base, 25% jitter, 32s cap) with automatic model fallback after 3 consecutive overloaded errors.
+- **Tool result persistence** — large agent outputs (>50KB) are saved to disk instead of stuffing the context window. Prevents compaction thrashing.
+
+### Security
+- **Bash security filter** — 12+ regex-based security checks ported from Claude Code's production system. Blocks command injection, IFS manipulation, process substitution, and more.
+- **Lesson sanitizer** — agent-generated lessons are sanitized before storage to prevent prompt injection via the learning loop.
+- **Skill integrity verification** — SHA-256 manifest of all prompt/skill files. Detects tampering before agent dispatch.
+- **Randomized untrusted content delimiters** — task descriptions wrapped in unpredictable boundaries to prevent injection from task content.
+
+### Architecture
+- **Pure Python, zero dependencies** — stdlib only. No pip install, no requirements.txt, no virtual environments. Copy the files and go.
+- **Cost-based model routing** — simple tasks go to Sonnet (cheaper, faster), complex tasks go to Opus (smarter). Configurable per-role.
+- **Abort controller hierarchy** — parent-child subprocess management with WeakRef-based cleanup. No orphaned processes.
+- **Prompt cache optimization** — static prompt sections cached across tasks; only dynamic context (task description, lessons, episodes) changes per dispatch.
+- **Knowledge graph** — PageRank-based episode importance scoring. Lessons that help many tasks bubble up.
+
 
 ## Limitations
 
@@ -186,7 +216,7 @@ Being honest here:
 
 ```bash
 # 1. Clone
-git clone https://github.com/your-org/equipa.git
+git clone https://github.com/sbknana/equipa.git
 cd equipa
 
 # 2. Run the interactive setup

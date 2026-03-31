@@ -56,7 +56,7 @@
 ## TL;DR
 
 ```bash
-git clone https://github.com/your-org/equipa-repo.git && cd equipa-repo
+git clone https://github.com/sbknana/equipa.git && cd equipa-repo
 python3 equipa_setup.py          # interactive setup wizard — does everything
 # Open Claude Desktop / Claude Code, point it at your project
 # Talk to Claude: "Create a task to add input validation to the user signup endpoint"
@@ -112,7 +112,7 @@ sqlite3 --version   # needs 3.35+
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/your-org/equipa-repo.git
+git clone https://github.com/sbknana/equipa.git
 cd equipa-repo
 ```
 
@@ -245,15 +245,23 @@ sudo systemctl status equipa-mcp
 The setup wizard offers to set this up. It runs ForgeSmith periodically to analyze agent performance and adjust prompts/config:
 
 ```bash
-# Run ForgeSmith every 6 hours
-0 */6 * * * cd /home/youruser/equipa && python3 forgesmith.py --full >> /home/youruser/equipa/logs/forgesmith.log 2>&1
+# The setup wizard (equipa_setup.py) auto-configures this for your OS:
+# - Linux/WSL: cron job
+# - Windows: Task Scheduler (schtasks)
+#
+# To set up manually:
 
-# Run SIMBA (rule generation) daily
-0 3 * * * cd /home/youruser/equipa && python3 forgesmith_simba.py >> /home/youruser/equipa/logs/simba.log 2>&1
+# Linux/WSL — add to crontab:
+0 0 * * * cd /path/to/equipa && python3 forgesmith.py --auto >> forgesmith.log 2>&1
 
-# Run GEPA (prompt evolution) weekly
-0 4 * * 0 cd /home/youruser/equipa && python3 forgesmith_gepa.py >> /home/youruser/equipa/logs/gepa.log 2>&1
-```
+# Windows — create scheduled task:
+# schtasks /create /tn "EQUIPA_ForgeSmith_Nightly" /tr "python forgesmith.py --auto" /sc daily /st 00:00 /f
+
+# GEPA prompt evolution (weekly recommended):
+0 3 * * 0 cd /path/to/equipa && python3 forgesmith_gepa.py --evolve >> gepa.log 2>&1
+
+# SIMBA vector memory maintenance (daily):
+30 0 * * * cd /path/to/equipa && python3 forgesmith.py --simba-maintenance >> simba.log 2>&1
 
 ### Option C: Nightly review
 

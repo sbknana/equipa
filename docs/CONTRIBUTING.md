@@ -62,7 +62,7 @@ EQUIPA has zero pip dependencies. It's pure Python stdlib. So setup is.. refresh
 ### Clone and go
 
 ```bash
-git clone https://github.com/your-org/equipa.git
+git clone https://github.com/sbknana/equipa.git
 cd equipa
 ```
 
