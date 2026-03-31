@@ -59,7 +59,7 @@ Available MCP tools:
 
 Key tables:
 - `tasks` (id, project_id, title, description, status, priority, completed_at)
-- `decisions` (id, project_id, topic, decision, rationale, alternatives_considered)
+- `decisions` (id, project_id, topic, decision, rationale, alternatives_considered, decision_type, status, resolved_by_task_id, verified_at)
 - `open_questions` (id, project_id, question, context, resolved)
 - `session_notes` (id, project_id, summary, key_points, next_steps)
 
