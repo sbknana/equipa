@@ -226,16 +226,24 @@ class TestBuildSystemPromptCacheSplit:
 
         assert "A test task description" in result.dynamic_suffix
 
-    def test_task_id_replaced_in_static(
+    def test_task_id_NOT_replaced_in_static(
         self, minimal_task, empty_context, mock_prompts_dir
     ):
-        """The {task_id} placeholder is replaced in static prefix."""
+        """The {task_id} placeholder is kept as-is in static prefix.
+
+        Per-task values like {task_id} and {project_id} must NOT be
+        substituted in the static prefix — doing so would make every
+        dispatch unique and defeat prompt caching.  The agent resolves
+        these from the '## Assigned Task' block in the dynamic suffix.
+        """
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
              patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
-        assert "{task_id}" not in result.static_prefix
-        assert "999" in result.static_prefix
+        # Static still has the literal placeholder (template, not interpolated)
+        assert "{task_id}" in result.static_prefix
+        # The actual task ID appears in the dynamic suffix (## Assigned Task)
+        assert "999" in result.dynamic_suffix
 
     def test_full_prompt_splits_on_boundary(
         self, minimal_task, empty_context, mock_prompts_dir
@@ -274,23 +282,29 @@ class TestBuildSystemPromptCacheSplit:
         assert "45 turns" in result.dynamic_suffix
         assert "45 turns" not in result.static_prefix
 
-    def test_same_role_same_static(self, empty_context, mock_prompts_dir):
-        """Two tasks with same role produce identical static prefixes."""
+    def test_same_role_same_static_across_tasks(self, empty_context, mock_prompts_dir):
+        """Two DIFFERENT tasks with same role produce identical static prefixes.
+
+        This is the critical cache-split invariant: the static prefix must be
+        byte-identical across dispatches so the API can cache it globally.
+        """
         task_a = {
             "id": 100, "title": "Task A", "description": "Desc A",
             "project_id": 23, "project_name": "Proj", "task_type": "feature",
         }
         task_b = {
-            "id": 100, "title": "Task B", "description": "Desc B",
-            "project_id": 23, "project_name": "Proj", "task_type": "bug",
+            "id": 200, "title": "Task B", "description": "Desc B",
+            "project_id": 42, "project_name": "OtherProj", "task_type": "bug",
         }
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
              patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result_a = _call_build_system_prompt(task_a, empty_context, "/tmp/proj")
             result_b = _call_build_system_prompt(task_b, empty_context, "/tmp/proj")
 
-        # Same task_id+project_id → same static prefix (role prompt is identical)
+        # Static prefix MUST be byte-identical (enables global cache hit)
         assert result_a.static_prefix == result_b.static_prefix
+        # Dynamic suffix MUST differ (different task metadata)
+        assert result_a.dynamic_suffix != result_b.dynamic_suffix
 
     def test_different_tasks_different_dynamic(self, empty_context, mock_prompts_dir):
         """Two different tasks produce different dynamic suffixes."""
@@ -342,6 +356,39 @@ class TestPlannerEvaluatorCacheSplit:
         assert "Planner" in result.static_prefix
         assert "Build feature X" in result.dynamic_suffix
         assert SYSTEM_PROMPT_DYNAMIC_BOUNDARY in result.full
+
+    def test_planner_static_not_substituted(self, mock_prompts_dir):
+        """Planner static prefix keeps {project_id} as literal placeholder."""
+        from equipa.prompts import build_planner_prompt
+        with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
+             patch("equipa.prompts.ROLE_PROMPTS", {
+                 "planner": mock_prompts_dir / "planner.md",
+             }):
+            result = build_planner_prompt(
+                goal="Plan X", project_id=99,
+                project_dir="/tmp/proj", project_context={},
+            )
+        # {project_id} should remain in static (template placeholder)
+        assert "{project_id}" in result.static_prefix
+        # Actual project_id appears in dynamic (## Project Info)
+        assert "99" in result.dynamic_suffix
+
+    def test_planner_static_identical_across_projects(self, mock_prompts_dir):
+        """Two planner dispatches with different project_ids have identical static."""
+        from equipa.prompts import build_planner_prompt
+        with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
+             patch("equipa.prompts.ROLE_PROMPTS", {
+                 "planner": mock_prompts_dir / "planner.md",
+             }):
+            result_a = build_planner_prompt(
+                goal="Plan A", project_id=10,
+                project_dir="/tmp/projA", project_context={},
+            )
+            result_b = build_planner_prompt(
+                goal="Plan B", project_id=20,
+                project_dir="/tmp/projB", project_context={},
+            )
+        assert result_a.static_prefix == result_b.static_prefix
 
     def test_evaluator_returns_prompt_result(self, mock_prompts_dir):
         from equipa.prompts import build_evaluator_prompt
