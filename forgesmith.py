@@ -2016,6 +2016,322 @@ def get_rubric_report(role=None, limit=20):
 
 
 # ============================================================
+# ============================================================
+# PHASE 2.95: GHOST VERIFICATION — Verify resolved security findings
+# ============================================================
+
+GHOST_SKILL_PATH = SCRIPT_DIR / "skills" / "security-reviewer" / "skills" \
+    / "ghost-verification" / "SKILL.md"
+
+MAX_GHOST_VERIFICATIONS_PER_RUN = 5
+GHOST_SCOUT_MODEL = "haiku"
+GHOST_SCOUT_MAX_TURNS = 10
+GHOST_SCOUT_TIMEOUT = 180  # seconds
+
+
+def fetch_unverified_resolved_findings() -> list[dict]:
+    """Fetch security findings that are resolved but not yet verified.
+
+    Returns decisions where:
+    - decision_type = 'security_finding'
+    - status = 'resolved'
+    - verified_at IS NULL
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT d.id, d.project_id, d.topic, d.decision, d.rationale,
+                      d.alternatives_considered, d.resolved_by_task_id
+               FROM decisions d
+               WHERE d.decision_type = 'security_finding'
+                 AND d.status = 'resolved'
+                 AND d.verified_at IS NULL
+               ORDER BY d.decided_at DESC
+               LIMIT ?""",
+            (MAX_GHOST_VERIFICATIONS_PER_RUN,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def load_ghost_skill_prompt() -> str | None:
+    """Load the ghost-verification SKILL.md prompt template.
+
+    Returns the prompt content (after the YAML frontmatter) or None if
+    the file cannot be read.
+    """
+    try:
+        text = GHOST_SKILL_PATH.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        log("  [GHOST] Could not read ghost-verification SKILL.md")
+        return None
+
+    # Strip YAML frontmatter (between --- delimiters)
+    parts = text.split("---", 2)
+    if len(parts) >= 3:
+        return parts[2].strip()
+    return text.strip()
+
+
+def build_ghost_prompt(skill_prompt: str, finding: dict) -> str:
+    """Build the full prompt for the ghost verification scout.
+
+    Injects the finding description, code path, and resolution context
+    into the skill template.
+    """
+    # Extract code path from rationale/alternatives (where agents typically
+    # store file paths) or from the decision field itself
+    code_path = finding.get("alternatives_considered", "") or ""
+    finding_description = finding.get("topic", "")
+    decision_text = finding.get("decision", "")
+    rationale = finding.get("rationale", "")
+    resolved_by = finding.get("resolved_by_task_id")
+
+    context_block = (
+        f"## Finding to Verify\n\n"
+        f"**Finding ID:** {finding['id']}\n"
+        f"**Finding description:** {finding_description}\n"
+        f"**Decision/Resolution:** {decision_text}\n"
+        f"**Rationale:** {rationale}\n"
+        f"**Code path / files:** {code_path}\n"
+    )
+    if resolved_by:
+        context_block += f"**Resolved by task:** #{resolved_by}\n"
+
+    return f"{skill_prompt}\n\n{context_block}"
+
+
+def dispatch_ghost_scout(prompt: str) -> str | None:
+    """Dispatch the security-reviewer agent with the ghost verification
+    skill context using the Haiku model for cost efficiency.
+
+    Returns the agent's raw output text or None on failure.
+    """
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "json",
+        "--model", GHOST_SCOUT_MODEL,
+        "--max-turns", str(GHOST_SCOUT_MAX_TURNS),
+        "--no-session-persistence",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=GHOST_SCOUT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        log("  [GHOST] Scout timed out")
+        return None
+    except FileNotFoundError:
+        log("  [GHOST] 'claude' command not found")
+        return None
+
+    if result.returncode != 0:
+        log(f"  [GHOST] Scout returned exit code {result.returncode}")
+        if result.stderr:
+            log(f"  [GHOST] stderr: {result.stderr[:200]}")
+        return None
+
+    raw = result.stdout.strip()
+    if not raw:
+        log("  [GHOST] Empty response from scout")
+        return None
+
+    # Parse JSON wrapper from --output-format json
+    try:
+        outer = json.loads(raw)
+        if isinstance(outer, dict) and "result" in outer:
+            return outer["result"]
+        return raw
+    except json.JSONDecodeError:
+        return raw
+
+
+def parse_ghost_verdict(output: str) -> tuple[str | None, str | None, str | None]:
+    """Parse the scout output for VERDICT, EVIDENCE, and SEVERITY.
+
+    Returns (verdict, evidence, severity) where verdict is
+    'VERIFIED' or 'STILL_PRESENT', or (None, None, None) on parse failure.
+    """
+    verdict_match = re.search(
+        r"VERDICT:\s*(VERIFIED|STILL_PRESENT)", output, re.IGNORECASE
+    )
+    if not verdict_match:
+        return None, None, None
+
+    verdict = verdict_match.group(1).upper()
+
+    evidence_match = re.search(
+        r"EVIDENCE:\s*(.+?)(?:\n(?:SEVERITY:|$)|\Z)",
+        output, re.DOTALL | re.IGNORECASE,
+    )
+    evidence = evidence_match.group(1).strip() if evidence_match else ""
+
+    severity = None
+    if verdict == "STILL_PRESENT":
+        sev_match = re.search(
+            r"SEVERITY:\s*(critical|high|medium|low)", output, re.IGNORECASE
+        )
+        severity = sev_match.group(1).lower() if sev_match else "high"
+
+    return verdict, evidence, severity
+
+
+def apply_ghost_verdict(
+    finding: dict, verdict: str, evidence: str, severity: str | None
+) -> dict | None:
+    """Apply the ghost verification result to the database.
+
+    - VERIFIED: sets verified_at = datetime('now')
+    - STILL_PRESENT: sets status to 'failed_resolution' and creates a
+      high-priority follow-up task.
+
+    Returns a summary dict of the action taken, or None on error.
+    """
+    conn = get_db(write=True)
+    try:
+        if verdict == "VERIFIED":
+            conn.execute(
+                "UPDATE decisions SET verified_at = datetime('now') WHERE id = ?",
+                (finding["id"],),
+            )
+            conn.commit()
+            return {
+                "finding_id": finding["id"],
+                "verdict": "VERIFIED",
+                "action": "marked_verified",
+                "evidence": evidence,
+            }
+
+        elif verdict == "STILL_PRESENT":
+            conn.execute(
+                "UPDATE decisions SET status = 'failed_resolution' WHERE id = ?",
+                (finding["id"],),
+            )
+
+            # Create a high-priority follow-up task
+            task_title = (
+                f"Ghost finding: {finding['topic'][:80]}"
+            )
+            task_desc = (
+                f"Security finding #{finding['id']} was marked resolved but "
+                f"ghost verification found it STILL PRESENT.\n\n"
+                f"**Original finding:** {finding['topic']}\n"
+                f"**Evidence:** {evidence}\n"
+                f"**Severity:** {severity or 'high'}\n\n"
+                f"Re-investigate and fix the vulnerability."
+            )
+            cursor = conn.execute(
+                """INSERT INTO tasks
+                   (project_id, title, description, status, priority)
+                   VALUES (?, ?, ?, 'todo', 'high')""",
+                (finding["project_id"], task_title, task_desc),
+            )
+            new_task_id = cursor.lastrowid
+            conn.commit()
+
+            return {
+                "finding_id": finding["id"],
+                "verdict": "STILL_PRESENT",
+                "action": "failed_resolution_task_created",
+                "new_task_id": new_task_id,
+                "severity": severity,
+                "evidence": evidence,
+            }
+
+        return None
+    except sqlite3.Error as exc:
+        log(f"  [GHOST] DB error applying verdict for finding #{finding['id']}: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def run_ghost_verification(dry_run: bool = False) -> dict:
+    """Run ghost finding verification for unverified resolved security findings.
+
+    Pipeline:
+    1. Fetch unverified resolved security findings (max 5)
+    2. Load ghost-verification skill prompt
+    3. For each finding: dispatch scout, parse verdict, apply result
+
+    Returns a summary dict with counts and details.
+    """
+    result = {
+        "findings_checked": 0,
+        "verified": 0,
+        "still_present": 0,
+        "parse_failures": 0,
+        "dispatch_failures": 0,
+        "details": [],
+    }
+
+    # Step 1: Fetch candidates
+    findings = fetch_unverified_resolved_findings()
+    if not findings:
+        log("  [GHOST] No unverified resolved security findings found")
+        return result
+
+    log(f"  [GHOST] Found {len(findings)} unverified resolved findings")
+
+    # Step 2: Load skill prompt
+    skill_prompt = load_ghost_skill_prompt()
+    if not skill_prompt:
+        log("  [GHOST] Cannot proceed without skill prompt")
+        return result
+
+    # Step 3: Verify each finding
+    for finding in findings:
+        finding_id = finding["id"]
+        log(f"  [GHOST] Verifying finding #{finding_id}: "
+            f"{finding['topic'][:60]}")
+
+        if dry_run:
+            result["findings_checked"] += 1
+            result["details"].append({
+                "finding_id": finding_id,
+                "action": "dry_run_skipped",
+            })
+            continue
+
+        # Build prompt and dispatch scout
+        prompt = build_ghost_prompt(skill_prompt, finding)
+        scout_output = dispatch_ghost_scout(prompt)
+
+        if not scout_output:
+            result["dispatch_failures"] += 1
+            result["findings_checked"] += 1
+            continue
+
+        # Parse verdict
+        verdict, evidence, severity = parse_ghost_verdict(scout_output)
+        if not verdict:
+            log(f"  [GHOST] Could not parse verdict for finding #{finding_id}")
+            result["parse_failures"] += 1
+            result["findings_checked"] += 1
+            continue
+
+        # Apply verdict
+        action_result = apply_ghost_verdict(finding, verdict, evidence, severity)
+        if action_result:
+            result["details"].append(action_result)
+            if verdict == "VERIFIED":
+                result["verified"] += 1
+                log(f"  [GHOST] Finding #{finding_id}: VERIFIED")
+            else:
+                result["still_present"] += 1
+                log(f"  [GHOST] Finding #{finding_id}: STILL_PRESENT "
+                    f"(task #{action_result.get('new_task_id')})")
+
+        result["findings_checked"] += 1
+
+    return result
+
+
+# ============================================================
 # PHASE 4.7: PROPOSE — OPRO-style LLM-driven prompt optimization
 # ============================================================
 
@@ -2788,6 +3104,17 @@ def run_full(cfg, dry_run=False):
                     log(f"  [{role}] {criterion}: {old} -> {new}")
         else:
             log("  No rubric weight changes (insufficient data or no significant correlations).")
+
+    # Ghost finding verification (auto mode only)
+    if not dry_run:
+        log("\nPHASE 2.95: GHOST VERIFICATION")
+        ghost_results = run_ghost_verification(dry_run=dry_run)
+        if ghost_results["findings_checked"] > 0:
+            log(f"  Checked {ghost_results['findings_checked']} findings: "
+                f"{ghost_results['verified']} verified, "
+                f"{ghost_results['still_present']} still present")
+        else:
+            log("  No unverified resolved security findings.")
 
     # Apply changes
     log(f"\nPHASE 3: {'PROPOSE' if dry_run else 'APPLY'} CHANGES")
