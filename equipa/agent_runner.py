@@ -15,7 +15,10 @@ import math
 import random
 import subprocess
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from equipa.prompts import PromptResult
 
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
@@ -149,7 +152,7 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
 
 
 def build_cli_command(
-    system_prompt: str,
+    system_prompt: str | PromptResult,
     project_dir: str,
     max_turns: int,
     model: str,
@@ -159,8 +162,14 @@ def build_cli_command(
     """Build the claude CLI command as a list of arguments.
 
     Args:
+        system_prompt: Full system prompt string, or PromptResult from
+            build_system_prompt(). PromptResult is coerced to str via
+            __str__() which returns the full prompt with boundary marker.
         streaming: If True, use stream-json output format for real-time monitoring.
     """
+    # Explicit str() ensures PromptResult.__str__() is called, producing
+    # the full prompt with SYSTEM_PROMPT_DYNAMIC_BOUNDARY marker.
+    prompt_str = str(system_prompt)
     output_format = "stream-json" if streaming else "json"
     cmd = [
         "claude",
@@ -170,7 +179,7 @@ def build_cli_command(
         "--model", model,
         "--max-turns", str(max_turns),
         "--no-session-persistence",
-        "--append-system-prompt", system_prompt,
+        "--append-system-prompt", prompt_str,
         "--mcp-config", str(MCP_CONFIG),
         "--add-dir", str(project_dir),
         "--permission-mode", "bypassPermissions",
@@ -984,6 +993,7 @@ async def run_agent_streaming_with_retry(
     max_retries: int = 10,
     fallback_model: str | None = "sonnet",
     persistent_retry: bool = False,
+    abort_controller: AbortController | None = None,
 ) -> dict[str, Any]:
     """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
 
@@ -997,6 +1007,7 @@ async def run_agent_streaming_with_retry(
 
     Args:
         persistent_retry: Enable persistent retry mode for unattended sessions
+        abort_controller: Optional parent abort controller for cancellation hierarchy
     """
     consecutive_529_errors = 0
     model_fallback_triggered = False
@@ -1010,7 +1021,7 @@ async def run_agent_streaming_with_retry(
         result = await _run_agent_streaming_impl(
             cmd, role=role, output=output, max_turns=max_turns,
             task_id=task_id, run_id=None, cycle_number=cycle_number,
-            project_dir=project_dir
+            project_dir=project_dir, abort_controller=abort_controller
         )
 
         # If successful, return immediately
@@ -1113,6 +1124,7 @@ async def run_agent_streaming(
     run_id: int | None = None,
     cycle_number: int = 1,
     project_dir: str | None = None,
+    abort_controller: AbortController | None = None,
 ) -> dict[str, Any]:
     """Spawn claude -p with stream-json output for real-time stuck detection.
 
@@ -1142,7 +1154,7 @@ async def dispatch_agent(
     max_turns: int,
     task_id: int,
     cycle: int,
-    system_prompt: str | None = None,
+    system_prompt: str | PromptResult | None = None,
     project_dir: str | None = None,
     args: Any = None,
 ) -> dict[str, Any]:
@@ -1151,8 +1163,14 @@ async def dispatch_agent(
     For Claude: delegates to run_agent_streaming() or run_agent().
     For Ollama: delegates to run_ollama_agent().
 
+    system_prompt accepts str or PromptResult (coerced to str via __str__).
+
     Returns the same result dict format regardless of provider.
     """
+    # Coerce PromptResult to str for downstream consumers
+    if system_prompt is not None:
+        system_prompt = str(system_prompt)
+
     # Security: verify skill file integrity before building any agent prompt
     if not verify_skill_integrity():
         return {
