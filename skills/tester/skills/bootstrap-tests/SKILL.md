@@ -497,6 +497,25 @@ pip install pytest
 python -m pip install pytest
 ```
 
+### Virtual Environment Issues
+
+```bash
+# Check if you're in a virtual environment
+echo $VIRTUAL_ENV
+
+# If not activated, find and activate it
+# For venv:
+source venv/bin/activate  # Linux/Mac
+# or
+.\venv\Scripts\activate  # Windows
+
+# For conda:
+conda activate <env-name>
+
+# Install dependencies in the activated environment
+pip install -r requirements-test.txt
+```
+
 ### "No tests collected"
 
 ```bash
