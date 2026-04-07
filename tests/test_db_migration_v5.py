@@ -35,30 +35,49 @@ def v4_db():
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
 
-    # Create minimal v4 schema (includes tables needed for v6/v7 migrations)
+    # Create minimal v4 schema — includes all tables that exist at v4
+    # so that later migrations (v5→v6, v6→v7) referencing decisions/projects
+    # can ALTER and CREATE VIEWs against them.
     cursor.execute("""
         CREATE TABLE projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            codename TEXT NOT NULL
+            name TEXT NOT NULL UNIQUE,
+            codename TEXT,
+            category TEXT,
+            status TEXT DEFAULT 'active',
+            summary TEXT,
+            target_market TEXT,
+            revenue_model TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cursor.execute("""
         CREATE TABLE tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL
+            project_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'todo',
+            priority TEXT DEFAULT 'medium',
+            blocked_by TEXT,
+            due_date DATE,
+            completed_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
         )
     """)
 
     cursor.execute("""
         CREATE TABLE decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER,
+            project_id INTEGER NOT NULL,
             topic TEXT NOT NULL,
             decision TEXT NOT NULL,
             rationale TEXT,
             alternatives_considered TEXT,
-            decided_at TEXT DEFAULT (datetime('now')),
+            decided_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (project_id) REFERENCES projects(id)
         )
     """)
@@ -99,7 +118,11 @@ def v4_db():
         )
     """)
 
-    # Insert some test data
+    # Insert test data
+    cursor.execute("""
+        INSERT INTO projects (name, codename) VALUES ('TestProject', 'test')
+    """)
+
     cursor.execute("""
         INSERT INTO lessons_learned (lesson, role, error_type)
         VALUES ('Always validate input', 'developer', 'validation_error')

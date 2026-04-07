@@ -439,13 +439,15 @@ def test_build_system_prompt_with_episodes():
     print(f"  Prompt length: {len(prompt)} chars")
 
     # Extract and show the episodes section
-    episodes_pos = prompt.find("## Past Experience")
+    # Coerce to str for .find()/.slice() — build_system_prompt returns PromptResult
+    prompt_str = str(prompt)
+    episodes_pos = prompt_str.find("## Past Experience")
     if episodes_pos != -1:
         # Find next section marker
-        next_section = prompt.find("\n## ", episodes_pos + 10)
+        next_section = prompt_str.find("\n## ", episodes_pos + 10)
         if next_section == -1:
             next_section = episodes_pos + 500  # Fallback
-        episodes_section = prompt[episodes_pos:next_section].strip()
+        episodes_section = prompt_str[episodes_pos:next_section].strip()
         print("\nInjected episodes section:")
         print(episodes_section[:400] + "..." if len(episodes_section) > 400 else episodes_section)
 
