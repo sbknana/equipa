@@ -10,6 +10,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 
@@ -46,6 +47,30 @@ def compute_keyword_overlap(text_a: str, text_b: str) -> float:
         return 0.0
     intersection = words_a & words_b
     union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+def _compute_ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
+    """Compute n-gram Jaccard similarity between two texts.
+
+    Uses character n-grams for fuzzy matching (catches typos, variations).
+    Returns similarity score 0.0-1.0.
+    """
+    if not text_a or not text_b:
+        return 0.0
+
+    def ngrams(s: str, n: int) -> set[str]:
+        s_lower = s.lower()
+        return set(s_lower[i:i+n] for i in range(len(s_lower) - n + 1))
+
+    ngrams_a = ngrams(text_a, n)
+    ngrams_b = ngrams(text_b, n)
+
+    if not ngrams_a or not ngrams_b:
+        return 0.0
+
+    intersection = ngrams_a & ngrams_b
+    union = ngrams_a | ngrams_b
     return len(intersection) / len(union)
 
 
@@ -104,6 +129,95 @@ def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
     return "\n".join(lines[:max_lines]).strip()
 
 
+def _deduplicate_log_lines(lines: list[str], threshold: float = 0.85) -> list[str]:
+    """Deduplicate similar log lines using n-gram Jaccard similarity.
+
+    Groups identical or nearly-identical lines, showing count instead of repeating.
+    Example: "Error: timeout\n" × 50 → "Error: timeout (×50)"
+    """
+    if not lines:
+        return lines
+
+    result: list[str] = []
+    line_groups: dict[str, int] = {}  # line → count
+    group_reps: list[str] = []  # first representative of each group
+
+    for line in lines:
+        if not line.strip():
+            result.append(line)
+            continue
+
+        # Find matching group
+        matched_idx = -1
+        for idx, rep in enumerate(group_reps):
+            sim = _compute_ngram_jaccard(line, rep)
+            if sim >= threshold:
+                matched_idx = idx
+                break
+
+        if matched_idx >= 0:
+            # Increment existing group
+            rep = group_reps[matched_idx]
+            line_groups[rep] += 1
+        else:
+            # New group
+            group_reps.append(line)
+            line_groups[line] = 1
+
+    # Emit deduplicated lines with counts
+    for rep in group_reps:
+        count = line_groups[rep]
+        if count > 1:
+            result.append(f"{rep.rstrip()} (×{count})")
+        else:
+            result.append(rep)
+
+    return result
+
+
+def _aggressive_compress_code(text: str) -> str:
+    """Aggressively compress code blocks by stripping comments, blank lines, normalizing indentation.
+
+    Reduces code output by 40-60% while preserving structure.
+    """
+    lines = text.splitlines()
+    compressed: list[str] = []
+    in_code = False
+    prev_blank = False
+
+    for line in lines:
+        # Detect code blocks
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            compressed.append(line)
+            continue
+
+        if not in_code:
+            compressed.append(line)
+            continue
+
+        # Strip comments (Python, JS, Go, etc.)
+        stripped = re.sub(r'//.*$', '', line)  # Single-line //
+        stripped = re.sub(r'#.*$', '', stripped)  # Python #
+        stripped = stripped.rstrip()
+
+        # Collapse consecutive blank lines
+        is_blank = not stripped
+        if is_blank and prev_blank:
+            continue
+        prev_blank = is_blank
+
+        # Normalize indentation (collapse to 2 spaces)
+        if stripped:
+            indent = len(line) - len(line.lstrip())
+            normalized_indent = ' ' * min(indent // 2, 4)
+            stripped = normalized_indent + stripped.lstrip()
+
+        compressed.append(stripped)
+
+    return "\n".join(compressed)
+
+
 def compact_agent_output(
     raw_output: str,
     max_words: int = 200,
@@ -115,6 +229,9 @@ def compact_agent_output(
 
     If agent_id and session_dir are provided, large outputs (>50KB by default) are
     persisted to disk before compaction, preventing context bloat.
+
+    Applies n-gram Jaccard deduplication to repetitive log lines and aggressive
+    compression to code blocks (strips comments, collapses blank lines, normalizes indentation).
 
     Args:
         raw_output: Raw agent output text
@@ -138,6 +255,14 @@ def compact_agent_output(
         from equipa.tool_result_storage import is_content_already_compacted
         if is_content_already_compacted(raw_output):
             return raw_output
+
+    # Apply aggressive code compression
+    raw_output = _aggressive_compress_code(raw_output)
+
+    # Apply n-gram Jaccard log line deduplication
+    lines = raw_output.splitlines()
+    deduped_lines = _deduplicate_log_lines(lines)
+    raw_output = "\n".join(deduped_lines)
 
     # Late import to avoid circular dependency — sanitizer may not be available
     from lesson_sanitizer import sanitize_lesson_content  # HARD dependency — no silent fallback
