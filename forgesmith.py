@@ -42,6 +42,7 @@ from forgesmith_impact import (
     log_impact_assessment,
     ensure_impact_assessment_column,
 )
+from forgesmith_litm import run_litm_audit
 from lesson_sanitizer import (
     sanitize_lesson_content,
     sanitize_error_signature,
@@ -3158,6 +3159,23 @@ def run_full(cfg, dry_run=False):
             log(f"  GEPA: {gepa_results['rollbacks']} rollbacks (underperformers)")
         if not gepa_results.get("roles_evolved") and not gepa_results.get("rollbacks"):
             log("  GEPA: No evolutions or rollbacks.")
+
+    # LITM: Self-tuning Lost-in-the-Middle attention weights (weekly)
+    if not dry_run:
+        log(f"\nPHASE 4.9: LITM WEIGHT AUDIT")
+        litm_report = run_litm_audit(
+            db_path=THEFORGE_DB,
+            dispatch_config_path=DISPATCH_CONFIG,
+            lookback_days=cfg.get("lookback_days", 7),
+            threshold=5,
+            dry_run=False
+        )
+        if litm_report["changes"]:
+            log(f"  LITM: {len(litm_report['changes'])} weight adjustments")
+            for change in litm_report["changes"]:
+                log(f"    {change}")
+        else:
+            log(f"  LITM: No adjustments needed ({litm_report['total_misses']} misses)")
 
     # Log the run
     if not dry_run:
