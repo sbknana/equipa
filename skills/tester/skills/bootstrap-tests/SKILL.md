@@ -553,6 +553,23 @@ python -m py_compile tests/conftest.py
 pytest tests/ --fixtures
 ```
 
+### Multiple or non-standard test directories
+
+```bash
+# If tests are scattered across the project
+# Update pytest config to include all test paths
+# In pyproject.toml:
+[tool.pytest.ini_options]
+testpaths = ["tests", "integration_tests", "unit_tests", "src"]
+
+# Or in pytest.ini:
+[pytest]
+testpaths = tests integration_tests unit_tests src
+
+# Discover all test files in project
+find . -name "test_*.py" -o -name "*_test.py" | grep -v venv | grep -v ".tox"
+```
+
 ## Quality Checklist
 
 - [ ] Test framework installed and version verified
