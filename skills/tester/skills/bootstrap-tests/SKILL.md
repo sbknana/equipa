@@ -612,6 +612,111 @@ NEXT STEPS:
 | Skip dependency declaration | Tests won't run in CI/other machines | Always add pytest to requirements/pyproject |
 | Use unittest instead of pytest | Harder to maintain, less powerful | Always use pytest for new test infrastructure |
 
+## Handling Import Errors After Bootstrap
+
+After creating test infrastructure, tests may fail with import errors. Handle systematically:
+
+### Pattern 1: "ModuleNotFoundError" for project code
+
+```bash
+# Check project structure
+ls -la src/ lib/ *.py
+
+# Install project in editable mode
+pip install -e .
+
+# If no setup.py/pyproject.toml with [project], add src to PYTHONPATH
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/src:$(pwd)"
+pytest tests/ -v
+```
+
+### Pattern 2: Missing test dependencies in existing tests
+
+```bash
+# Scan test files for imports
+grep -h "^import\|^from" tests/*.py | sort -u
+
+# Install missing packages
+pip install <missing-package>
+
+# Add to requirements-test.txt for future runs
+echo "<missing-package>" >> requirements-test.txt
+```
+
+### Pattern 3: Tests import from wrong locations
+
+```python
+# BAD: Assumes tests run from project root
+from src.module import function  # Breaks if run from tests/
+
+# GOOD: Use proper package imports
+from myproject.module import function  # Works from any directory
+```
+
+Fix by ensuring package is installed (`pip install -e .`) or adjusting imports.
+
+### Pattern 4: Circular imports or initialization issues
+
+```bash
+# Run single test file to isolate the issue
+pytest tests/test_specific.py -v
+
+# Check if __init__.py files exist where needed
+find . -type d -name tests -o -name src | xargs -I {} ls {}/__init__.py 2>&1 | grep "No such file"
+
+# Create missing __init__.py files
+touch tests/__init__.py src/__init__.py
+```
+
+## Real-World EQUIPA Context
+
+When working in EQUIPA multi-agent system, you'll encounter these scenarios:
+
+### Scenario: Developer wrote code but no tests
+
+**Action:** Don't just report "no tests exist". Create test infrastructure AND write a basic smoke test for the new code:
+
+```python
+# tests/test_new_feature.py
+"""Smoke tests for newly implemented feature."""
+import pytest
+
+def test_new_feature_imports():
+    """Verify new feature code can be imported."""
+    from myproject.new_feature import main_function
+    assert callable(main_function)
+
+def test_new_feature_basic():
+    """Verify new feature doesn't crash on basic input."""
+    from myproject.new_feature import main_function
+    # Use safe test data
+    result = main_function(test_input={"key": "value"})
+    assert result is not None
+```
+
+### Scenario: Tests exist but pytest not configured
+
+**Action:** Add configuration without breaking existing tests:
+
+1. Run tests without config first: `python -m pytest tests/ --collect-only`
+2. Note discovered tests
+3. Add minimal config that preserves discovery
+4. Re-run and verify same tests are found
+
+### Scenario: Multiple test frameworks detected
+
+```bash
+# Check what's actually being used
+grep -r "import unittest\|import pytest\|import nose" tests/
+
+# Prefer pytest even if unittest-style tests exist
+# pytest runs unittest.TestCase classes natively
+pip install pytest
+pytest tests/ -v  # Will run both styles
+```
+
+Don't rewrite unittest tests to pytest format — pytest runs them as-is.
+
 ## Escape Hatch
 
 If you've completed all 6 steps and tests still won't run due to complex project-specific issues (e.g., missing system dependencies, complex build process), then output:
