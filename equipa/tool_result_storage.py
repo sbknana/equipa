@@ -10,6 +10,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from pathlib import Path
@@ -69,6 +70,19 @@ def is_content_already_compacted(content: str) -> bool:
     avoids false-positives when the tag appears elsewhere in content.
     """
     return content.startswith(PERSISTED_OUTPUT_TAG)
+
+
+def kolmogorov_complexity_proxy(text: str) -> float:
+    """Estimate Kolmogorov complexity using gzip compression ratio.
+
+    Returns: gzip(text) / len(text). Lower ratio = more compressible = lower complexity.
+    Ratio > 0.6 suggests text is already compressed or random (skip further compression).
+    """
+    if not text:
+        return 1.0
+    text_bytes = text.encode('utf-8')
+    compressed = gzip.compress(text_bytes, compresslevel=6)
+    return len(compressed) / len(text_bytes)
 
 
 # --- Core Persistence Functions ---
@@ -193,6 +207,9 @@ def process_agent_output(
 
     This is the main entry point for equipa/parsing.py compact_agent_output().
 
+    Uses Kolmogorov complexity proxy (gzip ratio) to skip compression on
+    already-compressed or random data (ratio > 0.6).
+
     Args:
         raw_output: Raw agent output text
         agent_id: Unique identifier for this agent invocation (e.g., "developer-123-turn-5")
@@ -212,6 +229,12 @@ def process_agent_output(
     # Check size threshold
     size = len(raw_output.encode("utf-8"))
     if size <= persist_threshold:
+        return raw_output
+
+    # Kolmogorov proxy: skip persistence if content is already compressed or random
+    k_ratio = kolmogorov_complexity_proxy(raw_output)
+    if k_ratio > 0.6:
+        # Content is incompressible (already compressed or random) — skip persistence
         return raw_output
 
     # Persist the entire content
