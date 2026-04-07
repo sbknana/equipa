@@ -697,10 +697,42 @@ async def run_dev_test_loop(
         log(f"\n  [Cycle {cycle}] Running Tester agent "
             f"(budget: {tester_turns_allocated}/{tester_turns_max})...", output)
 
+        # Capture git diff to give tester context about developer changes
+        import subprocess
+        git_diff_context = ""
+        try:
+            result = subprocess.run(
+                ["git", "diff", "HEAD"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                git_diff = result.stdout.strip()
+                # Limit diff size to avoid prompt bloat
+                max_diff_chars = 8000
+                if len(git_diff) > max_diff_chars:
+                    git_diff = git_diff[:max_diff_chars] + f"\n\n[... diff truncated, {len(git_diff) - max_diff_chars} chars omitted ...]"
+                git_diff_context = (
+                    f"\n\n## Developer Changes (git diff)\n\n"
+                    f"The developer made the following changes:\n\n"
+                    f"```diff\n{git_diff}\n```\n\n"
+                    f"Write tests that verify these specific changes work correctly. "
+                    f"Focus your testing on the modified files and functions shown above."
+                )
+                log(f"  [Cycle {cycle}] Captured git diff ({len(git_diff)} chars) for tester context", output)
+            elif result.returncode == 0:
+                log(f"  [Cycle {cycle}] No uncommitted changes detected (git diff empty)", output)
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            log(f"  [Cycle {cycle}] Could not capture git diff: {e}", output)
+
+        tester_extra_context = git_diff_context
         tester_prompt = build_system_prompt(
             task, project_context, project_dir, role="tester",
             dispatch_config=dispatch_config,
             max_turns=tester_turns_allocated,
+            extra_context=tester_extra_context,
         )
         tester_cmd = build_cli_command(
             tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
