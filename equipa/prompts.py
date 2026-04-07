@@ -220,6 +220,60 @@ def build_task_prompt(
     return "\n".join(lines)
 
 
+def _apply_litm_reordering(history: str, alpha: float = 0.92, beta: float = 0.50, gamma: float = 0.88) -> str:
+    """Apply Lost-in-the-Middle U-curve positional weighting to compaction history.
+
+    Reorders sections so that task description + recent failures go at START and END,
+    with old history in the MIDDLE. Uses Claude profile weights: alpha=0.92, beta=0.50, gamma=0.88.
+
+    Returns reordered history string.
+    """
+    if not history or "## Prior Work Summary" not in history:
+        return history
+
+    # Split into sections by ## headers
+    sections = re.split(r'(## Prior Work Summary[^\n]*)', history)
+    if len(sections) < 3:
+        return history
+
+    # Extract header + content pairs
+    paired: list[tuple[str, str]] = []
+    for i in range(1, len(sections), 2):
+        if i + 1 < len(sections):
+            paired.append((sections[i], sections[i+1]))
+
+    if len(paired) <= 2:
+        return history  # Not enough to reorder
+
+    # Sort by cycle number (ascending = oldest first)
+    def extract_cycle(header: str) -> int:
+        match = re.search(r'Cycle (\d+)', header)
+        return int(match.group(1)) if match else 0
+
+    paired.sort(key=lambda x: extract_cycle(x[0]))
+
+    # Apply U-curve: first + last at edges, middle in center
+    n = len(paired)
+    reordered: list[tuple[str, str]] = []
+
+    # Most recent (highest attention)
+    reordered.append(paired[-1])
+
+    # Middle items (lowest attention)
+    for item in paired[1:-1]:
+        reordered.append(item)
+
+    # Oldest (moderate attention, establishes context)
+    reordered.append(paired[0])
+
+    # Reconstruct
+    result = sections[0]  # Preamble before first ##
+    for header, content in reordered:
+        result += header + content
+
+    return result
+
+
 def build_system_prompt(
     task: dict[str, Any],
     project_context: dict[str, Any],
@@ -433,7 +487,9 @@ def build_system_prompt(
         )
 
     # Append extra context (compaction history, test failures) if provided
+    # Apply LITM U-curve positional weighting before appending
     if extra_context:
+        extra_context = _apply_litm_reordering(extra_context)
         dynamic_parts.append("---\n\n" + extra_context)
 
     # Assemble dynamic suffix
