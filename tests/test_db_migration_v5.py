@@ -35,7 +35,34 @@ def v4_db():
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
 
-    # Create minimal v4 schema
+    # Create minimal v4 schema (includes tables needed for v6/v7 migrations)
+    cursor.execute("""
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codename TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            topic TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            rationale TEXT,
+            alternatives_considered TEXT,
+            decided_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE lessons_learned (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
