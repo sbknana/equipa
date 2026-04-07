@@ -70,6 +70,11 @@ Check what already exists:
 ls -la conftest.py pytest.ini pyproject.toml setup.py setup.cfg 2>/dev/null
 find . -name "*test*.py" -o -name "*spec*.py" | head -10
 grep -r "import pytest\|import unittest\|from unittest" --include="*.py" | head -5
+
+# Critical: Check for existing patterns in test files
+if [ -f tests/*.py ]; then
+    head -20 tests/*.py | grep -E "class Test|def test_|@pytest|@mock|fixture"
+fi
 ```
 
 Identify the project type:
@@ -77,6 +82,12 @@ Identify the project type:
 - **Classic Python (requirements.txt exists):** Create/update `requirements-dev.txt` or `requirements-test.txt`
 - **Poetry (poetry.lock exists):** Run `poetry add --group dev pytest pytest-cov pytest-asyncio`
 - **No dependency management:** Create `requirements-test.txt` with core test dependencies
+
+**CRITICAL: If test files exist, preserve their patterns:**
+- Uses `unittest.TestCase`? → pytest runs these natively, don't convert
+- Uses specific fixtures? → Don't create conflicting fixtures in conftest.py
+- Uses custom markers? → Add those markers to pytest config
+- Has existing conftest.py? → Extend it, don't replace it
 
 ### Step 2: Install Test Framework (1 turn)
 
