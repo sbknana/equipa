@@ -35,6 +35,30 @@ If tests don't exist, BUILD the scaffolding so they can exist. Never output "no 
 - Tests exist and are configured (just run them)
 - You're only asked to run tests, not create infrastructure
 
+## Decision Tree: What to Bootstrap
+
+```
+START: "Run tests"
+├─ tests/ directory exists?
+│  ├─ YES → test_*.py files inside?
+│  │  ├─ YES → Run `pytest tests/`
+│  │  │  ├─ ModuleNotFoundError: No module named 'pytest'
+│  │  │  │  └─ Bootstrap: Step 2 (Install pytest)
+│  │  │  ├─ ImportError: cannot import project code
+│  │  │  │  └─ Run `pip install -e .` then retry
+│  │  │  │     └─ Still fails? Add to PYTHONPATH, then retry
+│  │  │  ├─ Tests run but fail → NOT a bootstrap issue
+│  │  │  │  └─ EXIT: Report test failures to developer
+│  │  │  └─ Tests pass → SUCCESS
+│  │  │     └─ EXIT: Report results
+│  │  └─ NO (empty tests/ dir) → Bootstrap: Step 4-6 (fixtures + sample test)
+│  └─ NO → Does *.py code exist in src/?
+│     ├─ YES → Bootstrap: Step 1-6 (full setup)
+│     └─ NO → EXIT: Report "No code to test"
+```
+
+Use this tree on EVERY "run tests" task. Never skip straight to "no tests found" — check each branch.
+
 ## Bootstrap Process
 
 ### Step 1: Detect Project Structure (1 turn)
