@@ -131,6 +131,21 @@ EARLY_TERM_EXEMPT_ROLES = {
 MONOLOGUE_THRESHOLD = 3      # terminate after this many text-only turns in a row
 MONOLOGUE_EXEMPT_TURNS = 5   # do not trigger during first N turns (agent may be planning)
 
+# --- System Prompt Caching ---
+
+# Boundary marker separating static (globally cacheable) content from dynamic content.
+# Everything BEFORE this marker in the system prompt can be cached across tasks.
+# Everything AFTER contains per-task content (lessons, episodes, task description).
+#
+# Ported from Claude Code: nirholas-claude-code/src/constants/prompts.ts
+# Static = _common.md + role prompt (same for every task with a given role)
+# Dynamic = lessons, episodes, task description, language guidance, budget visibility
+#
+# WARNING: Do not remove or reorder this marker without updating cache logic in:
+# - equipa/prompts.py (build_system_prompt, PromptResult)
+# - equipa/agent_runner.py (build_cli_command)
+SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
+
 # --- Budget Visibility ---
 
 # Based on BATS research — budget visibility reduces wasted turns by ~40%

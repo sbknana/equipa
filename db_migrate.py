@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 5
+CURRENT_VERSION = 7
 
 
 # ============================================================
@@ -399,19 +399,177 @@ def migrate_v3_to_v4(conn):
 
 
 def migrate_v4_to_v5(conn):
-    """Add task_type column to tasks table (v4.0 -> v5.0).
+    """Add embedding columns and lesson graph table (v4.0 -> v5.0).
 
-    Stores the task classification (feature, bug_fix, refactor, test) used
-    by the orchestrator to inject task-type-specific prompt guidance.
-    Defaults to 'feature' for existing rows.
+    Adds:
+    - embedding TEXT column to lessons_learned (for semantic search)
+    - embedding TEXT column to agent_episodes (for episode similarity)
+    - lesson_graph_edges table (for relationship mapping between lessons)
+    - Indexes on src_id and dst_id for graph traversal performance
     """
+    # Add embedding column to lessons_learned
     try:
         conn.execute(
-            "ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'feature'"
+            "ALTER TABLE lessons_learned "
+            "ADD COLUMN embedding TEXT DEFAULT NULL"
         )
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Add embedding column to agent_episodes
+    try:
+        conn.execute(
+            "ALTER TABLE agent_episodes "
+            "ADD COLUMN embedding TEXT DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Create lesson_graph_edges table
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS lesson_graph_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_id INTEGER NOT NULL,
+            dst_id INTEGER NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(src_id, dst_id, edge_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lesson_graph_src
+            ON lesson_graph_edges(src_id);
+        CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst
+            ON lesson_graph_edges(dst_id);
+    """)
+
+
+def migrate_v5_to_v6(conn):
+    """Add decision staleness tracking (v5.0 -> v6.0).
+
+    Adds:
+    - last_validated DATETIME column to decisions table
+    - v_stale_decisions view for decisions unvalidated for 60+ days
+    """
+    # Add last_validated column to decisions
+    try:
+        conn.execute(
+            "ALTER TABLE decisions "
+            "ADD COLUMN last_validated DATETIME DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Create v_stale_decisions view
+    conn.executescript("""
+        DROP VIEW IF EXISTS v_stale_decisions;
+        CREATE VIEW v_stale_decisions AS
+        SELECT d.*, p.codename as project_name,
+               julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) as days_since_validation
+        FROM decisions d
+        JOIN projects p ON d.project_id = p.id
+        WHERE julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) > 60;
+    """)
+
+
+def migrate_v6_to_v7(conn):
+    """Add decision type, status, resolution tracking (v6.0 -> v7.0).
+
+    Adds to decisions table:
+    - decision_type TEXT (general, security_finding, architectural,
+      trade_off, resolution) DEFAULT 'general'
+    - status TEXT (open, resolved, superseded, wont_fix,
+      failed_resolution) DEFAULT 'open'
+    - resolved_by_task_id INTEGER (nullable FK to tasks)
+    - verified_at DATETIME (nullable)
+
+    Adds indexes:
+    - idx_decisions_type on (decision_type)
+    - idx_decisions_status on (status)
+    - idx_decisions_resolved_by on (resolved_by_task_id)
+
+    Adds view:
+    - v_open_security_findings: open security findings with project name
+
+    Recreates v_stale_decisions to include new columns in WHERE logic.
+    """
+    # Add decision_type column
+    try:
+        conn.execute(
+            "ALTER TABLE decisions "
+            "ADD COLUMN decision_type TEXT NOT NULL DEFAULT 'general'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add status column
+    try:
+        conn.execute(
+            "ALTER TABLE decisions "
+            "ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add resolved_by_task_id column (nullable FK to tasks)
+    try:
+        conn.execute(
+            "ALTER TABLE decisions "
+            "ADD COLUMN resolved_by_task_id INTEGER DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add verified_at timestamp
+    try:
+        conn.execute(
+            "ALTER TABLE decisions "
+            "ADD COLUMN verified_at DATETIME DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Create indexes for the new columns
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_decisions_type
+            ON decisions(decision_type);
+        CREATE INDEX IF NOT EXISTS idx_decisions_status
+            ON decisions(status);
+        CREATE INDEX IF NOT EXISTS idx_decisions_resolved_by
+            ON decisions(resolved_by_task_id);
+    """)
+
+    # Create v_open_security_findings view
+    conn.executescript("""
+        CREATE VIEW IF NOT EXISTS v_open_security_findings AS
+        SELECT d.id, d.project_id, p.codename as project_name,
+               d.topic, d.decision, d.rationale,
+               d.decided_at, d.last_validated,
+               d.resolved_by_task_id
+        FROM decisions d
+        JOIN projects p ON d.project_id = p.id
+        WHERE d.decision_type = 'security_finding'
+          AND d.status = 'open';
+    """)
+
+    # Recreate v_stale_decisions to exclude resolved/wont_fix decisions
+    conn.executescript("""
+        DROP VIEW IF EXISTS v_stale_decisions;
+        CREATE VIEW v_stale_decisions AS
+        SELECT d.*, p.codename as project_name,
+               julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) as days_since_validation
+        FROM decisions d
+        JOIN projects p ON d.project_id = p.id
+        WHERE d.status NOT IN ('resolved', 'wont_fix', 'failed_resolution')
+          AND julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) > 60;
+    """)
 
 
 # Migration registry: version -> (description, function)
@@ -420,7 +578,9 @@ MIGRATIONS = {
     2: ("ForgeSmith + agent tracking (v1 -> v2)", migrate_v1_to_v2),
     3: ("Agent messaging + action logging (v2 -> v3)", migrate_v2_to_v3),
     4: ("Impact assessment for ForgeSmith changes (v3 -> v4)", migrate_v3_to_v4),
-    5: ("Task type column for prompt routing (v4 -> v5)", migrate_v4_to_v5),
+    5: ("Embedding columns + lesson graph (v4 -> v5)", migrate_v4_to_v5),
+    6: ("Decision staleness tracking (v5 -> v6)", migrate_v5_to_v6),
+    7: ("Decision type/status + resolution tracking (v6 -> v7)", migrate_v6_to_v7),
 }
 
 

@@ -11,9 +11,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
+import random
+import subprocess
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from equipa.prompts import PromptResult
+
+from equipa.abort_controller import AbortController, create_child_abort_controller
+from equipa.bash_security import check_bash_command
 from equipa.constants import (
     EARLY_TERM_EXEMPT_ROLES,
     EARLY_TERM_FINAL_WARN_TURNS,
@@ -47,9 +55,104 @@ from equipa.parsing import validate_output
 from equipa.security import verify_skill_integrity
 from equipa.tasks import verify_task_updated
 
+# Retry configuration from Claude Code withRetry.ts
+BASE_DELAY_MS = 500
+MAX_BACKOFF_MS = 32000
+MAX_529_RETRIES = 3  # After 3x 529/overloaded, fall back to cheaper model
+JITTER_FACTOR = 0.25  # 25% jitter as per Claude Code
+
+# Persistent retry mode (for unattended sessions)
+PERSISTENT_MAX_BACKOFF_MS = 5 * 60 * 1000  # 5 minutes
+PERSISTENT_RESET_CAP_MS = 6 * 60 * 60 * 1000  # 6 hours
+HEARTBEAT_INTERVAL_MS = 30_000  # 30 seconds
+
+
+def get_retry_delay(
+    attempt: int,
+    max_delay_ms: int = MAX_BACKOFF_MS,
+    persistent: bool = False,
+) -> float:
+    """Exponential backoff with 25% jitter (Claude Code pattern).
+
+    Args:
+        attempt: Attempt number (1-indexed)
+        max_delay_ms: Maximum delay cap in milliseconds
+        persistent: If True, use persistent retry mode (higher backoff for unattended)
+
+    Returns:
+        Delay in seconds
+    """
+    if persistent:
+        max_delay_ms = min(max_delay_ms, PERSISTENT_MAX_BACKOFF_MS)
+
+    base_delay = min(BASE_DELAY_MS * math.pow(2, attempt - 1), max_delay_ms)
+    jitter = random.random() * JITTER_FACTOR * base_delay
+    return (base_delay + jitter) / 1000.0  # Convert ms to seconds
+
+
+def is_overloaded_error(stderr: str, stdout: str) -> bool:
+    """Detect 529/overloaded errors from Claude CLI output.
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text (may contain JSON error)
+
+    Returns:
+        True if this is an overloaded/529 error
+    """
+    combined = f"{stderr} {stdout}".lower()
+    return any(marker in combined for marker in [
+        "529",
+        "overloaded",
+        "overloaded_error",
+        "temporarily overloaded",
+    ])
+
+
+def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
+    """Check if error is a transient capacity issue (429 or 529/overloaded).
+
+    These errors are suitable for persistent retry mode with long backoff.
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text
+
+    Returns:
+        True if this is a 429 or 529 capacity error
+    """
+    combined = f"{stderr} {stdout}".lower()
+    return any(marker in combined for marker in ["429", "rate limit", "529", "overloaded"])
+
+
+def is_retryable_error(stderr: str, stdout: str) -> bool:
+    """Check if error is retryable (network, timeout, 429, 500-level).
+
+    Args:
+        stderr: Standard error text
+        stdout: Standard output text
+
+    Returns:
+        True if error should be retried
+    """
+    combined = f"{stderr} {stdout}".lower()
+    retryable_markers = [
+        "429",
+        "rate limit",
+        "connection",
+        "timeout",
+        "econnreset",
+        "epipe",
+        "500",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(marker in combined for marker in retryable_markers)
+
 
 def build_cli_command(
-    system_prompt: str,
+    system_prompt: str | PromptResult,
     project_dir: str,
     max_turns: int,
     model: str,
@@ -59,8 +162,14 @@ def build_cli_command(
     """Build the claude CLI command as a list of arguments.
 
     Args:
+        system_prompt: Full system prompt string, or PromptResult from
+            build_system_prompt(). PromptResult is coerced to str via
+            __str__() which returns the full prompt with boundary marker.
         streaming: If True, use stream-json output format for real-time monitoring.
     """
+    # Explicit str() ensures PromptResult.__str__() is called, producing
+    # the full prompt with SYSTEM_PROMPT_DYNAMIC_BOUNDARY marker.
+    prompt_str = str(system_prompt)
     output_format = "stream-json" if streaming else "json"
     cmd = [
         "claude",
@@ -70,7 +179,7 @@ def build_cli_command(
         "--model", model,
         "--max-turns", str(max_turns),
         "--no-session-persistence",
-        "--append-system-prompt", system_prompt,
+        "--append-system-prompt", prompt_str,
         "--mcp-config", str(MCP_CONFIG),
         "--add-dir", str(project_dir),
         "--permission-mode", "bypassPermissions",
@@ -88,101 +197,248 @@ def build_cli_command(
     return cmd
 
 
-async def run_agent(cmd: list[str], timeout: int | None = None) -> dict[str, Any]:
-    """Spawn claude -p, capture output, handle timeout."""
+async def run_agent(
+    cmd: list[str],
+    timeout: int | None = None,
+    max_retries: int = 10,
+    fallback_model: str | None = None,
+    persistent_retry: bool = False,
+    abort_controller: AbortController | None = None,
+) -> dict[str, Any]:
+    """Spawn claude -p with retry logic, exponential backoff, and model fallback.
+
+    Implements Claude Code withRetry.ts pattern:
+    - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
+    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
+    - Retries on 429, 5xx, connection errors, timeouts
+    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
+      with higher backoff (5 min max) and periodic heartbeats
+
+    Args:
+        cmd: Command list for subprocess
+        timeout: Per-attempt timeout (default: PROCESS_TIMEOUT)
+        max_retries: Maximum retry attempts (default: 10, ignored if persistent=True)
+        fallback_model: Model to fall back to after 3x 529 (e.g., "sonnet")
+        persistent_retry: Enable persistent retry mode for unattended sessions
+        abort_controller: Optional parent abort controller for cancellation hierarchy
+
+    Returns:
+        Result dict with success, result_text, num_turns, duration, cost, errors
+    """
     effective_timeout = timeout or PROCESS_TIMEOUT
     start_time = time.time()
+    consecutive_529_errors = 0
+    last_error = ""
+    model_fallback_triggered = False
+    persistent_attempt = 0
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    # Create child abort controller if parent provided
+    child_controller = (
+        create_child_abort_controller(abort_controller)
+        if abort_controller
+        else AbortController()
+    )
 
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=effective_timeout,
-            )
-        except asyncio.TimeoutError:
-            # Try to capture any partial output before killing
-            process.kill()
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=5,
-                )
-                partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-            except Exception:
-                partial_text = ""
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
+
+        # Check if already aborted before spawning subprocess
+        if child_controller.signal.aborted:
             duration = time.time() - start_time
             return {
                 "success": False,
-                "result_text": partial_text,
+                "result_text": "",
                 "num_turns": 0,
                 "duration": duration,
                 "cost": None,
-                "errors": [f"Process timed out after {effective_timeout} seconds"],
+                "errors": [f"Aborted before execution: {child_controller.signal.reason}"],
             }
 
-    except FileNotFoundError:
-        return {
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Register abort handler to kill subprocess
+            def abort_handler() -> None:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+
+            child_controller.signal.add_event_listener("abort", abort_handler, once=True)
+
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError:
+                # Try to capture any partial output before killing
+                process.kill()
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=5,
+                    )
+                    partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    partial_text = ""
+                duration = time.time() - start_time
+                return {
+                    "success": False,
+                    "result_text": partial_text,
+                    "num_turns": 0,
+                    "duration": duration,
+                    "cost": None,
+                    "errors": [f"Process timed out after {effective_timeout} seconds"],
+                }
+
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "result_text": "",
+                "num_turns": 0,
+                "duration": 0,
+                "cost": None,
+                "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+            }
+
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        # Parse JSON output
+        result: dict[str, Any] = {
             "success": False,
-            "result_text": "",
+            "result_text": stdout_text,
             "num_turns": 0,
-            "duration": 0,
+            "duration": time.time() - start_time,
             "cost": None,
-            "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+            "errors": [],
         }
 
-    duration = time.time() - start_time
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            result["errors"].append(f"stderr: {stderr_text}")
 
-    # Parse JSON output
-    result: dict[str, Any] = {
-        "success": False,
-        "result_text": stdout_text,
-        "num_turns": 0,
-        "duration": duration,
-        "cost": None,
-        "errors": [],
-    }
-
-    if stderr_text:
-        result["errors"].append(f"stderr: {stderr_text}")
-
-    if not stdout_text:
-        result["errors"].append("No output from agent")
-        return result
-
-    try:
-        data = json.loads(stdout_text)
-        result["result_text"] = data.get("result", stdout_text)
-        result["num_turns"] = data.get("num_turns", 0)
-        result["cost"] = data.get("cost_usd")
-
-        # Check for error subtypes
-        subtype = data.get("subtype", "")
-        if subtype == "error_max_turns":
-            # Agent ran out of turns but may have done useful work
-            result["success"] = True
-            result["errors"].append("Agent hit max turns limit")
-        elif data.get("is_error"):
-            result["success"] = False
-            result["errors"].append(f"Agent error: {data.get('result', 'unknown')}")
+        if not stdout_text:
+            result["errors"].append("No output from agent")
+            last_error = "No output from agent"
         else:
-            result["success"] = True
+            try:
+                data = json.loads(stdout_text)
+                result["result_text"] = data.get("result", stdout_text)
+                result["num_turns"] = data.get("num_turns", 0)
+                result["cost"] = data.get("cost_usd")
 
-    except json.JSONDecodeError:
-        # Output wasn't JSON, treat raw text as result
-        result["result_text"] = stdout_text
-        result["success"] = process.returncode == 0
+                # Check for error subtypes
+                subtype = data.get("subtype", "")
+                if subtype == "error_max_turns":
+                    # Agent ran out of turns but may have done useful work
+                    result["success"] = True
+                    result["errors"].append("Agent hit max turns limit")
+                elif data.get("is_error"):
+                    result["success"] = False
+                    error_msg = data.get('result', 'unknown')
+                    result["errors"].append(f"Agent error: {error_msg}")
+                    last_error = error_msg
+                else:
+                    result["success"] = True
 
+            except json.JSONDecodeError:
+                # Output wasn't JSON, treat raw text as result
+                result["result_text"] = stdout_text
+                result["success"] = process.returncode == 0
+                if not result["success"]:
+                    last_error = stdout_text[:200]
+
+        # If successful, return immediately
+        if result["success"]:
+            return result
+
+        # Check for 529/overloaded errors
+        if is_overloaded_error(stderr_text, stdout_text):
+            consecutive_529_errors += 1
+            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
+                # Trigger model fallback
+                if not model_fallback_triggered:
+                    # Find --model flag in cmd and replace
+                    for i, arg in enumerate(cmd):
+                        if arg == "--model" and i + 1 < len(cmd):
+                            original_model = cmd[i + 1]
+                            cmd[i + 1] = fallback_model
+                            model_fallback_triggered = True
+                            print(f"  [Retry] Model fallback triggered: "
+                                  f"{original_model} -> {fallback_model} "
+                                  f"(after {consecutive_529_errors}x 529 errors)")
+                            consecutive_529_errors = 0  # Reset counter for new model
+                            break
+        else:
+            consecutive_529_errors = 0  # Reset on non-529 error
+
+        # Check if error is retryable
+        if not is_retryable_error(stderr_text, stdout_text):
+            # Non-retryable error, fail immediately
+            return result
+
+        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        if persistent_retry and is_capacity_error:
+            persistent_attempt += 1
+            # In persistent mode, use separate attempt counter and higher backoff
+            delay_seconds = get_retry_delay(
+                persistent_attempt,
+                max_delay_ms=PERSISTENT_MAX_BACKOFF_MS,
+                persistent=True,
+            )
+            # Cap total delay at 6 hours
+            delay_ms = delay_seconds * 1000
+            if delay_ms > PERSISTENT_RESET_CAP_MS:
+                delay_ms = PERSISTENT_RESET_CAP_MS
+                delay_seconds = delay_ms / 1000.0
+
+            print(f"  [PersistentRetry] Attempt {persistent_attempt} failed "
+                  f"({time.time() - attempt_start:.1f}s). "
+                  f"Retrying in {delay_seconds:.1f}s... "
+                  f"(error: {last_error[:80]})")
+
+            # Chunk long sleeps into heartbeat intervals to show we're alive
+            remaining_ms = delay_ms
+            while remaining_ms > 0:
+                chunk_ms = min(remaining_ms, HEARTBEAT_INTERVAL_MS)
+                await asyncio.sleep(chunk_ms / 1000.0)
+                remaining_ms -= chunk_ms
+                if remaining_ms > 0:
+                    print(f"  [Heartbeat] Still retrying... "
+                          f"{remaining_ms / 1000.0:.0f}s remaining")
+
+            # Clamp attempt counter so we never exit the loop in persistent mode
+            if attempt >= max_retries:
+                attempt = max_retries
+            continue
+
+        # Last attempt exhausted (non-persistent mode)
+        if attempt >= max_retries:
+            result["errors"].append(
+                f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
+            )
+            return result
+
+        # Calculate retry delay with exponential backoff + jitter
+        delay_seconds = get_retry_delay(attempt)
+        print(f"  [Retry] Attempt {attempt}/{max_retries} failed "
+              f"({time.time() - attempt_start:.1f}s). "
+              f"Retrying in {delay_seconds:.1f}s... "
+              f"(error: {last_error[:80]})")
+
+        await asyncio.sleep(delay_seconds)
+
+    # Should never reach here, but fallback return
     return result
 
 
-async def run_agent_streaming(
+async def _run_agent_streaming_impl(
     cmd: list[str],
     role: str = "developer",
     timeout: int | None = None,
@@ -192,21 +448,23 @@ async def run_agent_streaming(
     run_id: int | None = None,
     cycle_number: int = 1,
     project_dir: str | None = None,
+    abort_controller: AbortController | None = None,
 ) -> dict[str, Any]:
-    """Spawn claude -p with stream-json output for real-time stuck detection.
+    """Internal implementation of streaming agent execution.
 
-    Monitors agent output turn-by-turn and terminates early if stuck signals
-    are detected. Only applies file-change monitoring to non-exempt roles
-    (developer, tester, debugger, etc.).
-
-    When task_id is provided, per-tool actions are logged to the agent_actions
-    table for observability and ForgeSmith analysis.
-
-    Returns the same dict format as run_agent().
+    This is the actual implementation that gets wrapped by run_agent_streaming
+    with retry logic.
     """
     effective_timeout = timeout or PROCESS_TIMEOUT
     start_time = time.time()
     is_exempt = role in EARLY_TERM_EXEMPT_ROLES
+
+    # Create child abort controller if parent provided
+    child_controller = (
+        create_child_abort_controller(abort_controller)
+        if abort_controller
+        else AbortController()
+    )
 
     # Tracking state
     turn_count = 0
@@ -245,6 +503,17 @@ async def run_agent_streaming(
     turns_since_last_tool: int = 0
     last_soft_checkpoint_turn: int = 0
 
+    # Check if already aborted before spawning subprocess
+    if child_controller.signal.aborted:
+        return {
+            "success": False,
+            "result_text": "",
+            "num_turns": 0,
+            "duration": time.time() - start_time,
+            "cost": None,
+            "errors": [f"Aborted before execution: {child_controller.signal.reason}"],
+        }
+
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -252,6 +521,17 @@ async def run_agent_streaming(
             stderr=asyncio.subprocess.PIPE,
             limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
         )
+
+        # Register abort handler to kill subprocess
+        def abort_handler() -> None:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+
+        child_controller.signal.add_event_listener("abort", abort_handler, once=True)
+
     except FileNotFoundError:
         return {
             "success": False,
@@ -374,6 +654,17 @@ async def run_agent_streaming(
                                 files_changed.add(file_path)
                         elif tool_name == "Bash":
                             bash_cmd = tool_input.get("command", "")
+
+                            # --- Bash security pre-execution filter ---
+                            sec_result = check_bash_command(bash_cmd)
+                            if not sec_result.safe:
+                                log(f"  [BashSecurity] BLOCKED check={sec_result.check_id}: "
+                                    f"{sec_result.message} — cmd={bash_cmd[:120]}", output)
+                                early_term_reason = (
+                                    f"Bash security violation (check {sec_result.check_id}): "
+                                    f"{sec_result.message}"
+                                )
+
                             if any(kw in bash_cmd for kw in [
                                 "git commit", "git add", "go build", "npm run build",
                                 "mkdir", "cp ", "mv ", "touch ", "tee ", "> ",
@@ -691,6 +982,171 @@ async def run_agent_with_retries(
     return result, max_retries
 
 
+async def run_agent_streaming_with_retry(
+    cmd: list[str],
+    role: str = "developer",
+    output: Any = None,
+    max_turns: int | None = None,
+    task_id: int | None = None,
+    cycle_number: int = 1,
+    project_dir: str | None = None,
+    max_retries: int = 10,
+    fallback_model: str | None = "sonnet",
+    persistent_retry: bool = False,
+    abort_controller: AbortController | None = None,
+) -> dict[str, Any]:
+    """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
+
+    Same retry architecture as run_agent():
+    - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
+    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
+    - Retryable errors: 429, 5xx, connection, timeout, ECONNRESET, EPIPE
+    - Non-retryable errors fail immediately
+    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
+      with higher backoff (5 min max) and periodic heartbeats
+
+    Args:
+        persistent_retry: Enable persistent retry mode for unattended sessions
+        abort_controller: Optional parent abort controller for cancellation hierarchy
+    """
+    consecutive_529_errors = 0
+    model_fallback_triggered = False
+    last_error = ""
+    persistent_attempt = 0
+
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
+
+        # Execute streaming agent
+        result = await _run_agent_streaming_impl(
+            cmd, role=role, output=output, max_turns=max_turns,
+            task_id=task_id, run_id=None, cycle_number=cycle_number,
+            project_dir=project_dir, abort_controller=abort_controller
+        )
+
+        # If successful, return immediately
+        if result.get("success"):
+            return result
+
+        # Extract error info
+        stderr_text = " ".join(result.get("errors", []))
+        stdout_text = result.get("result_text", "")
+        last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+
+        # Check for 529/overloaded errors
+        if is_overloaded_error(stderr_text, stdout_text):
+            consecutive_529_errors += 1
+            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
+                # Trigger model fallback
+                if not model_fallback_triggered:
+                    # Find --model flag in cmd and replace
+                    for i, arg in enumerate(cmd):
+                        if arg == "--model" and i + 1 < len(cmd):
+                            original_model = cmd[i + 1]
+                            cmd[i + 1] = fallback_model
+                            model_fallback_triggered = True
+                            print(f"  [Retry] Model fallback triggered: "
+                                  f"{original_model} -> {fallback_model} "
+                                  f"(after {consecutive_529_errors}x 529 errors)")
+                            consecutive_529_errors = 0  # Reset counter for new model
+                            break
+        else:
+            consecutive_529_errors = 0  # Reset on non-529 error
+
+        # Check if error is retryable
+        if not is_retryable_error(stderr_text, stdout_text):
+            # Non-retryable error, fail immediately
+            return result
+
+        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        if persistent_retry and is_capacity_error:
+            persistent_attempt += 1
+            # In persistent mode, use separate attempt counter and higher backoff
+            delay_seconds = get_retry_delay(
+                persistent_attempt,
+                max_delay_ms=PERSISTENT_MAX_BACKOFF_MS,
+                persistent=True,
+            )
+            # Cap total delay at 6 hours
+            delay_ms = delay_seconds * 1000
+            if delay_ms > PERSISTENT_RESET_CAP_MS:
+                delay_ms = PERSISTENT_RESET_CAP_MS
+                delay_seconds = delay_ms / 1000.0
+
+            print(f"  [PersistentRetry] Streaming attempt {persistent_attempt} failed "
+                  f"({time.time() - attempt_start:.1f}s). "
+                  f"Retrying in {delay_seconds:.1f}s... "
+                  f"(error: {last_error[:80]})")
+
+            # Chunk long sleeps into heartbeat intervals to show we're alive
+            remaining_ms = delay_ms
+            while remaining_ms > 0:
+                chunk_ms = min(remaining_ms, HEARTBEAT_INTERVAL_MS)
+                await asyncio.sleep(chunk_ms / 1000.0)
+                remaining_ms -= chunk_ms
+                if remaining_ms > 0:
+                    print(f"  [Heartbeat] Still retrying... "
+                          f"{remaining_ms / 1000.0:.0f}s remaining")
+
+            # Clamp attempt counter so we never exit the loop in persistent mode
+            if attempt >= max_retries:
+                attempt = max_retries
+            continue
+
+        # Last attempt exhausted (non-persistent mode)
+        if attempt >= max_retries:
+            result["errors"].append(
+                f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
+            )
+            return result
+
+        # Calculate retry delay with exponential backoff + jitter
+        delay_seconds = get_retry_delay(attempt)
+        print(f"  [Retry] Streaming attempt {attempt}/{max_retries} failed "
+              f"({time.time() - attempt_start:.1f}s). "
+              f"Retrying in {delay_seconds:.1f}s... "
+              f"(error: {last_error[:80]})")
+
+        await asyncio.sleep(delay_seconds)
+
+    # Should never reach here, but fallback return
+    return result
+
+
+async def run_agent_streaming(
+    cmd: list[str],
+    role: str = "developer",
+    timeout: int | None = None,
+    output: Any = None,
+    max_turns: int | None = None,
+    task_id: int | None = None,
+    run_id: int | None = None,
+    cycle_number: int = 1,
+    project_dir: str | None = None,
+    abort_controller: AbortController | None = None,
+) -> dict[str, Any]:
+    """Spawn claude -p with stream-json output for real-time stuck detection.
+
+    Monitors agent output turn-by-turn and terminates early if stuck signals
+    are detected. Only applies file-change monitoring to non-exempt roles
+    (developer, tester, debugger, etc.).
+
+    When task_id is provided, per-tool actions are logged to the agent_actions
+    table for observability and ForgeSmith analysis.
+
+    This function automatically includes retry logic with exponential backoff
+    and model fallback (after 3x 529 errors). Use run_agent_streaming_with_retry
+    directly if you need to customize retry parameters.
+
+    Returns the same dict format as run_agent().
+    """
+    return await run_agent_streaming_with_retry(
+        cmd, role=role, output=output, max_turns=max_turns,
+        task_id=task_id, cycle_number=cycle_number, project_dir=project_dir
+    )
+
+
 async def dispatch_agent(
     cmd: list[str],
     role: str,
@@ -698,7 +1154,7 @@ async def dispatch_agent(
     max_turns: int,
     task_id: int,
     cycle: int,
-    system_prompt: str | None = None,
+    system_prompt: str | PromptResult | None = None,
     project_dir: str | None = None,
     args: Any = None,
 ) -> dict[str, Any]:
@@ -707,16 +1163,25 @@ async def dispatch_agent(
     For Claude: delegates to run_agent_streaming() or run_agent().
     For Ollama: delegates to run_ollama_agent().
 
+    system_prompt accepts str or PromptResult (coerced to str via __str__).
+
     Returns the same result dict format regardless of provider.
     """
+    # Coerce PromptResult to str for downstream consumers
+    if system_prompt is not None:
+        system_prompt = str(system_prompt)
+
     # Security: verify skill file integrity before building any agent prompt
     if not verify_skill_integrity():
         return {
+            "success": False,
             "result": "blocked",
-            "output": "CRITICAL: Skill integrity verification failed — agent dispatch refused. "
-                      "Run --regenerate-manifest if changes are intentional.",
+            "result_text": "CRITICAL: Skill integrity verification failed — agent dispatch refused. "
+                          "Run --regenerate-manifest if changes are intentional.",
+            "num_turns": 0,
             "cost": 0,
             "duration": 0,
+            "errors": ["Skill integrity verification failed"],
         }
 
     # Late imports to avoid circular dependency
@@ -744,12 +1209,12 @@ async def dispatch_agent(
             max_turns=max_turns,
         )
 
-    # Default: Claude via run_agent_streaming
+    # Default: Claude via run_agent_streaming (with retry wrapper)
     use_streaming = role not in EARLY_TERM_EXEMPT_ROLES
     if use_streaming:
-        return await run_agent_streaming(
+        # Wrap streaming with retry logic
+        return await run_agent_streaming_with_retry(
             cmd, role=role, output=output, max_turns=max_turns,
-            task_id=task_id, run_id=None, cycle_number=cycle,
-            project_dir=project_dir)
+            task_id=task_id, cycle_number=cycle, project_dir=project_dir)
     else:
         return await run_agent(cmd)

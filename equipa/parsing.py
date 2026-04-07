@@ -1,0 +1,631 @@
+"""EQUIPA parsing module — output parsing, token estimation, and text extraction.
+
+Layer 4: Pure parsing/text-processing functions. Dependencies on constants
+only, plus late imports for sanitize_lesson_content (forgesmith integration).
+
+Extracted from forge_orchestrator.py as part of Phase 2 monolith split.
+
+Copyright 2026 Forgeborn
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+# --- Token Budget Constants ---
+# Anthropic recommendation: ~4 chars/token for Claude
+CHARS_PER_TOKEN: int = 4
+SYSTEM_PROMPT_TOKEN_TARGET: int = 8000   # 8K token target
+SYSTEM_PROMPT_TOKEN_HARD_LIMIT: int = 10000  # absolute max before aggressive trimming
+EPISODE_REDUCTION_THRESHOLD: int = 6000  # reduce episodes from 3->2 above this
+
+
+# --- Token Estimation ---
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count using ~4 chars/token approximation for Claude."""
+    if not text:
+        return 0
+    return len(text) // CHARS_PER_TOKEN
+
+
+def compute_keyword_overlap(text_a: str, text_b: str) -> float:
+    """Compute simple keyword overlap score between two texts.
+
+    Returns a float between 0.0 and 1.0 representing the fraction of
+    words in common (Jaccard similarity on word sets).
+    """
+    if not text_a or not text_b:
+        return 0.0
+    words_a = set(re.findall(r'\w+', text_a.lower()))
+    words_b = set(re.findall(r'\w+', text_b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+def deduplicate_lessons(lessons: list[dict]) -> list[dict]:
+    """Remove semantically duplicate lessons based on 60%+ word overlap.
+
+    Keeps the first (highest times_seen) lesson when duplicates are found.
+    Returns deduplicated list, max 5 lessons.
+    """
+    if not lessons:
+        return []
+
+    unique: list[dict] = []
+    for lesson in lessons:
+        lesson_text = lesson.get("lesson", "")
+        is_dup = False
+        for existing in unique:
+            overlap = compute_keyword_overlap(lesson_text, existing.get("lesson", ""))
+            if overlap >= 0.6:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(lesson)
+        if len(unique) >= 5:
+            break
+
+    return unique
+
+
+# --- Section Extraction ---
+
+def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
+    """Extract a named section from structured agent output.
+
+    Finds the last occurrence of 'MARKER:' and returns content.
+    For max_lines=1, returns just the header line value.
+    For max_lines>1, returns header + continuation lines.
+    For max_lines=-1 (bullet mode), returns header + bullet lines.
+    """
+    start = text.rfind(marker + ":")
+    if start == -1:
+        return ""
+    lines = text[start:].split("\n")
+    if max_lines == -1:
+        # Bullet mode: header + up to 5 bullet lines
+        kept = [lines[0]]
+        for line in lines[1:6]:
+            s = line.strip()
+            if s.startswith("-") or s == "":
+                kept.append(line)
+            else:
+                break
+        return "\n".join(kept).strip()
+    if max_lines == 1:
+        return lines[0].strip()
+    return "\n".join(lines[:max_lines]).strip()
+
+
+def compact_agent_output(
+    raw_output: str,
+    max_words: int = 200,
+    agent_id: str | None = None,
+    session_dir: str | None = None,
+    persist_threshold: int = 50_000,
+) -> str:
+    """Compact raw agent output into a concise summary preserving actionable details.
+
+    If agent_id and session_dir are provided, large outputs (>50KB by default) are
+    persisted to disk before compaction, preventing context bloat.
+
+    Args:
+        raw_output: Raw agent output text
+        max_words: Maximum words in compacted output (default 200)
+        agent_id: Optional agent identifier for persistence (e.g., "developer-123-turn-5")
+        session_dir: Optional session directory path for persistence
+        persist_threshold: Size threshold in bytes for persistence (default 50KB)
+
+    Returns:
+        Compacted output, or persistence reference if output was too large
+    """
+    if not raw_output:
+        return ""
+
+    # Apply tool result persistence if configured
+    if agent_id and session_dir:
+        from equipa.tool_result_storage import process_agent_output
+        raw_output = process_agent_output(raw_output, agent_id, session_dir, persist_threshold)
+
+        # If output was persisted, return the reference message directly (no further compaction)
+        from equipa.tool_result_storage import is_content_already_compacted
+        if is_content_already_compacted(raw_output):
+            return raw_output
+
+    # Late import to avoid circular dependency — sanitizer may not be available
+    from lesson_sanitizer import sanitize_lesson_content  # HARD dependency — no silent fallback
+
+    sections = {
+        "SUMMARY": _extract_section(raw_output, "SUMMARY"),
+        "FILES_CHANGED": _extract_section(raw_output, "FILES_CHANGED", max_lines=-1),
+        "BLOCKERS": _extract_section(raw_output, "BLOCKERS"),
+        "DECISIONS": _extract_section(raw_output, "DECISIONS"),
+        "REFLECTION": _extract_section(raw_output, "REFLECTION", max_lines=3),
+    }
+
+    # Sanitize all extracted sections to prevent cross-agent prompt injection (PS-02)
+    for key in sections:
+        if sections[key]:
+            sections[key] = sanitize_lesson_content(sections[key])
+
+    parts: list[str] = []
+    if sections["SUMMARY"]:
+        parts.append(sections["SUMMARY"])
+    if sections["FILES_CHANGED"]:
+        parts.append(sections["FILES_CHANGED"])
+    for key in ("BLOCKERS", "DECISIONS"):
+        if sections[key] and "none" not in sections[key].lower():
+            parts.append(sections[key])
+    if sections["REFLECTION"]:
+        parts.append(sections["REFLECTION"])
+
+    compact = "\n".join(parts)
+
+    if not compact.strip():
+        words = raw_output.split()
+        compact = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
+
+    words = compact.split()
+    if len(words) > max_words:
+        compact = " ".join(words[:max_words]) + "..."
+
+    return compact
+
+
+def _trim_prompt_section(
+    prompt: str, section_heading: str, max_chars: int | None = None
+) -> str:
+    """Remove or truncate a section from the prompt by its ## heading.
+
+    If max_chars is None, removes the entire section.
+    If max_chars is given, truncates the section content to that limit.
+    Returns the modified prompt.
+    """
+    start = prompt.find(section_heading)
+    if start == -1:
+        return prompt
+
+    # Find the next section boundary (## or ---)
+    next_section = len(prompt)
+    for marker in ["\n## ", "\n---"]:
+        pos = prompt.find(marker, start + len(section_heading))
+        if pos != -1 and pos < next_section:
+            next_section = pos
+
+    if max_chars is None:
+        # Remove entire section
+        return prompt[:start] + prompt[next_section:]
+    else:
+        # Truncate section content
+        section = prompt[start:next_section]
+        if len(section) > max_chars:
+            section = section[:max_chars] + "\n[...trimmed...]\n"
+        return prompt[:start] + section + prompt[next_section:]
+
+
+# --- Marker Extraction ---
+
+def _extract_marker_value(
+    text: str, marker: str, multiline: bool = False
+) -> str | None:
+    """Extract value after a MARKER: line from structured agent output.
+
+    For single-line markers, returns the value after the colon.
+    For multiline, collects continuation lines until the next known marker.
+    Returns None if not found or value is 'none'.
+    """
+    if not text:
+        return None
+    section_markers = ("RESULT:", "SUMMARY:", "FILES_CHANGED:", "DECISIONS:",
+                       "BLOCKERS:", "REFLECTION:", "```")
+    lines = text.splitlines()
+    collected: list[str] = []
+    in_section = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(marker):
+            value = stripped.split(":", 1)[1].strip()
+            if not multiline:
+                return value if value and value.lower() != "none" else None
+            in_section = True
+            if value and value.lower() != "none":
+                collected.append(value)
+            continue
+        if in_section:
+            if any(stripped.startswith(m) for m in section_markers if m != marker):
+                break
+            if stripped:
+                collected.append(stripped)
+
+    result = " ".join(collected).strip()
+    return result if result else None
+
+
+def parse_reflection(result_text: str) -> str | None:
+    """Extract REFLECTION text from agent structured output."""
+    return _extract_marker_value(result_text, "REFLECTION:", multiline=True)
+
+
+def parse_approach_summary(result_text: str) -> str | None:
+    """Extract SUMMARY text from agent output for the episode record."""
+    return _extract_marker_value(result_text, "SUMMARY:")
+
+
+# --- Failure Classification ---
+
+# Keyword patterns for failure classification — data-driven instead of if/elif chains
+_FAILURE_KEYWORD_PATTERNS: dict[str, list[str]] = {
+    "build_failure": ["syntaxerror", "compileerror", "build failed", "build error",
+                      "cannot find module", "type error", "typeerror"],
+    "import_error": ["modulenotfounderror", "importerror", "no module named",
+                     "module not found", "cannot resolve", "dependency",
+                     "missing package", "version conflict"],
+    "test_failure": ["assertionerror", "test failed", "tests failed",
+                     "assertion failed", "expected", "pytest"],
+    "environment_error": ["permission denied", "connection refused", "eacces",
+                          "econnrefused", "no such file or directory"],
+}
+
+# Priority order for selecting primary failure class
+_FAILURE_PRIORITY: list[str] = [
+    "analysis_paralysis", "timeout", "build_failure", "import_error",
+    "test_failure", "environment_error", "wrong_approach", "max_turns",
+]
+
+
+def classify_agent_failure(
+    outcome: str, result: dict, result_text: str = ""
+) -> dict | None:
+    """Classify an agent failure into structured categories.
+
+    Returns a dict with failure_class, secondary_classes, confidence,
+    signals, and raw_errors — or None if no failure detected.
+    """
+    if not isinstance(result, dict):
+        result = {}
+
+    errors = result.get("errors", [])
+    unique_errors = list(dict.fromkeys(errors))[:5]
+    truncated_errors = [e[:200] for e in unique_errors]
+    num_turns = result.get("num_turns", 0)
+    early_terminated = result.get("early_terminated", False)
+    early_term_reason = result.get("early_term_reason", "")
+
+    lower_errors = " ".join(e.lower() for e in unique_errors)
+    lower_result = result_text.lower() if result_text else ""
+    lower_reason = early_term_reason.lower()
+    signals: list[str] = []
+    classes_detected: list[str] = []
+
+    # --- Special cases (need contextual logic, not just keyword matching) ---
+    # Analysis paralysis
+    if "consecutive turns without file changes" in lower_reason:
+        classes_detected.append("analysis_paralysis")
+        signals.append(f"early_term: {early_term_reason[:120]}")
+    elif "consecutive" in lower_errors and "without file changes" in lower_errors:
+        classes_detected.append("analysis_paralysis")
+        signals.append("error mentions consecutive turns without file changes")
+    elif (num_turns >= EARLY_TERM_KILL_TURNS
+          and "files_changed: none" in lower_result):
+        classes_detected.append("analysis_paralysis")
+        signals.append(f"high turn count ({num_turns}) with no files changed")
+
+    # Timeout
+    if "timed out" in lower_reason or "timed out" in lower_errors:
+        classes_detected.append("timeout")
+        signals.append("process timed out")
+    elif outcome == "tester_timeout":
+        classes_detected.append("timeout")
+        signals.append("tester timeout outcome")
+
+    # Max turns
+    if any(k in lower_errors for k in ("max_turns", "max turns", "error_max_turns")) \
+            or outcome == "developer_max_turns":
+        classes_detected.append("max_turns")
+        signals.append("agent hit max turns limit")
+
+    # --- Keyword-driven classification (build, import, test, env) ---
+    for failure_class, keywords in _FAILURE_KEYWORD_PATTERNS.items():
+        # Test failure has special outcome-based detection
+        if failure_class == "test_failure" and outcome in ("cycles_exhausted", "tester_failed"):
+            classes_detected.append("test_failure")
+            signals.append(f"outcome indicates test failure: {outcome}")
+            continue
+        sources = [lower_errors] if failure_class == "environment_error" else [lower_errors, lower_result]
+        for kw in keywords:
+            if any(kw in s for s in sources):
+                if failure_class not in classes_detected:
+                    classes_detected.append(failure_class)
+                    signals.append(f"{failure_class} signal: {kw}")
+                break
+
+    # Wrong approach / loop detection
+    if "loop detected" in lower_reason or "repeated the same operation" in lower_reason:
+        classes_detected.append("wrong_approach")
+        signals.append(f"loop detection: {early_term_reason[:120]}")
+    elif "stuck" in lower_reason and "repeated" in lower_reason:
+        classes_detected.append("wrong_approach")
+        signals.append(f"stuck agent: {early_term_reason[:120]}")
+    elif outcome == "no_progress":
+        classes_detected.append("wrong_approach")
+        signals.append("no progress across multiple cycles")
+    elif ("result: blocked" in lower_result and "result: failed" in lower_result
+          and "wrong_approach" not in classes_detected):
+        classes_detected.append("wrong_approach")
+        signals.append("agent reported both blocked and failed")
+
+    # --- Determine primary class and confidence ---
+    if not classes_detected:
+        if unique_errors:
+            return {"failure_class": "unknown", "secondary_classes": [],
+                    "confidence": "low", "signals": ["unclassified error(s) present"],
+                    "raw_errors": truncated_errors}
+        return None
+
+    primary = next((c for c in _FAILURE_PRIORITY if c in classes_detected), "unknown")
+    secondary = [c for c in classes_detected if c != primary]
+    confidence = ("high" if len(signals) >= 2
+                  or early_terminated
+                  or outcome in ("cycles_exhausted", "no_progress")
+                  else "medium")
+
+    return {"failure_class": primary, "secondary_classes": secondary,
+            "confidence": confidence, "signals": signals[:5],
+            "raw_errors": truncated_errors}
+
+
+def parse_error_patterns(
+    result: dict, outcome: str | None = None, result_text: str | None = None
+) -> str | None:
+    """Extract and classify error patterns from agent result for episode record.
+
+    Produces structured JSON with failure classification when the agent failed.
+    Falls back to raw error string for backward compatibility if classification
+    yields nothing.
+    """
+    if not isinstance(result, dict):
+        return None
+
+    errors = result.get("errors", [])
+    rt = result_text or result.get("result_text", "")
+
+    # Attempt structured classification
+    classification = classify_agent_failure(outcome, result, rt)
+    if classification:
+        return json.dumps(classification)
+
+    # Fallback: raw error join (backward compat for edge cases)
+    if errors:
+        unique = list(dict.fromkeys(errors))
+        return "; ".join(e[:200] for e in unique[:5])
+
+    return None
+
+
+def compute_initial_q_value(outcome: str) -> float:
+    """Set initial Q-value based on task outcome.
+
+    Success starts higher (0.7), failure starts lower (0.3),
+    partial/blocked at neutral (0.5).
+    """
+    if outcome in ("tests_passed", "no_tests"):
+        return 0.7
+    elif outcome in ("developer_failed", "cycles_exhausted"):
+        return 0.3
+    else:
+        # blocked, timeout, no_progress, etc.
+        return 0.4
+
+
+# --- Structured Output Parsing ---
+
+def _parse_structured_output(text: str, schema: dict) -> dict:
+    """Generic parser for structured agent output with MARKER: value lines.
+
+    Schema is a dict mapping marker names to their types:
+        str   — single-line string value
+        int   — single-line integer value
+        list  — multi-line bullet list (lines starting with "- ")
+    Returns a dict with parsed values.
+    """
+    result: dict = {}
+    for marker, typ in schema.items():
+        if typ is list:
+            result[marker.lower().replace(" ", "_")] = []
+        elif typ is int:
+            result[marker.lower().replace(" ", "_")] = 0
+        else:
+            result[marker.lower().replace(" ", "_")] = "" if marker != "RESULT" else "unknown"
+
+    if not text:
+        return result
+
+    current_list_key: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        # Check all schema markers
+        matched = False
+        for marker, typ in schema.items():
+            key = marker.lower().replace(" ", "_")
+            if stripped.startswith(marker + ":"):
+                value = stripped.split(":", 1)[1].strip()
+                if typ is int:
+                    try:
+                        result[key] = int(value)
+                    except ValueError:
+                        pass
+                elif typ is list:
+                    current_list_key = key
+                else:
+                    result[key] = value.lower() if marker == "RESULT" else value
+                if typ is not list:
+                    current_list_key = None
+                matched = True
+                break
+
+        # Collect bullet items for list sections
+        if not matched and current_list_key and stripped.startswith("- "):
+            item = stripped[2:].strip()
+            if item.lower() != "none":
+                result[current_list_key].append(item)
+        elif not matched and stripped and not stripped.startswith("-"):
+            current_list_key = None
+
+    return result
+
+
+# Schemas for structured agent output parsing
+_TESTER_SCHEMA: dict = {
+    "RESULT": str, "TEST_FRAMEWORK": str, "TESTS_RUN": int,
+    "TESTS_PASSED": int, "TESTS_FAILED": int, "SUMMARY": str,
+    "FAILURE_DETAILS": list, "RECOMMENDATIONS": list,
+}
+
+_DEVELOPER_FILES_SCHEMA: dict = {"FILES_CHANGED": list}
+
+
+def parse_tester_output(result_text: str) -> dict:
+    """Parse structured output from the Tester agent."""
+    parsed = _parse_structured_output(result_text, _TESTER_SCHEMA)
+    # Backward compat: default test_framework to "none"
+    if not parsed.get("test_framework"):
+        parsed["test_framework"] = "none"
+    return parsed
+
+
+def parse_developer_output(result_text: str) -> list[str]:
+    """Extract FILES_CHANGED list from developer output."""
+    parsed = _parse_structured_output(result_text, _DEVELOPER_FILES_SCHEMA)
+    return parsed.get("files_changed", [])
+
+
+# --- Session Compaction ---
+
+
+def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str]:
+    """Cross-reference claimed FILES_CHANGED against actual git diff.
+
+    Returns only files that actually changed according to git.
+    Prevents agents from faking progress by claiming changes they didn't make.
+    """
+    import subprocess
+    if not claimed_files or not project_dir:
+        return claimed_files
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=project_dir, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return claimed_files  # Can't verify, trust the claim
+        actual_files = set(result.stdout.strip().splitlines())
+        # Also check staged files
+        staged = subprocess.run(
+            ["git", "diff", "--name-only", "--cached"],
+            cwd=project_dir, capture_output=True, text=True, timeout=10,
+        )
+        if staged.returncode == 0:
+            actual_files.update(staged.stdout.strip().splitlines())
+        if not actual_files:
+            return claimed_files  # No git changes detected, trust claim (might be committed already)
+        # Return intersection — only files that were both claimed AND actually changed
+        verified = [f for f in claimed_files if any(f.endswith(a) or a.endswith(f) for a in actual_files)]
+        return verified if verified else claimed_files  # Fallback to claims if no match (path format differences)
+    except Exception:
+        return claimed_files  # On error, trust the claim
+
+
+def build_compaction_summary(
+    role: str, result: dict, cycle: int, task: dict
+) -> str:
+    """Compact agent output into a concise summary preserving actionable details.
+
+    Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
+    BLOCKERS, SUMMARY) from raw output instead of passing raw tail content.
+    Target: ~200 words max to prevent context rot across cycles.
+    """
+    text = result.get("result_text", "")
+    # Compact to 200 words max, preserving file paths and error messages
+    compacted = compact_agent_output(text, max_words=200)
+
+    summary = (
+        f"## Prior Work Summary (Cycle {cycle}, {role})\n"
+        f"Task: #{task['id']} - {task['title']}\n"
+        f"Turns used: {result.get('num_turns', '?')}\n"
+        f"---\n"
+        f"{compacted}\n"
+    )
+    return summary
+
+
+def build_test_failure_context(test_results: dict, cycle: int) -> str:
+    """Format Tester failures + recommendations for the Developer's next attempt.
+
+    Returns a string to append to the Developer's system prompt.
+    Caps output to prevent unbounded context growth: max 5 failure details,
+    each truncated to 200 chars; max 3 recommendations.
+    """
+    lines = [
+        f"## Test Failures from Cycle {cycle}",
+        "",
+        f"The Tester agent ran {test_results['tests_run']} tests "
+        f"using {test_results['test_framework']}.",
+        f"**{test_results['tests_failed']} tests failed.**",
+        "",
+    ]
+
+    if test_results["failure_details"]:
+        lines.append("### Failing Tests:")
+        # Cap at 5 details, truncate each to 200 chars
+        for detail in test_results["failure_details"][:5]:
+            truncated = detail[:200] + "..." if len(detail) > 200 else detail
+            lines.append(f"- {truncated}")
+        remaining = len(test_results["failure_details"]) - 5
+        if remaining > 0:
+            lines.append(f"- ...and {remaining} more failure(s)")
+        lines.append("")
+
+    if test_results["recommendations"]:
+        lines.append("### Tester Recommendations:")
+        # Cap at 3 recommendations
+        for rec in test_results["recommendations"][:3]:
+            truncated = rec[:200] + "..." if len(rec) > 200 else rec
+            lines.append(f"- {truncated}")
+        lines.append("")
+
+    lines.append("**Fix these test failures. Do NOT skip or delete failing tests.**")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def validate_output(result: dict) -> tuple[bool, str]:
+    """Check if agent output contains the expected structured response.
+
+    Returns (is_valid, reason) tuple.
+    """
+    if not result["success"]:
+        return False, "Agent reported failure"
+
+    text = result.get("result_text", "")
+    if not text:
+        return False, "No output from agent"
+
+    # Check for the structured RESULT: marker
+    if "RESULT:" in text:
+        return True, "Structured output found"
+
+    # Agent might have done useful work without the marker
+    # (e.g., hit max turns). Check if there's substantial output.
+    if len(text) > 100:
+        return True, "Substantial output (no RESULT marker)"
+
+    return False, "Output too short and missing RESULT marker"

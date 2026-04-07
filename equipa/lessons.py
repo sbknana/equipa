@@ -154,6 +154,7 @@ def get_relevant_episodes(
     min_q_value: float = 0.3,
     limit: int = 3,
     task_description: str | None = None,
+    dispatch_config: dict | None = None,
 ) -> list[dict]:
     """Fetch relevant past episodes for injection into agent prompts.
 
@@ -164,6 +165,7 @@ def get_relevant_episodes(
     - q_value (base quality signal)
     - Task description keyword overlap (if task_description provided)
     - Recency weighting (episodes from last 7 days weighted 2x)
+    - Vector similarity (if vector_memory feature enabled and Ollama available)
 
     Args:
         role: Agent role (e.g. 'developer', 'tester')
@@ -172,6 +174,7 @@ def get_relevant_episodes(
         min_q_value: Minimum q_value threshold (default 0.3)
         limit: Maximum episodes to return (default 3)
         task_description: Optional task description for keyword similarity scoring
+        dispatch_config: Optional config dict for feature flags and Ollama settings
 
     Returns:
         List of episode dicts with id, approach_summary, outcome, reflection, q_value
@@ -223,6 +226,29 @@ def get_relevant_episodes(
         now = datetime.now()
         seven_days_ago = now - timedelta(days=7)
 
+        # Vector similarity scoring (if enabled)
+        vector_scores: dict[int, float] = {}
+        vector_memory_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
+            except ImportError:
+                pass
+
+        if vector_memory_enabled and task_description:
+            try:
+                from equipa.embeddings import find_similar_by_embedding, cosine_similarity
+                # Find similar episodes by embedding
+                similar_episodes = find_similar_by_embedding(
+                    task_description, "episodes", top_k=20, dispatch_config=dispatch_config
+                )
+                for ep_id, sim_score in similar_episodes:
+                    vector_scores[ep_id] = sim_score
+            except Exception:
+                # Ollama down or import failed — gracefully continue without vector scoring
+                pass
+
         for ep in episodes:
             score = ep.get("q_value", 0.5)
 
@@ -239,6 +265,7 @@ def get_relevant_episodes(
                     pass  # Can't parse date, skip recency bonus
 
             # Task description keyword overlap scoring
+            keyword_score = 0.0
             if task_description:
                 ep_text = (
                     (ep.get("approach_summary", "") or "")
@@ -248,6 +275,17 @@ def get_relevant_episodes(
                 overlap = compute_keyword_overlap(task_description, ep_text)
                 # Boost score by up to 50% based on keyword overlap
                 score *= (1.0 + overlap * 0.5)
+
+                keyword_score = overlap
+                # Boost score by up to 50% based on keyword overlap
+                score *= (1.0 + overlap * 0.5)
+
+            # Vector similarity scoring (blended with keyword scoring)
+            ep_id = ep.get("id")
+            if ep_id in vector_scores:
+                cosine_sim = vector_scores[ep_id]
+                # Blend: 60% existing score (keyword + q_value) + 40% vector similarity
+                score = 0.6 * score + 0.4 * cosine_sim
 
             # SIMBA rule bonus: boost episodes that followed synthesized rules
             if _simba_rules:
@@ -271,6 +309,39 @@ def get_relevant_episodes(
 
         # Sort by relevance score descending
         episodes.sort(key=lambda e: e.get("_relevance_score", 0), reverse=True)
+        # Knowledge graph reranking (if enabled)
+        knowledge_graph_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
+            except ImportError:
+                pass
+
+        if knowledge_graph_enabled:
+            try:
+                from equipa import graph
+                # Build adjacency list from graph edges
+                adj = graph.get_adjacency_list()
+                if adj:
+                    # Compute PageRank scores
+                    pr_scores = graph.pagerank(adj)
+                    # Rerank episodes using graph structure (30% graph, 70% similarity)
+                    candidates = [
+                        {"id": ep["id"], "similarity": ep.get("_relevance_score", 0.0)}
+                        for ep in episodes
+                    ]
+                    reranked = graph.rerank_with_graph(candidates, pr_scores, sim_weight=0.7, graph_weight=0.3)
+                    # Rebuild episodes list in reranked order
+                    id_to_ep = {ep["id"]: ep for ep in episodes}
+                    episodes = [id_to_ep[c["id"]] for c in reranked if c["id"] in id_to_ep]
+            except Exception:
+                # Graph module unavailable or error — continue without graph reranking
+                pass
+
+        # Sort by relevance score descending (if not already reranked by graph)
+        if not knowledge_graph_enabled:
+            episodes.sort(key=lambda e: e.get("_relevance_score", 0), reverse=True)
 
         # Return top N, strip internal scoring field
         result = episodes[:limit]
@@ -338,12 +409,17 @@ def record_agent_episode(
     outcome: str,
     role: str = "developer",
     output: list | None = None,
+    dispatch_config: dict | None = None,
 ) -> None:
     """Store a Reflexion episode in the agent_episodes table.
 
     Extracts reflection from agent output. If no reflection found in
     the output, records the episode with a null reflection (the
     orchestrator will attempt a standalone reflexion call separately).
+
+    After INSERT, attempts to generate and store embedding if vector_memory
+    feature is enabled. Embedding generation failure does not block episode
+    recording.
 
     Never crashes the orchestrator — all errors are logged and swallowed.
     """
@@ -362,13 +438,22 @@ def record_agent_episode(
         result_text = result.get("result_text", "") if isinstance(result, dict) else ""
         num_turns = result.get("num_turns", 0) if isinstance(result, dict) else 0
 
+        # If result_text is empty but output is provided, extract text from output
+        if not result_text and output:
+            # Concatenate all text content from output messages
+            text_parts = []
+            for msg in output:
+                if isinstance(msg, dict) and msg.get("type") == "text":
+                    text_parts.append(msg.get("text", ""))
+            result_text = "\n".join(text_parts)
+
         reflection = parse_reflection(result_text)
         approach = parse_approach_summary(result_text)
         error_patterns = parse_error_patterns(result, outcome=outcome, result_text=result_text)
         q_value = compute_initial_q_value(outcome)
 
         conn = get_db_connection(write=True)
-        conn.execute(
+        cursor = conn.execute(
             """INSERT INTO agent_episodes
                (task_id, role, task_type, project_id, approach_summary,
                 turns_used, outcome, error_patterns, reflection, q_value)
@@ -376,8 +461,33 @@ def record_agent_episode(
             (task_id, role, task_type, project_id, approach,
              num_turns, outcome, error_patterns, reflection, q_value),
         )
+        episode_id = cursor.lastrowid
         conn.commit()
         conn.close()
+
+        # Attempt to generate and store embedding (if vector_memory enabled)
+        vector_memory_enabled = False
+        if dispatch_config:
+            try:
+                from equipa.dispatch import is_feature_enabled
+                vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
+            except ImportError:
+                # Fallback for tests that don't have dispatch module
+                vector_memory_enabled = dispatch_config.get("features", {}).get("vector_memory", False)
+
+        if vector_memory_enabled and episode_id:
+            try:
+                from equipa.embeddings import embed_and_store_episode
+                # Combine approach + reflection for embedding
+                ep_text = f"{approach or ''} {reflection or ''}".strip()
+                if ep_text:
+                    success = embed_and_store_episode(episode_id, ep_text, dispatch_config)
+                    if not success:
+                        # Ollama down or error — log but don't fail
+                        log("  [VectorMemory] Failed to generate episode embedding (Ollama down?)", output)
+            except Exception:
+                # Import failed or unexpected error — continue without embedding
+                pass
 
         # Log failure classification if present
         failure_class_info = ""
@@ -473,16 +583,21 @@ def update_injected_episode_q_values_for_task(
     task_id: int,
     outcome: str,
     output: list | None = None,
+    dispatch_config: dict | None = None,
 ) -> None:
     """Look up which episodes were injected for a task and update their q_values.
 
     Called after task completion. Uses the _injected_episodes_by_task tracker
     to find which episodes were injected, then applies the MemRL reward signal.
 
+    If knowledge_graph feature is enabled, creates co-accessed edges between
+    injected episodes to track which episodes are used together.
+
     Args:
         task_id: The task ID that just completed
         outcome: The task outcome string (e.g. 'tests_passed', 'developer_failed')
         output: Optional output buffer for logging
+        dispatch_config: Optional config dict for feature flags
     """
     from equipa.output import log
 
@@ -495,3 +610,22 @@ def update_injected_episode_q_values_for_task(
 
     delta = "+0.1" if task_succeeded else "-0.05"
     log(f"  [MemRL] Updated q_values ({delta}) for {len(ep_ids)} injected episodes: {ep_ids}", output)
+
+    # Create co-accessed edges in knowledge graph (if enabled)
+    knowledge_graph_enabled = False
+    if dispatch_config:
+        try:
+            from equipa.dispatch import is_feature_enabled
+            knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
+        except ImportError:
+            pass
+
+    if knowledge_graph_enabled and len(ep_ids) >= 2:
+        try:
+            from equipa import graph
+            edges_created = graph.create_coaccessed_edges(ep_ids)
+            if edges_created > 0:
+                log(f"  [KnowledgeGraph] Created {edges_created} co-accessed edges between episodes", output)
+        except Exception:
+            # Graph module unavailable or error — continue without graph updates
+            pass

@@ -87,3 +87,49 @@ forge_config.json
 dispatch_config.json
 mcp_config.json
 forgesmith_config.json
+
+# EQUIPA agent task output artifacts (auto-generated summaries)
+*-[0-9][0-9][0-9][0-9].md
+SPLIT-PHASE*.md
+ANTI-COMPACTION-*.md
+LANG-PROMPTS-*.md
+FEATURE-FLAGS-*.md
+TEST-*.md
+INTEGRATION-TEST-*.md
+MODULE-DEPS-*.md
+QVALUE-FEEDBACK-*.md
+GEPA-EPISODE-CHECK-*.md
+SIMBA-EPISODE-BIAS-*.md
+INSTALL-TEST-*.md
+NARRATIONS-*.md
+RESEED-DATA-*.md
+FONT-SIZE-*.md
+QA-WYSIWYG-*.md
+NEW-CUSTOMER-INLINE-*.md
+WYSIWYG-EDITOR-*.md
+
+# Skill manifest (auto-generated, regenerate with --regenerate-manifest)
+skill_manifest.json
+
+# Internal project context (not user-facing documentation)
+CLAUDE.md
+
+# Pytest cache
+.pytest_cache/
+
+# Research/analysis reports (internal, not documentation)
+ecc-vs-equipa-analysis.md
+LANDSCAPE-REPORT-*.md
+MONOLITH-SPLIT-PLAN.md
+ECC-IMPLEMENTATION-PLAN.md
+docs-config.json
+tmp-*.md
+
+# Generated files
+project-manifest.json
+skill_manifest.json
+docs-config.json
+docs/html/
+theforge.db
+RETRY-*.md
+TOOL_RESULT_STORAGE*.md

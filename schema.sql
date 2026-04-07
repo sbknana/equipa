@@ -3,7 +3,7 @@
 -- Generated from the live theforge.db schema.
 -- Used by equipa_setup.py to create new installations.
 --
--- Tables: 30, Views: 7, Triggers: 1, Indexes: 11
+-- Tables: 30, Views: 9, Triggers: 1, Indexes: 14
 
 -- ============================================================
 -- TABLES
@@ -46,7 +46,13 @@ CREATE TABLE decisions (
     rationale TEXT,
     alternatives_considered TEXT,
     decided_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (project_id) REFERENCES projects(id)
+    last_validated DATETIME,
+    decision_type TEXT NOT NULL DEFAULT 'general',
+    status TEXT NOT NULL DEFAULT 'open',
+    resolved_by_task_id INTEGER DEFAULT NULL,
+    verified_at DATETIME DEFAULT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (resolved_by_task_id) REFERENCES tasks(id)
 );
 
 CREATE TABLE open_questions (
@@ -323,6 +329,7 @@ CREATE TABLE lessons_learned (
     times_injected INTEGER DEFAULT 0,
     effectiveness_score REAL,
     active INTEGER DEFAULT 1,
+    embedding TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -339,6 +346,7 @@ CREATE TABLE agent_episodes (
     error_patterns TEXT,
     reflection TEXT,
     q_value REAL DEFAULT 0.5,
+    embedding TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     times_injected INTEGER DEFAULT 0
 );
@@ -423,6 +431,9 @@ CREATE TABLE model_registry (
 
 CREATE INDEX idx_tasks_project_status ON tasks(project_id, status);
 CREATE INDEX idx_decisions_project ON decisions(project_id);
+CREATE INDEX idx_decisions_type ON decisions(decision_type);
+CREATE INDEX idx_decisions_status ON decisions(status);
+CREATE INDEX idx_decisions_resolved_by ON decisions(resolved_by_task_id);
 CREATE INDEX idx_open_questions_resolved ON open_questions(resolved);
 CREATE INDEX idx_projects_status ON projects(status);
 CREATE INDEX idx_components_project ON components(project_id);
@@ -475,6 +486,24 @@ FROM open_questions q
 JOIN projects p ON q.project_id = p.id
 WHERE q.resolved = 0
   AND julianday('now') - julianday(q.asked_at) > 7;
+
+CREATE VIEW v_stale_decisions AS
+SELECT d.*, p.codename as project_name,
+       julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) as days_since_validation
+FROM decisions d
+JOIN projects p ON d.project_id = p.id
+WHERE d.status NOT IN ('resolved', 'wont_fix', 'failed_resolution')
+  AND julianday('now') - julianday(COALESCE(d.last_validated, d.decided_at)) > 60;
+
+CREATE VIEW v_open_security_findings AS
+SELECT d.id, d.project_id, p.codename as project_name,
+       d.topic, d.decision, d.rationale,
+       d.decided_at, d.last_validated,
+       d.resolved_by_task_id
+FROM decisions d
+JOIN projects p ON d.project_id = p.id
+WHERE d.decision_type = 'security_finding'
+  AND d.status = 'open';
 
 CREATE VIEW v_upcoming_reminders AS
 SELECT r.*, p.codename as project_name,
@@ -558,8 +587,24 @@ CREATE INDEX IF NOT EXISTS idx_agent_actions_task ON agent_actions(task_id, cycl
 CREATE INDEX IF NOT EXISTS idx_agent_actions_tool ON agent_actions(tool_name, success);
 
 -- ============================================================
+-- LESSON GRAPH EDGES TABLE
+-- ============================================================
+-- Stores relationships between lessons for graph-based retrieval
+CREATE TABLE IF NOT EXISTS lesson_graph_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_id INTEGER NOT NULL,
+    dst_id INTEGER NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL DEFAULT 1.0,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(src_id, dst_id, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_lesson_graph_src ON lesson_graph_edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst ON lesson_graph_edges(dst_id);
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v3. Migrations handle upgrades from older versions.
-PRAGMA user_version = 3;
+-- Marks fresh installs as v7. Migrations handle upgrades from older versions.
+PRAGMA user_version = 7;
 

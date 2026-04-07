@@ -61,6 +61,7 @@ from equipa.constants import (
     ROLE_SKILLS,
     SKILL_MANIFEST_FILE,
     SKILLS_BASE_DIR,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     TESTER_COMPACTION_THRESHOLD,
     THEFORGE_DB,
 )
@@ -221,6 +222,7 @@ from equipa.security import (
 
 # --- Prompts (equipa.prompts) ---
 from equipa.prompts import (
+    PromptResult,
     _last_prompt_version,
     build_checkpoint_context,
     build_evaluator_prompt,
@@ -308,6 +310,37 @@ from equipa.dispatch import (
     scan_pending_work,
     score_project,
     validate_goals,
+)
+
+# --- MCP Health (equipa.mcp_health) ---
+from equipa.mcp_health import (
+    DEFAULT_BACKOFF,
+    HEALTH_CACHE,
+    HEALTHY_TTL,
+    MAX_BACKOFF,
+    MCPHealthMonitor,
+)
+
+# --- Routing (equipa.routing) ---
+from equipa.routing import (
+    auto_select_model,
+    record_model_outcome,
+    score_complexity,
+    select_model_by_complexity,
+)
+
+# --- Embeddings (equipa.embeddings) ---
+from equipa.embeddings import (
+    cosine_similarity,
+    embed_and_store_episode,
+    embed_and_store_lesson,
+    find_similar_by_embedding,
+    get_embedding,
+)
+
+# --- MCP Server (equipa.mcp_server) ---
+from equipa.mcp_server import (
+    run_server,
 )
 
 # --- CLI (equipa.cli) ---
@@ -561,6 +594,25 @@ __all__ = [
     "run_parallel_goals",
     "parse_task_ids",
     "run_parallel_tasks",
+    # MCP Health
+    "HEALTH_CACHE",
+    "DEFAULT_BACKOFF",
+    "MAX_BACKOFF",
+    "HEALTHY_TTL",
+    "MCPHealthMonitor",
+    # Routing
+    "auto_select_model",
+    "record_model_outcome",
+    "score_complexity",
+    "select_model_by_complexity",
+    # Embeddings
+    "cosine_similarity",
+    "embed_and_store_episode",
+    "embed_and_store_lesson",
+    "find_similar_by_embedding",
+    "get_embedding",
+    # MCP Server
+    "run_server",
     # CLI
     "get_provider",
     "get_ollama_model",

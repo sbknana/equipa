@@ -62,6 +62,7 @@ Score each on a 1-10 scale:
 1. Save a markdown report to the project directory at MarketDisruptor/ with filename report-INDUSTRYSLUG.md
 
 2. Log a decision to TheForge with your key finding using write_query INSERT INTO decisions
+2. Log a decision to TheForge with your key finding using write_query INSERT INTO decisions (include decision_type='general' and status='open')
 
 3. Add session notes summarizing your research using write_query INSERT INTO session_notes
 

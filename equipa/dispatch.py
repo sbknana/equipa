@@ -71,6 +71,10 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "security_review": True,
     "quality_scoring": True,
     "anti_compaction_state": True,
+    "vector_memory": False,
+    "auto_model_routing": False,
+    "knowledge_graph": False,
+    "autoresearch": True,
 }
 
 DEFAULT_DISPATCH_CONFIG: dict = {
@@ -83,6 +87,7 @@ DEFAULT_DISPATCH_CONFIG: dict = {
     "only_projects": [],
     "security_review": False,
     "features": dict(DEFAULT_FEATURE_FLAGS),
+    "autoresearch_max_retries": 3,
 }
 
 
@@ -394,6 +399,65 @@ async def run_project_tasks(
         total_duration += result.get("duration", 0)
         if result.get("cost"):
             total_cost += result["cost"]
+        # --- Autoresearch retry loop ---
+        autoresearch_on = is_feature_enabled(config, "autoresearch")
+        max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
+        retry_count = 0
+
+        while True:
+            result, cycles, outcome = await run_dev_test_loop(
+                task, project_dir, project_context, task_args, output=output,
+            )
+            total_duration += result.get("duration", 0)
+            if result.get("cost"):
+                total_cost += result["cost"]
+
+            # Success - break out of retry loop
+            if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
+                break
+
+            # Not retriable or retries exhausted
+            if not autoresearch_on or retry_count >= max_retries:
+                if retry_count > 0:
+                    log(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
+                        f"for task #{task_id}. Final outcome: {outcome}", output)
+                break
+
+            retry_count += 1
+            log(f"  [Autoresearch] Task #{task_id} failed ({outcome}). "
+                f"Retry {retry_count}/{max_retries}...", output)
+
+            # Clean up failed git branch
+            branch_name = f"forge-task-{task_id}"
+            if _is_git_repo(project_dir):
+                # Try main first, then master
+                cp = subprocess.run(
+                    ["git", "rev-parse", "--verify", "main"],
+                    cwd=project_dir, capture_output=True,
+                )
+                default_branch = "main" if cp.returncode == 0 else "master"
+                subprocess.run(
+                    ["git", "checkout", default_branch],
+                    cwd=project_dir, capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=project_dir, capture_output=True,
+                )
+                log(f"  [Autoresearch] Cleaned up branch {branch_name}", output)
+
+            # Reset task to todo so run_dev_test_loop picks it up fresh
+            conn = get_db_connection(write=True)
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+            conn.commit()
+            conn.close()
+            log(f"  [Autoresearch] Reset task #{task_id} to todo for fresh attempt", output)
+
+            # Re-fetch task to get clean state
+            task = fetch_task(task_id)
+            if not task:
+                log(f"  [Autoresearch] Task #{task_id} disappeared from DB. Aborting retries.", output)
+                break
 
         # Orchestrator-side DB update (don't rely on agent)
         update_task_status(task_id, outcome, output=output)

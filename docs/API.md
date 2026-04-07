@@ -4,518 +4,793 @@
 
 - [API.md — EQUIPA](#apimd-equipa)
   - [Overview](#overview)
-  - [CLI Entry Points](#cli-entry-points)
-    - [Forge Orchestrator — `forge_orchestrator.py`](#forge-orchestrator-forge_orchestratorpy)
-    - [Forgesmith — `forgesmith.py`](#forgesmith-forgesmithpy)
-    - [Forgesmith SIMBA — `forgesmith_simba.py`](#forgesmith-simba-forgesmith_simbapy)
-    - [Forgesmith GEPA — `forgesmith_gepa.py`](#forgesmith-gepa-forgesmith_gepapy)
-    - [Forge Arena — `forge_arena.py`](#forge-arena-forge_arenapy)
-    - [Database Migration — `db_migrate.py`](#database-migration-db_migratepy)
-    - [Additional Tools](#additional-tools)
-  - [Internal Python Interfaces](#internal-python-interfaces)
-    - [Agent Messaging System](#agent-messaging-system)
-    - [Agent Actions Logging](#agent-actions-logging)
-    - [Loop Detection — `LoopDetector` class](#loop-detection-loopdetector-class)
-    - [Lesson Injection System](#lesson-injection-system)
-    - [Episode Memory System](#episode-memory-system)
-    - [Lesson Sanitizer — `lesson_sanitizer.py`](#lesson-sanitizer-lesson_sanitizerpy)
-    - [Rubric Quality Scoring — `rubric_quality_scorer.py`](#rubric-quality-scoring-rubric_quality_scorerpy)
-    - [SARIF Helpers — `skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py`](#sarif-helpers-skillssecuritystatic-analysisskillssarif-parsingresourcessarif_helperspy)
-    - [Ollama Agent — `ollama_agent.py`](#ollama-agent-ollama_agentpy)
-  - [Database Schema (Key Tables — Inferred)](#database-schema-key-tables-inferred)
+  - [MCP Tools (Claude's Interface)](#mcp-tools-claudes-interface)
+    - [**initialize** — MCP handshake](#initialize-mcp-handshake)
+    - [**tools/list** — enumerate available tools](#toolslist-enumerate-available-tools)
+    - [**task_status** — query task state](#task_status-query-task-state)
+    - [**task_create** — add new task to queue](#task_create-add-new-task-to-queue)
+    - [**dispatch** — start agent execution](#dispatch-start-agent-execution)
+    - [**lessons** — retrieve knowledge base entries](#lessons-retrieve-knowledge-base-entries)
+    - [**agent_logs** — retrieve agent execution history](#agent_logs-retrieve-agent-execution-history)
+    - [**session_notes** — retrieve session journal](#session_notes-retrieve-session-journal)
+    - [**project_context** — load project README + recent tasks](#project_context-load-project-readme-recent-tasks)
+  - [CLI Tools (Human Interface)](#cli-tools-human-interface)
+    - [**python -m equipa.cli** — main CLI entry point](#python-m-equipacli-main-cli-entry-point)
+    - [**dispatch** — run a task](#dispatch-run-a-task)
+    - [**status** — check task state](#status-check-task-state)
+    - [**auto-dispatch** — run pending tasks in queue](#auto-dispatch-run-pending-tasks-in-queue)
+    - [**lessons** — query knowledge base](#lessons-query-knowledge-base)
+    - [**nightly-review** — generate portfolio report](#nightly-review-generate-portfolio-report)
+  - [Python API (Importable Modules)](#python-api-importable-modules)
+    - [**equipa.tasks** — task database queries](#equipatasks-task-database-queries)
+    - [**equipa.db** — database utilities](#equipadb-database-utilities)
+    - [**equipa.lessons** — knowledge base retrieval](#equipalessons-knowledge-base-retrieval)
+    - [**equipa.prompts** — prompt construction](#equipaprompts-prompt-construction)
+    - [**equipa.monitoring** — loop detection](#equipamonitoring-loop-detection)
   - [Error Handling](#error-handling)
-    - [Agent Error Classification](#agent-error-classification)
-    - [Early Termination Conditions](#early-termination-conditions)
-    - [Budget Awareness Messages (inferred)](#budget-awareness-messages-inferred)
-  - [Configuration](#configuration)
-    - [Dispatch Configuration](#dispatch-configuration)
-    - [Forgesmith Configuration](#forgesmith-configuration)
-  - [Adding HTTP API Endpoints](#adding-http-api-endpoints)
+    - [**Task already running**](#task-already-running)
+    - [**Agent stuck in loop**](#agent-stuck-in-loop)
+    - [**Cost breaker triggered**](#cost-breaker-triggered)
+    - [**Preflight check failed**](#preflight-check-failed)
+  - [Rate Limiting](#rate-limiting)
+  - [Known Limitations](#known-limitations)
+  - [Getting Started](#getting-started)
+  - [Advanced: Custom Agent Roles](#advanced-custom-agent-roles)
+  - [Contributing](#contributing)
+  - [Support](#support)
   - [Related Documentation](#related-documentation)
 
 ## Overview
 
-EQUIPA is a **multi-agent AI orchestration platform** built in pure Python with SQLite as its data store. It is **not a traditional REST/GraphQL/tRPC API service**. Instead, it operates as a collection of CLI tools, orchestration scripts, and internal Python function interfaces that coordinate AI agents (developers, testers, security reviewers) to execute software development tasks.
+EQUIPA does not expose a traditional REST or GraphQL API. It is a **conversational orchestration platform** — you talk to Claude in plain English, and Claude dispatches EQUIPA tasks behind the scenes. The primary interface is the **MCP (Model Context Protocol) server**, which Claude uses to interact with EQUIPA's task system, knowledge base, and monitoring stack.
 
-**There are no HTTP API endpoints exposed by this project.**
+For automation or scripting, EQUIPA includes a CLI and Python-importable modules. Most users never touch the CLI directly — Claude handles task dispatch, error recovery, and result reporting.
 
-EQUIPA's "API" is an internal programmatic interface consisting of:
+**Base invocation:**
+```bash
+python -m equipa.cli --task-id 42
+```
 
-- **CLI entry points** (invoked via `python script.py [args]`)
-- **SQLite database operations** (the central state store)
-- **Inter-agent messaging** (via the `agent_messages` subsystem)
-- **Internal Python function interfaces** used across modules
+**MCP server (Claude's interface):**
+```bash
+python -m equipa.mcp_server
+```
 
----
-
-## CLI Entry Points
-
-### Forge Orchestrator — `forge_orchestrator.py`
-
-The primary entry point for dispatching and managing agent tasks.
-
-| Command / Mode | Description |
-|---|---|
-| `python forge_orchestrator.py --task <id>` | Run a single task by ID (inferred) |
-| `python forge_orchestrator.py --dispatch` | Auto-dispatch tasks across projects based on scoring (inferred) |
-| `python forge_orchestrator.py --goals <file>` | Run parallel goals from a YAML/JSON goals file (inferred) |
-| `python forge_orchestrator.py --tasks <id,id,...>` | Run multiple tasks in parallel (inferred) |
-| `python forge_orchestrator.py --setup-repos` | Set up GitHub repos for all projects (inferred) |
-| `python forge_orchestrator.py --scan` | Scan for pending work across projects (inferred) |
-
-### Forgesmith — `forgesmith.py`
-
-The self-improvement engine that analyzes agent performance and evolves prompts/config.
-
-| Command / Mode | Description |
-|---|---|
-| `python forgesmith.py` | Run full analysis + apply changes (inferred) |
-| `python forgesmith.py --dry-run` | Analyze without applying changes (inferred) |
-| `python forgesmith.py --report` | Generate performance report only (inferred) |
-| `python forgesmith.py --rollback <run_id>` | Revert changes from a specific run (inferred) |
-| `python forgesmith.py --propose-only` | Generate O-PRO proposals without applying (inferred) |
-
-### Forgesmith SIMBA — `forgesmith_simba.py`
-
-Generates behavioral rules from high-variance agent episodes.
-
-| Command / Mode | Description |
-|---|---|
-| `python forgesmith_simba.py` | Run SIMBA rule generation pipeline (inferred) |
-| `python forgesmith_simba.py --dry-run` | Preview rules without storing (inferred) |
-| `python forgesmith_simba.py --role <role>` | Filter to a specific agent role (inferred) |
-
-### Forgesmith GEPA — `forgesmith_gepa.py`
-
-Genetic/evolutionary prompt optimization for agent roles.
-
-| Command / Mode | Description |
-|---|---|
-| `python forgesmith_gepa.py` | Run GEPA prompt evolution (inferred) |
-| `python forgesmith_gepa.py --dry-run` | Preview evolved prompts without deploying (inferred) |
-| `python forgesmith_gepa.py --role <role>` | Evolve prompts for a specific role (inferred) |
-
-### Forge Arena — `forge_arena.py`
-
-Multi-phase testing arena for agent evaluation.
-
-| Command / Mode | Description |
-|---|---|
-| `python forge_arena.py` | Run arena evaluation phases (inferred) |
-| `python forge_arena.py --dry-run` | Simulate without dispatching tasks (inferred) |
-| `python forge_arena.py --export-lora` | Export training data for LoRA fine-tuning (inferred) |
-
-### Database Migration — `db_migrate.py`
-
-Schema migration tool for the SQLite database.
-
-| Command / Mode | Description |
-|---|---|
-| `python db_migrate.py` | Run all pending migrations |
-| `python db_migrate.py --silent` | Run migrations without output (inferred) |
-
-### Additional Tools
-
-| Script | Description |
-|---|---|
-| `equipa_setup.py` | Interactive setup wizard for new installations |
-| `forge_dashboard.py` | Terminal dashboard for task/project status |
-| `analyze_performance.py` | Performance analytics and reporting |
-| `nightly_review.py` | Automated nightly portfolio review |
-| `autoresearch_loop.py` | Automated prompt optimization loop |
-| `autoresearch_prompts.py` | O-PRO prompt research and mutation |
-| `forgesmith_backfill.py` | Backfill episode data from agent logs |
-| `forgesmith_impact.py` | Impact assessment for configuration changes |
-| `ingest_training_results.py` | Ingest fine-tuning results into the database |
-| `prepare_training_data.py` | Prepare conversation data for model training |
-| `train_qlora.py` | QLoRA training script |
-| `train_qlora_peft.py` | QLoRA training with PEFT |
-| `ollama_agent.py` | Local Ollama-based agent with sandboxed tool execution |
-| `benchmark_migrations.py` | Benchmark and verify database migrations |
+The MCP server runs on stdio (no HTTP listener). Claude connects via the MCP protocol spec. No authentication required — local-only by design.
 
 ---
 
-## Internal Python Interfaces
+## MCP Tools (Claude's Interface)
 
-### Agent Messaging System
+These are the tools Claude calls to manage EQUIPA tasks. Not intended for direct human use.
 
-The inter-agent communication layer used by the orchestrator for multi-agent coordination.
+### **initialize** — MCP handshake
+Claude calls this on connection to announce capabilities.
 
-#### `post_agent_message(task_id, cycle, from_role, to_role, msg_type, content)`
+**Parameters:** None (protocol handshake)
 
-Post a message from one agent role to another.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | The task this message relates to |
-| `cycle` | `int` | The dev-test cycle number |
-| `from_role` | `str` | Sending role (e.g., `"developer"`, `"tester"`) |
-| `to_role` | `str` | Receiving role |
-| `msg_type` | `str` | Message type (e.g., `"test_results"`, `"feedback"`) |
-| `content` | `str` | Message content (JSON or plain text) |
-
-#### `read_agent_messages(task_id, to_role, max_cycle)`
-
-Read unread messages for a given role.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | The task to read messages for |
-| `to_role` | `str` | The role receiving messages |
-| `max_cycle` | `int` | Maximum cycle number to include |
-
-**Returns:** `list[dict]` — List of message records ordered by cycle and ID.
-
-#### `mark_messages_read(task_id, to_role, cycle_number)`
-
-Mark messages as read up to the given cycle.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `task_id` | `int` | The task ID |
-| `to_role` | `str` | The role whose messages to mark read |
-| `cycle_number` | `int` | Mark all messages up to this cycle |
-
-#### `format_messages_for_prompt(messages)`
-
-Format message records into a string suitable for injection into agent system prompts.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `messages` | `list[dict]` | Messages from `read_agent_messages()` |
-
-**Returns:** `str` — Formatted messages block, or empty string if no messages.
-
----
-
-### Agent Actions Logging
-
-#### `classify_error(error_text)`
-
-Classify an error string into a known category.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `error_text` | `str` | Raw error output text |
-
-**Returns:** `str` — One of: `"timeout"`, `"file_not_found"`, `"permission"`, `"syntax"`, `"import"`, `"test_failure"`, `"unknown"`, or `""` for empty input.
-
-#### `bulk_log_agent_actions(action_log, task_id, run_id, cycle, role)`
-
-Batch-insert agent action records. Never raises exceptions.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `action_log` | `list` | List of action records |
-| `task_id` | `int` | Associated task |
-| `run_id` | `str` | Run identifier |
-| `cycle` | `int` | Cycle number |
-| `role` | `str` | Agent role |
-
----
-
-### Loop Detection — `LoopDetector` class
-
-Detects when agents are stuck in repetitive loops.
-
-#### `LoopDetector(warn_threshold=3, terminate_threshold=5)` (inferred)
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `warn_threshold` | `int` | `3` (inferred) | Consecutive identical fingerprints before warning |
-| `terminate_threshold` | `int` | `5` (inferred) | Consecutive identical fingerprints before termination |
-
-#### `record(result)` → `str`
-
-Record a tool result and return loop status.
-
-**Returns:** One of `"ok"`, `"warn"`, or `"terminate"`.
-
-#### `warning_message()` → `str`
-
-Human-readable warning message when a loop is detected.
-
-#### `termination_summary()` → `str`
-
-Human-readable summary when a loop triggers termination.
-
----
-
-### Lesson Injection System
-
-#### `get_relevant_lessons(role, error_type, limit)` — `forgesmith.py`
-
-Retrieve lessons learned from past agent runs.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `role` | `str` | Agent role to filter lessons for |
-| `error_type` | `str` | Error category to match (optional) |
-| `limit` | `int` | Maximum number of lessons to return |
-
-**Returns:** `list[dict]` — Relevant lessons sorted by relevance.
-
-#### `format_lessons_for_injection(lessons)` — `forge_orchestrator.py`
-
-Format lessons into a prompt-injectable string wrapped in `<task_input>` tags.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `lessons` | `list[dict]` | Lessons from `get_relevant_lessons()` |
-
-**Returns:** `str` — Sanitized, formatted lessons text.
-
----
-
-### Episode Memory System
-
-#### `format_episodes_for_injection(episodes)` — `forge_orchestrator.py`
-
-Format past agent episodes for injection into agent context.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `episodes` | `list[dict]` | Episode records from the database |
-
-**Returns:** `str` — Formatted episode context.
-
-#### `update_episode_q_values(injected_episode_ids, task_succeeded)` — `forge_orchestrator.py`
-
-Update Q-values for episodes that were injected into a task's context, based on whether the task succeeded.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `injected_episode_ids` | `list[int]` | IDs of episodes that were injected |
-| `task_succeeded` | `bool` | Whether the task using these episodes succeeded |
-
----
-
-### Lesson Sanitizer — `lesson_sanitizer.py`
-
-Security layer that sanitizes lessons before injection into agent prompts.
-
-#### `sanitize_lesson_content(text)` → `str`
-
-Strips XML injection tags, role override phrases, base64 payloads, ANSI escapes, dangerous code blocks, and enforces length limits.
-
-#### `validate_lesson_structure(text)` → `bool`
-
-Returns `True` if the lesson text has a valid structure for injection.
-
-#### `wrap_lessons_in_task_input(lessons_text)` → `str`
-
-Wraps sanitized lessons in `<task_input>` tags for safe prompt injection.
-
----
-
-### Rubric Quality Scoring — `rubric_quality_scorer.py`
-
-#### `score_agent_output(result_text, files_changed, role)` → `dict`
-
-Score agent output across five quality dimensions.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `result_text` | `str` | Raw agent output text |
-| `files_changed` | `list[str]` | List of files modified by the agent |
-| `role` | `str` | Agent role (`"developer"`, `"tester"`, `"security_reviewer"`) |
-
-**Returns:**
-
+**Response:**
 ```json
 {
-  "total_score": 35,
-  "normalized_score": 0.7,
-  "max_possible": 50,
-  "dimensions": {
-    "naming_consistency": 7,
-    "code_structure": 8,
-    "test_coverage": 6,
-    "documentation": 7,
-    "error_handling": 7
-  },
-  "details": {
-    "matched_patterns": ["..."]
+  "protocolVersion": "2024-11-05",
+  "serverInfo": { "name": "equipa-mcp", "version": "3.1" },
+  "capabilities": { "tools": {} }
+}
+```
+
+---
+
+### **tools/list** — enumerate available tools
+Returns the list of tools Claude can call.
+
+**Response:**
+```json
+{
+  "tools": [
+    { "name": "task_status", "description": "Check task state, logs, blockers", ... },
+    { "name": "task_create", ... },
+    { "name": "dispatch", ... },
+    ...
+  ]
+}
+```
+
+---
+
+### **task_status** — query task state
+Check if a task is pending, running, complete, blocked, or failed.
+
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `task_id` | int | yes | Task ID from TheForge database |
+
+**Example:**
+```json
+{
+  "name": "task_status",
+  "arguments": { "task_id": 42 }
+}
+```
+
+**Response:**
+```json
+{
+  "task_id": 42,
+  "status": "blocked",
+  "blocker_type": "test_failure",
+  "last_updated": "2026-03-15T10:23:45Z",
+  "role": "developer",
+  "cycle": 3,
+  "cost_usd": 0.12
+}
+```
+
+If task does not exist: `{"error": "Task 42 not found"}`
+
+---
+
+### **task_create** — add new task to queue
+Create a task in TheForge database. Does **not** dispatch — just adds to backlog.
+
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `project_id` | int | yes | TheForge project ID |
+| `title` | str | yes | Short task name |
+| `description` | str | yes | Full task spec |
+| `priority` | int | no | 1-5 (default 3) |
+| `complexity` | str | no | `trivial`/`medium`/`complex` (inferred if omitted) |
+| `task_type` | str | no | `feature`/`bug`/`test`/`refactor`/`security`/`build_fix` |
+
+**Example:**
+```json
+{
+  "name": "task_create",
+  "arguments": {
+    "project_id": 23,
+    "title": "Add rate limiting to /api/upload",
+    "description": "Implement token bucket rate limiter. 10 req/min per IP. Store state in Redis.",
+    "priority": 4,
+    "task_type": "feature"
   }
 }
 ```
 
-**(inferred)** All five dimensions score 0–10, max possible is 50.
+**Response:**
+```json
+{ "task_id": 104, "status": "pending" }
+```
 
 ---
 
-### SARIF Helpers — `skills/security/static-analysis/skills/sarif-parsing/resources/sarif_helpers.py`
+### **dispatch** — start agent execution
+Kicks off an agent run for a task. Task must be in `pending` or `blocked` state.
 
-Utility library for parsing and analyzing SARIF (Static Analysis Results Interchange Format) files.
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `task_id` | int | yes | Task to run |
+| `role` | str | no | Force role (default: auto-select based on task type) |
+| `checkpoint_id` | str | no | Resume from checkpoint (UUID) |
 
-#### Key Functions
+**Example:**
+```json
+{
+  "name": "dispatch",
+  "arguments": { "task_id": 42 }
+}
+```
 
-| Function | Description |
-|---|---|
-| `load_sarif(path)` | Load a SARIF file from disk |
-| `save_sarif(sarif, path, indent)` | Write SARIF data to disk |
-| `extract_findings(sarif)` | Extract all findings as `Finding` objects |
-| `filter_by_level(findings, *levels)` | Filter findings by severity level |
-| `filter_by_file(findings, pattern)` | Filter findings by file path pattern |
-| `filter_by_rule(findings, *rule_ids)` | Filter findings by rule ID |
-| `group_by_file(findings)` | Group findings by file path |
-| `group_by_rule(findings)` | Group findings by rule ID |
-| `deduplicate(findings)` | Remove duplicate findings by fingerprint |
-| `merge_sarif_files(*paths)` | Merge multiple SARIF files into one |
-| `summary(findings)` | Generate a summary string of findings |
-| `to_csv_rows(findings)` | Convert findings to CSV-compatible rows |
+**Response:**
+```json
+{
+  "task_id": 42,
+  "agent_id": "dev-42-1711362845",
+  "role": "developer",
+  "status": "running"
+}
+```
 
----
-
-### Ollama Agent — `ollama_agent.py`
-
-Local agent interface for Ollama-hosted models with sandboxed tool execution.
-
-#### `ollama_chat(base_url, model, messages, tools, timeout)`
-
-Send a chat completion request to a local Ollama instance.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `base_url` | `str` | Ollama server URL (e.g., `http://localhost:11434`) |
-| `model` | `str` | Model name (e.g., `qwen2.5-coder:32b`) |
-| `messages` | `list[dict]` | Conversation messages |
-| `tools` | `list[dict]` | Tool definitions |
-| `timeout` | `int` | Request timeout in seconds |
-
-#### `check_ollama_health(base_url)` → `bool`
-
-Check if the Ollama server is reachable.
-
-#### `list_ollama_models(base_url)` → `list`
-
-List available models on the Ollama server.
-
-#### Sandboxed Tool Execution
-
-| Function | Description |
-|---|---|
-| `exec_read_file(project_dir, args)` | Read a file within the project sandbox |
-| `exec_list_directory(project_dir, args)` | List directory contents |
-| `exec_search_files(project_dir, args)` | Search for files by name |
-| `exec_grep(project_dir, args)` | Search file contents |
-| `exec_bash(project_dir, args, allow_write)` | Execute bash commands (with write protection) |
-| `exec_write_file(project_dir, args)` | Write a file (sandboxed) |
-| `exec_edit_file(project_dir, args)` | Edit a file (sandboxed) |
-
-All file operations are sandboxed via `safe_path()` which prevents directory traversal. Write commands are validated via `is_blocked_command()`.
+If task already running: `{"error": "Task 42 already in progress"}`
 
 ---
 
-## Database Schema (Key Tables — Inferred)
+### **lessons** — retrieve knowledge base entries
+Fetch lessons (episodic memories) from failed/succeeded tasks. Used by Claude to inject context before dispatching.
 
-The SQLite database (30+ tables) serves as the central state store. Key tables include:
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `role` | str | no | Filter by agent role |
+| `error_type` | str | no | Filter by error class |
+| `limit` | int | no | Max results (default 10) |
 
-| Table | Purpose (inferred) |
-|---|---|
-| `tasks` | Task definitions, status, assignments |
-| `projects` | Project metadata and configuration |
-| `agent_episodes` | Historical agent run data with Q-values |
-| `agent_lessons` | Lessons learned from past runs |
-| `agent_messages` | Inter-agent communication messages |
-| `agent_actions` | Logged agent tool invocations |
-| `rubric_scores` | Quality scores for agent outputs |
-| `simba_rules` | SIMBA-generated behavioral rules |
-| `forgesmith_changes` | Configuration change history |
-| `forgesmith_runs` | Forgesmith analysis run logs |
-| `schema_migrations` | Database migration tracking |
-| `prompt_versions` | Prompt evolution history (inferred) |
+**Example:**
+```json
+{
+  "name": "lessons",
+  "arguments": { "role": "tester", "limit": 5 }
+}
+```
 
-Database migrations are managed by `db_migrate.py` and progress through versions v0 → v1 → v2 → v3 → v4.
+**Response:**
+```json
+{
+  "lessons": [
+    {
+      "lesson_id": 17,
+      "content": "When pytest fails with 'fixture not found', check conftest.py scope is session-level",
+      "q_value": 0.82,
+      "times_injected": 12
+    },
+    ...
+  ]
+}
+```
+
+---
+
+### **agent_logs** — retrieve agent execution history
+Get the turn-by-turn tool call log for a running/completed task.
+
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `task_id` | int | yes | Task ID |
+| `max_turns` | int | no | Limit turns (default 100) |
+
+**Example:**
+```json
+{
+  "name": "agent_logs",
+  "arguments": { "task_id": 42, "max_turns": 10 }
+}
+```
+
+**Response:**
+```json
+{
+  "task_id": 42,
+  "turns": [
+    { "turn": 1, "tool": "read_file", "args": "src/app.py", "result": "...", "cost": 0.003 },
+    { "turn": 2, "tool": "bash", "args": "pytest tests/", "result": "FAILED", "error": "test_upload_rate_limit failed" },
+    ...
+  ]
+}
+```
+
+---
+
+### **session_notes** — retrieve session journal
+Fetch human-written notes from TheForge `session_notes` table.
+
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `project_id` | int | no | Filter by project |
+| `limit` | int | no | Max results (default 20) |
+
+**Example:**
+```json
+{
+  "name": "session_notes",
+  "arguments": { "project_id": 23 }
+}
+```
+
+**Response:**
+```json
+{
+  "notes": [
+    { "id": 5, "created_at": "2026-03-10T14:00:00Z", "content": "Redis host changed to redis.prod.internal" },
+    ...
+  ]
+}
+```
+
+---
+
+### **project_context** — load project README + recent tasks
+Get a snapshot of a project's state for Claude to inject into task context.
+
+**Arguments:**
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `project_id` | int | yes | TheForge project ID |
+
+**Example:**
+```json
+{
+  "name": "project_context",
+  "arguments": { "project_id": 23 }
+}
+```
+
+**Response:**
+```json
+{
+  "project_id": 23,
+  "name": "EQUIPA",
+  "repo_path": "/home/user/projects/EQUIPA",
+  "readme_summary": "Multi-agent AI orchestration platform...",
+  "recent_tasks": [
+    { "task_id": 101, "status": "completed", "title": "Add loop detection" },
+    { "task_id": 102, "status": "blocked", "title": "Fix tester retry logic" }
+  ]
+}
+```
+
+---
+
+## CLI Tools (Human Interface)
+
+For automation/scripting. Claude does not call these — they are for cron jobs, CI/CD, or manual debugging.
+
+### **python -m equipa.cli** — main CLI entry point
+
+**Usage:**
+```bash
+python -m equipa.cli [OPTIONS] COMMAND
+```
+
+**Global Options:**
+| Flag | Description |
+|------|-------------|
+| `--db PATH` | Override TheForge database path |
+| `--dry-run` | Simulate without writing to DB |
+| `--verbose` | Print debug logs |
+
+---
+
+### **dispatch** — run a task
+
+```bash
+python -m equipa.cli dispatch --task-id 42 [--role developer] [--checkpoint UUID]
+```
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `--task-id ID` | Task to run (required) |
+| `--role ROLE` | Force agent role (default: auto) |
+| `--checkpoint UUID` | Resume from checkpoint |
+
+**Example:**
+```bash
+python -m equipa.cli dispatch --task-id 42 --role tester
+```
+
+**Output:**
+```
+[EQUIPA] Dispatching task 42 (Tester)
+[Turn 1] read_file → src/tests/test_upload.py
+[Turn 2] bash → pytest tests/test_upload.py
+[Turn 3] write_file → tests/test_upload.py (added rate_limit fixture)
+[COMPLETE] Task 42 succeeded in 3 turns ($0.08)
+```
+
+---
+
+### **status** — check task state
+
+```bash
+python -m equipa.cli status --task-id 42
+```
+
+**Output:**
+```json
+{
+  "task_id": 42,
+  "status": "completed",
+  "role": "tester",
+  "cycles": 1,
+  "turns": 3,
+  "cost_usd": 0.08,
+  "files_changed": ["tests/test_upload.py"],
+  "started_at": "2026-03-15T10:00:00Z",
+  "completed_at": "2026-03-15T10:02:14Z"
+}
+```
+
+---
+
+### **auto-dispatch** — run pending tasks in queue
+
+```bash
+python -m equipa.cli auto-dispatch [--project-id 23] [--max-concurrent 3]
+```
+
+Scans `tasks` table for `status = 'pending'`, scores by priority/complexity, dispatches top N tasks.
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `--project-id ID` | Filter by project |
+| `--max-concurrent N` | Run N tasks in parallel (default 3) |
+| `--priority-min N` | Only tasks with priority ≥ N |
+
+**Example:**
+```bash
+python -m equipa.cli auto-dispatch --project-id 23 --max-concurrent 2
+```
+
+**Output:**
+```
+[EQUIPA] Scanning queue...
+[EQUIPA] Found 7 pending tasks
+[EQUIPA] Dispatching task 42 (priority 4, complexity medium)
+[EQUIPA] Dispatching task 43 (priority 3, complexity trivial)
+[EQUIPA] Task 42 completed ($0.08)
+[EQUIPA] Task 43 completed ($0.02)
+```
+
+---
+
+### **lessons** — query knowledge base
+
+```bash
+python -m equipa.cli lessons [--role developer] [--error-type test_failure] [--limit 10]
+```
+
+**Example:**
+```bash
+python -m equipa.cli lessons --role tester --limit 5
+```
+
+**Output:**
+```
+Lesson 17 (q=0.82): When pytest fails with 'fixture not found', check conftest.py scope
+Lesson 23 (q=0.76): If import fails in tests, ensure __init__.py exists in package
+...
+```
+
+---
+
+### **nightly-review** — generate portfolio report
+
+```bash
+python -m scripts.nightly_review [--db PATH]
+```
+
+Prints a summary of:
+- Tasks completed/blocked/pending
+- Agent success rates by role
+- Open questions
+- Stale projects (no activity >7 days)
+
+Used by ForgeSmith nightly cron job.
+
+**Example output:**
+```
+=== Portfolio Summary ===
+Total tasks: 127
+Completed: 89 (70%)
+Blocked: 8 (6%)
+Pending: 30 (24%)
+
+=== Agent Performance ===
+Developer: 85% success (102 runs)
+Tester: 92% success (67 runs)
+...
+
+=== Open Questions ===
+- Q: Should we migrate to PostgreSQL? (asked 2026-03-10)
+- Q: Redis timeout policy? (asked 2026-03-12)
+
+=== Stale Projects ===
+- Project 18: last activity 12 days ago
+```
+
+---
+
+## Python API (Importable Modules)
+
+For custom integrations. Not intended for end users — advanced use only.
+
+### **equipa.tasks** — task database queries
+
+```python
+from equipa.tasks import fetch_task, fetch_next_todo
+
+task = fetch_task(42)
+print(task["status"])  # "blocked"
+
+next_task = fetch_next_todo(project_id=23)
+print(next_task["title"])  # "Add rate limiting"
+```
+
+**Functions:**
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `fetch_task(task_id)` | `int → dict | None` | Retrieve task by ID |
+| `fetch_next_todo(project_id)` | `int → dict | None` | Get highest-priority pending task |
+| `fetch_project_context(project_id)` | `int → dict` | Load project summary + recent tasks |
+| `verify_task_updated(task_id)` | `int → bool` | Check if task row changed since last read |
+
+---
+
+### **equipa.db** — database utilities
+
+```python
+from equipa.db import get_db_connection
+
+conn = get_db_connection(write=False)
+cursor = conn.execute("SELECT * FROM tasks WHERE status = 'blocked'")
+blocked = cursor.fetchall()
+conn.close()
+```
+
+**Functions:**
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `get_db_connection(write=False)` | `bool → sqlite3.Connection` | Get pooled connection |
+| `ensure_schema()` | `() → None` | Create tables if missing |
+| `classify_error(error_text)` | `str → str` | Map error message to category |
+
+**Error categories (inferred):**
+- `test_failure` — pytest/unittest failures
+- `import_error` — ModuleNotFoundError, ImportError
+- `syntax_error` — SyntaxError, IndentationError
+- `file_not_found` — FileNotFoundError, missing imports
+- `permission_error` — PermissionError, access denied
+- `timeout` — subprocess/API timeouts
+- `unknown` — unclassified errors
+
+---
+
+### **equipa.lessons** — knowledge base retrieval
+
+```python
+from equipa.lessons import get_relevant_lessons
+
+lessons = get_relevant_lessons(
+    role="tester",
+    error_type="test_failure",
+    limit=5
+)
+for lesson in lessons:
+    print(lesson["content"])
+```
+
+**Functions:**
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `get_relevant_lessons(role, error_type, limit)` | `str, str, int → list[dict]` | Retrieve top-N lessons by Q-value |
+| `update_lesson_injection_count(lesson_ids)` | `list[int] → None` | Increment injection counters |
+| `get_active_simba_rules()` | `() → list[dict]` | Load all active SIMBA rules |
+
+---
+
+### **equipa.prompts** — prompt construction
+
+```python
+from equipa.prompts import build_system_prompt_cache_split
+
+result = build_system_prompt_cache_split(
+    role="developer",
+    task={"description": "Fix Redis timeout", "project_id": 23},
+    project_context={},
+    config={}
+)
+
+print(result.static)  # cacheable portion (role prompt + common rules)
+print(result.dynamic)  # task-specific portion (description, lessons)
+print(result.full)  # complete prompt
+```
+
+**PromptResult attributes:**
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `.static` | str | Role prompt + common instructions (cached) |
+| `.dynamic` | str | Task description + injected lessons (not cached) |
+| `.full` | str | Complete prompt (static + boundary + dynamic) |
+
+**Why split?** Anthropic's prompt caching bills per unique prefix. By isolating task-specific content in `.dynamic`, the `.static` portion gets cached across tasks.
+
+---
+
+### **equipa.monitoring** — loop detection
+
+```python
+from equipa.monitoring import LoopDetector
+
+detector = LoopDetector()
+status = detector.record(
+    result={"action": "read_file", "file": "src/app.py"},
+    turn=1,
+    files_changed=[]
+)
+
+if status == "warning":
+    print(detector.warning_message())
+elif status == "terminate":
+    print(detector.termination_summary())
+```
+
+**LoopDetector methods:**
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.record(result, turn, files_changed)` | `"ok" | "warning" | "terminate"` | Log agent output, check for loops |
+| `.warning_message()` | `str` | Generate loop warning for agent context |
+| `.termination_summary()` | `str` | Generate termination reason |
+
+**Loop detection rules:**
+- Same tool + args 4 times → terminate
+- Alternating pattern (A→B→A→B) 6 cycles → terminate
+- 3 consecutive text-only turns (no tool calls) → terminate (monologue)
 
 ---
 
 ## Error Handling
 
-### Agent Error Classification
+EQUIPA does not return HTTP status codes (no HTTP server). Errors are reported via:
+1. **Task status field** — `blocked`, `failed`, `early_terminated`
+2. **Blocker type** — `test_failure`, `timeout`, `permission_error`, etc.
+3. **Agent logs** — tool call results include `"error"` key
 
-Errors from agent runs are classified into categories:
+**Common error patterns:**
 
-| Category | Pattern (inferred) |
-|---|---|
-| `timeout` | Command exceeded time limit |
-| `file_not_found` | Referenced file does not exist |
-| `permission` | Permission denied errors |
-| `syntax` | Syntax errors in generated code |
-| `import` | Missing module/import errors |
-| `test_failure` | Test assertions failed |
-| `unknown` | Unclassifiable errors |
+### **Task already running**
+Attempting to dispatch a task that is already in progress.
 
-### Early Termination Conditions
+**MCP response:**
+```json
+{ "error": "Task 42 already in progress" }
+```
 
-The orchestrator terminates agent runs when:
-
-| Condition | Behavior |
-|---|---|
-| **Consecutive loop** | Same tool fingerprint repeated N times → warn then terminate |
-| **Alternating pattern** | Two-tool alternation detected at 6 cycles → terminate |
-| **Monologue detection** | 3+ consecutive text-only responses (no tool use) → terminate |
-| **Stuck phrases** | Known stuck phrases detected in output (case-insensitive) |
-| **Cost breaker** | Cumulative cost exceeds limit (scales with complexity) |
-| **Budget exhaustion** | Turn count exceeds max_turns with periodic warnings |
-
-### Budget Awareness Messages (inferred)
-
-| Trigger | Message Type |
-|---|---|
-| Periodic interval | Remaining turns notification |
-| 50% turns used | Halfway warning |
-| ~80%+ turns used | Critical warning |
+**Resolution:** Wait for current run to complete, or kill via `abort_controller`.
 
 ---
 
-## Configuration
+### **Agent stuck in loop**
+Agent repeats the same action 4+ times without file changes.
 
-### Dispatch Configuration
+**Logged as:** `early_terminated` (status), `loop_detected` (blocker_type)
 
-Loaded via `load_dispatch_config(filepath)`. Controls:
+**Example log:**
+```
+[Turn 12] read_file → src/app.py (loop detected: read_file called 4 times)
+[TERMINATE] Agent stuck in loop
+```
 
-- Per-role model selection
-- Per-role turn limits
-- Provider selection (Claude API vs Ollama)
-- Task type routing and prompts
-- Cost limits per complexity tier
-- Concurrency settings
-
-### Forgesmith Configuration
-
-Loaded via `load_config()`. Controls:
-
-- Lookback windows for analysis
-- Thresholds for change proposals
-- Rubric definitions and weights
-- SIMBA/GEPA parameters
-- Backup retention settings
+**Resolution:** ForgeSmith autoresearch loop will retry with refined prompt. Human intervention rarely needed.
 
 ---
 
-## Adding HTTP API Endpoints
+### **Cost breaker triggered**
+Agent exceeded cost budget (scales with complexity).
 
-This project currently has **no HTTP API endpoints**. If you need to expose EQUIPA's functionality via a web API, consider:
+**Logged as:** `early_terminated`, `cost_exceeded`
 
-1. **FastAPI wrapper**: Create a `forge_api.py` that wraps the orchestrator and database functions:
-   ```python
-   from fastapi import FastAPI
-   app = FastAPI()
-   
-   @app.get("/tasks/{task_id}")
-   async def get_task(task_id: int):
-       return fetch_task(task_id)
-   
-   @app.post("/tasks/{task_id}/dispatch")
-   async def dispatch_task(task_id: int):
-       # Trigger orchestrator for this task
-       ...
+**Example:**
+```
+[Turn 8] Cost: $0.42 (limit: $0.40)
+[TERMINATE] Cost limit exceeded
+```
+
+**Resolution:** Adjust `cost_limits` in `dispatch_config.toml` or increase task complexity tier.
+
+---
+
+### **Preflight check failed**
+Project dependencies not installed (npm/pip/go/cargo).
+
+**Logged as:** `preflight_failed`
+
+**Example:**
+```
+[Preflight] npm install → Error: package-lock.json missing
+[TERMINATE] Preflight check failed
+```
+
+**Resolution:** Agent retries after 60s. If repeated failures, human must fix dependencies.
+
+---
+
+## Rate Limiting
+
+EQUIPA uses **exponential backoff** for Anthropic API calls:
+- Base delay: 500ms
+- Jitter: ±25%
+- Cap: 32s
+- Model fallback: After 3 `overloaded_error` responses, downgrade Opus → Sonnet
+
+**Circuit breaker:**
+- After 5 consecutive API failures, circuit opens
+- Agent waits 60s before retry
+- Success resets failure counter
+
+**Cost controls:**
+- Trivial tasks: $0.10 limit
+- Medium tasks: $0.40 limit
+- Complex tasks: $1.00 limit
+
+Limits are per-task, not per-agent. Multi-cycle tasks (dev → test → fix) share the same budget.
+
+---
+
+## Known Limitations
+
+Be honest — this is not magic.
+
+1. **Agents still fail.** About 15% of tasks hit blockers requiring human intervention. Common causes: missing dependencies, ambiguous requirements, test flakiness.
+
+2. **Git worktree isolation is finicky.** Merge conflicts occasionally require manual cleanup. The branch strategy (ephemeral worktrees per task) is solid, but edge cases remain.
+
+3. **Self-improvement needs data.** ForgeSmith GEPA/SIMBA loops require 20-30 episodes per role before patterns emerge. Fresh installs start dumb.
+
+4. **Tester role depends on test suites.** If your project has no tests, the tester will write one test, declare victory, and exit. It is not a test generator — it is a test runner.
+
+5. **Early termination kills legitimate complex tasks.** The 10-turn reading limit occasionally terminates agents mid-analysis. Increase `max_turns_by_complexity` in `dispatch_config.toml` if your tasks need deep exploration.
+
+6. **Knowledge graph reranking is experimental.** PageRank-based episode injection improves relevance by ~8% (per SIMBA evals), but occasionally surfaces stale lessons. Pruning logic still being refined.
+
+7. **No auth, no multi-tenancy.** EQUIPA assumes single-user, local deployment. Do not expose the MCP server over the network. No ACLs, no API keys, no rate limiting per-user.
+
+8. **Bash security is paranoid.** The command filter blocks 12+ injection patterns, which occasionally false-positives legitimate commands (e.g., `echo "$(date)"` gets blocked). If you hit a false positive, escape via `write_file` then `bash execute_script.sh`.
+
+---
+
+## Getting Started
+
+1. **Install:** No pip dependencies. Clone and run.
+2. **Setup database:** `python equipa_setup.py` (creates SQLite schema)
+3. **Add to Claude Desktop:** Copy `.mcp/server_config.json` to `~/Library/Application Support/Claude/`
+4. **Talk to Claude:** "Create a task to add rate limiting to /api/upload"
+
+Claude will:
+- Create the task in TheForge
+- Dispatch a Developer agent
+- Monitor progress
+- Report results
+- Retry on failure (up to 3 attempts with git cleanup between)
+
+You never touch the CLI unless you are debugging or running cron jobs.
+
+---
+
+## Advanced: Custom Agent Roles
+
+To add a new agent role (e.g., "Documenter"):
+
+1. **Create prompt:** `prompts/documenter.md`
+2. **Add to dispatch config:** `dispatch_config.toml`
+   ```toml
+   [roles]
+   documenter.model = "claude-sonnet-4-20250514"
+   documenter.max_turns = 12
+   documenter.cost_limit = 0.30
    ```
+3. **Add task type mapping:**
+   ```toml
+   [task_types]
+   documentation = ["documenter"]
+   ```
+4. **Dispatch:** `python -m equipa.cli dispatch --task-id 42 --role documenter`
 
-2. **MCP Server**: The project already generates MCP configuration via `step_generate_mcp_config()` in `equipa_setup.py`, suggesting Model Context Protocol integration is a supported pattern.
+The agent will use `prompts/documenter.md` as its system prompt and inherit tool access from `prompts/common.md`.
 
-3. **SQLite direct access**: For read-only dashboards, query the SQLite database directly using the schema documented above.
+---
+
+## Contributing
+
+See `CONTRIBUTING.md`. Key points:
+- No dependencies added without consensus (keep it stdlib-only)
+- All agent prompts must include few-shot examples
+- Test coverage >80% (run `pytest tests/`)
+- Commit messages follow Conventional Commits
+
+---
+
+## Support
+
+- **Docs:** This file + `CLAUDE.md` + `README.md`
+- **Issues:** GitHub Issues (no Discord, no Slack)
+- **Logs:** `~/.theforge/logs/equipa/` (one file per agent run)
+- **Database:** `~/.theforge/forge.db` (SQLite — readable with `sqlite3` CLI)
+
+If Claude breaks, check `mcp_health.json` for server status. If stale, restart MCP server.
 ---
 
 ## Related Documentation
@@ -524,4 +799,3 @@ This project currently has **no HTTP API endpoints**. If you need to expose EQUI
 - [Architecture](ARCHITECTURE.md)
 - [Deployment](DEPLOYMENT.md)
 - [Contributing](CONTRIBUTING.md)
-

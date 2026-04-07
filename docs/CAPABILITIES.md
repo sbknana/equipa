@@ -385,10 +385,10 @@ Autoresearch is the automated prompt optimization loop. It takes agent prompts, 
 
 | File | Role |
 |------|------|
-| `autoresearch_loop.py` | The full optimization loop — mutate, deploy, benchmark, evaluate, commit/revert |
-| `autoresearch_prompts.py` | Standalone prompt mutation generator with tiered LLM support (Ollama → Sonnet → Opus) |
+| `scripts/autoresearch_loop.py` | The full optimization loop — mutate, deploy, benchmark, evaluate, commit/revert |
+| `scripts/autoresearch_prompts.py` | Standalone prompt mutation generator with tiered LLM support (Ollama → Sonnet → Opus) |
 
-`autoresearch_loop.py` is the production system. It runs end-to-end on Claudinator, dispatching real agents on real tasks and measuring actual outcomes. `autoresearch_prompts.py` is the lighter tool for generating prompt mutations without running the full benchmark loop.
+`scripts/autoresearch_loop.py` is the production system. It runs end-to-end on Claudinator, dispatching real agents on real tasks and measuring actual outcomes. `scripts/autoresearch_prompts.py` is the lighter tool for generating prompt mutations without running the full benchmark loop.
 
 ### Current Results
 
@@ -408,19 +408,19 @@ As of March 2026, autoresearch has optimized 7 roles:
 
 ```bash
 # Check current success rates for all roles
-python3 autoresearch_loop.py --status
+python3 scripts/autoresearch_loop.py --status
 
 # Optimize a single role (target 80% by default)
-python3 autoresearch_loop.py --role developer --target 80
+python3 scripts/autoresearch_loop.py --role developer --target 80
 
 # Optimize all underperforming roles
-python3 autoresearch_loop.py --all --target 80
+python3 scripts/autoresearch_loop.py --all --target 80
 
 # Limit optimization rounds
-python3 autoresearch_loop.py --role debugger --max-rounds 5
+python3 scripts/autoresearch_loop.py --role debugger --max-rounds 5
 
 # Rollback a role to its last backup
-python3 autoresearch_loop.py --rollback developer
+python3 scripts/autoresearch_loop.py --rollback developer
 ```
 
 ### How It Relates to ForgeSmith

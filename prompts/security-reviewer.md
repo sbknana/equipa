@@ -164,8 +164,35 @@ Tools: [semgrep (p/security-audit, p/trailofbits, p/owasp-top-ten) | grep-based 
 
 ### CRITICAL RULES
 
+### RECORDING SECURITY FINDINGS
+
+After writing the report, log each HIGH or CRITICAL finding as a decision in TheForge:
+
+```sql
+INSERT INTO decisions (project_id, topic, decision, rationale, decision_type, status)
+VALUES ({project_id}, '{finding_id}: {title}', '{impact description}', '{file:line + fix}', 'security_finding', 'open');
+```
+
+**Security reviewers MUST use `decision_type='security_finding'`** for all findings. This enables tracking via the `v_open_security_findings` view.
+
+When a fix task resolves a finding, the developer agent records a resolution decision:
+```sql
+INSERT INTO decisions (project_id, topic, decision, rationale, decision_type, status, resolved_by_task_id)
+VALUES ({project_id}, '{finding_id}: resolved', '{what was fixed}', '{verification details}', 'resolution', 'open', {task_id});
+```
+Then update the original finding:
+```sql
+UPDATE decisions SET status = 'resolved', resolved_by_task_id = {task_id}, verified_at = datetime('now')
+WHERE id = {original_finding_id};
+```
+
+---
+
+### CRITICAL RULES
+
 1. **You are NOT the developer.** Find problems. Don't fix them.
 2. **A completed report with partial findings beats a perfect report that never gets written.** If running low on turns, finalize what you have.
 3. **Every finding needs file:line evidence.** No vague warnings.
 4. **If semgrep or any tool call fails, keep going with grep.** Don't debug tools — review code.
 5. **ALWAYS save findings to the report file.** Tasks that produce no output file are worthless.
+6. **Log HIGH+ findings to TheForge decisions table** with `decision_type='security_finding'`.

@@ -443,7 +443,7 @@ SIMBA (**S**ystematic **I**dentification of **M**istakes and **B**ehavioral **A*
 ```bash
 python forgesmith.py --simba              # All roles
 python forgesmith.py --simba developer    # Specific role
-python forgesmith_simba.py --prune        # Prune stale rules
+python3 scripts/forgesmith_simba.py --prune        # Prune stale rules
 ```
 
 ### GEPA (Automatic Prompt Evolution)
@@ -768,7 +768,7 @@ Autoresearch is the automated system for improving agent prompts. It mutates pro
 
 ```bash
 # Show success rates for all roles (sliding window of last 15 runs)
-python3 autoresearch_loop.py --status
+python3 scripts/autoresearch_loop.py --status
 ```
 
 Output looks like:
@@ -788,13 +788,13 @@ debugger                  15    83.4%        9.1      80%
 
 ```bash
 # Optimize a single role
-python3 autoresearch_loop.py --role debugger --target 80
+python3 scripts/autoresearch_loop.py --role debugger --target 80
 
 # Optimize all roles below their targets
-python3 autoresearch_loop.py --all --target 80
+python3 scripts/autoresearch_loop.py --all --target 80
 
 # Limit to 5 rounds (default is 10)
-python3 autoresearch_loop.py --role debugger --max-rounds 5
+python3 scripts/autoresearch_loop.py --role debugger --max-rounds 5
 ```
 
 Each round takes 10-30 minutes depending on task complexity and agent turn counts. The loop prints progress as it goes — which round, which tasks passed/failed, whether the mutation was kept or reverted.
@@ -805,19 +805,19 @@ If you just want to generate improved prompts without running the full benchmark
 
 ```bash
 # Generate mutations for all underperforming roles (via local Ollama)
-python3 autoresearch_prompts.py
+python3 scripts/autoresearch_prompts.py
 
 # Single role
-python3 autoresearch_prompts.py --role developer
+python3 scripts/autoresearch_prompts.py --role developer
 
 # Use Anthropic Sonnet instead of local Ollama
-python3 autoresearch_prompts.py --tier 2
+python3 scripts/autoresearch_prompts.py --tier 2
 
 # Use Opus for highest quality mutations
-python3 autoresearch_prompts.py --tier 3
+python3 scripts/autoresearch_prompts.py --tier 3
 
 # Preview without writing files
-python3 autoresearch_prompts.py --dry-run
+python3 scripts/autoresearch_prompts.py --dry-run
 ```
 
 ### Rolling Back
@@ -826,10 +826,10 @@ If a prompt mutation makes things worse:
 
 ```bash
 # Rollback a single role to its last backup
-python3 autoresearch_loop.py --rollback developer
+python3 scripts/autoresearch_loop.py --rollback developer
 
 # Rollback all roles (autoresearch_prompts.py version)
-python3 autoresearch_prompts.py --rollback
+python3 scripts/autoresearch_prompts.py --rollback
 ```
 
 Backups are stored in `.autoresearch-backups/` with timestamps.
