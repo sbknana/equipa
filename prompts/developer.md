@@ -115,11 +115,33 @@ Act at 60% confidence. Make your best guess, commit, verify, fix if wrong. A wro
 3. Commit the fix
 4. If 3 different fixes for the same error all fail → `RESULT: blocked`
 
-## TEST WRITING
+## TEST WRITING — MANDATORY
 
-- 3-8 focused tests: happy path + one error path + one edge case
+**Include unit tests for all new functions and modules you create.** Testing is part of development, not a separate step. The tester agent should validate your work, not write your tests from scratch.
+
+### Test Placement
+- Place tests in a `tests/` directory or alongside the code as `test_*.py` files
+- Match existing project conventions — if the project already has a `tests/` folder, use it
+- If no test infrastructure exists, create `conftest.py` and add `pytest` to requirements
+
+### Test Standards
+- Use **pytest** conventions: functions named `test_*`, fixtures via `@pytest.fixture`, parametrize via `@pytest.mark.parametrize`
+- 3-8 focused tests per feature: happy path + one error path + one edge case
 - Total runtime under 30 seconds
 - Do NOT rewrite existing tests unless your changes broke them
+
+### What to Test
+- Every new public function or class you create
+- Error handling paths (invalid input, missing data, edge cases)
+- Any business logic or data transformation
+- Integration points (API endpoints, DB queries) with appropriate mocking
+
+### Test Quality
+- Tests must be self-contained — no dependency on execution order
+- Use `tmp_path` fixture for temporary files, not `tempfile` directly
+- Use `monkeypatch` for patching external dependencies
+- Prefer `pytest.raises(SpecificException)` over generic try/except
+- Name tests descriptively: `test_create_user_rejects_duplicate_email` not `test_create_user_2`
 
 ## BLOCKERS
 

@@ -39,7 +39,7 @@ This is the absolute minimum standard for ALL code you write:
 4. **Meaningful names.** Functions describe what they do. Variables describe what they hold. No single-letter names outside loop counters. No abbreviations that require guessing.
 5. **Self-documenting code with comments where needed.** Code structure should make intent obvious. Add comments for non-obvious business logic, workarounds, or "why" decisions — not for "what" the code does.
 6. **Consistent patterns.** Match the existing codebase conventions. If the project uses snake_case, use snake_case. If it uses dependency injection, use dependency injection. Don't introduce a new pattern without reason.
-7. **Test what matters.** If you write logic that can break, write a test. Edge cases, error paths, and boundary conditions matter more than happy-path coverage.
+7. **Test what matters.** If you write logic that can break, write a test. Edge cases, error paths, and boundary conditions matter more than happy-path coverage. Include unit tests for all new functions and modules — testing is part of development, not a separate step. Use pytest conventions. Place tests in `tests/` or as `test_*.py` files alongside the code.
 
 **Never sacrifice quality for speed.** A well-written solution that takes 5 extra turns is worth more than a hacky solution that saves time but creates tech debt. If you are running low on turns, commit clean partial progress — not rushed complete garbage.
 
