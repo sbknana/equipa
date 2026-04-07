@@ -1,10 +1,10 @@
 ---
 name: bootstrap-tests
 description: >
-  Create test infrastructure from scratch when none exists. Teaches the tester how to create
-  pytest conftest.py, add pytest to dependencies, create test fixtures, and run tests.
-  Use when: project has no tests, no conftest.py, no test framework installed, or pytest not
-  in dependencies. The tester should NEVER block because "no tests exist" — CREATE the infrastructure.
+  Create test infrastructure from scratch when none exists. Sets up pytest config, conftest.py,
+  adds test dependencies, creates common fixtures, and ensures tests can run. Use when the project
+  has no test infrastructure, when conftest.py is missing, or when test dependencies are not installed.
+  Triggers: no tests found, pytest not configured, no conftest, missing test dependencies, cannot run tests.
 allowed-tools:
   - Read
   - Write
@@ -18,509 +18,572 @@ allowed-tools:
 
 ## Core Principle
 
-**NEVER block because tests don't exist. CREATE the test infrastructure in 3-5 turns.**
+**Your job is to CREATE test infrastructure, not just report that it's missing.**
+If tests don't exist, BUILD the scaffolding so they can exist. Never output "no tests to run" as a blocker — that's what you're here to fix.
 
-When a project has no tests, your job is to create the minimum viable test infrastructure so future tests can be written. This is not about writing comprehensive tests — it's about removing the blocker that prevents ANY tests from running.
+## When to Use
 
-## When to Use This Skill
-
-- Project has NO test files at all
-- `conftest.py` does not exist (Python projects)
-- pytest is not installed / not in dependencies
-- Test command fails with "No module named 'pytest'"
-- You've been asked to test something but infrastructure is missing
+- Project has no test files at all
+- Test files exist but no test runner configuration
+- `pytest` command fails with "No module named pytest"
+- `conftest.py` doesn't exist but tests need shared fixtures
+- Tests exist but dependencies aren't declared in requirements/pyproject
 
 ## When NOT to Use
 
-- Tests exist but are failing (fix the tests, don't rebuild infrastructure)
-- pytest is installed and working (just write tests)
-- You're in a non-Python project (use language-specific test setup)
+- Tests already run successfully (use framework-detection instead)
+- Tests exist and are configured (just run them)
+- You're only asked to run tests, not create infrastructure
 
-## Rationalizations to Reject
+## Bootstrap Process
 
-| Shortcut | Why It's Wrong | Required Action |
-|----------|---------------|-----------------|
-| "There are no tests, I'll report blocked" | Your job is to CREATE infrastructure | Bootstrap pytest + conftest.py |
-| "I don't know what to test" | You're not writing tests yet, just infrastructure | Create fixtures, add pytest to deps, write 1 smoke test |
-| "The project is too complex for me to test" | Start simple — test one function | Write a single passing test to prove infrastructure works |
-| "I'll wait for the developer to set this up" | NO. You're the tester. This is your job. | Create the infrastructure NOW |
+### Step 1: Detect Project Structure (1 turn)
 
-## The 5-Turn Bootstrap Process
-
-### Turn 1: Detect Language & Current State
-
-**Goal: Identify what exists and what's missing**
+Check what already exists:
 
 ```bash
-# Check for Python project markers
-ls -la | grep -E "(pyproject.toml|setup.py|requirements.txt|Pipfile)"
-
-# Check for existing tests
-find . -name "*test*.py" -o -name "conftest.py" | head -20
-
-# Check if pytest is installed
-python -m pytest --version 2>&1 || echo "pytest not installed"
+# Check for existing test infrastructure
+ls -la conftest.py pytest.ini pyproject.toml setup.py setup.cfg 2>/dev/null
+find . -name "*test*.py" -o -name "*spec*.py" | head -10
+grep -r "import pytest\|import unittest\|from unittest" --include="*.py" | head -5
 ```
 
-**Decision tree:**
-- Python project + no pytest → Add pytest to dependencies (Turn 2)
-- Python project + pytest installed + no conftest.py → Create conftest.py (Turn 2)
-- Python project + pytest + conftest.py exists → Write smoke test (Turn 2)
-- Non-Python project → Use language-specific bootstrap (see Language Matrix below)
+Identify the project type:
+- **Modern Python (pyproject.toml exists):** Add pytest to `[tool.pytest.ini_options]` and `[project.optional-dependencies]`
+- **Classic Python (requirements.txt exists):** Create/update `requirements-dev.txt` or `requirements-test.txt`
+- **Poetry (poetry.lock exists):** Run `poetry add --group dev pytest pytest-cov pytest-asyncio`
+- **No dependency management:** Create `requirements-test.txt` with core test dependencies
 
-### Turn 2: Add pytest to Dependencies
+### Step 2: Install Test Framework (1 turn)
 
-**For Python projects, pytest MUST be in the dependency manifest.**
+**Priority order — do the FIRST one that matches:**
 
-#### If `requirements.txt` exists:
+#### For pyproject.toml projects:
 ```bash
-# Check if pytest is already there
-grep -i pytest requirements.txt
+# Add pytest to pyproject.toml [project.optional-dependencies]
+# Then install:
+pip install -e ".[test]"
+```
 
-# If not, add it (use Edit tool)
-# Add to requirements.txt:
+#### For requirements-based projects:
+```bash
+# Create requirements-test.txt if missing
+cat > requirements-test.txt << 'EOF'
 pytest>=8.0.0
-pytest-asyncio>=0.23.0  # If project uses asyncio
+pytest-cov>=4.1.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
+EOF
+
+pip install -r requirements-test.txt
 ```
 
-#### If `pyproject.toml` exists:
-```python
-# Add to [project.optional-dependencies] or [tool.poetry.group.dev.dependencies]
-
-# For setuptools projects:
-[project.optional-dependencies]
-test = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-]
-
-# For Poetry projects:
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.0.0"
-pytest-asyncio = "^0.23.0"
-```
-
-#### If `Pipfile` exists:
-```toml
-[dev-packages]
-pytest = ">=8.0.0"
-pytest-asyncio = ">=0.23.0"
-```
-
-**Then install:**
+#### For Poetry projects:
 ```bash
-# Try the appropriate command:
-pip install pytest pytest-asyncio      # requirements.txt
-poetry install                         # pyproject.toml + poetry
-pipenv install --dev                   # Pipfile
+poetry add --group dev pytest pytest-cov pytest-asyncio pytest-mock
 ```
 
-### Turn 3: Create conftest.py
-
-**Create a minimal `conftest.py` with common fixtures.**
-
-Location: `tests/conftest.py` or `conftest.py` in project root.
-
-```python
-"""
-Pytest configuration and shared fixtures.
-"""
-import pytest
-import tempfile
-import shutil
-from pathlib import Path
-
-
-@pytest.fixture
-def tmp_dir():
-    """
-    Provide a temporary directory that's cleaned up after the test.
-
-    Usage:
-        def test_something(tmp_dir):
-            test_file = tmp_dir / "test.txt"
-            test_file.write_text("data")
-    """
-    temp_dir = Path(tempfile.mkdtemp())
-    yield temp_dir
-    shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-@pytest.fixture
-def sample_data():
-    """
-    Provide sample data for testing.
-
-    Usage:
-        def test_something(sample_data):
-            assert sample_data["key"] == "value"
-    """
-    return {
-        "key": "value",
-        "items": [1, 2, 3],
-        "nested": {"inner": "data"}
-    }
-
-
-# Add asyncio fixture if project uses async
-@pytest.fixture
-def event_loop():
-    """
-    Create an event loop for async tests.
-
-    Usage:
-        @pytest.mark.asyncio
-        async def test_async_function():
-            result = await async_call()
-            assert result == expected
-    """
-    import asyncio
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+#### For pipenv projects:
+```bash
+pipenv install --dev pytest pytest-cov pytest-asyncio pytest-mock
 ```
 
-**Customize based on project:**
-- If project uses databases → add DB fixture
-- If project uses APIs → add mock API fixture
-- If project has config files → add config fixture
+#### For conda environments:
+```bash
+conda install pytest pytest-cov pytest-asyncio pytest-mock
+```
 
-### Turn 4: Create pytest.ini (Optional but Recommended)
+**Core test dependencies to always include:**
+- `pytest` — the test runner
+- `pytest-cov` — coverage reporting
+- `pytest-asyncio` — async test support (if project uses asyncio)
+- `pytest-mock` — mocking utilities
 
-**Create `pytest.ini` to configure test discovery and output.**
+### Step 3: Create pytest Configuration (1 turn)
+
+Create the most appropriate config for the project:
+
+#### Option A: pyproject.toml (preferred for modern projects)
+
+If `pyproject.toml` exists, add:
+
+```toml
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=.",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+```
+
+#### Option B: pytest.ini (if no pyproject.toml)
 
 ```ini
 [pytest]
-# Test discovery patterns
+minversion = 8.0
+testpaths = tests
 python_files = test_*.py *_test.py
 python_classes = Test*
 python_functions = test_*
-
-# Test directories
-testpaths = tests
-
-# Output options
 addopts =
-    -v                      # Verbose output
-    --tb=short             # Short traceback format
-    --strict-markers       # Error on unknown markers
-    --disable-warnings     # Hide warnings for cleaner output
-
-# Markers for categorizing tests
+    -ra
+    --strict-markers
+    --strict-config
+    --cov=.
+    --cov-report=term-missing:skip-covered
+    --cov-report=html
+    --cov-report=xml
 markers =
     slow: marks tests as slow (deselect with '-m "not slow"')
     integration: marks tests as integration tests
     unit: marks tests as unit tests
 ```
 
-### Turn 5: Write a Smoke Test
+### Step 4: Create conftest.py (1 turn)
 
-**Create a single test to verify infrastructure works.**
-
-Location: `tests/test_smoke.py`
+Create `tests/conftest.py` with common fixtures:
 
 ```python
-"""
-Smoke test to verify pytest infrastructure is working.
-"""
+"""Shared test fixtures and configuration."""
+import os
+import tempfile
+from pathlib import Path
+from typing import Generator
+
 import pytest
 
 
-def test_pytest_works():
-    """Basic test to confirm pytest can run."""
-    assert True
+# ============================================================================
+# Directory Fixtures
+# ============================================================================
+
+@pytest.fixture
+def tmp_dir() -> Generator[Path, None, None]:
+    """Create a temporary directory that is cleaned up after the test."""
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
-def test_fixtures_available(tmp_dir, sample_data):
-    """Verify conftest.py fixtures are loaded."""
+@pytest.fixture
+def sample_file(tmp_dir: Path) -> Path:
+    """Create a sample text file for testing."""
+    file_path = tmp_dir / "sample.txt"
+    file_path.write_text("Sample content for testing\n")
+    return file_path
+
+
+# ============================================================================
+# Environment Fixtures
+# ============================================================================
+
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide a clean environment with no sensitive env vars."""
+    sensitive_vars = [
+        "API_KEY", "SECRET_KEY", "PASSWORD", "TOKEN",
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    ]
+    for var in sensitive_vars:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture
+def mock_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Provide a mock environment with test values."""
+    test_env = {
+        "TEST_MODE": "true",
+        "LOG_LEVEL": "DEBUG",
+    }
+    for key, value in test_env.items():
+        monkeypatch.setenv(key, value)
+    return test_env
+
+
+# ============================================================================
+# Database Fixtures (add only if project uses DB)
+# ============================================================================
+
+@pytest.fixture
+def db_session():
+    """Create a test database session (customize for your ORM)."""
+    # Example for SQLAlchemy:
+    # engine = create_engine("sqlite:///:memory:")
+    # Base.metadata.create_all(engine)
+    # Session = sessionmaker(bind=engine)
+    # session = Session()
+    # yield session
+    # session.close()
+    pytest.skip("Database fixtures not yet implemented")
+
+
+# ============================================================================
+# Mock API Fixtures
+# ============================================================================
+
+@pytest.fixture
+def mock_http_response():
+    """Create a mock HTTP response object."""
+    class MockResponse:
+        def __init__(self, json_data: dict, status_code: int = 200):
+            self.json_data = json_data
+            self.status_code = status_code
+            self.text = str(json_data)
+
+        def json(self):
+            return self.json_data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise Exception(f"HTTP {self.status_code}")
+
+    return MockResponse
+
+
+# ============================================================================
+# Test Data Fixtures
+# ============================================================================
+
+@pytest.fixture
+def sample_data() -> dict:
+    """Provide sample test data."""
+    return {
+        "id": 1,
+        "name": "Test Item",
+        "active": True,
+        "tags": ["test", "sample"],
+    }
+```
+
+### Step 5: Create Sample Test (1 turn)
+
+Create `tests/test_example.py` to verify the setup works:
+
+```python
+"""Example test to verify test infrastructure is working."""
+import pytest
+from pathlib import Path
+
+
+def test_basic_assertion():
+    """Verify basic assertions work."""
+    assert 1 + 1 == 2
+
+
+def test_fixture_usage(tmp_dir: Path):
+    """Verify fixtures are working."""
     assert tmp_dir.exists()
-    assert "key" in sample_data
+    assert tmp_dir.is_dir()
+
+    # Create a test file
+    test_file = tmp_dir / "test.txt"
+    test_file.write_text("Hello, tests!")
+
+    assert test_file.exists()
+    assert test_file.read_text() == "Hello, tests!"
 
 
-@pytest.mark.asyncio
-async def test_async_works():
-    """Verify async tests can run (if project uses asyncio)."""
-    result = await async_dummy()
-    assert result == "async works"
+def test_sample_data_fixture(sample_data: dict):
+    """Verify data fixtures work."""
+    assert sample_data["id"] == 1
+    assert sample_data["name"] == "Test Item"
+    assert sample_data["active"] is True
 
 
-async def async_dummy():
-    """Dummy async function for testing."""
-    return "async works"
+@pytest.mark.parametrize("input,expected", [
+    (1, 2),
+    (2, 4),
+    (3, 6),
+])
+def test_parametrized(input: int, expected: int):
+    """Verify parametrized tests work."""
+    assert input * 2 == expected
+
+
+@pytest.mark.slow
+def test_slow_operation():
+    """Example of marking slow tests."""
+    import time
+    time.sleep(0.1)  # Simulate slow operation
+    assert True
 ```
 
-**Then run:**
+### Step 6: Verify and Run (1 turn)
+
 ```bash
-python -m pytest tests/test_smoke.py -v
+# Verify pytest is installed
+python -m pytest --version
+
+# Run tests with verbose output
+python -m pytest tests/ -v
+
+# Run with coverage
+python -m pytest tests/ --cov --cov-report=term-missing
 ```
 
-If this passes → infrastructure is complete. If it fails → fix the error and re-run.
+## Language-Specific Bootstrapping
 
-## Language-Specific Bootstrap
+### JavaScript/TypeScript Projects
 
-### JavaScript / TypeScript
+For Node.js projects without test infrastructure:
 
-**Turn 1: Check package.json**
 ```bash
-cat package.json | grep -E "(jest|vitest|mocha)"
-```
-
-**Turn 2: Add test framework**
-```bash
-# For Jest:
+# Install Jest
 npm install --save-dev jest @types/jest
 
-# For Vitest:
-npm install --save-dev vitest
-```
-
-**Turn 3: Create jest.config.js or vitest.config.ts**
-```javascript
-// jest.config.js
+# Create jest.config.js
+cat > jest.config.js << 'EOF'
 module.exports = {
   testEnvironment: 'node',
-  testMatch: ['**/__tests__/**/*.test.js'],
-  collectCoverageFrom: ['src/**/*.js'],
-};
-
-// vitest.config.ts
-import { defineConfig } from 'vitest/config';
-
-export default defineConfig({
-  test: {
-    globals: true,
-    environment: 'node',
-  },
-});
-```
-
-**Turn 4: Add to package.json**
-```json
-{
-  "scripts": {
-    "test": "jest",
-    "test:watch": "jest --watch"
+  testMatch: ['**/__tests__/**/*.test.js', '**/?(*.)+(spec|test).js'],
+  collectCoverageFrom: ['src/**/*.js', '!src/**/*.test.js'],
+  coverageThreshold: {
+    global: {
+      branches: 70,
+      functions: 70,
+      lines: 70,
+      statements: 70
+    }
   }
-}
-```
+};
+EOF
 
-**Turn 5: Write smoke test**
-```javascript
-// __tests__/smoke.test.js
-describe('Smoke Test', () => {
-  test('infrastructure works', () => {
-    expect(true).toBe(true);
+# Add test script to package.json
+npm pkg set scripts.test="jest"
+
+# Create sample test
+mkdir -p __tests__
+cat > __tests__/example.test.js << 'EOF'
+describe('Example Test Suite', () => {
+  test('basic assertion', () => {
+    expect(1 + 1).toBe(2);
   });
 });
+EOF
 ```
 
-### Go
+### Go Projects
 
-**Turn 1: Check for go.mod**
 ```bash
-cat go.mod
-```
-
-**Turn 2: Create test file**
-```go
-// smoke_test.go
+# Go has built-in testing - just create test files
+cat > example_test.go << 'EOF'
 package main
 
 import "testing"
 
-func TestSmoke(t *testing.T) {
-    if true != true {
-        t.Fatal("infrastructure broken")
+func TestBasicAssertion(t *testing.T) {
+    result := 1 + 1
+    if result != 2 {
+        t.Errorf("Expected 2, got %d", result)
     }
 }
-```
+EOF
 
-**Turn 3: Run tests**
-```bash
+# Run tests
 go test ./...
 ```
 
-**No additional setup needed — Go has built-in testing.**
+### Rust Projects
 
-### Rust
-
-**Turn 1: Check for Cargo.toml**
 ```bash
-cat Cargo.toml
-```
+# Create tests directory
+mkdir -p tests
 
-**Turn 2: Create test file**
-```rust
-// tests/smoke_test.rs
+cat > tests/integration_test.rs << 'EOF'
 #[test]
-fn test_infrastructure() {
-    assert_eq!(2 + 2, 4);
+fn test_basic_assertion() {
+    assert_eq!(1 + 1, 2);
 }
-```
+EOF
 
-**Turn 3: Run tests**
-```bash
+# Run tests
 cargo test
 ```
 
-**No additional setup needed — Cargo has built-in testing.**
+### C# Projects
 
-### C# / .NET
-
-**Turn 1: Check for .csproj**
 ```bash
-find . -name "*.csproj"
-```
-
-**Turn 2: Create test project**
-```bash
+# For .NET projects, tests are typically in separate test projects
+# Create a test project
 dotnet new xunit -n ProjectName.Tests
+
+# Add reference to main project
 cd ProjectName.Tests
 dotnet add reference ../ProjectName/ProjectName.csproj
-```
 
-**Turn 3: Write smoke test**
-```csharp
-// SmokeTests.cs
+# Create sample test
+cat > UnitTest1.cs << 'EOF'
 using Xunit;
 
-public class SmokeTests
+namespace ProjectName.Tests;
+
+public class ExampleTests
 {
     [Fact]
-    public void TestInfrastructure()
+    public void TestBasicAssertion()
     {
-        Assert.True(true);
+        Assert.Equal(2, 1 + 1);
+    }
+
+    [Theory]
+    [InlineData(1, 2)]
+    [InlineData(2, 4)]
+    [InlineData(3, 6)]
+    public void TestParameterized(int input, int expected)
+    {
+        Assert.Equal(expected, input * 2);
     }
 }
-```
+EOF
 
-**Turn 4: Run tests**
-```bash
+# Run tests
 dotnet test
 ```
 
 ## Common Fixtures Library
 
-### Python Fixtures
+When creating `conftest.py`, include these fixtures based on what the project needs:
 
-```python
-# Database fixture (for projects using SQLite/PostgreSQL)
-@pytest.fixture
-def test_db():
-    """Provide a test database connection."""
-    import sqlite3
-    conn = sqlite3.connect(":memory:")
-    yield conn
-    conn.close()
+### File System Operations
+- `tmp_dir` — temporary directory
+- `sample_file` — pre-populated test file
+- `mock_file_structure` — nested directory tree
 
+### Environment & Configuration
+- `clean_env` — isolated environment
+- `mock_env` — test environment variables
+- `mock_config` — test configuration object
 
-# Mock API fixture
-@pytest.fixture
-def mock_api(monkeypatch):
-    """Mock external API calls."""
-    def mock_get(*args, **kwargs):
-        return {"status": "ok", "data": []}
+### Database Operations (if applicable)
+- `db_session` — database session
+- `db_transaction` — rollback after test
+- `sample_db_data` — pre-populated test data
 
-    monkeypatch.setattr("requests.get", mock_get)
-    return mock_get
+### HTTP/API Mocking (if applicable)
+- `mock_http_response` — mock HTTP response
+- `mock_api_client` — mock API client
+- `requests_mock` — intercept requests library calls
 
+### Async Operations (if project uses asyncio)
+- `event_loop` — pytest-asyncio provides this
+- `async_client` — mock async HTTP client
 
-# Environment variable fixture
-@pytest.fixture
-def test_env(monkeypatch):
-    """Set test environment variables."""
-    monkeypatch.setenv("ENV", "test")
-    monkeypatch.setenv("DEBUG", "true")
-    yield
-    # Cleanup happens automatically
-```
+## Troubleshooting
 
-### JavaScript Fixtures
-
-```javascript
-// Mock setup
-beforeEach(() => {
-  jest.clearAllMocks();
-});
-
-// Common test data
-const mockUser = {
-  id: 1,
-  name: 'Test User',
-  email: 'test@example.com'
-};
-
-// API mocking
-jest.mock('./api', () => ({
-  fetchData: jest.fn(() => Promise.resolve({ data: [] }))
-}));
-```
-
-## Running Tests After Bootstrap
-
-Once infrastructure is created, verify it works:
+### "ModuleNotFoundError: No module named 'pytest'"
 
 ```bash
-# Python
-python -m pytest -v
+# Verify pip is using the correct Python
+which python
+which pip
 
-# JavaScript (Jest)
-npm test
+# Install pytest
+pip install pytest
 
-# JavaScript (Vitest)
-npm run test
-
-# Go
-go test ./...
-
-# Rust
-cargo test
-
-# C#
-dotnet test
+# If that fails, use python -m pip
+python -m pip install pytest
 ```
 
-**Expected output:**
+### "No tests collected"
+
+```bash
+# Check test discovery patterns
+pytest --collect-only
+
+# Verify test file naming
+ls tests/test_*.py tests/*_test.py
+
+# Check pytest configuration
+pytest --version && pytest --help | grep testpaths
 ```
-======================== test session starts =========================
-collected 3 items
 
-tests/test_smoke.py::test_pytest_works PASSED                  [ 33%]
-tests/test_smoke.py::test_fixtures_available PASSED            [ 66%]
-tests/test_smoke.py::test_async_works PASSED                   [100%]
+### "Import errors in tests"
 
-========================= 3 passed in 0.12s ==========================
+```bash
+# Install package in editable mode
+pip install -e .
+
+# Or add src to PYTHONPATH
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
+pytest tests/
 ```
 
-## Interpreting Output
+### Tests found but fixtures fail
 
-### Success Indicators
-- ✅ "X passed" in output
-- ✅ Exit code 0
-- ✅ No "ModuleNotFoundError" or "ImportError"
-- ✅ Fixtures load without errors
+```bash
+# Verify conftest.py is in the right location
+ls tests/conftest.py
 
-### Failure Indicators
-- ❌ "No tests collected" → Test files not in correct location
-- ❌ "ModuleNotFoundError: No module named 'pytest'" → pytest not installed
-- ❌ "fixture 'X' not found" → conftest.py not loaded or has errors
-- ❌ Exit code non-zero → Tests failed or infrastructure broken
+# Check for syntax errors
+python -m py_compile tests/conftest.py
 
-**If you see failures:**
-1. Read the error message carefully
-2. Fix the specific error (missing import, wrong path, etc.)
-3. Re-run tests
-4. If 3 attempts fail → report `RESULT: blocked` with the error message
+# Run pytest with verbose fixture info
+pytest tests/ --fixtures
+```
 
 ## Quality Checklist
 
-- [ ] pytest (or appropriate framework) added to dependencies
-- [ ] conftest.py created with at least 2 fixtures
-- [ ] pytest.ini or equivalent config file created
-- [ ] At least 1 smoke test written
-- [ ] Tests run successfully (`pytest` command exits 0)
-- [ ] Output shows "X passed" not "no tests collected"
+- [ ] Test framework installed and version verified
+- [ ] Configuration file created (pytest.ini or pyproject.toml)
+- [ ] `conftest.py` created with at least 3 common fixtures
+- [ ] Sample test file created and passes
+- [ ] `pytest --collect-only` shows tests are discovered
+- [ ] `pytest` command runs without errors
+- [ ] Coverage reporting configured
+- [ ] Test dependencies added to requirements/pyproject
 
-## Final Note
+## Output Format
 
-**Your job is to remove blockers, not achieve perfection.** The infrastructure you create doesn't need to be comprehensive — it needs to be functional. Write the minimum viable test setup, verify it works with a smoke test, then move on. Future developers and testers will expand it as needed.
+When bootstrap is complete, provide this summary:
+
+```
+TEST INFRASTRUCTURE BOOTSTRAPPED
+
+Framework: pytest 8.x.x
+Config: [pytest.ini | pyproject.toml | setup.cfg]
+Fixtures: [list fixture names from conftest.py]
+Sample Tests: [number] tests in tests/test_example.py
+
+RUN TESTS:
+  pytest tests/ -v
+  pytest tests/ --cov
+
+NEXT STEPS:
+  1. [Any remaining manual steps]
+  2. [Project-specific fixture recommendations]
+```
+
+## Anti-Patterns to Avoid
+
+| Wrong Approach | Why It's Wrong | Correct Approach |
+|---------------|---------------|------------------|
+| "No tests exist, reporting blocked" | Your job is to CREATE infrastructure | Bootstrap conftest.py and pytest.ini, create sample test |
+| Install every pytest plugin | Bloats dependencies unnecessarily | Install only pytest-cov, pytest-asyncio (if needed), pytest-mock |
+| Create fixtures for everything upfront | Unknown what tests will need | Create 3-5 common fixtures, expand as needed |
+| Skip dependency declaration | Tests won't run in CI/other machines | Always add pytest to requirements/pyproject |
+| Use unittest instead of pytest | Harder to maintain, less powerful | Always use pytest for new test infrastructure |
+
+## Escape Hatch
+
+If you've completed all 6 steps and tests still won't run due to complex project-specific issues (e.g., missing system dependencies, complex build process), then output:
+
+```
+RESULT: blocked
+SUMMARY: Test infrastructure created but tests require [specific blocker]
+BLOCKERS: [Exact description of what's preventing test execution]
+```
+
+But this should be RARE. 95% of projects can be bootstrapped successfully.
