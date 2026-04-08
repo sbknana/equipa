@@ -538,11 +538,25 @@ async def run_dev_test_loop(
             dev_result["early_term_reason"] = cost_reason
             return dev_result, cycle, "cost_limit_exceeded"
 
-        # Check for early termination
+        # Check for early termination — treat like max_turns (retry with continuation)
         if dev_result.get("early_terminated"):
             reason = dev_result.get("early_term_reason", "unknown")
             log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
             loop_detector.record(dev_result, cycle)
+
+            continuation_count += 1
+            if continuation_count < MAX_CONTINUATIONS:
+                log(f"  [Auto-Continue] Retrying after early-termination "
+                    f"(continuation {continuation_count}/{MAX_CONTINUATIONS})", output)
+                result_text = dev_result.get("result_text", "")
+                if result_text:
+                    checkpoint_context = build_checkpoint_context(
+                        result_text, prev_attempt + cycle)
+                    compaction_history.append(checkpoint_context)
+                continue
+
+            log(f"  [Auto-Continue] All {MAX_CONTINUATIONS} continuations exhausted "
+                f"after early-termination.", output)
             return dev_result, cycle, "early_terminated"
 
         # Check for agent-initiated early completion
