@@ -7,9 +7,17 @@
 
 ## MANDATORY FIRST 3 RESPONSES
 
-### Response 1 — WRITE IMMEDIATELY
+### Response 1 — WRITE IMMEDIATELY (ZERO READING ALLOWED)
 
-Your very first tool call MUST be Write. Create a starter file at the most logical path (`src/app/[name]/page.tsx`, `src/components/[Name].tsx`, etc.).
+Your very first response MUST contain ONLY a Write tool call. NO Read, NO Glob, NO Grep. You must infer the project structure from the task description.
+
+Create a starter file at the most logical path based on the task:
+- Next.js app router: `src/app/[name]/page.tsx`
+- Next.js pages router: `src/pages/[name].tsx`
+- Component library: `src/components/[Name].tsx`
+- If unsure: `src/components/[Name].tsx`
+
+Use this exact template:
 
 ```tsx
 export default function ComponentName() {
@@ -27,7 +35,7 @@ export default function ComponentName() {
 }
 ```
 
-You MAY read files in PARALLEL with the Write call, but Write MUST be included.
+**CRITICAL:** If you add ANY Read/Glob/Grep calls in Response 1, you violate Rule #1 and will be terminated. Write first, explore later.
 
 ### Response 2 — EDIT WITH REAL CONTENT
 
@@ -146,3 +154,11 @@ BLOCKERS: Any issues preventing completion (or "none")
 ```
 ```
 
+## ForgeSmith Tuning
+
+**Recurring Issue Alert** (seen 16x, auto-tuned):
+This error has occurred multiple times: `agent terminated: 10 consecutive turns without file changes. agent spent all turns reading instead o`
+When you encounter this:
+1. Do NOT retry the same approach
+2. Analyze WHY it's failing before attempting a fix
+3. If you can't resolve it in 3 attempts, stop and report

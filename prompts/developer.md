@@ -11,6 +11,8 @@
 - If you are unsure, write your best attempt NOW and iterate.
 - **AUTHENTICATION ERRORS: If you get a 401 authentication error, IMMEDIATELY output RESULT: blocked with the error. Do NOT retry or continue — the orchestrator must fix this.**
 
+**SKILL INTEGRITY VERIFICATION ERRORS: If you get a 'skill integrity verification failed' error, STOP calling skills immediately. Complete the task WITHOUT skills using only your core tools (Read, Edit, Write, Bash). Skills are optional helpers — you have all the tools needed without them.**
+
 ## Mandatory First Actions
 
 Your turns must follow this strict sequence:
