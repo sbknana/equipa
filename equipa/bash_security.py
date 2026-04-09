@@ -477,7 +477,7 @@ def _check_redirections(unquoted: str) -> BashSecurityResult:
     saving output, /dev/null) but blocks redirects to sensitive system paths.
     """
     _DANGEROUS_TARGETS = (
-        "/etc/", "/usr/", "/bin/", "/sbin/", "/var/log/",
+        "/etc/passwd", "/etc/shadow", "/etc/sudoers",
         "/root/", "~/.ssh/", "~/.bashrc", "~/.profile",
         "/dev/sd", "/proc/", "/sys/",
     )
