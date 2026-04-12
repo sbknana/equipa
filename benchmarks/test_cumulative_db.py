@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from cumulative_db import CumulativeDB
+from benchmarks.cumulative_db import CumulativeDB
 
 
 @pytest.fixture
