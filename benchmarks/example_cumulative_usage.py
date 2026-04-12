@@ -12,7 +12,7 @@ from pathlib import Path
 
 import docker
 
-from cumulative_db import CumulativeDB
+from benchmarks.cumulative_db import CumulativeDB
 
 logging.basicConfig(level=logging.INFO)
 
