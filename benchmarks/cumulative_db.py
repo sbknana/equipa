@@ -210,38 +210,58 @@ class CumulativeDB:
         if not cursor.fetchone():
             return
 
+        # Get column names from container DB (excluding primary key)
+        cursor = container_conn.execute("PRAGMA table_info(lessons_learned)")
+        columns = [row[1] for row in cursor if row[5] == 0]  # pk=0 means not primary key
+
+        if not columns:
+            return
+
+        # Find the lesson content column (likely 'lesson' or 'content')
+        lesson_col = None
+        for col in columns:
+            if col in ("lesson", "content"):
+                lesson_col = col
+                break
+
+        if not lesson_col:
+            logger.warning("No lesson/content column found in lessons_learned")
+            return
+
+        # Check if table exists in master DB
+        try:
+            master_conn.execute("SELECT 1 FROM lessons_learned LIMIT 1")
+        except sqlite3.OperationalError:
+            # Table doesn't exist in master yet, skip merge
+            return
+
         # Get existing lesson content hashes from master
         existing_hashes = set()
-        try:
-            cursor = master_conn.execute("SELECT lesson FROM lessons_learned")
-            for (lesson,) in cursor:
+        cursor = master_conn.execute(f"SELECT {lesson_col} FROM lessons_learned")
+        for (lesson,) in cursor:
+            if lesson:
                 content_hash = hashlib.sha256(lesson.encode("utf-8")).hexdigest()
                 existing_hashes.add(content_hash)
-        except sqlite3.OperationalError:
-            # Table doesn't exist in master yet
-            pass
 
         # Insert new lessons from container
-        cursor = container_conn.execute(
-            "SELECT project_id, role, error_type, error_signature, lesson, "
-            "source, times_seen, times_injected, effectiveness_score, active "
-            "FROM lessons_learned"
-        )
+        col_list = ", ".join(columns)
+        cursor = container_conn.execute(f"SELECT {col_list} FROM lessons_learned")
 
         inserted = 0
+        placeholders = ", ".join("?" * len(columns))
+        lesson_idx = columns.index(lesson_col)
+
         for row in cursor:
-            (project_id, role, error_type, error_signature, lesson,
-             source, times_seen, times_injected, effectiveness_score, active) = row
-            content_hash = hashlib.sha256(lesson.encode("utf-8")).hexdigest()
+            lesson_content = row[lesson_idx]
+            if not lesson_content:
+                continue
+
+            content_hash = hashlib.sha256(lesson_content.encode("utf-8")).hexdigest()
 
             if content_hash not in existing_hashes:
                 master_conn.execute(
-                    "INSERT INTO lessons_learned "
-                    "(project_id, role, error_type, error_signature, lesson, "
-                    "source, times_seen, times_injected, effectiveness_score, active) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (project_id, role, error_type, error_signature, lesson,
-                     source, times_seen, times_injected, effectiveness_score, active),
+                    f"INSERT INTO lessons_learned ({col_list}) VALUES ({placeholders})",
+                    row,
                 )
                 existing_hashes.add(content_hash)
                 inserted += 1
