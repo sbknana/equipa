@@ -20,8 +20,8 @@ KEY DIFFERENCES FROM FEATUREBENCH:
 5. SWE-bench dataset from HuggingFace: princeton-nlp/SWE-bench_Verified
 
 Architecture:
-  Phase 1 (one-time):  --setup   → Docker volume with Node.js + Claude CLI
-  Phase 2 (per-task):  --run     → EQUIPA inside containers → output.jsonl
+  Phase 1 (one-time):  --setup    → Docker volume with Node.js + Claude CLI
+  Phase 2 (per-task):  --limit N  → EQUIPA inside containers → output.jsonl
   Phase 3 (validate):  --validate → Official SWE-bench harness
 
 Usage:
@@ -48,12 +48,18 @@ from typing import Any
 
 try:
     import docker
+    import docker.errors
 except ImportError:
     print("ERROR: docker SDK not installed. Run: pip install docker")
     sys.exit(1)
 
 from cumulative_db import CumulativeDB
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 # --- Paths ---
@@ -140,6 +146,12 @@ def exec_cmd(
     container: Any, cmd: str, timeout: int = 300, workdir: str | None = None
 ) -> tuple[int, str]:
     """Execute a bash command inside the Docker container.
+
+    Args:
+        container: Docker container object.
+        cmd: Shell command to execute.
+        timeout: Max seconds (used by callers that wrap with shell timeout).
+        workdir: Working directory inside the container.
 
     Returns (exit_code, output_str). Never raises on command failure.
     """
@@ -1244,12 +1256,35 @@ def run_benchmark(
     output_path: str = "swebench_output.jsonl",
     cumulative: bool = True,
     workers: int = 1,
+    instance_filter: str = "",
+    skip_resolved: bool = False,
 ) -> None:
-    """Main benchmark loop — run EQUIPA inside Docker for each instance."""
+    """Main benchmark loop — run EQUIPA inside Docker for each instance.
+
+    Args:
+        limit: Maximum number of instances to run.
+        offset: Skip first N instances.
+        max_retries: Retry attempts per instance.
+        timeout: Seconds per attempt.
+        output_path: JSONL predictions output file.
+        cumulative: Enable cumulative knowledge DB.
+        workers: Number of concurrent Docker workers.
+        instance_filter: If set, only run this specific instance_id.
+        skip_resolved: Skip instances already in the output file.
+    """
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY not set.")
+        sys.exit(1)
+
+    if not DATASET_PATH.exists():
+        print(f"ERROR: Dataset not found at {DATASET_PATH}")
+        print(
+            "Download with:\n  python -c \"from datasets import load_dataset; "
+            "ds=load_dataset('princeton-nlp/SWE-bench_Verified', split='test'); "
+            f"ds.to_json('{DATASET_PATH}')\""
+        )
         sys.exit(1)
 
     client = docker.from_env()
@@ -1265,6 +1300,37 @@ def run_benchmark(
         sys.exit(1)
 
     dataset = load_dataset(str(DATASET_PATH), limit=limit, offset=offset)
+
+    # Filter to a specific instance if requested
+    if instance_filter:
+        dataset = [
+            inst for inst in dataset
+            if inst["instance_id"] == instance_filter
+        ]
+        if not dataset:
+            # Try partial match
+            dataset = load_dataset(str(DATASET_PATH))
+            dataset = [
+                inst for inst in dataset
+                if instance_filter in inst["instance_id"]
+            ]
+        if not dataset:
+            print(f"ERROR: Instance '{instance_filter}' not found in dataset.")
+            sys.exit(1)
+        print(f"  Filtered to {len(dataset)} instance(s) matching '{instance_filter}'")
+
+    # Skip already resolved instances if requested
+    if skip_resolved:
+        resolved_ids = _load_resolved_ids(output_path)
+        if resolved_ids:
+            before = len(dataset)
+            dataset = [
+                inst for inst in dataset
+                if inst["instance_id"] not in resolved_ids
+            ]
+            skipped = before - len(dataset)
+            if skipped:
+                print(f"  Skipped {skipped} already-resolved instances")
 
     # Initialize cumulative DB if enabled
     cumdb = None
@@ -1488,6 +1554,49 @@ def validate_results(output_path: str = "swebench_output.jsonl") -> None:
         print(f"ERROR: Validation failed: {e}")
 
 
+def _list_instances(limit: int = 0, offset: int = 0) -> None:
+    """Print available SWE-bench instances from the dataset."""
+    if not DATASET_PATH.exists():
+        print(f"ERROR: Dataset not found at {DATASET_PATH}")
+        print(
+            "Download with:\n  python -c \"from datasets import load_dataset; "
+            "ds=load_dataset('princeton-nlp/SWE-bench_Verified', split='test'); "
+            f"ds.to_json('{DATASET_PATH}')\""
+        )
+        sys.exit(1)
+
+    dataset = load_dataset(str(DATASET_PATH), limit=limit, offset=offset)
+    print(f"\nSWE-bench Verified instances ({len(dataset)} shown):\n")
+    for i, inst in enumerate(dataset):
+        iid = inst["instance_id"]
+        repo = inst["repo"]
+        f2p = inst.get("FAIL_TO_PASS", [])
+        if isinstance(f2p, str):
+            try:
+                f2p = json.loads(f2p)
+            except (json.JSONDecodeError, TypeError):
+                f2p = []
+        n_tests = len(f2p) if isinstance(f2p, list) else 0
+        print(f"  {i + 1:4d}. {iid:<55s} {repo:<30s} ({n_tests} F2P tests)")
+
+
+def _load_resolved_ids(output_path: str) -> set[str]:
+    """Load instance IDs already resolved in the output file."""
+    resolved: set[str] = set()
+    path = Path(output_path)
+    if not path.exists():
+        return resolved
+    with open(path) as f:
+        for line in f:
+            try:
+                pred = json.loads(line)
+                if pred.get("model_patch"):
+                    resolved.add(pred["instance_id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return resolved
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -1551,6 +1660,23 @@ if __name__ == "__main__":
         action="store_true",
         help="Force rebuild tools volume (skip prompt)",
     )
+    parser.add_argument(
+        "--instance",
+        type=str,
+        default="",
+        help="Run a single instance by ID (e.g., django__django-15790)",
+    )
+    parser.add_argument(
+        "--skip-resolved",
+        action="store_true",
+        help="Skip instances already resolved in the output file",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_instances",
+        help="List available instances from the dataset and exit",
+    )
     args = parser.parse_args()
 
     cumulative = args.cumulative and not args.no_cumulative
@@ -1558,6 +1684,8 @@ if __name__ == "__main__":
     if args.setup:
         client = docker.from_env()
         setup_tools_volume(client, force=args.force)
+    elif args.list_instances:
+        _list_instances(args.limit, args.offset)
     elif args.validate:
         validate_results(args.output)
     else:
@@ -1569,6 +1697,8 @@ if __name__ == "__main__":
             output_path=args.output,
             cumulative=cumulative,
             workers=args.workers,
+            instance_filter=args.instance,
+            skip_resolved=args.skip_resolved,
         )
         if args.validate:
             validate_results(args.output)
