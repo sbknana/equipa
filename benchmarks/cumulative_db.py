@@ -203,30 +203,45 @@ class CumulativeDB:
         self, master_conn: sqlite3.Connection, container_conn: sqlite3.Connection
     ) -> None:
         """Merge lessons with content-based deduplication."""
+        # Check if table exists in container DB
+        cursor = container_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='lessons_learned'"
+        )
+        if not cursor.fetchone():
+            return
+
         # Get existing lesson content hashes from master
         existing_hashes = set()
-        cursor = master_conn.execute("SELECT content FROM lessons_learned")
-        for (content,) in cursor:
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            existing_hashes.add(content_hash)
+        try:
+            cursor = master_conn.execute("SELECT lesson FROM lessons_learned")
+            for (lesson,) in cursor:
+                content_hash = hashlib.sha256(lesson.encode("utf-8")).hexdigest()
+                existing_hashes.add(content_hash)
+        except sqlite3.OperationalError:
+            # Table doesn't exist in master yet
+            pass
 
         # Insert new lessons from container
         cursor = container_conn.execute(
-            "SELECT project_id, content, lesson_type, task_id, created_at "
+            "SELECT project_id, role, error_type, error_signature, lesson, "
+            "source, times_seen, times_injected, effectiveness_score, active "
             "FROM lessons_learned"
         )
 
         inserted = 0
         for row in cursor:
-            project_id, content, lesson_type, task_id, created_at = row
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            (project_id, role, error_type, error_signature, lesson,
+             source, times_seen, times_injected, effectiveness_score, active) = row
+            content_hash = hashlib.sha256(lesson.encode("utf-8")).hexdigest()
 
             if content_hash not in existing_hashes:
                 master_conn.execute(
                     "INSERT INTO lessons_learned "
-                    "(project_id, content, lesson_type, task_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (project_id, content, lesson_type, task_id, created_at),
+                    "(project_id, role, error_type, error_signature, lesson, "
+                    "source, times_seen, times_injected, effectiveness_score, active) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (project_id, role, error_type, error_signature, lesson,
+                     source, times_seen, times_injected, effectiveness_score, active),
                 )
                 existing_hashes.add(content_hash)
                 inserted += 1
