@@ -260,6 +260,14 @@ class CumulativeDB:
         Assumes AUTOINCREMENT primary keys — no ID conflicts.
         Copies all columns except the primary key (which is auto-assigned).
         """
+        # Check if table exists in container DB
+        cursor = container_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        )
+        if not cursor.fetchone():
+            return
+
         # Get column names excluding primary key
         cursor = container_conn.execute(f"PRAGMA table_info({table_name})")
         columns = [
@@ -267,7 +275,15 @@ class CumulativeDB:
         ]
 
         if not columns:
-            # Table might not exist in container DB
+            return
+
+        # Check if table exists in master DB
+        cursor = master_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        )
+        if not cursor.fetchone():
+            logger.debug(f"Table {table_name} does not exist in master DB, skipping")
             return
 
         # Copy all rows
