@@ -945,6 +945,42 @@ def parse_task_ids(task_str: str) -> list[int]:
     return ids
 
 
+def _copy_hooks_to_worktree(main_repo_dir: str, worktree_dir: str) -> None:
+    """Copy git hooks from the main repo into a worktree.
+
+    Worktrees do NOT inherit .git/hooks from the parent repo. This means
+    pre-commit hooks (like plugin boundary checks) won't fire in worktrees
+    unless we explicitly copy them.
+    """
+    import shutil
+    main_hooks = Path(main_repo_dir) / ".git" / "hooks"
+    if not main_hooks.is_dir():
+        return
+
+    # Worktree .git is a file pointing to the main repo's worktree dir.
+    # The actual hooks dir for a worktree is in the main repo at:
+    # .git/worktrees/<worktree-name>/hooks (doesn't exist by default)
+    # But we can also just copy hooks into the worktree and configure.
+    #
+    # Simplest approach: copy the pre-commit hook and any other hooks
+    # to the worktree's common hooks dir.
+    wt_git_path = Path(worktree_dir) / ".git"
+    if wt_git_path.is_file():
+        # .git is a file like "gitdir: /path/to/.git/worktrees/task-123"
+        gitdir = wt_git_path.read_text().strip().replace("gitdir: ", "")
+        wt_hooks = Path(gitdir) / "hooks"
+        wt_hooks.mkdir(exist_ok=True)
+        for hook in main_hooks.iterdir():
+            if hook.is_file() and not hook.name.endswith(".sample"):
+                dest = wt_hooks / hook.name
+                shutil.copy2(str(hook), str(dest))
+    # Also copy .plugin-boundary-markers if it exists (for the pre-commit hook)
+    markers_src = Path(main_repo_dir) / ".plugin-boundary-markers"
+    markers_dst = Path(worktree_dir) / ".plugin-boundary-markers"
+    if markers_src.exists() and not markers_dst.exists():
+        shutil.copy2(str(markers_src), str(markers_dst))
+
+
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
@@ -1007,6 +1043,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     cwd=project_dir, capture_output=True, check=True,
                 )
                 worktree_dirs[t["id"]] = str(wt_path)
+                _copy_hooks_to_worktree(project_dir, str(wt_path))
                 print(f"  [Isolation] Task #{t['id']} -> {wt_path.name}")
             except subprocess.CalledProcessError:
                 # Fallback: if worktree creation fails, try without -b (branch may exist)
@@ -1018,6 +1055,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                         cwd=project_dir, capture_output=True, check=True,
                     )
                     worktree_dirs[t["id"]] = str(wt_path)
+                    _copy_hooks_to_worktree(project_dir, str(wt_path))
                     print(f"  [Isolation] Task #{t['id']} -> {wt_path.name} (retry)")
                 except Exception:
                     print(f"  [Isolation] WARNING: Could not create worktree for task #{t['id']}, using shared dir")
