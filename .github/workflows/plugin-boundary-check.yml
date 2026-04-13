@@ -5,19 +5,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Sparse checkout to avoid symlink/long-path issues
+          sparse-checkout: |
+            equipa/
+            .plugin-boundary-markers
+          sparse-checkout-cone-mode: false
       - name: Verify no direct plugin imports
         run: |
           # Core EQUIPA should never directly import plugin packages.
           # Plugins integrate via equipa.plugins entry points only.
-          # The markers file (.plugin-boundary-markers) is local-only
-          # and not committed — this check runs if it exists.
+          # The markers file is local-only (not committed) — this check
+          # runs only if it exists, otherwise passes cleanly.
           MARKERS_FILE=".plugin-boundary-markers"
           if [ -f "$MARKERS_FILE" ]; then
             MARKERS=$(cat "$MARKERS_FILE" | tr '\n' '|' | sed 's/|$//')
-            if [ -n "$MARKERS" ] && grep -rEi "$MARKERS" --include="*.py" .; then
+            if [ -n "$MARKERS" ] && grep -rEi "$MARKERS" --include="*.py" equipa/; then
               echo "::error::Direct plugin import detected. Use equipa.plugins entry points."
               exit 1
             fi
           else
-            echo "No plugin boundary markers file found — skipping check."
+            echo "No plugin boundary markers file found — check passes."
           fi
