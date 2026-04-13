@@ -156,3 +156,4 @@ tools/prepare_unified_training_data.py
 skill_manifest.json
 equipa/constants.py.bak
 
+.plugin-boundary-markers
