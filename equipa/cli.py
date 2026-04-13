@@ -789,9 +789,13 @@ def main() -> None:
     For --project mode, loops until no more todo tasks remain.
     For --task/--tasks mode, runs once and exits.
     """
-    # Apply config and discover roles at startup
+    # Apply config, discover roles, and load plugins at startup
     load_config()
     _discover_roles()
+
+    from equipa.plugins import load_plugins
+    import equipa.hooks as _hooks_module
+    load_plugins(_hooks_module)
 
     # Check sys.argv to determine if --project mode (no parse_args needed)
     is_project_mode = "--project" in sys.argv and "--task" not in sys.argv and "--tasks" not in sys.argv

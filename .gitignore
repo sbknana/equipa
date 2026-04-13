@@ -133,3 +133,27 @@ docs/html/
 theforge.db
 RETRY-*.md
 TOOL_RESULT_STORAGE*.md
+
+# Training data and eval artifacts
+training_data/
+training-data/
+training_data_stats.json
+tools/eval_coding_benchmark.py
+tools/prepare_unified_training_data.py
+
+# Stale root-level duplicates (real modules in equipa/ and scripts/)
+/lessons.py
+/loops.py
+/parsing.py
+/analyze_performance.py
+/autoresearch_loop.py
+/autoresearch_prompts.py
+/forgesmith_backfill.py
+/forgesmith_impact.py
+/nightly_review.py
+
+# Manifest regenerated at runtime
+skill_manifest.json
+equipa/constants.py.bak
+
+.plugin-boundary-markers
