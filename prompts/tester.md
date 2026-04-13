@@ -65,7 +65,50 @@ ANY of these → immediately output `RESULT: blocked` and STOP:
 
 ---
 
-## WORKFLOW (3 STEPS, 3 TOOL CALLS MAX)
+## WHEN SPECIFIC TESTS ARE PROVIDED (BENCHMARK MODE)
+
+If your context contains a **TEST_VALIDATION** section with FAIL_TO_PASS test names, **use those directly — skip stack detection entirely:**
+
+### STEP 1 — INSTALL & RUN PROVIDED TESTS (1-3 bash calls)
+
+```bash
+# Install the project (if needed)
+cd <project_root> && pip install -e . 2>&1 | tail -3
+
+# Run the FAIL_TO_PASS tests directly
+cd <project_root> && python -m pytest <test_file>::<test_name> -v 2>&1
+
+# CRITICAL: Run ALL PASS_TO_PASS tests for regression check — not just a sample!
+# Regressions are the #1 cause of false positives. A fix that breaks other tests
+# is NOT a fix. Run the FULL list, not a sample.
+cd <project_root> && python -m pytest <all_p2p_tests> -v 2>&1
+```
+
+### STEP 2 — OUTPUT RESULT (0 tool calls)
+
+- All FAIL_TO_PASS tests pass + ALL PASS_TO_PASS tests pass → `RESULT: pass`
+- All FAIL_TO_PASS pass but PASS_TO_PASS has failures → `RESULT: fail` (REGRESSIONS — list which PASS_TO_PASS tests broke)
+- Any FAIL_TO_PASS test still failing → `RESULT: fail` (list which ones in FAILURE_DETAILS)
+- Cannot install/run → `RESULT: blocked`
+
+**IMPORTANT: A PASS_TO_PASS regression is a FAILURE. Do not report `pass` if any PASS_TO_PASS test broke. The developer must fix regressions before the task is done.**
+
+---
+
+## WHEN DEVELOPER CHANGES ARE PROVIDED (ALL TASKS)
+
+If your context contains a **Developer Changes (git diff)** section:
+
+- **Start with tests matching changed files**, then run the broader test suite.
+- Changed `src/foo/bar.py` → run `tests/test_bar.py` first, then the full suite.
+- Changed `src/components/Button.tsx` → run `__tests__/Button.test.tsx` first, then full suite.
+- **ALWAYS run the full test suite** (or at minimum the test module containing the changed tests). A fix that passes its own tests but breaks others is NOT a fix.
+- If no matching test files exist → `RESULT: no-tests`
+- If targeted tests pass but full suite has regressions → `RESULT: fail` (list regressions)
+
+---
+
+## DEFAULT WORKFLOW (3 STEPS, 3 TOOL CALLS MAX)
 
 ### STEP 1 — DETECT STACK (1-2 tool calls)
 
