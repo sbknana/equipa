@@ -38,6 +38,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tarfile
@@ -677,11 +678,164 @@ print(f'task_id={tid}')
     return 1  # fallback
 
 
+def extract_attempt_reflection(
+    output: str,
+    patch: str,
+    attempt: int,
+    attempt_time: float,
+    task_status: str,
+) -> str:
+    """Extract a structured reflection from a failed attempt's output.
+
+    Parses the agent's RESULT block (SUMMARY, FILES_CHANGED, BLOCKERS,
+    REFLECTION) and combines it with attempt metadata to produce a concise
+    (<500 token) reflection for the next attempt.
+
+    Args:
+        output: Raw agent output from the attempt
+        patch: Git diff produced (may be empty)
+        attempt: Attempt number (1-based)
+        attempt_time: Wall-clock seconds for the attempt
+        task_status: Final task status (e.g. "blocked", "unknown")
+
+    Returns:
+        Structured reflection string for injection into next attempt.
+    """
+    # --- Parse structured fields from agent output ---
+    def _extract_field(text: str, field: str) -> str:
+        pattern = rf"(?:^|\n)\s*{field}:\s*(.+?)(?=\n\s*(?:SUMMARY|FILES_CHANGED|BLOCKERS|DECISIONS|REFLECTION|RESULT):|$)"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()[:300]
+        return ""
+
+    summary = _extract_field(output, "SUMMARY")
+    files_changed = _extract_field(output, "FILES_CHANGED")
+    blockers = _extract_field(output, "BLOCKERS")
+    reflection = _extract_field(output, "REFLECTION")
+
+    # --- Determine failure reason ---
+    output_lower = (output or "").lower()
+    if "timeout" in output_lower or attempt_time > 1700:
+        failure_reason = "timeout"
+    elif "authentication" in output_lower or "401" in output_lower:
+        failure_reason = "authentication_error"
+    elif blockers and "none" not in blockers.lower():
+        failure_reason = f"blocked: {blockers[:150]}"
+    elif task_status == "blocked":
+        failure_reason = "task_blocked"
+    elif not patch:
+        failure_reason = "no_patch_produced"
+    else:
+        failure_reason = f"tests_failed (status: {task_status})"
+
+    # --- Compute patch stats ---
+    patch_lines = patch.split("\n") if patch else []
+    adds = sum(
+        1 for line in patch_lines
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    dels = sum(
+        1 for line in patch_lines
+        if line.startswith("-") and not line.startswith("---")
+    )
+    patch_size_kb = len(patch) / 1024 if patch else 0
+
+    # --- Detect anti-patterns ---
+    anti_patterns: list[str] = []
+    if patch_size_kb > 500:
+        anti_patterns.append(
+            f"Patch bloated to {patch_size_kb:.0f}KB — avoid triggering "
+            "compilation or including generated files"
+        )
+    if "cython" in output_lower or "building extension" in output_lower:
+        anti_patterns.append(
+            "Triggered Cython/extension rebuild — commit source changes "
+            "BEFORE running tests"
+        )
+    if re.search(r"30 consecutive turns without file changes", output_lower):
+        anti_patterns.append(
+            "Agent spent all turns reading without writing code — "
+            "START EDITING IMMEDIATELY"
+        )
+    if "no_patch_produced" in failure_reason and attempt_time > 600:
+        anti_patterns.append(
+            "Ran for {:.0f}s with no output — do not over-analyze, "
+            "write code early".format(attempt_time)
+        )
+
+    # --- Build the reflection block ---
+    parts: list[str] = [
+        f"ATTEMPT {attempt} FAILED ({failure_reason}, {attempt_time:.0f}s):",
+    ]
+    if summary:
+        parts.append(f"  Approach: {summary}")
+    if files_changed and "none" not in files_changed.lower():
+        parts.append(f"  Files touched: {files_changed[:200]}")
+    if adds or dels:
+        parts.append(f"  Patch: +{adds}/-{dels} lines, {patch_size_kb:.1f}KB")
+    if reflection:
+        parts.append(f"  Agent reflection: {reflection[:200]}")
+    if anti_patterns:
+        parts.append("  AVOID: " + "; ".join(anti_patterns))
+
+    return "\n".join(parts)
+
+
 def reset_task_for_retry(
-    container: Any, instance: dict[str, Any], attempt: int
+    container: Any,
+    instance: dict[str, Any],
+    attempt: int,
+    previous_reflections: str = "",
 ) -> None:
-    """Reset the DB task for a retry attempt."""
-    py_script = f"""
+    """Reset the DB task for a retry attempt.
+
+    If previous_reflections is provided, appends a PREVIOUS ATTEMPTS block
+    to the task description so the next agent knows what was already tried.
+
+    Args:
+        container: Docker container handle
+        instance: SWE-bench instance dict
+        attempt: Current attempt number (1-based)
+        previous_reflections: Accumulated reflections from prior attempts
+    """
+    # Build the reflection injection SQL
+    if previous_reflections:
+        # Transfer reflection via JSON to avoid shell escaping issues
+        reflection_data = {
+            "db_path": f"{EQUIPA_DOCKER_DIR}/theforge.db",
+            "reflection": previous_reflections,
+        }
+        reflection_json = json.dumps(reflection_data).encode("utf-8")
+        _put_file(container, "/tmp", "reflection_data.json", reflection_json)
+
+        py_script = """
+import sqlite3, json
+with open('/tmp/reflection_data.json') as f:
+    d = json.load(f)
+conn = sqlite3.connect(d['db_path'])
+# Reset task state
+conn.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=1")
+conn.execute("DELETE FROM agent_runs WHERE task_id=1")
+conn.execute("DELETE FROM agent_actions WHERE task_id=1")
+conn.execute("DELETE FROM agent_messages WHERE task_id=1")
+# Inject reflection into task description
+cur = conn.execute("SELECT description FROM tasks WHERE id=1")
+row = cur.fetchone()
+if row:
+    desc = row[0]
+    marker = '\\n\\n--- PREVIOUS ATTEMPTS ---\\n'
+    if marker in desc:
+        desc = desc[:desc.index(marker)]
+    desc += marker + d['reflection']
+    conn.execute("UPDATE tasks SET description=? WHERE id=1", (desc,))
+conn.commit()
+conn.close()
+print('Task reset with reflection for attempt')
+"""
+        _put_script(container, "reset_task.py", py_script)
+    else:
+        py_script = f"""
 import sqlite3
 conn = sqlite3.connect('{EQUIPA_DOCKER_DIR}/theforge.db')
 conn.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=1")
@@ -692,7 +846,8 @@ conn.commit()
 conn.close()
 print('Task reset for attempt {attempt}')
 """
-    _put_script(container, "reset_task.py", py_script)
+        _put_script(container, "reset_task.py", py_script)
+
     exec_cmd(container, "python3 /tmp/reset_task.py")
 
 
@@ -1034,9 +1189,10 @@ def run_instance(
         # Create task
         task_id = create_task_in_container(container, instance)
 
-        # Retry loop
+        # Retry loop with cross-attempt memory
         best_patch = ""
         best_changes = 0
+        attempt_reflections: list[str] = []
 
         for attempt in range(1, max_retries + 1):
             result["attempts"] = attempt
@@ -1049,7 +1205,12 @@ def run_instance(
 
             if attempt > 1:
                 setup_masked_state(container, instance)
-                reset_task_for_retry(container, instance, attempt)
+                # Inject accumulated reflections from all prior attempts
+                reflections_block = "\n\n".join(attempt_reflections)
+                reset_task_for_retry(
+                    container, instance, attempt,
+                    previous_reflections=reflections_block,
+                )
 
             code, output = run_equipa_in_container(
                 container, task_id, timeout=timeout
@@ -1132,11 +1293,22 @@ def run_instance(
                             f"patch but {task_status} ({adds}+ {dels}-, "
                             f"{attempt_time:.0f}s)"
                         )
-                        continue
                 else:
                     print(f"empty diff ({attempt_time:.0f}s)")
+                    patch = ""
             else:
                 print(f"no patch ({attempt_time:.0f}s)")
+                patch = ""
+
+            # Extract reflection for cross-attempt memory
+            reflection = extract_attempt_reflection(
+                output=output,
+                patch=patch if patch else "",
+                attempt=attempt,
+                attempt_time=attempt_time,
+                task_status=task_status,
+            )
+            attempt_reflections.append(reflection)
 
         # Exhausted retries — submit best patch
         if best_patch:
