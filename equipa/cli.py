@@ -332,6 +332,22 @@ async def async_main() -> None:
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
 
+    # --- API key availability check ---
+    # Warn early if ANTHROPIC_API_KEY is missing. This is the #1 cause of
+    # 401 errors when running via nohup/background processes that don't
+    # source ~/.bashrc. The .env loader in forge_orchestrator.py handles
+    # automatic loading, but if both are missing we warn here.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        provider = (args.dispatch_config or {}).get("provider", "claude")
+        if provider != "ollama" and args.provider != "ollama":
+            print(
+                "WARNING: ANTHROPIC_API_KEY is not set in the environment.\n"
+                "  Background/nohup processes do not source ~/.bashrc.\n"
+                "  Fix: create a .env file in the EQUIPA project root with:\n"
+                "    ANTHROPIC_API_KEY=sk-ant-...\n"
+                "  Or export it in /etc/environment for system-wide access."
+            )
+
     # --- MCP server mode ---
     if args.mcp_server:
         from equipa.mcp_server import run_server

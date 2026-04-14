@@ -19,6 +19,13 @@ import os
 # Force unbuffered output so logs are visible in real-time via nohup/SSH
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+# Load .env BEFORE importing equipa — constants.py reads os.environ at
+# import time, so the API key must be in the environment before that happens.
+# This fixes ANTHROPIC_API_KEY being unavailable in nohup/background processes
+# that don't source ~/.bashrc.
+from equipa.env_loader import load_dotenv  # noqa: E402
+load_dotenv()
+
 from equipa import *  # noqa: F401, F403, E402
 from equipa.cli import main, async_main  # noqa: F401, E402
 
