@@ -157,3 +157,31 @@ skill_manifest.json
 equipa/constants.py.bak
 
 .plugin-boundary-markers
+
+# Benchmark results and artifacts
+benchmarks/EQUIPA*.json
+benchmarks/*.swebench-venv/
+benchmarks/FeatureBench/
+benchmarks/eval_outputs/
+benchmarks/logs/
+benchmarks/report.json
+benchmarks/fb_*.json
+benchmarks/fb_*.jsonl
+benchmarks/swebench_*.json
+benchmarks/swebench_*.jsonl
+benchmarks/container_dbs/
+benchmarks/*_full.json
+benchmarks/test_*.json
+benchmarks/first_50_instances.txt
+
+# QIAO — private, never commit to public repo
+prompts/qiao-*.md
+skills/qiao-*/
+**/qiao/
+qiao*.py
+
+# Task outputs (agent working dirs)
+task-outputs/
+
+# Runtime logs
+logs/
