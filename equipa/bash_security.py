@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 # Result type
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class BashSecurityResult:
     """Result of a bash security check.
 
@@ -276,11 +276,18 @@ def _check_incomplete_commands(command: str) -> BashSecurityResult:
             message="Command starts with operator (continuation line)",
         )
     # Trailing operator: command ends with |, ;, && (incomplete, expects more)
+    # Exception: \; at end is standard find -exec terminator, not incomplete
     if re.search(r"(?:\||&&|\|\||;)\s*$", trimmed):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.INCOMPLETE_COMMANDS,
-            message="Command ends with trailing operator (incomplete fragment)",
-        )
+        # Allow \; at end when used in find -exec context (POSIX standard)
+        if trimmed.rstrip().endswith("\\;") and re.search(
+            r"\bfind\b", trimmed
+        ) and re.search(r"-exec(?:dir)?\b", trimmed):
+            pass  # Safe: find -exec ... \;
+        else:
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.INCOMPLETE_COMMANDS,
+                message="Command ends with trailing operator (incomplete fragment)",
+            )
     return _SAFE
 
 
@@ -652,14 +659,39 @@ def _check_heredoc_in_substitution(command: str) -> BashSecurityResult:
     return _SAFE
 
 
+def _is_find_exec_escaped_semicolon(command: str) -> bool:
+    """Return True when all backslash-escaped operators are ``\\;`` in a
+    ``find -exec`` / ``find -execdir`` context.
+
+    After stripping every ``\\;`` occurrence, there should be no remaining
+    backslash-escaped operators for this to be considered safe.
+    """
+    if not re.search(r"\bfind\b", command):
+        return False
+    if not re.search(r"-exec(?:dir)?\b", command):
+        return False
+    # Strip all \; and re-check — any remaining \op is still dangerous
+    stripped = command.replace("\\;", "")
+    return not _has_backslash_escaped_operator(stripped)
+
+
 def _check_backslash_escaped_operators(command: str) -> BashSecurityResult:
-    r"""Check 21: ``\;``, ``\|``, ``\&``, ``\<``, ``\>`` outside quotes."""
-    if _has_backslash_escaped_operator(command):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.BACKSLASH_ESCAPED_OPERATORS,
-            message="Command contains backslash before shell operator which can hide command structure",
-        )
-    return _SAFE
+    r"""Check 21: ``\;``, ``\|``, ``\&``, ``\<``, ``\>`` outside quotes.
+
+    Exception: ``\;`` is allowed in ``find -exec`` / ``find -execdir``
+    context, where it is the standard command terminator.
+    """
+    if not _has_backslash_escaped_operator(command):
+        return _SAFE
+
+    # Allow \; in find -exec context (standard POSIX find syntax)
+    if _is_find_exec_escaped_semicolon(command):
+        return _SAFE
+
+    return BashSecurityResult(
+        safe=False, check_id=CheckID.BACKSLASH_ESCAPED_OPERATORS,
+        message="Command contains backslash before shell operator which can hide command structure",
+    )
 
 
 def _check_control_characters(command: str) -> BashSecurityResult:
@@ -761,15 +793,13 @@ def _check_shell_metacharacters(command: str, unquoted: str) -> BashSecurityResu
     NOTE: These patterns must match against the ORIGINAL command (not the
     unquoted version) because the metacharacters are *inside* quotes — the
     unquoted extractor would strip them.
-    """
-    # Quoted args with metacharacters inside
-    if re.search(r'''(?:^|\s)["'][^"']*[;&][^"']*["'](?:\s|$)''', command):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.SHELL_METACHARACTERS,
-            message="Command contains shell metacharacters (;, |, or &) in arguments",
-        )
 
-    # Find-specific patterns: -name, -path, -iname with metacharacters
+    Only targets find-style flags (``-name``, ``-path``, ``-iname``,
+    ``-regex``).  Semicolons inside quoted arguments to interpreters
+    (``python -c "import X; print(...)"``) are legitimate code separators
+    and are NOT flagged.
+    """
+    # Find-specific patterns: -name, -path, -iname, -regex with metacharacters
     for pattern in (
         r'''-name\s+["'][^"']*[;|&][^"']*["']''',
         r'''-path\s+["'][^"']*[;|&][^"']*["']''',
@@ -779,7 +809,7 @@ def _check_shell_metacharacters(command: str, unquoted: str) -> BashSecurityResu
         if re.search(pattern, command):
             return BashSecurityResult(
                 safe=False, check_id=CheckID.SHELL_METACHARACTERS,
-                message="Command contains shell metacharacters in arguments",
+                message="Command contains shell metacharacters in find arguments",
             )
     return _SAFE
 
