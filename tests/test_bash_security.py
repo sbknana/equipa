@@ -46,6 +46,8 @@ class TestSafeCommands:
         "tar czf archive.tar.gz dir/",
         "unzip file.zip -d /tmp/out",
         "find . -name '*.py' -type f",
+        r'find . -name "*.py" -exec grep -l "TODO" {} \;',
+        'python -c "import sys; print(sys.version)"',
     ])
     def test_safe_commands_pass(self, cmd: str) -> None:
         result = check_bash_command(cmd)
@@ -606,3 +608,83 @@ class TestCommentQuoteDesync:
         """# inside double quotes is not a comment."""
         result = check_bash_command('echo "hello # not a comment"')
         assert result.safe
+
+
+class TestCodeExplorationFalsePositives:
+    """Verify that read-only code exploration commands are NOT blocked.
+
+    Regression tests for FeatureBench false positives where agents were
+    blocked from searching codebases with standard find+grep and python -c
+    introspection commands.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        r'find /testbed -type f -name "*.py" -exec grep -l "pattern" {} \;',
+        r'find /testbed -name "conftest.py" -exec grep -l "genai" {} \;',
+        r'find . -name "*.py" -exec head -5 {} \;',
+        r'find /testbed -name "*.py" -execdir grep -l "test" {} \;',
+        r'find /srv/project -type f -name "*.txt" -exec wc -l {} \;',
+    ])
+    def test_find_exec_backslash_semicolon_is_safe(self, cmd: str) -> None:
+        """find -exec {} \\; is standard POSIX syntax, must not be blocked."""
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"False positive on find -exec command: {cmd!r} — "
+            f"check {result.check_id}: {result.message}"
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        'python -c "from module import X; print(X.__init__)"',
+        'python -c "import os; print(os.listdir())"',
+        'python -c "import sys; print(sys.version)"',
+        'python3 -c "from pathlib import Path; print(list(Path(\".\").glob(\"*.py\")))"',
+    ])
+    def test_python_c_introspection_is_safe(self, cmd: str) -> None:
+        """python -c with import/print for introspection must not be blocked."""
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"False positive on python -c command: {cmd!r} — "
+            f"check {result.check_id}: {result.message}"
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        "find /testbed -type f -name '*.py' | head -20",
+        "find . -name '*.py' | xargs grep -l 'pattern'",
+        "find . -name '*.py' -type f | wc -l",
+        "grep -rn 'pattern' /testbed/",
+        "grep -rl 'import pytest' tests/",
+    ])
+    def test_find_grep_pipe_combinations_are_safe(self, cmd: str) -> None:
+        """find piped to grep/head/wc is read-only exploration."""
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"False positive on find+grep pipe: {cmd!r} — "
+            f"check {result.check_id}: {result.message}"
+        )
+
+    def test_trailing_semicolon_still_blocked(self) -> None:
+        """Trailing bare ; (not \\;) should still be blocked as incomplete."""
+        result = check_bash_command("echo hello;")
+        assert not result.safe
+        assert result.check_id == CheckID.INCOMPLETE_COMMANDS
+
+    def test_trailing_pipe_still_blocked(self) -> None:
+        """Trailing | should still be blocked as incomplete."""
+        result = check_bash_command("cat file.txt |")
+        assert not result.safe
+        assert result.check_id == CheckID.INCOMPLETE_COMMANDS
+
+    def test_find_exec_plus_is_safe(self) -> None:
+        """find -exec {} + is also standard POSIX syntax."""
+        result = check_bash_command(
+            'find /testbed -name "*.py" -exec grep -l "test" {} +'
+        )
+        assert result.safe
+
+    def test_find_exec_with_malicious_payload_still_blocked(self) -> None:
+        r"""find -exec with additional backslash-escaped operators is NOT safe."""
+        # \| after \; means something beyond find -exec
+        result = check_bash_command(
+            r'find . -exec cat {} \; \| evil'
+        )
+        assert not result.safe
