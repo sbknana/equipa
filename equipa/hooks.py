@@ -100,7 +100,13 @@ def fire(event: str, **kwargs: Any) -> list[Any]:
             result = callback(event=event, **kwargs)
             results.append(result)
         except Exception as exc:
-            logger.warning("Hook callback %s for '%s' failed: %s", getattr(callback, "__name__", repr(callback)), event, exc)
+            cb_name = getattr(callback, "__name__", repr(callback))
+            cb_module = getattr(callback, "__module__", "unknown")
+            logger.warning(
+                "Hook callback %s (from %s) for '%s' failed: %s: %s",
+                cb_name, cb_module, event,
+                type(exc).__name__, exc,
+            )
             results.append(None)
 
     # Fire external command hooks
@@ -141,7 +147,13 @@ async def fire_async(event: str, **kwargs: Any) -> list[Any]:
             result = callback(event=event, **kwargs)
             results.append(result)
         except Exception as exc:
-            logger.warning("Hook callback %s for '%s' failed: %s", getattr(callback, "__name__", repr(callback)), event, exc)
+            cb_name = getattr(callback, "__name__", repr(callback))
+            cb_module = getattr(callback, "__module__", "unknown")
+            logger.warning(
+                "Hook callback %s (from %s) for '%s' failed: %s: %s",
+                cb_name, cb_module, event,
+                type(exc).__name__, exc,
+            )
             results.append(None)
 
     # Fire external command hooks asynchronously
