@@ -28,6 +28,7 @@ ROLE_SKILLS = {
     "tester": SKILLS_BASE_DIR / "tester",
     "code-reviewer": SKILLS_BASE_DIR / "code-reviewer",
     "debugger": SKILLS_BASE_DIR / "debugger",
+    "qiao-developer": SKILLS_BASE_DIR / "qiao-developer",
 }
 
 # Role prompt files (prepended with _common.md automatically)
@@ -42,6 +43,10 @@ ROLE_PROMPTS = {
     "debugger": PROMPTS_DIR / "debugger.md",
     "code-reviewer": PROMPTS_DIR / "code-reviewer.md",
     "qa-tester": PROMPTS_DIR / "qa-tester.md",
+    "qiao-developer": PROMPTS_DIR / "qiao-developer.md",
+    "qiao-tester": PROMPTS_DIR / "qiao-tester.md",
+    "qiao-benchmarker": PROMPTS_DIR / "qiao-benchmarker.md",
+    "qiao-researcher": PROMPTS_DIR / "qiao-researcher.md",
 }
 
 # --- Agent Defaults ---
@@ -63,6 +68,10 @@ DEFAULT_ROLE_TURNS = {
     "debugger": 30,
     "code-reviewer": 20,
     "qa-tester": 25,
+    "qiao-developer": 40,
+    "qiao-tester": 25,
+    "qiao-benchmarker": 30,
+    "qiao-researcher": 35,
 }
 
 # Checkpoint/Resume: save agent output on timeout for continuation
