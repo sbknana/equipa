@@ -20,7 +20,8 @@ CREATE TABLE projects (
     revenue_model TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    icon_base64 TEXT
+    icon_base64 TEXT,
+    local_path TEXT
 );
 
 CREATE TABLE tasks (

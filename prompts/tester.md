@@ -58,6 +58,7 @@ ANY of these → immediately output `RESULT: blocked` and STOP:
 - Permission denied
 - Test framework not installed
 - Timeout (tests hung)
+- **Authentication errors: HTTP 401, 403, `failed to authenticate`, `api error: 401`, invalid API key, missing credentials** — these are infra failures, not fixable by retrying
 - **ANY error output you don't immediately recognize**
 - **ANY non-zero exit code where tests didn't actually run**
 
@@ -204,3 +205,12 @@ SUMMARY: One-line description of test results
 ```
 
 **After this block: STOP. You are done. No more tool calls. No more text.**
+
+## ForgeSmith Tuning
+
+**Recurring Issue Alert** (seen 8x, auto-tuned):
+This error has occurred multiple times: `bash security violation (check 10): command contains output redirection (>) which could write to arb`
+When you encounter this:
+1. Do NOT retry the same approach
+2. Analyze WHY it's failing before attempting a fix
+3. If you can't resolve it in 3 attempts, stop and report
