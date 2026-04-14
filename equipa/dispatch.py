@@ -91,6 +91,130 @@ DEFAULT_DISPATCH_CONFIG: dict = {
 }
 
 
+# --- Cross-Attempt Memory Helpers ---
+
+_ATTEMPT_MARKER = "\n\n--- PREVIOUS ATTEMPTS ---\n"
+
+
+def _build_dispatch_attempt_reflection(
+    attempt: int,
+    outcome: str,
+    cycles: int,
+    result: dict,
+) -> str:
+    """Build a concise reflection from a failed dev-test loop attempt.
+
+    Extracts key failure signals from the loop result and outcome to help
+    the next attempt avoid repeating the same mistakes.
+
+    Args:
+        attempt: 1-based attempt number
+        outcome: Outcome string from run_dev_test_loop (e.g. "cycles_exhausted")
+        cycles: Number of dev-test cycles completed
+        result: Result dict from the dev-test loop
+
+    Returns:
+        A concise reflection string (<300 chars).
+    """
+    duration = result.get("duration", 0)
+    cost = result.get("cost", 0)
+
+    # Determine failure category
+    if outcome == "cycles_exhausted":
+        reason = f"exhausted {cycles} dev-test cycles without passing tests"
+    elif outcome == "cost_limit":
+        reason = f"hit cost limit (${cost:.2f}) after {cycles} cycle(s)"
+    elif outcome == "early_completed_blocked":
+        reason = "agent reported blocked"
+    elif outcome == "loop_detected":
+        reason = "loop detected — agent kept trying the same approach"
+    else:
+        reason = outcome
+
+    # Extract structured fields from agent output if available
+    from equipa.parsing import _extract_section
+
+    raw_output = result.get("raw_output", "")
+    files_info = ""
+    blockers_info = ""
+    reflection_info = ""
+
+    if raw_output:
+        files_text = _extract_section(raw_output, "FILES_CHANGED")
+        if files_text and "none" not in files_text.lower():
+            # Strip the marker prefix
+            files_text = files_text.replace("FILES_CHANGED:", "").strip()[:200]
+            if files_text:
+                files_info = f"\n  Files touched: {files_text}"
+
+        blockers_text = _extract_section(raw_output, "BLOCKERS")
+        if blockers_text and "none" not in blockers_text.lower():
+            blockers_text = blockers_text.replace("BLOCKERS:", "").strip()[:200]
+            if blockers_text:
+                blockers_info = f"\n  Blockers: {blockers_text}"
+
+        reflection_text = _extract_section(raw_output, "REFLECTION", max_lines=3)
+        if reflection_text:
+            reflection_text = reflection_text.replace("REFLECTION:", "").strip()[:200]
+            if reflection_text:
+                reflection_info = f"\n  Agent reflection: {reflection_text}"
+
+    parts = [
+        f"ATTEMPT {attempt} FAILED ({reason}, {cycles} cycles, {duration:.0f}s):",
+    ]
+    if files_info:
+        parts.append(files_info)
+    if blockers_info:
+        parts.append(blockers_info)
+    if reflection_info:
+        parts.append(reflection_info)
+    parts.append("  DO NOT repeat this approach. Try a different strategy.")
+
+    return "\n".join(parts)
+
+
+def _inject_attempt_reflections(
+    conn: object,
+    task_id: int,
+    reflections: list[str],
+) -> None:
+    """Inject accumulated attempt reflections into a task's description.
+
+    Appends a PREVIOUS ATTEMPTS block to the task description so the next
+    agent attempt knows what was already tried and what failed.
+
+    Args:
+        conn: SQLite connection (caller manages commit)
+        task_id: Task ID to update
+        reflections: List of reflection strings from prior attempts
+    """
+    cur = conn.execute(  # type: ignore[union-attr]
+        "SELECT description FROM tasks WHERE id = ?", (task_id,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    desc = row[0] or ""
+
+    # Strip any existing reflection block to avoid unbounded growth
+    if _ATTEMPT_MARKER in desc:
+        desc = desc[: desc.index(_ATTEMPT_MARKER)]
+
+    # Build and append the new block
+    reflections_block = "\n\n".join(reflections)
+
+    # Enforce token budget (~500 tokens ≈ ~2000 chars)
+    if len(reflections_block) > 2000:
+        reflections_block = reflections_block[:2000] + "\n[...earlier attempts trimmed...]"
+
+    desc += _ATTEMPT_MARKER + reflections_block
+
+    conn.execute(  # type: ignore[union-attr]
+        "UPDATE tasks SET description = ? WHERE id = ?", (desc, task_id)
+    )
+
+
 def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
     """Check if a feature flag is enabled.
 
@@ -393,10 +517,11 @@ async def run_project_tasks(
             title=task.get("title", ""),
         )
 
-        # --- Autoresearch retry loop ---
+        # --- Autoresearch retry loop with cross-attempt memory ---
         autoresearch_on = is_feature_enabled(config, "autoresearch")
         max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
         retry_count = 0
+        attempt_reflections: list[str] = []
 
         while True:
             result, cycles, outcome = await run_dev_test_loop(
@@ -409,6 +534,12 @@ async def run_project_tasks(
             # Success - break out of retry loop
             if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
                 break
+
+            # Extract reflection from failed attempt for cross-attempt memory
+            attempt_reflection = _build_dispatch_attempt_reflection(
+                retry_count + 1, outcome, cycles, result,
+            )
+            attempt_reflections.append(attempt_reflection)
 
             # Not retriable or retries exhausted
             if not autoresearch_on or retry_count >= max_retries:
@@ -440,14 +571,17 @@ async def run_project_tasks(
                 )
                 log(f"  [Autoresearch] Cleaned up branch {branch_name}", output)
 
-            # Reset task to todo so run_dev_test_loop picks it up fresh
+            # Reset task to todo and inject cross-attempt memory
             conn = get_db_connection(write=True)
             conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+            if attempt_reflections:
+                _inject_attempt_reflections(conn, task_id, attempt_reflections)
             conn.commit()
             conn.close()
-            log(f"  [Autoresearch] Reset task #{task_id} to todo for fresh attempt", output)
+            log(f"  [Autoresearch] Reset task #{task_id} to todo with "
+                f"{len(attempt_reflections)} attempt reflection(s)", output)
 
-            # Re-fetch task to get clean state
+            # Re-fetch task to get clean state (with injected reflections)
             task = fetch_task(task_id)
             if not task:
                 log(f"  [Autoresearch] Task #{task_id} disappeared from DB. Aborting retries.", output)
