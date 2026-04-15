@@ -471,11 +471,12 @@ async def _run_agent_streaming_impl(
     turn_count = 0
     turns_without_file_change = 0
     # Scale early termination with budget — larger budgets get more reading time
-    # but cap aggressively to prevent analysis paralysis on large codebases.
-    # Max kill threshold = 1.5x base (was 2x — too generous, agents burned 12+ turns)
+    # but cap HARD to prevent analysis paralysis on large codebases.
+    # Max kill threshold = 1.25x base. Previous 1.5x was too generous — agents
+    # burned 12+ turns reading on 58KB+ patches (FeatureBench task 3).
     effective_kill_turns = min(
-        int(EARLY_TERM_KILL_TURNS * 1.5),
-        max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.18))
+        int(EARLY_TERM_KILL_TURNS * 1.25),
+        max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.15))
     )
     # On paralysis retries, progressively tighten kill thresholds.
     # Each retry halves remaining patience: retry 1 → -2 turns, retry 2 → -3, etc.
@@ -695,12 +696,14 @@ async def _run_agent_streaming_impl(
                         turns_without_file_change += 1
                         # Track consecutive read-only tool calls for faster
                         # escalation on large codebases. When agent calls
-                        # Read/Grep/Glob 4+ times without Edit/Write, skip
+                        # Read/Grep/Glob 3+ times without Edit/Write, skip
                         # straight to final warning — don't wait for the
-                        # normal turn-based escalation.
+                        # normal turn-based escalation. Reduced from 4 to 3
+                        # because agents on 58KB+ patches hit all 4 reads
+                        # before the warning could change their behavior.
                         if tool_name in ("Read", "Grep", "Glob", "Agent"):
                             consecutive_readonly_tools += 1
-                        if (consecutive_readonly_tools >= 4
+                        if (consecutive_readonly_tools >= 3
                                 and not final_warning_injected):
                             log(f"  [EarlyTerm] FAST ESCALATION: "
                                 f"{consecutive_readonly_tools} consecutive "
@@ -808,6 +811,22 @@ async def _run_agent_streaming_impl(
                     consecutive_text_only_turns = 0
                 else:
                     consecutive_text_only_turns += 1
+
+                    # Post-final-warning enforcement for text-only turns:
+                    # If agent was told "write next turn or die" but responds
+                    # with pure text (no tool calls at all), that's worse than
+                    # a read-only tool call — kill immediately.
+                    if must_write_next_turn and not is_exempt:
+                        early_term_reason = (
+                            f"Agent terminated: received FINAL WARNING but "
+                            f"responded with text-only turn (no tool calls) "
+                            f"instead of Edit/Write. "
+                            f"{turns_without_file_change} turns without "
+                            f"file changes — analysis paralysis"
+                        )
+                        log(f"  [EarlyTerm] KILLED (post-warning, text-only): "
+                            f"{early_term_reason}", output)
+
                     monologue_action = _check_monologue(
                         consecutive_text_only_turns, turn_count,
                     )
