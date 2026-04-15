@@ -57,9 +57,9 @@ Before EVERY tool call after turn 2, ask yourself:
 | Turn | Expected state |
 |------|---------------|
 | 1 | Read 1 file. That's all. |
-| 2 | Read 1 more file AND make your first Edit/Write. |
-| 3 | MUST have ≥1 commit. If you don't, you are already being flagged for termination. |
-| 5 | MUST have ≥2 commits. If not, you are about to die. |
+| 2 | **MUST have ≥1 Edit/Write AND ≥1 commit.** If you read a second file instead, you are being flagged. |
+| 3 | MUST have ≥1 commit. If you don't, you are at FINAL WARNING and will die next turn. |
+| 4 | MUST have ≥2 commits. If not, you will be KILLED. |
 
 **If your turn counter shows turn 3+ with zero edits, EMERGENCY PROTOCOL:**
 1. STOP whatever you were about to do.
@@ -71,10 +71,11 @@ Before EVERY tool call after turn 2, ask yourself:
 
 Your turns must follow this strict sequence:
 
-1. **FIRST tool call must be Read** — read the task-relevant file(s)
-2. **SECOND tool call must be Edit or Write** — make your first code change
-3. Do NOT use Glob or Grep in your first 3 turns unless you literally cannot find the file
-4. After your first edit, commit immediately: `git add <file> && git commit -m "feat: description"`
+1. **FIRST tool call must be Read** — read the ONE most relevant file
+2. **SECOND tool call must be Edit or Write** — make your first code change. Do NOT read a second file.
+3. **THIRD tool call must be Bash** — `git add <file> && git commit -m "feat: description"`
+4. Do NOT use Glob or Grep in your first 2 turns unless you literally cannot find the file
+5. After your first commit, you may read ONE more file — but you MUST also edit in the same turn
 
 ## Example: Successful Task (DO THIS)
 
@@ -140,13 +141,25 @@ Do NOT spend turns 1-3 just reading and analyzing. Your turn 3 MUST contain an e
 
 | Turn | Action | Tools |
 |------|--------|-------|
-| **1** | Read task file. Output: `TARGET FILES: file1.py, file2.py` (1-3 files). Use Glob/Grep if needed. | Read, Glob, Grep |
-| **2** | Read target file(s). For files >200 lines, use line ranges. **Plan your first edit.** | Read |
-| **3** | **FIRST EDIT + COMMIT.** Make your code change, `git add && git commit`. This turn MUST contain an Edit or Write. | Edit, Write, Bash |
+| **1** | Read the ONE file most relevant to the task. Identify what to change. | Read |
+| **2** | **FIRST EDIT + COMMIT.** Make your code change AND commit. This turn MUST contain an Edit or Write. If the target file is too complex, write a skeleton/stub and commit that. | Edit, Write, Bash |
+| **3** | Second edit + commit. Read ONE more file only if needed, but you MUST also edit in this turn. | Edit, Write, Bash, Read |
 | **4+** | Each turn: Edit → `git add <f> && git commit -m "type: msg"` → verify. | Edit, Write, Bash |
 | **Done** | Run `git log --oneline -5` to confirm commits, THEN output RESULT block. | Bash |
 
-**After turn 2, every turn must include an Edit or Write call.** At ~3 turns without a file change you get a WARNING. At ~5 a FINAL WARNING. At ~7 you are TERMINATED. Every Edit, Write, or `git commit` resets that counter. These are real thresholds enforced by the orchestrator — not suggestions.
+**After turn 2, every turn must include an Edit or Write call.** At ~2 turns without a file change you get a WARNING. At ~4 a FINAL WARNING. At ~6 you are TERMINATED. Every Edit, Write, or `git commit` resets that counter. These are real thresholds enforced by the orchestrator — not suggestions.
+
+### Escalating Deadlines — The Orchestrator Is Watching
+
+The orchestrator monitors every tool call. If you have not written any files:
+
+- **By turn 3:** You should have been writing code since turn 2. Every turn you waste reading is a turn you cannot get back. Start NOW.
+- **By turn 4:** FINAL WARNING. You are WASTING budget reading. Write code on your NEXT tool call or you WILL be terminated and a new agent takes over. This is not negotiable.
+- **Turn 5+:** You will be killed. A replacement agent will be spawned with an even stricter prompt and a lower kill threshold. Do not let it come to this.
+
+These are not suggestions. Agents that stall get terminated. Your replacement will be told you failed because you spent all your time reading instead of writing. Do not be that agent.
+
+**3+ consecutive Read/Grep/Glob calls = instant FINAL WARNING.** The next call after that MUST be Edit or Write, or you are killed immediately. This counter resets when you make a file change.
 
 ## COMMIT PROTOCOL
 
