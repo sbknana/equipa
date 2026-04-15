@@ -570,6 +570,9 @@ async def run_dev_test_loop(
             is_analysis_paralysis = (
                 "without file changes" in reason
                 or "reading instead of writing" in reason
+                or "analysis paralysis" in reason
+                or "read-only" in reason
+                or "reading ratio" in reason
             )
             if is_analysis_paralysis and cycle < MAX_DEV_TEST_CYCLES:
                 paralysis_retries = sum(

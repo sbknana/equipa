@@ -486,6 +486,19 @@ async def _run_agent_streaming_impl(
         effective_kill_turns = max(3, effective_kill_turns - reduction)
         log(f"  [EarlyTerm] Paralysis retry #{paralysis_retry_count}: "
             f"kill threshold reduced to {effective_kill_turns} turns", output)
+        # On ANY paralysis retry, the agent gets ZERO free reads.
+        # Set must_write_next_turn from the start so the very first
+        # read-only tool call triggers a kill. Previous behavior allowed
+        # retry #1 agents one free read — they used it to start another
+        # analysis spiral. Seen in FeatureBench task 3: agents hit
+        # EarlyTerm on attempts 4, 5, 6, 8, 10 because each retry still
+        # opened with Read calls.
+        must_write_next_turn = True
+        warning_injected = True
+        final_warning_injected = True
+        log(f"  [EarlyTerm] Paralysis retry #{paralysis_retry_count}: "
+            f"must_write_next_turn=True from turn 0 — ZERO free reads",
+            output)
     effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.7))
     effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.45))
     has_any_file_change = False
@@ -730,14 +743,15 @@ async def _run_agent_streaming_impl(
 
                         # Track consecutive read-only tool calls for faster
                         # escalation on large codebases. When agent calls
-                        # Read/Grep/Glob 3+ times without Edit/Write, skip
+                        # Read/Grep/Glob 2+ times without Edit/Write, skip
                         # straight to final warning — don't wait for the
-                        # normal turn-based escalation. Reduced from 4 to 3
-                        # because agents on 58KB+ patches hit all 4 reads
-                        # before the warning could change their behavior.
+                        # normal turn-based escalation. Reduced from 3 to 2
+                        # because agents on 58KB+ patches burned all 3 reads
+                        # before the warning could change their behavior
+                        # (FeatureBench task 3, attempts 4-10).
                         if tool_name in ("Read", "Grep", "Glob", "Agent"):
                             consecutive_readonly_tools += 1
-                        if (consecutive_readonly_tools >= 3
+                        if (consecutive_readonly_tools >= 2
                                 and not final_warning_injected):
                             log(f"  [EarlyTerm] FAST ESCALATION: "
                                 f"{consecutive_readonly_tools} consecutive "
@@ -824,6 +838,33 @@ async def _run_agent_streaming_impl(
                                     f"Write, you are dead.", output)
                                 final_warning_injected = True
                                 must_write_next_turn = True
+
+                            # Reading-ratio kill: even if the agent made an
+                            # early edit, catch agents that relapse into
+                            # analysis after one trivial change. If >75% of
+                            # tool calls are read-only after turn 8, kill.
+                            if (turn_count >= 8
+                                    and not early_term_reason
+                                    and consecutive_readonly_tools >= 4
+                                    and len(tool_history) > 0):
+                                read_tools_total = sum(
+                                    1 for sig in tool_history
+                                    if any(sig.startswith(t)
+                                           for t in ("Read:", "Grep:", "Glob:",
+                                                     "Agent:"))
+                                )
+                                ratio = read_tools_total / len(tool_history)
+                                if ratio >= 0.75:
+                                    early_term_reason = (
+                                        f"Agent terminated: {ratio:.0%} of "
+                                        f"tool calls are read-only after "
+                                        f"{turn_count} turns "
+                                        f"({read_tools_total}/{len(tool_history)}). "
+                                        f"Reading ratio exceeded 75% threshold "
+                                        f"— analysis paralysis with token edits"
+                                    )
+                                    log(f"  [EarlyTerm] KILLED (reading ratio): "
+                                        f"{early_term_reason}", output)
 
                             if turns_without_file_change >= effective_kill_turns:
                                 early_term_reason = (
