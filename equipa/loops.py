@@ -503,10 +503,16 @@ async def run_dev_test_loop(
             project_dir=project_dir, model=dev_model,
         )
 
+        # Extract paralysis retry count so agent_runner can apply tighter
+        # kill thresholds. Without this, the escalating prompt injections
+        # have no teeth — the agent still gets the full kill budget.
+        paralysis_retries = dev_run_config.get("_paralysis_retry_count", 0)
+
         dev_result = await dispatch_agent(
             dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
             task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
-            project_dir=project_dir, args=args)
+            project_dir=project_dir, args=args,
+            paralysis_retry_count=paralysis_retries)
         dev_result["turns_allocated"] = dev_turns_allocated
         dev_result["turns_max"] = dev_turns_max
         total_duration += dev_result.get("duration", 0)
@@ -537,41 +543,92 @@ async def run_dev_test_loop(
             log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
             loop_detector.record(dev_result, cycle)
 
-            # If killed for analysis paralysis (no file changes), retry ONCE with
-            # an ultra-aggressive scaffold-first prompt instead of failing immediately.
-            # This is the #1 cause of failure on large codebases.
+            # If killed for analysis paralysis (no file changes), retry with
+            # escalating scaffold-first prompts. Each retry is MORE aggressive
+            # and reduces the kill threshold. This is the #1 cause of failure
+            # on large codebases — seen in FeatureBench task 3 where the agent
+            # hit EarlyTerm on attempts 4, 5, 6, 8, 10.
             is_analysis_paralysis = (
                 "without file changes" in reason
                 or "reading instead of writing" in reason
             )
             if is_analysis_paralysis and cycle < MAX_DEV_TEST_CYCLES:
-                log(f"  [Cycle {cycle}] Analysis paralysis detected — retrying with "
-                    f"scaffold-first injection (attempt {cycle + 1}).", output)
-                paralysis_injection = (
-                    "## CRITICAL: Previous Agent KILLED for Analysis Paralysis\n\n"
-                    "The previous agent was TERMINATED after spending ALL its "
-                    "turns reading code without writing a single line. You are "
-                    "the replacement. If you repeat this mistake, you will ALSO "
-                    "be terminated and the task will be marked as FAILED.\n\n"
-                    "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
-                    "1. **Your FIRST tool call MUST be Edit or Write.** Not Read. "
-                    "Not Grep. Not Glob. EDIT or WRITE.\n"
-                    "2. **Do NOT read any files first.** The task description "
-                    "contains everything you need to write a first draft.\n"
-                    "3. **Write a minimal skeleton/stub immediately.** It does "
-                    "not need to be perfect. Wrong code you can fix is infinitely "
-                    "better than no code at all.\n"
-                    "4. **After your first edit, commit it.** Then read ONE file "
-                    "if needed and make your next edit.\n\n"
-                    "### WHY THE PREVIOUS AGENT FAILED\n\n"
-                    "It tried to understand the entire codebase before writing. "
-                    "On large repos, this is impossible within the turn budget. "
-                    "The correct approach: write first, read errors, fix "
-                    "iteratively.\n\n"
-                    "**If your first tool call is Read, Grep, or Glob, you will "
-                    "be immediately terminated.** Write code NOW."
+                paralysis_retries = sum(
+                    1 for ctx in compaction_history
+                    if "KILLED for Analysis Paralysis" in ctx
                 )
+                log(f"  [Cycle {cycle}] Analysis paralysis detected "
+                    f"(paralysis retry #{paralysis_retries + 1}) — retrying "
+                    f"with escalating scaffold-first injection.", output)
+
+                # Escalating kill threshold reduction: each retry halves
+                # the remaining patience. Passed via env hint in the prompt.
+                reduced_kill = max(3, 6 - paralysis_retries)
+
+                if paralysis_retries == 0:
+                    # First retry — firm but instructive
+                    paralysis_injection = (
+                        "## CRITICAL: Previous Agent KILLED for Analysis "
+                        "Paralysis\n\n"
+                        "The previous agent was TERMINATED after spending ALL "
+                        "its turns reading code without writing a single line. "
+                        "You are the replacement. If you repeat this mistake, "
+                        "you will ALSO be terminated and the task will be "
+                        "marked as FAILED.\n\n"
+                        "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
+                        "1. **Your FIRST tool call MUST be Edit or Write.** "
+                        "Not Read. Not Grep. Not Glob. EDIT or WRITE.\n"
+                        "2. **Do NOT read any files first.** The task "
+                        "description contains everything you need for a "
+                        "first draft.\n"
+                        "3. **Write a minimal skeleton/stub immediately.** "
+                        "Wrong code you can fix is infinitely better than no "
+                        "code at all.\n"
+                        "4. **After your first edit, commit it.** Then read "
+                        "ONE file if needed and make your next edit.\n\n"
+                        f"**Kill threshold: {reduced_kill} turns.** If your "
+                        f"first tool call is Read, you are already failing."
+                    )
+                elif paralysis_retries == 1:
+                    # Second retry — maximum urgency
+                    paralysis_injection = (
+                        "## FINAL CHANCE: 2 Agents Already KILLED\n\n"
+                        "**TWO agents have been terminated on this task for "
+                        "analysis paralysis.** You are the LAST attempt before "
+                        "this task is marked FAILED.\n\n"
+                        "### ZERO-READ PROTOCOL\n\n"
+                        "- **Do NOT read ANY files.** Period.\n"
+                        "- Your FIRST action: Write a stub/skeleton file based "
+                        "ONLY on the task description.\n"
+                        "- Your SECOND action: `git add && git commit`.\n"
+                        "- Your THIRD action: Read ONE file, make ONE edit, "
+                        "commit.\n"
+                        "- Repeat: read-edit-commit in tight loops.\n\n"
+                        f"**Kill threshold: {reduced_kill} turns without file "
+                        f"changes.** You have almost NO reading budget. Write "
+                        f"FIRST."
+                    )
+                else:
+                    # Third+ retry — absolute minimum
+                    paralysis_injection = (
+                        f"## EMERGENCY: {paralysis_retries + 1} Agents KILLED "
+                        f"on This Task\n\n"
+                        f"**{paralysis_retries} previous agents ALL failed by "
+                        f"reading instead of writing.** Kill threshold: "
+                        f"{reduced_kill} turns. Your very first tool call MUST "
+                        f"create or edit a file. Do NOT read anything. Write a "
+                        f"skeleton based on the task title alone, commit it, "
+                        f"then iterate. This is your only chance."
+                    )
                 compaction_history.append(paralysis_injection)
+
+                # Store retry count so agent_runner applies tighter kill
+                # thresholds on the next dispatch. Using dict key check,
+                # not hasattr (dev_run_config is a dict, not an object).
+                dev_run_config["_paralysis_retry_count"] = (
+                    paralysis_retries + 1
+                )
+
                 # Don't return — fall through to next cycle
                 continue
 

@@ -449,6 +449,7 @@ async def _run_agent_streaming_impl(
     cycle_number: int = 1,
     project_dir: str | None = None,
     abort_controller: AbortController | None = None,
+    paralysis_retry_count: int = 0,
 ) -> dict[str, Any]:
     """Internal implementation of streaming agent execution.
 
@@ -476,6 +477,14 @@ async def _run_agent_streaming_impl(
         int(EARLY_TERM_KILL_TURNS * 1.5),
         max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.18))
     )
+    # On paralysis retries, progressively tighten kill thresholds.
+    # Each retry halves remaining patience: retry 1 → -2 turns, retry 2 → -3, etc.
+    # Floor at 3 turns — even the most aggressive retry needs a couple turns.
+    if paralysis_retry_count > 0:
+        reduction = min(paralysis_retry_count + 1, effective_kill_turns - 3)
+        effective_kill_turns = max(3, effective_kill_turns - reduction)
+        log(f"  [EarlyTerm] Paralysis retry #{paralysis_retry_count}: "
+            f"kill threshold reduced to {effective_kill_turns} turns", output)
     effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.7))
     effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.45))
     has_any_file_change = False
@@ -491,6 +500,7 @@ async def _run_agent_streaming_impl(
     warning_injected = False
     final_warning_injected = False
     must_write_next_turn = False  # After final warning, kill on next read-only turn
+    consecutive_readonly_tools = 0  # Track read-only streaks for faster escalation
     loop_warning_injected = False
     early_term_reason: str | None = None
     loop_detected_details: str | None = None  # noqa: F841
@@ -679,9 +689,29 @@ async def _run_agent_streaming_impl(
                 if turn_has_tool_calls and not is_exempt:
                     if turn_has_file_change:
                         turns_without_file_change = 0
+                        consecutive_readonly_tools = 0
                         must_write_next_turn = False  # Agent wrote — crisis averted
                     else:
                         turns_without_file_change += 1
+                        # Track consecutive read-only tool calls for faster
+                        # escalation on large codebases. When agent calls
+                        # Read/Grep/Glob 4+ times without Edit/Write, skip
+                        # straight to final warning — don't wait for the
+                        # normal turn-based escalation.
+                        if tool_name in ("Read", "Grep", "Glob", "Agent"):
+                            consecutive_readonly_tools += 1
+                        if (consecutive_readonly_tools >= 4
+                                and not final_warning_injected):
+                            log(f"  [EarlyTerm] FAST ESCALATION: "
+                                f"{consecutive_readonly_tools} consecutive "
+                                f"read-only tool calls without any file edit. "
+                                f"Skipping to FINAL WARNING. "
+                                f"(role={role}, turn ~{turn_count}). "
+                                f"Your NEXT tool call MUST be Edit or Write "
+                                f"or you will be TERMINATED.", output)
+                            warning_injected = True
+                            final_warning_injected = True
+                            must_write_next_turn = True
 
                         tool_history.append(_build_tool_signature(tool_name, tool_input))
 
@@ -1025,6 +1055,7 @@ async def run_agent_streaming_with_retry(
     fallback_model: str | None = "sonnet",
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
+    paralysis_retry_count: int = 0,
 ) -> dict[str, Any]:
     """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
 
@@ -1052,7 +1083,8 @@ async def run_agent_streaming_with_retry(
         result = await _run_agent_streaming_impl(
             cmd, role=role, output=output, max_turns=max_turns,
             task_id=task_id, run_id=None, cycle_number=cycle_number,
-            project_dir=project_dir, abort_controller=abort_controller
+            project_dir=project_dir, abort_controller=abort_controller,
+            paralysis_retry_count=paralysis_retry_count,
         )
 
         # If successful, return immediately
@@ -1156,6 +1188,7 @@ async def run_agent_streaming(
     cycle_number: int = 1,
     project_dir: str | None = None,
     abort_controller: AbortController | None = None,
+    paralysis_retry_count: int = 0,
 ) -> dict[str, Any]:
     """Spawn claude -p with stream-json output for real-time stuck detection.
 
@@ -1174,7 +1207,8 @@ async def run_agent_streaming(
     """
     return await run_agent_streaming_with_retry(
         cmd, role=role, output=output, max_turns=max_turns,
-        task_id=task_id, cycle_number=cycle_number, project_dir=project_dir
+        task_id=task_id, cycle_number=cycle_number, project_dir=project_dir,
+        paralysis_retry_count=paralysis_retry_count,
     )
 
 
@@ -1188,6 +1222,7 @@ async def dispatch_agent(
     system_prompt: str | PromptResult | None = None,
     project_dir: str | None = None,
     args: Any = None,
+    paralysis_retry_count: int = 0,
 ) -> dict[str, Any]:
     """Dispatch an agent using the configured provider (Claude or Ollama).
 
@@ -1246,6 +1281,7 @@ async def dispatch_agent(
         # Wrap streaming with retry logic
         return await run_agent_streaming_with_retry(
             cmd, role=role, output=output, max_turns=max_turns,
-            task_id=task_id, cycle_number=cycle, project_dir=project_dir)
+            task_id=task_id, cycle_number=cycle, project_dir=project_dir,
+            paralysis_retry_count=paralysis_retry_count)
     else:
         return await run_agent(cmd)
