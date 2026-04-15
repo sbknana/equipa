@@ -277,9 +277,9 @@ def test_same_input_different_output_not_flagged():
 
 def test_constants_values():
     """Test that early termination constants have expected values."""
-    assert EARLY_TERM_WARN_TURNS == 5, f"EARLY_TERM_WARN_TURNS should be 5, got {EARLY_TERM_WARN_TURNS}"
-    assert EARLY_TERM_FINAL_WARN_TURNS == 8, f"EARLY_TERM_FINAL_WARN_TURNS should be 8, got {EARLY_TERM_FINAL_WARN_TURNS}"
-    assert EARLY_TERM_KILL_TURNS == 10, f"EARLY_TERM_KILL_TURNS should be 10, got {EARLY_TERM_KILL_TURNS}"
+    assert EARLY_TERM_WARN_TURNS == 2, f"EARLY_TERM_WARN_TURNS should be 2, got {EARLY_TERM_WARN_TURNS}"
+    assert EARLY_TERM_FINAL_WARN_TURNS == 4, f"EARLY_TERM_FINAL_WARN_TURNS should be 4, got {EARLY_TERM_FINAL_WARN_TURNS}"
+    assert EARLY_TERM_KILL_TURNS == 6, f"EARLY_TERM_KILL_TURNS should be 6, got {EARLY_TERM_KILL_TURNS}"
     assert EARLY_TERM_WARN_TURNS < EARLY_TERM_FINAL_WARN_TURNS < EARLY_TERM_KILL_TURNS, \
         f"WARN_TURNS ({EARLY_TERM_WARN_TURNS}) < FINAL_WARN_TURNS ({EARLY_TERM_FINAL_WARN_TURNS}) < KILL_TURNS ({EARLY_TERM_KILL_TURNS})"
 
@@ -1136,7 +1136,7 @@ def test_developer_prompt_has_mandatory_first_actions():
         "developer prompt missing first-action Read directive"
     assert "SECOND tool call must be Edit or Write" in text, \
         "developer prompt missing second-action Edit/Write directive"
-    assert "Do NOT use Glob or Grep in your first 3 turns" in text, \
+    assert "Do NOT use Glob or Grep in your first 2 turns" in text, \
         "developer prompt missing Glob/Grep restriction"
 
 
