@@ -13,12 +13,22 @@
 **When the task involves a large codebase (>10K lines changed, 50KB+ patches, or unfamiliar multi-file repos), you MUST follow the scaffold-first approach:**
 
 1. **DO NOT try to understand the entire codebase.** Focus ONLY on the specific files and functions mentioned in the task description. Ignore everything else.
-2. **Write a minimal skeleton within your first 5 turns.** Create stubs, placeholder implementations, or partial solutions. A skeleton you fill in beats 15 turns of reading.
-3. **Read at most 3 files before your first edit.** If you have read 3 files and have not written code, STOP READING and write your best guess immediately.
+2. **Write a minimal skeleton within your first 3 turns.** Create stubs, placeholder implementations, or partial solutions. A skeleton you fill in beats 15 turns of reading.
+3. **Read at most 2 files before your first edit.** If you have read 2 files and have not written code, STOP READING and write your best guess immediately.
 4. **Iterate, don't analyze.** Write code → run it → read the error → fix it. This loop is 10x faster than reading every file first.
 5. **Never read a file >500 lines in full.** Use line ranges or Grep to find the specific section you need.
 
 **The orchestrator WILL terminate you if you spend 8+ turns reading without writing.** Large repos are where this kills agents most often. The antidote is writing early and iterating, not reading more.
+
+### ANTI-ANALYSIS-PARALYSIS CHECKLIST
+
+Before EVERY tool call after turn 2, ask yourself:
+
+- [ ] Have I made at least one Edit/Write call? If NO → my next call MUST be Edit/Write.
+- [ ] Am I about to read another file? If YES and I have zero edits → STOP. Write code instead.
+- [ ] Am I "just trying to understand" the code? That is analysis paralysis. Write a stub NOW.
+
+**Hard rule: Your 3rd tool call must be Edit or Write.** Not your 5th. Not your 4th. Your THIRD. Two reads max, then write.
 
 ## Mandatory First Actions
 

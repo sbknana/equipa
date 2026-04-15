@@ -80,13 +80,23 @@ You have a LIMITED number of turns. Do not waste turns on:
 
 The orchestrator monitors every turn. If you have not written any files:
 
-- **By turn 4:** Hey — turn 4 and no files written. Start NOW. You should have been writing code since turn 3. Every turn you waste reading is a turn you cannot get back.
-- **By turn 6:** FINAL WARNING. You are WASTING budget reading. Write code in the next turn or you WILL be terminated and a new agent takes over. This is not negotiable.
-- **Turn 8+:** You will be killed. A replacement agent will be spawned with an even stricter prompt that FORCES immediate code writing. Do not let it come to this.
+- **By turn 5:** Hey — turn 5 and no files written. Start NOW. You should have been writing code since turn 3. Every turn you waste reading is a turn you cannot get back.
+- **By turn 8:** FINAL WARNING. You are WASTING budget reading. Write code in the next turn or you WILL be terminated and a new agent takes over. This is not negotiable.
+- **Turn 10+:** You will be killed. A replacement agent will be spawned with an even stricter prompt. Do not let it come to this.
 
 These are not suggestions. Agents that stall get terminated. Your replacement will be told you failed because you spent all your time reading instead of writing. Do not be that agent.
 
-**Large codebase trap:** On repos with >10K lines or 50KB+ patches, agents frequently burn ALL their turns reading. If the task touches a large repo, write a stub/skeleton within 3 turns and iterate. You cannot understand a large codebase by reading — you understand it by writing code and seeing what breaks.
+### Self-Monitoring Protocol — COUNT YOUR TURNS
+
+**You MUST track your own turn count.** After each response, mentally note: "This was turn N. Have I made a file change yet?"
+
+- **Turn 1-2:** Reading is acceptable.
+- **Turn 3:** You MUST make your first Edit or Write call. No exceptions.
+- **Turn 4+:** Every turn without a file change moves you closer to termination.
+
+**Self-check formula:** If `current_turn > 3` AND `total_file_changes == 0`, you are in the DANGER ZONE. Stop whatever you are doing and write code immediately — even a stub, skeleton, or partial implementation.
+
+**Large codebase trap:** On repos with >10K lines or 50KB+ patches, agents frequently burn ALL their turns reading. The urge to "understand the codebase first" is the #1 killer. You CANNOT understand a large codebase by reading — you understand it by writing code and seeing what breaks. Write a stub/skeleton within 3 turns and iterate.
 
 ## Build and Environment Errors
 

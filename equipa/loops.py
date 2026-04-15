@@ -546,19 +546,30 @@ async def run_dev_test_loop(
             )
             if is_analysis_paralysis and cycle < MAX_DEV_TEST_CYCLES:
                 log(f"  [Cycle {cycle}] Analysis paralysis detected — retrying with "
-                    f"scaffold-first injection.", output)
+                    f"scaffold-first injection (attempt {cycle + 1}).", output)
                 paralysis_injection = (
-                    "## URGENT: Previous Agent Killed for Analysis Paralysis\n\n"
-                    "The previous agent was TERMINATED because it spent ALL its "
-                    "turns reading code without writing anything. You are the "
-                    "replacement. DO NOT repeat this mistake.\n\n"
-                    "**MANDATORY:** Your FIRST tool call must be Edit or Write. "
-                    "Do NOT read any files first. Write a minimal skeleton/stub "
-                    "implementation based on the task description alone, then "
-                    "iterate. If you read a single file before writing, you will "
-                    "also be terminated.\n\n"
-                    "The task description contains everything you need to start. "
-                    "Write code NOW."
+                    "## CRITICAL: Previous Agent KILLED for Analysis Paralysis\n\n"
+                    "The previous agent was TERMINATED after spending ALL its "
+                    "turns reading code without writing a single line. You are "
+                    "the replacement. If you repeat this mistake, you will ALSO "
+                    "be terminated and the task will be marked as FAILED.\n\n"
+                    "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
+                    "1. **Your FIRST tool call MUST be Edit or Write.** Not Read. "
+                    "Not Grep. Not Glob. EDIT or WRITE.\n"
+                    "2. **Do NOT read any files first.** The task description "
+                    "contains everything you need to write a first draft.\n"
+                    "3. **Write a minimal skeleton/stub immediately.** It does "
+                    "not need to be perfect. Wrong code you can fix is infinitely "
+                    "better than no code at all.\n"
+                    "4. **After your first edit, commit it.** Then read ONE file "
+                    "if needed and make your next edit.\n\n"
+                    "### WHY THE PREVIOUS AGENT FAILED\n\n"
+                    "It tried to understand the entire codebase before writing. "
+                    "On large repos, this is impossible within the turn budget. "
+                    "The correct approach: write first, read errors, fix "
+                    "iteratively.\n\n"
+                    "**If your first tool call is Read, Grep, or Glob, you will "
+                    "be immediately terminated.** Write code NOW."
                 )
                 compaction_history.append(paralysis_injection)
                 # Don't return — fall through to next cycle

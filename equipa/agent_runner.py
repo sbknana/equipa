@@ -470,13 +470,14 @@ async def _run_agent_streaming_impl(
     turn_count = 0
     turns_without_file_change = 0
     # Scale early termination with budget — larger budgets get more reading time
-    # but never exceed 2x the base threshold (prevents overly generous scaling)
+    # but cap aggressively to prevent analysis paralysis on large codebases.
+    # Max kill threshold = 1.5x base (was 2x — too generous, agents burned 12+ turns)
     effective_kill_turns = min(
-        EARLY_TERM_KILL_TURNS * 2,
-        max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.2))
+        int(EARLY_TERM_KILL_TURNS * 1.5),
+        max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.18))
     )
-    effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.8))
-    effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.5))
+    effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.7))
+    effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.45))
     has_any_file_change = False
     tool_history: list[str] = []
     tool_errors: list[str | None] = []
@@ -704,36 +705,41 @@ async def _run_agent_streaming_impl(
 
                         # File-change turn monitoring (non-exempt roles only)
                         if not is_exempt and turns_without_file_change > 0:
+                            remaining = effective_kill_turns - turns_without_file_change
                             if (turns_without_file_change >= effective_warn_turns
                                     and not warning_injected):
                                 log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
                                     f"turns without file changes (role={role}, "
-                                    f"turn ~{turn_count}). STOP READING. Your next "
-                                    f"tool call MUST be Edit or Write. Write a stub "
-                                    f"or skeleton — anything that creates a file "
-                                    f"change. You have {effective_kill_turns - turns_without_file_change} "
-                                    f"turns before termination.", output)
+                                    f"turn ~{turn_count}). STOP READING AND WRITE "
+                                    f"CODE NOW. Your next tool call MUST be Edit or "
+                                    f"Write — not Read, not Grep, not Glob. Write a "
+                                    f"stub or skeleton immediately. You have "
+                                    f"{remaining} turns before termination. This is "
+                                    f"not a suggestion — agents that ignore this "
+                                    f"warning get killed.", output)
                                 warning_injected = True
 
                             if (turns_without_file_change >= effective_final_warn_turns
                                     and not final_warning_injected):
-                                log(f"  [EarlyTerm] FINAL WARNING: "
+                                log(f"  [EarlyTerm] FINAL WARNING — IMMINENT KILL: "
                                     f"{turns_without_file_change} turns without file "
                                     f"changes (role={role}, turn ~{turn_count}). "
-                                    f"YOU WILL BE KILLED IN "
-                                    f"{effective_kill_turns - turns_without_file_change} "
-                                    f"TURNS. A replacement agent with a stricter "
-                                    f"prompt is ready. Use Edit or Write NOW. "
-                                    f"Write ANYTHING — a comment, a stub, a "
-                                    f"skeleton. Zero file changes = termination.", output)
+                                    f"YOU WILL BE TERMINATED IN {remaining} TURNS. "
+                                    f"A replacement agent is already queued. Your "
+                                    f"ONLY option: call Edit or Write RIGHT NOW. "
+                                    f"Write ANYTHING that creates a file change — "
+                                    f"a stub, a skeleton, a partial implementation. "
+                                    f"If your very next tool call is not Edit or "
+                                    f"Write, you are dead.", output)
                                 final_warning_injected = True
 
                             if turns_without_file_change >= effective_kill_turns:
                                 early_term_reason = (
                                     f"Agent terminated: {turns_without_file_change} "
-                                    f"consecutive turns without file changes. "
-                                    f"Agent spent all turns reading instead of "
-                                    f"writing code — replaced with stricter agent"
+                                    f"consecutive turns without file changes "
+                                    f"(threshold: {effective_kill_turns}). "
+                                    f"Agent spent all turns reading/analyzing "
+                                    f"instead of writing code — analysis paralysis"
                                 )
                                 log(f"  [EarlyTerm] KILLED: {early_term_reason}",
                                     output)
