@@ -107,9 +107,9 @@ MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns
 
 # Detect stuck agents mid-run and kill before wasting turns
 # Escalating warnings: first warning -> final warning -> kill
-EARLY_TERM_WARN_TURNS = 5        # turns with no Edit/Write before first warning
-EARLY_TERM_FINAL_WARN_TURNS = 8  # turns with no Edit/Write before final warning
-EARLY_TERM_KILL_TURNS = 10        # turns with no Edit/Write before killing agent
+EARLY_TERM_WARN_TURNS = 4        # turns with no Edit/Write before first warning
+EARLY_TERM_FINAL_WARN_TURNS = 6  # turns with no Edit/Write before final warning
+EARLY_TERM_KILL_TURNS = 8        # turns with no Edit/Write before killing agent
 EARLY_TERM_STUCK_PHRASES = [
     "i am unable to",
     "i cannot",

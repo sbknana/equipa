@@ -708,10 +708,11 @@ async def _run_agent_streaming_impl(
                                     and not warning_injected):
                                 log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
                                     f"turns without file changes (role={role}, "
-                                    f"turn ~{turn_count}). WARNING: You have not "
-                                    f"written any code yet. Your job is to WRITE "
-                                    f"CODE, not read the entire codebase. Start "
-                                    f"writing NOW or you will be replaced.", output)
+                                    f"turn ~{turn_count}). STOP READING. Your next "
+                                    f"tool call MUST be Edit or Write. Write a stub "
+                                    f"or skeleton — anything that creates a file "
+                                    f"change. You have {effective_kill_turns - turns_without_file_change} "
+                                    f"turns before termination.", output)
                                 warning_injected = True
 
                             if (turns_without_file_change >= effective_final_warn_turns
@@ -719,11 +720,12 @@ async def _run_agent_streaming_impl(
                                 log(f"  [EarlyTerm] FINAL WARNING: "
                                     f"{turns_without_file_change} turns without file "
                                     f"changes (role={role}, turn ~{turn_count}). "
-                                    f"FINAL WARNING: You are about to be TERMINATED "
-                                    f"for wasting budget. Write code in the NEXT "
-                                    f"TURN or a new agent takes over. Do NOT read "
-                                    f"another file. Kill threshold: "
-                                    f"{effective_kill_turns}.", output)
+                                    f"YOU WILL BE KILLED IN "
+                                    f"{effective_kill_turns - turns_without_file_change} "
+                                    f"TURNS. A replacement agent with a stricter "
+                                    f"prompt is ready. Use Edit or Write NOW. "
+                                    f"Write ANYTHING — a comment, a stub, a "
+                                    f"skeleton. Zero file changes = termination.", output)
                                 final_warning_injected = True
 
                             if turns_without_file_change >= effective_kill_turns:

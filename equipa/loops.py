@@ -531,11 +531,39 @@ async def run_dev_test_loop(
             dev_result["early_term_reason"] = cost_reason
             return dev_result, cycle, "cost_limit_exceeded"
 
-        # Check for early termination
+        # Check for early termination — retry analysis paralysis with stricter prompt
         if dev_result.get("early_terminated"):
             reason = dev_result.get("early_term_reason", "unknown")
             log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
             loop_detector.record(dev_result, cycle)
+
+            # If killed for analysis paralysis (no file changes), retry ONCE with
+            # an ultra-aggressive scaffold-first prompt instead of failing immediately.
+            # This is the #1 cause of failure on large codebases.
+            is_analysis_paralysis = (
+                "without file changes" in reason
+                or "reading instead of writing" in reason
+            )
+            if is_analysis_paralysis and cycle < MAX_DEV_TEST_CYCLES:
+                log(f"  [Cycle {cycle}] Analysis paralysis detected — retrying with "
+                    f"scaffold-first injection.", output)
+                paralysis_injection = (
+                    "## URGENT: Previous Agent Killed for Analysis Paralysis\n\n"
+                    "The previous agent was TERMINATED because it spent ALL its "
+                    "turns reading code without writing anything. You are the "
+                    "replacement. DO NOT repeat this mistake.\n\n"
+                    "**MANDATORY:** Your FIRST tool call must be Edit or Write. "
+                    "Do NOT read any files first. Write a minimal skeleton/stub "
+                    "implementation based on the task description alone, then "
+                    "iterate. If you read a single file before writing, you will "
+                    "also be terminated.\n\n"
+                    "The task description contains everything you need to start. "
+                    "Write code NOW."
+                )
+                compaction_history.append(paralysis_injection)
+                # Don't return — fall through to next cycle
+                continue
+
             return dev_result, cycle, "early_terminated"
 
         # Check for agent-initiated early completion

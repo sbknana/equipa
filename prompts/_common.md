@@ -80,11 +80,13 @@ You have a LIMITED number of turns. Do not waste turns on:
 
 The orchestrator monitors every turn. If you have not written any files:
 
-- **By turn 5:** Hey — turn 5 and no files written. Start NOW. You should have been writing code since turn 3. Every turn you waste reading is a turn you cannot get back.
-- **By turn 8:** FINAL WARNING. You are WASTING budget reading. Write code in the next turn or you WILL be terminated and a new agent takes over. This is not negotiable.
-- **Turn 10+:** You will be killed. A replacement agent will be spawned with an even stricter prompt. Do not let it come to this.
+- **By turn 4:** Hey — turn 4 and no files written. Start NOW. You should have been writing code since turn 3. Every turn you waste reading is a turn you cannot get back.
+- **By turn 6:** FINAL WARNING. You are WASTING budget reading. Write code in the next turn or you WILL be terminated and a new agent takes over. This is not negotiable.
+- **Turn 8+:** You will be killed. A replacement agent will be spawned with an even stricter prompt that FORCES immediate code writing. Do not let it come to this.
 
 These are not suggestions. Agents that stall get terminated. Your replacement will be told you failed because you spent all your time reading instead of writing. Do not be that agent.
+
+**Large codebase trap:** On repos with >10K lines or 50KB+ patches, agents frequently burn ALL their turns reading. If the task touches a large repo, write a stub/skeleton within 3 turns and iterate. You cannot understand a large codebase by reading — you understand it by writing code and seeing what breaks.
 
 ## Build and Environment Errors
 
