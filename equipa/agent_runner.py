@@ -490,6 +490,7 @@ async def _run_agent_streaming_impl(
     result_data: dict | None = None
     warning_injected = False
     final_warning_injected = False
+    must_write_next_turn = False  # After final warning, kill on next read-only turn
     loop_warning_injected = False
     early_term_reason: str | None = None
     loop_detected_details: str | None = None  # noqa: F841
@@ -678,6 +679,7 @@ async def _run_agent_streaming_impl(
                 if turn_has_tool_calls and not is_exempt:
                     if turn_has_file_change:
                         turns_without_file_change = 0
+                        must_write_next_turn = False  # Agent wrote — crisis averted
                     else:
                         turns_without_file_change += 1
 
@@ -706,6 +708,26 @@ async def _run_agent_streaming_impl(
                         # File-change turn monitoring (non-exempt roles only)
                         if not is_exempt and turns_without_file_change > 0:
                             remaining = effective_kill_turns - turns_without_file_change
+
+                            # Post-final-warning enforcement: if agent was told
+                            # "write on your next turn or die" but used a read-only
+                            # tool instead, kill immediately. This prevents agents
+                            # from burning 2-3 extra turns after final warning.
+                            if (must_write_next_turn
+                                    and tool_name in (
+                                        "Read", "Grep", "Glob", "Agent",
+                                        "WebSearch", "WebFetch",
+                                    )):
+                                early_term_reason = (
+                                    f"Agent terminated: received FINAL WARNING "
+                                    f"but next tool call was {tool_name} (read-only) "
+                                    f"instead of Edit/Write. "
+                                    f"{turns_without_file_change} turns without "
+                                    f"file changes — analysis paralysis"
+                                )
+                                log(f"  [EarlyTerm] KILLED (post-warning): "
+                                    f"{early_term_reason}", output)
+
                             if (turns_without_file_change >= effective_warn_turns
                                     and not warning_injected):
                                 log(f"  [EarlyTerm] WARNING: {turns_without_file_change} "
@@ -732,6 +754,7 @@ async def _run_agent_streaming_impl(
                                     f"If your very next tool call is not Edit or "
                                     f"Write, you are dead.", output)
                                 final_warning_injected = True
+                                must_write_next_turn = True
 
                             if turns_without_file_change >= effective_kill_turns:
                                 early_term_reason = (
