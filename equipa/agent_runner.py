@@ -694,6 +694,40 @@ async def _run_agent_streaming_impl(
                         must_write_next_turn = False  # Agent wrote — crisis averted
                     else:
                         turns_without_file_change += 1
+                        # On paralysis retries (retry_count > 0), the prompt
+                        # explicitly says "FIRST tool call must be Edit or
+                        # Write." Enforce this in code: if the agent's very
+                        # first tool call on a retry is a read-only tool,
+                        # skip straight to must_write_next_turn. On retry 2+
+                        # kill immediately — the agent was told not to read.
+                        if (paralysis_retry_count > 0
+                                and not has_any_file_change
+                                and tool_name in ("Read", "Grep", "Glob", "Agent")):
+                            if paralysis_retry_count >= 2 and turn_count <= 2:
+                                # Retry 2+: agent was told "Do NOT read ANY
+                                # files" but read anyway. Kill immediately.
+                                early_term_reason = (
+                                    f"Agent terminated: paralysis retry "
+                                    f"#{paralysis_retry_count} but first tool "
+                                    f"call was {tool_name} (read-only) despite "
+                                    f"ZERO-READ PROTOCOL. Prompt said 'Do NOT "
+                                    f"read ANY files' but agent ignored it."
+                                )
+                                log(f"  [EarlyTerm] KILLED (retry violation): "
+                                    f"{early_term_reason}", output)
+                            elif (paralysis_retry_count == 1
+                                    and turn_count == 1
+                                    and not must_write_next_turn):
+                                # First retry: allow exactly ONE read, then
+                                # force write. Set must_write immediately.
+                                log(f"  [EarlyTerm] Paralysis retry #1: "
+                                    f"first tool is {tool_name}. Allowing "
+                                    f"ONE read — next call MUST be Edit/Write "
+                                    f"or you die.", output)
+                                warning_injected = True
+                                final_warning_injected = True
+                                must_write_next_turn = True
+
                         # Track consecutive read-only tool calls for faster
                         # escalation on large codebases. When agent calls
                         # Read/Grep/Glob 3+ times without Edit/Write, skip
