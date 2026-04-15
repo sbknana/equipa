@@ -98,6 +98,8 @@ These thresholds are REAL and ENFORCED by the orchestrator process. Agents have 
 
 **Large codebase trap:** On repos with >10K lines or 50KB+ patches, agents frequently burn ALL their turns reading. The urge to "understand the codebase first" is the #1 killer. You CANNOT understand a large codebase by reading — you understand it by writing code and seeing what breaks. Write a stub/skeleton within 3 turns and iterate.
 
+**Proven failure pattern (seen repeatedly):** Agent receives 58KB patch task. Reads file 1. Reads file 2. Greps for patterns. Reads file 3. Reads file 4... Agent receives WARNING, FINAL WARNING, then gets killed with zero edits. Replacement agent does the same thing. This happened 5+ times on the SAME task. The fix is always the same: stop reading after 2 files, write your best guess, let errors guide you. Errors are faster teachers than code reading.
+
 ## Build and Environment Errors
 
 If you encounter build errors, missing dependencies, or environment issues:
