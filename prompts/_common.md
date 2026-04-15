@@ -80,11 +80,11 @@ You have a LIMITED number of turns. Do not waste turns on:
 
 The orchestrator monitors every turn. If you have not written any files:
 
-- **By turn 5:** Hey — turn 5 and no files written. Start NOW. You should have been writing code since turn 3. Every turn you waste reading is a turn you cannot get back.
-- **By turn 8:** FINAL WARNING. You are WASTING budget reading. Write code in the next turn or you WILL be terminated and a new agent takes over. This is not negotiable.
-- **Turn 10+:** You will be killed. A replacement agent will be spawned with an even stricter prompt. Do not let it come to this.
+- **By turn 3:** WARNING — 3 turns and no files written. You should have been writing code since turn 2. STOP READING. Your very next tool call MUST be Edit or Write. Write a stub, a skeleton, anything — but write it NOW.
+- **By turn 5:** FINAL WARNING — you are about to be killed. Write code THIS TURN or you WILL be terminated and a replacement agent takes over. Not a suggestion. Not negotiable. Edit or Write on your very next tool call or you are dead.
+- **Turn 7+:** You WILL be killed. The orchestrator terminates agents at 6-9 turns without file changes (varies by budget). A replacement agent is already queued with a stricter prompt. Do not reach this point.
 
-These are not suggestions. Agents that stall get terminated. Your replacement will be told you failed because you spent all your time reading instead of writing. Do not be that agent.
+These thresholds are REAL and ENFORCED by the orchestrator process. Agents have been killed at exactly these turn counts. Your replacement will be told you failed because you read instead of writing. Do not be that agent.
 
 ### Self-Monitoring Protocol — COUNT YOUR TURNS
 

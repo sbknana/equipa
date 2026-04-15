@@ -18,7 +18,19 @@
 4. **Iterate, don't analyze.** Write code → run it → read the error → fix it. This loop is 10x faster than reading every file first.
 5. **Never read a file >500 lines in full.** Use line ranges or Grep to find the specific section you need.
 
-**The orchestrator WILL terminate you if you spend 8+ turns reading without writing.** Large repos are where this kills agents most often. The antidote is writing early and iterating, not reading more.
+**The orchestrator WILL terminate you if you spend 6-9 turns reading without writing.** Large repos are where this kills agents most often. The antidote is writing early and iterating, not reading more.
+
+### SCAFFOLD-FIRST EXAMPLES
+
+**Example: 58KB masking patch across 12 files**
+- BAD: Read all 12 files (12 turns). Grep for patterns (4 turns). Still no code written. KILLED.
+- GOOD: Read the 2 most important files (2 turns). Write a skeleton with `# TODO` stubs for uncertain parts (turn 3). Fill in stubs one at a time (turns 4-8). DONE in 8 turns.
+
+**Example: New feature touching unfamiliar 50K-line codebase**
+- BAD: Read main.py (1000 lines), read utils.py, read models.py, read config.py, read tests... KILLED at turn 7.
+- GOOD: Read the one file mentioned in the task (turn 1). Write your implementation based on patterns visible in that file (turn 2). Run tests, fix errors (turns 3-5). DONE.
+
+**The key insight: You learn MORE from writing wrong code and reading the error than from reading correct code.** Errors tell you exactly what the codebase expects. Reading code gives you incomplete understanding that grows slower.
 
 ### ANTI-ANALYSIS-PARALYSIS CHECKLIST
 
@@ -27,6 +39,7 @@ Before EVERY tool call after turn 2, ask yourself:
 - [ ] Have I made at least one Edit/Write call? If NO → my next call MUST be Edit/Write.
 - [ ] Am I about to read another file? If YES and I have zero edits → STOP. Write code instead.
 - [ ] Am I "just trying to understand" the code? That is analysis paralysis. Write a stub NOW.
+- [ ] Have I read 3+ files without editing? You are IN analysis paralysis. Write code THIS TURN.
 
 **Hard rule: Your 3rd tool call must be Edit or Write.** Not your 5th. Not your 4th. Your THIRD. Two reads max, then write.
 
@@ -109,7 +122,7 @@ Do NOT spend turns 1-3 just reading and analyzing. Your turn 3 MUST contain an e
 | **4+** | Each turn: Edit → `git add <f> && git commit -m "type: msg"` → verify. | Edit, Write, Bash |
 | **Done** | Run `git log --oneline -5` to confirm commits, THEN output RESULT block. | Bash |
 
-**After turn 2, every turn must include an Edit or Write call.** At ~11 turns without a file change you get a warning. At ~18 a final warning. At ~22 you are terminated. Every Edit, Write, or `git commit` resets that counter.
+**After turn 2, every turn must include an Edit or Write call.** At ~3 turns without a file change you get a WARNING. At ~5 a FINAL WARNING. At ~7 you are TERMINATED. Every Edit, Write, or `git commit` resets that counter. These are real thresholds enforced by the orchestrator — not suggestions.
 
 ## COMMIT PROTOCOL
 
