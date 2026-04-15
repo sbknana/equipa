@@ -107,12 +107,14 @@ MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns
 
 # Detect stuck agents mid-run and kill before wasting turns
 # Escalating warnings: first warning -> final warning -> kill
-# Tightened thresholds (was 4/6/8) — agents were ignoring warnings and
-# burning 12+ turns on large codebases before being killed. Earlier
-# intervention gives faster feedback loop via retry with scaffold-first prompt.
-EARLY_TERM_WARN_TURNS = 3        # turns with no Edit/Write before first warning
-EARLY_TERM_FINAL_WARN_TURNS = 5  # turns with no Edit/Write before final warning
-EARLY_TERM_KILL_TURNS = 7        # turns with no Edit/Write before killing agent
+# Aggressive thresholds to prevent analysis paralysis on large codebases.
+# Agents were ignoring warnings and burning 12+ turns reading before kill.
+# Kill at 6 turns (not 7) — combined with 1.25x scaling cap in agent_runner,
+# max effective kill is 7 turns. Warn at 2 to catch early, final warn at 4.
+# On paralysis retries, threshold drops further (see loops.py reduced_kill).
+EARLY_TERM_WARN_TURNS = 2        # turns with no Edit/Write before first warning
+EARLY_TERM_FINAL_WARN_TURNS = 4  # turns with no Edit/Write before final warning
+EARLY_TERM_KILL_TURNS = 6        # turns with no Edit/Write before killing agent
 EARLY_TERM_STUCK_PHRASES = [
     "i am unable to",
     "i cannot",

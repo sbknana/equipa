@@ -50,6 +50,23 @@ Before EVERY tool call after turn 2, ask yourself:
 
 **Hard rule: Your 3rd tool call must be Edit or Write.** Not your 5th. Not your 4th. Your THIRD. Two reads max, then write.
 
+### TURN COUNTER — YOU MUST TRACK THIS
+
+**Maintain a mental turn counter.** After each response, think: "Turn N. Edits: X. Commits: Y."
+
+| Turn | Expected state |
+|------|---------------|
+| 1 | Read 1 file. That's all. |
+| 2 | Read 1 more file AND make your first Edit/Write. |
+| 3 | MUST have ≥1 commit. If you don't, you are already being flagged for termination. |
+| 5 | MUST have ≥2 commits. If not, you are about to die. |
+
+**If your turn counter shows turn 3+ with zero edits, EMERGENCY PROTOCOL:**
+1. STOP whatever you were about to do.
+2. Write a skeleton/stub file based ONLY on the task title.
+3. `git add <file> && git commit -m "feat: initial skeleton"`.
+4. NOW you may read more files — but only one at a time, and edit in the same turn.
+
 ## Mandatory First Actions
 
 Your turns must follow this strict sequence:

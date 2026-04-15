@@ -746,11 +746,13 @@ async def _run_agent_streaming_impl(
                             # "write on your next turn or die" but used a read-only
                             # tool instead, kill immediately. This prevents agents
                             # from burning 2-3 extra turns after final warning.
+                            # Kill on ANY tool that is not Edit/Write/Bash-edit
+                            # after final warning. Previous list missed Bash,
+                            # ToolSearch, and other non-writing tools. Inverting
+                            # the check: only Edit and Write are writing tools.
+                            write_tools = {"Edit", "Write", "NotebookEdit"}
                             if (must_write_next_turn
-                                    and tool_name in (
-                                        "Read", "Grep", "Glob", "Agent",
-                                        "WebSearch", "WebFetch",
-                                    )):
+                                    and tool_name not in write_tools):
                                 early_term_reason = (
                                     f"Agent terminated: received FINAL WARNING "
                                     f"but next tool call was {tool_name} (read-only) "

@@ -463,22 +463,41 @@ async def run_dev_test_loop(
         else:
             message_context = ""
 
-        # Build extra context from compaction history
+        # Build extra context from compaction history.
+        # CRITICAL: Paralysis injection (KILLED for Analysis Paralysis) must
+        # NEVER be truncated — it's the primary mechanism to change agent
+        # behavior on retry. Separate it from regular compaction history.
         _dc = getattr(args, "dispatch_config", None)
+        paralysis_entries: list[str] = []
+        regular_entries: list[str] = []
+        for entry in compaction_history:
+            if "KILLED for Analysis Paralysis" in entry or "Agents KILLED" in entry:
+                paralysis_entries.append(entry)
+            else:
+                regular_entries.append(entry)
+
         if is_feature_enabled(_dc, "anti_compaction_state") and compaction_history:
-            if cycle >= 2 and len(compaction_history) > 1:
+            # Build regular context with truncation
+            if cycle >= 2 and len(regular_entries) > 1:
                 consolidated = (
                     f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
-                    + "\n\n".join(compaction_history)
+                    + "\n\n".join(regular_entries)
                 )
                 words = consolidated.split()
                 if len(words) > 400:
                     consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
                 extra_context = consolidated
             else:
-                extra_context = "\n\n".join(compaction_history)
+                extra_context = "\n\n".join(regular_entries)
+
+            # Prepend paralysis warnings — these MUST NOT be truncated.
+            # They go first so the agent sees them before anything else.
+            if paralysis_entries:
+                paralysis_block = "\n\n".join(paralysis_entries)
+                extra_context = paralysis_block + "\n\n" + extra_context if extra_context else paralysis_block
         else:
-            extra_context = ""
+            # Even without anti_compaction_state, always include paralysis warnings
+            extra_context = "\n\n".join(paralysis_entries) if paralysis_entries else ""
 
         if message_context:
             extra_context = message_context + "\n\n" + extra_context if extra_context else message_context
