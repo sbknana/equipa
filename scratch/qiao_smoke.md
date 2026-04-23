@@ -1,0 +1,7 @@
+# QIAO wiring smoke test scratch file
+
+This file exists only as a safe target for QIAO Option 2 A/B dispatches.
+Agents should append a single line below, then commit. Do not modify
+anything else.
+
+Agents that touched this file:
