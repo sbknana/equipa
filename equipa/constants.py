@@ -19,6 +19,7 @@ THEFORGE_DB = Path(os.environ.get(
 ))
 MCP_CONFIG = Path(__file__).parent.parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+STANDING_ORDERS_DIR = Path(__file__).parent.parent / "standing_orders"
 SKILLS_BASE_DIR = Path(__file__).parent.parent / "skills"
 
 # Per-role skill directories (loaded via --add-dir when role has skills)

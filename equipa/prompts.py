@@ -25,6 +25,7 @@ from equipa.constants import (
     BUDGET_CHECK_INTERVAL,
     PROMPTS_DIR,
     ROLE_PROMPTS,
+    STANDING_ORDERS_DIR,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 )
 from equipa.lessons import (
@@ -147,6 +148,26 @@ class PromptResult:
         raise AttributeError(
             f"'{type(self).__name__}' object has no attribute '{name}'"
         )
+
+
+def load_standing_orders(role: str) -> str:
+    """Load the standing orders file for a given role.
+
+    Standing orders define a role's permanent operating authority, approval
+    gates, and escalation rules. They live in standing_orders/{role}.md and
+    are injected into the static prefix of every dispatch for that role.
+
+    Returns the standing orders text prefixed with a section separator,
+    or an empty string if no standing orders file exists for the role.
+    """
+    orders_path = STANDING_ORDERS_DIR / f"{role}.md"
+    if not orders_path.exists():
+        return ""
+    try:
+        text = orders_path.read_text(encoding="utf-8")
+        return "\n\n---\n\n" + text
+    except OSError:
+        return ""
 
 
 def build_task_prompt(
@@ -373,7 +394,8 @@ def build_system_prompt(
     # =========================================================================
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
-    static_prefix = common_text + "\n\n---\n\n" + role_text
+    standing_orders = load_standing_orders(role)
+    static_prefix = common_text + "\n\n---\n\n" + role_text + standing_orders
 
     # =========================================================================
     # DYNAMIC SUFFIX — per-task content, changes every dispatch
@@ -588,10 +610,11 @@ def build_planner_prompt(
 
     common_text = common_path.read_text(encoding="utf-8")
     role_text = role_path.read_text(encoding="utf-8")
+    standing_orders = load_standing_orders("planner")
 
     # Static prefix: byte-identical across all planner dispatches.
     # Do NOT substitute {project_id}/{task_id} — they're in the dynamic suffix.
-    static_prefix = common_text + "\n\n---\n\n" + role_text
+    static_prefix = common_text + "\n\n---\n\n" + role_text + standing_orders
 
     # Per-prompt unpredictable delimiter for untrusted content isolation
     _delim = _make_untrusted_delimiter()
