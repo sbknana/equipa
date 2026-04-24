@@ -144,6 +144,7 @@ Self-improvement lives outside the package:
 - `forgesmith_gepa.py` — CMA-ES prompt evolution with A/B testing
 - `scripts/forgesmith_simba.py` — Behavioral rule synthesis from failure patterns
 - `scripts/autoresearch_loop.py` — Nightly benchmarking and optimization
+- `scripts/equipa_harness_sweep.py` — One-knob-at-a-time model/prompt tuning sweeps
 
 ---
 
