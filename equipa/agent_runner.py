@@ -1377,26 +1377,36 @@ async def dispatch_agent(
         from equipa.rlm_decompose import (
             estimate_context_tokens,
             load_repo_files,
+            run_decompose_session,
             should_decompose,
-            build_repo_summary,
-            build_decompose_system_prompt,
         )
         rlm_enabled = is_feature_enabled(dispatch_config, "rlm_decompose")
         if rlm_enabled:
             repo_files = load_repo_files(project_dir)
             ctx_tokens = estimate_context_tokens(system_prompt, repo_files)
             if should_decompose(role, ctx_tokens, rlm_enabled):
-                summary = build_repo_summary(repo_files)
-                system_prompt = build_decompose_system_prompt(
-                    original_prompt=system_prompt,
-                    role=role,
-                    repo_summary=summary,
-                )
                 from equipa.output import log
                 log(
                     f"RLM Decompose active: {len(repo_files)} files, "
                     f"~{ctx_tokens:,} tokens, role={role}"
                 )
+                decompose_result = run_decompose_session(
+                    system_prompt=system_prompt,
+                    project_dir=project_dir,
+                    role=role,
+                    repo_files=repo_files,
+                    mcp_config=mcp_config or "",
+                )
+                return {
+                    "success": decompose_result.success,
+                    "result_text": decompose_result.output,
+                    "num_turns": decompose_result.sub_queries_run,
+                    "duration": 0,
+                    "cost": 0,
+                    "errors": decompose_result.errors,
+                    "rlm_decompose": True,
+                    "files_examined": decompose_result.files_examined,
+                }
 
     # Default: Claude via run_agent_streaming (with retry wrapper)
     use_streaming = role not in EARLY_TERM_EXEMPT_ROLES
