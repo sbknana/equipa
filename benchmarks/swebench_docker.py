@@ -2309,6 +2309,12 @@ if __name__ == "__main__":
         dest="list_instances",
         help="List available instances from the dataset and exit",
     )
+    parser.add_argument(
+        "--token-status",
+        action="store_true",
+        dest="token_status",
+        help="Print OAuth token health status and exit",
+    )
     args = parser.parse_args()
 
     cumulative = args.cumulative and not args.no_cumulative
@@ -2316,6 +2322,8 @@ if __name__ == "__main__":
     if args.setup:
         client = docker.from_env()
         setup_tools_volume(client, force=args.force)
+    elif args.token_status:
+        _check_token_status()
     elif args.list_instances:
         _list_instances(args.limit, args.offset)
     elif args.validate:
