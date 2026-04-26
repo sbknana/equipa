@@ -89,6 +89,7 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "auto_model_routing": False,
         "knowledge_graph": False,
         "autoresearch": True,
+        "rlm_decompose": False,
     }
 
     def test_contains_all_expected_flags(self):

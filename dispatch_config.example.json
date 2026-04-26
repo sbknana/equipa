@@ -56,7 +56,8 @@
         "vector_memory": false,
         "auto_model_routing": false,
         "knowledge_graph": false,
-        "autoresearch": true
+        "autoresearch": true,
+        "rlm_decompose": false
     },
     "project_dirs": {},
     "provider": "claude",
