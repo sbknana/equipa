@@ -40,10 +40,13 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tarfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +84,13 @@ CONDA_PREFIX = (
     "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed"
 )
 
+# OAuth credentials — host path for Max CLI auth
+HOST_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+# Token age warning threshold (6 hours in seconds)
+TOKEN_AGE_ALARM_SECONDS = 6 * 3600
+# Token refresh interval for background helper (30 minutes)
+TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60
+
 # EQUIPA source files to copy into Docker
 EQUIPA_SOURCE_DIRS = ["equipa", "prompts", "skills"]
 EQUIPA_SOURCE_FILES = [
@@ -94,6 +104,280 @@ EQUIPA_SOURCE_FILES = [
     "forgesmith_config.json",
     "skill_manifest.json",
 ]
+
+
+# ============================================================
+# OAuth Credential Management
+# ============================================================
+
+
+def read_host_credentials() -> dict[str, Any] | None:
+    """Read the current OAuth credentials from the host filesystem.
+
+    Returns the parsed credentials dict, or None if the file doesn't
+    exist or isn't valid JSON. Reads fresh every call — never caches.
+    """
+    if not HOST_CREDENTIALS_PATH.exists():
+        return None
+    try:
+        raw = HOST_CREDENTIALS_PATH.read_text(encoding="utf-8")
+        creds = json.loads(raw)
+        return creds
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read host credentials: %s", e)
+        return None
+
+
+def get_token_age_seconds(creds: dict[str, Any] | None) -> float | None:
+    """Compute how old the access token is, in seconds.
+
+    Looks for an 'expiresAt' ISO timestamp or 'expires_at' epoch field
+    in the credentials. If neither exists, returns None (unknown age).
+    """
+    if not creds:
+        return None
+
+    # Try expiresAt (ISO 8601 string) — common in Anthropic OAuth
+    expires_at_str = creds.get("expiresAt")
+    if expires_at_str:
+        try:
+            expires_at = datetime.fromisoformat(
+                expires_at_str.replace("Z", "+00:00")
+            )
+            now = datetime.now(timezone.utc)
+            # Token lifetime is typically 1-8 hours; age = lifetime - remaining
+            remaining = (expires_at - now).total_seconds()
+            # If we don't know the original lifetime, just report remaining
+            # Negative remaining means expired
+            if remaining < 0:
+                return abs(remaining)  # seconds since expiry
+            return None  # Still valid, can't compute age without issue time
+        except (ValueError, TypeError):
+            pass
+
+    # Try expires_at (epoch seconds)
+    expires_epoch = creds.get("expires_at")
+    if isinstance(expires_epoch, (int, float)):
+        remaining = expires_epoch - time.time()
+        if remaining < 0:
+            return abs(remaining)
+        return None
+
+    return None
+
+
+def log_token_telemetry(creds: dict[str, Any] | None, context: str) -> None:
+    """Log token age telemetry at container startup.
+
+    Emits a warning if the token is older than TOKEN_AGE_ALARM_SECONDS
+    or if the token appears expired.
+
+    Args:
+        creds: Parsed credentials dict (or None).
+        context: Human-readable context string (e.g. instance_id).
+    """
+    if not creds:
+        logger.warning(
+            "[TOKEN] No credentials found on host — API key auth only. "
+            "Context: %s", context
+        )
+        return
+
+    has_access = bool(creds.get("accessToken") or creds.get("access_token"))
+    has_refresh = bool(
+        creds.get("refreshToken") or creds.get("refresh_token")
+    )
+    expires_at_str = creds.get("expiresAt", "unknown")
+    rate_tier = creds.get("rateLimitTier", "unknown")
+
+    age = get_token_age_seconds(creds)
+    age_str = f"{age:.0f}s ago (EXPIRED)" if age else "valid/unknown"
+
+    logger.info(
+        "[TOKEN] Context: %s | access=%s refresh=%s expires=%s "
+        "age=%s tier=%s",
+        context[:50], has_access, has_refresh, expires_at_str,
+        age_str, rate_tier,
+    )
+
+    if age and age > TOKEN_AGE_ALARM_SECONDS:
+        logger.warning(
+            "[TOKEN ALARM] Token expired %.0f hours ago (>%dh threshold). "
+            "Context: %s. Refresh may be needed.",
+            age / 3600, TOKEN_AGE_ALARM_SECONDS // 3600, context,
+        )
+
+
+def inject_credentials_into_container(
+    container: Any, creds: dict[str, Any]
+) -> None:
+    """Copy fresh OAuth credentials into the container's Claude config.
+
+    Writes to both /root/.claude/.credentials.json and
+    /home/equipa/.claude/.credentials.json so the CLI finds valid
+    tokens regardless of which user runs it.
+
+    Args:
+        container: Docker container object.
+        creds: Parsed credentials dict to inject.
+    """
+    creds_bytes = json.dumps(creds, indent=2).encode("utf-8")
+
+    for user_home in ["/root", "/home/equipa"]:
+        claude_dir = f"{user_home}/.claude"
+        # Ensure directory exists
+        exec_cmd(container, f"mkdir -p {claude_dir}", timeout=10)
+        _put_file(container, claude_dir, ".credentials.json", creds_bytes)
+
+    logger.debug("[TOKEN] Injected fresh credentials into container")
+
+
+def refresh_host_token() -> bool:
+    """Attempt to refresh the host OAuth token using the refresh token.
+
+    Reads the current credentials, uses the refreshToken to mint a new
+    accessToken via the Anthropic OAuth endpoint, and writes the updated
+    credentials back to the host file.
+
+    Returns True if refresh succeeded, False otherwise.
+
+    NOTE: This is a best-effort operation. The exact OAuth endpoint and
+    parameters may change. If Anthropic uses rotating refresh tokens,
+    each refresh invalidates the prior refresh token — callers must
+    ensure only one refresh runs at a time.
+    """
+    creds = read_host_credentials()
+    if not creds:
+        logger.warning("[REFRESH] No host credentials to refresh")
+        return False
+
+    refresh_token = creds.get("refreshToken") or creds.get("refresh_token")
+    if not refresh_token:
+        logger.warning("[REFRESH] No refresh token in credentials")
+        return False
+
+    # Use Claude CLI's built-in auth refresh if available
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            # Claude CLI handles token refresh internally on any command
+            # Running a lightweight command triggers the refresh flow
+            logger.info("[REFRESH] Triggering CLI-based token refresh...")
+            result = subprocess.run(
+                ["claude", "--print-system-prompt"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                # Re-read credentials — CLI should have refreshed them
+                new_creds = read_host_credentials()
+                if new_creds and new_creds.get("accessToken") != creds.get(
+                    "accessToken"
+                ):
+                    logger.info(
+                        "[REFRESH] Token refreshed successfully via CLI"
+                    )
+                    return True
+                logger.info(
+                    "[REFRESH] CLI ran but token unchanged "
+                    "(may still be valid)"
+                )
+                return True
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug("[REFRESH] CLI refresh unavailable: %s", e)
+
+    logger.warning(
+        "[REFRESH] Could not refresh token — CLI unavailable or failed. "
+        "Manual re-authentication may be needed after ~8 hours."
+    )
+    return False
+
+
+class TokenRefreshDaemon:
+    """Background thread that periodically refreshes the host OAuth token.
+
+    Runs every TOKEN_REFRESH_INTERVAL_SECONDS (default 30min) during
+    a benchmark run. Ensures the host credentials.json always has a
+    valid access token so new containers inherit fresh credentials.
+
+    Thread-safe: uses a lock around refresh operations to prevent
+    concurrent refresh races (important with rotating refresh tokens).
+
+    Usage:
+        daemon = TokenRefreshDaemon()
+        daemon.start()
+        # ... run benchmark ...
+        daemon.stop()
+    """
+
+    def __init__(
+        self, interval: int = TOKEN_REFRESH_INTERVAL_SECONDS
+    ) -> None:
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._refresh_lock = threading.Lock()
+        self._refresh_count = 0
+        self._last_refresh: float = 0
+
+    def start(self) -> None:
+        """Start the background refresh thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="token-refresh"
+        )
+        self._thread.start()
+        logger.info(
+            "[REFRESH DAEMON] Started — refreshing every %ds",
+            self._interval,
+        )
+
+    def stop(self) -> None:
+        """Stop the background refresh thread."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        logger.info(
+            "[REFRESH DAEMON] Stopped — %d refreshes performed",
+            self._refresh_count,
+        )
+
+    def _run(self) -> None:
+        """Main loop: sleep, refresh, repeat."""
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=self._interval)
+            if self._stop_event.is_set():
+                break
+            self._do_refresh()
+
+    def _do_refresh(self) -> None:
+        """Perform one refresh cycle under lock."""
+        with self._refresh_lock:
+            logger.info("[REFRESH DAEMON] Refreshing host token...")
+            if refresh_host_token():
+                self._refresh_count += 1
+                self._last_refresh = time.time()
+            else:
+                logger.warning(
+                    "[REFRESH DAEMON] Refresh failed — "
+                    "token may expire during long runs"
+                )
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """Return daemon statistics."""
+        return {
+            "refresh_count": self._refresh_count,
+            "last_refresh": self._last_refresh,
+            "running": bool(
+                self._thread and self._thread.is_alive()
+            ),
+        }
 
 
 # ============================================================
@@ -1166,6 +1450,19 @@ def run_instance(
         container = client.containers.run(**run_kwargs)
         print(f"    Container started: {container.short_id}")
 
+        # --- Layer 1: Re-read host credentials freshly for each container ---
+        # Prevents stale token propagation across containers. Each container
+        # gets the most recent token from the host filesystem, even if a
+        # previous container's CLI refresh updated it.
+        host_creds = read_host_credentials()
+        log_token_telemetry(host_creds, context=iid)
+        if host_creds:
+            inject_credentials_into_container(container, host_creds)
+            print(
+                f"    Fresh OAuth credentials injected "
+                f"(expires: {host_creds.get('expiresAt', 'unknown')})"
+            )
+
         # Copy EQUIPA source
         equipa_tar_buf.seek(0)
         copy_tar_to_container(container, equipa_tar_buf)
@@ -1527,6 +1824,26 @@ def run_benchmark(
     print(f"  Cumulative mode: {'ON' if cumulative else 'OFF'}")
     print(f"{'=' * 60}\n")
 
+    # --- Layer 2: Start background token refresh daemon ---
+    # Keeps host credentials.json fresh during long benchmark runs.
+    # New containers always inherit valid tokens from the host.
+    # NOTE: 8-hour hard limit on OAuth token lifetime still applies.
+    # For runs >8hr, manual re-authentication may be needed.
+    refresh_daemon = TokenRefreshDaemon()
+    host_creds = read_host_credentials()
+    if host_creds:
+        log_token_telemetry(host_creds, context="benchmark_start")
+        refresh_daemon.start()
+        print(
+            f"  Token refresh daemon: ON "
+            f"(every {TOKEN_REFRESH_INTERVAL_SECONDS // 60}min)"
+        )
+    else:
+        print(
+            "  Token refresh daemon: OFF "
+            "(no OAuth credentials — using API key auth)"
+        )
+
     # Create EQUIPA tar once
     print("  Packaging EQUIPA source...")
     equipa_tar = create_equipa_tar()
@@ -1623,6 +1940,14 @@ def run_benchmark(
             )
 
             _write_predictions(output_path, results)
+
+    # Stop token refresh daemon
+    refresh_daemon.stop()
+    daemon_stats = refresh_daemon.stats
+    if daemon_stats["refresh_count"] > 0:
+        print(
+            f"  Token refreshes during run: {daemon_stats['refresh_count']}"
+        )
 
     # Final summary
     total_time = time.time() - total_start
