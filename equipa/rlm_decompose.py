@@ -59,6 +59,8 @@ _BLOCKED_MODULES = frozenset({
     "code", "codeop", "compileall", "py_compile",
     "webbrowser", "ftplib", "smtplib", "telnetlib",
     "pathlib", "tempfile", "glob", "fnmatch",
+    "io", "pickle", "shelve", "marshal", "zipfile", "tarfile",
+    "gzip", "bz2", "lzma", "sqlite3", "dbm",
 })
 
 
@@ -105,7 +107,7 @@ def estimate_repo_tokens(repo_files: dict[str, str]) -> int:
     """Estimate total tokens for a repo file map."""
     total_chars = sum(len(content) for content in repo_files.values())
     total_chars += sum(len(path) for path in repo_files)
-    return estimate_tokens(str(total_chars))
+    return max(1, math.ceil(total_chars / CHARS_PER_TOKEN))
 
 
 def estimate_context_tokens(
@@ -191,6 +193,22 @@ def validate_repl_code(code: str) -> list[str]:
 
         elif isinstance(node, (ast.AsyncFunctionDef, ast.AsyncFor, ast.AsyncWith)):
             violations.append("Async constructs not allowed in REPL sandbox")
+
+        elif isinstance(node, ast.Raise):
+            if node.exc and isinstance(node.exc, ast.Name):
+                if node.exc.id in ("SystemExit", "KeyboardInterrupt",
+                                    "GeneratorExit"):
+                    violations.append(
+                        f"Blocked raise: {node.exc.id}"
+                    )
+            elif node.exc and isinstance(node.exc, ast.Call):
+                func = node.exc.func
+                if isinstance(func, ast.Name) and func.id in (
+                    "SystemExit", "KeyboardInterrupt", "GeneratorExit",
+                ):
+                    violations.append(
+                        f"Blocked raise: {func.id}()"
+                    )
 
     return violations
 
@@ -278,6 +296,7 @@ class ReplSandbox:
         self.sub_queries_run = 0
         self.output_buffer = io.StringIO()
         self._model = SUB_QUERY_MODELS.get(role, "haiku")
+        self._persistent_globals: dict[str, Any] | None = None
 
     def sub_query(self, prompt: str, files: dict[str, str]) -> str:
         """Helper exposed to REPL code: spawn a cheaper sub-call."""
@@ -349,30 +368,39 @@ class ReplSandbox:
         return __import__(name, *args, **kwargs)
 
     def execute(self, code: str) -> str:
-        """Execute REPL code in the sandbox and return captured output."""
+        """Execute REPL code in the sandbox and return captured output.
+
+        State persists between calls so multi-turn REPL sessions can
+        accumulate variables from prior code blocks.
+        """
         violations = validate_repl_code(code)
         if violations:
             return "SANDBOX VIOLATION:\n" + "\n".join(
                 f"  - {v}" for v in violations
             )
 
-        sandbox_globals = self._build_globals()
-        self.output_buffer = io.StringIO()
+        if self._persistent_globals is None:
+            self._persistent_globals = self._build_globals()
 
-        old_print = sandbox_globals["__builtins__"]["print"]
+        self.output_buffer = io.StringIO()
         buffer = self.output_buffer
+
+        import builtins as _builtins
+        real_print = _builtins.print
 
         def safe_print(*args: Any, **kwargs: Any) -> None:
             kwargs["file"] = buffer
-            old_print(*args, **kwargs)
+            real_print(*args, **kwargs)
 
-        sandbox_globals["__builtins__"]["print"] = safe_print
+        self._persistent_globals["__builtins__"]["print"] = safe_print
 
         try:
             compiled = compile(code, "<rlm-repl>", "exec")
-            exec(compiled, sandbox_globals)  # noqa: S102 — intentional sandbox exec
+            exec(compiled, self._persistent_globals)  # noqa: S102
         except SandboxViolation as e:
             return f"SANDBOX VIOLATION: {e}"
+        except (SystemExit, KeyboardInterrupt, GeneratorExit) as e:
+            return f"SANDBOX VIOLATION: {type(e).__name__} blocked"
         except Exception as e:
             return f"EXECUTION ERROR ({type(e).__name__}): {e}"
 
@@ -511,6 +539,54 @@ def build_repo_summary(repo_files: dict[str, str]) -> str:
 
 # --- Orchestration ---
 
+MAX_REPL_TURNS = 10
+CODE_BLOCK_PATTERN = re.compile(
+    r"```(?:python)?\s*\n(.*?)```", re.DOTALL
+)
+
+
+def _extract_code_blocks(text: str) -> list[str]:
+    """Extract Python code blocks from an LM response."""
+    blocks = CODE_BLOCK_PATTERN.findall(text)
+    return [b.strip() for b in blocks if b.strip()]
+
+
+def _call_outer_agent(
+    prompt: str,
+    model: str,
+    project_dir: str,
+    timeout: int = 180,
+) -> str:
+    """Spawn the outer decompose agent via Claude CLI.
+
+    Returns the agent's text response (may contain code blocks).
+    """
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "text",
+        "--model", model,
+        "--max-turns", "1",
+        "--no-session-persistence",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=project_dir,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return f"[agent error: exit code {result.returncode}] {result.stderr[:500]}"
+    except subprocess.TimeoutExpired:
+        return "[agent error: timed out]"
+    except Exception as e:
+        return f"[agent error: {e}]"
+
+
 def run_decompose_session(
     system_prompt: str,
     project_dir: str,
@@ -520,12 +596,15 @@ def run_decompose_session(
 ) -> DecomposeResult:
     """Run a full REPL decomposition session.
 
+    Multi-turn loop:
     1. Load repo files if not provided
-    2. Build decompose prompt
-    3. Execute the outer agent's Python code blocks in the sandbox
-    4. Return aggregated results
+    2. Build decompose prompt with REPL instructions
+    3. Spawn outer agent to produce Python code blocks
+    4. Execute each code block in sandbox, collect outputs
+    5. Feed execution results back for next turn
+    6. Return aggregated review results
 
-    This is called by the dispatch layer when should_decompose() is True.
+    Called by the dispatch layer when should_decompose() is True.
     """
     if repo_files is None:
         repo_files = load_repo_files(project_dir)
@@ -559,9 +638,52 @@ def run_decompose_session(
         repo_summary=summary,
     )
 
+    outer_model = SUB_QUERY_MODELS.get(role, "sonnet")
+    all_outputs: list[str] = []
+    errors: list[str] = []
+    conversation = decompose_prompt
+
+    for turn in range(MAX_REPL_TURNS):
+        log(f"  RLM turn {turn + 1}/{MAX_REPL_TURNS}")
+
+        agent_response = _call_outer_agent(
+            prompt=conversation,
+            model=outer_model,
+            project_dir=project_dir,
+        )
+
+        if agent_response.startswith("[agent error:"):
+            errors.append(agent_response)
+            break
+
+        code_blocks = _extract_code_blocks(agent_response)
+
+        if not code_blocks:
+            all_outputs.append(agent_response)
+            break
+
+        turn_results: list[str] = []
+        for i, code in enumerate(code_blocks):
+            exec_result = sandbox.execute(code)
+            turn_results.append(
+                f"[Block {i + 1} output]\n{exec_result}"
+            )
+            log(f"    Block {i + 1}: {len(exec_result)} chars output")
+
+        block_output = "\n\n".join(turn_results)
+        all_outputs.append(block_output)
+
+        conversation = (
+            f"{decompose_prompt}\n\n"
+            f"## Previous REPL Results (turn {turn + 1})\n\n"
+            f"{block_output}\n\n"
+            f"Continue your analysis. Write more Python code blocks "
+            f"or provide your final review (no code blocks = done)."
+        )
+
     return DecomposeResult(
-        output=decompose_prompt,
+        output="\n\n---\n\n".join(all_outputs),
         sub_queries_run=sandbox.sub_queries_run,
         files_examined=len(repo_files),
-        errors=[],
+        errors=errors,
     )

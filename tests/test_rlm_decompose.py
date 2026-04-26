@@ -242,6 +242,45 @@ class TestValidateReplCode:
         violations = validate_repl_code("input('prompt')")
         assert len(violations) == 1
 
+    def test_blocked_raise_system_exit(self) -> None:
+        violations = validate_repl_code("raise SystemExit")
+        assert len(violations) == 1
+        assert "SystemExit" in violations[0]
+
+    def test_blocked_raise_system_exit_call(self) -> None:
+        violations = validate_repl_code("raise SystemExit(0)")
+        assert len(violations) == 1
+        assert "SystemExit" in violations[0]
+
+    def test_blocked_raise_keyboard_interrupt(self) -> None:
+        violations = validate_repl_code("raise KeyboardInterrupt")
+        assert len(violations) == 1
+        assert "KeyboardInterrupt" in violations[0]
+
+    def test_blocked_raise_generator_exit(self) -> None:
+        violations = validate_repl_code("raise GeneratorExit")
+        assert len(violations) == 1
+
+    def test_blocked_io_import(self) -> None:
+        violations = validate_repl_code("import io")
+        assert len(violations) == 1
+
+    def test_blocked_pickle_import(self) -> None:
+        violations = validate_repl_code("import pickle")
+        assert len(violations) == 1
+
+    def test_blocked_sqlite3_import(self) -> None:
+        violations = validate_repl_code("import sqlite3")
+        assert len(violations) == 1
+
+    def test_blocked_zipfile_import(self) -> None:
+        violations = validate_repl_code("import zipfile")
+        assert len(violations) == 1
+
+    def test_allowed_raise_value_error(self) -> None:
+        violations = validate_repl_code("raise ValueError('bad')")
+        assert violations == []
+
 
 # ---------------------------------------------------------------------------
 # Sandbox execution
@@ -390,6 +429,22 @@ class TestReplSandbox:
     def test_blocked_nested_import_via_builtins(self, sandbox: ReplSandbox) -> None:
         result = sandbox.execute("__builtins__['__import__']('os')")
         assert "SANDBOX VIOLATION" in result or "EXECUTION ERROR" in result
+
+    def test_system_exit_caught_at_runtime(self, sandbox: ReplSandbox) -> None:
+        result = sandbox.execute("raise SystemExit")
+        assert "SANDBOX VIOLATION" in result
+
+    def test_keyboard_interrupt_caught_at_runtime(self, sandbox: ReplSandbox) -> None:
+        result = sandbox.execute("raise KeyboardInterrupt")
+        assert "SANDBOX VIOLATION" in result
+
+    def test_blocked_io_import_runtime(self, sandbox: ReplSandbox) -> None:
+        result = sandbox.execute("import io")
+        assert "SANDBOX VIOLATION" in result
+
+    def test_blocked_pickle_import_runtime(self, sandbox: ReplSandbox) -> None:
+        result = sandbox.execute("import pickle")
+        assert "SANDBOX VIOLATION" in result
 
 
 # ---------------------------------------------------------------------------
