@@ -15,11 +15,14 @@ import pytest
 
 from equipa.rlm_decompose import (
     DECOMPOSE_ELIGIBLE_ROLES,
+    MAX_REPL_TURNS,
     MAX_SUB_QUERIES,
     TOKEN_THRESHOLD,
     DecomposeResult,
     ReplSandbox,
     SandboxViolation,
+    _call_outer_agent,
+    _extract_code_blocks,
     build_decompose_system_prompt,
     build_repo_summary,
     estimate_context_tokens,
@@ -371,6 +374,23 @@ class TestReplSandbox:
         )
         assert "2" in result
 
+    def test_persistent_state_across_calls(self, sandbox: ReplSandbox) -> None:
+        sandbox.execute("my_var = 42")
+        result = sandbox.execute("print(my_var * 2)")
+        assert "84" in result
+
+    def test_persistent_state_accumulates(self, sandbox: ReplSandbox) -> None:
+        sandbox.execute("results = []")
+        sandbox.execute("results.append('first')")
+        sandbox.execute("results.append('second')")
+        result = sandbox.execute("print(results)")
+        assert "first" in result
+        assert "second" in result
+
+    def test_blocked_nested_import_via_builtins(self, sandbox: ReplSandbox) -> None:
+        result = sandbox.execute("__builtins__['__import__']('os')")
+        assert "SANDBOX VIOLATION" in result or "EXECUTION ERROR" in result
+
 
 # ---------------------------------------------------------------------------
 # Sub-query runner
@@ -557,6 +577,33 @@ class TestDecomposeResult:
 # Orchestration: run_decompose_session
 # ---------------------------------------------------------------------------
 
+class TestExtractCodeBlocks:
+    def test_single_python_block(self) -> None:
+        text = "Here is code:\n```python\nprint('hi')\n```\nDone."
+        blocks = _extract_code_blocks(text)
+        assert len(blocks) == 1
+        assert "print('hi')" in blocks[0]
+
+    def test_multiple_blocks(self) -> None:
+        text = "```python\nx = 1\n```\nThen:\n```python\ny = 2\n```"
+        blocks = _extract_code_blocks(text)
+        assert len(blocks) == 2
+
+    def test_no_blocks(self) -> None:
+        blocks = _extract_code_blocks("Just text, no code.")
+        assert blocks == []
+
+    def test_empty_block_skipped(self) -> None:
+        text = "```python\n\n```"
+        blocks = _extract_code_blocks(text)
+        assert blocks == []
+
+    def test_untagged_code_block(self) -> None:
+        text = "```\nprint('hi')\n```"
+        blocks = _extract_code_blocks(text)
+        assert len(blocks) == 1
+
+
 class TestRunDecomposeSession:
     def test_empty_repo(self) -> None:
         result = run_decompose_session(
@@ -568,7 +615,11 @@ class TestRunDecomposeSession:
         assert not result.success
         assert "empty_repo" in result.errors
 
-    def test_with_files(self) -> None:
+    @patch(
+        "equipa.rlm_decompose._call_outer_agent",
+        return_value="No code blocks — final review: looks good.",
+    )
+    def test_with_files(self, _mock_agent: MagicMock) -> None:
         files = {"main.py": "print('hello')", "utils.py": "def add(a,b): return a+b"}
         result = run_decompose_session(
             system_prompt="Review this code.",
@@ -578,10 +629,35 @@ class TestRunDecomposeSession:
         )
         assert result.success
         assert result.files_examined == 2
-        assert "repo_files" in result.output
-        assert "sub_query" in result.output
+        assert "looks good" in result.output
 
-    def test_auto_loads_repo(self, tmp_path: object) -> None:
+    def test_multi_turn_with_code_blocks(self) -> None:
+        call_count = 0
+
+        def mock_agent(prompt: str, model: str, project_dir: str, timeout: int = 180) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "```python\npy = [k for k in repo_files if k.endswith('.py')]\nprint(f'Found {len(py)} Python files')\n```"
+            return "Final review: 2 Python files analyzed, all clean."
+
+        with patch("equipa.rlm_decompose._call_outer_agent", side_effect=mock_agent):
+            files = {"main.py": "x = 1", "utils.py": "y = 2", "readme.md": "# hi"}
+            result = run_decompose_session(
+                system_prompt="Review.",
+                project_dir="/tmp/test",
+                role="code-reviewer",
+                repo_files=files,
+            )
+        assert result.success
+        assert result.files_examined == 3
+        assert call_count == 2
+
+    @patch(
+        "equipa.rlm_decompose._call_outer_agent",
+        return_value="All clear.",
+    )
+    def test_auto_loads_repo(self, _mock_agent: MagicMock, tmp_path: object) -> None:
         from pathlib import Path
         p = Path(str(tmp_path))
         (p / "main.py").write_text("x = 1")
