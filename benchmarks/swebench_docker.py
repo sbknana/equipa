@@ -24,8 +24,24 @@ Architecture:
   Phase 2 (per-task):  --limit N  → EQUIPA inside containers → output.jsonl
   Phase 3 (validate):  --validate → Official SWE-bench harness
 
+OAuth Token Handling:
+  Each Docker container receives a FRESH copy of the host's
+  ~/.claude/.credentials.json at startup (Layer 1). A background daemon
+  refreshes the host token every 30 minutes via Claude CLI (Layer 2).
+
+  HARD LIMIT: Anthropic OAuth tokens have an ~8-hour maximum lifetime.
+  Runs exceeding 8 hours require manual re-authentication on the host
+  (`claude` in a terminal) before the next batch. Token age is logged
+  at every container startup; an alarm fires if age exceeds 6 hours.
+
+  If Anthropic uses rotating refresh tokens, each refresh invalidates
+  the prior token. The daemon serializes refreshes with a lock to
+  prevent races, but concurrent benchmark processes on the same host
+  should be avoided.
+
 Usage:
     python swebench_docker.py --setup
+    python swebench_docker.py --token-status
     python swebench_docker.py --limit 20 --retries 3 --workers 4
     python swebench_docker.py --validate
     python swebench_docker.py --limit 100 --retries 3 --validate
@@ -131,11 +147,33 @@ def read_host_credentials() -> dict[str, Any] | None:
 def get_token_age_seconds(creds: dict[str, Any] | None) -> float | None:
     """Compute how old the access token is, in seconds.
 
-    Looks for an 'expiresAt' ISO timestamp or 'expires_at' epoch field
-    in the credentials. If neither exists, returns None (unknown age).
+    Looks for 'expiresAt' ISO timestamp, 'expires_at' epoch, or
+    'issuedAt' fields in the credentials. Returns the age (seconds
+    since issuance) if determinable, or None if unknown.
+
+    For tokens still valid but approaching expiry, estimates age using
+    a default 1-hour token lifetime (Anthropic OAuth standard). This
+    allows the alarm to fire BEFORE expiry, not only after.
     """
     if not creds:
         return None
+
+    # Default Anthropic OAuth token lifetime: 1 hour (3600s)
+    DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
+
+    now = datetime.now(timezone.utc)
+    now_epoch = time.time()
+
+    # Best case: issuedAt field gives exact age
+    issued_at_str = creds.get("issuedAt")
+    if issued_at_str:
+        try:
+            issued_at = datetime.fromisoformat(
+                issued_at_str.replace("Z", "+00:00")
+            )
+            return max(0, (now - issued_at).total_seconds())
+        except (ValueError, TypeError):
+            pass
 
     # Try expiresAt (ISO 8601 string) — common in Anthropic OAuth
     expires_at_str = creds.get("expiresAt")
@@ -144,24 +182,22 @@ def get_token_age_seconds(creds: dict[str, Any] | None) -> float | None:
             expires_at = datetime.fromisoformat(
                 expires_at_str.replace("Z", "+00:00")
             )
-            now = datetime.now(timezone.utc)
-            # Token lifetime is typically 1-8 hours; age = lifetime - remaining
             remaining = (expires_at - now).total_seconds()
-            # If we don't know the original lifetime, just report remaining
-            # Negative remaining means expired
             if remaining < 0:
-                return abs(remaining)  # seconds since expiry
-            return None  # Still valid, can't compute age without issue time
+                # Already expired — age = lifetime + seconds past expiry
+                return DEFAULT_TOKEN_LIFETIME_SECONDS + abs(remaining)
+            # Still valid — estimate age = lifetime - remaining
+            return max(0, DEFAULT_TOKEN_LIFETIME_SECONDS - remaining)
         except (ValueError, TypeError):
             pass
 
     # Try expires_at (epoch seconds)
     expires_epoch = creds.get("expires_at")
     if isinstance(expires_epoch, (int, float)):
-        remaining = expires_epoch - time.time()
+        remaining = expires_epoch - now_epoch
         if remaining < 0:
-            return abs(remaining)
-        return None
+            return DEFAULT_TOKEN_LIFETIME_SECONDS + abs(remaining)
+        return max(0, DEFAULT_TOKEN_LIFETIME_SECONDS - remaining)
 
     return None
 
@@ -191,19 +227,40 @@ def log_token_telemetry(creds: dict[str, Any] | None, context: str) -> None:
     rate_tier = creds.get("rateLimitTier", "unknown")
 
     age = get_token_age_seconds(creds)
-    age_str = f"{age:.0f}s ago (EXPIRED)" if age else "valid/unknown"
+    if age is not None:
+        age_str = f"{age:.0f}s old ({age / 3600:.1f}h)"
+    else:
+        age_str = "unknown"
+
+    # Compute remaining time for actionable logging
+    remaining_str = "unknown"
+    expires_at_val = creds.get("expiresAt")
+    if expires_at_val:
+        try:
+            exp = datetime.fromisoformat(
+                expires_at_val.replace("Z", "+00:00")
+            )
+            remaining = (exp - datetime.now(timezone.utc)).total_seconds()
+            if remaining < 0:
+                remaining_str = f"EXPIRED {abs(remaining):.0f}s ago"
+            else:
+                remaining_str = f"{remaining:.0f}s remaining ({remaining / 3600:.1f}h)"
+        except (ValueError, TypeError):
+            pass
 
     logger.info(
         "[TOKEN] Context: %s | access=%s refresh=%s expires=%s "
-        "age=%s tier=%s",
+        "age=%s remaining=%s tier=%s",
         context[:50], has_access, has_refresh, expires_at_str,
-        age_str, rate_tier,
+        age_str, remaining_str, rate_tier,
     )
 
-    if age and age > TOKEN_AGE_ALARM_SECONDS:
+    if age is not None and age > TOKEN_AGE_ALARM_SECONDS:
         logger.warning(
-            "[TOKEN ALARM] Token expired %.0f hours ago (>%dh threshold). "
-            "Context: %s. Refresh may be needed.",
+            "[TOKEN ALARM] Token age %.1fh exceeds %dh threshold. "
+            "Context: %s. Token may expire during this run — "
+            "refresh daemon should handle this, but runs >8hr "
+            "require manual re-authentication.",
             age / 3600, TOKEN_AGE_ALARM_SECONDS // 3600, context,
         )
 
@@ -2075,6 +2132,84 @@ def _list_instances(limit: int = 0, offset: int = 0) -> None:
                 f2p = []
         n_tests = len(f2p) if isinstance(f2p, list) else 0
         print(f"  {i + 1:4d}. {iid:<55s} {repo:<30s} ({n_tests} F2P tests)")
+
+
+def _check_token_status() -> None:
+    """Print OAuth token health status and exit.
+
+    Use before starting a long benchmark run to verify credentials
+    are fresh. Exits with code 1 if token is expired or missing.
+    """
+    creds = read_host_credentials()
+    if not creds:
+        print("TOKEN STATUS: NO CREDENTIALS FOUND")
+        print(f"  Expected at: {HOST_CREDENTIALS_PATH}")
+        print("  Run `claude` in a terminal to authenticate.")
+        sys.exit(1)
+
+    has_access = bool(creds.get("accessToken") or creds.get("access_token"))
+    has_refresh = bool(
+        creds.get("refreshToken") or creds.get("refresh_token")
+    )
+    expires_at_str = creds.get("expiresAt", "unknown")
+    rate_tier = creds.get("rateLimitTier", "unknown")
+    age = get_token_age_seconds(creds)
+
+    # Compute remaining
+    remaining: float | None = None
+    if expires_at_str and expires_at_str != "unknown":
+        try:
+            exp = datetime.fromisoformat(
+                expires_at_str.replace("Z", "+00:00")
+            )
+            remaining = (exp - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError):
+            pass
+
+    print("TOKEN STATUS:")
+    print(f"  Credentials file: {HOST_CREDENTIALS_PATH}")
+    print(f"  Access token:     {'present' if has_access else 'MISSING'}")
+    print(f"  Refresh token:    {'present' if has_refresh else 'MISSING'}")
+    print(f"  Expires at:       {expires_at_str}")
+    print(f"  Rate limit tier:  {rate_tier}")
+
+    if age is not None:
+        print(f"  Token age:        {age:.0f}s ({age / 3600:.1f}h)")
+    else:
+        print("  Token age:        unknown")
+
+    if remaining is not None:
+        if remaining < 0:
+            print(f"  Status:           EXPIRED ({abs(remaining):.0f}s ago)")
+            print("\n  ACTION: Run `claude` in a terminal to re-authenticate.")
+            sys.exit(1)
+        elif remaining < 1800:
+            print(
+                f"  Status:           EXPIRING SOON "
+                f"({remaining:.0f}s / {remaining / 60:.0f}min left)"
+            )
+            print("\n  WARNING: Token will expire during most benchmark runs.")
+            print("  The refresh daemon will attempt to renew it.")
+        else:
+            print(
+                f"  Status:           VALID "
+                f"({remaining:.0f}s / {remaining / 3600:.1f}h remaining)"
+            )
+    else:
+        print("  Status:           unknown (no expiry field)")
+
+    # Estimate max safe run duration
+    if remaining is not None and remaining > 0:
+        # Daemon refreshes every 30min, so effective limit is ~remaining
+        # plus however many successful refreshes happen
+        print(
+            f"\n  Estimated safe run time: {remaining / 3600:.1f}h "
+            f"without refresh, up to ~8h with daemon"
+        )
+    print(
+        "\n  NOTE: Hard limit is ~8 hours per OAuth session. "
+        "For longer runs, re-authenticate between batches."
+    )
 
 
 def _load_resolved_ids(output_path: str) -> set[str]:
