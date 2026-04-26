@@ -202,6 +202,11 @@ PRIORITY_ORDER = {
     "low": 1,
 }
 
+# --- RLM Decompose Mode ---
+RLM_TOKEN_THRESHOLD = 100_000  # context tokens to trigger REPL decomposition
+RLM_MAX_SUB_QUERIES = 20       # max sub-queries per decompose session
+RLM_SUB_QUERY_TIMEOUT = 120    # seconds per sub-query
+
 # Default GitHub owner for --setup-repos
 GITHUB_OWNER = ""
 

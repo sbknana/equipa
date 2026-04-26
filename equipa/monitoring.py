@@ -300,6 +300,65 @@ def _check_git_changes(project_dir: str | None) -> bool:
     return False
 
 
+def has_branch_commits(project_dir: str | None) -> bool:
+    """Check if the current branch has any commits vs its merge-base with HEAD~50.
+
+    Uses `git log --oneline` to count commits on the current branch that are
+    not on the default remote branch. Falls back to checking if there are any
+    commits at all beyond the initial state.
+
+    This is used by the no-progress guard to avoid false-positives when an
+    agent committed work in early cycles but then idled in later cycles.
+    """
+    if not project_dir:
+        return False
+
+    project_dir_str = str(project_dir)
+    if not os.path.isdir(project_dir_str):
+        return False
+
+    try:
+        # Try to find merge-base with common default branches
+        for base_ref in ("origin/main", "origin/master", "main", "master"):
+            merge_base = subprocess.run(
+                ["git", "merge-base", base_ref, "HEAD"],
+                cwd=project_dir_str,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if merge_base.returncode == 0 and merge_base.stdout.strip():
+                base_sha = merge_base.stdout.strip()
+                log_result = subprocess.run(
+                    ["git", "log", "--oneline", f"{base_sha}..HEAD"],
+                    cwd=project_dir_str,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if log_result.returncode == 0:
+                    commits = [
+                        ln for ln in log_result.stdout.strip().splitlines() if ln
+                    ]
+                    return len(commits) > 0
+
+        # Fallback: check git diff --stat HEAD~5..HEAD for any file changes
+        diff_result = subprocess.run(
+            ["git", "diff", "--stat", "HEAD~5..HEAD"],
+            cwd=project_dir_str,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if diff_result.returncode == 0 and diff_result.stdout.strip():
+            return True
+
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return False
+
+    return False
+
+
 # --- Early Complete Parsing ---
 
 def _parse_early_complete(text: str) -> str | None:

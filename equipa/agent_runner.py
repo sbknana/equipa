@@ -1371,6 +1371,33 @@ async def dispatch_agent(
             max_turns=max_turns,
         )
 
+    # RLM REPL decomposition for large-repo reviews
+    if system_prompt and project_dir and role in ("code-reviewer", "integration-tester"):
+        from equipa.dispatch import is_feature_enabled
+        from equipa.rlm_decompose import (
+            estimate_context_tokens,
+            load_repo_files,
+            should_decompose,
+            build_repo_summary,
+            build_decompose_system_prompt,
+        )
+        rlm_enabled = is_feature_enabled(dispatch_config, "rlm_decompose")
+        if rlm_enabled:
+            repo_files = load_repo_files(project_dir)
+            ctx_tokens = estimate_context_tokens(system_prompt, repo_files)
+            if should_decompose(role, ctx_tokens, rlm_enabled):
+                summary = build_repo_summary(repo_files)
+                system_prompt = build_decompose_system_prompt(
+                    original_prompt=system_prompt,
+                    role=role,
+                    repo_summary=summary,
+                )
+                from equipa.output import log
+                log(
+                    f"RLM Decompose active: {len(repo_files)} files, "
+                    f"~{ctx_tokens:,} tokens, role={role}"
+                )
+
     # Default: Claude via run_agent_streaming (with retry wrapper)
     use_streaming = role not in EARLY_TERM_EXEMPT_ROLES
     if use_streaming:

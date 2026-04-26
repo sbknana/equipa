@@ -50,6 +50,7 @@ from equipa.monitoring import (
     _check_cost_limit,
     adjust_dynamic_budget,
     calculate_dynamic_budget,
+    has_branch_commits,
 )
 from equipa.output import log
 from equipa.parsing import (
@@ -773,9 +774,22 @@ async def run_dev_test_loop(
             log(f"  [Cycle {cycle}] No progress detected ({dev_turns_used} turns, no files marker) "
                 f"({no_progress_count}/{NO_PROGRESS_LIMIT} consecutive).", output)
             if no_progress_count >= NO_PROGRESS_LIMIT:
-                log(f"  [Cycle {cycle}] No progress for {NO_PROGRESS_LIMIT} cycles. "
-                    f"Marking blocked.", output)
-                return dev_result, cycle, "no_progress"
+                if has_branch_commits(project_dir):
+                    log(
+                        f"  [Cycle {cycle}] No per-cycle progress for "
+                        f"{NO_PROGRESS_LIMIT} cycles, but branch has "
+                        f"accumulated commits — not blocking.",
+                        output,
+                    )
+                    no_progress_count = 0
+                else:
+                    log(
+                        f"  [Cycle {cycle}] No progress for "
+                        f"{NO_PROGRESS_LIMIT} cycles and no branch "
+                        f"commits. Marking blocked.",
+                        output,
+                    )
+                    return dev_result, cycle, "no_progress"
         else:
             no_progress_count = 0
             if files_changed:

@@ -137,7 +137,7 @@ def should_decompose(
         return False
     if role not in DECOMPOSE_ELIGIBLE_ROLES:
         return False
-    if context_tokens < TOKEN_THRESHOLD:
+    if context_tokens <= TOKEN_THRESHOLD:
         return False
     return True
 
@@ -293,8 +293,7 @@ class ReplSandbox:
         self.sub_queries_run += 1
         log(
             f"  RLM sub-query #{self.sub_queries_run}: "
-            f"{prompt[:80]}... ({len(files)} files)",
-            "cyan",
+            f"{prompt[:80]}... ({len(files)} files)"
         )
         return _run_sub_query(
             prompt=prompt,
@@ -545,7 +544,6 @@ def run_decompose_session(
     log(
         f"RLM Decompose: {len(repo_files)} files, "
         f"~{context_tokens:,} tokens, role={role}",
-        "cyan",
     )
 
     sandbox = ReplSandbox(

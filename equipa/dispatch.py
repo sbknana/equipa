@@ -75,6 +75,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "auto_model_routing": False,
     "knowledge_graph": False,
     "autoresearch": True,
+    "rlm_decompose": False,
 }
 
 DEFAULT_DISPATCH_CONFIG: dict = {
