@@ -300,6 +300,55 @@ def _check_git_changes(project_dir: str | None) -> bool:
     return False
 
 
+def get_starting_sha(project_dir: str | None) -> str | None:
+    """Capture the current HEAD SHA at loop start for session-commit detection."""
+    if not project_dir:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+    return None
+
+
+def has_session_commits(
+    project_dir: str | None, starting_sha: str | None
+) -> bool:
+    """Check if HEAD has moved since the loop started (i.e. any commits this session).
+
+    More reliable than has_branch_commits() because it doesn't depend on
+    finding a merge-base or remote branches. Works on main, isolation
+    branches, and worktrees alike.
+    """
+    if not project_dir or not starting_sha:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            current_sha = result.stdout.strip()
+            if current_sha != starting_sha:
+                return True
+            # HEAD same — but there may be uncommitted changes (staged/unstaged)
+            return _check_git_changes(project_dir)
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+    return False
+
+
 def has_branch_commits(project_dir: str | None) -> bool:
     """Check if the current branch has any commits vs its merge-base with HEAD~50.
 

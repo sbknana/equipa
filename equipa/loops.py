@@ -50,7 +50,9 @@ from equipa.monitoring import (
     _check_cost_limit,
     adjust_dynamic_budget,
     calculate_dynamic_budget,
+    get_starting_sha,
     has_branch_commits,
+    has_session_commits,
 )
 from equipa.output import log
 from equipa.parsing import (
@@ -362,6 +364,7 @@ async def run_dev_test_loop(
     task_id = task["id"]
     last_error_type: str | None = None
     loop_detector = LoopDetector()
+    accumulated_files: set[str] = set()
 
     # Load cost limits from dispatch config (overrides defaults)
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
@@ -761,32 +764,40 @@ async def run_dev_test_loop(
             log(f"  [Cycle {cycle}] Developer marked task as BLOCKED.", output)
             return dev_result, cycle, "developer_blocked"
 
-        # Progress detection
+        # Progress detection — track both per-cycle and accumulated changes
         files_changed = parse_developer_output(dev_result.get("result_text", ""))
         dev_turns_used = dev_result.get("num_turns", 0)
+        if files_changed:
+            accumulated_files.update(files_changed)
         made_progress = bool(files_changed) or dev_turns_used >= 3
 
         if made_progress:
             last_error_type = None
 
         if not made_progress:
-            no_progress_count += 1
-            log(f"  [Cycle {cycle}] No progress detected ({dev_turns_used} turns, no files marker) "
-                f"({no_progress_count}/{NO_PROGRESS_LIMIT} consecutive).", output)
-            if no_progress_count >= NO_PROGRESS_LIMIT:
-                if has_branch_commits(project_dir):
-                    log(
-                        f"  [Cycle {cycle}] No per-cycle progress for "
-                        f"{NO_PROGRESS_LIMIT} cycles, but branch has "
-                        f"accumulated commits — not blocking.",
-                        output,
-                    )
-                    no_progress_count = 0
-                else:
+            # Idle cycle — but if earlier cycles produced real work, don't penalise
+            if accumulated_files or has_branch_commits(project_dir):
+                log(
+                    f"  [Cycle {cycle}] No per-cycle progress "
+                    f"({dev_turns_used} turns, no files marker), but "
+                    f"{len(accumulated_files)} accumulated file(s) "
+                    f"across prior cycles — not counting against limit.",
+                    output,
+                )
+            else:
+                no_progress_count += 1
+                log(
+                    f"  [Cycle {cycle}] No progress detected "
+                    f"({dev_turns_used} turns, no files marker) "
+                    f"({no_progress_count}/{NO_PROGRESS_LIMIT} "
+                    f"consecutive).",
+                    output,
+                )
+                if no_progress_count >= NO_PROGRESS_LIMIT:
                     log(
                         f"  [Cycle {cycle}] No progress for "
-                        f"{NO_PROGRESS_LIMIT} cycles and no branch "
-                        f"commits. Marking blocked.",
+                        f"{NO_PROGRESS_LIMIT} cycles and no "
+                        f"accumulated changes. Marking blocked.",
                         output,
                     )
                     return dev_result, cycle, "no_progress"
