@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 # Import module directly
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import importlib.util
 
 def load_module(name, path):
@@ -15,8 +15,8 @@ def load_module(name, path):
     spec.loader.exec_module(mod)
     return mod
 
-parsing = load_module("parsing", Path(__file__).parent / "equipa" / "parsing.py")
-trs = load_module("tool_result_storage", Path(__file__).parent / "equipa" / "tool_result_storage.py")
+parsing = load_module("parsing", Path(__file__).parent.parent / "equipa" / "parsing.py")
+trs = load_module("tool_result_storage", Path(__file__).parent.parent / "equipa" / "tool_result_storage.py")
 
 print("Testing integration: parsing.compact_agent_output with persistence...")
 

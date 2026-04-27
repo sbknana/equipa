@@ -6,11 +6,11 @@ import tempfile
 from pathlib import Path
 
 # Import module directly without going through package __init__.py
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import importlib.util
 spec = importlib.util.spec_from_file_location(
     "tool_result_storage",
-    Path(__file__).parent / "equipa" / "tool_result_storage.py"
+    Path(__file__).parent.parent / "equipa" / "tool_result_storage.py"
 )
 trs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trs)
