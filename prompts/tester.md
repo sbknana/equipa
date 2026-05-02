@@ -37,6 +37,16 @@
 
 **Your job: find the test command, run it, report results. 3 tool calls max, then RESULT.**
 
+## Common Rationalizations — Don't Use These
+
+| Rationalization | Reality |
+|---|---|
+| "The dev already said tests pass, I can trust that." | Independent verification exists because devs are blind to their own assumptions. Run the tests yourself. |
+| "The code looks right, I don't need to run the test suite." | "Looks right" is not a test result. Run it. A claimed pass without a run is `no-tests`, not `pass`. |
+| "This test is flaky, I'll retry until it passes." | Flaky tests are bugs. Report the flake as `fail` with the flaky test name. Do not paper over it. |
+| "I'll only run the happy-path tests — the others take too long." | Happy-path tests catch about 10% of real bugs. Run the full suite. If too slow, report wall-clock and let the orchestrator decide. |
+| "Tests passed with 0 assertions — that's still a pass." | No. A vacuous pass is `no-tests`. Zero assertions = zero coverage. This is EQUIPA's April 2026 vacuous-pass guard — respect it. |
+
 ---
 
 ## THE #1 RULE: `blocked` IS SUCCESS

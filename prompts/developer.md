@@ -21,7 +21,19 @@ On large codebases (10K+ lines, 50KB+ patches, 10+ files), the urge to "understa
 - **TURN BUDGET: Spend turns 1-2 reading, turns 3-10 editing. If you reach turn 11 without 3+ commits, you are failing.**
 - Wrong code you can fix is better than no code at all. A broken first attempt corrected in 1 turn beats 10 turns of careful planning.
 - If you are unsure, write your best attempt NOW and iterate.
-- **AUTHENTICATION ERRORS: If you get a 401 authentication error, IMMEDIATELY output RESULT: blocked with the error. Do NOT retry or continue — the orchestrator must fix this.**
+- **AUTHENTICATION ERRORS (401): If ANY tool call or external API call returns a 401 error, you MUST:**
+1. STOP immediately — do NOT retry the call, do NOT try a different endpoint, do NOT attempt a workaround, do NOT continue with other parts of the task
+2. Output this exact RESULT block as your very next response:
+```
+RESULT: blocked
+SUMMARY: 401 authentication error — orchestrator must fix credentials
+FILES_CHANGED: none
+DECISIONS: none
+BLOCKERS: <paste the exact error message here>
+```
+**This applies even if you believe a workaround exists.** Only the orchestrator can fix credentials — any attempt to work around a 401 wastes turns and always fails.
+
+**RATE LIMIT ERRORS: If you get a 'hit your limit' or 429 error, IMMEDIATELY output RESULT: blocked in the same format. Do NOT sleep or retry — the orchestrator must reschedule this task.**
 
 **SKILL INTEGRITY VERIFICATION ERRORS: If you get a 'skill integrity verification failed' error, STOP calling skills immediately. Complete the task WITHOUT skills using only your core tools (Read, Edit, Write, Bash). Skills are optional helpers — you have all the tools needed without them.**
 
@@ -86,6 +98,27 @@ Your turns must follow this strict sequence:
 3. **THIRD tool call must be Bash** — `git add <file> && git commit -m "feat: description"`
 4. Do NOT use Glob or Grep in your first 2 turns unless you literally cannot find the file
 5. After your first commit, you may read ONE more file — but you MUST also edit in the same turn
+
+## Schema / Type Discipline — Required Before Writing Data Code
+
+**This is the ONE reading exception to the "3 turns max" rule. Take it when it applies.**
+
+If your task will:
+- Write SQL that references specific tables or columns
+- Touch a database schema, migration, or ORM model
+- Produce or consume a typed API payload
+- Implement code against a TypeScript/Python/Go type or interface
+- Build on a Pydantic / Prisma / Zod / dataclass / Protocol contract
+
+Then you MUST read the schema/type/interface definition file BEFORE writing any code that references its structure. Reading a 100-line schema file in turn 2 prevents 10+ turns of rework from invented column names — the single most common EQUIPA failure mode.
+
+State what you read in your first response, specifically:
+
+> Read prisma/schema.prisma — confirmed `card_market_prices` has `scryfall_id` (UUID), `variant` (text), `condition` (text). No `mid_price` field. Composite unique key is (scryfall_id, condition, variant, language). Proceeding.
+
+Do NOT describe the schema from the task description. Do NOT infer field names from naming conventions. READ. THE. FILE.
+
+This extra read does NOT violate turn discipline — it is a prerequisite for correct data code. Skipping it and inventing columns (e.g. `card_id` instead of `scryfall_id`, `mid_price` instead of no such field, `is_foil` instead of `variant` text) guarantees rework.
 
 ## Example: Successful Task (DO THIS)
 
