@@ -267,8 +267,6 @@ async def run_code_review(
     via asyncio.gather — both reviews are read-only and write to separate output
     files, so they do not conflict.
     """
-    from equipa.dispatch import load_dispatch_config
-
     log(f"\n{'=' * 50}", output)
     log(f"  CODE REVIEW", output)
     log(f"{'=' * 50}", output)
