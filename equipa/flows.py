@@ -35,9 +35,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.db import db_conn
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,84 @@ VALID_CHILD_STATES = frozenset(
 TERMINAL_CHILD_STATES = frozenset({"done", "failed", "cancelled"})
 
 VALID_RELATIONSHIPS = frozenset({"managed", "mirrored"})
+
+
+# --- Flow-revision capture rate limiting (PLAN-1067 §2.B3 operator decision) ---
+#
+# Capture is rate-limited to once per (flow_id, task_id) per
+# FLOW_CAPTURE_RATE_LIMIT_SECONDS. Stored in-memory because the DB row from the
+# prior capture is itself the persisted state — restart is fine, the cache just
+# rebuilds on the next round of transitions.
+FLOW_CAPTURE_RATE_LIMIT_SECONDS: float = 60.0
+_flow_capture_last_ts: dict[tuple[int, int], float] = {}
+
+
+def _flow_capture_should_fire(
+    flow_id: int,
+    task_id: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return True if a capture for (flow_id, task_id) is allowed right now.
+
+    Updates the in-memory timestamp cache when it returns True so subsequent
+    calls within the rate-limit window are suppressed. ``now`` is injectable
+    for testing.
+    """
+    ts = time.monotonic() if now is None else now
+    key = (flow_id, task_id)
+    last = _flow_capture_last_ts.get(key)
+    if last is not None and (ts - last) < FLOW_CAPTURE_RATE_LIMIT_SECONDS:
+        return False
+    _flow_capture_last_ts[key] = ts
+    return True
+
+
+def _capture_running_children_safe(
+    flow_id: int,
+    revision: int,
+    project_id: int,
+    children: list[tuple[int, str | None, str]],
+    dispatch_config: dict | None,
+) -> None:
+    """Capture sessions for every running child task in a flow on revision bump.
+
+    PLAN-1067 §2.B3 — gated by ``session_persistence`` feature flag.
+    Rate-limited per (flow_id, task_id) per
+    :data:`FLOW_CAPTURE_RATE_LIMIT_SECONDS`. Never raises — capture errors
+    are logged and swallowed so a failure in session persistence cannot
+    abort a flow transition.
+    """
+    if not is_feature_enabled(dispatch_config, "session_persistence"):
+        return
+    # Lazy import — avoids circular dependency (sessions imports db, which
+    # is fine, but keeping the import local keeps the flow module light when
+    # the feature is off).
+    from equipa import sessions
+
+    cycle_id = f"flow:{flow_id}:{revision}"
+    for task_id, role, state in children:
+        if state in TERMINAL_CHILD_STATES:
+            continue
+        if not _flow_capture_should_fire(flow_id, task_id):
+            logger.debug(
+                "[flows] capture rate-limited for flow_id=%s task_id=%s",
+                flow_id, task_id,
+            )
+            continue
+        try:
+            sessions.capture(
+                task_id=task_id,
+                role=role or "developer",
+                project_id=project_id,
+                cycle_id=cycle_id,
+                soft_checkpoint_path=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[flows] session capture failed for flow_id=%s task_id=%s: %s",
+                flow_id, task_id, exc,
+            )
 
 
 class FlowError(RuntimeError):
@@ -332,7 +412,34 @@ def transition(
             event=event,
             payload=payload,
         )
+        # Snapshot the running children inside the same transaction so the
+        # post-commit capture sees the same set the revision bump applied to.
+        running_children = [
+            (int(r["task_id"]), r["role"], r["state"])
+            for r in conn.execute(
+                "SELECT task_id, role, state FROM flow_tasks "
+                "WHERE flow_id = ? AND state NOT IN ('done','failed','cancelled')",
+                (flow_id,),
+            ).fetchall()
+        ]
+        project_id = int(_load_flow_for_update(conn, flow_id)["project_id"])
         row = _load_flow_for_update(conn, flow_id)
+
+    # PLAN-1067 §2.B3 — capture every running child task on every revision
+    # bump. Rate-limited per (flow_id, task_id) per the operator decision.
+    # Done OUTSIDE the flow's write transaction so a slow capture cannot
+    # extend the flows-table lock window.
+    try:
+        dc = load_dispatch_config(None)
+    except Exception:  # noqa: BLE001 — never let config load break a transition
+        dc = None
+    _capture_running_children_safe(
+        flow_id=flow_id,
+        revision=new_rev,
+        project_id=project_id,
+        children=running_children,
+        dispatch_config=dc,
+    )
     return _row_to_flow(row)
 
 
