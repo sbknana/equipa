@@ -75,6 +75,7 @@ class HeartbeatConfig:
     enable_redispatch: bool = True
     enable_container_check: bool = True
     enable_orphan_prune: bool = True
+    enable_session_purge: bool = True
     dry_run: bool = False
 
     @classmethod
@@ -141,6 +142,7 @@ class SweepResult:
     redispatched_agent_runs: list[int] = field(default_factory=list)
     hung_containers: list[str] = field(default_factory=list)
     pruned_orphan_dbs: list[str] = field(default_factory=list)
+    purged_sessions: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_summary(self) -> dict[str, Any]:
@@ -151,6 +153,7 @@ class SweepResult:
             "redispatched_agent_runs": self.redispatched_agent_runs,
             "hung_containers": self.hung_containers,
             "pruned_orphan_dbs": self.pruned_orphan_dbs,
+            "purged_sessions": self.purged_sessions,
             "errors": self.errors,
         }
 
@@ -502,6 +505,44 @@ def prune_orphan_container_dbs(
     return pruned
 
 
+def purge_expired_sessions(*, dry_run: bool = False) -> int:
+    """Delete all expired ``agent_sessions`` rows.
+
+    PLAN-1067 §2.B3 — fourth sweep stage. Mirrors the dry-run +
+    telemetry shape of the other sweeps. Runs UNCONDITIONALLY (not
+    gated by ``session_persistence``) — purging stale rows is always
+    safe regardless of whether new captures are happening.
+
+    Returns the number of rows that were (or would have been, in
+    dry-run) deleted. Uses ``equipa.sessions.purge_expired`` which
+    holds the canonical TTL-aware DELETE; on dry-run we count via
+    ``COUNT(*)`` instead so no data is mutated.
+    """
+    from equipa import sessions
+    from equipa.db import db_conn
+
+    if dry_run:
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        try:
+            with db_conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM agent_sessions "
+                    "WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (now_iso,),
+                ).fetchone()
+            return int(row["c"]) if row else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("purge_expired_sessions dry-run count failed: %s", exc)
+            return 0
+
+    try:
+        return int(sessions.purge_expired())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("purge_expired_sessions failed: %s", exc)
+        return 0
+
+
 def _list_all_container_ids(docker_bin: str) -> set[str]:
     if not shutil.which(docker_bin):
         return set()
@@ -630,6 +671,18 @@ def run_once(config: HeartbeatConfig) -> SweepResult:
         logger.exception("Heartbeat config auto-snapshot failed")
         result.errors.append(f"auto_snapshot: {exc!r}")
 
+    # PLAN-1067 §2.B3 — fourth sweep stage. Runs unconditionally because
+    # purging expired session rows is safe whether or not session_persistence
+    # is enabled (no new captures means no new rows; old rows still age out).
+    if config.enable_session_purge:
+        try:
+            result.purged_sessions = purge_expired_sessions(
+                dry_run=config.dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Session purge failed")
+            result.errors.append(f"purge_expired_sessions: {exc!r}")
+
     result.duration_seconds = time.time() - started
 
     try:
@@ -639,11 +692,13 @@ def run_once(config: HeartbeatConfig) -> SweepResult:
         result.errors.append(f"_record_sweep: {exc!r}")
 
     logger.info(
-        "heartbeat tick: stale=%d redispatched=%d hung=%d pruned=%d errors=%d in %.2fs",
+        "heartbeat tick: stale=%d redispatched=%d hung=%d pruned=%d "
+        "purged_sessions=%d errors=%d in %.2fs",
         len(result.stale_tasks),
         len(result.redispatched_agent_runs),
         len(result.hung_containers),
         len(result.pruned_orphan_dbs),
+        result.purged_sessions,
         len(result.errors),
         result.duration_seconds,
     )
