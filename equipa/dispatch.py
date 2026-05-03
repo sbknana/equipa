@@ -35,6 +35,7 @@ from equipa.constants import (
     DEFAULT_MAX_TURNS,
     DEFAULT_MODEL,
     MAX_MANAGER_ROUNDS,
+    MAX_TASK_RANGE,
     PRIORITY_ORDER,
     PROJECT_DIRS,
 )
@@ -920,13 +921,22 @@ def parse_task_ids(task_str: str) -> list[int]:
     Examples: "109,110,111" -> [109, 110, 111]
               "109-114" -> [109, 110, 111, 112, 113, 114]
               "109,112-114" -> [109, 112, 113, 114]
+
+    Each "start-end" range is bounded by MAX_TASK_RANGE to prevent memory
+    exhaustion (e.g. "1-999999999" would otherwise materialise ~1B ints).
     """
     ids: list[int] = []
     for part in task_str.split(","):
         part = part.strip()
         if "-" in part:
-            start, end = part.split("-", 1)
-            ids.extend(range(int(start), int(end) + 1))
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end - start > MAX_TASK_RANGE:
+                raise ValueError(
+                    f"task range too large: {part} (max {MAX_TASK_RANGE})"
+                )
+            ids.extend(range(start, end + 1))
         else:
             ids.append(int(part))
     return ids
