@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 
-from equipa.db import ensure_schema, get_db_connection
+from equipa.db import db_conn, ensure_schema
 
 
 def post_agent_message(
@@ -28,15 +28,13 @@ def post_agent_message(
     """Insert a structured message from one agent role to another."""
     try:
         ensure_schema()
-        conn = get_db_connection(write=True)
-        conn.execute(
-            """INSERT INTO agent_messages
-               (task_id, cycle_number, from_role, to_role, message_type, content)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (task_id, cycle, from_role, to_role, msg_type, content),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """INSERT INTO agent_messages
+                   (task_id, cycle_number, from_role, to_role, message_type, content)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (task_id, cycle, from_role, to_role, msg_type, content),
+            )
     except Exception as e:
         print(f"  [Messages] WARNING: Failed to post agent message: {e}")
 
@@ -49,27 +47,26 @@ def read_agent_messages(
     """Fetch unread messages for a given role on a task."""
     try:
         ensure_schema()
-        conn = get_db_connection()
-        if max_cycle is not None:
-            rows = conn.execute(
-                """SELECT id, task_id, cycle_number, from_role, to_role,
-                          message_type, content, created_at
-                   FROM agent_messages
-                   WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL
-                         AND cycle_number <= ?
-                   ORDER BY cycle_number ASC, id ASC""",
-                (task_id, to_role, max_cycle),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT id, task_id, cycle_number, from_role, to_role,
-                          message_type, content, created_at
-                   FROM agent_messages
-                   WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL
-                   ORDER BY cycle_number ASC, id ASC""",
-                (task_id, to_role),
-            ).fetchall()
-        conn.close()
+        with db_conn() as conn:
+            if max_cycle is not None:
+                rows = conn.execute(
+                    """SELECT id, task_id, cycle_number, from_role, to_role,
+                              message_type, content, created_at
+                       FROM agent_messages
+                       WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL
+                             AND cycle_number <= ?
+                       ORDER BY cycle_number ASC, id ASC""",
+                    (task_id, to_role, max_cycle),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, task_id, cycle_number, from_role, to_role,
+                              message_type, content, created_at
+                       FROM agent_messages
+                       WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL
+                       ORDER BY cycle_number ASC, id ASC""",
+                    (task_id, to_role),
+                ).fetchall()
         return [dict(row) for row in rows]
     except Exception as e:
         print(f"  [Messages] WARNING: Failed to read agent messages: {e}")
@@ -82,15 +79,13 @@ def mark_messages_read(
     """Mark all unread messages for a role as consumed by a given cycle."""
     try:
         ensure_schema()
-        conn = get_db_connection(write=True)
-        conn.execute(
-            """UPDATE agent_messages
-               SET read_by_cycle = ?
-               WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL""",
-            (cycle_number, task_id, to_role),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """UPDATE agent_messages
+                   SET read_by_cycle = ?
+                   WHERE task_id = ? AND to_role = ? AND read_by_cycle IS NULL""",
+                (cycle_number, task_id, to_role),
+            )
     except Exception as e:
         print(f"  [Messages] WARNING: Failed to mark messages as read: {e}")
 
