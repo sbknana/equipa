@@ -863,13 +863,31 @@ def _check_control_characters(command: str) -> BashSecurityResult:
     return _SAFE
 
 
+_PYTHON_HEREDOC_RE = re.compile(
+    r"""^\s*(?:python|python3|python2|py)\s+-c\s*['"]"""
+)
+
+
 def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
     """Check 23: Newline inside quotes where next line starts with #.
 
-    This exploits line-based comment stripping to hide arguments from
-    path validation.
+    Threat model: ``bash -c "real_cmd # malicious_arg"`` — the ``#`` makes
+    bash skip the rest of the line, hiding payload bytes from path
+    validation. BUT ``python3 -c "import x  # comment"`` is the standard
+    Python comment syntax; agents writing Python heredocs in task #2096
+    hit this constantly.
+
+    Loosen by allowlisting ``python -c`` / ``python3 -c`` heredoc forms,
+    where ``#`` is Python's legitimate comment character. The block stands
+    for bash/sh/zsh ``-c`` invocations, where ``#`` is the comment
+    smuggling primitive this check was designed to catch.
     """
     if "\n" not in command or "#" not in command:
+        return _SAFE
+
+    # Python -c heredoc: # is a legit comment character inside the quoted
+    # script, not a bash-comment smuggling primitive.
+    if _PYTHON_HEREDOC_RE.match(command):
         return _SAFE
 
     in_single = False
