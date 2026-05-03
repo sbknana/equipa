@@ -533,6 +533,11 @@ async def run_dev_test_loop(
     total_duration = 0.0
     task_id = task["id"]
     last_error_type: str | None = None
+    # Per-loop config dict for tracking transient state across cycles
+    # (paralysis retry count, etc.). Initialised here so references at
+    # lines ~702 (read) and ~824 (write) do not raise NameError.
+    # Bootstrap-patched 2026-05-02 — see TheForge task #2095.
+    dev_run_config: dict[str, Any] = {}
     loop_detector = LoopDetector()
     accumulated_files: set[str] = set()
 
