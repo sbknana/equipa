@@ -981,6 +981,233 @@ def _copy_hooks_to_worktree(main_repo_dir: str, worktree_dir: str) -> None:
         shutil.copy2(str(markers_src), str(markers_dst))
 
 
+def _create_isolation_worktrees(
+    tasks: list[dict],
+    project_dir: str,
+    worktree_base: Path,
+) -> dict[int, str]:
+    """Create per-task git worktrees for filesystem isolation.
+
+    Returns a map of task_id -> worktree directory path. Tasks for which
+    worktree creation fails are omitted from the returned map (they will
+    fall back to sharing project_dir).
+    """
+    worktree_dirs: dict[int, str] = {}
+    worktree_base.mkdir(exist_ok=True)
+    for t in tasks:
+        task_id = t["id"]
+        branch_name = f"forge-task-{task_id}"
+        wt_path = worktree_base / f"task-{task_id}"
+        try:
+            if wt_path.exists():
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(wt_path)],
+                    cwd=project_dir, capture_output=True,
+                )
+            subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                cwd=project_dir, capture_output=True, check=True,
+            )
+            worktree_dirs[task_id] = str(wt_path)
+            _copy_hooks_to_worktree(project_dir, str(wt_path))
+            print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
+        except subprocess.CalledProcessError:
+            # Fallback: branch may already exist — delete and retry.
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=project_dir, capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                    cwd=project_dir, capture_output=True, check=True,
+                )
+                worktree_dirs[task_id] = str(wt_path)
+                _copy_hooks_to_worktree(project_dir, str(wt_path))
+                print(f"  [Isolation] Task #{task_id} -> {wt_path.name} (retry)")
+            except subprocess.CalledProcessError as retry_err:
+                print(
+                    f"  [Isolation] WARNING: Could not create worktree for "
+                    f"task #{task_id}, using shared dir "
+                    f"(retry failed: {retry_err.stderr[:200] if retry_err.stderr else retry_err})"
+                )
+    return worktree_dirs
+
+
+def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool:
+    """Merge a single task branch into the main repo's current branch.
+
+    Returns True if the merge succeeded (HEAD advanced), False otherwise.
+    All failures are logged to stdout — the function NEVER swallows errors
+    silently. On any failure path, the branch is preserved (not deleted).
+    """
+    try:
+        current_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=project_dir, capture_output=True, text=True,
+        ).stdout.strip()
+        if not current_branch:
+            for candidate in ["master", "main"]:
+                check = subprocess.run(
+                    ["git", "show-ref", "--verify", f"refs/heads/{candidate}"],
+                    cwd=project_dir, capture_output=True,
+                )
+                if check.returncode == 0:
+                    subprocess.run(
+                        ["git", "checkout", candidate],
+                        cwd=project_dir, capture_output=True,
+                    )
+                    current_branch = candidate
+                    break
+        print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
+
+        pre_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_dir, capture_output=True, text=True,
+        ).stdout.strip()
+
+        ahead = subprocess.run(
+            ["git", "log", "--oneline", f"HEAD..{branch_name}"],
+            cwd=project_dir, capture_output=True, text=True,
+        )
+        if not ahead.stdout.strip():
+            print(
+                f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
+                f"NO commits ahead of HEAD — skipping merge"
+            )
+            return False
+
+        commits_ahead = len(ahead.stdout.strip().split("\n"))
+        print(
+            f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
+            f"{commits_ahead} commit(s) to merge"
+        )
+
+        stash_result = subprocess.run(
+            ["git", "stash"], cwd=project_dir, capture_output=True, text=True,
+        )
+        had_stash = "Saved working directory" in stash_result.stdout
+
+        try:
+            merge_result = subprocess.run(
+                ["git", "merge", "--no-edit", branch_name],
+                cwd=project_dir, capture_output=True, text=True,
+            )
+            post_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_dir, capture_output=True, text=True,
+            ).stdout.strip()
+
+            if merge_result.returncode == 0 and post_head != pre_head:
+                print(
+                    f"  [Isolation] Merged task #{task_id} into main "
+                    f"({pre_head[:8]} -> {post_head[:8]})"
+                )
+                return True
+            if merge_result.returncode == 0 and post_head == pre_head:
+                print(
+                    f"  [Isolation] WARNING: Merge returned 0 for task "
+                    f"#{task_id} but HEAD unchanged ({pre_head[:8]})"
+                )
+                print(f"  [Isolation] Merge stdout: {merge_result.stdout[:200]}")
+                return False
+
+            # Conflict path: try rebase-then-merge.
+            subprocess.run(
+                ["git", "merge", "--abort"],
+                cwd=project_dir, capture_output=True,
+            )
+            rebase_result = subprocess.run(
+                ["git", "rebase", "HEAD", branch_name],
+                cwd=project_dir, capture_output=True, text=True,
+            )
+            if rebase_result.returncode != 0:
+                subprocess.run(
+                    ["git", "rebase", "--abort"],
+                    cwd=project_dir, capture_output=True,
+                )
+                print(
+                    f"  [Isolation] Merge FAILED for task #{task_id}: "
+                    f"{merge_result.stderr[:200]}"
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                return False
+
+            merge2 = subprocess.run(
+                ["git", "merge", "--no-edit", branch_name],
+                cwd=project_dir, capture_output=True, text=True,
+            )
+            if merge2.returncode == 0:
+                print(f"  [Isolation] Merged task #{task_id} (after rebase)")
+                return True
+            subprocess.run(
+                ["git", "merge", "--abort"],
+                cwd=project_dir, capture_output=True,
+            )
+            print(
+                f"  [Isolation] Merge FAILED for task #{task_id} "
+                f"(conflict after rebase)"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            return False
+        finally:
+            if had_stash:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=project_dir, capture_output=True, text=True,
+                )
+    except (subprocess.SubprocessError, OSError) as e:
+        # Explicit error log — do NOT silently swallow. Branch is preserved
+        # because we did not add it to the merged set.
+        print(f"  [Isolation] Merge error for task #{task_id}: {e}")
+        print(f"  [Isolation] Branch '{branch_name}' PRESERVED (merge errored)")
+        return False
+
+
+def _cleanup_worktrees(
+    project_dir: str,
+    worktree_dirs: dict[int, str],
+    merged_tasks: set[int],
+    worktree_base: Path,
+) -> None:
+    """Remove worktree directories; delete merged branches; preserve unmerged.
+
+    Per-task failures are logged (not silently swallowed) so that data-loss
+    investigations have evidence of which step failed.
+    """
+    for task_id, wt_path in worktree_dirs.items():
+        branch_name = f"forge-task-{task_id}"
+        try:
+            state_file = Path(wt_path) / ".forge-state.json"
+            if state_file.exists():
+                state_file.unlink()
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", wt_path],
+                cwd=project_dir, capture_output=True,
+            )
+            if task_id in merged_tasks:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=project_dir, capture_output=True,
+                )
+            else:
+                print(
+                    f"  [Isolation] Keeping branch '{branch_name}' "
+                    f"(unmerged work)"
+                )
+        except (subprocess.SubprocessError, OSError) as e:
+            print(
+                f"  [Isolation] Cleanup error for task #{task_id} "
+                f"(branch '{branch_name}'): {e}"
+            )
+    # Clean up worktree base dir if empty (rmdir on non-empty dir raises
+    # OSError — that's expected when other worktrees exist, not an error).
+    try:
+        worktree_base.rmdir()
+    except OSError:
+        pass
+
+
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
@@ -1023,42 +1250,12 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             return
 
     # Create per-task git worktrees for filesystem isolation
-    worktree_dirs: dict[int, str] = {}
     worktree_base = Path(project_dir) / ".forge-worktrees"
     use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
-
-    if use_worktrees:
-        worktree_base.mkdir(exist_ok=True)
-        for t in tasks:
-            branch_name = f"forge-task-{t['id']}"
-            wt_path = worktree_base / f"task-{t['id']}"
-            try:
-                # Clean up stale worktree if exists
-                if wt_path.exists():
-                    subprocess.run(["git", "worktree", "remove", "--force", str(wt_path)],
-                                   cwd=project_dir, capture_output=True)
-                # Create worktree from current HEAD
-                subprocess.run(
-                    ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                    cwd=project_dir, capture_output=True, check=True,
-                )
-                worktree_dirs[t["id"]] = str(wt_path)
-                _copy_hooks_to_worktree(project_dir, str(wt_path))
-                print(f"  [Isolation] Task #{t['id']} -> {wt_path.name}")
-            except subprocess.CalledProcessError:
-                # Fallback: if worktree creation fails, try without -b (branch may exist)
-                try:
-                    subprocess.run(["git", "branch", "-D", branch_name],
-                                   cwd=project_dir, capture_output=True)
-                    subprocess.run(
-                        ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                        cwd=project_dir, capture_output=True, check=True,
-                    )
-                    worktree_dirs[t["id"]] = str(wt_path)
-                    _copy_hooks_to_worktree(project_dir, str(wt_path))
-                    print(f"  [Isolation] Task #{t['id']} -> {wt_path.name} (retry)")
-                except Exception:
-                    print(f"  [Isolation] WARNING: Could not create worktree for task #{t['id']}, using shared dir")
+    worktree_dirs: dict[int, str] = (
+        _create_isolation_worktrees(tasks, project_dir, worktree_base)
+        if use_worktrees else {}
+    )
 
     async def run_one_task(task):
         output = []
@@ -1147,132 +1344,21 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         for r in results:
             if isinstance(r, Exception):
                 continue
-            if r.get("needs_merge", False) or (r["task"]["id"] in worktree_dirs and r["outcome"] in ("tests_passed", "no_tests")):
+            if r.get("needs_merge", False) or (
+                r["task"]["id"] in worktree_dirs
+                and r["outcome"] in ("tests_passed", "no_tests")
+            ):
                 merge_candidates.append(r)
 
         for r in merge_candidates:
             task_id = r["task"]["id"]
             branch_name = f"forge-task-{task_id}"
-            try:
-                # Ensure we're on the default branch in the MAIN repo
-                current_branch = subprocess.run(
-                    ["git", "branch", "--show-current"],
-                    cwd=project_dir, capture_output=True, text=True,
-                ).stdout.strip()
-                if not current_branch:
-                    for candidate in ["master", "main"]:
-                        check = subprocess.run(
-                            ["git", "show-ref", "--verify", f"refs/heads/{candidate}"],
-                            cwd=project_dir, capture_output=True,
-                        )
-                        if check.returncode == 0:
-                            subprocess.run(["git", "checkout", candidate],
-                                           cwd=project_dir, capture_output=True)
-                            current_branch = candidate
-                            break
-                print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
-
-                # Capture HEAD before merge to verify it changed
-                pre_head = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=project_dir, capture_output=True, text=True,
-                ).stdout.strip()
-
-                # Check branch has commits ahead of HEAD
-                ahead = subprocess.run(
-                    ["git", "log", "--oneline", f"HEAD..{branch_name}"],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-                if not ahead.stdout.strip():
-                    print(f"  [Isolation] Task #{task_id}: branch '{branch_name}' has NO commits ahead of HEAD — skipping merge")
-                    continue
-
-                commits_ahead = len(ahead.stdout.strip().split(chr(10)))
-                print(f"  [Isolation] Task #{task_id}: branch '{branch_name}' has {commits_ahead} commit(s) to merge")
-
-                # Stash any uncommitted changes
-                stash_result = subprocess.run(
-                    ["git", "stash"], cwd=project_dir, capture_output=True, text=True,
-                )
-                had_stash = "Saved working directory" in stash_result.stdout
-
-                merge_result = subprocess.run(
-                    ["git", "merge", "--no-edit", branch_name],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-
-                # Verify HEAD actually changed
-                post_head = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=project_dir, capture_output=True, text=True,
-                ).stdout.strip()
-
-                if merge_result.returncode == 0 and post_head != pre_head:
-                    print(f"  [Isolation] Merged task #{task_id} into main ({pre_head[:8]} -> {post_head[:8]})")
-                    r["merge_ok"] = True
-                    merged_tasks_seq.add(task_id)
-                elif merge_result.returncode == 0 and post_head == pre_head:
-                    print(f"  [Isolation] WARNING: Merge returned 0 for task #{task_id} but HEAD unchanged ({pre_head[:8]})")
-                    print(f"  [Isolation] Merge stdout: {merge_result.stdout[:200]}")
-                else:
-                    # Try rebase-then-merge for conflicts
-                    subprocess.run(["git", "merge", "--abort"],
-                                   cwd=project_dir, capture_output=True)
-                    # Attempt rebase
-                    rebase_result = subprocess.run(
-                        ["git", "rebase", "HEAD", branch_name],
-                        cwd=project_dir, capture_output=True, text=True,
-                    )
-                    if rebase_result.returncode == 0:
-                        # Try merge again after rebase
-                        merge2 = subprocess.run(
-                            ["git", "merge", "--no-edit", branch_name],
-                            cwd=project_dir, capture_output=True, text=True,
-                        )
-                        if merge2.returncode == 0:
-                            print(f"  [Isolation] Merged task #{task_id} (after rebase)")
-                            r["merge_ok"] = True
-                            merged_tasks_seq.add(task_id)
-                        else:
-                            subprocess.run(["git", "merge", "--abort"],
-                                           cwd=project_dir, capture_output=True)
-                            print(f"  [Isolation] Merge FAILED for task #{task_id} (conflict after rebase)")
-                            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                    else:
-                        subprocess.run(["git", "rebase", "--abort"],
-                                       cwd=project_dir, capture_output=True)
-                        print(f"  [Isolation] Merge FAILED for task #{task_id}: {merge_result.stderr[:200]}")
-                        print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                # Pop stash only if we actually stashed something
-                if had_stash:
-                    subprocess.run(["git", "stash", "pop"], cwd=project_dir,
-                                   capture_output=True, text=True)
-            except Exception as e:
-                print(f"  [Isolation] Merge error for task #{task_id}: {e}")
+            if _merge_task_branch(project_dir, task_id, branch_name):
+                r["merge_ok"] = True
+                merged_tasks_seq.add(task_id)
 
     # Clean up worktrees — only delete branches that were successfully merged
     if use_worktrees:
-        for task_id, wt_path in worktree_dirs.items():
-            try:
-                branch_name = f"forge-task-{task_id}"
-                # Clean up ephemeral agent state file before removing worktree
-                state_file = Path(wt_path) / ".forge-state.json"
-                if state_file.exists():
-                    state_file.unlink()
-                # Always remove the worktree directory (it's a working copy)
-                subprocess.run(["git", "worktree", "remove", "--force", wt_path],
-                               cwd=project_dir, capture_output=True)
-                if task_id in merged_tasks_seq:
-                    # Branch was merged — safe to delete
-                    subprocess.run(["git", "branch", "-D", branch_name],
-                                   cwd=project_dir, capture_output=True)
-                else:
-                    # Branch was NOT merged — PRESERVE it so work isn't lost
-                    print(f"  [Isolation] Keeping branch '{branch_name}' (unmerged work)")
-            except Exception:
-                pass
-        # Clean up worktree base dir if empty
-        try:
-            worktree_base.rmdir()
-        except OSError:
-            pass
+        _cleanup_worktrees(
+            project_dir, worktree_dirs, merged_tasks_seq, worktree_base,
+        )
