@@ -16,12 +16,59 @@ import math
 import random
 import subprocess
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from equipa.prompts import PromptResult
+
+
+class _AgentResultRequired(TypedDict):
+    """Always-present keys in an AgentResult.
+
+    Every return path of dispatch_agent and the underlying runners must set
+    these six keys. They form the core contract relied on by callers
+    (loops.py, dispatch.py, manager.py).
+    """
+
+    success: bool
+    result_text: str
+    num_turns: int
+    duration: float
+    cost: float | None
+    errors: list[str]
+
+
+class AgentResult(_AgentResultRequired, total=False):
+    """Return shape for dispatch_agent and the underlying agent runners.
+
+    The six required keys are declared on _AgentResultRequired. The keys
+    below are optional — they are added by specific code paths (streaming
+    runner, RLM decompose, callers that annotate results after dispatch).
+
+    Adding a new key? Declare it here so mypy can catch typos at call sites.
+    """
+
+    # Streaming runner (run_agent_streaming) additions
+    has_file_changes: bool
+    early_terminated: bool
+    early_term_reason: str
+    early_completed: bool
+    early_complete_reason: str
+    compaction_count: int
+    compaction_signals: list[dict[str, str]]
+    files_read: list[str]
+    files_changed_set: list[str]
+    action_log: list[dict[str, Any]]
+
+    # RLM decompose path additions
+    rlm_decompose: bool
+    files_examined: list[str]
+
+    # Caller-injected annotations (set by loops.py after dispatch)
+    turns_allocated: int
+    turns_max: int
 
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
@@ -1384,7 +1431,7 @@ async def dispatch_agent(
     project_dir: str | None = None,
     args: Any = None,
     paralysis_retry_count: int = 0,
-) -> dict[str, Any]:
+) -> AgentResult:
     """Dispatch an agent using the configured provider (Claude or Ollama).
 
     For Claude: delegates to run_agent_streaming() or run_agent().
