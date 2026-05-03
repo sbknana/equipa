@@ -57,6 +57,11 @@ DEFAULT_MAX_TURNS = 25
 DEFAULT_MAX_RETRIES = 3
 PROCESS_TIMEOUT = 3600  # 60 minutes
 
+# Default timeout (seconds) for git/gh subprocess calls.
+# Single source of truth for git command timeouts across the codebase.
+# Long-running operations (worktree add, push, merge) override this explicitly.
+GIT_DEFAULT_TIMEOUT = 30
+
 # Per-role turn limits (used when dispatch config or CLI doesn't specify)
 DEFAULT_ROLE_TURNS = {
     "developer": 40,

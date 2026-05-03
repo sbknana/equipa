@@ -750,15 +750,9 @@ def _capture_git_diff_context(
     Returns an empty string when the diff is empty, the command fails, or
     times out. Diff is truncated at 8000 chars to avoid prompt bloat.
     """
-    import subprocess
+    from equipa.git_ops import git_run
     try:
-        result = subprocess.run(
-            ["git", "diff", "HEAD"],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = git_run(["diff", "HEAD"], project_dir, timeout=10)
         if result.returncode == 0 and result.stdout.strip():
             git_diff = result.stdout.strip()
             max_diff_chars = 8000

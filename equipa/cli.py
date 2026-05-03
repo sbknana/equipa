@@ -676,18 +676,14 @@ async def async_main() -> None:
                   f"Retry {retry_count}/{max_retries}...")
 
             # Clean up failed git branch
-            import subprocess as _sp
             branch_name = f"forge-task-{task['id']}"
             try:
-                from equipa.git_ops import _is_git_repo
+                from equipa.git_ops import _is_git_repo, git_run
                 if _is_git_repo(project_dir):
-                    cp = _sp.run(["git", "rev-parse", "--verify", "main"],
-                                 cwd=project_dir, capture_output=True)
+                    cp = git_run(["rev-parse", "--verify", "main"], project_dir, timeout=10)
                     default_branch = "main" if cp.returncode == 0 else "master"
-                    _sp.run(["git", "checkout", default_branch],
-                            cwd=project_dir, capture_output=True)
-                    _sp.run(["git", "branch", "-D", branch_name],
-                            cwd=project_dir, capture_output=True)
+                    git_run(["checkout", default_branch], project_dir, timeout=10)
+                    git_run(["branch", "-D", branch_name], project_dir, timeout=10)
                     print(f"  [Autoresearch] Cleaned up branch {branch_name}")
             except Exception as e:
                 print(f"  [Autoresearch] Git cleanup warning: {e}")
