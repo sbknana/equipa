@@ -591,6 +591,18 @@ def migrate_v7_to_v8(conn):
     the most-recently-updated row in each (error_signature, source) group
     and folding the duplicates' times_seen counts into the survivor.
     """
+    # Skip if the lessons_learned table doesn't exist yet. The table is
+    # created lazily by the orchestrator on first run (see schema.sql /
+    # ensure_schema), and minimal test fixtures may upgrade through this
+    # version without it. The unique index is only meaningful once the
+    # table exists; ensure_schema() will recreate it via schema.sql.
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'lessons_learned'"
+    ).fetchone()
+    if not table_exists:
+        return
+
     # Find duplicate (error_signature, source) groups among active rows.
     # The legacy code's SELECT-then-INSERT had a benign race that could
     # produce duplicates under concurrent writers; clean those up so the
