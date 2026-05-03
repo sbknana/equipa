@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
@@ -27,10 +28,14 @@ EPISODE_REDUCTION_THRESHOLD: int = 6000  # reduce episodes from 3->2 above this
 # --- Token Estimation ---
 
 def estimate_tokens(text: str) -> int:
-    """Estimate token count using ~4 chars/token approximation for Claude."""
-    if not text:
-        return 0
-    return len(text) // CHARS_PER_TOKEN
+    """Estimate token count using ~4 chars/token approximation for Claude.
+
+    Always returns at least 1 (a call site that estimates "no tokens" for a
+    real input is a footgun for budget arithmetic). Rounds up so partial
+    chunks count. This is the canonical implementation; rlm_decompose.py
+    re-exports this symbol.
+    """
+    return max(1, math.ceil(len(text) / CHARS_PER_TOKEN))
 
 
 def compute_keyword_overlap(text_a: str, text_b: str) -> float:
