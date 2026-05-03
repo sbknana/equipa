@@ -24,6 +24,7 @@ from equipa.constants import (
     DYNAMIC_BUDGET_EXTEND_TURNS,
     DYNAMIC_BUDGET_MIN_TURNS,
     DYNAMIC_BUDGET_START_RATIO,
+    EFFORT_BUDGET_MULTIPLIERS,
     EARLY_TERM_STUCK_PHRASES,
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
@@ -840,18 +841,42 @@ class LoopDetector:
 
 # --- Dynamic Turn Budget ---
 
-def calculate_dynamic_budget(max_turns: int) -> tuple[int, int]:
+def _resolve_effort_multiplier(effort: str | None) -> float:
+    """Resolve the effort string to a budget multiplier.
+
+    Unknown or missing efforts fall back to 1.0 (default behavior). Matching
+    is case-insensitive to tolerate dispatch_config keys like "High" or "MAX".
+    """
+    if not effort:
+        return 1.0
+    return EFFORT_BUDGET_MULTIPLIERS.get(effort.lower(), 1.0)
+
+
+def calculate_dynamic_budget(
+    max_turns: int, effort: str | None = None
+) -> tuple[int, int]:
     """Calculate the starting turn budget for an agent.
 
     Starts at DYNAMIC_BUDGET_START_RATIO of max_turns, with a floor of
     DYNAMIC_BUDGET_MIN_TURNS to ensure agents can at least read files.
 
-    Returns (starting_budget, max_turns) tuple.
+    When ``effort`` is supplied, both the effective max and the starting
+    budget are scaled by EFFORT_BUDGET_MULTIPLIERS — higher effort buys
+    more thoughtful turns but each turn still consumes one budget slot,
+    so the total budget needs to grow to match.
+
+    Returns (starting_budget, effective_max_turns) tuple. Note that the
+    second element reflects the effort-boosted max, not the input.
     """
-    starting = max(DYNAMIC_BUDGET_MIN_TURNS, int(max_turns * DYNAMIC_BUDGET_START_RATIO))
-    # Don't exceed the max
-    starting = min(starting, max_turns)
-    return starting, max_turns
+    eff_mult = _resolve_effort_multiplier(effort)
+    boosted_max = max(1, int(max_turns * eff_mult))
+    starting = max(
+        DYNAMIC_BUDGET_MIN_TURNS,
+        int(boosted_max * DYNAMIC_BUDGET_START_RATIO),
+    )
+    # Don't exceed the boosted max
+    starting = min(starting, boosted_max)
+    return starting, boosted_max
 
 
 def adjust_dynamic_budget(

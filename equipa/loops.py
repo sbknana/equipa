@@ -1058,18 +1058,24 @@ async def run_dev_test_loop(
     dev_turns_max = get_role_turns(task_role, args, task=task)
     tester_turns_max = get_role_turns("tester", args, task=task)
 
-    # Dynamic turn budgets: start conservative, extend on progress
-    dev_turns_allocated, _ = calculate_dynamic_budget(dev_turns_max)
-    tester_turns_allocated, _ = calculate_dynamic_budget(tester_turns_max)
+    # Dynamic turn budgets: start conservative, extend on progress.
+    # Effort scales budget — high-effort agents need more turns to match the
+    # extra thinking per turn that --effort high buys at the CLI layer.
+    effort = (dispatch_config or {}).get("effort")
+    dev_turns_allocated, dev_turns_max = calculate_dynamic_budget(
+        dev_turns_max, effort=effort)
+    tester_turns_allocated, tester_turns_max = calculate_dynamic_budget(
+        tester_turns_max, effort=effort)
 
     # Resolve cost limit for this complexity tier
     effective_cost_limit = (config_cost_limits or COST_LIMITS).get(complexity, 10.0)
     log(f"  Task complexity: {complexity}", output)
     log(f"  Cost limit: ${effective_cost_limit:.2f} ({complexity})", output)
+    effort_label = effort or "default"
     log(f"  Developer: model={dev_model}, budget={dev_turns_allocated}/{dev_turns_max} "
-        f"(dynamic)", output)
+        f"(dynamic, effort={effort_label})", output)
     log(f"  Tester: model={tester_model}, budget={tester_turns_allocated}/{tester_turns_max} "
-        f"(dynamic)", output)
+        f"(dynamic, effort={effort_label})", output)
 
     # Check for checkpoint from a previous timed-out attempt
     checkpoint_text, prev_attempt = load_checkpoint(task_id, role=task_role)

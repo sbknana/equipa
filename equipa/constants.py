@@ -97,6 +97,18 @@ DYNAMIC_BUDGET_MIN_TURNS = 15      # Minimum starting budget regardless of ratio
 DYNAMIC_BUDGET_EXTEND_TURNS = 10   # Extra turns granted when agent reports FILES_CHANGED
 DYNAMIC_BUDGET_BLOCKED_RATIO = 0.5  # Reduce remaining budget by 50% on RESULT: blocked
 
+# Effort multipliers applied to dynamic turn budgets. Mirrors the --effort flag
+# passed to the Claude CLI (see agent_runner.py): higher effort = more thoughtful
+# turns, but each turn still counts the same against the budget. To prevent
+# high-effort agents from running out of turns mid-task, scale the budget too.
+EFFORT_BUDGET_MULTIPLIERS = {
+    "low": 0.7,
+    "default": 1.0,
+    "high": 1.5,
+    "xhigh": 2.0,
+    "max": 2.5,
+}
+
 # Default model per role (overridden by dispatch_config per-role or per-complexity keys)
 DEFAULT_ROLE_MODELS = {
     "developer": "opus",
