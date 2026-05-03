@@ -189,21 +189,19 @@ def load_soft_checkpoint(
         return None
 
 
-def build_compaction_recovery_context(
-    soft_checkpoint: dict,
+def _format_recovery_prompt(
+    state: dict,
     forge_state: dict | None = None,
 ) -> str:
-    """Build a strong recovery prompt from soft checkpoint + .forge-state.json.
+    """Format a recovery / resume prompt from a state dict.
 
-    Used when a compaction is detected to give the continuation agent
-    maximum context about what was already accomplished.
-
-    Args:
-        soft_checkpoint: Data from load_soft_checkpoint().
-        forge_state: Optional data from .forge-state.json on disk.
-
-    Returns:
-        Formatted context string for injection into the agent prompt.
+    Shared by :func:`build_compaction_recovery_context` (within-task soft
+    checkpoint path) and :func:`equipa.sessions.build_resume_prompt`
+    (orchestrator-cycle path). The session state is a strict superset of the
+    soft-checkpoint state, so this single formatter handles both — keys that
+    only exist on the session side (``open_files``, ``recent_tool_calls``,
+    ``partial_reasoning``) are rendered when present and silently skipped
+    otherwise.
     """
     parts: list[str] = []
 
@@ -214,12 +212,19 @@ def build_compaction_recovery_context(
         "Do NOT re-introduce yourself. Resume from where you left off.\n"
     )
 
-    # Soft checkpoint data
-    turn = soft_checkpoint.get("turn_count", 0)
-    files_changed = soft_checkpoint.get("files_changed", [])
-    files_read = soft_checkpoint.get("files_read", [])
-    compaction_count = soft_checkpoint.get("compaction_count", 0)
-    last_text = soft_checkpoint.get("last_result_text", "")
+    turn = state.get("turn_count", 0)
+    files_changed = state.get("files_changed", [])
+    files_read = state.get("files_read", [])
+    open_files = state.get("open_files", [])
+    compaction_count = state.get("compaction_count", 0)
+    # Sessions populate ``partial_reasoning``; soft checkpoints use
+    # ``last_result_text``. Either is acceptable input here.
+    last_text = (
+        state.get("partial_reasoning")
+        or state.get("last_result_text")
+        or ""
+    )
+    recent_tool_calls = state.get("recent_tool_calls") or []
 
     parts.append(f"**Turn count at checkpoint:** {turn}")
     parts.append(f"**Compactions detected so far:** {compaction_count}")
@@ -235,12 +240,28 @@ def build_compaction_recovery_context(
             f"{', '.join(files_read)}"
         )
 
+    if open_files:
+        parts.append(f"**Open files:** {', '.join(open_files)}")
+
     if last_text:
         parts.append(
             f"\n**Your last output (truncated):**\n```\n{last_text}\n```"
         )
 
-    # .forge-state.json data (agent's own state file)
+    if recent_tool_calls:
+        rendered_calls = []
+        for call in recent_tool_calls:
+            if not isinstance(call, dict):
+                continue
+            tool = call.get("tool", "?")
+            turn_num = call.get("turn", "?")
+            ok = call.get("ok", "?")
+            rendered_calls.append(f"- turn {turn_num}: {tool} (ok={ok})")
+        if rendered_calls:
+            parts.append(
+                "\n**Recent tool calls:**\n" + "\n".join(rendered_calls)
+            )
+
     if forge_state:
         parts.append("\n**Agent state file (.forge-state.json):**")
         current_step = forge_state.get("current_step", "")
@@ -266,3 +287,22 @@ def build_compaction_recovery_context(
     )
 
     return "\n".join(parts)
+
+
+def build_compaction_recovery_context(
+    soft_checkpoint: dict,
+    forge_state: dict | None = None,
+) -> str:
+    """Build a strong recovery prompt from soft checkpoint + .forge-state.json.
+
+    Used when a compaction is detected to give the continuation agent
+    maximum context about what was already accomplished.
+
+    Args:
+        soft_checkpoint: Data from load_soft_checkpoint().
+        forge_state: Optional data from .forge-state.json on disk.
+
+    Returns:
+        Formatted context string for injection into the agent prompt.
+    """
+    return _format_recovery_prompt(soft_checkpoint, forge_state=forge_state)
