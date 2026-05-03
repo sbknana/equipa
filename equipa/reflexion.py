@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from equipa.db import get_db_connection
+from equipa.db import db_conn
 from equipa.lessons import record_agent_episode
 from equipa.output import log
 from equipa.parsing import parse_reflection
@@ -99,18 +99,16 @@ async def run_reflexion_agent(
             pass  # not JSON, use raw text
 
         # Update the most recent episode for this task (subquery for portability)
-        conn = get_db_connection(write=True)
-        conn.execute(
-            """UPDATE agent_episodes SET reflection = ?
-               WHERE id = (
-                   SELECT id FROM agent_episodes
-                   WHERE task_id = ? AND reflection IS NULL
-                   ORDER BY id DESC LIMIT 1
-               )""",
-            (reflection_text, task_id),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """UPDATE agent_episodes SET reflection = ?
+                   WHERE id = (
+                       SELECT id FROM agent_episodes
+                       WHERE task_id = ? AND reflection IS NULL
+                       ORDER BY id DESC LIMIT 1
+                   )""",
+                (reflection_text, task_id),
+            )
 
         preview = reflection_text[:120] + "..." if len(reflection_text) > 120 else reflection_text
         log(f"  [Reflexion] Captured reflection: {preview}", output)
