@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from equipa.agent_runner import (
@@ -469,13 +470,11 @@ def _load_forge_state_json(project_dir: str | None) -> dict | None:
     """
     if not project_dir:
         return None
-    from pathlib import Path
     state_file = Path(project_dir) / ".forge-state.json"
     if not state_file.exists():
         return None
     try:
-        import json as _json
-        return _json.loads(state_file.read_text(encoding="utf-8"))
+        return json.loads(state_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
