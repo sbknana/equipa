@@ -89,6 +89,7 @@ from equipa.roles import (
     get_role_model,
     get_role_turns,
 )
+from equipa import sessions
 from equipa.tasks import _get_task_status, get_task_complexity
 
 
@@ -465,6 +466,37 @@ def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | 
     return _create_review_lessons(
         findings, project_id, source="security-reviewer", error_type="security",
     )
+
+
+def _capture_session_safe(
+    task_id: int,
+    role: str,
+    project_id: int | None,
+    dispatch_config: dict | None,
+    output: Any = None,
+    cycle_id: str | None = None,
+) -> None:
+    """Capture an orchestrator-cycle session, gated by feature flag.
+
+    Wrapped in try/except so a session capture failure can never abort the
+    dev-test loop. PLAN-1067 §2.B3 — invoked from every exit path of
+    run_dev_test_loop so a subsequent cycle (or heartbeat tick) can restore
+    the in-flight state.
+    """
+    if not is_feature_enabled(dispatch_config, "session_persistence"):
+        return
+    if project_id is None:
+        return
+    try:
+        sessions.capture(
+            task_id=task_id,
+            role=role,
+            project_id=project_id,
+            cycle_id=cycle_id or f"task:{task_id}",
+            soft_checkpoint_path=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — never let session writes break the loop
+        log(f"  [Session] WARNING: capture failed for task {task_id}: {exc}", output)
 
 
 def _load_forge_state_json(project_dir: str | None) -> dict | None:
@@ -1051,6 +1083,28 @@ async def run_dev_test_loop(
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
     config_cost_limits = (dispatch_config or {}).get("cost_limits")
 
+    # PLAN-1067 §2.B3 — restore prior session state on loop entry.
+    # If the agent ran before and a session was captured (e.g. by a heartbeat
+    # tick or a prior cycle), prepend the resume-prompt prefix to the dev's
+    # extra context so the next dispatch resumes with full continuity.
+    project_id_for_session = task.get("project_id") if isinstance(task, dict) else None
+    session_persistence_on = is_feature_enabled(dispatch_config, "session_persistence")
+    if session_persistence_on:
+        try:
+            restored_state = sessions.restore(task_id, task_role)
+            if restored_state:
+                resume_prefix = sessions.build_resume_prompt(restored_state)
+                if resume_prefix:
+                    state.compaction_history.insert(0, resume_prefix)
+                    log(
+                        f"  [Session] Restored prior session state for "
+                        f"task {task_id} role={task_role} "
+                        f"({len(resume_prefix)} chars resume context)",
+                        output,
+                    )
+        except Exception as exc:  # noqa: BLE001 — never break the loop on session failure
+            log(f"  [Session] WARNING: restore failed: {exc}", output)
+
     # Reset status so orchestrator is authoritative
     conn = get_db_connection(write=True)
     conn.execute("UPDATE tasks SET status = 'in_progress' WHERE id = ?", (task_id,))
@@ -1133,313 +1187,327 @@ async def run_dev_test_loop(
     # behavior degrades gracefully to the legacy cumulative diff.
     prev_cycle_sha = await _resolve_head_sha(project_dir, output)
 
-    for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
-        log(f"\n{'=' * 50}", output)
-        log(f"  DEV-TEST CYCLE {cycle}/{MAX_DEV_TEST_CYCLES}", output)
-        log(f"{'=' * 50}", output)
+    # PLAN-1067 §2.B3 — wrap the dev-test loop in try/finally so
+    # session capture runs on EVERY exit path (success, failure, exception).
+    try:
+        for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
+            log(f"\n{'=' * 50}", output)
+            log(f"  DEV-TEST CYCLE {cycle}/{MAX_DEV_TEST_CYCLES}", output)
+            log(f"{'=' * 50}", output)
 
-        # --- Lifecycle hooks: pre_cycle ---
-        await fire_hook(
-            "pre_cycle",
-            task_id=task_id, cycle=cycle, project_dir=project_dir,
-            total_cost=state.total_cost,
-        )
-
-        # --- Developer Phase ---
-        log(f"\n  [Cycle {cycle}] Running Developer agent "
-            f"(budget: {dev_turns_allocated}/{dev_turns_max})...", output)
-
-        # --- Inter-agent messages ---
-        agent_msgs = read_agent_messages(task_id, task_role)
-        if agent_msgs:
-            message_context = format_messages_for_prompt(agent_msgs)
-            mark_messages_read(task_id, task_role, cycle)
-            log(f"  [Cycle {cycle}] Injected {len(agent_msgs)} message(s) from other agents", output)
-        else:
-            message_context = ""
-
-        # Build extra context from compaction history.
-        # CRITICAL: Paralysis injection (KILLED for Analysis Paralysis) must
-        # NEVER be truncated — it's the primary mechanism to change agent
-        # behavior on retry. See _build_dev_extra_context for the full policy.
-        _dc = getattr(args, "dispatch_config", None)
-        extra_context = _build_dev_extra_context(
-            state.compaction_history, cycle, message_context, _dc
-        )
-
-        dev_prompt = build_system_prompt(
-            task, project_context, project_dir,
-            role=task_role, extra_context=extra_context,
-            dispatch_config=dispatch_config,
-            error_type=state.last_error_type,
-            max_turns=dev_turns_allocated,
-        )
-        use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
-        dev_cmd = build_cli_command(
-            dev_prompt, project_dir, dev_turns_allocated, dev_model, role=task_role,
-            streaming=use_streaming,
-        )
-
-        # --- Lifecycle hooks: pre_agent_start ---
-        await fire_hook(
-            "pre_agent_start",
-            task_id=task_id, cycle=cycle, role=task_role,
-            project_dir=project_dir, model=dev_model,
-        )
-
-        # Extract paralysis retry count so agent_runner can apply tighter
-        # kill thresholds. Without this, the escalating prompt injections
-        # have no teeth — the agent still gets the full kill budget.
-        paralysis_retries = state.dev_run_config.get("_paralysis_retry_count", 0)
-
-        dev_result: AgentResult = await dispatch_agent(
-            dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
-            task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
-            project_dir=project_dir, args=args,
-            paralysis_retry_count=paralysis_retries)
-        dev_result["turns_allocated"] = dev_turns_allocated
-        dev_result["turns_max"] = dev_turns_max
-        state.total_duration += dev_result.get("duration", 0)
-        state.total_cost += _accumulate_cost(
-            dev_result, f"[Cycle {cycle}] Developer", output)
-
-        # --- Lifecycle hooks: post_agent_finish (developer) ---
-        await fire_hook(
-            "post_agent_finish",
-            task_id=task_id, cycle=cycle, role=task_role,
-            project_dir=project_dir, success=dev_result.get("success", False),
-            cost=dev_result.get("cost"), duration=dev_result.get("duration", 0),
-        )
-
-        # Cost-based circuit breaker
-        cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
-        if cost_reason:
-            log(f"  [Cycle {cycle}] {cost_reason}", output)
-            state.loop_detector.record(dev_result, cycle)
-            _apply_cost_totals(dev_result, state.total_cost, state.total_duration)
-            dev_result["early_terminated"] = True
-            dev_result["early_term_reason"] = cost_reason
-            return dev_result, cycle, "cost_limit_exceeded"
-
-        # Check for early termination — retry analysis paralysis with stricter prompt
-        if dev_result.get("early_terminated"):
-            reason = dev_result.get("early_term_reason", "unknown")
-            log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
-            state.loop_detector.record(dev_result, cycle)
-
-            # If killed for analysis paralysis (no file changes), retry with
-            # escalating scaffold-first prompts. Each retry is MORE aggressive
-            # and reduces the kill threshold. This is the #1 cause of failure
-            # on large codebases — seen in FeatureBench task 3 where the agent
-            # hit EarlyTerm on attempts 4, 5, 6, 8, 10.
-            if _handle_paralysis_retry(
-                reason, cycle, state.compaction_history, state.dev_run_config, output
-            ):
-                continue
-
-            return dev_result, cycle, "early_terminated"
-
-        # Check for agent-initiated early completion
-        if dev_result.get("early_completed"):
-            ec_reason = dev_result.get("early_complete_reason", "")
-            log(f"  [Cycle {cycle}] Developer signaled early completion: "
-                f"{ec_reason}", output)
-            no_changes_phrases = [
-                "no changes needed", "no changes required",
-                "no modifications needed", "nothing to change",
-                "already implemented", "already exists",
-                "no work needed", "task already complete",
-            ]
-            if any(phrase in ec_reason.lower() for phrase in no_changes_phrases):
-                log(f"  [Cycle {cycle}] Skipping tester — agent reported no "
-                    f"changes needed.", output)
-                clear_checkpoints(task_id)
-                dev_result["cost"] = state.total_cost
-                dev_result["duration"] = state.total_duration
-                return dev_result, cycle, "early_completed_no_changes"
-            log(f"  [Cycle {cycle}] Agent completed early with changes — "
-                f"proceeding to tester.", output)
-
-        # Check for timeout or max_turns — save checkpoint, optionally
-        # continue with recovery context, or exit if continuations exhausted.
-        cont_action, state.continuation_count, cont_err_type, cont_outcome = (
-            await _handle_dev_continuation(
-                dev_result, task_id, task_role, cycle, prev_attempt,
-                project_dir, state.continuation_count, state.compaction_history, output,
+            # --- Lifecycle hooks: pre_cycle ---
+            await fire_hook(
+                "pre_cycle",
+                task_id=task_id, cycle=cycle, project_dir=project_dir,
+                total_cost=state.total_cost,
             )
-        )
-        if cont_action == "continue":
-            state.last_error_type = cont_err_type
-            continue
-        if cont_action == "exit":
-            return dev_result, cycle, cont_outcome  # type: ignore[return-value]
-        # cont_action == "proceed" — fall through to normal flow
 
-        # Check for agent failure
-        if not dev_result["success"]:
-            if dev_result.get("has_file_changes"):
-                log(f"  [Cycle {cycle}] Developer agent reported failure but made file changes. "
-                    f"Proceeding to tester.", output)
-                dev_result["success"] = True
+            # --- Developer Phase ---
+            log(f"\n  [Cycle {cycle}] Running Developer agent "
+                f"(budget: {dev_turns_allocated}/{dev_turns_max})...", output)
+
+            # --- Inter-agent messages ---
+            agent_msgs = read_agent_messages(task_id, task_role)
+            if agent_msgs:
+                message_context = format_messages_for_prompt(agent_msgs)
+                mark_messages_read(task_id, task_role, cycle)
+                log(f"  [Cycle {cycle}] Injected {len(agent_msgs)} message(s) from other agents", output)
             else:
-                log(f"  [Cycle {cycle}] Developer agent failed.", output)
-                return dev_result, cycle, "developer_failed"
+                message_context = ""
 
-        # Compaction
-        dev_turns_used_for_compact = dev_result.get("num_turns", 0)
-        log(f"  [Cycle {cycle}] Compacting developer output "
-            f"({dev_turns_used_for_compact} turns)...", output)
-        summary = build_compaction_summary("Developer", dev_result, cycle, task)
-        state.compaction_history.append(summary)
-
-        # Check if Developer marked task blocked
-        status = _get_task_status(task["id"])
-        if status == "blocked":
-            log(f"  [Cycle {cycle}] Developer marked task as BLOCKED.", output)
-            return dev_result, cycle, "developer_blocked"
-
-        # Progress detection — track both per-cycle and accumulated changes
-        progress_action, state.no_progress_count, error_reset = _check_dev_progress(
-            dev_result, state.accumulated_files, state.no_progress_count,
-            project_dir, cycle, output,
-        )
-        if error_reset is None:
-            state.last_error_type = None
-        if progress_action == "block":
-            return dev_result, cycle, "no_progress"
-
-        # --- Dynamic Budget Adjustment ---
-        prev_budget = dev_turns_allocated
-        dev_turns_allocated = adjust_dynamic_budget(
-            dev_turns_allocated, dev_turns_max,
-            dev_result.get("result_text", ""))
-        if dev_turns_allocated != prev_budget:
-            log(f"  [DynBudget] Developer budget adjusted: {prev_budget} -> "
-                f"{dev_turns_allocated}/{dev_turns_max}", output)
-
-        # --- Loop Detection ---
-        loop_action = state.loop_detector.record(dev_result, cycle)
-        if loop_action == "terminate":
-            log(f"  [Cycle {cycle}] LOOP DETECTED: Agent repeated the same failing "
-                f"pattern {state.loop_detector.consecutive_same} times. Terminating early.", output)
-            dev_result.setdefault("errors", []).append(state.loop_detector.termination_summary())
-            return dev_result, cycle, "loop_detected"
-        elif loop_action == "warn":
-            log(f"  [Cycle {cycle}] Loop warning: Agent has repeated the same pattern "
-                f"{state.loop_detector.consecutive_same} times. Injecting 'try different approach' "
-                f"guidance.", output)
-            state.compaction_history.append(state.loop_detector.warning_message())
-            dev_result.setdefault("errors", []).append(
-                f"Loop warning: agent repeated same pattern "
-                f"{state.loop_detector.consecutive_same} times (cycle {cycle})"
+            # Build extra context from compaction history.
+            # CRITICAL: Paralysis injection (KILLED for Analysis Paralysis) must
+            # NEVER be truncated — it's the primary mechanism to change agent
+            # behavior on retry. See _build_dev_extra_context for the full policy.
+            _dc = getattr(args, "dispatch_config", None)
+            extra_context = _build_dev_extra_context(
+                state.compaction_history, cycle, message_context, _dc
             )
 
-        # --- Tester Phase ---
-        log(f"\n  [Cycle {cycle}] Running Tester agent "
-            f"(budget: {tester_turns_allocated}/{tester_turns_max})...", output)
+            dev_prompt = build_system_prompt(
+                task, project_context, project_dir,
+                role=task_role, extra_context=extra_context,
+                dispatch_config=dispatch_config,
+                error_type=state.last_error_type,
+                max_turns=dev_turns_allocated,
+            )
+            use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
+            dev_cmd = build_cli_command(
+                dev_prompt, project_dir, dev_turns_allocated, dev_model, role=task_role,
+                streaming=use_streaming,
+            )
 
-        # Capture git diff to give tester context about developer changes.
-        # Diff against the prior cycle's HEAD SHA so we don't re-send earlier
-        # cycles' diffs to every subsequent tester (see task #2145).
-        tester_extra_context = await _capture_git_diff_context(
-            project_dir, cycle, output, base_ref=prev_cycle_sha,
-        )
-        tester_prompt = build_system_prompt(
-            task, project_context, project_dir, role="tester",
+            # --- Lifecycle hooks: pre_agent_start ---
+            await fire_hook(
+                "pre_agent_start",
+                task_id=task_id, cycle=cycle, role=task_role,
+                project_dir=project_dir, model=dev_model,
+            )
+
+            # Extract paralysis retry count so agent_runner can apply tighter
+            # kill thresholds. Without this, the escalating prompt injections
+            # have no teeth — the agent still gets the full kill budget.
+            paralysis_retries = state.dev_run_config.get("_paralysis_retry_count", 0)
+
+            dev_result: AgentResult = await dispatch_agent(
+                dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
+                task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
+                project_dir=project_dir, args=args,
+                paralysis_retry_count=paralysis_retries)
+            dev_result["turns_allocated"] = dev_turns_allocated
+            dev_result["turns_max"] = dev_turns_max
+            state.total_duration += dev_result.get("duration", 0)
+            state.total_cost += _accumulate_cost(
+                dev_result, f"[Cycle {cycle}] Developer", output)
+
+            # --- Lifecycle hooks: post_agent_finish (developer) ---
+            await fire_hook(
+                "post_agent_finish",
+                task_id=task_id, cycle=cycle, role=task_role,
+                project_dir=project_dir, success=dev_result.get("success", False),
+                cost=dev_result.get("cost"), duration=dev_result.get("duration", 0),
+            )
+
+            # Cost-based circuit breaker
+            cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
+            if cost_reason:
+                log(f"  [Cycle {cycle}] {cost_reason}", output)
+                state.loop_detector.record(dev_result, cycle)
+                _apply_cost_totals(dev_result, state.total_cost, state.total_duration)
+                dev_result["early_terminated"] = True
+                dev_result["early_term_reason"] = cost_reason
+                return dev_result, cycle, "cost_limit_exceeded"
+
+            # Check for early termination — retry analysis paralysis with stricter prompt
+            if dev_result.get("early_terminated"):
+                reason = dev_result.get("early_term_reason", "unknown")
+                log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
+                state.loop_detector.record(dev_result, cycle)
+
+                # If killed for analysis paralysis (no file changes), retry with
+                # escalating scaffold-first prompts. Each retry is MORE aggressive
+                # and reduces the kill threshold. This is the #1 cause of failure
+                # on large codebases — seen in FeatureBench task 3 where the agent
+                # hit EarlyTerm on attempts 4, 5, 6, 8, 10.
+                if _handle_paralysis_retry(
+                    reason, cycle, state.compaction_history, state.dev_run_config, output
+                ):
+                    continue
+
+                return dev_result, cycle, "early_terminated"
+
+            # Check for agent-initiated early completion
+            if dev_result.get("early_completed"):
+                ec_reason = dev_result.get("early_complete_reason", "")
+                log(f"  [Cycle {cycle}] Developer signaled early completion: "
+                    f"{ec_reason}", output)
+                no_changes_phrases = [
+                    "no changes needed", "no changes required",
+                    "no modifications needed", "nothing to change",
+                    "already implemented", "already exists",
+                    "no work needed", "task already complete",
+                ]
+                if any(phrase in ec_reason.lower() for phrase in no_changes_phrases):
+                    log(f"  [Cycle {cycle}] Skipping tester — agent reported no "
+                        f"changes needed.", output)
+                    clear_checkpoints(task_id)
+                    dev_result["cost"] = state.total_cost
+                    dev_result["duration"] = state.total_duration
+                    return dev_result, cycle, "early_completed_no_changes"
+                log(f"  [Cycle {cycle}] Agent completed early with changes — "
+                    f"proceeding to tester.", output)
+
+            # Check for timeout or max_turns — save checkpoint, optionally
+            # continue with recovery context, or exit if continuations exhausted.
+            cont_action, state.continuation_count, cont_err_type, cont_outcome = (
+                await _handle_dev_continuation(
+                    dev_result, task_id, task_role, cycle, prev_attempt,
+                    project_dir, state.continuation_count, state.compaction_history, output,
+                )
+            )
+            if cont_action == "continue":
+                state.last_error_type = cont_err_type
+                continue
+            if cont_action == "exit":
+                return dev_result, cycle, cont_outcome  # type: ignore[return-value]
+            # cont_action == "proceed" — fall through to normal flow
+
+            # Check for agent failure
+            if not dev_result["success"]:
+                if dev_result.get("has_file_changes"):
+                    log(f"  [Cycle {cycle}] Developer agent reported failure but made file changes. "
+                        f"Proceeding to tester.", output)
+                    dev_result["success"] = True
+                else:
+                    log(f"  [Cycle {cycle}] Developer agent failed.", output)
+                    return dev_result, cycle, "developer_failed"
+
+            # Compaction
+            dev_turns_used_for_compact = dev_result.get("num_turns", 0)
+            log(f"  [Cycle {cycle}] Compacting developer output "
+                f"({dev_turns_used_for_compact} turns)...", output)
+            summary = build_compaction_summary("Developer", dev_result, cycle, task)
+            state.compaction_history.append(summary)
+
+            # Check if Developer marked task blocked
+            status = _get_task_status(task["id"])
+            if status == "blocked":
+                log(f"  [Cycle {cycle}] Developer marked task as BLOCKED.", output)
+                return dev_result, cycle, "developer_blocked"
+
+            # Progress detection — track both per-cycle and accumulated changes
+            progress_action, state.no_progress_count, error_reset = _check_dev_progress(
+                dev_result, state.accumulated_files, state.no_progress_count,
+                project_dir, cycle, output,
+            )
+            if error_reset is None:
+                state.last_error_type = None
+            if progress_action == "block":
+                return dev_result, cycle, "no_progress"
+
+            # --- Dynamic Budget Adjustment ---
+            prev_budget = dev_turns_allocated
+            dev_turns_allocated = adjust_dynamic_budget(
+                dev_turns_allocated, dev_turns_max,
+                dev_result.get("result_text", ""))
+            if dev_turns_allocated != prev_budget:
+                log(f"  [DynBudget] Developer budget adjusted: {prev_budget} -> "
+                    f"{dev_turns_allocated}/{dev_turns_max}", output)
+
+            # --- Loop Detection ---
+            loop_action = state.loop_detector.record(dev_result, cycle)
+            if loop_action == "terminate":
+                log(f"  [Cycle {cycle}] LOOP DETECTED: Agent repeated the same failing "
+                    f"pattern {state.loop_detector.consecutive_same} times. Terminating early.", output)
+                dev_result.setdefault("errors", []).append(state.loop_detector.termination_summary())
+                return dev_result, cycle, "loop_detected"
+            elif loop_action == "warn":
+                log(f"  [Cycle {cycle}] Loop warning: Agent has repeated the same pattern "
+                    f"{state.loop_detector.consecutive_same} times. Injecting 'try different approach' "
+                    f"guidance.", output)
+                state.compaction_history.append(state.loop_detector.warning_message())
+                dev_result.setdefault("errors", []).append(
+                    f"Loop warning: agent repeated same pattern "
+                    f"{state.loop_detector.consecutive_same} times (cycle {cycle})"
+                )
+
+            # --- Tester Phase ---
+            log(f"\n  [Cycle {cycle}] Running Tester agent "
+                f"(budget: {tester_turns_allocated}/{tester_turns_max})...", output)
+
+            # Capture git diff to give tester context about developer changes.
+            # Diff against the prior cycle's HEAD SHA so we don't re-send earlier
+            # cycles' diffs to every subsequent tester (see task #2145).
+            tester_extra_context = await _capture_git_diff_context(
+                project_dir, cycle, output, base_ref=prev_cycle_sha,
+            )
+            tester_prompt = build_system_prompt(
+                task, project_context, project_dir, role="tester",
+                dispatch_config=dispatch_config,
+                max_turns=tester_turns_allocated,
+                extra_context=tester_extra_context,
+            )
+            tester_cmd = build_cli_command(
+                tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
+                streaming=True,
+            )
+
+            # --- Lifecycle hooks: pre_agent_start (tester) ---
+            await fire_hook(
+                "pre_agent_start",
+                task_id=task_id, cycle=cycle, role="tester",
+                project_dir=project_dir, model=tester_model,
+            )
+
+            tester_result: AgentResult = await dispatch_agent(
+                tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
+                task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
+                project_dir=project_dir, args=args)
+            tester_result["turns_allocated"] = tester_turns_allocated
+            tester_result["turns_max"] = tester_turns_max
+            state.total_duration += tester_result.get("duration", 0)
+            state.total_cost += _accumulate_cost(
+                tester_result, f"[Cycle {cycle}] Tester", output)
+
+            # --- Lifecycle hooks: post_agent_finish (tester) ---
+            await fire_hook(
+                "post_agent_finish",
+                task_id=task_id, cycle=cycle, role="tester",
+                project_dir=project_dir, success=tester_result.get("success", False),
+                cost=tester_result.get("cost"), duration=tester_result.get("duration", 0),
+            )
+
+            # Cost-based circuit breaker after tester phase
+            cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
+            if cost_reason:
+                log(f"  [Cycle {cycle}] {cost_reason} (after tester)", output)
+                _apply_cost_totals(tester_result, state.total_cost, state.total_duration)
+                tester_result["early_terminated"] = True
+                tester_result["early_term_reason"] = cost_reason
+                return tester_result, cycle, "cost_limit_exceeded"
+
+            # Check for early termination (stuck tester)
+            if tester_result.get("early_terminated"):
+                reason = tester_result.get("early_term_reason", "unknown")
+                log(f"  [Cycle {cycle}] Tester early-terminated: {reason}", output)
+                log(f"  [Cycle {cycle}] Treating tester early-termination as no-tests (accepting dev work)", output)
+                tester_result["result"] = "no-tests"
+                tester_result["tests_run"] = 0
+                tester_result["tests_passed"] = 0
+
+            # Check for timeout
+            if any("timed out" in e for e in tester_result.get("errors", [])):
+                log(f"  [Cycle {cycle}] Tester timed out.", output)
+                return tester_result, cycle, "tester_timeout"
+
+            # Compaction
+            tester_turns_for_compact = tester_result.get("num_turns", 0)
+            log(f"  [Cycle {cycle}] Compacting tester output "
+                f"({tester_turns_for_compact} turns)...", output)
+            summary = build_compaction_summary("Tester", tester_result, cycle, task)
+            state.compaction_history.append(summary)
+
+            # Parse Tester output
+            test_results = parse_tester_output(tester_result.get("result_text", ""))
+            test_outcome = test_results["result"]
+
+            log(f"  [Cycle {cycle}] Tester result: {test_outcome} "
+                f"({test_results['tests_passed']}/{test_results['tests_run']} passed)", output)
+
+            # --- Lifecycle hooks: post_cycle ---
+            await fire_hook(
+                "post_cycle",
+                task_id=task_id, cycle=cycle, project_dir=project_dir,
+                test_outcome=test_outcome, total_cost=state.total_cost,
+            )
+
+            outcome_action, return_result, outcome_str = _dispatch_tester_outcome(
+                test_results, tester_result, dev_result, cycle, task_id,
+                task_role, state.total_cost, state.total_duration,
+                state.compaction_history, output,
+            )
+            if outcome_action == "exit":
+                return return_result, cycle, outcome_str  # type: ignore[return-value]
+            # outcome_action == "continue_loop" — fall through to next iteration.
+            # Refresh prev_cycle_sha so the next cycle's tester diff starts from
+            # this cycle's final HEAD (excluding earlier cycles' commits).
+            next_sha = await _resolve_head_sha(project_dir, output)
+            if next_sha:
+                prev_cycle_sha = next_sha
+
+        # All cycles exhausted
+        log(f"\n  All {MAX_DEV_TEST_CYCLES} dev-test cycles exhausted. Marking blocked.", output)
+        tester_result["cost"] = state.total_cost
+        tester_result["duration"] = state.total_duration
+        return tester_result, MAX_DEV_TEST_CYCLES, "cycles_exhausted"
+    finally:
+        # PLAN-1067 §2.B3 — capture orchestrator-cycle session on every exit.
+        # Gated by feature flag; never raises (writes go through the safe
+        # helper that swallows-and-logs).
+        _capture_session_safe(
+            task_id=task_id,
+            role=task_role,
+            project_id=project_id_for_session,
             dispatch_config=dispatch_config,
-            max_turns=tester_turns_allocated,
-            extra_context=tester_extra_context,
+            output=output,
         )
-        tester_cmd = build_cli_command(
-            tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
-            streaming=True,
-        )
-
-        # --- Lifecycle hooks: pre_agent_start (tester) ---
-        await fire_hook(
-            "pre_agent_start",
-            task_id=task_id, cycle=cycle, role="tester",
-            project_dir=project_dir, model=tester_model,
-        )
-
-        tester_result: AgentResult = await dispatch_agent(
-            tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
-            task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
-            project_dir=project_dir, args=args)
-        tester_result["turns_allocated"] = tester_turns_allocated
-        tester_result["turns_max"] = tester_turns_max
-        state.total_duration += tester_result.get("duration", 0)
-        state.total_cost += _accumulate_cost(
-            tester_result, f"[Cycle {cycle}] Tester", output)
-
-        # --- Lifecycle hooks: post_agent_finish (tester) ---
-        await fire_hook(
-            "post_agent_finish",
-            task_id=task_id, cycle=cycle, role="tester",
-            project_dir=project_dir, success=tester_result.get("success", False),
-            cost=tester_result.get("cost"), duration=tester_result.get("duration", 0),
-        )
-
-        # Cost-based circuit breaker after tester phase
-        cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
-        if cost_reason:
-            log(f"  [Cycle {cycle}] {cost_reason} (after tester)", output)
-            _apply_cost_totals(tester_result, state.total_cost, state.total_duration)
-            tester_result["early_terminated"] = True
-            tester_result["early_term_reason"] = cost_reason
-            return tester_result, cycle, "cost_limit_exceeded"
-
-        # Check for early termination (stuck tester)
-        if tester_result.get("early_terminated"):
-            reason = tester_result.get("early_term_reason", "unknown")
-            log(f"  [Cycle {cycle}] Tester early-terminated: {reason}", output)
-            log(f"  [Cycle {cycle}] Treating tester early-termination as no-tests (accepting dev work)", output)
-            tester_result["result"] = "no-tests"
-            tester_result["tests_run"] = 0
-            tester_result["tests_passed"] = 0
-
-        # Check for timeout
-        if any("timed out" in e for e in tester_result.get("errors", [])):
-            log(f"  [Cycle {cycle}] Tester timed out.", output)
-            return tester_result, cycle, "tester_timeout"
-
-        # Compaction
-        tester_turns_for_compact = tester_result.get("num_turns", 0)
-        log(f"  [Cycle {cycle}] Compacting tester output "
-            f"({tester_turns_for_compact} turns)...", output)
-        summary = build_compaction_summary("Tester", tester_result, cycle, task)
-        state.compaction_history.append(summary)
-
-        # Parse Tester output
-        test_results = parse_tester_output(tester_result.get("result_text", ""))
-        test_outcome = test_results["result"]
-
-        log(f"  [Cycle {cycle}] Tester result: {test_outcome} "
-            f"({test_results['tests_passed']}/{test_results['tests_run']} passed)", output)
-
-        # --- Lifecycle hooks: post_cycle ---
-        await fire_hook(
-            "post_cycle",
-            task_id=task_id, cycle=cycle, project_dir=project_dir,
-            test_outcome=test_outcome, total_cost=state.total_cost,
-        )
-
-        outcome_action, return_result, outcome_str = _dispatch_tester_outcome(
-            test_results, tester_result, dev_result, cycle, task_id,
-            task_role, state.total_cost, state.total_duration,
-            state.compaction_history, output,
-        )
-        if outcome_action == "exit":
-            return return_result, cycle, outcome_str  # type: ignore[return-value]
-        # outcome_action == "continue_loop" — fall through to next iteration.
-        # Refresh prev_cycle_sha so the next cycle's tester diff starts from
-        # this cycle's final HEAD (excluding earlier cycles' commits).
-        next_sha = await _resolve_head_sha(project_dir, output)
-        if next_sha:
-            prev_cycle_sha = next_sha
-
-    # All cycles exhausted
-    log(f"\n  All {MAX_DEV_TEST_CYCLES} dev-test cycles exhausted. Marking blocked.", output)
-    tester_result["cost"] = state.total_cost
-    tester_result["duration"] = state.total_duration
-    return tester_result, MAX_DEV_TEST_CYCLES, "cycles_exhausted"
