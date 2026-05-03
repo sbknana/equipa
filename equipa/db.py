@@ -14,7 +14,9 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from equipa.constants import THEFORGE_DB
 
@@ -28,6 +30,12 @@ def get_db_connection(write: bool = False) -> sqlite3.Connection:
 
     Args:
         write: If True, open in read-write mode. Default is read-only.
+
+    Note:
+        Prefer :func:`db_conn` for a context-managed handle that uniformly
+        commits on success, rolls back on error, and always closes — closing
+        the QS-01 leak family that the bare ``connect()``/``close()`` pattern
+        kept reintroducing.
     """
     if not THEFORGE_DB.exists():
         raise FileNotFoundError(f"TheForge database not found at {THEFORGE_DB}")
@@ -39,6 +47,51 @@ def get_db_connection(write: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@contextmanager
+def db_conn(write: bool = False) -> Iterator[sqlite3.Connection]:
+    """Context-managed TheForge DB connection.
+
+    Replaces the bare ``conn = get_db_connection(...)`` / ``conn.close()``
+    pattern with a single ``with`` block that:
+
+      * always closes the connection (even on exception) — closes the QS-01
+        connection-leak family that re-surfaced across 10+ security reviews;
+      * commits on clean exit when ``write=True``;
+      * rolls back on exception when ``write=True`` so partial writes never
+        leak past the failure boundary.
+
+    Read-only handles do not commit/rollback (the underlying connection is
+    opened in URI ``mode=ro``), but they still get the guaranteed close.
+
+    Example:
+        >>> with db_conn(write=True) as conn:
+        ...     conn.execute("INSERT INTO t (x) VALUES (?)", (1,))
+
+    Args:
+        write: If True, open in read-write mode. Default is read-only.
+
+    Yields:
+        sqlite3.Connection: an open handle with ``row_factory = sqlite3.Row``.
+    """
+    conn = get_db_connection(write=write)
+    try:
+        yield conn
+        if write:
+            conn.commit()
+    except Exception:
+        if write:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                logger.exception("[DB] rollback failed during db_conn cleanup")
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            logger.exception("[DB] close failed during db_conn cleanup")
 
 
 # --- Schema ---
