@@ -32,6 +32,8 @@ from equipa.config import (
     load_dispatch_config,
 )
 from equipa.constants import (
+    ATTEMPT_REFLECTIONS_MAX_CHARS,
+    ATTEMPT_SECTION_TRIM_CHARS,
     DEFAULT_MAX_TURNS,
     DEFAULT_MODEL,
     MAX_MANAGER_ROUNDS,
@@ -131,19 +133,25 @@ def _build_dispatch_attempt_reflection(
         files_text = _extract_section(raw_output, "FILES_CHANGED")
         if files_text and "none" not in files_text.lower():
             # Strip the marker prefix
-            files_text = files_text.replace("FILES_CHANGED:", "").strip()[:200]
+            files_text = files_text.replace("FILES_CHANGED:", "").strip()[
+                :ATTEMPT_SECTION_TRIM_CHARS
+            ]
             if files_text:
                 files_info = f"\n  Files touched: {files_text}"
 
         blockers_text = _extract_section(raw_output, "BLOCKERS")
         if blockers_text and "none" not in blockers_text.lower():
-            blockers_text = blockers_text.replace("BLOCKERS:", "").strip()[:200]
+            blockers_text = blockers_text.replace("BLOCKERS:", "").strip()[
+                :ATTEMPT_SECTION_TRIM_CHARS
+            ]
             if blockers_text:
                 blockers_info = f"\n  Blockers: {blockers_text}"
 
         reflection_text = _extract_section(raw_output, "REFLECTION", max_lines=3)
         if reflection_text:
-            reflection_text = reflection_text.replace("REFLECTION:", "").strip()[:200]
+            reflection_text = reflection_text.replace("REFLECTION:", "").strip()[
+                :ATTEMPT_SECTION_TRIM_CHARS
+            ]
             if reflection_text:
                 reflection_info = f"\n  Agent reflection: {reflection_text}"
 
@@ -193,8 +201,11 @@ def _inject_attempt_reflections(
     reflections_block = "\n\n".join(reflections)
 
     # Enforce token budget (~500 tokens ≈ ~2000 chars)
-    if len(reflections_block) > 2000:
-        reflections_block = reflections_block[:2000] + "\n[...earlier attempts trimmed...]"
+    if len(reflections_block) > ATTEMPT_REFLECTIONS_MAX_CHARS:
+        reflections_block = (
+            reflections_block[:ATTEMPT_REFLECTIONS_MAX_CHARS]
+            + "\n[...earlier attempts trimmed...]"
+        )
 
     desc += _ATTEMPT_MARKER + reflections_block
 
