@@ -66,6 +66,8 @@ MAX_DIFF_RATIO = 0.20  # Max 20% change per evolution cycle
 GEPA_BUDGET = "light"  # light/medium/heavy — start conservative
 AB_SPLIT_RATIO = 0.5   # 50/50 A/B split
 MIN_AB_TASKS_FOR_ROLLBACK = 10  # Need 10+ tasks before judging
+EPISODE_HISTORY_OVERLAP_THRESHOLD = 0.4  # Mutation-to-failed-episode similarity
+EPISODE_HISTORY_PENALTY = 0.7  # Multiply fitness by this when matching failed episodes
 SUCCESS_OUTCOMES = {"success", "tests_passed", "no_tests"}
 FAILURE_OUTCOMES = {"early_terminated", "blocked", "cycles_exhausted",
                     "developer_max_turns"}
@@ -103,6 +105,152 @@ def log(msg):
     """Print timestamped message."""
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [GEPA] {msg}")
+
+
+# --- Keyword overlap (local copy from equipa/parsing.py) ---
+
+def compute_keyword_overlap(text_a: str, text_b: str) -> float:
+    """Compute simple keyword overlap score between two texts.
+
+    Returns a float between 0.0 and 1.0 representing the fraction of
+    words in common (Jaccard similarity on word sets).
+    """
+    if not text_a or not text_b:
+        return 0.0
+    words_a = set(re.findall(r'\w+', text_a.lower()))
+    words_b = set(re.findall(r'\w+', text_b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+# --- Episode history check for GEPA candidates ---
+
+def get_failed_episodes_by_keywords(
+    role: str,
+    q_value_threshold: float = 0.3,
+    lookback_days: int = 90,
+) -> list[dict]:
+    """Fetch failed episodes for a role with low q_values.
+
+    Returns list of dicts with approach_summary, outcome, q_value, reflection.
+    Used to detect when a GEPA candidate resembles a previously failed approach.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT ae.id, ae.approach_summary, ae.outcome,
+                      ae.q_value, ae.reflection, ae.error_patterns
+               FROM agent_episodes ae
+               WHERE ae.role = ?
+                 AND ae.q_value < ?
+                 AND ae.outcome IN ('early_terminated', 'blocked',
+                                    'cycles_exhausted', 'developer_max_turns')
+                 AND ae.created_at >= datetime('now', ?)
+                 AND ae.approach_summary IS NOT NULL
+                 AND ae.approach_summary != ''
+               ORDER BY ae.q_value ASC
+               LIMIT 200""",
+            (role, q_value_threshold, f"-{lookback_days} days"),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def check_episode_history_for_candidate(
+    role: str,
+    mutation_diff: str,
+    overlap_threshold: float = EPISODE_HISTORY_OVERLAP_THRESHOLD,
+    penalty_factor: float = EPISODE_HISTORY_PENALTY,
+) -> dict:
+    """Check if a GEPA mutation resembles previously failed approaches.
+
+    Compares the textual diff (behavioral change) of a candidate mutation
+    against approach_summaries of failed episodes with low q_values.
+
+    Args:
+        role: The agent role being evolved.
+        mutation_diff: The textual diff between old and new prompt.
+        overlap_threshold: Minimum keyword overlap to consider a match.
+        penalty_factor: Multiplier applied to fitness when matches found.
+
+    Returns:
+        dict with keys:
+        - penalize (bool): Whether to apply a penalty.
+        - matching_episodes (int): Number of failed episodes that matched.
+        - max_overlap (float): Highest overlap score found.
+        - penalty_factor (float): The multiplier to apply (1.0 if no penalty).
+    """
+    if not mutation_diff or not mutation_diff.strip():
+        return {
+            "penalize": False,
+            "matching_episodes": 0,
+            "max_overlap": 0.0,
+            "penalty_factor": 1.0,
+        }
+
+    failed_episodes = get_failed_episodes_by_keywords(role)
+    if not failed_episodes:
+        return {
+            "penalize": False,
+            "matching_episodes": 0,
+            "max_overlap": 0.0,
+            "penalty_factor": 1.0,
+        }
+
+    matching_count = 0
+    max_overlap = 0.0
+
+    for ep in failed_episodes:
+        ep_text = (
+            (ep.get("approach_summary", "") or "")
+            + " "
+            + (ep.get("reflection", "") or "")
+        )
+        overlap = compute_keyword_overlap(mutation_diff, ep_text)
+        if overlap > max_overlap:
+            max_overlap = overlap
+        if overlap > overlap_threshold:
+            matching_count += 1
+
+    should_penalize = matching_count > 0
+    effective_penalty = penalty_factor if should_penalize else 1.0
+
+    if should_penalize:
+        log(
+            f"GEPA candidate for {role} resembles {matching_count} "
+            f"failed episode(s) (max overlap: {max_overlap:.2f}) "
+            f"— penalizing score (x{effective_penalty})"
+        )
+
+    return {
+        "penalize": should_penalize,
+        "matching_episodes": matching_count,
+        "max_overlap": round(max_overlap, 4),
+        "penalty_factor": effective_penalty,
+    }
+
+
+def extract_mutation_diff(old_text: str, new_text: str) -> str:
+    """Extract the behavioral change between old and new prompt text.
+
+    Returns a string containing only the added/changed lines from the diff,
+    which represents the key behavioral mutation GEPA is proposing.
+    """
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, n=0)
+
+    added_lines = []
+    for line in diff:
+        # Capture added lines (excluding diff headers)
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:].strip())
+
+    return " ".join(added_lines)
 
 
 # ============================================================
@@ -403,6 +551,10 @@ def run_gepa_for_role(role, episodes, cfg, dry_run=False):
         log(f"Evolved prompt rejected: {reason}")
         return None
 
+    # Check mutation against failed episode history
+    mutation_diff = extract_mutation_diff(current_prompt, evolved_prompt)
+    history_check = check_episode_history_for_candidate(role, mutation_diff)
+
     return {
         "role": role,
         "evolved_prompt": evolved_prompt,
@@ -410,6 +562,7 @@ def run_gepa_for_role(role, episodes, cfg, dry_run=False):
         "dry_run": False,
         "train_size": len(trainset),
         "val_size": len(valset),
+        "episode_history_check": history_check,
     }
 
 
@@ -559,9 +712,13 @@ def store_evolved_prompt(result, run_id, cfg, dry_run=False):
         "val_size": result.get("val_size", 0),
     })
 
+    history_check = result.get("episode_history_check", {})
     evidence = json.dumps({
         "episodes_used": result.get("train_size", 0) + result.get("val_size", 0),
         "diff_ratio": round(diff_ratio, 4),
+        "episode_history_penalty": history_check.get("penalize", False),
+        "matching_failed_episodes": history_check.get("matching_episodes", 0),
+        "max_episode_overlap": history_check.get("max_overlap", 0.0),
     })
 
     conn = get_db(write=True)
@@ -855,12 +1012,17 @@ def run_gepa(cfg, dry_run=False, role_filter=None, run_id=None):
         store_result = store_evolved_prompt(
             gepa_result, run_id or "gepa-standalone", cfg, dry_run=dry_run
         )
+        history_check = gepa_result.get("episode_history_check", {})
         results["roles_evolved"] += 1
         results["details"][role] = {
             "evolved": True,
             "version": store_result["version"],
             "file": store_result["file"],
             "diff_ratio": store_result["diff_ratio"],
+            "episode_penalty_applied": history_check.get("penalize", False),
+            "matching_failed_episodes": history_check.get(
+                "matching_episodes", 0
+            ),
         }
 
     # Check A/B test results and rollback underperformers
