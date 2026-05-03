@@ -11,6 +11,7 @@ erDiagram
     string created_at
     string updated_at
     string icon_base64
+    string local_path
   }
   tasks {
     int id PK
@@ -33,6 +34,11 @@ erDiagram
     string rationale
     string alternatives_considered
     string decided_at
+    string last_validated
+    string decision_type
+    string status
+    int resolved_by_task_id FK
+    string verified_at
   }
   open_questions {
     int id PK
@@ -178,6 +184,7 @@ erDiagram
   }
   tasks }o--|| projects : "project_id"
   decisions }o--|| projects : "project_id"
+  decisions }o--|| tasks : "resolved_by_task_id"
   open_questions }o--|| projects : "project_id"
   session_notes }o--|| projects : "project_id"
   code_artifacts }o--|| projects : "project_id"
