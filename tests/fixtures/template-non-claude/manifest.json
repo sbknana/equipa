@@ -1,0 +1,19 @@
+{
+  "exported_at": "2026-05-03T12:00:00+00:00",
+  "file_sha": {
+    "assets/ASSISTANT.md": "3933e235ba83fbc4cc36c34cf294fcb6686b56ab78d0858e7639ccdc0428e8c3",
+    "tables/projects.jsonl": "b4feaf6a6eac34c2db8833963a169c0e25b0cf324b8b86606bbadf12f360041f",
+    "tables/tasks.jsonl": "74ee71e7fff0babecba53b898f7802df8a5d5c637e49e9f0fe2f6651173b4994"
+  },
+  "id_namespace": "source",
+  "row_counts": {
+    "projects": 1,
+    "tasks": 1
+  },
+  "source_runtime": "hypothetical-other-agent",
+  "table_list": [
+    "projects",
+    "tasks"
+  ],
+  "version": "1.0"
+}
