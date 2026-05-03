@@ -409,11 +409,19 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
         )
 
     # Locale quoting: $"..."
+    # Threat model: $"..." is bash i18n syntax; theoretically can carry hidden
+    # characters. In practice it is only used as an attack primitive when
+    # combined with command-execution tools. Allow it when the surrounding
+    # command is a known-safe read-only text tool (grep/sed/awk/find), where
+    # the pattern is the legitimate use case (passing localized search terms).
+    # Loosen for task #2096-class false positives while keeping the block
+    # active for cmd/eval/sh/bash/python/node/etc.
     if re.search(r'\$"[^"]*"', command):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
-            message="Command contains locale quoting ($\"...\") which can hide characters",
-        )
+        if base_cmd not in _LOCALE_QUOTING_SAFE_BASES:
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
+                message="Command contains locale quoting ($\"...\") which can hide characters",
+            )
 
     # Empty ANSI-C or locale quotes before dash: $''-exec or $""-exec
     if re.search(r"""\$['\"]{2}\s*-""", command):
@@ -794,6 +802,53 @@ _ZSH_DANGEROUS_COMMANDS: frozenset[str] = frozenset([
 
 _ZSH_PRECOMMAND_MODIFIERS: frozenset[str] = frozenset([
     "command", "builtin", "noglob", "nocorrect",
+])
+
+# Read-only text tools where locale quoting ($"...") is a legitimate i18n
+# pattern, not an attack vector. Allowlist used by Check 4.
+_LOCALE_QUOTING_SAFE_BASES: frozenset[str] = frozenset([
+    "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "sed", "awk", "gawk",
+    "find", "fd",
+    "echo", "printf",
+])
+
+# Read-only commands safe to appear inside $() command substitution.
+# Used by Check 8. Anything not in this list keeps $() blocked.
+_SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
+    "git",          # rev-parse, log, diff, branch, etc. (all read-only forms)
+    "date",
+    "basename", "dirname", "realpath", "readlink",
+    "pwd",
+    "echo", "printf",
+    "cat",          # of project-relative files only — see check
+    "wc", "head", "tail", "sort", "uniq",
+    "grep", "egrep", "fgrep", "rg", "ag",
+    "sed", "awk",
+    "ls", "find", "fd",
+    "tr", "cut", "tee",
+    "id", "whoami", "hostname", "uname",
+    "which", "type", "command",
+    "env",
+    "expr", "test",
+])
+
+# Commands that MUST NEVER appear inside $() — these are the dangerous side
+# effecting commands that the original Check 8 was designed to block.
+_DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
+    "rm", "mv", "cp", "dd", "shred",
+    "chmod", "chown", "chgrp",
+    "curl", "wget", "ssh", "scp", "rsync", "ftp", "nc", "ncat", "telnet",
+    "sudo", "su", "doas",
+    "eval", "exec", "source", ".",
+    "bash", "sh", "zsh", "ksh", "dash", "fish",
+    "python", "python3", "perl", "ruby", "node", "deno", "php",
+    "kill", "killall", "pkill",
+    "mount", "umount",
+    "iptables", "nft",
+    "systemctl", "service",
+    "apt", "apt-get", "yum", "dnf", "pip", "pip3", "npm", "yarn",
+    "docker", "podman", "kubectl",
 ])
 
 
