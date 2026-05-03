@@ -256,3 +256,9 @@ GITIGNORE_TEMPLATES = {
 # Aggregate cost ceiling for run_manager_loop. Bootstrap-added 2026-05-03
 # to unblock M4 test (#2113); enforcement still TODO in manager.py.
 MANAGER_COST_LIMIT = 30.0
+
+# --- Parallel Task Parsing ---
+# Maximum number of IDs a single "start-end" range can expand to in
+# parse_task_ids(). Prevents memory exhaustion DoS from inputs like
+# "--tasks 1-999999999" (security finding EP-01).
+MAX_TASK_RANGE = 1000
