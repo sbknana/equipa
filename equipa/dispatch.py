@@ -1172,6 +1172,49 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
         return False
 
 
+async def _stash_uncommitted_in_worktree(
+    wt_path: str,
+    task_id: int,
+    branch_name: str,
+) -> None:
+    """Stash any uncommitted changes inside ``wt_path`` onto its branch.
+
+    Runs inside the worktree itself so the stash lands on ``branch_name``'s
+    HEAD. Includes untracked files (``-u``) so newly-created agent files
+    are preserved. Stash message is tagged so it can be located later by
+    rescue tooling: ``equipa-early-term task-<id>``.
+
+    Silent failure paths (missing git, no changes, locked index) are
+    logged but never raised — cleanup must continue even if the stash
+    cannot be saved.
+    """
+    from equipa.git_ops import git_run_async
+
+    if not Path(wt_path).exists():
+        return
+    try:
+        status = await git_run_async(
+            ["status", "--porcelain"], wt_path, timeout=15,
+        )
+        if status.returncode != 0 or not status.stdout.strip():
+            return
+        stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
+        result = await git_run_async(
+            ["stash", "push", "-u", "-m", stash_msg],
+            wt_path, timeout=30,
+        )
+        if result.returncode == 0 and "No local changes" not in result.stdout:
+            print(
+                f"  [Isolation] Task #{task_id}: stashed uncommitted work "
+                f"on '{branch_name}' as '{stash_msg}'"
+            )
+    except (subprocess.SubprocessError, OSError) as e:
+        print(
+            f"  [Isolation] Could not stash uncommitted work for task "
+            f"#{task_id} on '{branch_name}': {e}"
+        )
+
+
 async def _cleanup_worktrees(
     project_dir: str,
     worktree_dirs: dict[int, str],
@@ -1194,6 +1237,17 @@ async def _cleanup_worktrees(
             state_file = Path(wt_path) / ".forge-state.json"
             if state_file.exists():
                 state_file.unlink()
+            # Preserve uncommitted work on UNMERGED branches before the
+            # `git worktree remove --force` discards the working tree.
+            # Without this, an early_terminated agent that wrote 32 turns of
+            # edits but did not commit loses everything when the worktree is
+            # torn down. Stash on the worktree's own branch (HEAD) so the
+            # work can be salvaged later by checking out the branch and
+            # running `git stash pop`.
+            if task_id not in merged_tasks:
+                await _stash_uncommitted_in_worktree(
+                    wt_path, task_id, branch_name,
+                )
             await git_run_async(
                 ["worktree", "remove", "--force", wt_path],
                 project_dir, timeout=30,

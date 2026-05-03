@@ -194,6 +194,60 @@ def test_cleanup_worktrees_deletes_merged_preserves_unmerged(tmp_path, capsys):
     assert not (base / "task-11").exists()
 
 
+def test_cleanup_worktrees_stashes_uncommitted_on_unmerged_branch(
+    tmp_path, capsys,
+):
+    """Regression for task #2158 — when an early_terminated agent leaves
+    uncommitted file changes in its worktree, cleanup must stash them on
+    the branch BEFORE ``git worktree remove --force`` discards them.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    worktree_dirs = _create_isolation_worktrees(
+        [{"id": 30}], str(repo), base,
+    )
+    wt_path = Path(worktree_dirs[30])
+
+    # Simulate 32 turns of edits the agent never got to commit.
+    (wt_path / "modified.py").write_text("print('important work')\n")
+    _git(wt_path, "add", "modified.py")
+    (wt_path / "untracked.txt").write_text("untracked but valuable\n")
+
+    capsys.readouterr()
+    # Empty merged_tasks set → task 30 is unmerged → must stash.
+    _cleanup_worktrees(str(repo), worktree_dirs, set(), base)
+
+    out = capsys.readouterr().out
+    assert "stashed uncommitted work" in out
+    assert "task-30" in out
+
+    # Verify the stash actually exists on the preserved branch.
+    stash_list = _git(repo, "stash", "list").stdout
+    assert "equipa-early-term task-30" in stash_list
+
+    # Branch is preserved even though work is stashed.
+    branches = _git(repo, "branch", "--list").stdout
+    assert "forge-task-30" in branches
+
+
+def test_cleanup_worktrees_no_stash_when_clean(tmp_path, capsys):
+    """If the worktree has no uncommitted changes, do NOT create an
+    empty stash — keeps the stash list noise-free.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    worktree_dirs = _create_isolation_worktrees(
+        [{"id": 31}], str(repo), base,
+    )
+    capsys.readouterr()
+    _cleanup_worktrees(str(repo), worktree_dirs, set(), base)
+
+    stash_list = _git(repo, "stash", "list").stdout
+    assert "task-31" not in stash_list
+
+
 def test_cleanup_worktrees_logs_errors_explicitly(tmp_path, capsys):
     """If git operations fail (e.g. invalid project_dir), the cleanup
     helper must LOG the error — the original code's
