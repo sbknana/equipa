@@ -913,7 +913,7 @@ def test_preflight_detects_node_project():
         pkg_json = Path(tmpdir) / "package.json"
         pkg_json.write_text('{"name": "test", "scripts": {"build": "echo ok"}}')
 
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert language == "node", f"expected language='node', got '{language}'"
@@ -929,7 +929,7 @@ def test_preflight_detects_go_project():
         go_mod = Path(tmpdir) / "go.mod"
         go_mod.write_text("module example.com/test\n\ngo 1.21\n")
 
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert language == "go", f"expected language='go', got '{language}'"
@@ -945,7 +945,7 @@ def test_preflight_detects_python_project():
         req = Path(tmpdir) / "requirements.txt"
         req.write_text("flask==3.0.0\n")
 
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert language == "python", f"expected language='python', got '{language}'"
@@ -955,7 +955,7 @@ def test_preflight_detects_python_project():
         pyproject = Path(tmpdir2) / "pyproject.toml"
         pyproject.write_text('[project]\nname = "test"\n')
 
-        success2, language2, error_details2 = asyncio.get_event_loop().run_until_complete(
+        success2, language2, error_details2 = asyncio.run(
             preflight_build_check(tmpdir2)
         )
         assert language2 == "python", f"expected language='python' for pyproject.toml, got '{language2}'"
@@ -971,7 +971,7 @@ def test_preflight_detects_csharp_project():
         csproj = Path(tmpdir) / "MyApp.csproj"
         csproj.write_text('<Project Sdk="Microsoft.NET.Sdk">\n</Project>')
 
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert language == "csharp", f"expected language='csharp', got '{language}'"
@@ -995,7 +995,7 @@ def test_preflight_skipped_for_build_fix_tasks():
             "Resolve compilation issues",
         ]
         for desc in skip_descriptions:
-            success, language, error_details = asyncio.get_event_loop().run_until_complete(
+            success, language, error_details = asyncio.run(
                 preflight_build_check(tmpdir, task_description=desc)
             )
             assert success is True, \
@@ -1014,7 +1014,7 @@ def test_preflight_failure_injected_into_context():
         pkg_json = Path(tmpdir) / "package.json"
         pkg_json.write_text('{"name": "test", "scripts": {"build": "exit 1"}}')
 
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         # The build command will likely fail (no node_modules, or exit 1)
@@ -1042,7 +1042,7 @@ def test_preflight_does_not_block_task():
         go_mod.write_text("module example.com/test\n\ngo 1.21\n")
 
         # Should NOT raise an exception — returns a result tuple
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert isinstance(result, tuple), f"expected tuple, got {type(result)}"
@@ -1060,7 +1060,7 @@ def test_preflight_unknown_project():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Empty directory — no project files
-        success, language, error_details = asyncio.get_event_loop().run_until_complete(
+        success, language, error_details = asyncio.run(
             preflight_build_check(tmpdir)
         )
         assert success is True, "empty dir should return success=True (nothing to check)"

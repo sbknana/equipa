@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -32,16 +32,16 @@ def _run(coro):
 
 class TestCaptureGitDiffContext:
     def test_returns_empty_when_diff_is_empty(self):
-        with patch("subprocess.run", return_value=_FakeProc(0, "")):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(return_value=_FakeProc(0, ""))):
             assert _run(_capture_git_diff_context("/tmp", cycle=1)) == ""
 
     def test_returns_empty_on_nonzero_returncode(self):
-        with patch("subprocess.run", return_value=_FakeProc(128, "")):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(return_value=_FakeProc(128, ""))):
             assert _run(_capture_git_diff_context("/tmp", cycle=1)) == ""
 
     def test_formats_non_empty_diff(self):
         diff = "diff --git a/x.py b/x.py\n+ added line"
-        with patch("subprocess.run", return_value=_FakeProc(0, diff)):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(return_value=_FakeProc(0, diff))):
             ctx = _run(_capture_git_diff_context("/tmp", cycle=2))
         assert "## Developer Changes (git diff)" in ctx
         assert "```diff\n" in ctx
@@ -51,33 +51,33 @@ class TestCaptureGitDiffContext:
     def test_truncates_at_8000_chars(self):
         # Build a diff that exceeds the 8000-char cap
         long_diff = "x" * 9000
-        with patch("subprocess.run", return_value=_FakeProc(0, long_diff)):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(return_value=_FakeProc(0, long_diff))):
             ctx = _run(_capture_git_diff_context("/tmp", cycle=1))
         assert "[... diff truncated, 1000 chars omitted ...]" in ctx
 
     def test_swallows_subprocess_errors(self):
         import subprocess
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 10)):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(side_effect=subprocess.TimeoutExpired("git", 10))):
             assert _run(_capture_git_diff_context("/tmp", cycle=1)) == ""
 
     def test_swallows_filenotfound(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError("git")):
+        with patch("equipa.git_ops.git_run_async", new=AsyncMock(side_effect=FileNotFoundError("git"))):
             assert _run(_capture_git_diff_context("/tmp", cycle=1)) == ""
 
     def test_uses_provided_base_ref(self):
         """Per-cycle SHA mode (task #2145): diff runs against base_ref, not HEAD."""
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd, *args, **kwargs):
-            captured["cmd"] = cmd
+        async def fake_async(args, project_dir, timeout=None):
+            captured["args"] = args
             return _FakeProc(0, "")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("equipa.git_ops.git_run_async", side_effect=fake_async):
             _run(_capture_git_diff_context("/tmp", cycle=2, base_ref="abc1234"))
 
-        # git_run prepends ["git", ...] internally; we only assert the diff target
-        assert "abc1234" in captured["cmd"]
-        assert "HEAD" not in captured["cmd"]
+        # git_run_async receives the args list without the "git" prefix
+        assert "abc1234" in captured["args"]
+        assert "HEAD" not in captured["args"]
 
 
 # ---- _dispatch_tester_outcome ----------------------------------------------

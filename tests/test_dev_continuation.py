@@ -23,7 +23,7 @@ from equipa.loops import _handle_dev_continuation
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 @pytest.fixture(autouse=True)
