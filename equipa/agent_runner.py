@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
+from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.constants import (
     EARLY_TERM_EXEMPT_ROLES,
     EARLY_TERM_FINAL_WARN_TURNS,
@@ -189,7 +190,6 @@ def build_cli_command(
     # When dispatch_config.json has 'effort' set (e.g. "high"/"xhigh"/"max"), pass
     # it to the Claude CLI for extended thinking. No-op when unset (CLI uses default).
     try:
-        from equipa.dispatch import load_dispatch_config
         _dc = load_dispatch_config(None)
         _effort = _dc.get('effort')
         if _effort:
@@ -1378,7 +1378,6 @@ async def dispatch_agent(
 
     # RLM REPL decomposition for large-repo reviews
     if system_prompt and project_dir and role in ("code-reviewer", "integration-tester"):
-        from equipa.dispatch import is_feature_enabled
         from equipa.rlm_decompose import (
             estimate_context_tokens,
             load_repo_files,

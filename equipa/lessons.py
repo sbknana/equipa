@@ -16,6 +16,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 
+from equipa.config import is_feature_enabled
 from equipa.constants import THEFORGE_DB
 from equipa.db import ensure_schema, get_db_connection
 from equipa.parsing import (
@@ -222,7 +223,6 @@ def get_relevant_episodes(
         vector_memory_enabled = False
         if dispatch_config:
             try:
-                from equipa.dispatch import is_feature_enabled
                 vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
             except ImportError:
                 pass
@@ -299,7 +299,6 @@ def get_relevant_episodes(
         knowledge_graph_enabled = False
         if dispatch_config:
             try:
-                from equipa.dispatch import is_feature_enabled
                 knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
             except ImportError:
                 pass
@@ -455,7 +454,6 @@ def record_agent_episode(
         vector_memory_enabled = False
         if dispatch_config:
             try:
-                from equipa.dispatch import is_feature_enabled
                 vector_memory_enabled = is_feature_enabled(dispatch_config, "vector_memory")
             except ImportError:
                 # Fallback for tests that don't have dispatch module
@@ -601,7 +599,6 @@ def update_injected_episode_q_values_for_task(
     knowledge_graph_enabled = False
     if dispatch_config:
         try:
-            from equipa.dispatch import is_feature_enabled
             knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
         except ImportError:
             pass

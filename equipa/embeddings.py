@@ -14,6 +14,7 @@ import sqlite3
 import urllib.request
 from typing import Any
 
+from equipa.config import is_feature_enabled
 from equipa.constants import THEFORGE_DB
 
 
@@ -112,7 +113,6 @@ def embed_and_store_lesson(
     knowledge_graph_enabled = False
     if dispatch_config:
         try:
-            from equipa.dispatch import is_feature_enabled
             knowledge_graph_enabled = is_feature_enabled(dispatch_config, "knowledge_graph")
         except ImportError:
             pass

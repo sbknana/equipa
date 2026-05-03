@@ -22,6 +22,7 @@ import string
 import sys
 from typing import Any
 
+from equipa.config import is_feature_enabled
 from equipa.constants import (
     BUDGET_CHECK_INTERVAL,
     PROMPTS_DIR,
@@ -364,7 +365,6 @@ def build_system_prompt(
     # Late imports to avoid circular dependencies with monolith during transition
     from equipa.git_ops import detect_project_language
 
-    from equipa.dispatch import is_feature_enabled  # noqa: F811
 
     try:
         from forgesmith import get_relevant_lessons
