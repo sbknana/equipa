@@ -683,6 +683,108 @@ def _build_dev_extra_context(
     return extra_context
 
 
+async def _handle_dev_continuation(
+    dev_result: dict[str, Any],
+    task_id: int,
+    task_role: str,
+    cycle: int,
+    prev_attempt: int,
+    project_dir: str,
+    continuation_count: int,
+    compaction_history: list[str],
+    output: Any = None,
+) -> tuple[str, int, str | None, str | None]:
+    """Handle developer timeout / max-turns: save checkpoint and decide next step.
+
+    Saves a hard checkpoint (and fires on_checkpoint hook) when result_text is
+    available. If continuations remain, builds a recovery context (soft
+    checkpoint + .forge-state.json on compaction, plain checkpoint context
+    otherwise) and appends it to compaction_history. If continuations are
+    exhausted, signals exit with outcome 'developer_timeout' or
+    'developer_max_turns'.
+
+    Returns (action, new_continuation_count, last_error_type, outcome):
+      - action='continue': caller should `continue` to next cycle
+      - action='exit': caller should return with outcome
+      - action='proceed': not a timeout/max-turns case, caller continues
+        normal post-dispatch flow
+
+    Mutates compaction_history (append). Pure on dev_result.
+    """
+    is_timeout = any("timed out" in e for e in dev_result.get("errors", []))
+    is_max_turns = any("max turns" in e for e in dev_result.get("errors", []))
+
+    if not (is_timeout or is_max_turns):
+        return "proceed", continuation_count, None, None
+
+    reason = "timed out" if is_timeout else "hit max turns"
+    last_error_type = "timeout" if is_timeout else "max_turns"
+    new_count = continuation_count + 1
+    log(
+        f"  [Cycle {cycle}] Developer {reason}. "
+        f"(continuation {new_count}/{MAX_CONTINUATIONS})",
+        output,
+    )
+
+    result_text = dev_result.get("result_text", "")
+    if result_text:
+        attempt_num = prev_attempt + cycle
+        cp_path = save_checkpoint(task_id, attempt_num, result_text, role=task_role)
+        if cp_path:
+            log(
+                f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}",
+                output,
+            )
+            await fire_hook(
+                "on_checkpoint",
+                task_id=task_id, cycle=cycle, attempt=attempt_num,
+                project_dir=project_dir, checkpoint_path=str(cp_path),
+            )
+
+    dev_compaction_count = dev_result.get("compaction_count", 0)
+    if dev_compaction_count > 0:
+        log(
+            f"  [Compaction] {dev_compaction_count} compaction(s) "
+            f"detected during streaming",
+            output,
+        )
+
+    if new_count < MAX_CONTINUATIONS:
+        log(f"  [Auto-Continue] Spawning new developer agent to continue...", output)
+
+        # Build enhanced continuation context with compaction recovery
+        if dev_compaction_count > 0:
+            soft_cp = load_soft_checkpoint(task_id, role=task_role)
+            forge_state = _load_forge_state_json(project_dir)
+
+            if soft_cp:
+                recovery_ctx = build_compaction_recovery_context(
+                    soft_cp, forge_state)
+                compaction_history.append(recovery_ctx)
+                log(
+                    f"  [Compaction] Injecting recovery context "
+                    f"from soft checkpoint + forge-state",
+                    output,
+                )
+            elif result_text:
+                checkpoint_context = build_checkpoint_context(
+                    result_text, prev_attempt + cycle)
+                compaction_history.append(checkpoint_context)
+        elif result_text:
+            checkpoint_context = build_checkpoint_context(
+                result_text, prev_attempt + cycle)
+            compaction_history.append(checkpoint_context)
+        return "continue", new_count, last_error_type, None
+
+    log(
+        f"  [Auto-Continue] All {MAX_CONTINUATIONS} continuations exhausted. "
+        f"Marking blocked.",
+        output,
+    )
+    outcome = "developer_timeout" if is_timeout else "developer_max_turns"
+    return "exit", new_count, last_error_type, outcome
+
+
 async def run_dev_test_loop(
     task: dict[str, Any],
     project_dir: str,
@@ -936,65 +1038,20 @@ async def run_dev_test_loop(
             log(f"  [Cycle {cycle}] Agent completed early with changes — "
                 f"proceeding to tester.", output)
 
-        # Check for timeout or max_turns
-        is_timeout = any("timed out" in e for e in dev_result.get("errors", []))
-        is_max_turns = any("max turns" in e for e in dev_result.get("errors", []))
-
-        if is_timeout or is_max_turns:
-            reason = "timed out" if is_timeout else "hit max turns"
-            last_error_type = "timeout" if is_timeout else "max_turns"
-            continuation_count += 1
-            log(f"  [Cycle {cycle}] Developer {reason}. "
-                f"(continuation {continuation_count}/{MAX_CONTINUATIONS})", output)
-
-            result_text = dev_result.get("result_text", "")
-            if result_text:
-                attempt_num = prev_attempt + cycle
-                cp_path = save_checkpoint(task_id, attempt_num, result_text, role=task_role)
-                if cp_path:
-                    log(f"  [Checkpoint] Saved ({len(result_text)} chars) -> {cp_path.name}", output)
-                    # --- Lifecycle hooks: on_checkpoint ---
-                    await fire_hook(
-                        "on_checkpoint",
-                        task_id=task_id, cycle=cycle, attempt=attempt_num,
-                        project_dir=project_dir, checkpoint_path=str(cp_path),
-                    )
-
-            # Check for compaction signals from streaming
-            dev_compaction_count = dev_result.get("compaction_count", 0)
-            if dev_compaction_count > 0:
-                log(f"  [Compaction] {dev_compaction_count} compaction(s) "
-                    f"detected during streaming", output)
-
-            if continuation_count < MAX_CONTINUATIONS:
-                log(f"  [Auto-Continue] Spawning new developer agent to continue...", output)
-
-                # Build enhanced continuation context with compaction recovery
-                if dev_compaction_count > 0:
-                    # Load soft checkpoint + .forge-state.json for richer context
-                    soft_cp = load_soft_checkpoint(task_id, role=task_role)
-                    forge_state = _load_forge_state_json(project_dir)
-
-                    if soft_cp:
-                        recovery_ctx = build_compaction_recovery_context(
-                            soft_cp, forge_state)
-                        compaction_history.append(recovery_ctx)
-                        log(f"  [Compaction] Injecting recovery context "
-                            f"from soft checkpoint + forge-state", output)
-                    elif result_text:
-                        checkpoint_context = build_checkpoint_context(
-                            result_text, prev_attempt + cycle)
-                        compaction_history.append(checkpoint_context)
-                elif result_text:
-                    checkpoint_context = build_checkpoint_context(
-                        result_text, prev_attempt + cycle)
-                    compaction_history.append(checkpoint_context)
-                continue
-
-            log(f"  [Auto-Continue] All {MAX_CONTINUATIONS} continuations exhausted. "
-                f"Marking blocked.", output)
-            outcome = "developer_timeout" if is_timeout else "developer_max_turns"
-            return dev_result, cycle, outcome
+        # Check for timeout or max_turns — save checkpoint, optionally
+        # continue with recovery context, or exit if continuations exhausted.
+        cont_action, continuation_count, cont_err_type, cont_outcome = (
+            await _handle_dev_continuation(
+                dev_result, task_id, task_role, cycle, prev_attempt,
+                project_dir, continuation_count, compaction_history, output,
+            )
+        )
+        if cont_action == "continue":
+            last_error_type = cont_err_type
+            continue
+        if cont_action == "exit":
+            return dev_result, cycle, cont_outcome  # type: ignore[return-value]
+        # cont_action == "proceed" — fall through to normal flow
 
         # Check for agent failure
         if not dev_result["success"]:
