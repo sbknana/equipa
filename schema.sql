@@ -717,8 +717,44 @@ CREATE TABLE IF NOT EXISTS config_version_files (
 CREATE INDEX IF NOT EXISTS idx_cvf_version ON config_version_files(version_id);
 
 -- ============================================================
+-- PAPERCLIP AGENT SESSIONS (v11)
+-- ============================================================
+-- Capture of an in-flight agent's rolling state so the orchestrator can
+-- resume / postmortem after a crash, kill, or context compaction. Per
+-- PLAN-1067 B1.
+--
+-- state_json is JSON text matching the contract documented on
+-- db_migrate.migrate_v10_to_v11 (open_files / files_changed / files_read /
+-- recent_tool_calls / partial_reasoning / turn_count / compaction_count /
+-- soft_checkpoint_path). cycle_id is opaque to the persistence layer
+-- (heartbeat-tick UUID or flow-revision marker).
+--
+-- expires_at defaults to created_at + 14 days when capture writes a row
+-- (set by the caller, not enforced in schema). FK to tasks is intentionally
+-- NOT ON DELETE CASCADE: sessions are kept after task purge so they are
+-- available for postmortem analysis.
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    project_id INTEGER NOT NULL,
+    cycle_id TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    byte_size INTEGER,
+    created_at TEXT,
+    last_seen_at TEXT,
+    expires_at TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id),
+    FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_task_role_seen
+    ON agent_sessions(task_id, role, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_expires
+    ON agent_sessions(expires_at);
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v10. Migrations handle upgrades from older versions.
-PRAGMA user_version = 10;
+-- Marks fresh installs as v11. Migrations handle upgrades from older versions.
+PRAGMA user_version = 11;
 

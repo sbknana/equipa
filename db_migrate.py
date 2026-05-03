@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 10
+CURRENT_VERSION = 11
 
 
 # ============================================================
@@ -776,6 +776,74 @@ def migrate_v9_to_v10(conn):
     conn.commit()
 
 
+def migrate_v10_to_v11(conn):
+    """Add Paperclip agent-session capture table (v10 -> v11).
+
+    Adds the ``agent_sessions`` table per PLAN-1067.md B1. This is the
+    persistence layer for capturing the rolling state of an in-flight agent
+    so that the orchestrator can resume / postmortem after a crash, kill,
+    or context compaction.
+
+    state_json SHAPE (stable contract — additions must be backwards
+    compatible; existing readers must tolerate unknown keys)::
+
+        {
+            "open_files":         [str, ...],
+            "files_changed":      [str, ...],
+            "files_read":         [str, ...],
+            "recent_tool_calls":  [
+                {"tool": str, "args_hash": str, "ok": bool, "turn": int},
+                ...
+            ],
+            "partial_reasoning":  str,    # truncated to 8 KB
+            "turn_count":         int,
+            "compaction_count":   int,
+            "soft_checkpoint_path": str,
+        }
+
+    This is a strict superset of the existing soft-checkpoint dict, so
+    ``open_files`` / ``files_changed`` / ``files_read`` / ``turn_count``
+    / ``compaction_count`` reuse the names already produced upstream.
+
+    ``cycle_id`` is an opaque string from the perspective of the persistence
+    layer — it is either a heartbeat-tick UUID or a flow-revision marker,
+    written and read by callers that know its provenance.
+
+    Per the operator decision in PLAN-1067, ``expires_at`` is set by the
+    capture-side caller (created_at + 14 days). The schema does not enforce
+    the default; this keeps the column truthful for callers that want
+    to override (e.g. shorter expiry for security-sensitive sessions).
+
+    FK behaviour: ``agent_sessions`` does NOT cascade-delete with
+    ``tasks`` — sessions are intentionally kept after task purge so they
+    are available for postmortem analysis.
+
+    The schema is idempotent (CREATE TABLE / CREATE INDEX IF NOT EXISTS)
+    so it is safe to re-run after partial failure.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id INTEGER PRIMARY KEY,
+            task_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            project_id INTEGER NOT NULL,
+            cycle_id TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            byte_size INTEGER,
+            created_at TEXT,
+            last_seen_at TEXT,
+            expires_at TEXT,
+            FOREIGN KEY(task_id) REFERENCES tasks(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_task_role_seen
+            ON agent_sessions(task_id, role, last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_expires
+            ON agent_sessions(expires_at);
+    """)
+    conn.commit()
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -788,6 +856,7 @@ MIGRATIONS = {
     8: ("Partial unique index on lessons_learned (v7 -> v8)", migrate_v7_to_v8),
     9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
     10: ("Paperclip config version tables (v9 -> v10)", migrate_v9_to_v10),
+    11: ("Paperclip agent_sessions table (v10 -> v11)", migrate_v10_to_v11),
 }
 
 

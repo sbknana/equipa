@@ -89,9 +89,13 @@ def _index_names(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in rows}
 
 
-def test_current_version_is_ten():
-    """The migrator's CURRENT_VERSION constant tracks the latest schema."""
-    assert CURRENT_VERSION == 10
+def test_current_version_is_at_least_ten():
+    """The migrator's CURRENT_VERSION constant tracks the latest schema.
+
+    v10 added Paperclip config-version tables. Any later migration must
+    only ever bump this forward, never backward.
+    """
+    assert CURRENT_VERSION >= 10
 
 
 def test_migration_creates_both_tables(v9_db):
