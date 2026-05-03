@@ -10,6 +10,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import equipa.constants as _equipa_constants
+from equipa.config import is_feature_enabled
 from equipa.constants import (
     COMPLEXITY_MULTIPLIERS,
     COST_ESTIMATE_PER_TURN,
@@ -80,7 +81,6 @@ def get_role_model(
       5. DEFAULT_ROLE_MODELS
       6. auto-routing (if auto_model_routing feature flag enabled)
     """
-    from equipa.dispatch import is_feature_enabled
     from equipa.tasks import get_task_complexity
 
     effective_config = config or getattr(args, "dispatch_config", None)

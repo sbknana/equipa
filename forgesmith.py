@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from equipa.config import is_feature_enabled
 from forgesmith_gepa import run_gepa
 
 # forgesmith_simba and forgesmith_impact were moved to scripts/ during
@@ -356,7 +357,6 @@ def extract_lessons(runs, cfg):
 
                 # Attempt to generate and store embedding (if vector_memory enabled)
                 try:
-                    from equipa.dispatch import is_feature_enabled
                     if is_feature_enabled(cfg, "vector_memory"):
                         from equipa.embeddings import embed_and_store_lesson
                         embed_and_store_lesson(lesson_id, lesson, dispatch_config=cfg)

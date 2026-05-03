@@ -641,8 +641,6 @@ def _build_dev_extra_context(
       - Without anti_compaction_state, only paralysis warnings are included.
       - Inter-agent messages (when present) are prepended to the final blob.
     """
-    from equipa.dispatch import is_feature_enabled
-
     paralysis_entries, regular_entries = _split_compaction_history(
         compaction_history
     )
@@ -1006,8 +1004,6 @@ async def run_dev_test_loop(
 
     Returns (last_result, cycles_completed, outcome_reason) tuple.
     """
-    from equipa.dispatch import is_feature_enabled
-
     # Auto-install deps before first cycle if needed
     await auto_install_dependencies(project_dir, output=output)
 
