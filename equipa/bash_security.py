@@ -321,6 +321,177 @@ def _check_jq_exploits(command: str, base_cmd: str) -> BashSecurityResult:
     return _SAFE
 
 
+def _parse_git_commit_message(command: str) -> tuple[str, str, str] | None:
+    """Quote-aware tokenizer for ``git commit ... -m <msg> [remainder]``.
+
+    Walks the command character-by-character respecting quote and escape
+    state, so multi-line messages containing ``$``, backticks, escaped
+    quotes, or embedded newlines do not desync the parser the way a
+    non-greedy regex does.
+
+    Returns a tuple ``(quote, message_content, remainder)`` if a quoted
+    ``-m`` argument is found, or ``None`` if no quoted message is present
+    (in which case the command is treated as safe by the caller — other
+    validators handle metacharacters before ``-m``).
+    """
+    # Verify the command starts with `git commit` and find the prefix region
+    if not re.match(r"^git[ \t]+commit\b", command):
+        return None
+
+    # Walk to find the `-m` flag respecting quotes. Anything before -m must
+    # be plain whitespace or git flags — reject embedded shell metacharacters
+    # (the original char-class guard).
+    n = len(command)
+    i = 0
+    in_single = False
+    in_double = False
+    escaped = False
+
+    # Skip past `git commit`
+    m = re.match(r"^git[ \t]+commit[ \t]+", command)
+    if not m:
+        return None
+    i = m.end()
+
+    # Walk until we find `-m` outside of quotes
+    m_pos = -1
+    while i < n:
+        ch = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            # Reject shell metacharacters in the pre-message region
+            if ch in ";&|`$<>()\n\r":
+                # `(` may legitimately appear in a flag value? No — git commit
+                # flags don't use parens. Treat as a metacharacter and bail.
+                return None
+            # Detect `-m` token
+            if (
+                ch == "-"
+                and i + 1 < n
+                and command[i + 1] == "m"
+                and (i + 2 == n or command[i + 2] in " \t")
+                and (i == 0 or command[i - 1] in " \t")
+            ):
+                m_pos = i
+                break
+        i += 1
+
+    if m_pos < 0:
+        return None
+    if in_single or in_double or escaped:
+        return None
+
+    # Skip past `-m` and following whitespace
+    j = m_pos + 2
+    while j < n and command[j] in " \t":
+        j += 1
+    if j >= n:
+        return None
+
+    quote = command[j]
+    if quote not in ('"', "'"):
+        return None
+
+    # Walk the quoted message respecting escape state. The closing quote is
+    # the FIRST unescaped quote of the same kind — but we honor backslash
+    # escapes (only inside double quotes; single quotes cannot be escaped).
+    k = j + 1
+    msg_chars: list[str] = []
+    msg_escaped = False
+    while k < n:
+        ch = command[k]
+        if msg_escaped:
+            msg_chars.append(ch)
+            msg_escaped = False
+            k += 1
+            continue
+        if quote == '"' and ch == "\\":
+            msg_escaped = True
+            msg_chars.append(ch)
+            k += 1
+            continue
+        if ch == quote:
+            break
+        msg_chars.append(ch)
+        k += 1
+    else:
+        # Unterminated quote — let other validators handle it
+        return None
+
+    message_content = "".join(msg_chars)
+    remainder = command[k + 1:]
+    return quote, message_content, remainder
+
+
+# `$(cat <<'DELIM' ... DELIM)` and `$(cat <<\DELIM ... DELIM)` use a
+# quoted heredoc delimiter, which prevents shell expansion inside the body.
+# `cat` simply outputs literal text — no command execution. This is the
+# canonical Claude Code multi-line commit pattern.
+_BENIGN_CAT_HEREDOC_RE = re.compile(
+    r"""^\$\(\s*cat\s+<<\s*(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"""
+    r"""|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)\""""
+    r"""|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*))"""
+    r"""\s*\n[\s\S]*?\n\s*(?P=sq)\s*\n?\s*\)\s*$""",
+    re.MULTILINE,
+)
+
+
+def _is_benign_cat_heredoc_inner(inner: str) -> bool:
+    """True if ``inner`` (the body of a ``$(...)``) is a single
+    ``cat <<'DELIM' ... DELIM`` with a quoted or backslash-escaped delimiter.
+
+    Quoted/escaped delimiters suppress parameter and command expansion inside
+    the heredoc body, so ``cat`` only emits literal text — no execution.
+    Unquoted ``<<EOF`` is NOT benign because expansions still happen.
+    """
+    stripped = inner.strip()
+    for pattern in (
+        # Single-quoted delimiter: <<'EOF'
+        r"^cat\s+<<-?\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*\n"
+        r"[\s\S]*?\n\s*\1\s*$",
+        # Double-quoted delimiter: <<"EOF" (also suppresses expansion)
+        r'^cat\s+<<-?\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\n'
+        r'[\s\S]*?\n\s*\1\s*$',
+        # Backslash-escaped delimiter: <<\EOF (also suppresses expansion)
+        r"^cat\s+<<-?\s*\\([A-Za-z_][A-Za-z0-9_]*)\s*\n"
+        r"[\s\S]*?\n\s*\1\s*$",
+    ):
+        if re.match(pattern, stripped):
+            return True
+    return False
+
+
+def _is_benign_cat_heredoc_substitution(message: str) -> bool:
+    """True if the message is exactly a single ``$(cat <<'DELIM' ... DELIM)``.
+
+    Only quoted (single or double) or backslash-escaped heredoc delimiters
+    are considered benign — those forms suppress parameter and command
+    expansion inside the heredoc body, so the substitution can only emit
+    literal text. Unquoted ``<<EOF`` is NOT benign because expansions
+    still happen.
+    """
+    stripped = message.strip()
+    if not stripped.startswith("$(") or not stripped.endswith(")"):
+        return False
+    inner = stripped[2:-1]
+    return _is_benign_cat_heredoc_inner(inner)
+
+
 def _check_git_commit_substitution(
     command: str, base_cmd: str,
 ) -> BashSecurityResult:
@@ -328,6 +499,11 @@ def _check_git_commit_substitution(
 
     ``git commit -m "$(evil)"`` expands the substitution before git sees it.
     Double-quoted messages allow expansion; single-quoted are safe.
+
+    The canonical Claude Code multi-line commit pattern
+    ``git commit -m "$(cat <<'EOF' ... EOF)"`` is permitted because the
+    single-quoted heredoc delimiter suppresses all expansion inside the
+    body — ``cat`` only emits literal text.
 
     Also blocks:
     - Shell metacharacters in the remainder after the -m "..." argument
@@ -339,44 +515,34 @@ def _check_git_commit_substitution(
     if not re.match(r"^git\s+commit\s+", command):
         return _SAFE
 
-    # Backslashes can desync our regex quote-boundary detection — bail
-    if "\\" in command:
-        return _SAFE  # Let other validators handle it
-
-    # Match: git commit [flags] -m <quote><message><quote> [remainder]
-    # The character class before -m excludes shell metacharacters so that
-    # ``git commit ; evil -m 'x'`` does NOT match (`;`` is not in the class).
-    msg_match = re.match(
-        r"""^git[ \t]+commit[ \t]+[^;&|`$<>()\n\r]*?"""
-        r"""-m[ \t]+(["'])([\s\S]*?)\1(.*)$""",
-        command,
-    )
-    if not msg_match:
+    parsed = _parse_git_commit_message(command)
+    if parsed is None:
         return _SAFE
 
-    quote = msg_match.group(1)
-    message_content = msg_match.group(2) or ""
-    remainder = msg_match.group(3) or ""
+    quote, message_content, remainder = parsed
 
-    # Double-quoted message with $(), ``, or ${}
+    # Double-quoted message with $(), ``, or ${} — block UNLESS the message
+    # is a benign single-quoted-delimiter cat-heredoc (the canonical
+    # multi-line commit pattern).
     if quote == '"' and re.search(r"\$\(|`|\$\{", message_content):
-        return BashSecurityResult(
-            safe=False,
-            check_id=CheckID.GIT_COMMIT_SUBSTITUTION,
-            message="Git commit message contains command substitution patterns",
-        )
+        if not _is_benign_cat_heredoc_substitution(message_content):
+            return BashSecurityResult(
+                safe=False,
+                check_id=CheckID.GIT_COMMIT_SUBSTITUTION,
+                message="Git commit message contains command substitution patterns",
+            )
 
-    # Remainder after the -m argument contains shell operators
-    if remainder and re.search(r"[;|&()`]|\$\(|\$\{", remainder):
-        return BashSecurityResult(
-            safe=False,
-            check_id=CheckID.GIT_COMMIT_SUBSTITUTION,
-            message="Git commit has shell metacharacters after -m argument",
-        )
-
-    # Check for unquoted redirect operators in remainder
-    if remainder:
+    # Remainder after the closing quote: ignore plain whitespace, additional
+    # git flags, and trailing newlines. Only flag genuine shell operators
+    # in unquoted regions of the remainder.
+    if remainder.strip():
         unquoted_rem = _extract_unquoted(remainder)
+        if re.search(r"[;|&()`]|\$\(|\$\{", unquoted_rem):
+            return BashSecurityResult(
+                safe=False,
+                check_id=CheckID.GIT_COMMIT_SUBSTITUTION,
+                message="Git commit has shell metacharacters after -m argument",
+            )
         if re.search(r"[<>]", unquoted_rem):
             return BashSecurityResult(
                 safe=False,
@@ -801,13 +967,29 @@ def _check_unicode_whitespace(command: str) -> BashSecurityResult:
 
 
 def _check_heredoc_in_substitution(command: str) -> BashSecurityResult:
-    """Check 19: Heredoc inside command substitution ($(...<<...))."""
-    if re.search(r"\$\(.*<<", command):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.HEREDOC_IN_SUBSTITUTION,
-            message="Command contains heredoc inside command substitution",
-        )
-    return _SAFE
+    """Check 19: Heredoc inside command substitution ($(...<<...)).
+
+    The canonical Claude Code multi-line commit pattern
+    ``$(cat <<'DELIM' ... DELIM)`` is permitted because the single-quoted
+    (or backslash-escaped) heredoc delimiter suppresses ALL parameter and
+    command expansion inside the body — ``cat`` only emits literal text.
+    Unquoted ``<<EOF`` is still blocked because expansions happen there.
+    """
+    if not re.search(r"\$\(.*<<", command, re.DOTALL):
+        return _SAFE
+
+    # Whitelist: if EVERY top-level $(...) substitution body is a single
+    # benign `cat <<'DELIM' ... DELIM` (with matching backreferenced
+    # delimiter), the command is safe. Reuses the same helper as check 12
+    # to keep parsing semantics consistent across both checks.
+    inners = _extract_dollar_paren_inners(command)
+    if inners and all(_is_benign_cat_heredoc_inner(inner) for inner in inners):
+        return _SAFE
+
+    return BashSecurityResult(
+        safe=False, check_id=CheckID.HEREDOC_IN_SUBSTITUTION,
+        message="Command contains heredoc inside command substitution",
+    )
 
 
 def _is_find_exec_escaped_semicolon(command: str) -> bool:

