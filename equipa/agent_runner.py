@@ -162,6 +162,7 @@ def build_cli_command(
     model: str,
     role: str = "developer",
     streaming: bool = False,
+    prompt_message: str | None = None,
 ) -> list[str]:
     """Build the claude CLI command as a list of arguments.
 
@@ -170,15 +171,21 @@ def build_cli_command(
             build_system_prompt(). PromptResult is coerced to str via
             __str__() which returns the full prompt with boundary marker.
         streaming: If True, use stream-json output format for real-time monitoring.
+        prompt_message: Optional override for the user-facing -p message. Defaults
+            to a generic "Execute the task..." instruction. Manager-mode dispatch
+            (planner/evaluator) supplies role-specific text here.
     """
     # Explicit str() ensures PromptResult.__str__() is called, producing
     # the full prompt with SYSTEM_PROMPT_DYNAMIC_BOUNDARY marker.
     prompt_str = str(system_prompt)
     output_format = "stream-json" if streaming else "json"
+    user_prompt = prompt_message or (
+        f"Execute the task described in your system prompt. Work in: {project_dir}"
+    )
     cmd = [
         "claude",
         "-p",
-        f"Execute the task described in your system prompt. Work in: {project_dir}",
+        user_prompt,
         "--output-format", output_format,
         "--model", model,
         "--max-turns", str(max_turns),
