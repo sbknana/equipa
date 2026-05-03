@@ -1,0 +1,201 @@
+"""Unit tests for the worktree-isolation helpers extracted from
+run_parallel_tasks: _create_isolation_worktrees, _merge_task_branch,
+and _cleanup_worktrees.
+
+These helpers exist because run_parallel_tasks was a 295-line function
+in which silent ``except Exception: pass`` made worktree-merge data-loss
+(open question #332) impossible to diagnose. The tests here exercise:
+
+1. happy path — helper does its job, prints expected breadcrumbs
+2. error path — helper logs the error explicitly and does NOT swallow it
+
+Tests use real ``git`` subprocess calls inside ``tmp_path`` repos so the
+helper logic is exercised end-to-end without mocking subprocess.
+
+Copyright 2026 Forgeborn
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from equipa.dispatch import (
+    _cleanup_worktrees,
+    _create_isolation_worktrees,
+    _merge_task_branch,
+)
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True,
+    )
+
+
+def _init_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-b", "main")
+    _git(path, "config", "user.email", "test@example.com")
+    _git(path, "config", "user.name", "Test")
+    (path / "README.md").write_text("init\n")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-m", "initial")
+
+
+def _git_available() -> bool:
+    return shutil.which("git") is not None
+
+
+pytestmark = pytest.mark.skipif(not _git_available(), reason="git not available")
+
+
+# --- _create_isolation_worktrees ---
+
+
+def test_create_isolation_worktrees_happy_path(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tasks = [{"id": 1}, {"id": 2}]
+    base = repo / ".forge-worktrees"
+
+    result = _create_isolation_worktrees(tasks, str(repo), base)
+
+    assert set(result.keys()) == {1, 2}
+    assert (base / "task-1").is_dir()
+    assert (base / "task-2").is_dir()
+    branches = _git(repo, "branch", "--list").stdout
+    assert "forge-task-1" in branches
+    assert "forge-task-2" in branches
+    out = capsys.readouterr().out
+    assert "[Isolation] Task #1 -> task-1" in out
+    assert "[Isolation] Task #2 -> task-2" in out
+
+
+def test_create_isolation_worktrees_error_path_logs_warning(tmp_path, capsys):
+    """If git can't create worktrees (bare/invalid repo), the helper
+    must log a WARNING and return without the failed task — never crash
+    or silently swallow the error.
+    """
+    not_a_repo = tmp_path / "not_a_repo"
+    not_a_repo.mkdir()
+    base = not_a_repo / ".forge-worktrees"
+
+    result = _create_isolation_worktrees([{"id": 99}], str(not_a_repo), base)
+
+    assert 99 not in result
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "task #99" in out
+
+
+# --- _merge_task_branch ---
+
+
+def test_merge_task_branch_happy_path(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    _create_isolation_worktrees([{"id": 7}], str(repo), base)
+    capsys.readouterr()  # clear setup output
+
+    wt = base / "task-7"
+    (wt / "feature.txt").write_text("hello\n")
+    _git(wt, "add", "feature.txt")
+    _git(wt, "commit", "-m", "feat: add feature")
+
+    pre_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    ok = _merge_task_branch(str(repo), 7, "forge-task-7")
+    post_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert ok is True
+    assert pre_head != post_head
+    out = capsys.readouterr().out
+    assert "Merged task #7 into main" in out
+
+
+def test_merge_task_branch_no_commits_returns_false(tmp_path, capsys):
+    """A worktree with zero new commits must be skipped (False) and
+    explicitly logged as 'NO commits ahead' — never silently treated as
+    success.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    _create_isolation_worktrees([{"id": 5}], str(repo), base)
+    capsys.readouterr()
+
+    ok = _merge_task_branch(str(repo), 5, "forge-task-5")
+
+    assert ok is False
+    out = capsys.readouterr().out
+    assert "NO commits ahead of HEAD" in out
+
+
+def test_merge_task_branch_missing_branch_logs_explicitly(tmp_path, capsys):
+    """A nonexistent branch is still a failure that must be logged —
+    not silently swallowed (the bug class behind open question #332).
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    ok = _merge_task_branch(str(repo), 42, "forge-task-does-not-exist")
+
+    assert ok is False
+    out = capsys.readouterr().out
+    # Either "NO commits" (git log returns empty) or an explicit error log
+    # — what matters is the helper does NOT silently return True.
+    assert "task #42" in out or "forge-task-does-not-exist" in out
+
+
+# --- _cleanup_worktrees ---
+
+
+def test_cleanup_worktrees_deletes_merged_preserves_unmerged(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    worktree_dirs = _create_isolation_worktrees(
+        [{"id": 10}, {"id": 11}], str(repo), base,
+    )
+    capsys.readouterr()
+
+    # Pretend task 10 merged, task 11 did not.
+    _cleanup_worktrees(str(repo), worktree_dirs, {10}, base)
+
+    branches = _git(repo, "branch", "--list").stdout
+    assert "forge-task-10" not in branches  # merged → deleted
+    assert "forge-task-11" in branches      # unmerged → preserved
+    out = capsys.readouterr().out
+    assert "Keeping branch 'forge-task-11'" in out
+    assert not (base / "task-10").exists()
+    assert not (base / "task-11").exists()
+
+
+def test_cleanup_worktrees_logs_errors_explicitly(tmp_path, capsys):
+    """If git operations fail (e.g. invalid project_dir), the cleanup
+    helper must LOG the error — the original code's
+    ``except Exception: pass`` is exactly the bug we are fixing.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    base = repo / ".forge-worktrees"
+    worktree_dirs = _create_isolation_worktrees(
+        [{"id": 20}], str(repo), base,
+    )
+    capsys.readouterr()
+
+    # Point cleanup at a nonexistent project_dir → subprocess.run with
+    # cwd=bad_dir raises FileNotFoundError. The helper must catch it and
+    # LOG explicitly (not silently `pass` like the pre-refactor code).
+    bad_dir = str(tmp_path / "definitely-not-a-repo")
+    _cleanup_worktrees(bad_dir, worktree_dirs, set(), base)
+
+    out = capsys.readouterr().out
+    # Helper must produce an explicit "Cleanup error" log line — this is
+    # the exact behavior change vs. the old `except Exception: pass`.
+    assert "Cleanup error for task #20" in out
+    assert "forge-task-20" in out
