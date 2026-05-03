@@ -612,6 +612,77 @@ def _handle_paralysis_retry(
     return True
 
 
+def _split_compaction_history(
+    compaction_history: list[str],
+) -> tuple[list[str], list[str]]:
+    """Partition compaction_history into (paralysis_entries, regular_entries).
+
+    Paralysis entries contain markers from _build_paralysis_injection and
+    MUST NOT be truncated when building dev extra-context — they are the
+    primary mechanism for changing agent behavior on retry.
+    """
+    paralysis_entries: list[str] = []
+    regular_entries: list[str] = []
+    for entry in compaction_history:
+        if "KILLED for Analysis Paralysis" in entry or "Agents KILLED" in entry:
+            paralysis_entries.append(entry)
+        else:
+            regular_entries.append(entry)
+    return paralysis_entries, regular_entries
+
+
+def _build_dev_extra_context(
+    compaction_history: list[str],
+    cycle: int,
+    message_context: str,
+    dispatch_config: dict | None,
+) -> str:
+    """Compose the developer's extra_context from history + inter-agent messages.
+
+    Behavior preserved exactly from the inline implementation:
+      - Paralysis warnings are NEVER truncated; they always go first.
+      - With anti_compaction_state enabled, regular entries from cycle >= 2
+        are consolidated under a header and truncated to 400 words.
+      - Without anti_compaction_state, only paralysis warnings are included.
+      - Inter-agent messages (when present) are prepended to the final blob.
+    """
+    from equipa.dispatch import is_feature_enabled
+
+    paralysis_entries, regular_entries = _split_compaction_history(
+        compaction_history
+    )
+
+    if is_feature_enabled(dispatch_config, "anti_compaction_state") and compaction_history:
+        if cycle >= 2 and len(regular_entries) > 1:
+            consolidated = (
+                f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
+                + "\n\n".join(regular_entries)
+            )
+            words = consolidated.split()
+            if len(words) > 400:
+                consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
+            extra_context = consolidated
+        else:
+            extra_context = "\n\n".join(regular_entries)
+
+        if paralysis_entries:
+            paralysis_block = "\n\n".join(paralysis_entries)
+            extra_context = (
+                paralysis_block + "\n\n" + extra_context
+                if extra_context else paralysis_block
+            )
+    else:
+        extra_context = "\n\n".join(paralysis_entries) if paralysis_entries else ""
+
+    if message_context:
+        extra_context = (
+            message_context + "\n\n" + extra_context
+            if extra_context else message_context
+        )
+
+    return extra_context
+
+
 async def run_dev_test_loop(
     task: dict[str, Any],
     project_dir: str,
@@ -766,41 +837,11 @@ async def run_dev_test_loop(
         # Build extra context from compaction history.
         # CRITICAL: Paralysis injection (KILLED for Analysis Paralysis) must
         # NEVER be truncated — it's the primary mechanism to change agent
-        # behavior on retry. Separate it from regular compaction history.
+        # behavior on retry. See _build_dev_extra_context for the full policy.
         _dc = getattr(args, "dispatch_config", None)
-        paralysis_entries: list[str] = []
-        regular_entries: list[str] = []
-        for entry in compaction_history:
-            if "KILLED for Analysis Paralysis" in entry or "Agents KILLED" in entry:
-                paralysis_entries.append(entry)
-            else:
-                regular_entries.append(entry)
-
-        if is_feature_enabled(_dc, "anti_compaction_state") and compaction_history:
-            # Build regular context with truncation
-            if cycle >= 2 and len(regular_entries) > 1:
-                consolidated = (
-                    f"## Previous Attempts (Cycles 1-{cycle - 1})\n\n"
-                    + "\n\n".join(regular_entries)
-                )
-                words = consolidated.split()
-                if len(words) > 400:
-                    consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
-                extra_context = consolidated
-            else:
-                extra_context = "\n\n".join(regular_entries)
-
-            # Prepend paralysis warnings — these MUST NOT be truncated.
-            # They go first so the agent sees them before anything else.
-            if paralysis_entries:
-                paralysis_block = "\n\n".join(paralysis_entries)
-                extra_context = paralysis_block + "\n\n" + extra_context if extra_context else paralysis_block
-        else:
-            # Even without anti_compaction_state, always include paralysis warnings
-            extra_context = "\n\n".join(paralysis_entries) if paralysis_entries else ""
-
-        if message_context:
-            extra_context = message_context + "\n\n" + extra_context if extra_context else message_context
+        extra_context = _build_dev_extra_context(
+            compaction_history, cycle, message_context, _dc
+        )
 
         dev_prompt = build_system_prompt(
             task, project_context, project_dir,
