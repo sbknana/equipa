@@ -8,6 +8,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -200,6 +201,48 @@ def git_run(
     EQUIPA. It guarantees consistent timeout handling and PATH resolution.
     """
     return _run_with_env(["git", *args], cwd, timeout)
+
+
+async def git_run_async(
+    args: list[str],
+    cwd: str | Path,
+    timeout: int = GIT_DEFAULT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Async equivalent of ``git_run`` — does NOT block the event loop.
+
+    Uses ``asyncio.create_subprocess_exec`` so callers running inside an
+    async function (dispatch loops, dev-test loop) can issue git commands
+    without serialising the loop. Returns a ``subprocess.CompletedProcess``
+    with the same ``returncode``, ``stdout``, and ``stderr`` shape as
+    ``git_run`` so call sites can be migrated incrementally.
+
+    A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
+    the child process is killed before the error propagates.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=str(cwd),
+        env=_get_repo_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise subprocess.TimeoutExpired(["git", *args], timeout) from e
+    return subprocess.CompletedProcess(
+        args=["git", *args],
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=stdout_b.decode("utf-8", errors="replace"),
+        stderr=stderr_b.decode("utf-8", errors="replace"),
+    )
 
 
 def _gh_run(
