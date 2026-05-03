@@ -185,6 +185,18 @@ def build_cli_command(
         "--permission-mode", "bypassPermissions",
     ]
 
+    # Load effort flag from dispatch_config — production-only config-driven setting.
+    # When dispatch_config.json has 'effort' set (e.g. "high"/"xhigh"/"max"), pass
+    # it to the Claude CLI for extended thinking. No-op when unset (CLI uses default).
+    try:
+        from equipa.dispatch import load_dispatch_config
+        _dc = load_dispatch_config(None)
+        _effort = _dc.get('effort')
+        if _effort:
+            cmd.extend(["--effort", _effort])
+    except Exception:
+        pass  # config missing/unloadable → CLI default effort
+
     # stream-json requires --verbose
     if streaming:
         cmd.append("--verbose")
@@ -482,23 +494,18 @@ async def _run_agent_streaming_impl(
     # Each retry halves remaining patience: retry 1 → -2 turns, retry 2 → -3, etc.
     # Floor at 3 turns — even the most aggressive retry needs a couple turns.
     if paralysis_retry_count > 0:
-        reduction = min(paralysis_retry_count + 1, effective_kill_turns - 3)
-        effective_kill_turns = max(3, effective_kill_turns - reduction)
+        # Loosened 2026-05-02 for Opus 4.7 retest. Previous behavior:
+        # halved patience per retry + ZERO free reads from turn 0. That
+        # works for 4.6 but kills 4.7 instantly because 4.7 legitimately
+        # needs 1-3 reads to plan complex edits. New behavior: gentler
+        # reduction (cap at 25% of base, not halving), and DO NOT
+        # pre-arm must_write_next_turn — let normal escalation rules
+        # handle reading limits.
+        reduction = min(paralysis_retry_count, max(1, effective_kill_turns // 4))
+        effective_kill_turns = max(8, effective_kill_turns - reduction)
         log(f"  [EarlyTerm] Paralysis retry #{paralysis_retry_count}: "
-            f"kill threshold reduced to {effective_kill_turns} turns", output)
-        # On ANY paralysis retry, the agent gets ZERO free reads.
-        # Set must_write_next_turn from the start so the very first
-        # read-only tool call triggers a kill. Previous behavior allowed
-        # retry #1 agents one free read — they used it to start another
-        # analysis spiral. Seen in FeatureBench task 3: agents hit
-        # EarlyTerm on attempts 4, 5, 6, 8, 10 because each retry still
-        # opened with Read calls.
-        must_write_next_turn = True
-        warning_injected = True
-        final_warning_injected = True
-        log(f"  [EarlyTerm] Paralysis retry #{paralysis_retry_count}: "
-            f"must_write_next_turn=True from turn 0 — ZERO free reads",
-            output)
+            f"kill threshold reduced to {effective_kill_turns} turns "
+            f"(loosened: free reads still allowed)", output)
     effective_final_warn_turns = max(EARLY_TERM_FINAL_WARN_TURNS, int(effective_kill_turns * 0.7))
     effective_warn_turns = max(EARLY_TERM_WARN_TURNS, int(effective_kill_turns * 0.45))
     has_any_file_change = False
@@ -742,16 +749,14 @@ async def _run_agent_streaming_impl(
                                 must_write_next_turn = True
 
                         # Track consecutive read-only tool calls for faster
-                        # escalation on large codebases. When agent calls
-                        # Read/Grep/Glob 2+ times without Edit/Write, skip
-                        # straight to final warning — don't wait for the
-                        # normal turn-based escalation. Reduced from 3 to 2
-                        # because agents on 58KB+ patches burned all 3 reads
-                        # before the warning could change their behavior
-                        # (FeatureBench task 3, attempts 4-10).
+                        # escalation on large codebases. Threshold loosened
+                        # 2026-05-02 from 2 to 12 for Opus 4.7 retest — 4.7
+                        # legitimately needs more reading turns than 4.6 to
+                        # plan complex edits. If 4.7 retest fails, restore
+                        # to 2 (was tuned for 4.6 + FeatureBench task 3).
                         if tool_name in ("Read", "Grep", "Glob", "Agent"):
                             consecutive_readonly_tools += 1
-                        if (consecutive_readonly_tools >= 2
+                        if (consecutive_readonly_tools >= 12
                                 and not final_warning_injected):
                             log(f"  [EarlyTerm] FAST ESCALATION: "
                                 f"{consecutive_readonly_tools} consecutive "

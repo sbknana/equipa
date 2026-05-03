@@ -478,13 +478,30 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
 
 
 def _check_redirections(unquoted: str) -> BashSecurityResult:
-    """Checks 9-10: Input and output redirection in unquoted content."""
-    if "<" in unquoted:
+    """Checks 9-10: Input and output redirection in unquoted content.
+
+    Allowlist common-and-safe stderr handling patterns (`2>&1`, `2>/dev/null`,
+    `>/dev/null`, `2>>...log` for logfile append). Without this allowlist,
+    agents calling `git X 2>&1 || echo fail` or `rg X file 2>/dev/null` get
+    blocked, forcing rewrites that waste turns.
+    """
+    # Strip safe stderr/stdout redirection patterns before the literal-char check
+    safe_patterns = [
+        r"2\s*>\s*&\s*1",         # 2>&1
+        r"2\s*>\s*/dev/null",     # 2>/dev/null
+        r">\s*/dev/null",         # >/dev/null
+        r"2\s*>>\s*[\w./-]+\.log",  # 2>>somefile.log
+    ]
+    cleaned = unquoted
+    for pat in safe_patterns:
+        cleaned = re.sub(pat, "", cleaned)
+
+    if "<" in cleaned:
         return BashSecurityResult(
             safe=False, check_id=CheckID.INPUT_REDIRECTION,
             message="Command contains input redirection (<) which could read sensitive files",
         )
-    if ">" in unquoted:
+    if ">" in cleaned:
         return BashSecurityResult(
             safe=False, check_id=CheckID.OUTPUT_REDIRECTION,
             message="Command contains output redirection (>) which could write to arbitrary files",
