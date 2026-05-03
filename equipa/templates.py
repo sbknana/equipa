@@ -314,15 +314,23 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
 
 
 def _assert_no_claude_specific_fields(manifest: dict[str, Any]) -> None:
-    """Walk manifest looking for Claude-specific substrings in keys/values."""
-    def _walk(node: Any) -> None:
+    """Walk manifest looking for Claude-specific substrings in keys/values.
+
+    The ``file_sha`` map's KEYS are on-disk file paths (e.g.
+    ``assets/CLAUDE.md`` is a long-standing project-doc convention, not a
+    Claude-runtime leak) — its keys are exempt from the substring check.
+    Its values (SHA hex digests) are still checked.
+    """
+    def _walk(node: Any, *, in_file_sha: bool = False) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
-                _check_string(key)
-                _walk(value)
+                if not in_file_sha:
+                    _check_string(key)
+                next_in_file_sha = (key == "file_sha") or in_file_sha
+                _walk(value, in_file_sha=next_in_file_sha)
         elif isinstance(node, list):
             for item in node:
-                _walk(item)
+                _walk(item, in_file_sha=in_file_sha)
         elif isinstance(node, str):
             _check_string(node)
 
