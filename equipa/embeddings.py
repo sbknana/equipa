@@ -10,11 +10,15 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import urllib.error
 import urllib.request
 from typing import Any
 
 from equipa.constants import THEFORGE_DB
+
+logger = logging.getLogger(__name__)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -63,7 +67,7 @@ def get_embedding(
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
             return data.get("embedding")
-    except Exception:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         # Ollama down, timeout, or API error — return None gracefully
         return None
 
@@ -105,7 +109,7 @@ def embed_and_store_lesson(
             conn.commit()
         finally:
             conn.close()
-    except Exception:
+    except (sqlite3.Error, ImportError):
         return False
 
     # Create similarity edges in knowledge graph (if enabled)
@@ -124,8 +128,8 @@ def embed_and_store_lesson(
             edges_created = graph.create_similarity_edges(lesson_id, embedding, threshold=0.8)
             # Silent success — don't spam logs on every lesson storage
         except Exception:
-            # Graph module unavailable or error — continue without graph updates
-            pass
+            # Telemetry: graph enrichment is best-effort. Log but don't fail lesson storage.
+            logger.exception("[Telemetry] knowledge graph edge creation failed for lesson %s", lesson_id)
 
     return True
 
@@ -165,7 +169,7 @@ def embed_and_store_episode(
             return True
         finally:
             conn.close()
-    except Exception:
+    except (sqlite3.Error, ImportError):
         return False
 
 
@@ -225,5 +229,5 @@ def find_similar_by_embedding(
             return scores[:top_k]
         finally:
             conn.close()
-    except Exception:
+    except sqlite3.Error:
         return []
