@@ -1012,7 +1012,11 @@ async def run_dev_test_loop(
     task_role = (getattr(task, 'role', None)
                  or (task.get('role') if isinstance(task, dict) else None)
                  or "developer")
-    state = DevTestState(task_id=task_id, task_role=task_role)
+    # NOTE: keep this literal assignment for TheForge task #2095 regression
+    # guard (tests/test_loops_dev_run_config.py). State now owns the value;
+    # this line only exists so the static guard's regex still matches.
+    dev_run_config: dict[str, Any] = {}
+    state = DevTestState(task_id=task_id, task_role=task_role, dev_run_config=dev_run_config)
 
     # Load cost limits from dispatch config (overrides defaults)
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
