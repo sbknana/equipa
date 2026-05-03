@@ -4,10 +4,20 @@ Provides a simple event system for extending orchestrator behavior without
 modifying core code. Supports both Python callables and external command hooks
 configured via hooks.json.
 
-9 lifecycle events:
-    pre_agent_start, post_agent_finish, pre_cycle, post_cycle,
-    on_checkpoint, on_cost_warning, on_stuck_detected,
-    pre_dispatch, post_task_complete
+Two parallel event namespaces are supported:
+
+1. Legacy snake_case events (pre_agent_start, post_agent_finish, pre_cycle,
+   post_cycle, on_checkpoint, on_cost_warning, on_stuck_detected,
+   pre_dispatch, post_task_complete) — original 9 lifecycle events.
+
+2. Colon-namespaced pipeline events (attempt:before, attempt:after,
+   dev_test:fail, diff:empty, security_review:after, compaction:before,
+   compaction:after, task:done, task:blocked) — used by the equipa/hooks/
+   handler modules that migrate the inline guards previously scattered
+   in loops.py (vacuous-pass check, classifier false-positive retry,
+   security-reviewer output gate).
+
+See docs/HOOKS.md for the event contracts and handler authoring guide.
 
 Copyright 2026 Forgeborn
 """
@@ -25,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 # --- Lifecycle Event Names ---
 
-LIFECYCLE_EVENTS: tuple[str, ...] = (
+# Legacy snake_case events (original 9).
+LEGACY_EVENTS: tuple[str, ...] = (
     "pre_agent_start",
     "post_agent_finish",
     "pre_cycle",
@@ -36,6 +47,22 @@ LIFECYCLE_EVENTS: tuple[str, ...] = (
     "pre_dispatch",
     "post_task_complete",
 )
+
+# New colon-namespaced pipeline events (task #2075).
+# These fire at well-defined points in run_dev_test_loop and dispatch.
+PIPELINE_EVENTS: tuple[str, ...] = (
+    "attempt:before",
+    "attempt:after",
+    "dev_test:fail",
+    "diff:empty",
+    "security_review:after",
+    "compaction:before",
+    "compaction:after",
+    "task:done",
+    "task:blocked",
+)
+
+LIFECYCLE_EVENTS: tuple[str, ...] = LEGACY_EVENTS + PIPELINE_EVENTS
 
 # --- Internal callback registry ---
 
