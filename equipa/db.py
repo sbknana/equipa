@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -44,154 +45,96 @@ def get_db_connection(write: bool = False) -> sqlite3.Connection:
 
 _SCHEMA_ENSURED = False
 
+# Canonical schema lives at the repo root.  This module is at
+# <repo>/equipa/db.py, so the schema file is one directory up.
+SCHEMA_SQL_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
+
+
+class SchemaNotInitialised(RuntimeError):
+    """Raised when TheForge DB schema cannot be applied or located.
+
+    Production callers should run ``db_migrate.py`` (or ``equipa_setup.py``)
+    before importing modules that touch the DB.  This exception signals that
+    the safety-net path failed and the orchestrator must not continue.
+    """
+
+
+def _make_schema_idempotent(schema_sql: str) -> str:
+    """Rewrite CREATE statements in schema.sql to be idempotent.
+
+    Mirrors the logic in tests/conftest.py:_ensure_full_schema so we can
+    treat schema.sql as the single source of truth without duplicating
+    table definitions inside this module.
+    """
+    for keyword in ("TABLE", "VIEW", "TRIGGER", "INDEX"):
+        schema_sql = re.sub(
+            rf"CREATE {keyword}(?!\s+IF\s+NOT\s+EXISTS)",
+            f"CREATE {keyword} IF NOT EXISTS",
+            schema_sql,
+            flags=re.IGNORECASE,
+        )
+    schema_sql = re.sub(
+        r"CREATE UNIQUE INDEX(?!\s+IF\s+NOT\s+EXISTS)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS",
+        schema_sql,
+        flags=re.IGNORECASE,
+    )
+    return schema_sql
+
 
 def ensure_schema() -> None:
-    """Create all agent tables if they do not exist (called once at startup).
+    """Apply the canonical ``schema.sql`` to TheForge DB if needed.
 
-    Safety net — schema is primarily managed by db_migrate.py.
+    Safety net: the primary schema management path is ``db_migrate.py``
+    (for upgrades) and ``equipa_setup.py`` (for fresh installs).  This
+    function exists so library callers can safely touch the DB even when
+    those entry points have not run — but unlike the previous inline
+    ``CREATE TABLE`` block it does not duplicate table definitions.
+
+    Raises:
+        SchemaNotInitialised: if ``schema.sql`` is missing or applying it
+            fails.  Callers must NOT swallow this — a missing schema means
+            downstream telemetry and lesson lookups will silently lose data.
     """
     global _SCHEMA_ENSURED
     if _SCHEMA_ENSURED:
         return
+
+    if not SCHEMA_SQL_PATH.exists():
+        raise SchemaNotInitialised(
+            f"Canonical schema file not found at {SCHEMA_SQL_PATH}. "
+            "Run equipa_setup.py or db_migrate.py before using the DB."
+        )
+
     try:
-        # get_db_connection raises FileNotFoundError if the DB file does not
-        # exist.  For ensure_schema that is fine in production (db_migrate.py
-        # creates the file first), but in test worktrees the DB may start
-        # empty or absent.  Fall back to sqlite3.connect (which auto-creates
-        # the file) when the DB does not exist yet.
-        try:
-            conn = get_db_connection(write=True)
-        except FileNotFoundError:
-            conn = sqlite3.connect(str(THEFORGE_DB))
-            conn.row_factory = sqlite3.Row
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_episodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER, role TEXT, task_type TEXT,
-                project_id INTEGER, approach_summary TEXT,
-                turns_used INTEGER, outcome TEXT, error_patterns TEXT,
-                reflection TEXT, q_value REAL DEFAULT 0.5,
-                embedding TEXT,
-                times_injected INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS lessons_learned (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER,
-                role TEXT,
-                error_type TEXT,
-                error_signature TEXT,
-                lesson TEXT NOT NULL,
-                source TEXT DEFAULT 'forgesmith',
-                times_seen INTEGER DEFAULT 1,
-                times_injected INTEGER DEFAULT 0,
-                effectiveness_score REAL,
-                active INTEGER DEFAULT 1,
-                embedding TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL, cycle_number INTEGER NOT NULL,
-                from_role TEXT NOT NULL, to_role TEXT NOT NULL,
-                message_type TEXT NOT NULL, content TEXT NOT NULL,
-                read_by_cycle INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL, run_id INTEGER,
-                cycle_number INTEGER NOT NULL, role TEXT NOT NULL,
-                turn_number INTEGER NOT NULL, tool_name TEXT NOT NULL,
-                tool_input_preview TEXT, input_hash TEXT,
-                output_length INTEGER, success INTEGER NOT NULL DEFAULT 1,
-                error_type TEXT, error_summary TEXT, duration_ms INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS forgesmith_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                started_at TEXT NOT NULL DEFAULT (datetime('now')),
-                completed_at TEXT,
-                agent_runs_analyzed INTEGER DEFAULT 0,
-                changes_made INTEGER DEFAULT 0,
-                summary TEXT,
-                mode TEXT DEFAULT 'auto'
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS forgesmith_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                change_type TEXT NOT NULL,
-                target_file TEXT,
-                old_value TEXT,
-                new_value TEXT,
-                rationale TEXT NOT NULL,
-                evidence TEXT,
-                effectiveness_score REAL,
-                reverted_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS rubric_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_run_id INTEGER NOT NULL,
-                task_id INTEGER,
-                project_id INTEGER,
-                role TEXT NOT NULL,
-                rubric_version INTEGER DEFAULT 1,
-                criteria_scores TEXT NOT NULL,
-                total_score REAL NOT NULL,
-                max_possible REAL NOT NULL,
-                normalized_score REAL NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_actions_task "
-            "ON agent_actions(task_id, cycle_number)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_actions_tool "
-            "ON agent_actions(tool_name, success)"
-        )
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS lesson_graph_edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                src_id INTEGER NOT NULL,
-                dst_id INTEGER NOT NULL,
-                edge_type TEXT NOT NULL,
-                weight REAL DEFAULT 1.0,
-                created_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(src_id, dst_id, edge_type)
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_lesson_graph_src "
-            "ON lesson_graph_edges(src_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst "
-            "ON lesson_graph_edges(dst_id)"
-        )
+        schema_sql = _make_schema_idempotent(SCHEMA_SQL_PATH.read_text())
+    except OSError as e:
+        raise SchemaNotInitialised(
+            f"Could not read schema file at {SCHEMA_SQL_PATH}: {e}"
+        ) from e
+
+    # get_db_connection raises FileNotFoundError if the DB file does not
+    # exist.  In production db_migrate.py / equipa_setup.py creates the
+    # file first; in test worktrees the DB may start absent, so fall back
+    # to sqlite3.connect (which auto-creates) before applying schema.sql.
+    try:
+        conn = get_db_connection(write=True)
+    except FileNotFoundError:
+        conn = sqlite3.connect(str(THEFORGE_DB))
+        conn.row_factory = sqlite3.Row
+
+    try:
+        conn.executescript(schema_sql)
         conn.commit()
-        conn.close()
-        _SCHEMA_ENSURED = True
     except sqlite3.Error as e:
-        # Schema creation is best-effort — db_migrate.py is the primary path.
-        # Log but do not crash the orchestrator if it fails here.
-        logger.exception("[Schema] Could not ensure tables: %s", e)
+        logger.exception("[Schema] Failed to apply schema.sql: %s", e)
+        raise SchemaNotInitialised(
+            f"Failed to apply {SCHEMA_SQL_PATH.name}: {e}"
+        ) from e
+    finally:
+        conn.close()
+
+    _SCHEMA_ENSURED = True
 
 
 # --- Record Functions ---
