@@ -93,3 +93,29 @@ All 26 tests pass in 3.72s.
 
 4. **DB connection in finally block**: `get_failed_episodes_by_keywords` uses try/finally to
    ensure connection closure, addressing the recurring QS-01 pattern.
+
+## Backport Verification — Task #2128 (2026-05-03)
+
+After the 2026-05-03 GitHub force-push restoration, this feature was re-verified to
+confirm the backport from `origin/master` is intact:
+
+| Origin commit | Local commit | Status |
+|---|---|---|
+| `4777c18` (`feat: add episode history check for GEPA prompt mutations`) | `9a4d328` | byte-identical for `forgesmith_gepa.py` |
+| `b713548` (`test: add 26 tests for GEPA episode history check + fix conftest import`) | `97bbe4b` | byte-identical for `tests/test_gepa_episode_check.py` and `tests/conftest.py` |
+| `9da4bc0` (`docs: add GEPA episode check output document`) | `0732a40` | byte-identical for `GEPA-EPISODE-CHECK-1603.md` |
+
+Verified via `git diff <origin>:<path> <local>:<path>` — zero diff for each file.
+
+Test run on 2026-05-03 with Python 3.12.3 / pytest 9.0.2:
+
+```
+tests/test_gepa_episode_check.py ... 26 passed in 4.05s
+```
+
+The earlier task description (which stated `tests/test_gepa_episode_check.py` had been
+DROPPED because `compute_keyword_overlap` did not exist locally) was based on an outdated
+view of the repo. The function is present in `forgesmith_gepa.py` (and also in
+`equipa/parsing.py` and `equipa/lessons.py`), the test file exists, and all 26 tests pass.
+No further porting needed.
+
