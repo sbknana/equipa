@@ -491,6 +491,127 @@ def _load_forge_state_json(project_dir: str | None) -> dict | None:
         return None
 
 
+def _is_analysis_paralysis(reason: str) -> bool:
+    """Return True if an early-term reason matches analysis-paralysis patterns.
+
+    Analysis paralysis = agent killed for reading without writing. The patterns
+    here mirror the kill-message phrases emitted by agent_runner so this helper
+    can be the single source of truth for paralysis detection.
+    """
+    return (
+        "without file changes" in reason
+        or "reading instead of writing" in reason
+        or "analysis paralysis" in reason
+        or "read-only" in reason
+        or "reading ratio" in reason
+    )
+
+
+def _build_paralysis_injection(paralysis_retries: int, reduced_kill: int) -> str:
+    """Build the escalating scaffold-first prompt for a paralysis retry.
+
+    paralysis_retries is the count of prior paralysis kills on this task.
+    Returns the full markdown injection that will be prepended to the next
+    developer dispatch via compaction_history.
+    """
+    if paralysis_retries == 0:
+        return (
+            "## CRITICAL: Previous Agent KILLED for Analysis "
+            "Paralysis\n\n"
+            "The previous agent was TERMINATED after spending ALL "
+            "its turns reading code without writing a single line. "
+            "You are the replacement. If you repeat this mistake, "
+            "you will ALSO be terminated and the task will be "
+            "marked as FAILED.\n\n"
+            "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
+            "1. **Your FIRST tool call MUST be Edit or Write.** "
+            "Not Read. Not Grep. Not Glob. EDIT or WRITE.\n"
+            "2. **Do NOT read any files first.** The task "
+            "description contains everything you need for a "
+            "first draft.\n"
+            "3. **Write a minimal skeleton/stub immediately.** "
+            "Wrong code you can fix is infinitely better than no "
+            "code at all.\n"
+            "4. **After your first edit, commit it.** Then read "
+            "ONE file if needed and make your next edit.\n\n"
+            f"**Kill threshold: {reduced_kill} turns.** If your "
+            f"first tool call is Read, you are already failing."
+        )
+    if paralysis_retries == 1:
+        return (
+            "## FINAL CHANCE: 2 Agents Already KILLED\n\n"
+            "**TWO agents have been terminated on this task for "
+            "analysis paralysis.** You are the LAST attempt before "
+            "this task is marked FAILED.\n\n"
+            "### ZERO-READ PROTOCOL\n\n"
+            "- **Do NOT read ANY files.** Period.\n"
+            "- Your FIRST action: Write a stub/skeleton file based "
+            "ONLY on the task description.\n"
+            "- Your SECOND action: `git add && git commit`.\n"
+            "- Your THIRD action: Read ONE file, make ONE edit, "
+            "commit.\n"
+            "- Repeat: read-edit-commit in tight loops.\n\n"
+            f"**Kill threshold: {reduced_kill} turns without file "
+            f"changes.** You have almost NO reading budget. Write "
+            f"FIRST."
+        )
+    return (
+        f"## EMERGENCY: {paralysis_retries + 1} Agents KILLED "
+        f"on This Task\n\n"
+        f"**{paralysis_retries} previous agents ALL failed by "
+        f"reading instead of writing.** Kill threshold: "
+        f"{reduced_kill} turns. Your very first tool call MUST "
+        f"create or edit a file. Do NOT read anything. Write a "
+        f"skeleton based on the task title alone, commit it, "
+        f"then iterate. This is your only chance."
+    )
+
+
+def _handle_paralysis_retry(
+    reason: str,
+    cycle: int,
+    compaction_history: list[str],
+    dev_run_config: dict[str, Any],
+    output: Any = None,
+) -> bool:
+    """If reason indicates analysis paralysis, append an escalating injection.
+
+    Returns True when paralysis was detected and the caller should `continue`
+    to the next cycle (a stricter scaffold-first prompt is now in
+    compaction_history). Returns False when reason is not paralysis-shaped or
+    when retries are exhausted (cycle == MAX_DEV_TEST_CYCLES) — caller should
+    fall through to the normal early-terminated exit.
+
+    Mutates compaction_history (append) and dev_run_config
+    (_paralysis_retry_count). Mirrors the original inline logic exactly so
+    the refactor is behavior-preserving.
+    """
+    if not _is_analysis_paralysis(reason):
+        return False
+    if cycle >= MAX_DEV_TEST_CYCLES:
+        return False
+
+    paralysis_retries = sum(
+        1 for ctx in compaction_history
+        if "KILLED for Analysis Paralysis" in ctx
+    )
+    log(
+        f"  [Cycle {cycle}] Analysis paralysis detected "
+        f"(paralysis retry #{paralysis_retries + 1}) — retrying "
+        f"with escalating scaffold-first injection.",
+        output,
+    )
+
+    # Escalating kill threshold reduction: each retry halves
+    # the remaining patience. Passed via env hint in the prompt.
+    reduced_kill = max(3, 6 - paralysis_retries)
+    compaction_history.append(
+        _build_paralysis_injection(paralysis_retries, reduced_kill)
+    )
+    dev_run_config["_paralysis_retry_count"] = paralysis_retries + 1
+    return True
+
+
 async def run_dev_test_loop(
     task: dict[str, Any],
     project_dir: str,
@@ -746,91 +867,9 @@ async def run_dev_test_loop(
             # and reduces the kill threshold. This is the #1 cause of failure
             # on large codebases — seen in FeatureBench task 3 where the agent
             # hit EarlyTerm on attempts 4, 5, 6, 8, 10.
-            is_analysis_paralysis = (
-                "without file changes" in reason
-                or "reading instead of writing" in reason
-                or "analysis paralysis" in reason
-                or "read-only" in reason
-                or "reading ratio" in reason
-            )
-            if is_analysis_paralysis and cycle < MAX_DEV_TEST_CYCLES:
-                paralysis_retries = sum(
-                    1 for ctx in compaction_history
-                    if "KILLED for Analysis Paralysis" in ctx
-                )
-                log(f"  [Cycle {cycle}] Analysis paralysis detected "
-                    f"(paralysis retry #{paralysis_retries + 1}) — retrying "
-                    f"with escalating scaffold-first injection.", output)
-
-                # Escalating kill threshold reduction: each retry halves
-                # the remaining patience. Passed via env hint in the prompt.
-                reduced_kill = max(3, 6 - paralysis_retries)
-
-                if paralysis_retries == 0:
-                    # First retry — firm but instructive
-                    paralysis_injection = (
-                        "## CRITICAL: Previous Agent KILLED for Analysis "
-                        "Paralysis\n\n"
-                        "The previous agent was TERMINATED after spending ALL "
-                        "its turns reading code without writing a single line. "
-                        "You are the replacement. If you repeat this mistake, "
-                        "you will ALSO be terminated and the task will be "
-                        "marked as FAILED.\n\n"
-                        "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
-                        "1. **Your FIRST tool call MUST be Edit or Write.** "
-                        "Not Read. Not Grep. Not Glob. EDIT or WRITE.\n"
-                        "2. **Do NOT read any files first.** The task "
-                        "description contains everything you need for a "
-                        "first draft.\n"
-                        "3. **Write a minimal skeleton/stub immediately.** "
-                        "Wrong code you can fix is infinitely better than no "
-                        "code at all.\n"
-                        "4. **After your first edit, commit it.** Then read "
-                        "ONE file if needed and make your next edit.\n\n"
-                        f"**Kill threshold: {reduced_kill} turns.** If your "
-                        f"first tool call is Read, you are already failing."
-                    )
-                elif paralysis_retries == 1:
-                    # Second retry — maximum urgency
-                    paralysis_injection = (
-                        "## FINAL CHANCE: 2 Agents Already KILLED\n\n"
-                        "**TWO agents have been terminated on this task for "
-                        "analysis paralysis.** You are the LAST attempt before "
-                        "this task is marked FAILED.\n\n"
-                        "### ZERO-READ PROTOCOL\n\n"
-                        "- **Do NOT read ANY files.** Period.\n"
-                        "- Your FIRST action: Write a stub/skeleton file based "
-                        "ONLY on the task description.\n"
-                        "- Your SECOND action: `git add && git commit`.\n"
-                        "- Your THIRD action: Read ONE file, make ONE edit, "
-                        "commit.\n"
-                        "- Repeat: read-edit-commit in tight loops.\n\n"
-                        f"**Kill threshold: {reduced_kill} turns without file "
-                        f"changes.** You have almost NO reading budget. Write "
-                        f"FIRST."
-                    )
-                else:
-                    # Third+ retry — absolute minimum
-                    paralysis_injection = (
-                        f"## EMERGENCY: {paralysis_retries + 1} Agents KILLED "
-                        f"on This Task\n\n"
-                        f"**{paralysis_retries} previous agents ALL failed by "
-                        f"reading instead of writing.** Kill threshold: "
-                        f"{reduced_kill} turns. Your very first tool call MUST "
-                        f"create or edit a file. Do NOT read anything. Write a "
-                        f"skeleton based on the task title alone, commit it, "
-                        f"then iterate. This is your only chance."
-                    )
-                compaction_history.append(paralysis_injection)
-
-                # Store retry count so agent_runner applies tighter kill
-                # thresholds on the next dispatch. Using dict key check,
-                # not hasattr (dev_run_config is a dict, not an object).
-                dev_run_config["_paralysis_retry_count"] = (
-                    paralysis_retries + 1
-                )
-
-                # Don't return — fall through to next cycle
+            if _handle_paralysis_retry(
+                reason, cycle, compaction_history, dev_run_config, output
+            ):
                 continue
 
             return dev_result, cycle, "early_terminated"
