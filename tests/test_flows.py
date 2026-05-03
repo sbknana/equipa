@@ -133,21 +133,21 @@ def test_migration_creates_flow_tables(fresh_db):
         assert "flow_revisions" in names
         assert "flow_tasks" in names
 
-        # PRAGMA user_version stamped to 9
+        # PRAGMA user_version stamped to current head (>=9 — flow migration is the v9 step but later migrations may have stamped higher)
         v = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert v == 9
+        assert v >= 9
     finally:
         conn.close()
 
 
 def test_migration_is_idempotent(fresh_db):
-    """Running migrations again on an already-v9 DB is a no-op."""
+    """Running migrations again is a no-op once the DB is at head."""
     from db_migrate import run_migrations
 
     success, from_ver, to_ver = run_migrations(str(fresh_db), silent=True)
     assert success
-    assert from_ver == 9
-    assert to_ver == 9
+    assert from_ver >= 9
+    assert to_ver == from_ver  # head equals starting version on idempotent re-run
 
 
 # --- Core API ---
