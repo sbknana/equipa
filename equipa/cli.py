@@ -289,6 +289,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
     group.add_argument("--mcp-server", action="store_true",
                         help="Run as MCP server (JSON-RPC over stdio)")
+    group.add_argument("--config-cmd", choices=["snapshot", "list", "diff", "rollback"],
+                        metavar="VERB",
+                        help="Config-versioning subcommand: snapshot|list|diff|rollback")
 
     parser.add_argument("--project-dir", type=str, metavar="PATH",
                         help="Project directory (used with --add-project)")
@@ -322,14 +325,157 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Print command without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
+    # --- Config-versioning args (used with --config-cmd) ---
+    parser.add_argument("--config-project", type=int, default=None,
+                        metavar="N", help="Project id for --config-cmd (snapshot/list)")
+    parser.add_argument("--config-message", "-m", type=str, default=None,
+                        metavar="MSG", help="Commit message for --config-cmd snapshot")
+    parser.add_argument("--config-version-a", type=int, default=None,
+                        metavar="ID", help="First version id for --config-cmd diff")
+    parser.add_argument("--config-version-b", type=int, default=None,
+                        metavar="ID", help="Second version id for --config-cmd diff")
+    parser.add_argument("--config-version", type=int, default=None,
+                        metavar="ID", help="Target version id for --config-cmd rollback")
+    parser.add_argument("--force", action="store_true",
+                        help="Force --config-cmd rollback past dirty-file check")
+
     return parser
 
 
 # --- Per-Mode Handlers ---
 
+def _auto_snapshot_dispatch(
+    project_id: int | None,
+    dispatch_config: dict | None,
+    *,
+    source: str = "auto-dispatch",
+) -> None:
+    """Take an auto-snapshot of tracked configs at dispatch entry.
+
+    Cheap (dedup on content_sha → no DB write if config unchanged).
+    Wrapped in try/except so a snapshot failure cannot crash dispatch.
+    Skipped when ``features.config_versioning`` flag is False.
+    """
+    if not project_id:
+        return
+    if not is_feature_enabled(dispatch_config, "config_versioning"):
+        return
+    try:
+        from equipa import config_versions
+        config_versions.snapshot(int(project_id), source=source)
+    except Exception:  # noqa: BLE001 — must not crash caller
+        import logging
+        logging.getLogger(__name__).exception(
+            "[config_versions] auto-snapshot failed for project=%s source=%s",
+            project_id, source,
+        )
+
+
 async def run_mode_mcp_server(args: argparse.Namespace) -> None:
     """Run as MCP server (JSON-RPC over stdio)."""
     run_server()
+
+
+# --- Config-Versioning Helpers ---
+
+def _resolve_config_project_id(args: argparse.Namespace) -> int:
+    """Resolve the project id used by config-versioning commands.
+
+    Order of precedence:
+        1. Explicit --project flag
+        2. --goal-project flag
+        3. Single project registered in TheForge
+
+    Exits with a clear error if none of the above can identify a project.
+    """
+    explicit = (getattr(args, "config_project", None)
+                or getattr(args, "goal_project", None))
+    if explicit:
+        return int(explicit)
+
+    db_path = _equipa_constants.THEFORGE_DB
+    if not db_path.exists():
+        print(f"ERROR: TheForge DB not found at {db_path}; pass --project N")
+        sys.exit(1)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT id, name FROM projects WHERE status != 'archived'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) == 1:
+        return int(rows[0][0])
+    print("ERROR: --config-cmd requires --project N (multiple active projects).")
+    for row in rows:
+        print(f"  {row[0]}: {row[1]}")
+    sys.exit(1)
+
+
+async def run_mode_config(args: argparse.Namespace) -> None:
+    """Dispatch the config-versioning subcommand selected by --config-cmd."""
+    from equipa import config_versions
+
+    verb = args.config_cmd
+
+    if verb == "snapshot":
+        project_id = _resolve_config_project_id(args)
+        version_id = config_versions.snapshot(
+            project_id,
+            source="manual",
+            commit_message=args.config_message,
+        )
+        print(f"snapshot: project={project_id} version_id={version_id}")
+        return
+
+    if verb == "list":
+        project_id = _resolve_config_project_id(args)
+        rows = config_versions.list_versions(project_id)
+        if not rows:
+            print(f"No config versions for project {project_id}.")
+            return
+        print(f"id\tcreated_at\tsource\tmessage")
+        for row in rows:
+            msg = row.get("commit_message") or ""
+            print(f"{row['id']}\t{row['created_at']}\t{row['source']}\t{msg}")
+        return
+
+    if verb == "diff":
+        if args.config_version_a is None or args.config_version_b is None:
+            print("ERROR: --config-cmd diff requires "
+                  "--config-version-a ID --config-version-b ID")
+            sys.exit(1)
+        diffs = config_versions.diff(args.config_version_a, args.config_version_b)
+        if not diffs:
+            print("(no differences)")
+            return
+        for path, text in diffs.items():
+            print(f"--- {path} ---")
+            print(text)
+        return
+
+    if verb == "rollback":
+        if args.config_version is None:
+            print("ERROR: --config-cmd rollback requires --config-version ID")
+            sys.exit(1)
+        try:
+            paths = config_versions.rollback(
+                args.config_version,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(2)
+        verb_label = "would rewrite" if args.dry_run else "rewrote"
+        print(f"rollback: {verb_label} {len(paths)} file(s) for version {args.config_version}")
+        for p in paths:
+            print(f"  {p}")
+        return
+
+    print(f"ERROR: unknown config verb: {verb}")
+    sys.exit(1)
 
 
 async def run_mode_regenerate_manifest(args: argparse.Namespace) -> None:
@@ -378,6 +524,10 @@ async def run_mode_auto_run(args: argparse.Namespace) -> None:
     for proj in work:
         score_project(proj, dispatch_config)
     work.sort(key=lambda p: p.get("score", 0), reverse=True)
+
+    # Auto-snapshot tracked configs once per project at dispatch entry.
+    for proj in work:
+        _auto_snapshot_dispatch(proj.get("project_id"), dispatch_config)
 
     # Dry run: show plan and exit
     if args.dry_run:
@@ -469,6 +619,11 @@ async def run_mode_goal(args: argparse.Namespace) -> None:
 
     project_context = fetch_project_context(args.goal_project)
 
+    # Auto-snapshot tracked configs once at dispatch entry.
+    _auto_snapshot_dispatch(
+        args.goal_project, getattr(args, "dispatch_config", None),
+    )
+
     # Show goal info
     print(f"\nGoal: {args.goal}")
     print(f"Project: {project_info.get('name', 'Unknown')} (ID: {args.goal_project})")
@@ -511,6 +666,14 @@ async def run_mode_tasks(args: argparse.Namespace) -> None:
         print("ERROR: Could not parse task IDs from --tasks argument.")
         sys.exit(1)
 
+    # Auto-snapshot tracked configs once at dispatch entry.
+    tasks_for_snapshot = fetch_tasks_by_ids(task_ids)
+    if tasks_for_snapshot:
+        _auto_snapshot_dispatch(
+            tasks_for_snapshot[0].get("project_id"),
+            getattr(args, "dispatch_config", None),
+        )
+
     if args.dry_run:
         tasks = fetch_tasks_by_ids(task_ids)
         print("\n--- DRY RUN (Parallel Tasks) ---")
@@ -536,6 +699,12 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         if not task:
             print(f"No todo tasks found for project {args.project}")
             sys.exit(0)
+
+    # Auto-snapshot tracked configs once at dispatch entry.
+    _auto_snapshot_dispatch(
+        task.get("project_id"),
+        getattr(args, "dispatch_config", None),
+    )
 
     # Resolve project directory
     project_dir = resolve_project_dir(task)
@@ -776,6 +945,8 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     """
     if args.mcp_server:
         return run_mode_mcp_server
+    if getattr(args, "config_cmd", None):
+        return run_mode_config
     if args.regenerate_manifest:
         return run_mode_regenerate_manifest
     if args.add_project:

@@ -525,6 +525,44 @@ def _list_all_container_ids(docker_bin: str) -> set[str]:
 # Tick driver
 
 
+def _auto_snapshot_active_projects(db_path: Path) -> None:
+    """Snapshot tracked configs for every active project.
+
+    Gated on the ``config_versioning`` feature flag in dispatch_config.json.
+    Each per-project ``snapshot()`` call is independent — a failure on one
+    project does not skip the rest. Called from :func:`run_once`.
+    """
+    try:
+        from equipa.config import is_feature_enabled, load_dispatch_config
+        from equipa import config_versions
+    except Exception:  # noqa: BLE001 — never crash heartbeat on import error
+        logger.exception("config_versions import failed; skipping auto-snapshot")
+        return
+
+    dispatch_config = load_dispatch_config(None)
+    if not is_feature_enabled(dispatch_config, "config_versioning"):
+        return
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id FROM projects WHERE status != 'archived'"
+            ).fetchall()
+    except sqlite3.Error:
+        logger.exception("Could not enumerate projects for auto-snapshot")
+        return
+
+    for row in rows:
+        project_id = int(row["id"])
+        try:
+            config_versions.snapshot(project_id, source="auto-cli")
+        except Exception:  # noqa: BLE001 — per-project isolation
+            logger.exception(
+                "auto-snapshot failed for project_id=%s", project_id,
+            )
+
+
 def run_once(config: HeartbeatConfig) -> SweepResult:
     """Run a single heartbeat sweep synchronously.
 
@@ -581,6 +619,16 @@ def run_once(config: HeartbeatConfig) -> SweepResult:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Orphan DB prune failed")
             result.errors.append(f"prune_orphan_container_dbs: {exc!r}")
+
+    # Auto-snapshot tracked configs for every active project so out-of-band
+    # operator edits between dispatches get captured. Cheap (dedup on
+    # content_sha — no write if unchanged) and fully wrapped in try/except so
+    # a snapshot failure cannot interrupt the sweep.
+    try:
+        _auto_snapshot_active_projects(config.db_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Heartbeat config auto-snapshot failed")
+        result.errors.append(f"auto_snapshot: {exc!r}")
 
     result.duration_seconds = time.time() - started
 

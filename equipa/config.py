@@ -41,6 +41,9 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "knowledge_graph": False,
     "autoresearch": True,
     "rlm_decompose": False,
+    "config_versioning": False,
+    "session_persistence": False,
+    "project_templates": False,
 }
 
 DEFAULT_DISPATCH_CONFIG: dict = {
