@@ -555,17 +555,51 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
 def _check_redirections(unquoted: str) -> BashSecurityResult:
     """Checks 9-10: Input and output redirection in unquoted content.
 
-    Allowlist common-and-safe stderr handling patterns (`2>&1`, `2>/dev/null`,
-    `>/dev/null`, `2>>...log` for logfile append). Without this allowlist,
-    agents calling `git X 2>&1 || echo fail` or `rg X file 2>/dev/null` get
-    blocked, forcing rewrites that waste turns.
+    Threat model: ``cmd > /etc/passwd`` overwrites system files; ``cmd >
+    ~/.bashrc`` plants persistent shell hooks. BUT ``cmd > /tmp/out.log``
+    and ``cmd >> build.log`` are routine dev patterns that wasted turns
+    in task #2096 retries.
+
+    Allowlist (stripped before the literal-char check):
+      - 2>&1, 2>/dev/null, >/dev/null, 2>>*.log (existing)
+      - > and >> targeting /tmp/, ./, or any relative path (no leading /)
+      - >> appending to *.log anywhere
+
+    Explicit denylist (always blocks regardless of above):
+      - /etc/, /usr/, /bin/, /sbin/, /boot/, /root/, /sys/, /dev/sd*,
+        /dev/disk*, /var/log/ (system logs), ~/.* (dotfile in home),
+        /home/*/.* (dotfile in any user home)
     """
+    # Hard denylist applied to the ORIGINAL unquoted string before any
+    # stripping — these targets are never safe even if they textually match
+    # the allowlist patterns later.
+    danger_target_re = re.compile(
+        r">>?\s*("
+        r"/etc/|/usr/|/bin/|/sbin/|/boot/|/root/|/sys/|"
+        r"/dev/sd[a-z]|/dev/disk|/dev/nvme|/dev/hd[a-z]|"
+        r"/var/log/|"
+        r"~/\.|/home/[^/]+/\."
+        r")"
+    )
+    if danger_target_re.search(unquoted):
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.OUTPUT_REDIRECTION,
+            message="Command redirects output to a sensitive system path",
+        )
+
     # Strip safe stderr/stdout redirection patterns before the literal-char check
     safe_patterns = [
-        r"2\s*>\s*&\s*1",         # 2>&1
-        r"2\s*>\s*/dev/null",     # 2>/dev/null
-        r">\s*/dev/null",         # >/dev/null
-        r"2\s*>>\s*[\w./-]+\.log",  # 2>>somefile.log
+        r"2\s*>\s*&\s*1",                  # 2>&1
+        r"2\s*>\s*/dev/null",              # 2>/dev/null
+        r">\s*/dev/null",                  # >/dev/null
+        r"2\s*>>\s*[\w./-]+\.log",         # 2>>somefile.log
+        r">>\s*[\w./-]+\.log",             # >>somefile.log (dev append)
+        # > or >> targeting /tmp/...
+        r">>?\s*/tmp/[\w./-]+",
+        # > or >> targeting ./relative or relative paths (no leading /)
+        # Path may contain dots and slashes but not start with /.
+        r">>?\s*\./[\w./-]+",
+        r">>?\s*[A-Za-z_][\w./-]*",
     ]
     cleaned = unquoted
     for pat in safe_patterns:

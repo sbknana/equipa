@@ -178,12 +178,14 @@ class TestRedirection:
         assert result.check_id == CheckID.INPUT_REDIRECTION
 
     def test_output_redirect(self) -> None:
-        result = check_bash_command("cmd > /tmp/out.txt")
+        # /etc/passwd is on the danger denylist — still blocked.
+        result = check_bash_command("cmd > /etc/passwd")
         assert not result.safe
         assert result.check_id == CheckID.OUTPUT_REDIRECTION
 
     def test_append_redirect(self) -> None:
-        result = check_bash_command("cmd >> /tmp/out.txt")
+        # /usr/bin/x is on the danger denylist — still blocked.
+        result = check_bash_command("cmd >> /usr/bin/x")
         assert not result.safe
         assert result.check_id == CheckID.OUTPUT_REDIRECTION
 
