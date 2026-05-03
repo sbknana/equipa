@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from equipa.agent_runner import (
+    AgentResult,
     build_cli_command,
     dispatch_agent,
     run_agent,
@@ -1185,7 +1186,7 @@ async def run_dev_test_loop(
         # have no teeth — the agent still gets the full kill budget.
         paralysis_retries = state.dev_run_config.get("_paralysis_retry_count", 0)
 
-        dev_result = await dispatch_agent(
+        dev_result: AgentResult = await dispatch_agent(
             dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
             task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
             project_dir=project_dir, args=args,
@@ -1355,7 +1356,7 @@ async def run_dev_test_loop(
             project_dir=project_dir, model=tester_model,
         )
 
-        tester_result = await dispatch_agent(
+        tester_result: AgentResult = await dispatch_agent(
             tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
             task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
             project_dir=project_dir, args=args)

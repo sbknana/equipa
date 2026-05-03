@@ -322,7 +322,7 @@ async def run_agent(
     fallback_model: str | None = None,
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
-) -> dict[str, Any]:
+) -> AgentResult:
     """Spawn claude -p with retry logic, exponential backoff, and model fallback.
 
     Implements Claude Code withRetry.ts pattern:
@@ -1264,7 +1264,7 @@ async def run_agent_streaming_with_retry(
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     paralysis_retry_count: int = 0,
-) -> dict[str, Any]:
+) -> AgentResult:
     """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
 
     Same retry architecture as run_agent():
@@ -1397,7 +1397,7 @@ async def run_agent_streaming(
     project_dir: str | None = None,
     abort_controller: AbortController | None = None,
     paralysis_retry_count: int = 0,
-) -> dict[str, Any]:
+) -> AgentResult:
     """Spawn claude -p with stream-json output for real-time stuck detection.
 
     Monitors agent output turn-by-turn and terminates early if stuck signals

@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from equipa.agent_runner import AgentResult
 
 from equipa.constants import (
     AUTOFIX_COST_LIMIT,
@@ -179,7 +182,7 @@ async def _dispatch_autofix_agent(
     cycle: int,
     args: Any,
     output: Any = None,
-) -> tuple[dict[str, Any], float]:
+) -> tuple[AgentResult, float]:
     """Dispatch a single auto-fix agent (debugger or planner). Returns (result, cost)."""
     from equipa.agent_runner import build_cli_command, dispatch_agent
     from equipa.constants import COST_ESTIMATE_PER_TURN
@@ -194,7 +197,7 @@ async def _dispatch_autofix_agent(
         role=role, max_turns=budget, dispatch_config=dispatch_config,
     )
     cmd = build_cli_command(prompt, project_dir, budget, model, role=role, streaming=streaming)
-    result = await dispatch_agent(
+    result: AgentResult = await dispatch_agent(
         cmd, role=role, output=output, max_turns=budget, task_id=task_id,
         cycle=cycle, system_prompt=prompt, project_dir=project_dir, args=args,
     )
