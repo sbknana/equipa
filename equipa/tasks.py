@@ -18,13 +18,12 @@ from equipa.constants import (
     PROJECT_DIRS,
     THEFORGE_DB,
 )
-from equipa.db import get_db_connection
+from equipa.db import db_conn
 
 
 def fetch_task(task_id: int) -> dict | None:
     """Fetch a specific task by ID, including project info."""
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         row = conn.execute(
             """
             SELECT t.*, p.name as project_name,
@@ -36,14 +35,11 @@ def fetch_task(task_id: int) -> dict | None:
             (task_id,),
         ).fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
 
 
 def fetch_next_todo(project_id: int) -> dict | None:
     """Find the highest-priority todo task for a project."""
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         rows = conn.execute(
             """
             SELECT t.*, p.name as project_name,
@@ -56,26 +52,23 @@ def fetch_next_todo(project_id: int) -> dict | None:
             (project_id,),
         ).fetchall()
 
-        if not rows:
-            return None
+    if not rows:
+        return None
 
-        # Sort by priority text mapping (critical > high > medium > low)
-        tasks = [dict(r) for r in rows]
-        tasks.sort(
-            key=lambda t: PRIORITY_ORDER.get(
-                str(t.get("priority", "low")).lower(), 0
-            ),
-            reverse=True,
-        )
-        return tasks[0]
-    finally:
-        conn.close()
+    # Sort by priority text mapping (critical > high > medium > low)
+    tasks = [dict(r) for r in rows]
+    tasks.sort(
+        key=lambda t: PRIORITY_ORDER.get(
+            str(t.get("priority", "low")).lower(), 0
+        ),
+        reverse=True,
+    )
+    return tasks[0]
 
 
 def fetch_project_context(project_id: int) -> dict:
     """Get recent project context: last session, open questions, recent decisions."""
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         context: dict = {}
 
         # Last session notes
@@ -116,27 +109,21 @@ def fetch_project_context(project_id: int) -> dict:
         context["recent_decisions"] = [dict(r) for r in rows]
 
         return context
-    finally:
-        conn.close()
 
 
 def _get_task_status(task_id: int) -> str | None:
     """Quick read of task status string from DB."""
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         return row["status"] if row else None
-    finally:
-        conn.close()
 
 
 def fetch_project_info(project_id: int) -> dict | None:
     """Get project name and codename from project_id."""
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         row = conn.execute(
             """
             SELECT id, name,
@@ -147,8 +134,6 @@ def fetch_project_info(project_id: int) -> dict | None:
             (project_id,),
         ).fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
 
 
 def fetch_tasks_by_ids(task_ids: list[int]) -> list[dict]:
@@ -160,8 +145,7 @@ def fetch_tasks_by_ids(task_ids: list[int]) -> list[dict]:
     if not task_ids:
         return []
 
-    conn = get_db_connection()
-    try:
+    with db_conn() as conn:
         placeholders = ", ".join("?" for _ in task_ids)
         rows = conn.execute(
             f"""
@@ -177,8 +161,6 @@ def fetch_tasks_by_ids(task_ids: list[int]) -> list[dict]:
         # Build a dict keyed by ID for ordering
         by_id = {row["id"]: dict(row) for row in rows}
         return [by_id[tid] for tid in task_ids if tid in by_id]
-    finally:
-        conn.close()
 
 
 def get_task_complexity(task: dict | None) -> str:
@@ -255,13 +237,11 @@ def resolve_project_dir(task: dict) -> str | None:
     project_id = task.get("project_id")
     if project_id and THEFORGE_DB:
         try:
-            conn = sqlite3.connect(str(THEFORGE_DB))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT local_path FROM projects WHERE id = ? AND local_path IS NOT NULL",
-                (project_id,)
-            ).fetchone()
-            conn.close()
+            with db_conn() as conn:
+                row = conn.execute(
+                    "SELECT local_path FROM projects WHERE id = ? AND local_path IS NOT NULL",
+                    (project_id,)
+                ).fetchone()
             if row and row["local_path"]:
                 db_path = row["local_path"].rstrip("/").rstrip("\\")
                 # Translate Windows paths to Samba mount
