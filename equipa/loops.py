@@ -25,6 +25,7 @@ from equipa.checkpoints import (
     load_soft_checkpoint,
     save_checkpoint,
 )
+from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.hooks import fire_async as fire_hook
 from equipa.constants import (
     COST_ESTIMATE_PER_TURN,
@@ -93,8 +94,6 @@ def run_quality_scoring(
     Gated by the quality_scoring feature flag. Never crashes the
     orchestrator — all errors are logged and swallowed.
     """
-    from equipa.dispatch import is_feature_enabled
-
     try:
         from rubric_quality_scorer import score_and_store as quality_score_and_store
     except ImportError:
@@ -143,8 +142,6 @@ async def run_security_review(
     Uses the security-reviewer role with ClaudeStick tools.
     Only runs if security_review is enabled in dispatch config.
     """
-    from equipa.dispatch import load_dispatch_config
-
     log(f"\n{'=' * 50}", output)
     log(f"  SECURITY REVIEW", output)
     log(f"{'=' * 50}", output)
