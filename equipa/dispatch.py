@@ -18,9 +18,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from equipa.config import (
     DEFAULT_DISPATCH_CONFIG,
@@ -583,6 +586,13 @@ async def run_project_dispatch(
                 project_summary, config, args, output=output,
             )
         except Exception as e:
+            # TELEMETRY safety net: run_project_tasks transitively invokes
+            # AI APIs, subprocess, git, and DB calls — any of which can raise
+            # unbounded exception types. Keep broad but log with traceback so
+            # failures aren't silently swallowed.
+            logger.exception(
+                "[Dispatch] project '%s' raised during run_project_tasks", codename
+            )
             log(f"[{codename}] EXCEPTION: {e}", output)
             result = {
                 "project_id": project_summary["project_id"],
@@ -772,6 +782,13 @@ async def run_single_goal(
                 goal_args, output=output,
             )
         except Exception as e:
+            # TELEMETRY safety net: run_manager_loop invokes AI APIs, subprocess,
+            # git, and DB calls. Keep broad — narrowing risks dropping a real
+            # failure path — but log with traceback for diagnostics.
+            logger.exception(
+                "[Goal %d] '%s' raised during run_manager_loop",
+                index + 1, project_name,
+            )
             log(f"\n[Goal {index + 1}] EXCEPTION: {e}", output)
             return {
                 "index": index,
