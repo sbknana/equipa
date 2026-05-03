@@ -148,7 +148,8 @@ async def test_run_dev_test_loop_completes_without_name_error(monkeypatch):
     monkeypatch.setattr(loops, "get_role_model", lambda *a, **kw: "test-model")
     monkeypatch.setattr(loops, "get_role_turns", lambda *a, **kw: 10)
     monkeypatch.setattr(
-        loops, "calculate_dynamic_budget", lambda max_turns: (max_turns, max_turns)
+        loops, "calculate_dynamic_budget",
+        lambda max_turns, effort=None: (max_turns, max_turns)
     )
     monkeypatch.setattr(loops, "load_checkpoint", lambda *a, **kw: ("", 0))
     monkeypatch.setattr(loops, "fire_hook", _async_none)
