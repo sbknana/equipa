@@ -513,57 +513,19 @@ def _build_paralysis_injection(paralysis_retries: int, reduced_kill: int) -> str
     paralysis_retries is the count of prior paralysis kills on this task.
     Returns the full markdown injection that will be prepended to the next
     developer dispatch via compaction_history.
+
+    The escalating prompt copy lives in prompts/_paralysis_attempt_*.md so it
+    can be tuned and A/B-tested without engine code changes (S4 refactor).
     """
-    if paralysis_retries == 0:
-        return (
-            "## CRITICAL: Previous Agent KILLED for Analysis "
-            "Paralysis\n\n"
-            "The previous agent was TERMINATED after spending ALL "
-            "its turns reading code without writing a single line. "
-            "You are the replacement. If you repeat this mistake, "
-            "you will ALSO be terminated and the task will be "
-            "marked as FAILED.\n\n"
-            "### MANDATORY PROTOCOL — NO EXCEPTIONS\n\n"
-            "1. **Your FIRST tool call MUST be Edit or Write.** "
-            "Not Read. Not Grep. Not Glob. EDIT or WRITE.\n"
-            "2. **Do NOT read any files first.** The task "
-            "description contains everything you need for a "
-            "first draft.\n"
-            "3. **Write a minimal skeleton/stub immediately.** "
-            "Wrong code you can fix is infinitely better than no "
-            "code at all.\n"
-            "4. **After your first edit, commit it.** Then read "
-            "ONE file if needed and make your next edit.\n\n"
-            f"**Kill threshold: {reduced_kill} turns.** If your "
-            f"first tool call is Read, you are already failing."
-        )
-    if paralysis_retries == 1:
-        return (
-            "## FINAL CHANCE: 2 Agents Already KILLED\n\n"
-            "**TWO agents have been terminated on this task for "
-            "analysis paralysis.** You are the LAST attempt before "
-            "this task is marked FAILED.\n\n"
-            "### ZERO-READ PROTOCOL\n\n"
-            "- **Do NOT read ANY files.** Period.\n"
-            "- Your FIRST action: Write a stub/skeleton file based "
-            "ONLY on the task description.\n"
-            "- Your SECOND action: `git add && git commit`.\n"
-            "- Your THIRD action: Read ONE file, make ONE edit, "
-            "commit.\n"
-            "- Repeat: read-edit-commit in tight loops.\n\n"
-            f"**Kill threshold: {reduced_kill} turns without file "
-            f"changes.** You have almost NO reading budget. Write "
-            f"FIRST."
-        )
-    return (
-        f"## EMERGENCY: {paralysis_retries + 1} Agents KILLED "
-        f"on This Task\n\n"
-        f"**{paralysis_retries} previous agents ALL failed by "
-        f"reading instead of writing.** Kill threshold: "
-        f"{reduced_kill} turns. Your very first tool call MUST "
-        f"create or edit a file. Do NOT read anything. Write a "
-        f"skeleton based on the task title alone, commit it, "
-        f"then iterate. This is your only chance."
+    from equipa.prompts import load_paralysis_template
+
+    template = load_paralysis_template(paralysis_retries)
+    if paralysis_retries == 0 or paralysis_retries == 1:
+        return template.substitute(reduced_kill=reduced_kill)
+    return template.substitute(
+        reduced_kill=reduced_kill,
+        paralysis_retries=paralysis_retries,
+        agent_count=paralysis_retries + 1,
     )
 
 

@@ -18,6 +18,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import re
+import string
 import sys
 from typing import Any
 
@@ -148,6 +149,32 @@ class PromptResult:
         raise AttributeError(
             f"'{type(self).__name__}' object has no attribute '{name}'"
         )
+
+
+def load_paralysis_template(retry_num: int) -> string.Template:
+    """Load the escalating paralysis-retry prompt template.
+
+    retry_num is the count of prior paralysis kills on this task.
+    - retry_num == 0 -> prompts/_paralysis_attempt_1.md (first retry)
+    - retry_num == 1 -> prompts/_paralysis_attempt_2.md (second retry)
+    - retry_num >= 2 -> prompts/_paralysis_attempt_3.md (escalating)
+
+    Returns a string.Template instance ready for substitute(). The trailing
+    newline (if any) is stripped so output matches the prior inline strings
+    byte-for-byte.
+
+    Available substitution variables (caller must provide all referenced):
+    - $reduced_kill (all attempts)
+    - $paralysis_retries, $agent_count (attempt 3+ only)
+    """
+    if retry_num <= 0:
+        path = PROMPTS_DIR / "_paralysis_attempt_1.md"
+    elif retry_num == 1:
+        path = PROMPTS_DIR / "_paralysis_attempt_2.md"
+    else:
+        path = PROMPTS_DIR / "_paralysis_attempt_3.md"
+    text = path.read_text(encoding="utf-8").rstrip("\n")
+    return string.Template(text)
 
 
 def load_standing_orders(role: str) -> str:

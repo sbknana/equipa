@@ -1,9 +1,12 @@
 {
   "version": 1,
-  "generated_at": "2026-05-03T03:50:32Z",
+  "generated_at": "2026-05-03T04:29:12Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
     "prompts/_common.md": "df45eaaace2932a2a5daf84b430e3af7e9d5f81a46d829b4c584c0bde5e98174",
+    "prompts/_paralysis_attempt_1.md": "b80458d620337231f8bb6ef42a48ad0d37e8277dc63a4fa8594b46346d1a42de",
+    "prompts/_paralysis_attempt_2.md": "79aff6947153d87ec2a454826822fbc950a99fda95f7e1c3b4e5aa784099bb4a",
+    "prompts/_paralysis_attempt_3.md": "d407098d0c2bafe2105c66cd7a5c0ebdb711b83495336e4729dae7616adc74ea",
     "prompts/code-reviewer.md": "e81e43c8968c94becdbec3f83e403a8b301e7ca1640658ec569295f705208a2c",
     "prompts/debugger.md": "6e71bb6f1159ceff15da64e1046ddf0adb4ccecbc6905c062b28b0a41df7ad51",
     "prompts/developer.md": "9bce0d1aecfe0b187c69cca48fe5a392152a78ec52004e34e03ddae175aaf152",
