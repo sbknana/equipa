@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 7
+CURRENT_VERSION = 8
 
 
 # ============================================================
@@ -572,6 +572,91 @@ def migrate_v6_to_v7(conn):
     """)
 
 
+def migrate_v7_to_v8(conn):
+    """Add partial unique index on lessons_learned (v7.0 -> v8.0).
+
+    Adds:
+    - UNIQUE INDEX idx_lessons_sig_source_active on
+      lessons_learned(error_signature, source) WHERE active = 1
+
+    The index supports the INSERT ... ON CONFLICT(error_signature, source)
+    upsert path in equipa.loops._create_review_lessons, collapsing the prior
+    SELECT + UPDATE/INSERT round-trips into a single statement.
+
+    Scoping the index to active = 1 preserves the original dedup semantics
+    (only active rows are deduplicated; deactivated lessons can coexist with
+    a newer active one for the same signature+source).
+
+    Before creating the index, deactivates duplicate active rows by keeping
+    the most-recently-updated row in each (error_signature, source) group
+    and folding the duplicates' times_seen counts into the survivor.
+    """
+    # Skip if the lessons_learned table doesn't exist yet. The table is
+    # created lazily by the orchestrator on first run (see schema.sql /
+    # ensure_schema), and minimal test fixtures may upgrade through this
+    # version without it. The unique index is only meaningful once the
+    # table exists; ensure_schema() will recreate it via schema.sql.
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'lessons_learned'"
+    ).fetchone()
+    if not table_exists:
+        return
+
+    # Find duplicate (error_signature, source) groups among active rows.
+    # The legacy code's SELECT-then-INSERT had a benign race that could
+    # produce duplicates under concurrent writers; clean those up so the
+    # UNIQUE INDEX creation succeeds.
+    duplicate_groups = conn.execute(
+        """SELECT error_signature, source, COUNT(*) AS n
+           FROM lessons_learned
+           WHERE active = 1
+           GROUP BY error_signature, source
+           HAVING n > 1"""
+    ).fetchall()
+
+    for row in duplicate_groups:
+        sig = row["error_signature"] if hasattr(row, "keys") else row[0]
+        src = row["source"] if hasattr(row, "keys") else row[1]
+        rows = conn.execute(
+            """SELECT id, COALESCE(times_seen, 1) AS times_seen
+               FROM lessons_learned
+               WHERE active = 1
+                 AND error_signature IS ?
+                 AND source IS ?
+               ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, id DESC""",
+            (sig, src),
+        ).fetchall()
+        if len(rows) <= 1:
+            continue
+        keeper_id = rows[0]["id"] if hasattr(rows[0], "keys") else rows[0][0]
+        loser_total = sum(
+            (r["times_seen"] if hasattr(r, "keys") else r[1]) for r in rows[1:]
+        )
+        loser_ids = [
+            (r["id"] if hasattr(r, "keys") else r[0]) for r in rows[1:]
+        ]
+        # Fold duplicates' times_seen into the keeper, then deactivate them.
+        placeholders = ",".join("?" * len(loser_ids))
+        conn.execute(
+            "UPDATE lessons_learned "
+            "SET times_seen = COALESCE(times_seen, 1) + ?, "
+            "    updated_at = datetime('now') "
+            "WHERE id = ?",
+            (loser_total, keeper_id),
+        )
+        conn.execute(
+            f"UPDATE lessons_learned SET active = 0 WHERE id IN ({placeholders})",
+            loser_ids,
+        )
+    conn.commit()
+
+    conn.executescript("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lessons_sig_source_active
+            ON lessons_learned(error_signature, source) WHERE active = 1;
+    """)
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -581,6 +666,7 @@ MIGRATIONS = {
     5: ("Embedding columns + lesson graph (v4 -> v5)", migrate_v4_to_v5),
     6: ("Decision staleness tracking (v5 -> v6)", migrate_v5_to_v6),
     7: ("Decision type/status + resolution tracking (v6 -> v7)", migrate_v6_to_v7),
+    8: ("Partial unique index on lessons_learned (v7 -> v8)", migrate_v7_to_v8),
 }
 
 

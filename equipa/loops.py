@@ -410,38 +410,36 @@ def _create_review_lessons(
             continue
 
         sig = re.sub(r'[^\w\s]', '', safe_description.lower())[:200]
+        lesson_text = (
+            f"{lesson_prefix} {severity} issue: {safe_description}. "
+            f"Check for this pattern in future code and prevent it proactively."
+        )
+        if not validate_lesson_structure(lesson_text):
+            continue
+        lesson_text = sanitize_lesson_content(lesson_text)
 
-        # Deduplicate by (error_signature, source) so security and code reviews
-        # don't collide even if they happen to flag the same file:line with the
-        # same prose.
-        existing = conn.execute(
-            """SELECT id FROM lessons_learned
-               WHERE error_signature = ? AND source = ? AND active = 1""",
-            (sig, source),
+        # Single round-trip upsert. The partial UNIQUE INDEX
+        # idx_lessons_sig_source_active (active=1) deduplicates active rows by
+        # (error_signature, source); inactive rows are not in the index, so
+        # they don't collide with new active inserts.
+        # RETURNING times_seen lets us tell new rows (==1) from updates (>1).
+        row = conn.execute(
+            """INSERT INTO lessons_learned
+               (project_id, role, error_type, error_signature, lesson,
+                source, times_seen, active)
+               VALUES (?, 'developer', ?, ?, ?, ?, 1, 1)
+               ON CONFLICT(error_signature, source) WHERE active = 1
+               DO UPDATE SET
+                 times_seen = lessons_learned.times_seen + 1,
+                 updated_at = datetime('now')
+               RETURNING times_seen""",
+            (project_id, error_type, sig, lesson_text, source),
         ).fetchone()
 
-        if existing:
-            conn.execute(
-                """UPDATE lessons_learned
-                   SET times_seen = times_seen + 1, updated_at = datetime('now')
-                   WHERE id = ?""",
-                (existing["id"],),
-            )
-        else:
-            lesson_text = (
-                f"{lesson_prefix} {severity} issue: {safe_description}. "
-                f"Check for this pattern in future code and prevent it proactively."
-            )
-            if not validate_lesson_structure(lesson_text):
-                continue
-            lesson_text = sanitize_lesson_content(lesson_text)
-            conn.execute(
-                """INSERT INTO lessons_learned
-                   (project_id, role, error_type, error_signature, lesson, source, times_seen)
-                   VALUES (?, 'developer', ?, ?, ?, ?, 1)""",
-                (project_id, error_type, sig, lesson_text, source),
-            )
-            created += 1
+        if row is not None:
+            times_seen = row["times_seen"] if hasattr(row, "keys") else row[0]
+            if times_seen == 1:
+                created += 1
 
     conn.commit()
     conn.close()
