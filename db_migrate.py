@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 9
+CURRENT_VERSION = 10
 
 
 # ============================================================
@@ -729,6 +729,53 @@ def migrate_v8_to_v9(conn):
     conn.commit()
 
 
+def migrate_v9_to_v10(conn):
+    """Add Paperclip config-version tracking tables (v9 -> v10).
+
+    Adds two tables for snapshotting orchestrator configuration files
+    (per PLAN-1067.md A1):
+
+    * ``config_versions``       - one row per snapshot of the config tree.
+                                  ``content_sha`` is a SHA-256 over the
+                                  sorted (file_path, file_sha) pairs and is
+                                  used to dedup identical snapshots.
+    * ``config_version_files``  - the actual file blobs (plain text) for a
+                                  given version. ON DELETE CASCADE so that
+                                  removing a version cleans up its files.
+
+    The schema is idempotent (CREATE TABLE IF NOT EXISTS) so it is safe to
+    re-run after partial failure.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS config_versions (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER,
+            created_at TEXT,
+            source TEXT CHECK (source IN ('manual','auto-dispatch','auto-cli','auto-rollback')),
+            commit_message TEXT,
+            content_sha TEXT NOT NULL,
+            parent_version_id INTEGER,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_config_versions_project_created
+            ON config_versions(project_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS config_version_files (
+            id INTEGER PRIMARY KEY,
+            version_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            content_blob TEXT NOT NULL,
+            file_sha TEXT NOT NULL,
+            byte_size INTEGER,
+            FOREIGN KEY(version_id) REFERENCES config_versions(id) ON DELETE CASCADE,
+            UNIQUE(version_id, file_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cvf_version
+            ON config_version_files(version_id);
+    """)
+    conn.commit()
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -740,6 +787,7 @@ MIGRATIONS = {
     7: ("Decision type/status + resolution tracking (v6 -> v7)", migrate_v6_to_v7),
     8: ("Partial unique index on lessons_learned (v7 -> v8)", migrate_v7_to_v8),
     9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
+    10: ("Paperclip config version tables (v9 -> v10)", migrate_v9_to_v10),
 }
 
 

@@ -682,8 +682,43 @@ CREATE INDEX IF NOT EXISTS idx_flow_tasks_flow ON flow_tasks(flow_id);
 CREATE INDEX IF NOT EXISTS idx_flow_tasks_task ON flow_tasks(task_id);
 
 -- ============================================================
+-- PAPERCLIP CONFIG VERSIONS (v10)
+-- ============================================================
+-- Snapshot history of orchestrator configuration files. One config_versions
+-- row per snapshot; many config_version_files rows hang off it. content_sha
+-- is computed over sorted (file_path, file_sha) pairs and is used to dedup
+-- identical snapshots within a project.
+CREATE TABLE IF NOT EXISTS config_versions (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER,
+    created_at TEXT,
+    source TEXT CHECK (source IN ('manual','auto-dispatch','auto-cli','auto-rollback')),
+    commit_message TEXT,
+    content_sha TEXT NOT NULL,
+    parent_version_id INTEGER,
+    FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_config_versions_project_created
+    ON config_versions(project_id, created_at);
+
+-- Blobs for each file in a config snapshot. content_blob is plain text
+-- (configs are tiny). ON DELETE CASCADE removes file rows when their parent
+-- version is deleted.
+CREATE TABLE IF NOT EXISTS config_version_files (
+    id INTEGER PRIMARY KEY,
+    version_id INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    content_blob TEXT NOT NULL,
+    file_sha TEXT NOT NULL,
+    byte_size INTEGER,
+    FOREIGN KEY(version_id) REFERENCES config_versions(id) ON DELETE CASCADE,
+    UNIQUE(version_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_cvf_version ON config_version_files(version_id);
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v9. Migrations handle upgrades from older versions.
-PRAGMA user_version = 9;
+-- Marks fresh installs as v10. Migrations handle upgrades from older versions.
+PRAGMA user_version = 10;
 
