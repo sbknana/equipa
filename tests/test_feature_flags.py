@@ -90,10 +90,13 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "knowledge_graph": False,
         "autoresearch": True,
         "rlm_decompose": False,
+        "config_versioning": False,
+        "session_persistence": False,
+        "project_templates": False,
     }
 
     def test_contains_all_expected_flags(self):
-        """DEFAULT_FEATURE_FLAGS has exactly the 13 expected flags."""
+        """DEFAULT_FEATURE_FLAGS has exactly the expected flags."""
         self.assertEqual(set(DEFAULT_FEATURE_FLAGS.keys()),
                          set(self.EXPECTED_FLAGS.keys()))
 
