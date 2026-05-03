@@ -31,12 +31,14 @@ from equipa.checkpoints import (
 from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.hooks import fire_async as fire_hook
 from equipa.constants import (
+    CODE_REVIEW_SEVERITY_PATTERNS,
     COST_ESTIMATE_PER_TURN,
     COST_LIMITS,
     EARLY_TERM_EXEMPT_ROLES,
     MAX_CONTINUATIONS,
     MAX_DEV_TEST_CYCLES,
     NO_PROGRESS_LIMIT,
+    SECURITY_SEVERITY_PATTERNS,
 )
 from equipa.db import (
     _get_latest_agent_run_id,
@@ -208,11 +210,29 @@ async def run_security_review(
     return sec_result
 
 
-def _extract_security_findings(result_text: str) -> list[tuple[str, str]]:
-    """Extract individual CRITICAL and HIGH severity findings from security review output.
+def _extract_findings(
+    result_text: str,
+    severity_patterns: dict[str, tuple[str, ...]],
+    *,
+    case_sensitive: bool,
+) -> list[tuple[str, str]]:
+    """Extract reviewer findings from agent output.
 
-    Looks for lines containing severity markers and extracts the finding description.
-    Returns a list of (severity, description) tuples.
+    Scans `result_text` line-by-line for headers tagged with one of the
+    severity labels in `severity_patterns`. Each map entry pairs a severity
+    label with a tuple of suffix patterns (e.g. ``"CRITICAL:"``, ``"[CRITICAL]"``)
+    that distinguish a finding header from prose mentioning the word. The
+    first matching label on a line wins (insertion order of the dict).
+
+    `case_sensitive=False` is used for security review output (CRITICAL/HIGH)
+    because reviewers SHOUT severities; `case_sensitive=True` is used for
+    code review output (Critical/Important) to avoid false positives like
+    "critically important" matching the Important label.
+
+    Each finding is normalized: bullet prefixes (``-``, ``*``, ``•``) are
+    stripped, short single-line headers are merged with the next line so the
+    description is meaningful, and oversize descriptions are truncated to
+    500 chars.
     """
     findings: list[tuple[str, str]] = []
     if not result_text:
@@ -221,34 +241,40 @@ def _extract_security_findings(result_text: str) -> list[tuple[str, str]]:
     lines = result_text.split("\n")
     for i, line in enumerate(lines):
         line_stripped = line.strip()
-        line_upper = line_stripped.upper()
+        haystack = line_stripped if case_sensitive else line_stripped.upper()
 
-        # Match lines that contain severity ratings
-        severity = None
-        if "CRITICAL" in line_upper and any(
-            p in line_upper for p in ("CRITICAL:", "CRITICAL**", "[CRITICAL]", "CRITICAL —", "CRITICAL -")
-        ):
-            severity = "CRITICAL"
-        elif "HIGH" in line_upper and any(
-            p in line_upper for p in ("HIGH:", "HIGH**", "[HIGH]", "HIGH —", "HIGH -")
-        ):
-            severity = "HIGH"
+        severity: str | None = None
+        for label, patterns in severity_patterns.items():
+            needles = patterns if case_sensitive else tuple(p.upper() for p in patterns)
+            label_token = label if case_sensitive else label.upper()
+            if label_token in haystack and any(p in haystack for p in needles):
+                severity = label
+                break
 
-        if severity:
-            desc = line_stripped
-            for prefix in ("- ", "* ", "• "):
-                if desc.startswith(prefix):
-                    desc = desc[len(prefix):]
+        if severity is None:
+            continue
 
-            if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
-                desc = desc + " " + lines[i + 1].strip()
+        desc = line_stripped
+        for prefix in ("- ", "* ", "• "):
+            if desc.startswith(prefix):
+                desc = desc[len(prefix):]
 
-            if len(desc) > 500:
-                desc = desc[:497] + "..."
+        if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
+            desc = desc + " " + lines[i + 1].strip()
 
-            findings.append((severity, desc))
+        if len(desc) > 500:
+            desc = desc[:497] + "..."
+
+        findings.append((severity, desc))
 
     return findings
+
+
+def _extract_security_findings(result_text: str) -> list[tuple[str, str]]:
+    """Extract CRITICAL and HIGH findings from security-reviewer output."""
+    return _extract_findings(
+        result_text, SECURITY_SEVERITY_PATTERNS, case_sensitive=False,
+    )
 
 
 async def run_code_review(
@@ -337,45 +363,10 @@ async def run_code_review(
 
 
 def _extract_code_review_findings(result_text: str) -> list[tuple[str, str]]:
-    """Extract Critical and Important findings from code review output.
-
-    Code reviewer uses different severity labels (Critical / Important /
-    Suggestion) than security reviewer (CRITICAL / HIGH / MEDIUM / LOW / INFO).
-    This function matches the code-reviewer convention, keeping the two
-    extractors role-specific so severity semantics stay clean.
-    """
-    findings: list[tuple[str, str]] = []
-    if not result_text:
-        return findings
-
-    lines = result_text.split("\n")
-    for i, line in enumerate(lines):
-        line_stripped = line.strip()
-
-        # Match Critical / Important labels — case-sensitive on the prefix to
-        # avoid matching prose like "critically important". Patterns mirror
-        # _extract_security_findings but use code-reviewer vocab.
-        severity = None
-        if any(p in line_stripped for p in ("Critical:", "**Critical", "[Critical]", "Critical —", "Critical -")):
-            severity = "Critical"
-        elif any(p in line_stripped for p in ("Important:", "**Important", "[Important]", "Important —", "Important -")):
-            severity = "Important"
-
-        if severity:
-            desc = line_stripped
-            for prefix in ("- ", "* ", "• "):
-                if desc.startswith(prefix):
-                    desc = desc[len(prefix):]
-
-            if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
-                desc = desc + " " + lines[i + 1].strip()
-
-            if len(desc) > 500:
-                desc = desc[:497] + "..."
-
-            findings.append((severity, desc))
-
-    return findings
+    """Extract Critical and Important findings from code-reviewer output."""
+    return _extract_findings(
+        result_text, CODE_REVIEW_SEVERITY_PATTERNS, case_sensitive=True,
+    )
 
 
 def _create_review_lessons(

@@ -262,3 +262,23 @@ MANAGER_COST_LIMIT = 30.0
 # parse_task_ids(). Prevents memory exhaustion DoS from inputs like
 # "--tasks 1-999999999" (security finding EP-01).
 MAX_TASK_RANGE = 1000
+
+# --- Reviewer Finding Extraction ---
+# Severity tokens + the suffixes that distinguish a real finding header from
+# prose mentioning the word. Used by equipa.loops._extract_findings to scan
+# reviewer output for actionable items. Two severity vocabularies:
+#   - SECURITY: CRITICAL/HIGH (case-insensitive — security reviewers shout)
+#   - CODE_REVIEW: Critical/Important (case-sensitive — avoids "critically
+#     important" prose false-positives)
+# Each map: severity-label -> tuple of suffix patterns to look for after the
+# label. The match function checks that the label appears AND at least one
+# suffix follows it on the same line.
+SECURITY_SEVERITY_PATTERNS = {
+    "CRITICAL": ("CRITICAL:", "CRITICAL**", "[CRITICAL]", "CRITICAL —", "CRITICAL -"),
+    "HIGH": ("HIGH:", "HIGH**", "[HIGH]", "HIGH —", "HIGH -"),
+}
+
+CODE_REVIEW_SEVERITY_PATTERNS = {
+    "Critical": ("Critical:", "**Critical", "[Critical]", "Critical —", "Critical -"),
+    "Important": ("Important:", "**Important", "[Important]", "Important —", "Important -"),
+}
