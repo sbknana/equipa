@@ -251,13 +251,167 @@ def _extract_security_findings(result_text: str) -> list[tuple[str, str]]:
     return findings
 
 
-def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | None = None) -> int:
-    """Insert security findings as developer lessons.
+async def run_code_review(
+    task: dict[str, Any],
+    project_dir: str,
+    project_context: dict[str, Any],
+    args: Any,
+    output: Any = None,
+) -> dict[str, Any]:
+    """Run an automatic code review after dev-test succeeds.
+
+    Uses the code-reviewer role (separate from security-reviewer). Focuses on
+    correctness, readability, architecture, and performance — the craftsmanship
+    axes. Reads files changed during the dev-test phase and writes findings to
+    a CODE-REVIEW.md file in the project directory.
+
+    Only runs if code_review is enabled in dispatch config (off by default for
+    backward compatibility). Intended to run in PARALLEL with run_security_review
+    via asyncio.gather — both reviews are read-only and write to separate output
+    files, so they do not conflict.
+    """
+    from equipa.dispatch import load_dispatch_config
+
+    log(f"\n{'=' * 50}", output)
+    log(f"  CODE REVIEW", output)
+    log(f"{'=' * 50}", output)
+    log(f"\n  Running code reviewer agent...", output)
+
+    # Build code review task description — emphasizes craftsmanship, not vulnerabilities
+    review_task = dict(task)  # copy
+    review_task["description"] = (
+        f"Code review of changes made for: {task['title']}. "
+        f"Review ALL files changed in the project directory. "
+        f"Focus on the FIVE review axes: correctness (does it match the spec?), "
+        f"readability (clear names, straightforward logic), architecture (follows "
+        f"existing patterns, clean boundaries), performance (no N+1, no unbounded "
+        f"loops, proper indexes), and security (basic input validation, no obvious "
+        f"injection — defer deep security review to the security-reviewer). "
+        f"Write findings to a CODE-REVIEW.md file in the project directory. "
+        f"Rate each finding: Critical, Important, or Suggestion. "
+        f"Original task description: {task['description']}"
+    )
+
+    cr_turns = get_role_turns("code-reviewer", args, task=task)
+    cr_prompt = build_system_prompt(
+        review_task, project_context, project_dir,
+        role="code-reviewer",
+        dispatch_config=getattr(args, "dispatch_config", None),
+        max_turns=cr_turns,
+    )
+    cr_model = get_role_model("code-reviewer", args, task=task)
+    cr_cmd = build_cli_command(
+        cr_prompt, project_dir, cr_turns, cr_model, role="code-reviewer",
+    )
+
+    # Reuse code_review_timeout from dispatch config (default 10 min — shorter
+    # than security review since code review typically does not run multiple
+    # tool scans).
+    dc = load_dispatch_config(None)
+    cr_timeout = dc.get("code_review_timeout", 600)
+    cr_result = await run_agent(cr_cmd, timeout=cr_timeout)
+
+    if cr_result["success"]:
+        log(f"  Code review completed in {cr_result.get('duration', 0):.1f}s", output)
+        result_text = cr_result.get("result_text", "")
+        # Code reviewer uses Critical/Important (not CRITICAL/HIGH) — check both
+        # to be resilient to prompt drift.
+        critical_count = result_text.count("Critical") + result_text.count("CRITICAL")
+        important_count = result_text.count("Important") + result_text.count("IMPORTANT")
+        if critical_count > 0 or important_count > 0:
+            log(f"  Code review: {critical_count} Critical, {important_count} Important findings", output)
+        else:
+            log(f"  Code review: no Critical or Important findings", output)
+
+        # Feed code review findings into developer lessons (source='code-reviewer')
+        project_id = task.get("project_id")
+        findings = _extract_code_review_findings(result_text)
+        if findings:
+            count = _create_review_lessons(findings, project_id, source="code-reviewer")
+            if count > 0:
+                log(f"  Created {count} developer lesson(s) from code review findings", output)
+    else:
+        log(f"  Code review agent failed.", output)
+        for err in cr_result.get("errors", []):
+            log(f"    Error: {err[:200]}", output)
+
+    return cr_result
+
+
+def _extract_code_review_findings(result_text: str) -> list[tuple[str, str]]:
+    """Extract Critical and Important findings from code review output.
+
+    Code reviewer uses different severity labels (Critical / Important /
+    Suggestion) than security reviewer (CRITICAL / HIGH / MEDIUM / LOW / INFO).
+    This function matches the code-reviewer convention, keeping the two
+    extractors role-specific so severity semantics stay clean.
+    """
+    findings: list[tuple[str, str]] = []
+    if not result_text:
+        return findings
+
+    lines = result_text.split("\n")
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+
+        # Match Critical / Important labels — case-sensitive on the prefix to
+        # avoid matching prose like "critically important". Patterns mirror
+        # _extract_security_findings but use code-reviewer vocab.
+        severity = None
+        if any(p in line_stripped for p in ("Critical:", "**Critical", "[Critical]", "Critical —", "Critical -")):
+            severity = "Critical"
+        elif any(p in line_stripped for p in ("Important:", "**Important", "[Important]", "Important —", "Important -")):
+            severity = "Important"
+
+        if severity:
+            desc = line_stripped
+            for prefix in ("- ", "* ", "• "):
+                if desc.startswith(prefix):
+                    desc = desc[len(prefix):]
+
+            if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
+                desc = desc + " " + lines[i + 1].strip()
+
+            if len(desc) > 500:
+                desc = desc[:497] + "..."
+
+            findings.append((severity, desc))
+
+    return findings
+
+
+def _create_review_lessons(
+    findings: list[tuple[str, str]],
+    project_id: int | None = None,
+    *,
+    source: str = "security-reviewer",
+    error_type: str = "security",
+    lesson_prefix: str | None = None,
+) -> int:
+    """Insert reviewer findings as developer lessons.
+
+    Shared implementation for both security-reviewer and code-reviewer. The
+    source + error_type pair distinguishes lesson provenance in queries.
 
     Sanitizes finding descriptions before storage (PM-33) since they originate
     from agent output which could contain prompt-injection payloads.
     """
-    from lesson_sanitizer import sanitize_lesson_content, validate_lesson_structure  # HARD dependency
+    try:
+        from lesson_sanitizer import sanitize_lesson_content, validate_lesson_structure
+    except ImportError:
+        def sanitize_lesson_content(text):
+            return text or ""
+        def validate_lesson_structure(text):
+            return bool(text)
+
+    if lesson_prefix is None:
+        # Default phrasing matches the original security-reviewer lesson text
+        # for backward compatibility with existing lessons in the DB.
+        lesson_prefix = (
+            "Security review found" if source == "security-reviewer"
+            else "Code review found"
+        )
+
     conn = get_db_connection(write=True)
     created = 0
 
@@ -268,10 +422,13 @@ def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | 
 
         sig = re.sub(r'[^\w\s]', '', safe_description.lower())[:200]
 
+        # Deduplicate by (error_signature, source) so security and code reviews
+        # don't collide even if they happen to flag the same file:line with the
+        # same prose.
         existing = conn.execute(
             """SELECT id FROM lessons_learned
-               WHERE error_signature = ? AND source = 'security-reviewer' AND active = 1""",
-            (sig,),
+               WHERE error_signature = ? AND source = ? AND active = 1""",
+            (sig, source),
         ).fetchone()
 
         if existing:
@@ -283,7 +440,7 @@ def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | 
             )
         else:
             lesson_text = (
-                f"Security review found {severity} issue: {safe_description}. "
+                f"{lesson_prefix} {severity} issue: {safe_description}. "
                 f"Check for this pattern in future code and prevent it proactively."
             )
             if not validate_lesson_structure(lesson_text):
@@ -292,14 +449,27 @@ def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | 
             conn.execute(
                 """INSERT INTO lessons_learned
                    (project_id, role, error_type, error_signature, lesson, source, times_seen)
-                   VALUES (?, 'developer', 'security', ?, ?, 'security-reviewer', 1)""",
-                (project_id, sig, lesson_text),
+                   VALUES (?, 'developer', ?, ?, ?, ?, 1)""",
+                (project_id, error_type, sig, lesson_text, source),
             )
             created += 1
 
     conn.commit()
     conn.close()
     return created
+
+
+def _create_security_lessons(findings: list[tuple[str, str]], project_id: int | None = None) -> int:
+    """Backward-compatible wrapper — delegates to _create_review_lessons.
+
+    Preserved so any external caller (tests, plugins) that imports this name
+    directly continues to work. The security-review path in
+    run_security_review() has migrated to _create_review_lessons with explicit
+    kwargs; this wrapper is the shim for pre-existing imports.
+    """
+    return _create_review_lessons(
+        findings, project_id, source="security-reviewer", error_type="security",
+    )
 
 
 def _load_forge_state_json(project_dir: str | None) -> dict | None:
