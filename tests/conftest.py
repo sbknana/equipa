@@ -24,7 +24,7 @@ def _ensure_full_schema():
     CREATE VIEW to CREATE VIEW IF NOT EXISTS so this is idempotent.
     CREATE INDEX already uses IF NOT EXISTS in the schema file.
     """
-    from forge_orchestrator import THEFORGE_DB
+    from equipa.constants import THEFORGE_DB
 
     schema_path = REPO_ROOT / "schema.sql"
     if not schema_path.exists():
@@ -81,11 +81,11 @@ def _ensure_full_schema():
 
 def pytest_configure(config):
     """Ensure database schema exists before any tests collect."""
-    import forge_orchestrator
+    from equipa import db as equipa_db
 
     # Reset ensure_schema cache so it re-runs for test DB
-    forge_orchestrator._SCHEMA_ENSURED = False
-    forge_orchestrator.ensure_schema()
+    equipa_db._SCHEMA_ENSURED = False
+    equipa_db.ensure_schema()
 
     # Apply the full schema.sql for tables not covered by ensure_schema()
     _ensure_full_schema()
