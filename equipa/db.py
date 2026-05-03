@@ -250,21 +250,19 @@ def record_agent_run(
                 error_type = "agent_error"
         files_changed = result.get("files_changed_count", 0) if isinstance(result, dict) else 0
 
-        conn = get_db_connection(write=True)
-        conn.execute(
-            """INSERT INTO agent_runs
-               (task_id, project_id, role, model, complexity, num_turns,
-                max_turns_allowed, duration_seconds, cost_usd, outcome,
-                success, cycle_number, continuation_count, files_changed_count,
-                error_type, error_summary, turns_allocated, prompt_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (task_id, project_id, role, model, complexity, num_turns,
-             max_turns, duration, cost, outcome,
-             success, cycle_number, continuation_count, files_changed,
-             error_type, error_summary, turns_allocated, prompt_version),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """INSERT INTO agent_runs
+                   (task_id, project_id, role, model, complexity, num_turns,
+                    max_turns_allowed, duration_seconds, cost_usd, outcome,
+                    success, cycle_number, continuation_count, files_changed_count,
+                    error_type, error_summary, turns_allocated, prompt_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, project_id, role, model, complexity, num_turns,
+                 max_turns, duration, cost, outcome,
+                 success, cycle_number, continuation_count, files_changed,
+                 error_type, error_summary, turns_allocated, prompt_version),
+            )
         budget_info = f", allocated={turns_allocated}" if turns_allocated else ""
         version_info = f", prompt={prompt_version}" if prompt_version != "baseline" else ""
         log(f"  [Telemetry] Recorded agent run: role={role}, outcome={outcome}, "
@@ -282,12 +280,11 @@ def _get_latest_agent_run_id(task_id: int) -> int | None:
     Returns the ID or None if not found. Never raises.
     """
     try:
-        conn = get_db_connection()
-        row = conn.execute(
-            "SELECT id FROM agent_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        conn.close()
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM agent_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
         return row["id"] if row else None
     except sqlite3.Error:
         logger.exception("[Telemetry] Failed to look up latest agent run id")
@@ -340,19 +337,17 @@ def log_agent_action(
     Never crashes the orchestrator — all errors are logged and swallowed.
     """
     try:
-        conn = get_db_connection(write=True)
-        conn.execute(
-            """INSERT INTO agent_actions
-               (task_id, run_id, cycle_number, role, turn_number, tool_name,
-                tool_input_preview, input_hash, output_length, success,
-                error_type, error_summary, duration_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (task_id, run_id, cycle, role, turn, tool_name,
-             tool_input_preview, input_hash, output_length,
-             1 if success else 0, error_type, error_summary, duration_ms),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """INSERT INTO agent_actions
+                   (task_id, run_id, cycle_number, role, turn_number, tool_name,
+                    tool_input_preview, input_hash, output_length, success,
+                    error_type, error_summary, duration_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, run_id, cycle, role, turn, tool_name,
+                 tool_input_preview, input_hash, output_length,
+                 1 if success else 0, error_type, error_summary, duration_ms),
+            )
     except Exception:
         # Telemetry must NEVER crash the orchestrator (broad except is intentional
         # here). Previously this was a silent `pass` — now ops can grep
@@ -376,24 +371,22 @@ def bulk_log_agent_actions(
         return
     try:
         ensure_schema()
-        conn = get_db_connection(write=True)
-        conn.executemany(
-            """INSERT INTO agent_actions
-               (task_id, run_id, cycle_number, role, turn_number, tool_name,
-                tool_input_preview, input_hash, output_length, success,
-                error_type, error_summary, duration_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (task_id, run_id, cycle, role, a["turn"], a["tool"],
-                 a.get("input_preview"), a.get("input_hash"),
-                 a.get("output_length"), 1 if a.get("success", True) else 0,
-                 a.get("error_type"), a.get("error_summary"),
-                 a.get("duration_ms"))
-                for a in action_log
-            ],
-        )
-        conn.commit()
-        conn.close()
+        with db_conn(write=True) as conn:
+            conn.executemany(
+                """INSERT INTO agent_actions
+                   (task_id, run_id, cycle_number, role, turn_number, tool_name,
+                    tool_input_preview, input_hash, output_length, success,
+                    error_type, error_summary, duration_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (task_id, run_id, cycle, role, a["turn"], a["tool"],
+                     a.get("input_preview"), a.get("input_hash"),
+                     a.get("output_length"), 1 if a.get("success", True) else 0,
+                     a.get("error_type"), a.get("error_summary"),
+                     a.get("duration_ms"))
+                    for a in action_log
+                ],
+            )
     except Exception:
         # Telemetry must NEVER crash the orchestrator.
         logger.exception("[Telemetry] Failed to bulk insert agent actions")
@@ -420,26 +413,23 @@ def update_task_status(
     success_outcomes = ("tests_passed", "no_tests", "early_completed_no_changes")
     new_status = "done" if outcome in success_outcomes else "blocked"
 
-    conn = get_db_connection(write=True)
     try:
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
-            log(f"  [DB] Task {task_id} not found — skipping status update.", output)
-            return
-        current = row["status"]
+        with db_conn(write=True) as conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not row:
+                log(f"  [DB] Task {task_id} not found — skipping status update.", output)
+                return
+            current = row["status"]
 
-        conn.execute(
-            "UPDATE tasks SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?",
-            (new_status, new_status, task_id),
-        )
-        conn.commit()
+            conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?",
+                (new_status, new_status, task_id),
+            )
         log(f"  [DB] Task {task_id}: {current} -> {new_status} (outcome: {outcome})", output)
     except sqlite3.Error as e:
         # Real logic path (not telemetry) — narrow to sqlite errors only so
         # programmer bugs (KeyError, AttributeError) still surface as crashes.
         log(f"  [DB] ERROR updating task {task_id}: {e}", output)
         logger.exception("[DB] Failed to update task %s status", task_id)
-    finally:
-        conn.close()
