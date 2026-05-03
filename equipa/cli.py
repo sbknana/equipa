@@ -333,20 +333,27 @@ async def async_main() -> None:
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
 
-    # --- API key availability check ---
-    # Warn early if ANTHROPIC_API_KEY is missing. This is the #1 cause of
-    # 401 errors when running via nohup/background processes that don't
-    # source ~/.bashrc. The .env loader in forge_orchestrator.py handles
-    # automatic loading, but if both are missing we warn here.
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        provider = (args.dispatch_config or {}).get("provider", "claude")
-        if provider != "ollama" and args.provider != "ollama":
+    # --- Auth availability check (Max subscription OR API key) ---
+    # Warn only when neither auth source is present. The Claude CLI accepts
+    # either an ANTHROPIC_API_KEY env var OR a Max subscription credential
+    # file at ~/.claude/.credentials.json. The previous version warned on
+    # missing API key alone, which produced misleading warnings for users
+    # running on a Max subscription.
+    provider = (args.dispatch_config or {}).get("provider", "claude")
+    if provider != "ollama" and args.provider != "ollama":
+        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        max_creds_path = Path.home() / ".claude" / ".credentials.json"
+        has_max_creds = max_creds_path.is_file()
+        if not has_api_key and not has_max_creds:
             print(
-                "WARNING: ANTHROPIC_API_KEY is not set in the environment.\n"
+                "WARNING: No Claude credentials found.\n"
+                "  Neither ANTHROPIC_API_KEY is set nor ~/.claude/.credentials.json exists.\n"
                 "  Background/nohup processes do not source ~/.bashrc.\n"
-                "  Fix: create a .env file in the EQUIPA project root with:\n"
-                "    ANTHROPIC_API_KEY=sk-ant-...\n"
-                "  Or export it in /etc/environment for system-wide access."
+                "  Fix one of:\n"
+                "    - Sign in with `claude login` to use a Max subscription, OR\n"
+                "    - Create a .env file in the EQUIPA project root with:\n"
+                "        ANTHROPIC_API_KEY=sk-ant-...\n"
+                "    - Or export it in /etc/environment for system-wide access."
             )
 
     # --- MCP server mode ---
