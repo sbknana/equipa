@@ -9,6 +9,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +20,74 @@ from equipa.constants import (
     THEFORGE_DB,
 )
 from equipa.db import db_conn
+
+# Ordered weakest -> strongest so we can compare/escalate complexities.
+_COMPLEXITY_RANK = {"simple": 0, "medium": 1, "complex": 2, "epic": 3}
+_RANK_TO_COMPLEXITY = {v: k for k, v in _COMPLEXITY_RANK.items()}
+
+# Patterns that indicate scope by site/file/call-site count.
+# Each captures one or more digit groups; the largest match wins.
+_SITE_COUNT_PATTERNS = (
+    re.compile(
+        r"\b(\d+)\s+(?:sites?|places?|files?|pairs?|call\s?sites?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bacross\s+(\d+)\s+files?\b", re.IGNORECASE),
+    re.compile(
+        r"\b(\d+)\+\s+(?:git\s+)?(?:calls?|call\s?sites?)\b",
+        re.IGNORECASE,
+    ),
+)
+
+# Wave-prefix nomenclature: P1..P5, M1..M9, D1..D9 followed by space.
+_WAVE_PREFIX_RE = re.compile(r"^(?:P[1-5]|M[1-9]|D[1-9])\s")
+
+
+def _max_site_count(description: str) -> int:
+    """Return the largest digit-prefixed scope count found in the description."""
+    if not description:
+        return 0
+    best = 0
+    for pattern in _SITE_COUNT_PATTERNS:
+        for match in pattern.finditer(description):
+            try:
+                value = int(match.group(1))
+            except (ValueError, IndexError):
+                continue
+            if value > best:
+                best = value
+    return best
+
+
+def _site_count_floor(site_count: int) -> str | None:
+    """Map an effective site count to a minimum complexity label.
+
+    Returns None when the count is too small (<= 3) to justify escalation.
+    """
+    if site_count >= 51:
+        return "epic"
+    if site_count >= 16:
+        return "complex"
+    if site_count >= 4:
+        return "medium"
+    return None
+
+
+def _escalate(current: str, floor: str | None) -> str:
+    """Return the higher-ranked of `current` and `floor`."""
+    if floor is None:
+        return current
+    return _RANK_TO_COMPLEXITY[max(_COMPLEXITY_RANK[current], _COMPLEXITY_RANK[floor])]
+
+
+def _classify_by_length(desc_len: int) -> str:
+    if desc_len < 100:
+        return "simple"
+    if desc_len < 400:
+        return "medium"
+    if desc_len < 800:
+        return "complex"
+    return "epic"
 
 
 def fetch_task(task_id: int) -> dict | None:
@@ -166,27 +235,38 @@ def fetch_tasks_by_ids(task_ids: list[int]) -> list[dict]:
 def get_task_complexity(task: dict | None) -> str:
     """Resolve task complexity.
 
-    Checks the task's 'complexity' field first (set in DB), then infers from
-    description length as a fallback.
+    Resolution order:
+      1. Start from the explicit DB `complexity` field if present, else from a
+         description-length heuristic.
+      2. Escalate based on a SITE-COUNT scan of the description (digit-prefixed
+         scope hints like "78 files", "across 11 files", "15+ git calls").
+      3. Apply a Wave-prefix override: titles like "P1 ", "M3 ", "D2 " (Wave 3
+         nomenclature) require a minimum complexity of "medium".
 
-    Returns one of: 'simple', 'medium', 'complex', 'epic'
+    Returns one of: 'simple', 'medium', 'complex', 'epic'.
     """
-    # Explicit complexity in the task record
-    explicit = ((task or {}).get("complexity") or "").strip().lower()
-    if explicit in COMPLEXITY_MULTIPLIERS:
-        return explicit
+    task = task or {}
+    description = task.get("description") or ""
+    title = (task.get("title") or "").strip()
 
-    # Infer from description length
-    desc = (task or {}).get("description", "") or ""
-    desc_len = len(desc)
-    if desc_len < 100:
-        return "simple"
-    elif desc_len < 400:
-        return "medium"
-    elif desc_len < 800:
-        return "complex"
+    explicit = (task.get("complexity") or "").strip().lower()
+    if explicit in COMPLEXITY_MULTIPLIERS:
+        complexity = explicit
     else:
-        return "epic"
+        complexity = _classify_by_length(len(description))
+
+    # Escalate based on observed scope count in the description. Applied
+    # whether or not an explicit value is present — a "simple" record with
+    # 78 sites in its description is not actually simple.
+    site_count = _max_site_count(description)
+    complexity = _escalate(complexity, _site_count_floor(site_count))
+
+    # Wave-prefix override: precision-described refactor tasks must not run
+    # under the "simple" 0.5x turn multiplier.
+    if _WAVE_PREFIX_RE.match(title):
+        complexity = _escalate(complexity, "medium")
+
+    return complexity
 
 
 def verify_task_updated(task_id: int) -> tuple[bool, str]:
