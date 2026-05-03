@@ -24,6 +24,69 @@ if TYPE_CHECKING:
     from equipa.prompts import PromptResult
 
 
+# Module-level cache of recent tool calls per (task_id, role). Populated by
+# the streaming loop via :func:`_record_tool_call`; read by
+# :func:`get_recent_tool_calls` from ``equipa.sessions`` at cycle-boundary
+# capture time. The buffer storage inside the loop (``tool_history``) is
+# unchanged — this is a tiny parallel mirror so the orchestrator-cycle
+# session capture can read recent activity without reaching into a frame
+# local. PLAN-1067 §2.B2.
+_RECENT_TOOL_CALLS: dict[tuple[int, str], list[dict[str, Any]]] = {}
+_RECENT_TOOL_CALLS_MAX: int = 50
+
+
+def _record_tool_call(
+    task_id: int,
+    role: str,
+    tool: str,
+    *,
+    turn: int,
+    ok: bool,
+    args_hash: str = "",
+) -> None:
+    """Append a tool-call record to the per-(task, role) ring buffer.
+
+    Caps the buffer at :data:`_RECENT_TOOL_CALLS_MAX` to keep memory bounded
+    for long-running agents. Failure to record is non-fatal.
+    """
+    try:
+        key = (int(task_id), str(role))
+    except (TypeError, ValueError):
+        return
+    buf = _RECENT_TOOL_CALLS.setdefault(key, [])
+    buf.append({
+        "tool": tool,
+        "args_hash": args_hash,
+        "ok": bool(ok),
+        "turn": int(turn),
+    })
+    if len(buf) > _RECENT_TOOL_CALLS_MAX:
+        del buf[: len(buf) - _RECENT_TOOL_CALLS_MAX]
+
+
+def get_recent_tool_calls(
+    task_id: int,
+    role: str,
+    n: int = 20,
+) -> list[dict[str, Any]]:
+    """Return up to the last ``n`` tool calls recorded for ``(task_id, role)``.
+
+    Returns the list in chronological order (oldest first). Returns an empty
+    list if nothing has been recorded for this pair — callers must treat the
+    buffer as best-effort. This is the ONE accessor exposed by
+    ``agent_runner`` for orchestrator-cycle session capture (PLAN-1067 §2.B2);
+    the underlying ``tool_history`` remains a frame-local list inside the
+    streaming loop.
+    """
+    if n <= 0:
+        return []
+    key = (int(task_id), str(role))
+    buf = _RECENT_TOOL_CALLS.get(key)
+    if not buf:
+        return []
+    return list(buf[-n:])
+
+
 class _AgentResultRequired(TypedDict):
     """Always-present keys in an AgentResult.
 
