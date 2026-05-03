@@ -294,3 +294,29 @@ CODE_REVIEW_SEVERITY_PATTERNS = {
     "Critical": ("Critical:", "**Critical", "[Critical]", "Critical —", "Critical -"),
     "Important": ("Important:", "**Important", "[Important]", "Important —", "Important -"),
 }
+
+# --- Prompt Budget Limits ---
+# Caps on chars / words for slices injected into agent prompts. Centralised
+# here so prompt budget is tunable in one place rather than scattered through
+# loops.py / dispatch.py as bare literals.
+
+# Tester context: cap for the per-cycle git diff appended to tester prompts.
+# Diffs larger than this are truncated with a "[...chars omitted...]" footer.
+TESTER_GIT_DIFF_MAX_CHARS = 8000
+
+# Cross-attempt reflections: cap for the PREVIOUS ATTEMPTS block appended to a
+# task description before re-dispatch. ~500 tokens ≈ ~2000 chars.
+ATTEMPT_REFLECTIONS_MAX_CHARS = 2000
+
+# Compaction consolidation: cap (in words) for cycle 2+ "Previous Attempts"
+# block injected into the developer's extra_context.
+COMPACTION_CONSOLIDATION_MAX_WORDS = 400
+
+# Per-attempt summary sections: cap for FILES_CHANGED / BLOCKERS / REFLECTION
+# snippets quoted in the cross-attempt reflection blob.
+ATTEMPT_SECTION_TRIM_CHARS = 200
+
+# Extracted security / code-review findings: cap for the description text
+# stored as a developer lesson. Longer descriptions are truncated with an
+# ellipsis (the truncation reserves 3 chars for "...").
+FINDING_DESCRIPTION_MAX_CHARS = 500

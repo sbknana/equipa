@@ -33,13 +33,16 @@ from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.hooks import fire_async as fire_hook
 from equipa.constants import (
     CODE_REVIEW_SEVERITY_PATTERNS,
+    COMPACTION_CONSOLIDATION_MAX_WORDS,
     COST_ESTIMATE_PER_TURN,
     COST_LIMITS,
     EARLY_TERM_EXEMPT_ROLES,
+    FINDING_DESCRIPTION_MAX_CHARS,
     MAX_CONTINUATIONS,
     MAX_DEV_TEST_CYCLES,
     NO_PROGRESS_LIMIT,
     SECURITY_SEVERITY_PATTERNS,
+    TESTER_GIT_DIFF_MAX_CHARS,
 )
 from equipa.db import (
     _get_latest_agent_run_id,
@@ -233,7 +236,7 @@ def _extract_findings(
     Each finding is normalized: bullet prefixes (``-``, ``*``, ``•``) are
     stripped, short single-line headers are merged with the next line so the
     description is meaningful, and oversize descriptions are truncated to
-    500 chars.
+    ``FINDING_DESCRIPTION_MAX_CHARS``.
     """
     findings: list[tuple[str, str]] = []
     if not result_text:
@@ -263,8 +266,8 @@ def _extract_findings(
         if len(desc) < 40 and i + 1 < len(lines) and lines[i + 1].strip():
             desc = desc + " " + lines[i + 1].strip()
 
-        if len(desc) > 500:
-            desc = desc[:497] + "..."
+        if len(desc) > FINDING_DESCRIPTION_MAX_CHARS:
+            desc = desc[: FINDING_DESCRIPTION_MAX_CHARS - 3] + "..."
 
         findings.append((severity, desc))
 
@@ -590,7 +593,8 @@ def _build_dev_extra_context(
     Behavior preserved exactly from the inline implementation:
       - Paralysis warnings are NEVER truncated; they always go first.
       - With anti_compaction_state enabled, regular entries from cycle >= 2
-        are consolidated under a header and truncated to 400 words.
+        are consolidated under a header and truncated to
+        ``COMPACTION_CONSOLIDATION_MAX_WORDS`` words.
       - Without anti_compaction_state, only paralysis warnings are included.
       - Inter-agent messages (when present) are prepended to the final blob.
     """
@@ -605,8 +609,11 @@ def _build_dev_extra_context(
                 + "\n\n".join(regular_entries)
             )
             words = consolidated.split()
-            if len(words) > 400:
-                consolidated = " ".join(words[:400]) + "\n[...earlier context trimmed...]"
+            if len(words) > COMPACTION_CONSOLIDATION_MAX_WORDS:
+                consolidated = (
+                    " ".join(words[:COMPACTION_CONSOLIDATION_MAX_WORDS])
+                    + "\n[...earlier context trimmed...]"
+                )
             extra_context = consolidated
         else:
             extra_context = "\n\n".join(regular_entries)
@@ -771,7 +778,7 @@ async def _capture_git_diff_context(
     The diff command runs via ``git_run_async`` (native asyncio subprocess)
     so the 10s timeout cannot block the event loop. Returns an empty
     string when the diff is empty, the command fails, or times out. Diff is
-    truncated at 8000 chars to avoid prompt bloat.
+    truncated at ``TESTER_GIT_DIFF_MAX_CHARS`` to avoid prompt bloat.
     """
     from equipa.git_ops import git_run_async
     try:
@@ -780,12 +787,11 @@ async def _capture_git_diff_context(
         )
         if result.returncode == 0 and result.stdout.strip():
             git_diff = result.stdout.strip()
-            max_diff_chars = 8000
-            if len(git_diff) > max_diff_chars:
+            if len(git_diff) > TESTER_GIT_DIFF_MAX_CHARS:
                 git_diff = (
-                    git_diff[:max_diff_chars]
+                    git_diff[:TESTER_GIT_DIFF_MAX_CHARS]
                     + f"\n\n[... diff truncated, "
-                      f"{len(git_diff) - max_diff_chars} chars omitted ...]"
+                      f"{len(git_diff) - TESTER_GIT_DIFF_MAX_CHARS} chars omitted ...]"
                 )
             log(
                 f"  [Cycle {cycle}] Captured git diff ({len(git_diff)} chars) "
