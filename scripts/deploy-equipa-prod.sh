@@ -26,7 +26,10 @@ SOURCE_REPO_MARKER="forge_orchestrator.py"   # file that must exist in source CW
 UPSTREAM_REMOTE="${EQUIPA_UPSTREAM_REMOTE:-upstream-local}"
 UPSTREAM_BRANCH="${EQUIPA_UPSTREAM_BRANCH:-master}"
 
-# Files that exist ONLY in production. Keep this list in sync with PROD_ONLY.md.
+# Files that exist ONLY in production. Keep this list in sync with
+# .deploy-allowlist (canonical machine-readable form) and docs/PROD_ONLY.md.example.
+# This in-script array is the *fallback* used when .deploy-allowlist cannot be
+# located in the source tree, so deploy still works on a stripped-down checkout.
 PROD_ONLY_FILES=(
     "dispatch_config.json"
     "forge_config.json"
@@ -37,6 +40,47 @@ PROD_ONLY_FILES=(
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 SNAPSHOT_DIR="/tmp/equipa-prod-snapshot-${TIMESTAMP}"
+
+# ---------------------------------------------------------------------------
+# Allowlist loading
+# ---------------------------------------------------------------------------
+# Load .deploy-allowlist (preferred, machine-readable source of truth) and
+# overlay it on the in-script default. If the file is absent we keep the
+# hardcoded list so the script remains self-contained.
+load_deploy_allowlist() {
+    local allowlist_path="${1:-}"
+    if [ -z "${allowlist_path}" ] || [ ! -f "${allowlist_path}" ]; then
+        return 1
+    fi
+    local loaded=()
+    local line trimmed
+    while IFS= read -r line || [ -n "${line}" ]; do
+        # Strip trailing CR (Windows line endings) and surrounding whitespace.
+        trimmed="${line%$'\r'}"
+        trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        case "${trimmed}" in
+            ''|'#'*) continue ;;
+        esac
+        loaded+=("${trimmed}")
+    done < "${allowlist_path}"
+    if [ "${#loaded[@]}" -eq 0 ]; then
+        return 1
+    fi
+    PROD_ONLY_FILES=("${loaded[@]}")
+    return 0
+}
+
+is_allowlisted() {
+    local needle="$1"
+    local entry
+    for entry in "${PROD_ONLY_FILES[@]}"; do
+        if [ "${entry}" = "${needle}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +121,14 @@ require_cmd git
 require_cmd python3
 require_cmd cp
 
+# Prefer the canonical allowlist file when it ships with the source repo.
+ALLOWLIST_PATH="${SOURCE_DIR}/.deploy-allowlist"
+if load_deploy_allowlist "${ALLOWLIST_PATH}"; then
+    log "  loaded prod-only allowlist from .deploy-allowlist (${#PROD_ONLY_FILES[@]} entries)"
+else
+    log "  using built-in prod-only allowlist (${#PROD_ONLY_FILES[@]} entries; .deploy-allowlist not found)"
+fi
+
 # ---------------------------------------------------------------------------
 # Step 2: verify Equipa-prod exists
 # ---------------------------------------------------------------------------
@@ -115,15 +167,101 @@ for rel_path in "${PROD_ONLY_FILES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 5: pull source into prod
+# Step 5: pull source into prod (with auto-bootstrap for source drift)
 # ---------------------------------------------------------------------------
 log "Step 5: git pull ${UPSTREAM_REMOTE} ${UPSTREAM_BRANCH} in prod"
 if ! git -C "${PROD_DIR}" remote get-url "${UPSTREAM_REMOTE}" >/dev/null 2>&1; then
     fail "remote '${UPSTREAM_REMOTE}' not configured in ${PROD_DIR}"
 fi
-if ! git -C "${PROD_DIR}" pull --ff-only "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"; then
-    fail "git pull failed (non-fast-forward or conflict). Inspect ${PROD_DIR} manually."
+
+# Fetch first so we know the new upstream tip and the file set it tracks.
+log "  fetching ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}"
+if ! git -C "${PROD_DIR}" fetch "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"; then
+    fail "git fetch ${UPSTREAM_REMOTE} ${UPSTREAM_BRANCH} failed"
 fi
+NEW_UPSTREAM_TIP="$(git -C "${PROD_DIR}" rev-parse "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}")"
+log "  upstream tip          = ${NEW_UPSTREAM_TIP}"
+
+# Inventory: which files does the new upstream tip track?
+UPSTREAM_FILES_TMP="$(mktemp)"
+trap 'rm -f "${UPSTREAM_FILES_TMP}"' EXIT
+git -C "${PROD_DIR}" ls-tree -r --name-only "${NEW_UPSTREAM_TIP}" > "${UPSTREAM_FILES_TMP}"
+
+# Inventory: what is dirty in prod right now? (modified, staged, untracked)
+SOURCE_DRIFT=()
+UNKNOWN=()
+DIRTY_COUNT=0
+while IFS= read -r status_line; do
+    [ -z "${status_line}" ] && continue
+    DIRTY_COUNT=$((DIRTY_COUNT + 1))
+    # Porcelain v1 format: "XY <space> path".
+    # Renames use "R  old -> new"; production never renames so we treat the
+    # whole tail as a single path and surface anything weird as UNKNOWN.
+    rel_path="${status_line:3}"
+    # Strip surrounding double-quotes that git adds for paths with spaces.
+    if [ "${rel_path#\"}" != "${rel_path}" ]; then
+        rel_path="${rel_path#\"}"
+        rel_path="${rel_path%\"}"
+    fi
+    if grep -qxF -- "${rel_path}" "${UPSTREAM_FILES_TMP}"; then
+        SOURCE_DRIFT+=("${rel_path}")
+    elif is_allowlisted "${rel_path}"; then
+        # Already snapshotted in step 4; safe to leave alone.
+        :
+    else
+        UNKNOWN+=("${rel_path}")
+    fi
+done < <(git -C "${PROD_DIR}" status --porcelain)
+
+if [ "${#UNKNOWN[@]}" -gt 0 ]; then
+    warn "  prod contains ${#UNKNOWN[@]} file(s) that are neither tracked upstream nor in the allowlist:"
+    for f in "${UNKNOWN[@]}"; do
+        warn "    - ${f}"
+    done
+    fail "Refusing to destroy unrecognized files. Either remove them, add them to .deploy-allowlist (and docs/PROD_ONLY.md.example), or commit them upstream first."
+fi
+
+if [ "${#SOURCE_DRIFT[@]}" -gt 0 ]; then
+    log "[deploy] Auto-bootstrapping: ${#SOURCE_DRIFT[@]} source files reset to upstream"
+    # Source files are NEVER edited in prod by hand — they only ever land
+    # there via this deploy script. Anything dirty that upstream tracks is
+    # safe to discard; the snapshot in step 4 already preserved prod-only
+    # files separately, so this reset cannot lose tuned config.
+    if ! git -C "${PROD_DIR}" reset --hard "${NEW_UPSTREAM_TIP}"; then
+        fail "git reset --hard ${NEW_UPSTREAM_TIP} failed during auto-bootstrap"
+    fi
+    # Untracked files that collided with upstream paths still need removing
+    # before they shadow the just-reset working tree. Delete them precisely,
+    # one path at a time — never use rm -rf.
+    while IFS= read -r status_line; do
+        [ -z "${status_line}" ] && continue
+        # Only ?? entries can remain after a hard reset.
+        case "${status_line:0:2}" in
+            '??')
+                rel_path="${status_line:3}"
+                if [ "${rel_path#\"}" != "${rel_path}" ]; then
+                    rel_path="${rel_path#\"}"
+                    rel_path="${rel_path%\"}"
+                fi
+                if grep -qxF -- "${rel_path}" "${UPSTREAM_FILES_TMP}"; then
+                    log "  removing untracked source-tree collision: ${rel_path}"
+                    rm -f -- "${PROD_DIR}/${rel_path}"
+                fi
+                ;;
+        esac
+    done < <(git -C "${PROD_DIR}" status --porcelain)
+elif [ "${DIRTY_COUNT}" -eq 0 ]; then
+    if ! git -C "${PROD_DIR}" pull --ff-only "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"; then
+        fail "git pull failed (non-fast-forward or conflict). Inspect ${PROD_DIR} manually."
+    fi
+else
+    # Dirty state was entirely allowlisted prod-only files; pull is still
+    # the safest path because those will be restored from snapshot in step 6.
+    if ! git -C "${PROD_DIR}" pull --ff-only "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"; then
+        fail "git pull failed (non-fast-forward or conflict). Inspect ${PROD_DIR} manually."
+    fi
+fi
+
 PROD_COMMIT_AFTER="$(git -C "${PROD_DIR}" rev-parse HEAD)"
 log "  prod HEAD after pull  = ${PROD_COMMIT_AFTER}"
 

@@ -1,0 +1,17 @@
+# .deploy-allowlist
+# Canonical, machine-readable list of files that may legitimately exist in
+# Equipa-prod but NOT in upstream source. Read by scripts/deploy-equipa-prod.sh.
+#
+# Format: one relative path per line. Lines starting with '#' and blank lines
+# are ignored. No globs — exact relative paths only, so the allowlist cannot
+# accidentally widen.
+#
+# Keep this file in sync with:
+#   - PROD_ONLY_FILES array in scripts/deploy-equipa-prod.sh
+#   - section list in docs/PROD_ONLY.md.example
+#   - EXPECTED_PROD_ONLY_FILES fixture in tests/test_deploy_script.py
+dispatch_config.json
+forge_config.json
+mcp_config.json
+theforge.db
+.env
