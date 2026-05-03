@@ -4,9 +4,11 @@ Extracts dispatch/auto-run logic from forge_orchestrator.py (Phase 5 split).
 Includes: scan_pending_work, score_project, apply_dispatch_filters,
 run_project_tasks, run_project_dispatch, run_auto_dispatch,
 run_parallel_tasks, run_single_goal, run_parallel_goals,
-parse_task_ids, load_goals_file, validate_goals,
-load_dispatch_config, is_feature_enabled, DEFAULT_DISPATCH_CONFIG,
-DEFAULT_FEATURE_FLAGS.
+parse_task_ids, load_goals_file, validate_goals.
+
+Feature-flag and dispatch-config primitives now live in equipa.config
+(layer 2). They are re-exported here for backward compatibility with
+existing `from equipa.dispatch import is_feature_enabled` callers.
 
 Copyright 2026 Forgeborn
 """
@@ -20,6 +22,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from equipa.config import (
+    DEFAULT_DISPATCH_CONFIG,
+    DEFAULT_FEATURE_FLAGS,
+    is_feature_enabled,
+    load_dispatch_config,
+)
 from equipa.constants import (
     DEFAULT_MAX_TURNS,
     DEFAULT_MODEL,
@@ -59,37 +67,12 @@ from equipa.tasks import (
 )
 
 
-# --- Feature Flags ---
-
-DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
-    "language_prompts": True,
-    "hooks": False,
-    "mcp_health": False,
-    "forgesmith_lessons": True,
-    "forgesmith_episodes": True,
-    "gepa_ab_testing": False,
-    "security_review": True,
-    "quality_scoring": True,
-    "anti_compaction_state": True,
-    "vector_memory": False,
-    "auto_model_routing": False,
-    "knowledge_graph": False,
-    "autoresearch": True,
-    "rlm_decompose": False,
-}
-
-DEFAULT_DISPATCH_CONFIG: dict = {
-    "max_concurrent": 8,
-    "model": "sonnet",
-    "max_turns": 25,
-    "max_tasks_per_project": 3,
-    "skip_projects": [],
-    "priority_boost": {},
-    "only_projects": [],
-    "security_review": False,
-    "features": dict(DEFAULT_FEATURE_FLAGS),
-    "autoresearch_max_retries": 3,
-}
+__all_reexports__ = (
+    "DEFAULT_FEATURE_FLAGS",
+    "DEFAULT_DISPATCH_CONFIG",
+    "is_feature_enabled",
+    "load_dispatch_config",
+)
 
 
 # --- Cross-Attempt Memory Helpers ---
@@ -214,69 +197,6 @@ def _inject_attempt_reflections(
     conn.execute(  # type: ignore[union-attr]
         "UPDATE tasks SET description = ? WHERE id = ?", (desc, task_id)
     )
-
-
-def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
-    """Check if a feature flag is enabled.
-
-    Reads from dispatch_config["features"][feature_name]. Falls back to
-    DEFAULT_FEATURE_FLAGS if the feature is not in the config.
-
-    Returns True/False. Unknown features default to False.
-    """
-    if dispatch_config is None:
-        return DEFAULT_FEATURE_FLAGS.get(feature_name, False)
-    features = dispatch_config.get("features", {})
-    return features.get(feature_name, DEFAULT_FEATURE_FLAGS.get(feature_name, False))
-
-
-def load_dispatch_config(filepath: str | Path | None) -> dict:
-    """Load dispatch_config.json preferences.
-
-    Returns a config dict with defaults for any missing keys.
-    Falls back to defaults entirely if file not found.
-    """
-    config = dict(DEFAULT_DISPATCH_CONFIG)
-
-    if filepath is None:
-        # Try default location — use the script's parent directory
-        # (forge_orchestrator.py lives alongside dispatch_config.json)
-        import equipa.constants as _c
-        filepath = Path(_c.THEFORGE_DB).parent / "dispatch_config.json"
-        if not filepath.exists():
-            # Fall back to CWD-relative
-            filepath = Path("dispatch_config.json")
-    else:
-        filepath = Path(filepath)
-
-    if not filepath.exists():
-        return config
-
-    try:
-        data = json.loads(filepath.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"WARNING: Could not load dispatch config '{filepath}': {e}")
-        print("  Using defaults.")
-        return config
-
-    # Merge loaded values over defaults
-    for key in DEFAULT_DISPATCH_CONFIG:
-        if key in data:
-            config[key] = data[key]
-
-    # Deep-merge features: user's partial features dict is overlaid on defaults
-    # so specifying e.g. {"features": {"hooks": true}} does not wipe other flags.
-    if "features" in data and isinstance(data["features"], dict):
-        merged_features = dict(DEFAULT_FEATURE_FLAGS)
-        merged_features.update(data["features"])
-        config["features"] = merged_features
-
-    # Also merge any extra keys not in defaults (model_developer, model_epic, etc.)
-    for key in data:
-        if key not in config:
-            config[key] = data[key]
-
-    return config
 
 
 # --- DB Scanning & Scoring ---
