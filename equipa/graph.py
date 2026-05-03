@@ -12,7 +12,7 @@ import math
 import random
 from collections import defaultdict
 
-from equipa.db import get_db_connection
+from equipa.db import db_conn
 
 
 # --- Edge Management ---
@@ -33,15 +33,13 @@ def add_edge(
 
     Uses REPLACE to handle duplicate edges (updates weight if edge exists).
     """
-    conn = get_db_connection(write=True)
-    conn.execute(
-        """INSERT OR REPLACE INTO lesson_graph_edges
-           (src_id, dst_id, edge_type, weight)
-           VALUES (?, ?, ?, ?)""",
-        (src_id, dst_id, edge_type, weight),
-    )
-    conn.commit()
-    conn.close()
+    with db_conn(write=True) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO lesson_graph_edges
+               (src_id, dst_id, edge_type, weight)
+               VALUES (?, ?, ?, ?)""",
+            (src_id, dst_id, edge_type, weight),
+        )
 
 
 def get_adjacency_list() -> dict[int, list[tuple[int, float]]]:
@@ -50,11 +48,10 @@ def get_adjacency_list() -> dict[int, list[tuple[int, float]]]:
     Returns:
         Dictionary mapping node_id -> [(neighbor_id, weight), ...]
     """
-    conn = get_db_connection()
-    rows = conn.execute(
-        "SELECT src_id, dst_id, weight FROM lesson_graph_edges"
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT src_id, dst_id, weight FROM lesson_graph_edges"
+        ).fetchall()
 
     adj: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for row in rows:
@@ -74,26 +71,24 @@ def create_coaccessed_edges(lesson_ids: list[int]) -> int:
     if len(lesson_ids) < 2:
         return 0
 
-    conn = get_db_connection(write=True)
     created = 0
-    for i, src in enumerate(lesson_ids):
-        for dst in lesson_ids[i + 1:]:
-            # Bidirectional edges
-            conn.execute(
-                """INSERT OR IGNORE INTO lesson_graph_edges
-                   (src_id, dst_id, edge_type, weight)
-                   VALUES (?, ?, 'coaccessed', 1.0)""",
-                (src, dst),
-            )
-            conn.execute(
-                """INSERT OR IGNORE INTO lesson_graph_edges
-                   (src_id, dst_id, edge_type, weight)
-                   VALUES (?, ?, 'coaccessed', 1.0)""",
-                (dst, src),
-            )
-            created += 2
-    conn.commit()
-    conn.close()
+    with db_conn(write=True) as conn:
+        for i, src in enumerate(lesson_ids):
+            for dst in lesson_ids[i + 1:]:
+                # Bidirectional edges
+                conn.execute(
+                    """INSERT OR IGNORE INTO lesson_graph_edges
+                       (src_id, dst_id, edge_type, weight)
+                       VALUES (?, ?, 'coaccessed', 1.0)""",
+                    (src, dst),
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO lesson_graph_edges
+                       (src_id, dst_id, edge_type, weight)
+                       VALUES (?, ?, 'coaccessed', 1.0)""",
+                    (dst, src),
+                )
+                created += 2
     return created
 
 
@@ -114,12 +109,11 @@ def create_similarity_edges(
     """
     import json
 
-    conn = get_db_connection()
-    rows = conn.execute(
-        "SELECT id, embedding FROM lessons_learned WHERE id != ? AND embedding IS NOT NULL",
-        (lesson_id,),
-    ).fetchall()
-    conn.close()
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, embedding FROM lessons_learned WHERE id != ? AND embedding IS NOT NULL",
+            (lesson_id,),
+        ).fetchall()
 
     created = 0
     for row in rows:
