@@ -1361,6 +1361,109 @@ def test_git_diff_non_git_directory():
         subprocess.run(["rm", "-rf", tmpdir], capture_output=True)
 
 
+# --- Paralysis retry read gate tests ---
+
+
+def test_paralysis_retry_2_first_read_not_killed():
+    """Retry >= 2 + turn 1 + Read must NOT kill — only arm must_write_next_turn.
+
+    Regression test for the unsatisfiable ZERO-READ PROTOCOL: previously,
+    paralysis_retry_count >= 2 with any read-only tool on turns 1-2 was an
+    instant kill, even though the agent has zero forward context after a
+    paralysis kill (soft_checkpoint stores only the file list, not contents)
+    and must read at least one file to know what to edit.
+    """
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    early_term, must_write = _evaluate_paralysis_retry_read_gate(
+        paralysis_retry_count=2,
+        turn_count=1,
+        tool_name="Read",
+        has_any_file_change=False,
+        must_write_next_turn=False,
+    )
+    assert early_term is None, \
+        f"retry 2 first Read must not be killed; got early_term={early_term!r}"
+    assert must_write is True, \
+        "retry 2 first Read should arm must_write_next_turn so the NEXT call must write"
+
+
+def test_paralysis_retry_1_first_read_allowed_arms_must_write():
+    """Retry == 1 + turn 1 + Read keeps the existing ONE-read allowance."""
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    early_term, must_write = _evaluate_paralysis_retry_read_gate(
+        paralysis_retry_count=1,
+        turn_count=1,
+        tool_name="Read",
+        has_any_file_change=False,
+        must_write_next_turn=False,
+    )
+    assert early_term is None
+    assert must_write is True
+
+
+def test_paralysis_retry_0_no_op():
+    """Without a paralysis retry the gate is a no-op (returns inputs unchanged)."""
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    early_term, must_write = _evaluate_paralysis_retry_read_gate(
+        paralysis_retry_count=0,
+        turn_count=1,
+        tool_name="Read",
+        has_any_file_change=False,
+        must_write_next_turn=False,
+    )
+    assert early_term is None
+    assert must_write is False
+
+
+def test_paralysis_retry_write_tool_no_op():
+    """A write-class tool on a paralysis retry is a no-op (gate ignores writes)."""
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    for tool in ("Edit", "Write", "Bash"):
+        early_term, must_write = _evaluate_paralysis_retry_read_gate(
+            paralysis_retry_count=2,
+            turn_count=1,
+            tool_name=tool,
+            has_any_file_change=False,
+            must_write_next_turn=False,
+        )
+        assert early_term is None, f"write tool {tool} unexpectedly killed"
+        assert must_write is False, f"write tool {tool} unexpectedly armed must_write"
+
+
+def test_paralysis_retry_after_file_change_no_op():
+    """Once the agent has produced any file change, the gate stops firing."""
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    early_term, must_write = _evaluate_paralysis_retry_read_gate(
+        paralysis_retry_count=3,
+        turn_count=1,
+        tool_name="Read",
+        has_any_file_change=True,
+        must_write_next_turn=False,
+    )
+    assert early_term is None
+    assert must_write is False
+
+
+def test_paralysis_retry_already_armed_no_double_arm():
+    """If must_write_next_turn is already armed, the gate does not re-arm or kill."""
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    early_term, must_write = _evaluate_paralysis_retry_read_gate(
+        paralysis_retry_count=2,
+        turn_count=1,
+        tool_name="Read",
+        has_any_file_change=False,
+        must_write_next_turn=True,
+    )
+    assert early_term is None
+    assert must_write is True
+
+
 # --- Main ---
 
 def main():
@@ -1448,6 +1551,13 @@ def main():
         test_git_diff_no_false_positives_on_read_only_bash,
         test_git_diff_detects_committed_then_clean,
         test_git_diff_non_git_directory,
+        # Paralysis retry read gate tests
+        test_paralysis_retry_2_first_read_not_killed,
+        test_paralysis_retry_1_first_read_allowed_arms_must_write,
+        test_paralysis_retry_0_no_op,
+        test_paralysis_retry_write_tool_no_op,
+        test_paralysis_retry_after_file_change_no_op,
+        test_paralysis_retry_already_armed_no_double_arm,
     ]
 
     passed = 0
