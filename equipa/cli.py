@@ -34,6 +34,7 @@ from equipa.checkpoints import load_checkpoint
 from equipa.db import record_agent_run, update_task_status
 from equipa.dispatch import (
     apply_dispatch_filters,
+    cleanup_failed_attempt,
     is_feature_enabled,
     load_dispatch_config,
     load_goals_file,
@@ -654,6 +655,7 @@ async def async_main() -> None:
         autoresearch_on = is_feature_enabled(dc, "autoresearch")
         max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
         retry_count = 0
+        attempt_reflections: list[str] = []
 
         while True:
             result, cycles, outcome = await run_dev_test_loop(
@@ -663,6 +665,14 @@ async def async_main() -> None:
             # Success - break out
             if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
                 break
+
+            # Capture reflection from the failed attempt for cross-attempt memory
+            from equipa.dispatch import _build_dispatch_attempt_reflection
+            attempt_reflections.append(
+                _build_dispatch_attempt_reflection(
+                    retry_count + 1, outcome, cycles, result,
+                )
+            )
 
             # Not retriable or exhausted
             if not autoresearch_on or retry_count >= max_retries:
@@ -675,26 +685,10 @@ async def async_main() -> None:
             print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
                   f"Retry {retry_count}/{max_retries}...")
 
-            # Clean up failed git branch
-            branch_name = f"forge-task-{task['id']}"
-            try:
-                from equipa.git_ops import _is_git_repo, git_run
-                if _is_git_repo(project_dir):
-                    cp = git_run(["rev-parse", "--verify", "main"], project_dir, timeout=10)
-                    default_branch = "main" if cp.returncode == 0 else "master"
-                    git_run(["checkout", default_branch], project_dir, timeout=10)
-                    git_run(["branch", "-D", branch_name], project_dir, timeout=10)
-                    print(f"  [Autoresearch] Cleaned up branch {branch_name}")
-            except Exception as e:
-                print(f"  [Autoresearch] Git cleanup warning: {e}")
-
-            # Reset task to todo
-            from equipa.db import get_db_connection
-            conn = get_db_connection(write=True)
-            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task["id"],))
-            conn.commit()
-            conn.close()
-            print(f"  [Autoresearch] Reset task #{task['id']} to todo for fresh attempt")
+            # Clean up failed branch and reset task (with reflection memory)
+            cleanup_failed_attempt(
+                task["id"], project_dir, attempt_reflections,
+            )
 
         # Post-task telemetry (DB update, ForgeSmith recording, quality scoring, reflexion, MemRL)
         task_role = task.get("role") or "developer"
