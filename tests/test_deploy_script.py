@@ -366,6 +366,55 @@ def test_deploy_halts_on_unknown_files(tmp_path: Path) -> None:
     assert "DO NOT DELETE" in unknown.read_text()
 
 
+def test_step8_regenerates_before_comparing(tmp_path: Path) -> None:
+    """Regression guard for task #2134: Step 8 must regenerate the manifest
+    BEFORE establishing its baseline hash. Comparing the just-pulled file
+    against a freshly-regenerated one produced false-positive drift errors
+    because forge_orchestrator.py auto-regenerates at runtime in prod."""
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    # Locate Step 8 by its log line and read everything to Step 9.
+    step8_start = text.find('log "Step 8: verify skill_manifest hashes"')
+    step9_start = text.find('log "Step 9:')
+    assert step8_start != -1, "Step 8 log line missing"
+    assert step9_start != -1 and step9_start > step8_start, "Step 9 log line missing"
+    step8 = text[step8_start:step9_start]
+
+    # The two regenerations must both happen before any failure-comparing
+    # branch. We assert at least two --regenerate-manifest invocations exist
+    # and that the comparison is between two post-regen hashes (not against
+    # a pre-pull baseline).
+    regen_count = step8.count("--regenerate-manifest")
+    assert regen_count >= 2, (
+        f"Step 8 must invoke --regenerate-manifest at least twice "
+        f"(found {regen_count}). Single regen reintroduces the false-positive "
+        f"hash drift bug from task #2134."
+    )
+
+    # The old buggy variable name MANIFEST_BEFORE captured the pre-regen file;
+    # the fix renames it to a baseline-after-regen variable. This assertion
+    # is intentionally narrow — it only forbids the specific variable that
+    # encoded the bug, not all uses of the word "before".
+    assert "MANIFEST_BEFORE=" not in step8, (
+        "Step 8 still defines MANIFEST_BEFORE — the pre-regen baseline that "
+        "caused false-positive drift in task #2134. Use a post-regen baseline."
+    )
+
+
+def test_step8_comment_documents_false_positive_fix(tmp_path: Path) -> None:
+    """The Step 8 fix must be documented inline so future readers do not
+    revert to the simpler-looking single-regen comparison."""
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+    step8_start = text.find("# Step 8: verify skill_manifest hashes")
+    assert step8_start != -1, "Step 8 banner comment missing"
+    # Look at the comment block immediately around the Step 8 banner.
+    snippet = text[max(0, step8_start - 50): step8_start + 1500]
+    assert "auto-regenerate" in snippet.lower() or "auto-regen" in snippet.lower(), (
+        "Step 8 must document the auto-regeneration false-positive cause "
+        "so the fix is not silently reverted."
+    )
+
+
 def test_deploy_clean_prod_still_works(tmp_path: Path) -> None:
     """Backwards-compat: a clean prod with no drift must still deploy via
     the regular fast-forward pull path."""

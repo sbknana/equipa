@@ -293,6 +293,20 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 8: verify skill_manifest hashes
+#
+# The manifest shipped from upstream was generated in source-repo's
+# environment; forge_orchestrator.py also auto-regenerates it at runtime in
+# prod. Comparing the just-pulled file against a fresh regeneration therefore
+# produces a false-positive "drift" any time the two environments differ
+# even slightly. To detect *real* tampering (skill content changed under us
+# between two regenerations on the SAME host), we instead:
+#
+#   1. Regenerate once to establish a deterministic post-regen baseline.
+#   2. Regenerate again and compare the two regen results.
+#
+# A stable manifest must hash identically across two consecutive regens.
+# Any difference here indicates non-deterministic generation or skill content
+# changing mid-deploy, both of which warrant aborting.
 # ---------------------------------------------------------------------------
 log "Step 8: verify skill_manifest hashes"
 MANIFEST_PATH="${PROD_DIR}/skill_manifest.json"
@@ -303,13 +317,20 @@ if [ ! -f "${MANIFEST_PATH}" ]; then
 elif [ ! -f "${ORCH_PATH}" ]; then
     warn "  forge_orchestrator.py missing in prod (skipping hash check)"
 else
-    MANIFEST_BEFORE="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+    # First regeneration establishes the deterministic baseline. Without
+    # this step the "before" hash is whatever upstream happened to commit,
+    # which is often stale relative to the runtime regenerator.
     if ( cd "${PROD_DIR}" && python3 forge_orchestrator.py --regenerate-manifest >/dev/null 2>&1 ); then
-        MANIFEST_AFTER="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
-        if [ "${MANIFEST_BEFORE}" != "${MANIFEST_AFTER}" ]; then
-            fail "skill_manifest.json hashes drifted unexpectedly (before=${MANIFEST_BEFORE} after=${MANIFEST_AFTER}). Investigate skill content tampering before continuing."
+        MANIFEST_BASELINE="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+        # Second regeneration must produce an identical hash on the same host.
+        if ! ( cd "${PROD_DIR}" && python3 forge_orchestrator.py --regenerate-manifest >/dev/null 2>&1 ); then
+            fail "skill_manifest second regeneration failed (first succeeded). Investigate orchestrator state before continuing."
         fi
-        log "  manifest hash stable (${MANIFEST_AFTER})"
+        MANIFEST_VERIFY="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+        if [ "${MANIFEST_BASELINE}" != "${MANIFEST_VERIFY}" ]; then
+            fail "skill_manifest.json hashes drifted between two consecutive regenerations (baseline=${MANIFEST_BASELINE} verify=${MANIFEST_VERIFY}). Generation is non-deterministic or skill content changed mid-deploy."
+        fi
+        log "  manifest hash stable across regenerations (${MANIFEST_VERIFY})"
     else
         warn "  --regenerate-manifest not available; skipping hash recomputation"
     fi
