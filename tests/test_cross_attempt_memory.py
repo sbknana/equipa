@@ -6,6 +6,7 @@ injected into task descriptions so retry agents avoid repeating mistakes.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 
 import pytest
@@ -283,11 +284,11 @@ class TestCleanupFailedAttempt:
         )
 
         reflections = ["ATTEMPT 1 FAILED: tried X, did not work"]
-        cleanup_failed_attempt(
+        asyncio.run(cleanup_failed_attempt(
             task_id=42,
             project_dir=str(tmp_path),
             reflections=reflections,
-        )
+        ))
 
         assert len(calls) == 1, (
             "cleanup_failed_attempt must invoke _inject_attempt_reflections "
@@ -346,9 +347,9 @@ class TestCleanupFailedAttempt:
             dispatch_mod, "get_db_connection", lambda write=False: wrapped
         )
 
-        cleanup_failed_attempt(
+        asyncio.run(cleanup_failed_attempt(
             task_id=7, project_dir=str(tmp_path), reflections=[]
-        )
+        ))
 
         assert calls == [], (
             "Empty reflections list must NOT trigger injection"

@@ -17,6 +17,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,10 +25,28 @@ from pathlib import Path
 import pytest
 
 from equipa.dispatch import (
-    _cleanup_worktrees,
-    _create_isolation_worktrees,
-    _merge_task_branch,
+    _cleanup_worktrees as _cleanup_worktrees_async,
+    _create_isolation_worktrees as _create_isolation_worktrees_async,
+    _merge_task_branch as _merge_task_branch_async,
 )
+
+
+def _create_isolation_worktrees(tasks, project_dir, base):
+    return asyncio.run(
+        _create_isolation_worktrees_async(tasks, project_dir, base),
+    )
+
+
+def _merge_task_branch(project_dir, task_id, branch_name):
+    return asyncio.run(
+        _merge_task_branch_async(project_dir, task_id, branch_name),
+    )
+
+
+def _cleanup_worktrees(project_dir, worktree_dirs, merged_tasks, base):
+    return asyncio.run(
+        _cleanup_worktrees_async(project_dir, worktree_dirs, merged_tasks, base),
+    )
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:

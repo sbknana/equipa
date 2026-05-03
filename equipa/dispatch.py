@@ -203,7 +203,7 @@ def _inject_attempt_reflections(
     )
 
 
-def cleanup_failed_attempt(
+async def cleanup_failed_attempt(
     task_id: int,
     project_dir: str,
     reflections: list[str],
@@ -233,18 +233,16 @@ def cleanup_failed_attempt(
 
     if _is_git_repo(project_dir):
         try:
-            cp = subprocess.run(
-                ["git", "rev-parse", "--verify", "main"],
-                cwd=project_dir, capture_output=True,
+            from equipa.git_ops import git_run_async
+            cp = await git_run_async(
+                ["rev-parse", "--verify", "main"], project_dir, timeout=10,
             )
             default_branch = "main" if cp.returncode == 0 else "master"
-            subprocess.run(
-                ["git", "checkout", default_branch],
-                cwd=project_dir, capture_output=True,
+            await git_run_async(
+                ["checkout", default_branch], project_dir, timeout=30,
             )
-            subprocess.run(
-                ["git", "branch", "-D", branch_name],
-                cwd=project_dir, capture_output=True,
+            await git_run_async(
+                ["branch", "-D", branch_name], project_dir, timeout=10,
             )
             msg = f"  [Autoresearch] Cleaned up branch {branch_name}"
             if output is not None:
@@ -552,12 +550,10 @@ async def run_project_tasks(
                 f"Retry {retry_count}/{max_retries}...", output)
 
             # Clean up failed git branch and reset task for next attempt.
-            # Wrapped in asyncio.to_thread so the multiple subprocess.run
-            # calls inside cleanup_failed_attempt do NOT block the event
-            # loop — important when this runs concurrently with other
-            # tasks under run_parallel_tasks.
-            await asyncio.to_thread(
-                cleanup_failed_attempt,
+            # cleanup_failed_attempt is now natively async (uses
+            # git_run_async under the hood), so it will not block the
+            # event loop while other parallel tasks are running.
+            await cleanup_failed_attempt(
                 task_id, project_dir, attempt_reflections, output,
             )
 
@@ -983,7 +979,7 @@ def _copy_hooks_to_worktree(main_repo_dir: str, worktree_dir: str) -> None:
         shutil.copy2(str(markers_src), str(markers_dst))
 
 
-def _create_isolation_worktrees(
+async def _create_isolation_worktrees(
     tasks: list[dict],
     project_dir: str,
     worktree_base: Path,
@@ -993,7 +989,12 @@ def _create_isolation_worktrees(
     Returns a map of task_id -> worktree directory path. Tasks for which
     worktree creation fails are omitted from the returned map (they will
     fall back to sharing project_dir).
+
+    Uses ``git_run_async`` so the per-task git invocations do not block
+    the event loop while parallel task dispatch is queued.
     """
+    from equipa.git_ops import git_run_async
+
     worktree_dirs: dict[int, str] = {}
     worktree_base.mkdir(exist_ok=True)
     for t in tasks:
@@ -1002,75 +1003,87 @@ def _create_isolation_worktrees(
         wt_path = worktree_base / f"task-{task_id}"
         try:
             if wt_path.exists():
-                subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(wt_path)],
-                    cwd=project_dir, capture_output=True,
+                await git_run_async(
+                    ["worktree", "remove", "--force", str(wt_path)],
+                    project_dir, timeout=30,
                 )
-            subprocess.run(
-                ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                cwd=project_dir, capture_output=True, check=True,
+            add_res = await git_run_async(
+                ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                project_dir, timeout=60,
             )
-            worktree_dirs[task_id] = str(wt_path)
-            _copy_hooks_to_worktree(project_dir, str(wt_path))
-            print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
-        except subprocess.CalledProcessError:
-            # Fallback: branch may already exist — delete and retry.
-            try:
-                subprocess.run(
-                    ["git", "branch", "-D", branch_name],
-                    cwd=project_dir, capture_output=True,
+            if add_res.returncode != 0:
+                # Fallback: branch may already exist — delete and retry.
+                await git_run_async(
+                    ["branch", "-D", branch_name], project_dir, timeout=10,
                 )
-                subprocess.run(
-                    ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                    cwd=project_dir, capture_output=True, check=True,
+                retry_res = await git_run_async(
+                    ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                    project_dir, timeout=60,
                 )
+                if retry_res.returncode != 0:
+                    err_preview = (
+                        retry_res.stderr[:200] if retry_res.stderr
+                        else f"rc={retry_res.returncode}"
+                    )
+                    print(
+                        f"  [Isolation] WARNING: Could not create worktree for "
+                        f"task #{task_id}, using shared dir "
+                        f"(retry failed: {err_preview})"
+                    )
+                    continue
                 worktree_dirs[task_id] = str(wt_path)
                 _copy_hooks_to_worktree(project_dir, str(wt_path))
                 print(f"  [Isolation] Task #{task_id} -> {wt_path.name} (retry)")
-            except subprocess.CalledProcessError as retry_err:
-                print(
-                    f"  [Isolation] WARNING: Could not create worktree for "
-                    f"task #{task_id}, using shared dir "
-                    f"(retry failed: {retry_err.stderr[:200] if retry_err.stderr else retry_err})"
-                )
+            else:
+                worktree_dirs[task_id] = str(wt_path)
+                _copy_hooks_to_worktree(project_dir, str(wt_path))
+                print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
+        except (subprocess.SubprocessError, OSError) as e:
+            print(
+                f"  [Isolation] WARNING: Worktree creation errored for "
+                f"task #{task_id}: {e}"
+            )
     return worktree_dirs
 
 
-def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool:
+async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool:
     """Merge a single task branch into the main repo's current branch.
 
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
     All failures are logged to stdout — the function NEVER swallows errors
     silently. On any failure path, the branch is preserved (not deleted).
+
+    Uses ``git_run_async`` so the 6-12 git invocations per merge do not
+    block the event loop.
     """
+    from equipa.git_ops import git_run_async
+
     try:
-        current_branch = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=project_dir, capture_output=True, text=True,
-        ).stdout.strip()
+        current = await git_run_async(
+            ["branch", "--show-current"], project_dir, timeout=10,
+        )
+        current_branch = current.stdout.strip()
         if not current_branch:
             for candidate in ["master", "main"]:
-                check = subprocess.run(
-                    ["git", "show-ref", "--verify", f"refs/heads/{candidate}"],
-                    cwd=project_dir, capture_output=True,
+                check = await git_run_async(
+                    ["show-ref", "--verify", f"refs/heads/{candidate}"],
+                    project_dir, timeout=10,
                 )
                 if check.returncode == 0:
-                    subprocess.run(
-                        ["git", "checkout", candidate],
-                        cwd=project_dir, capture_output=True,
+                    await git_run_async(
+                        ["checkout", candidate], project_dir, timeout=30,
                     )
                     current_branch = candidate
                     break
         print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
 
-        pre_head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=project_dir, capture_output=True, text=True,
-        ).stdout.strip()
+        pre_head_res = await git_run_async(
+            ["rev-parse", "HEAD"], project_dir, timeout=10,
+        )
+        pre_head = pre_head_res.stdout.strip()
 
-        ahead = subprocess.run(
-            ["git", "log", "--oneline", f"HEAD..{branch_name}"],
-            cwd=project_dir, capture_output=True, text=True,
+        ahead = await git_run_async(
+            ["log", "--oneline", f"HEAD..{branch_name}"], project_dir, timeout=15,
         )
         if not ahead.stdout.strip():
             print(
@@ -1085,20 +1098,19 @@ def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool
             f"{commits_ahead} commit(s) to merge"
         )
 
-        stash_result = subprocess.run(
-            ["git", "stash"], cwd=project_dir, capture_output=True, text=True,
+        stash_result = await git_run_async(
+            ["stash"], project_dir, timeout=30,
         )
         had_stash = "Saved working directory" in stash_result.stdout
 
         try:
-            merge_result = subprocess.run(
-                ["git", "merge", "--no-edit", branch_name],
-                cwd=project_dir, capture_output=True, text=True,
+            merge_result = await git_run_async(
+                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
             )
-            post_head = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=project_dir, capture_output=True, text=True,
-            ).stdout.strip()
+            post_head_res = await git_run_async(
+                ["rev-parse", "HEAD"], project_dir, timeout=10,
+            )
+            post_head = post_head_res.stdout.strip()
 
             if merge_result.returncode == 0 and post_head != pre_head:
                 print(
@@ -1115,18 +1127,15 @@ def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool
                 return False
 
             # Conflict path: try rebase-then-merge.
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=project_dir, capture_output=True,
+            await git_run_async(
+                ["merge", "--abort"], project_dir, timeout=15,
             )
-            rebase_result = subprocess.run(
-                ["git", "rebase", "HEAD", branch_name],
-                cwd=project_dir, capture_output=True, text=True,
+            rebase_result = await git_run_async(
+                ["rebase", "HEAD", branch_name], project_dir, timeout=60,
             )
             if rebase_result.returncode != 0:
-                subprocess.run(
-                    ["git", "rebase", "--abort"],
-                    cwd=project_dir, capture_output=True,
+                await git_run_async(
+                    ["rebase", "--abort"], project_dir, timeout=15,
                 )
                 print(
                     f"  [Isolation] Merge FAILED for task #{task_id}: "
@@ -1135,16 +1144,14 @@ def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool
                 print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
                 return False
 
-            merge2 = subprocess.run(
-                ["git", "merge", "--no-edit", branch_name],
-                cwd=project_dir, capture_output=True, text=True,
+            merge2 = await git_run_async(
+                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
             )
             if merge2.returncode == 0:
                 print(f"  [Isolation] Merged task #{task_id} (after rebase)")
                 return True
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=project_dir, capture_output=True,
+            await git_run_async(
+                ["merge", "--abort"], project_dir, timeout=15,
             )
             print(
                 f"  [Isolation] Merge FAILED for task #{task_id} "
@@ -1154,9 +1161,8 @@ def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool
             return False
         finally:
             if had_stash:
-                subprocess.run(
-                    ["git", "stash", "pop"],
-                    cwd=project_dir, capture_output=True, text=True,
+                await git_run_async(
+                    ["stash", "pop"], project_dir, timeout=30,
                 )
     except (subprocess.SubprocessError, OSError) as e:
         # Explicit error log — do NOT silently swallow. Branch is preserved
@@ -1166,7 +1172,7 @@ def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool
         return False
 
 
-def _cleanup_worktrees(
+async def _cleanup_worktrees(
     project_dir: str,
     worktree_dirs: dict[int, str],
     merged_tasks: set[int],
@@ -1176,21 +1182,25 @@ def _cleanup_worktrees(
 
     Per-task failures are logged (not silently swallowed) so that data-loss
     investigations have evidence of which step failed.
+
+    Uses ``git_run_async`` so the per-task ``git worktree remove`` and
+    ``git branch -D`` calls do not block the event loop.
     """
+    from equipa.git_ops import git_run_async
+
     for task_id, wt_path in worktree_dirs.items():
         branch_name = f"forge-task-{task_id}"
         try:
             state_file = Path(wt_path) / ".forge-state.json"
             if state_file.exists():
                 state_file.unlink()
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", wt_path],
-                cwd=project_dir, capture_output=True,
+            await git_run_async(
+                ["worktree", "remove", "--force", wt_path],
+                project_dir, timeout=30,
             )
             if task_id in merged_tasks:
-                subprocess.run(
-                    ["git", "branch", "-D", branch_name],
-                    cwd=project_dir, capture_output=True,
+                await git_run_async(
+                    ["branch", "-D", branch_name], project_dir, timeout=10,
                 )
             else:
                 print(
@@ -1254,13 +1264,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # Create per-task git worktrees for filesystem isolation
     worktree_base = Path(project_dir) / ".forge-worktrees"
     use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
-    # Worktree creation issues 2-3 git commands per task. Run in a worker
-    # thread so the event loop is not blocked while the loop is otherwise
-    # idle waiting on agent dispatch.
+    # Worktree creation issues 2-3 git commands per task. The helper is
+    # natively async (uses git_run_async) so the event loop is not
+    # blocked while subprocesses run.
     worktree_dirs: dict[int, str] = (
-        await asyncio.to_thread(
-            _create_isolation_worktrees, tasks, project_dir, worktree_base,
-        )
+        await _create_isolation_worktrees(tasks, project_dir, worktree_base)
         if use_worktrees else {}
     )
 
@@ -1360,21 +1368,20 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         for r in merge_candidates:
             task_id = r["task"]["id"]
             branch_name = f"forge-task-{task_id}"
-            # Each merge issues 6-12 subprocess.run calls; run them in a
-            # worker thread to keep the event loop responsive (e.g. for
-            # any background tasks still draining post-gather).
-            merge_ok = await asyncio.to_thread(
-                _merge_task_branch, project_dir, task_id, branch_name,
+            # Each merge issues 6-12 git invocations; the helper is now
+            # natively async (uses git_run_async) so the event loop stays
+            # responsive for any background work draining post-gather.
+            merge_ok = await _merge_task_branch(
+                project_dir, task_id, branch_name,
             )
             if merge_ok:
                 r["merge_ok"] = True
                 merged_tasks_seq.add(task_id)
 
     # Clean up worktrees — only delete branches that were successfully merged.
-    # Wrapped in asyncio.to_thread so the per-task `git worktree remove` and
+    # Helper is natively async; per-task `git worktree remove` and
     # `git branch -D` calls do not block the event loop.
     if use_worktrees:
-        await asyncio.to_thread(
-            _cleanup_worktrees,
+        await _cleanup_worktrees(
             project_dir, worktree_dirs, merged_tasks_seq, worktree_base,
         )

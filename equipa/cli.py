@@ -660,7 +660,7 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                   f"Retry {retry_count}/{max_retries}...")
 
             # Clean up failed branch and reset task (with reflection memory)
-            cleanup_failed_attempt(
+            await cleanup_failed_attempt(
                 task["id"], project_dir, attempt_reflections,
             )
 

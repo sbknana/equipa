@@ -741,10 +741,10 @@ async def _resolve_head_sha(
     ``git diff <ref>`` without a None-check; the worst-case behavior is the
     legacy cumulative diff against the working HEAD.
     """
-    from equipa.git_ops import git_run
+    from equipa.git_ops import git_run_async
     try:
-        result = await asyncio.to_thread(
-            git_run, ["rev-parse", "HEAD"], project_dir, 5
+        result = await git_run_async(
+            ["rev-parse", "HEAD"], project_dir, timeout=5,
         )
         if result.returncode == 0:
             sha = result.stdout.strip()
@@ -767,15 +767,15 @@ async def _capture_git_diff_context(
     dev-test loop passes the prior cycle's HEAD SHA so each cycle's tester
     sees only the changes made in that cycle (avoids cumulative diff bloat).
 
-    The diff command runs in a worker thread via ``asyncio.to_thread`` so the
-    10s subprocess timeout cannot block the event loop. Returns an empty
+    The diff command runs via ``git_run_async`` (native asyncio subprocess)
+    so the 10s timeout cannot block the event loop. Returns an empty
     string when the diff is empty, the command fails, or times out. Diff is
     truncated at 8000 chars to avoid prompt bloat.
     """
-    from equipa.git_ops import git_run
+    from equipa.git_ops import git_run_async
     try:
-        result = await asyncio.to_thread(
-            git_run, ["diff", base_ref], project_dir, 10
+        result = await git_run_async(
+            ["diff", base_ref], project_dir, timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
             git_diff = result.stdout.strip()
