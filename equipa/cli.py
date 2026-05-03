@@ -47,6 +47,7 @@ from equipa.dispatch import (
     score_project,
     validate_goals,
 )
+from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
 from equipa.lessons import update_injected_episode_q_values_for_task
@@ -256,6 +257,171 @@ async def _post_task_telemetry(
     # Record model outcome for circuit breaker (cost routing)
     success = outcome in ("tests_passed", "no_tests")
     record_model_outcome(model, success)
+
+
+# --- Template subcommand (PLAN-1067 §3.C3) ---
+
+_TEMPLATE_FLAG_DISABLED_MSG = (
+    "ERROR: project_templates feature flag is disabled.\n"
+    "  Enable it in dispatch_config.json under features.project_templates "
+    "before running 'equipa template' commands."
+)
+
+
+def _build_template_arg_parser() -> argparse.ArgumentParser:
+    """Argparse parser for the ``equipa template <verb>`` subcommand surface."""
+    parser = argparse.ArgumentParser(
+        prog="equipa template",
+        description="Export, import, or validate EQUIPA project templates.",
+    )
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    export_p = sub.add_parser("export", help="Export a project to a template directory or archive")
+    export_p.add_argument("project_id", type=int, help="Source project ID in TheForge")
+    export_p.add_argument("--out", type=str, default=None, metavar="PATH",
+                          help="Output directory (default: ./equipa-template-<project_id>)")
+    export_p.add_argument("--archive", action="store_true",
+                          help="Pack the result into a single .tar.gz archive")
+    export_p.add_argument("--scrub-costs", action="store_true",
+                          help="Null out cost_usd column in exported agent_runs")
+
+    import_p = sub.add_parser("import", help="Import a template archive into the local TheForge DB")
+    import_p.add_argument("archive_path", type=str,
+                          help="Template directory or .tar.gz archive to import")
+    import_p.add_argument("--name", type=str, default=None,
+                          help="Override the imported project's name")
+    import_p.add_argument("--on-conflict", choices=["rename", "merge", "fail"],
+                          default="rename",
+                          help="Strategy when target name already exists (default: rename)")
+    import_p.add_argument("--re-embed", action="store_true",
+                          help="Regenerate embeddings for imported lessons")
+    import_p.add_argument("--force", action="store_true",
+                          help="Overwrite existing files in the target project working dir")
+
+    validate_p = sub.add_parser("validate", help="Validate a template manifest (CI-friendly)")
+    validate_p.add_argument("archive_path", type=str,
+                            help="Template directory or .tar.gz archive to validate")
+
+    return parser
+
+
+def _template_feature_enabled(dispatch_config_arg: str | None) -> bool:
+    """Resolve the project_templates feature flag using the same loader the
+    main CLI uses. Kept separate so the template surface works without
+    invoking the full async_main argparse path."""
+    cfg = load_dispatch_config(dispatch_config_arg)
+    return is_feature_enabled(cfg, "project_templates")
+
+
+def _resolve_template_dir(archive_path: str) -> Path:
+    """Resolve an archive path to the directory containing manifest.json.
+
+    Accepts either a directory or a .tar.gz archive. Archives are extracted
+    into a temp dir; the caller is responsible for cleanup if needed.
+    For ``validate``, we extract to a temp dir and let the OS reap it on
+    process exit — validate runs short and we never need the directory
+    after returning.
+    """
+    import tempfile
+
+    p = Path(archive_path)
+    if not p.exists():
+        raise FileNotFoundError(f"archive not found: {archive_path}")
+    if p.is_dir():
+        return p
+    if p.is_file() and p.name.endswith(".tar.gz"):
+        tmp = Path(tempfile.mkdtemp(prefix="equipa-tpl-validate-"))
+        _templates._safe_extract_tar(p, tmp)
+        return _templates._locate_manifest_dir(tmp)
+    raise ValueError(
+        f"archive_path must be a directory or .tar.gz archive: {archive_path}"
+    )
+
+
+def _handle_template_subcommand(argv: list[str]) -> int:
+    """Entry point for ``equipa template ...`` invocations.
+
+    Returns the desired process exit code. Feature-flag-gated: prints a
+    guard message and returns 2 when the project_templates flag is off.
+    """
+    parser = _build_template_arg_parser()
+    # Allow --dispatch-config FILE before the verb so feature-flag overrides
+    # can be tested in isolation. argparse subparsers don't natively support
+    # parent flags interleaved with the verb, so we strip it manually here.
+    dispatch_cfg_path: str | None = None
+    cleaned: list[str] = []
+    skip_next = False
+    for i, tok in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--dispatch-config":
+            if i + 1 >= len(argv):
+                parser.error("--dispatch-config requires a value")
+            dispatch_cfg_path = argv[i + 1]
+            skip_next = True
+            continue
+        if tok.startswith("--dispatch-config="):
+            dispatch_cfg_path = tok.split("=", 1)[1]
+            continue
+        cleaned.append(tok)
+    args = parser.parse_args(cleaned)
+
+    if not _template_feature_enabled(dispatch_cfg_path):
+        print(_TEMPLATE_FLAG_DISABLED_MSG, file=sys.stderr)
+        return 2
+
+    if args.verb == "export":
+        out_dir = (
+            Path(args.out)
+            if args.out
+            else Path.cwd() / f"equipa-template-{args.project_id}"
+        )
+        try:
+            result_path = _templates.export(
+                args.project_id,
+                out_dir,
+                archive=args.archive,
+                scrub_costs=args.scrub_costs,
+            )
+        except (FileExistsError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(str(result_path))
+        return 0
+
+    if args.verb == "import":
+        try:
+            new_project_id = _templates.import_archive(
+                Path(args.archive_path),
+                target_project_name=args.name,
+                on_conflict=args.on_conflict,
+                force=args.force,
+                re_embed=args.re_embed,
+            )
+        except (FileExistsError, FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"Imported project_id={new_project_id}")
+        return 0
+
+    if args.verb == "validate":
+        try:
+            template_dir = _resolve_template_dir(args.archive_path)
+            manifest_path = template_dir / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(f"manifest.json missing in {template_dir}")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            _templates.validate_manifest(manifest)
+            _templates._verify_file_hashes(template_dir, manifest)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            print(f"INVALID: {exc}", file=sys.stderr)
+            return 1
+        print(f"OK: {args.archive_path}")
+        return 0
+
+    parser.error(f"unknown verb: {args.verb}")
+    return 2  # pragma: no cover (parser.error exits)
 
 
 # --- Main Entry Points ---
@@ -853,6 +1019,12 @@ def main() -> None:
     _discover_roles()
 
     load_plugins(_hooks_module)
+
+    # 'equipa template <verb> ...' subcommand short-circuit. Handled here
+    # so the existing mutually-exclusive flag group in async_main does not
+    # need to learn about it.
+    if len(sys.argv) >= 2 and sys.argv[1] == "template":
+        sys.exit(_handle_template_subcommand(sys.argv[2:]))
 
     # Check sys.argv to determine if --project mode (no parse_args needed)
     is_project_mode = "--project" in sys.argv and "--task" not in sys.argv and "--tasks" not in sys.argv
