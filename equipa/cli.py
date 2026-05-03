@@ -33,6 +33,7 @@ from equipa.agent_runner import build_cli_command, run_agent_streaming, run_agen
 from equipa.checkpoints import load_checkpoint
 from equipa.db import record_agent_run, update_task_status
 from equipa.dispatch import (
+    _build_dispatch_attempt_reflection,
     apply_dispatch_filters,
     cleanup_failed_attempt,
     is_feature_enabled,
@@ -47,6 +48,7 @@ from equipa.dispatch import (
     validate_goals,
 )
 from equipa.git_ops import setup_all_repos
+import equipa.hooks as _hooks_module
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     run_dev_test_loop,
@@ -54,6 +56,7 @@ from equipa.loops import (
     run_security_review,
 )
 from equipa.manager import run_manager_loop
+from equipa.mcp_server import run_server
 from equipa.monitoring import calculate_dynamic_budget
 from equipa.output import (
     log,
@@ -63,9 +66,11 @@ from equipa.output import (
     print_summary,
 )
 from equipa.parsing import estimate_tokens
+from equipa.plugins import load_plugins
 from equipa.prompts import build_planner_prompt, build_system_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import _discover_roles, get_role_model, get_role_turns
+from equipa.routing import record_model_outcome
 from equipa.security import write_skill_manifest
 from equipa.tasks import (
     fetch_next_todo,
@@ -249,7 +254,6 @@ async def _post_task_telemetry(
     update_injected_episode_q_values_for_task(task["id"], outcome, output=output)
 
     # Record model outcome for circuit breaker (cost routing)
-    from equipa.routing import record_model_outcome
     success = outcome in ("tests_passed", "no_tests")
     record_model_outcome(model, success)
 
@@ -325,7 +329,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 async def run_mode_mcp_server(args: argparse.Namespace) -> None:
     """Run as MCP server (JSON-RPC over stdio)."""
-    from equipa.mcp_server import run_server
     run_server()
 
 
@@ -641,7 +644,6 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 break
 
             # Capture reflection from the failed attempt for cross-attempt memory
-            from equipa.dispatch import _build_dispatch_attempt_reflection
             attempt_reflections.append(
                 _build_dispatch_attempt_reflection(
                     retry_count + 1, outcome, cycles, result,
@@ -850,8 +852,6 @@ def main() -> None:
     load_config()
     _discover_roles()
 
-    from equipa.plugins import load_plugins
-    import equipa.hooks as _hooks_module
     load_plugins(_hooks_module)
 
     # Check sys.argv to determine if --project mode (no parse_args needed)
