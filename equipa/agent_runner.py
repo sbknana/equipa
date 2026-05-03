@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import random
 import subprocess
 import time
 from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from equipa.prompts import PromptResult
@@ -194,7 +197,7 @@ def build_cli_command(
         _effort = _dc.get('effort')
         if _effort:
             cmd.extend(["--effort", _effort])
-    except Exception:
+    except (ImportError, FileNotFoundError, OSError, KeyError, ValueError):
         pass  # config missing/unloadable → CLI default effort
 
     # stream-json requires --verbose
@@ -296,7 +299,7 @@ async def run_agent(
                         process.communicate(), timeout=5,
                     )
                     partial_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-                except Exception:
+                except (asyncio.TimeoutError, OSError, ProcessLookupError):
                     partial_text = ""
                 duration = time.time() - start_time
                 return {
@@ -1063,7 +1066,11 @@ async def _run_agent_streaming_impl(
                                         f"via {tool_label}", output)
 
     except Exception as e:
+        # Justified broad catch: the streaming monitor parses arbitrary JSON tool events
+        # from a long-lived subprocess; any unexpected event shape must NOT crash the
+        # orchestrator. Reason captured into early_term_reason for surfacing upstream.
         early_term_reason = f"Streaming monitor error: {e}"
+        logger.exception("[Telemetry] streaming monitor caught unexpected error")
 
     # --- Kill process if still running ---
     if process.returncode is None:
@@ -1071,7 +1078,7 @@ async def _run_agent_streaming_impl(
         process.kill()
         try:
             await asyncio.wait_for(process.communicate(), timeout=5)
-        except Exception:
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
             pass
 
     duration = time.time() - start_time
@@ -1087,7 +1094,7 @@ async def _run_agent_streaming_impl(
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
         if stderr_text:
             result["errors"].append(f"stderr: {stderr_text}")
-    except Exception:
+    except (asyncio.TimeoutError, OSError, AttributeError):
         pass
 
     # Bulk insert action log to agent_actions table

@@ -11,10 +11,13 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
 from equipa.constants import THEFORGE_DB
+
+logger = logging.getLogger(__name__)
 
 
 # --- Connection ---
@@ -185,8 +188,10 @@ def ensure_schema() -> None:
         conn.commit()
         conn.close()
         _SCHEMA_ENSURED = True
-    except Exception as e:
-        print(f"  [Schema] WARNING: Could not ensure tables: {e}")
+    except sqlite3.Error as e:
+        # Schema creation is best-effort — db_migrate.py is the primary path.
+        # Log but do not crash the orchestrator if it fails here.
+        logger.exception("[Schema] Could not ensure tables: %s", e)
 
 
 # --- Record Functions ---
@@ -269,9 +274,10 @@ def record_agent_run(
         log(f"  [Telemetry] Recorded agent run: role={role}, outcome={outcome}, "
             f"turns={num_turns}/{max_turns}{budget_info}{version_info}, "
             f"duration={duration:.0f}s", output)
-    except Exception as e:
-        # Use print fallback — log() might not be available
-        print(f"  [Telemetry] WARNING: Failed to record agent run: {e}")
+    except Exception:
+        # Telemetry must NEVER crash the orchestrator. Catch broadly here, but
+        # use logger.exception() so ops can grep for [Telemetry] tracebacks.
+        logger.exception("[Telemetry] Failed to record agent run")
 
 
 def _get_latest_agent_run_id(task_id: int) -> int | None:
@@ -287,7 +293,8 @@ def _get_latest_agent_run_id(task_id: int) -> int | None:
         ).fetchone()
         conn.close()
         return row["id"] if row else None
-    except Exception:
+    except sqlite3.Error:
+        logger.exception("[Telemetry] Failed to look up latest agent run id")
         return None
 
 
@@ -351,7 +358,10 @@ def log_agent_action(
         conn.commit()
         conn.close()
     except Exception:
-        pass  # Never crash the orchestrator for telemetry
+        # Telemetry must NEVER crash the orchestrator (broad except is intentional
+        # here). Previously this was a silent `pass` — now ops can grep
+        # [Telemetry] in logs for swallowed errors.
+        logger.exception("[Telemetry] Failed to log agent action")
 
 
 def bulk_log_agent_actions(
@@ -388,8 +398,9 @@ def bulk_log_agent_actions(
         )
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"  [ActionLog] WARNING: Failed to bulk insert actions: {e}")
+    except Exception:
+        # Telemetry must NEVER crash the orchestrator.
+        logger.exception("[Telemetry] Failed to bulk insert agent actions")
 
 
 # --- Task Status ---
@@ -429,7 +440,10 @@ def update_task_status(
         )
         conn.commit()
         log(f"  [DB] Task {task_id}: {current} -> {new_status} (outcome: {outcome})", output)
-    except Exception as e:
+    except sqlite3.Error as e:
+        # Real logic path (not telemetry) — narrow to sqlite errors only so
+        # programmer bugs (KeyError, AttributeError) still surface as crashes.
         log(f"  [DB] ERROR updating task {task_id}: {e}", output)
+        logger.exception("[DB] Failed to update task %s status", task_id)
     finally:
         conn.close()

@@ -93,7 +93,8 @@ class TestGetEmbedding:
     @patch("urllib.request.urlopen")
     def test_ollama_down_returns_none(self, mock_urlopen):
         """Connection error returns None gracefully."""
-        mock_urlopen.side_effect = Exception("Connection refused")
+        # Use realistic transport error — narrowed except catches URLError/OSError
+        mock_urlopen.side_effect = ConnectionRefusedError("Connection refused")
         result = get_embedding("test text")
         assert result is None
 
@@ -160,7 +161,8 @@ class TestEmbedAndStoreLesson:
     def test_db_error_returns_false(self, mock_connect, mock_get_embedding):
         """Database error returns False."""
         mock_get_embedding.return_value = [0.1, 0.2]
-        mock_connect.side_effect = Exception("DB error")
+        # Use sqlite3.Error subclass — narrowed except catches sqlite3.Error
+        mock_connect.side_effect = sqlite3.OperationalError("DB error")
         result = embed_and_store_lesson(123, "test")
         assert result is False
 
@@ -262,7 +264,8 @@ class TestFindSimilarByEmbedding:
     def test_db_error_returns_empty(self, mock_connect, mock_get_embedding):
         """Database error returns empty list."""
         mock_get_embedding.return_value = [0.1, 0.2]
-        mock_connect.side_effect = Exception("DB error")
+        # Use sqlite3.Error subclass — narrowed except catches sqlite3.Error
+        mock_connect.side_effect = sqlite3.OperationalError("DB error")
         result = find_similar_by_embedding("query", "lessons")
         assert result == []
 
