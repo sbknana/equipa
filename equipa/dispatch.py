@@ -1279,6 +1279,10 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
     All tasks must belong to the same project (for safety).
+
+    When ``args.use_flow`` is true (or the parallel fanout has more than
+    one task), a row in the ``flows`` table tracks the orchestration so
+    the run survives a Claudinator restart and supports sticky cancel.
     """
     # Fetch all tasks
     tasks = fetch_tasks_by_ids(task_ids)
@@ -1306,6 +1310,43 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     max_concurrent = getattr(args, "max_concurrent", None) or 4
     semaphore = asyncio.Semaphore(max_concurrent)
 
+    # --- Task Flow tracking (durable revisions + sticky cancel) ---
+    # The flow row is created up front so a mid-run restart can find it.
+    flow_id: int | None = None
+    use_flow = getattr(args, "use_flow", None)
+    if use_flow is None:
+        use_flow = len(tasks) > 1
+    if use_flow:
+        try:
+            from equipa import flows as _flows
+            flow = _flows.create_flow(
+                project_id=project_id,
+                title=(getattr(args, "flow_title", None)
+                       or f"parallel fanout: {len(tasks)} tasks"),
+                metadata={
+                    "task_ids": [t["id"] for t in tasks],
+                    "max_concurrent": max_concurrent,
+                },
+            )
+            flow_id = flow.id
+            for t in tasks:
+                _flows.add_child(
+                    flow_id,
+                    t["id"],
+                    role=t.get("role") or "developer",
+                    relationship="mirrored",
+                )
+            _flows.transition(
+                flow_id,
+                "running",
+                event="dispatch_start",
+                payload={"task_count": len(tasks)},
+            )
+            print(f"  [Flow] tracking fanout under flow_id={flow_id}")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("[flows] could not create flow: %s", e)
+            flow_id = None
+
     print(f"\nParallel task execution: {len(tasks)} tasks, max {max_concurrent} concurrent")
     for t in tasks:
         print(f"  - #{t['id']}: {t['title']}")
@@ -1331,13 +1372,72 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         output = []
         # Use worktree if available, otherwise shared project_dir
         task_dir = worktree_dirs.get(task["id"], project_dir)
+        # Honour sticky cancel: if the flow was cancelled before we reached
+        # this task, skip the dev-test loop entirely.
+        if flow_id is not None:
+            try:
+                from equipa import flows as _flows
+                if _flows.is_cancelled(flow_id):
+                    log(
+                        f"[Task #{task['id']}] Skipped — flow_id={flow_id} "
+                        f"is sticky-cancelled",
+                        output,
+                    )
+                    return {
+                        "task": task,
+                        "result": {"cost": 0, "duration": 0},
+                        "cycles": 0,
+                        "outcome": "cancelled",
+                        "output": output,
+                        "merge_ok": False,
+                        "needs_merge": False,
+                    }
+            except Exception:  # pragma: no cover
+                logger.exception("[flows] cancel check failed")
+
         async with semaphore:
+            # Re-check after acquiring the semaphore — the flow may have
+            # been cancelled while we were queued.
+            if flow_id is not None:
+                try:
+                    from equipa import flows as _flows
+                    if _flows.is_cancelled(flow_id):
+                        return {
+                            "task": task,
+                            "result": {"cost": 0, "duration": 0},
+                            "cycles": 0,
+                            "outcome": "cancelled",
+                            "output": output,
+                            "merge_ok": False,
+                            "needs_merge": False,
+                        }
+                    _flows.update_child_state(flow_id, task["id"], "running")
+                except Exception:  # pragma: no cover
+                    logger.exception("[flows] child running update failed")
+
             log(f"\n[Task #{task['id']}] Starting: {task['title']}", output)
             result, cycles, outcome = await run_dev_test_loop(
                 task, task_dir, project_context, args, output=output,
             )
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
+            if flow_id is not None:
+                try:
+                    from equipa import flows as _flows
+                    child_state = (
+                        "done"
+                        if outcome in ("tests_passed", "no_tests")
+                        else "failed"
+                    )
+                    _flows.update_child_state(
+                        flow_id, task["id"], child_state,
+                        payload={"outcome": outcome, "cycles": cycles},
+                    )
+                except _flows.FlowCancelled:
+                    # Sticky cancel beat us to the punch — that's fine.
+                    pass
+                except Exception:  # pragma: no cover
+                    logger.exception("[flows] child terminal update failed")
             # Record telemetry
             task_role = task.get("role") or "developer"
             record_agent_run(
@@ -1365,6 +1465,14 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         *[run_one_task(t) for t in tasks],
         return_exceptions=True,
     )
+
+    # Reconcile flow state from final child outcomes.
+    if flow_id is not None:
+        try:
+            from equipa import flows as _flows
+            _flows.reconcile_after_restart(flow_id)
+        except Exception:  # pragma: no cover
+            logger.exception("[flows] post-gather reconcile failed")
 
     # Print results
     print(f"\n{'#' * 60}")
