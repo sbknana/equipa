@@ -19,33 +19,42 @@ def test_git_diff_integration_with_loops():
     """Test that git diff integration is present in loops.py code.
 
     This test verifies the implementation exists by checking the actual
-    code structure rather than running the async function.
+    code structure rather than running the async function. Post-S3 refactor,
+    the git-diff capture lives in _capture_git_diff_context, which is
+    invoked from run_dev_test_loop.
     """
     from equipa import loops
     import inspect
 
-    # Verify run_dev_test_loop contains git diff logic
-    source = inspect.getsource(loops.run_dev_test_loop)
+    # Combined source of the orchestrator + the extracted helper. Either
+    # the inline form (pre-refactor) or the helper invocation (post-refactor)
+    # satisfies the structural assertions below.
+    loop_source = inspect.getsource(loops.run_dev_test_loop)
+    helper_source = inspect.getsource(loops._capture_git_diff_context)
+    source = loop_source + "\n" + helper_source
 
-    # Check for git diff capture — impl uses `import subprocess as _sp`
+    # Check for git diff capture — impl uses subprocess.run inside the helper
     assert "git diff" in source.lower() or "git" in source.lower()
     assert "_sp.run" in source or "subprocess.run" in source
     assert '["git", "diff",' in source
 
     # Check for context building
-    assert "tester_extra_context" in source
+    assert "tester_extra_context" in loop_source
     assert "Developer Changes" in source
 
-    # Check for truncation logic (current impl caps at 3000 chars)
+    # Check for truncation logic (current impl caps at 8000 chars)
     assert "3000" in source or "max_diff_chars" in source
 
     # Check that context is passed to tester
-    assert "extra_context" in source
-    assert "build_system_prompt" in source
+    assert "extra_context" in loop_source
+    assert "build_system_prompt" in loop_source
 
-    # Check for error handling (timeout kwarg in _sp.run calls)
+    # Check for error handling (timeout kwarg in subprocess.run calls)
     assert "except" in source.lower() or "timeout" in source.lower()
     assert "timeout" in source.lower()
+
+    # Refactor invariant: orchestrator delegates to the helper
+    assert "_capture_git_diff_context" in loop_source
 
 
 def test_git_diff_truncation_at_8000_chars():

@@ -277,9 +277,11 @@ def test_same_input_different_output_not_flagged():
 
 def test_constants_values():
     """Test that early termination constants have expected values."""
-    assert EARLY_TERM_WARN_TURNS == 2, f"EARLY_TERM_WARN_TURNS should be 2, got {EARLY_TERM_WARN_TURNS}"
-    assert EARLY_TERM_FINAL_WARN_TURNS == 4, f"EARLY_TERM_FINAL_WARN_TURNS should be 4, got {EARLY_TERM_FINAL_WARN_TURNS}"
-    assert EARLY_TERM_KILL_TURNS == 6, f"EARLY_TERM_KILL_TURNS should be 6, got {EARLY_TERM_KILL_TURNS}"
+    # Loosened on 2026-05-02 (commit d7ac174) for Opus 4.7 retest — 4.7 needs more
+    # reading turns before first edit on EQUIPA-class refactor tasks.
+    assert EARLY_TERM_WARN_TURNS == 12, f"EARLY_TERM_WARN_TURNS should be 12, got {EARLY_TERM_WARN_TURNS}"
+    assert EARLY_TERM_FINAL_WARN_TURNS == 20, f"EARLY_TERM_FINAL_WARN_TURNS should be 20, got {EARLY_TERM_FINAL_WARN_TURNS}"
+    assert EARLY_TERM_KILL_TURNS == 25, f"EARLY_TERM_KILL_TURNS should be 25, got {EARLY_TERM_KILL_TURNS}"
     assert EARLY_TERM_WARN_TURNS < EARLY_TERM_FINAL_WARN_TURNS < EARLY_TERM_KILL_TURNS, \
         f"WARN_TURNS ({EARLY_TERM_WARN_TURNS}) < FINAL_WARN_TURNS ({EARLY_TERM_FINAL_WARN_TURNS}) < KILL_TURNS ({EARLY_TERM_KILL_TURNS})"
 
@@ -1134,9 +1136,13 @@ def test_developer_prompt_has_mandatory_first_actions():
     # Check key directives
     assert "FIRST tool call must be Read" in text, \
         "developer prompt missing first-action Read directive"
-    assert "SECOND tool call must be Edit or Write" in text, \
-        "developer prompt missing second-action Edit/Write directive"
-    assert "Do NOT use Glob or Grep in your first 2 turns" in text, \
+    # Loosened on 2026-05-02 (commit d7ac174) for Opus 4.7 retest:
+    # SECOND must be Read (target file), THIRD must be Edit/Write.
+    assert "SECOND tool call must be Read" in text, \
+        "developer prompt missing second-action Read (target file) directive"
+    assert "THIRD tool call must be Edit or Write" in text, \
+        "developer prompt missing third-action Edit/Write directive"
+    assert "Do NOT use Glob or Grep in your first 3 turns" in text, \
         "developer prompt missing Glob/Grep restriction"
 
 
