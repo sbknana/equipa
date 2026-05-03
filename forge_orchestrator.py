@@ -26,7 +26,6 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 from equipa.env_loader import load_dotenv  # noqa: E402
 load_dotenv()
 
-from equipa import *  # noqa: F401, F403, E402
 from equipa.cli import main, async_main  # noqa: F401, E402
 
 if __name__ == "__main__":
