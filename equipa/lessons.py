@@ -13,11 +13,14 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 
 from equipa.constants import THEFORGE_DB
 from equipa.db import ensure_schema, get_db_connection
+
+logger = logging.getLogger(__name__)
 from equipa.parsing import (
     compute_initial_q_value,
     compute_keyword_overlap,
@@ -111,9 +114,10 @@ def update_lesson_injection_count(lesson_ids: list[int]) -> None:
         )
         conn.commit()
         conn.close()
-    except Exception as e:
-        # Don't fail the orchestrator if lesson update fails
-        print(f"Warning: Failed to update lesson injection count: {e}")
+    except sqlite3.Error:
+        # Lesson-injection counter is telemetry-adjacent — don't crash
+        # the orchestrator, but log so we notice persistent DB issues.
+        logger.exception("[Telemetry] Failed to update lesson injection count")
 
 
 # --- Episode Injection (MemRL pattern) ---
@@ -134,7 +138,10 @@ def get_active_simba_rules():
         ).fetchall()
         conn.close()
         return [{"lesson": r["lesson"], "signature": r["error_signature"]} for r in rows]
-    except Exception:
+    except sqlite3.Error:
+        # Quality-degrading retrieval failure: previously silent. Log it so
+        # we notice when SIMBA rules silently stop being injected.
+        logger.exception("[Lessons] Failed to load active SIMBA rules")
         return []
 
 
@@ -236,9 +243,11 @@ def get_relevant_episodes(
                 )
                 for ep_id, sim_score in similar_episodes:
                     vector_scores[ep_id] = sim_score
-            except Exception:
-                # Ollama down or import failed — gracefully continue without vector scoring
-                pass
+            except (ImportError, OSError, ValueError):
+                # Ollama down (OSError), embeddings module missing (ImportError),
+                # or malformed embedding (ValueError). Continue without vector
+                # scoring but log so we see when retrieval quality degrades.
+                logger.exception("[Lessons] Vector scoring unavailable; falling back to keyword-only")
 
         for ep in episodes:
             score = ep.get("q_value", 0.5)
@@ -321,9 +330,11 @@ def get_relevant_episodes(
                     # Rebuild episodes list in reranked order
                     id_to_ep = {ep["id"]: ep for ep in episodes}
                     episodes = [id_to_ep[c["id"]] for c in reranked if c["id"] in id_to_ep]
-            except Exception:
-                # Graph module unavailable or error — continue without graph reranking
-                pass
+            except (ImportError, sqlite3.Error, KeyError):
+                # Graph module unavailable, DB error, or malformed adjacency.
+                # Continue without graph reranking but log — silent degradation
+                # was masking real bugs in PageRank wiring (see KG-01).
+                logger.exception("[Lessons] Knowledge-graph reranking failed; using base scoring")
 
         # Sort by relevance score descending (if not already reranked by graph)
         if not knowledge_graph_enabled:
@@ -336,8 +347,10 @@ def get_relevant_episodes(
             ep.pop("created_at", None)
 
         return result
-    except Exception as e:
-        print(f"Warning: Failed to fetch relevant episodes: {e}")
+    except sqlite3.Error:
+        # Quality-degrading retrieval failure — log so we see when the
+        # episode bank stops being injected into prompts.
+        logger.exception("[Lessons] Failed to fetch relevant episodes")
         return []
 
 
@@ -471,9 +484,10 @@ def record_agent_episode(
                     if not success:
                         # Ollama down or error — log but don't fail
                         log("  [VectorMemory] Failed to generate episode embedding (Ollama down?)", output)
-            except Exception:
-                # Import failed or unexpected error — continue without embedding
-                pass
+            except (ImportError, OSError, sqlite3.Error):
+                # Embeddings module missing, Ollama unreachable, or DB write
+                # failed. Don't crash the orchestrator but log for visibility.
+                logger.exception("[VectorMemory] Failed to embed episode")
 
         # Log failure classification if present
         failure_class_info = ""
@@ -495,8 +509,10 @@ def record_agent_episode(
         else:
             log(f"  [Reflexion] Recorded episode{failure_class_info} (no reflection in output)", output)
 
-    except Exception as e:
-        print(f"  [Reflexion] WARNING: Failed to record episode: {e}")
+    except Exception:
+        # Reflexion recording is telemetry — must NEVER crash the orchestrator.
+        # Broad except is intentional; logger.exception captures traceback.
+        logger.exception("[Telemetry] Failed to record agent episode")
 
 
 # --- Episode Injection Count & Q-Value Updates ---
@@ -521,8 +537,9 @@ def update_episode_injection_count(episode_ids: list[int]) -> None:
         )
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"Warning: Failed to update episode injection count: {e}")
+    except sqlite3.Error:
+        # Telemetry counter — never crash the orchestrator.
+        logger.exception("[Telemetry] Failed to update episode injection count")
 
 
 def update_episode_q_values(
@@ -561,8 +578,10 @@ def update_episode_q_values(
 
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"Warning: Failed to update episode q_values: {e}")
+    except sqlite3.Error:
+        # MemRL reward signal — narrow to DB errors so caller bugs (TypeError
+        # on bad ep_id) still surface. Telemetry-style swallow with log.
+        logger.exception("[Telemetry] Failed to update episode q_values")
 
 
 def update_injected_episode_q_values_for_task(
@@ -612,6 +631,8 @@ def update_injected_episode_q_values_for_task(
             edges_created = graph.create_coaccessed_edges(ep_ids)
             if edges_created > 0:
                 log(f"  [KnowledgeGraph] Created {edges_created} co-accessed edges between episodes", output)
-        except Exception:
-            # Graph module unavailable or error — continue without graph updates
-            pass
+        except (ImportError, sqlite3.Error):
+            # Graph module not present (extracted module split) or DB error.
+            # Continue without graph updates — log so we notice persistent
+            # failures (KG edge creation is part of retrieval quality).
+            logger.exception("[KnowledgeGraph] Failed to create co-accessed edges")
