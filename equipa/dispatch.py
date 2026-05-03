@@ -47,13 +47,14 @@ from equipa.db import (
     update_task_status,
 )
 from equipa.hooks import fire_async as fire_hook
-from equipa.git_ops import _is_git_repo
+from equipa.git_ops import _is_git_repo, git_run_async
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     run_dev_test_loop,
     run_quality_scoring,
 )
 from equipa.manager import run_manager_loop
+from equipa.parsing import _extract_section
 from equipa.output import (
     log,
     print_dispatch_plan,
@@ -122,8 +123,6 @@ def _build_dispatch_attempt_reflection(
         reason = outcome
 
     # Extract structured fields from agent output if available
-    from equipa.parsing import _extract_section
-
     raw_output = result.get("raw_output", "")
     files_info = ""
     blockers_info = ""
@@ -244,7 +243,6 @@ async def cleanup_failed_attempt(
 
     if _is_git_repo(project_dir):
         try:
-            from equipa.git_ops import git_run_async
             cp = await git_run_async(
                 ["rev-parse", "--verify", "main"], project_dir, timeout=10,
             )
@@ -1004,8 +1002,6 @@ async def _create_isolation_worktrees(
     Uses ``git_run_async`` so the per-task git invocations do not block
     the event loop while parallel task dispatch is queued.
     """
-    from equipa.git_ops import git_run_async
-
     worktree_dirs: dict[int, str] = {}
     worktree_base.mkdir(exist_ok=True)
     for t in tasks:
@@ -1067,8 +1063,6 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
-    from equipa.git_ops import git_run_async
-
     try:
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
@@ -1199,8 +1193,6 @@ async def _stash_uncommitted_in_worktree(
     logged but never raised — cleanup must continue even if the stash
     cannot be saved.
     """
-    from equipa.git_ops import git_run_async
-
     if not Path(wt_path).exists():
         return
     try:
@@ -1240,8 +1232,6 @@ async def _cleanup_worktrees(
     Uses ``git_run_async`` so the per-task ``git worktree remove`` and
     ``git branch -D`` calls do not block the event loop.
     """
-    from equipa.git_ops import git_run_async
-
     for task_id, wt_path in worktree_dirs.items():
         branch_name = f"forge-task-{task_id}"
         try:
