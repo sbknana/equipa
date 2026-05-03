@@ -9,6 +9,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -741,19 +742,53 @@ async def _handle_dev_continuation(
     return "exit", new_count, last_error_type, outcome
 
 
-def _capture_git_diff_context(
+async def _resolve_head_sha(
     project_dir: str,
-    cycle: int,
     output: Any = None,
 ) -> str:
-    """Capture HEAD git diff and format it as tester extra_context.
+    """Return the current HEAD commit SHA, or "HEAD" on failure.
 
-    Returns an empty string when the diff is empty, the command fails, or
-    times out. Diff is truncated at 8000 chars to avoid prompt bloat.
+    Used by the dev-test loop to anchor per-cycle git diffs. Falls back to
+    the literal string "HEAD" so callers can pass the result straight to
+    ``git diff <ref>`` without a None-check; the worst-case behavior is the
+    legacy cumulative diff against the working HEAD.
     """
     from equipa.git_ops import git_run
     try:
-        result = git_run(["diff", "HEAD"], project_dir, timeout=10)
+        result = await asyncio.to_thread(
+            git_run, ["rev-parse", "HEAD"], project_dir, 5
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if sha:
+                return sha
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        log(f"  [git] Could not resolve HEAD SHA: {e}", output)
+    return "HEAD"
+
+
+async def _capture_git_diff_context(
+    project_dir: str,
+    cycle: int,
+    output: Any = None,
+    base_ref: str = "HEAD",
+) -> str:
+    """Capture git diff vs ``base_ref`` and format it as tester extra_context.
+
+    ``base_ref`` defaults to ``HEAD`` for backwards compatibility, but the
+    dev-test loop passes the prior cycle's HEAD SHA so each cycle's tester
+    sees only the changes made in that cycle (avoids cumulative diff bloat).
+
+    The diff command runs in a worker thread via ``asyncio.to_thread`` so the
+    10s subprocess timeout cannot block the event loop. Returns an empty
+    string when the diff is empty, the command fails, or times out. Diff is
+    truncated at 8000 chars to avoid prompt bloat.
+    """
+    from equipa.git_ops import git_run
+    try:
+        result = await asyncio.to_thread(
+            git_run, ["diff", base_ref], project_dir, 10
+        )
         if result.returncode == 0 and result.stdout.strip():
             git_diff = result.stdout.strip()
             max_diff_chars = 8000
@@ -1061,6 +1096,13 @@ async def run_dev_test_loop(
     tester_result: dict[str, Any] = {}
     dev_result: dict[str, Any] = {}
 
+    # Track the HEAD SHA at the end of each cycle so the next cycle's tester
+    # diff only includes that cycle's developer changes. Without this, every
+    # cycle pays the prompt-bloat tax of all prior cycles' diffs (TheForge
+    # task #2145). Falls back to "HEAD" if the initial rev-parse fails so
+    # behavior degrades gracefully to the legacy cumulative diff.
+    prev_cycle_sha = await _resolve_head_sha(project_dir, output)
+
     for cycle in range(1, MAX_DEV_TEST_CYCLES + 1):
         log(f"\n{'=' * 50}", output)
         log(f"  DEV-TEST CYCLE {cycle}/{MAX_DEV_TEST_CYCLES}", output)
@@ -1266,8 +1308,12 @@ async def run_dev_test_loop(
         log(f"\n  [Cycle {cycle}] Running Tester agent "
             f"(budget: {tester_turns_allocated}/{tester_turns_max})...", output)
 
-        # Capture git diff to give tester context about developer changes
-        tester_extra_context = _capture_git_diff_context(project_dir, cycle, output)
+        # Capture git diff to give tester context about developer changes.
+        # Diff against the prior cycle's HEAD SHA so we don't re-send earlier
+        # cycles' diffs to every subsequent tester (see task #2145).
+        tester_extra_context = await _capture_git_diff_context(
+            project_dir, cycle, output, base_ref=prev_cycle_sha,
+        )
         tester_prompt = build_system_prompt(
             task, project_context, project_dir, role="tester",
             dispatch_config=dispatch_config,
@@ -1354,7 +1400,12 @@ async def run_dev_test_loop(
         )
         if outcome_action == "exit":
             return return_result, cycle, outcome_str  # type: ignore[return-value]
-        # outcome_action == "continue_loop" — fall through to next iteration
+        # outcome_action == "continue_loop" — fall through to next iteration.
+        # Refresh prev_cycle_sha so the next cycle's tester diff starts from
+        # this cycle's final HEAD (excluding earlier cycles' commits).
+        next_sha = await _resolve_head_sha(project_dir, output)
+        if next_sha:
+            prev_cycle_sha = next_sha
 
     # All cycles exhausted
     log(f"\n  All {MAX_DEV_TEST_CYCLES} dev-test cycles exhausted. Marking blocked.", output)
