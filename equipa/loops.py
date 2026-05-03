@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from dataclasses import dataclass, field
 from typing import Any
 
 from equipa.agent_runner import (
@@ -937,6 +938,42 @@ def _check_dev_progress(
     return "continue", no_progress_count, ""
 
 
+@dataclass
+class DevTestState:
+    """Per-loop mutable state for run_dev_test_loop.
+
+    Bundles the half-dozen list/set/int/dict mutables that the loop body
+    threads through helper calls so that adding a new branch can no longer
+    silently forget to update one of them. Helper functions still accept
+    the individual fields (so their unit tests stay focused), but the loop
+    body holds a single `state` reference.
+    """
+
+    task_id: int
+    task_role: str
+    compaction_history: list[str] = field(default_factory=list)
+    accumulated_files: set[str] = field(default_factory=set)
+    no_progress_count: int = 0
+    continuation_count: int = 0
+    total_cost: float = 0.0
+    total_duration: float = 0.0
+    last_error_type: str | None = None
+    dev_run_config: dict[str, Any] = field(default_factory=dict)
+    loop_detector: LoopDetector = field(default_factory=LoopDetector)
+
+    def record_progress(self, files_changed: list[str], dev_turns_used: int) -> bool:
+        """Apply the loop's progress rule and update accumulated_files.
+
+        Progress = the developer reported FILES_CHANGED, OR it spent enough
+        turns (>= 3) that we treat the cycle as productive even without a
+        marker. This mirrors `_check_dev_progress` so both call sites stay
+        in lockstep.
+        """
+        if files_changed:
+            self.accumulated_files.update(files_changed)
+        return bool(files_changed) or dev_turns_used >= 3
+
+
 async def run_dev_test_loop(
     task: dict[str, Any],
     project_dir: str,
@@ -970,20 +1007,12 @@ async def run_dev_test_loop(
         project_dir, task_description=task_description, output=output,
     )
 
-    compaction_history: list[str] = []
-    no_progress_count = 0
-    continuation_count = 0
-    total_cost = 0.0
-    total_duration = 0.0
     task_id = task["id"]
-    last_error_type: str | None = None
-    # Per-loop config dict for tracking transient state across cycles
-    # (paralysis retry count, etc.). Initialised here so references at
-    # lines ~702 (read) and ~824 (write) do not raise NameError.
-    # Bootstrap-patched 2026-05-02 — see TheForge task #2095.
-    dev_run_config: dict[str, Any] = {}
-    loop_detector = LoopDetector()
-    accumulated_files: set[str] = set()
+    # Resolve role early so DevTestState carries it for helper calls.
+    task_role = (getattr(task, 'role', None)
+                 or (task.get('role') if isinstance(task, dict) else None)
+                 or "developer")
+    state = DevTestState(task_id=task_id, task_role=task_role)
 
     # Load cost limits from dispatch config (overrides defaults)
     dispatch_config = getattr(args, "dispatch_config", None) if args else None
@@ -998,9 +1027,6 @@ async def run_dev_test_loop(
 
     # Resolve model and turns using adaptive tiering
     complexity = get_task_complexity(task)
-    task_role = (getattr(task, 'role', None)
-                 or (task.get('role') if isinstance(task, dict) else None)
-                 or "developer")
     dev_model = get_role_model(task_role, args, task=task)
     tester_model = get_role_model("tester", args, task=task)
     dev_turns_max = get_role_turns(task_role, args, task=task)
@@ -1023,7 +1049,7 @@ async def run_dev_test_loop(
     checkpoint_text, prev_attempt = load_checkpoint(task_id, role=task_role)
     if checkpoint_text:
         checkpoint_context = build_checkpoint_context(checkpoint_text, prev_attempt)
-        compaction_history.append(checkpoint_context)
+        state.compaction_history.append(checkpoint_context)
         log(f"  [Checkpoint] Loaded checkpoint from attempt #{prev_attempt} "
             f"({len(checkpoint_text)} chars). Agent will continue from there.", output)
 
@@ -1033,10 +1059,10 @@ async def run_dev_test_loop(
             task, project_dir, project_context,
             preflight_lang, preflight_error, args, output=output,
         )
-        total_cost += autofix_cost
+        state.total_cost += autofix_cost
 
         if autofix_ok:
-            compaction_history.append(
+            state.compaction_history.append(
                 f"## Build Auto-Fixed\n\n"
                 f"The build was broken but an auto-fix debugger agent repaired it "
                 f"(method: {autofix_summary}, cost: ${autofix_cost:.2f}).\n"
@@ -1054,7 +1080,7 @@ async def run_dev_test_loop(
             return {
                 "early_terminated": True,
                 "early_term_reason": f"build_broken ({autofix_summary})",
-                "cost": total_cost,
+                "cost": state.total_cost,
                 "duration": 0,
             }, 0, "build_broken"
 
@@ -1070,7 +1096,7 @@ async def run_dev_test_loop(
         await fire_hook(
             "pre_cycle",
             task_id=task_id, cycle=cycle, project_dir=project_dir,
-            total_cost=total_cost,
+            total_cost=state.total_cost,
         )
 
         # --- Developer Phase ---
@@ -1092,14 +1118,14 @@ async def run_dev_test_loop(
         # behavior on retry. See _build_dev_extra_context for the full policy.
         _dc = getattr(args, "dispatch_config", None)
         extra_context = _build_dev_extra_context(
-            compaction_history, cycle, message_context, _dc
+            state.compaction_history, cycle, message_context, _dc
         )
 
         dev_prompt = build_system_prompt(
             task, project_context, project_dir,
             role=task_role, extra_context=extra_context,
             dispatch_config=dispatch_config,
-            error_type=last_error_type,
+            error_type=state.last_error_type,
             max_turns=dev_turns_allocated,
         )
         use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
@@ -1118,7 +1144,7 @@ async def run_dev_test_loop(
         # Extract paralysis retry count so agent_runner can apply tighter
         # kill thresholds. Without this, the escalating prompt injections
         # have no teeth — the agent still gets the full kill budget.
-        paralysis_retries = dev_run_config.get("_paralysis_retry_count", 0)
+        paralysis_retries = state.dev_run_config.get("_paralysis_retry_count", 0)
 
         dev_result = await dispatch_agent(
             dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
@@ -1127,8 +1153,8 @@ async def run_dev_test_loop(
             paralysis_retry_count=paralysis_retries)
         dev_result["turns_allocated"] = dev_turns_allocated
         dev_result["turns_max"] = dev_turns_max
-        total_duration += dev_result.get("duration", 0)
-        total_cost += _accumulate_cost(
+        state.total_duration += dev_result.get("duration", 0)
+        state.total_cost += _accumulate_cost(
             dev_result, f"[Cycle {cycle}] Developer", output)
 
         # --- Lifecycle hooks: post_agent_finish (developer) ---
@@ -1140,11 +1166,11 @@ async def run_dev_test_loop(
         )
 
         # Cost-based circuit breaker
-        cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
+        cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
         if cost_reason:
             log(f"  [Cycle {cycle}] {cost_reason}", output)
-            loop_detector.record(dev_result, cycle)
-            _apply_cost_totals(dev_result, total_cost, total_duration)
+            state.loop_detector.record(dev_result, cycle)
+            _apply_cost_totals(dev_result, state.total_cost, state.total_duration)
             dev_result["early_terminated"] = True
             dev_result["early_term_reason"] = cost_reason
             return dev_result, cycle, "cost_limit_exceeded"
@@ -1153,7 +1179,7 @@ async def run_dev_test_loop(
         if dev_result.get("early_terminated"):
             reason = dev_result.get("early_term_reason", "unknown")
             log(f"  [Cycle {cycle}] Developer early-terminated: {reason}", output)
-            loop_detector.record(dev_result, cycle)
+            state.loop_detector.record(dev_result, cycle)
 
             # If killed for analysis paralysis (no file changes), retry with
             # escalating scaffold-first prompts. Each retry is MORE aggressive
@@ -1161,7 +1187,7 @@ async def run_dev_test_loop(
             # on large codebases — seen in FeatureBench task 3 where the agent
             # hit EarlyTerm on attempts 4, 5, 6, 8, 10.
             if _handle_paralysis_retry(
-                reason, cycle, compaction_history, dev_run_config, output
+                reason, cycle, state.compaction_history, state.dev_run_config, output
             ):
                 continue
 
@@ -1182,22 +1208,22 @@ async def run_dev_test_loop(
                 log(f"  [Cycle {cycle}] Skipping tester — agent reported no "
                     f"changes needed.", output)
                 clear_checkpoints(task_id)
-                dev_result["cost"] = total_cost
-                dev_result["duration"] = total_duration
+                dev_result["cost"] = state.total_cost
+                dev_result["duration"] = state.total_duration
                 return dev_result, cycle, "early_completed_no_changes"
             log(f"  [Cycle {cycle}] Agent completed early with changes — "
                 f"proceeding to tester.", output)
 
         # Check for timeout or max_turns — save checkpoint, optionally
         # continue with recovery context, or exit if continuations exhausted.
-        cont_action, continuation_count, cont_err_type, cont_outcome = (
+        cont_action, state.continuation_count, cont_err_type, cont_outcome = (
             await _handle_dev_continuation(
                 dev_result, task_id, task_role, cycle, prev_attempt,
-                project_dir, continuation_count, compaction_history, output,
+                project_dir, state.continuation_count, state.compaction_history, output,
             )
         )
         if cont_action == "continue":
-            last_error_type = cont_err_type
+            state.last_error_type = cont_err_type
             continue
         if cont_action == "exit":
             return dev_result, cycle, cont_outcome  # type: ignore[return-value]
@@ -1218,7 +1244,7 @@ async def run_dev_test_loop(
         log(f"  [Cycle {cycle}] Compacting developer output "
             f"({dev_turns_used_for_compact} turns)...", output)
         summary = build_compaction_summary("Developer", dev_result, cycle, task)
-        compaction_history.append(summary)
+        state.compaction_history.append(summary)
 
         # Check if Developer marked task blocked
         status = _get_task_status(task["id"])
@@ -1227,12 +1253,12 @@ async def run_dev_test_loop(
             return dev_result, cycle, "developer_blocked"
 
         # Progress detection — track both per-cycle and accumulated changes
-        progress_action, no_progress_count, error_reset = _check_dev_progress(
-            dev_result, accumulated_files, no_progress_count,
+        progress_action, state.no_progress_count, error_reset = _check_dev_progress(
+            dev_result, state.accumulated_files, state.no_progress_count,
             project_dir, cycle, output,
         )
         if error_reset is None:
-            last_error_type = None
+            state.last_error_type = None
         if progress_action == "block":
             return dev_result, cycle, "no_progress"
 
@@ -1246,20 +1272,20 @@ async def run_dev_test_loop(
                 f"{dev_turns_allocated}/{dev_turns_max}", output)
 
         # --- Loop Detection ---
-        loop_action = loop_detector.record(dev_result, cycle)
+        loop_action = state.loop_detector.record(dev_result, cycle)
         if loop_action == "terminate":
             log(f"  [Cycle {cycle}] LOOP DETECTED: Agent repeated the same failing "
-                f"pattern {loop_detector.consecutive_same} times. Terminating early.", output)
-            dev_result.setdefault("errors", []).append(loop_detector.termination_summary())
+                f"pattern {state.loop_detector.consecutive_same} times. Terminating early.", output)
+            dev_result.setdefault("errors", []).append(state.loop_detector.termination_summary())
             return dev_result, cycle, "loop_detected"
         elif loop_action == "warn":
             log(f"  [Cycle {cycle}] Loop warning: Agent has repeated the same pattern "
-                f"{loop_detector.consecutive_same} times. Injecting 'try different approach' "
+                f"{state.loop_detector.consecutive_same} times. Injecting 'try different approach' "
                 f"guidance.", output)
-            compaction_history.append(loop_detector.warning_message())
+            state.compaction_history.append(state.loop_detector.warning_message())
             dev_result.setdefault("errors", []).append(
                 f"Loop warning: agent repeated same pattern "
-                f"{loop_detector.consecutive_same} times (cycle {cycle})"
+                f"{state.loop_detector.consecutive_same} times (cycle {cycle})"
             )
 
         # --- Tester Phase ---
@@ -1292,8 +1318,8 @@ async def run_dev_test_loop(
             project_dir=project_dir, args=args)
         tester_result["turns_allocated"] = tester_turns_allocated
         tester_result["turns_max"] = tester_turns_max
-        total_duration += tester_result.get("duration", 0)
-        total_cost += _accumulate_cost(
+        state.total_duration += tester_result.get("duration", 0)
+        state.total_cost += _accumulate_cost(
             tester_result, f"[Cycle {cycle}] Tester", output)
 
         # --- Lifecycle hooks: post_agent_finish (tester) ---
@@ -1305,10 +1331,10 @@ async def run_dev_test_loop(
         )
 
         # Cost-based circuit breaker after tester phase
-        cost_reason = _check_cost_limit(total_cost, complexity, config_cost_limits)
+        cost_reason = _check_cost_limit(state.total_cost, complexity, config_cost_limits)
         if cost_reason:
             log(f"  [Cycle {cycle}] {cost_reason} (after tester)", output)
-            _apply_cost_totals(tester_result, total_cost, total_duration)
+            _apply_cost_totals(tester_result, state.total_cost, state.total_duration)
             tester_result["early_terminated"] = True
             tester_result["early_term_reason"] = cost_reason
             return tester_result, cycle, "cost_limit_exceeded"
@@ -1332,7 +1358,7 @@ async def run_dev_test_loop(
         log(f"  [Cycle {cycle}] Compacting tester output "
             f"({tester_turns_for_compact} turns)...", output)
         summary = build_compaction_summary("Tester", tester_result, cycle, task)
-        compaction_history.append(summary)
+        state.compaction_history.append(summary)
 
         # Parse Tester output
         test_results = parse_tester_output(tester_result.get("result_text", ""))
@@ -1345,12 +1371,13 @@ async def run_dev_test_loop(
         await fire_hook(
             "post_cycle",
             task_id=task_id, cycle=cycle, project_dir=project_dir,
-            test_outcome=test_outcome, total_cost=total_cost,
+            test_outcome=test_outcome, total_cost=state.total_cost,
         )
 
         outcome_action, return_result, outcome_str = _dispatch_tester_outcome(
             test_results, tester_result, dev_result, cycle, task_id,
-            task_role, total_cost, total_duration, compaction_history, output,
+            task_role, state.total_cost, state.total_duration,
+            state.compaction_history, output,
         )
         if outcome_action == "exit":
             return return_result, cycle, outcome_str  # type: ignore[return-value]
@@ -1358,6 +1385,6 @@ async def run_dev_test_loop(
 
     # All cycles exhausted
     log(f"\n  All {MAX_DEV_TEST_CYCLES} dev-test cycles exhausted. Marking blocked.", output)
-    tester_result["cost"] = total_cost
-    tester_result["duration"] = total_duration
+    tester_result["cost"] = state.total_cost
+    tester_result["duration"] = state.total_duration
     return tester_result, MAX_DEV_TEST_CYCLES, "cycles_exhausted"
