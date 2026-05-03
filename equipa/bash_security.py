@@ -518,9 +518,34 @@ def _check_redirections(unquoted: str) -> BashSecurityResult:
 
 
 def _check_dangerous_variables(unquoted: str) -> BashSecurityResult:
-    """Check 6: Variables used in redirect/pipe context."""
-    if (re.search(r"[<>|]\s*\$[A-Za-z_]", unquoted)
-            or re.search(r"\$[A-Za-z_][A-Za-z0-9_]*\s*[|<>]", unquoted)):
+    """Check 6: Variables used in redirect/pipe context.
+
+    Threat model: ``cat $UNTRUSTED > /etc/passwd`` — an attacker-controlled
+    variable spliced into a pipe or redirect can re-target the command at
+    arbitrary files or pipelines. BUT the same regex matches benign loop
+    bodies like ``for f in *.py; do echo $f | grep TODO; done`` which is
+    common in dev work (task #2096).
+
+    Loosen by allowlisting variables declared in a preceding ``for VAR in``
+    statement within the same command string. The block stands for all
+    other variable references in pipe/redirect contexts.
+    """
+    pipe_var_re = re.compile(r"[<>|]\s*\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+    var_pipe_re = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\s*[|<>]")
+    matches = list(pipe_var_re.finditer(unquoted)) + list(var_pipe_re.finditer(unquoted))
+    if not matches:
+        return _SAFE
+
+    # Collect names declared as loop variables earlier in the command.
+    loop_vars = {
+        m.group(1)
+        for m in re.finditer(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", unquoted)
+    }
+
+    for m in matches:
+        var_name = m.group(1)
+        if var_name in loop_vars:
+            continue
         return BashSecurityResult(
             safe=False, check_id=CheckID.DANGEROUS_VARIABLES,
             message="Command contains variables in dangerous contexts (redirections or pipes)",
