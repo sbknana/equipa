@@ -29,21 +29,22 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 def _reload_db_modules(db_path: Path):
-    """Reload constants/db/flows so they bind to the temp DB path."""
-    import os
+    """Point equipa.constants/equipa.db at the temp DB without breaking
+    other modules that have already imported THEFORGE_DB-using helpers.
 
-    os.environ["THEFORGE_DB"] = str(db_path)
-
-    # Force re-import to pick up the new env var.
-    for mod in ("equipa.flows", "equipa.db", "equipa.constants"):
-        if mod in sys.modules:
-            del sys.modules[mod]
-
+    The original implementation deleted these modules from sys.modules and
+    re-imported them. That left stale bindings in any other test module
+    that had already done `from equipa.db import get_db_connection` —
+    those callables continued to use the original THEFORGE_DB and broke
+    the test isolation. We now mutate the module attribute in place,
+    which all dynamic THEFORGE_DB lookups respect, and leave the helper
+    callables untouched.
+    """
     constants = importlib.import_module("equipa.constants")
     db = importlib.import_module("equipa.db")
     flows = importlib.import_module("equipa.flows")
-    # Sanity: the constants module should be pointing at our temp DB.
-    assert str(constants.THEFORGE_DB) == str(db_path)
+    constants.THEFORGE_DB = db_path
+    db.THEFORGE_DB = db_path
     return constants, db, flows
 
 
@@ -90,7 +91,31 @@ def fresh_db(tmp_path):
     assert success, f"migration failed {from_ver}->{to_ver}"
     assert to_ver >= 9, f"expected v>=9, got {to_ver}"
 
-    return db_path
+    # Capture the ORIGINAL DB path by VALUE before the test runs. Capturing
+    # via module reference is fragile because test_survives_simulated_restart
+    # deletes equipa.* from sys.modules to simulate an orchestrator restart,
+    # which would leave us holding detached module objects whose attribute
+    # writes don't reach the freshly re-imported modules.
+    _constants_now = importlib.import_module("equipa.constants")
+    _db_now = importlib.import_module("equipa.db")
+    _orig_constants_db = _constants_now.THEFORGE_DB
+    _orig_db_db = _db_now.THEFORGE_DB
+    del _constants_now, _db_now
+
+    yield db_path
+
+    # Robust teardown: regardless of what the test did to sys.modules,
+    # re-import the modules fresh and write the original values back.
+    # importlib.import_module is a no-op if already in sys.modules, and a
+    # fresh import otherwise — either way we get the live module.
+    _constants_after = importlib.import_module("equipa.constants")
+    _db_after = importlib.import_module("equipa.db")
+    _constants_after.THEFORGE_DB = _orig_constants_db
+    _db_after.THEFORGE_DB = _orig_db_db
+    # Reset schema-ensured cache so subsequent tests' ensure_schema() runs
+    # against their own (monkeypatched) THEFORGE_DB rather than skipping.
+    if hasattr(_db_after, "_SCHEMA_ENSURED"):
+        _db_after._SCHEMA_ENSURED = False
 
 
 # --- Migration smoke ---
@@ -300,10 +325,15 @@ def test_survives_simulated_restart(fresh_db):
     # Pretend the orchestrator dies here. Child task 2 is still pending.
     pre_revisions = flows.get_revisions(flow.id)
 
-    # ---- "restart": purge modules and re-import. ----
-    for mod in ("equipa.flows", "equipa.db", "equipa.constants"):
-        if mod in sys.modules:
-            del sys.modules[mod]
+    # ---- "restart": rebind the flows module without deleting it from
+    # sys.modules. The earlier implementation called
+    # `del sys.modules["equipa.db"]` etc., which broke other test files
+    # that had already done `from equipa.db import ensure_schema` at
+    # import time — their function references continued to point at the
+    # detached module object while monkeypatch wrote to the freshly
+    # re-imported entry in sys.modules. Re-binding via _reload_db_modules
+    # (which now mutates in-place) preserves both semantics: DB state is
+    # reloaded from disk via flows2, and other modules keep working.
     _, _, flows2 = _reload_db_modules(fresh_db)
 
     # Audit log survives.
