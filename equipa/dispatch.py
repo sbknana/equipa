@@ -18,9 +18,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from equipa.config import (
     DEFAULT_DISPATCH_CONFIG,
