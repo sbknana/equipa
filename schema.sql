@@ -335,6 +335,12 @@ CREATE TABLE lessons_learned (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Partial unique index supporting INSERT ON CONFLICT upserts in
+-- _create_review_lessons. Scoped to active=1 so deactivated lessons
+-- can coexist with newer active ones for the same (signature, source).
+CREATE UNIQUE INDEX idx_lessons_sig_source_active
+    ON lessons_learned(error_signature, source) WHERE active = 1;
+
 CREATE TABLE agent_episodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER,
