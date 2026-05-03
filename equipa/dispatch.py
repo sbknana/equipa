@@ -551,9 +551,14 @@ async def run_project_tasks(
             log(f"  [Autoresearch] Task #{task_id} failed ({outcome}). "
                 f"Retry {retry_count}/{max_retries}...", output)
 
-            # Clean up failed git branch and reset task for next attempt
-            cleanup_failed_attempt(
-                task_id, project_dir, attempt_reflections, output=output,
+            # Clean up failed git branch and reset task for next attempt.
+            # Wrapped in asyncio.to_thread so the multiple subprocess.run
+            # calls inside cleanup_failed_attempt do NOT block the event
+            # loop — important when this runs concurrently with other
+            # tasks under run_parallel_tasks.
+            await asyncio.to_thread(
+                cleanup_failed_attempt,
+                task_id, project_dir, attempt_reflections, output,
             )
 
             # Re-fetch task to get clean state (with injected reflections)
@@ -1249,8 +1254,13 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # Create per-task git worktrees for filesystem isolation
     worktree_base = Path(project_dir) / ".forge-worktrees"
     use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
+    # Worktree creation issues 2-3 git commands per task. Run in a worker
+    # thread so the event loop is not blocked while the loop is otherwise
+    # idle waiting on agent dispatch.
     worktree_dirs: dict[int, str] = (
-        _create_isolation_worktrees(tasks, project_dir, worktree_base)
+        await asyncio.to_thread(
+            _create_isolation_worktrees, tasks, project_dir, worktree_base,
+        )
         if use_worktrees else {}
     )
 
@@ -1350,12 +1360,21 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         for r in merge_candidates:
             task_id = r["task"]["id"]
             branch_name = f"forge-task-{task_id}"
-            if _merge_task_branch(project_dir, task_id, branch_name):
+            # Each merge issues 6-12 subprocess.run calls; run them in a
+            # worker thread to keep the event loop responsive (e.g. for
+            # any background tasks still draining post-gather).
+            merge_ok = await asyncio.to_thread(
+                _merge_task_branch, project_dir, task_id, branch_name,
+            )
+            if merge_ok:
                 r["merge_ok"] = True
                 merged_tasks_seq.add(task_id)
 
-    # Clean up worktrees — only delete branches that were successfully merged
+    # Clean up worktrees — only delete branches that were successfully merged.
+    # Wrapped in asyncio.to_thread so the per-task `git worktree remove` and
+    # `git branch -D` calls do not block the event loop.
     if use_worktrees:
-        _cleanup_worktrees(
+        await asyncio.to_thread(
+            _cleanup_worktrees,
             project_dir, worktree_dirs, merged_tasks_seq, worktree_base,
         )
