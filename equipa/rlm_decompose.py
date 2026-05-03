@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from equipa.output import log
+from equipa.parsing import estimate_tokens
 
 # --- Configuration ---
 
@@ -97,10 +98,7 @@ class DecomposeResult:
 
 
 # --- Token Estimation ---
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count from character length (4 chars/token heuristic)."""
-    return max(1, math.ceil(len(text) / CHARS_PER_TOKEN))
+# estimate_tokens is imported from equipa.parsing (canonical implementation).
 
 
 def estimate_repo_tokens(repo_files: dict[str, str]) -> int:
