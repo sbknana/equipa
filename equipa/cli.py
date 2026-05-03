@@ -256,8 +256,12 @@ async def _post_task_telemetry(
 
 # --- Main Entry Points ---
 
-async def async_main() -> None:
-    """Main entry point."""
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the argparse parser for async_main.
+
+    Extracted so the parser definition is testable in isolation and so
+    async_main itself stays focused on dispatch.
+    """
     parser = argparse.ArgumentParser(
         description="EQUIPA: Run AI agents on TheForge tasks"
     )
@@ -314,247 +318,210 @@ async def async_main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print command without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
-    args = parser.parse_args()
+    return parser
 
-    # Auto-detect non-TTY (nohup, SSH pipe, etc.) and default to --yes
-    if not args.yes and not sys.stdin.isatty():
-        args.yes = True
-        print("Non-interactive mode detected (stdin is not a TTY). Auto-enabling --yes.")
 
-    # Validate --goal requires --goal-project
-    if args.goal and not args.goal_project:
-        parser.error("--goal requires --goal-project <project_id>")
+# --- Per-Mode Handlers ---
 
-    # Warn if --dev-test combined with --role
-    if args.dev_test and args.role != "developer":
-        print(f"WARNING: --dev-test mode ignores --role ('{args.role}'). "
-              f"Loop uses Developer + Tester automatically.")
+async def run_mode_mcp_server(args: argparse.Namespace) -> None:
+    """Run as MCP server (JSON-RPC over stdio)."""
+    from equipa.mcp_server import run_server
+    run_server()
 
-    # Load dispatch config globally so model tiering and adaptive turns work in all modes
-    args.dispatch_config = load_dispatch_config(args.dispatch_config)
 
-    # --- Auth availability check (Max subscription OR API key) ---
-    # Warn only when neither auth source is present. The Claude CLI accepts
-    # either an ANTHROPIC_API_KEY env var OR a Max subscription credential
-    # file at ~/.claude/.credentials.json. The previous version warned on
-    # missing API key alone, which produced misleading warnings for users
-    # running on a Max subscription.
-    provider = (args.dispatch_config or {}).get("provider", "claude")
-    if provider != "ollama" and args.provider != "ollama":
-        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-        max_creds_path = Path.home() / ".claude" / ".credentials.json"
-        has_max_creds = max_creds_path.is_file()
-        if not has_api_key and not has_max_creds:
-            print(
-                "WARNING: No Claude credentials found.\n"
-                "  Neither ANTHROPIC_API_KEY is set nor ~/.claude/.credentials.json exists.\n"
-                "  Background/nohup processes do not source ~/.bashrc.\n"
-                "  Fix one of:\n"
-                "    - Sign in with `claude login` to use a Max subscription, OR\n"
-                "    - Create a .env file in the EQUIPA project root with:\n"
-                "        ANTHROPIC_API_KEY=sk-ant-...\n"
-                "    - Or export it in /etc/environment for system-wide access."
-            )
+async def run_mode_regenerate_manifest(args: argparse.Namespace) -> None:
+    """Regenerate skill_manifest.json with SHA-256 hashes."""
+    write_skill_manifest()
 
-    # --- MCP server mode ---
-    if args.mcp_server:
-        from equipa.mcp_server import run_server
-        run_server()
+
+async def run_mode_add_project(args: argparse.Namespace) -> None:
+    """Register a new project in EQUIPA DB and config."""
+    if not args.project_dir:
+        # Re-create a minimal parser to surface the same error message format
+        # used by the original implementation.
+        _build_arg_parser().error("--add-project requires --project-dir <path>")
+    _handle_add_project(args.add_project, args.project_dir)
+
+
+async def run_mode_setup_repos(args: argparse.Namespace) -> None:
+    """Init git + GitHub private repo for one or all projects."""
+    setup_all_repos(args)
+
+
+async def run_mode_auto_run(args: argparse.Namespace) -> None:
+    """Auto-scan projects and dispatch work by priority."""
+    dispatch_config = args.dispatch_config
+
+    # CLI overrides
+    if args.max_concurrent is not None:
+        dispatch_config["max_concurrent"] = args.max_concurrent
+    if args.max_tasks_per_project is not None:
+        dispatch_config["max_tasks_per_project"] = args.max_tasks_per_project
+
+    # Scan DB for pending work
+    print("Scanning TheForge for pending work...")
+    work = scan_pending_work()
+    if not work:
+        print("No projects with todo tasks found.")
         return
 
-    # --- Regenerate skill manifest mode ---
-    if args.regenerate_manifest:
-        write_skill_manifest()
+    # Apply filters
+    work = apply_dispatch_filters(work, dispatch_config, args)
+    if not work:
+        print("No projects match filters (check --only-project, skip_projects, only_projects).")
         return
 
-    # --- Add project mode ---
-    if args.add_project:
-        if not args.project_dir:
-            parser.error("--add-project requires --project-dir <path>")
-        _handle_add_project(args.add_project, args.project_dir)
-        return
+    # Score and sort
+    for proj in work:
+        score_project(proj, dispatch_config)
+    work.sort(key=lambda p: p.get("score", 0), reverse=True)
 
-    # --- Setup repos mode (Phase 4B) ---
-    if args.setup_repos or args.setup_repos_project:
-        setup_all_repos(args)
-        return
-
-    # --- Auto-run mode (Phase 5) ---
-    if args.auto_run:
-        dispatch_config = args.dispatch_config
-
-        # CLI overrides
-        if args.max_concurrent is not None:
-            dispatch_config["max_concurrent"] = args.max_concurrent
-        if args.max_tasks_per_project is not None:
-            dispatch_config["max_tasks_per_project"] = args.max_tasks_per_project
-
-        # Scan DB for pending work
-        print("Scanning TheForge for pending work...")
-        work = scan_pending_work()
-        if not work:
-            print("No projects with todo tasks found.")
-            return
-
-        # Apply filters
-        work = apply_dispatch_filters(work, dispatch_config, args)
-        if not work:
-            print("No projects match filters (check --only-project, skip_projects, only_projects).")
-            return
-
-        # Score and sort
-        for proj in work:
-            score_project(proj, dispatch_config)
-        work.sort(key=lambda p: p.get("score", 0), reverse=True)
-
-        # Dry run: show plan and exit
-        if args.dry_run:
-            print("\n--- DRY RUN (Auto-Run) ---")
-            print_dispatch_plan(work, dispatch_config)
-            print("\n--- END DRY RUN ---")
-            return
-
-        # Show plan and confirm
+    # Dry run: show plan and exit
+    if args.dry_run:
+        print("\n--- DRY RUN (Auto-Run) ---")
         print_dispatch_plan(work, dispatch_config)
-
-        if not args.yes:
-            response = input("\nProceed with dispatch? (y/n): ").strip().lower()
-            if response != "y":
-                print("Aborted.")
-                return
-
-        # Dispatch
-        await run_auto_dispatch(work, dispatch_config, args)
+        print("\n--- END DRY RUN ---")
         return
 
-    # --- Parallel goals mode (Phase 4A) ---
-    if args.parallel_goals:
-        defaults, goals = load_goals_file(args.parallel_goals)
-        resolved_goals = validate_goals(goals)
+    # Show plan and confirm
+    print_dispatch_plan(work, dispatch_config)
 
-        # Apply per-goal defaults from file, allow CLI overrides
-        if args.max_concurrent is not None:
-            defaults["max_concurrent"] = args.max_concurrent
-
-        if args.dry_run:
-            print("\n--- DRY RUN (Parallel Goals) ---")
-            print(f"Goals file: {args.parallel_goals}")
-            print(f"Goals: {len(resolved_goals)}")
-            print(f"Max concurrent: {defaults['max_concurrent']}")
-            print(f"Default model: {defaults['model']}")
-            print(f"Default max turns: {defaults['max_turns']}")
-            print(f"Default max rounds: {defaults['max_rounds']}")
-            print()
-            for i, g in enumerate(resolved_goals):
-                model = g.get("model", defaults["model"])
-                print(f"  [{i + 1}] Project: {g['project_info']['name']} (ID: {g['project_id']})")
-                print(f"      Goal: {g['goal'][:80]}")
-                print(f"      Dir: {g['project_dir']}")
-                print(f"      Model: {model}")
-                planner_prompt = build_planner_prompt(
-                    g["goal"], g["project_id"], g["project_dir"],
-                    fetch_project_context(g["project_id"]),
-                )
-                print(f"      Planner prompt: {len(planner_prompt)} chars")
-                print()
-            print("--- END DRY RUN ---")
+    if not args.yes:
+        response = input("\nProceed with dispatch? (y/n): ").strip().lower()
+        if response != "y":
+            print("Aborted.")
             return
 
-        # Confirm
-        if not args.yes:
-            print(f"\nAbout to run {len(resolved_goals)} goals "
-                  f"(max {defaults['max_concurrent']} concurrent).")
-            for i, g in enumerate(resolved_goals):
-                print(f"  [{i + 1}] {g['project_info']['name']}: {g['goal'][:60]}")
-            response = input("\nProceed? (y/n): ").strip().lower()
-            if response != "y":
-                print("Aborted.")
-                return
+    # Dispatch
+    await run_auto_dispatch(work, dispatch_config, args)
 
-        await run_parallel_goals(resolved_goals, defaults, args)
-        return
 
-    # --- Manager mode (Phase 3) ---
-    if args.goal:
-        project_info = fetch_project_info(args.goal_project)
-        if not project_info:
-            print(f"ERROR: Project {args.goal_project} not found in TheForge")
-            sys.exit(1)
+async def run_mode_parallel_goals(args: argparse.Namespace) -> None:
+    """Run multiple goals in parallel from a goals JSON file."""
+    defaults, goals = load_goals_file(args.parallel_goals)
+    resolved_goals = validate_goals(goals)
 
-        # Resolve project directory from project info
-        codename = project_info.get("codename", "").lower().strip()
-        project_name = project_info.get("name", "").lower().strip()
-        project_dir = _equipa_constants.PROJECT_DIRS.get(codename) or _equipa_constants.PROJECT_DIRS.get(project_name)
+    # Apply per-goal defaults from file, allow CLI overrides
+    if args.max_concurrent is not None:
+        defaults["max_concurrent"] = args.max_concurrent
 
-        if not project_dir:
-            print(f"ERROR: Could not find project directory for '{project_info.get('name', 'Unknown')}'")
-            print("Known projects:", ", ".join(sorted(_equipa_constants.PROJECT_DIRS.keys())))
-            sys.exit(1)
-
-        if not Path(project_dir).exists():
-            print(f"ERROR: Project directory does not exist: {project_dir}")
-            sys.exit(1)
-
-        project_context = fetch_project_context(args.goal_project)
-
-        # Show goal info
-        print(f"\nGoal: {args.goal}")
-        print(f"Project: {project_info.get('name', 'Unknown')} (ID: {args.goal_project})")
-        print(f"Directory: {project_dir}")
-        print(f"Model: {args.model}")
-        print(f"Max turns/agent: {args.max_turns}")
-        print(f"Max rounds: {args.max_rounds}")
-
-        if args.dry_run:
-            # Show what the planner prompt would look like
+    if args.dry_run:
+        print("\n--- DRY RUN (Parallel Goals) ---")
+        print(f"Goals file: {args.parallel_goals}")
+        print(f"Goals: {len(resolved_goals)}")
+        print(f"Max concurrent: {defaults['max_concurrent']}")
+        print(f"Default model: {defaults['model']}")
+        print(f"Default max turns: {defaults['max_turns']}")
+        print(f"Default max rounds: {defaults['max_rounds']}")
+        print()
+        for i, g in enumerate(resolved_goals):
+            model = g.get("model", defaults["model"])
+            print(f"  [{i + 1}] Project: {g['project_info']['name']} (ID: {g['project_id']})")
+            print(f"      Goal: {g['goal'][:80]}")
+            print(f"      Dir: {g['project_dir']}")
+            print(f"      Model: {model}")
             planner_prompt = build_planner_prompt(
-                args.goal, args.goal_project, project_dir, project_context,
+                g["goal"], g["project_id"], g["project_dir"],
+                fetch_project_context(g["project_id"]),
             )
-            print("\n--- DRY RUN (Manager Mode) ---")
-            print(f"Planner prompt: {len(planner_prompt)} chars")
-            print(f"\nManager loop would run up to {args.max_rounds} rounds.")
-            print("Each round: Planner -> Dev+Test loop per task -> Evaluator")
-            print("\n--- END DRY RUN ---")
+            print(f"      Planner prompt: {len(planner_prompt)} chars")
+            print()
+        print("--- END DRY RUN ---")
+        return
+
+    # Confirm
+    if not args.yes:
+        print(f"\nAbout to run {len(resolved_goals)} goals "
+              f"(max {defaults['max_concurrent']} concurrent).")
+        for i, g in enumerate(resolved_goals):
+            print(f"  [{i + 1}] {g['project_info']['name']}: {g['goal'][:60]}")
+        response = input("\nProceed? (y/n): ").strip().lower()
+        if response != "y":
+            print("Aborted.")
             return
 
-        # Confirm before running
-        if not args.yes:
-            response = input("\nProceed? (y/n): ").strip().lower()
-            if response != "y":
-                print("Aborted.")
-                return
+    await run_parallel_goals(resolved_goals, defaults, args)
 
-        # Run the manager loop
-        print(f"\nStarting Manager mode (max {args.max_rounds} rounds)...")
-        outcome, rounds, completed, blocked, cost, duration = await run_manager_loop(
-            args.goal, args.goal_project, project_dir, project_context, args,
+
+async def run_mode_goal(args: argparse.Namespace) -> None:
+    """Manager mode: high-level goal across multiple rounds."""
+    project_info = fetch_project_info(args.goal_project)
+    if not project_info:
+        print(f"ERROR: Project {args.goal_project} not found in TheForge")
+        sys.exit(1)
+
+    # Resolve project directory from project info
+    codename = project_info.get("codename", "").lower().strip()
+    project_name = project_info.get("name", "").lower().strip()
+    project_dir = _equipa_constants.PROJECT_DIRS.get(codename) or _equipa_constants.PROJECT_DIRS.get(project_name)
+
+    if not project_dir:
+        print(f"ERROR: Could not find project directory for '{project_info.get('name', 'Unknown')}'")
+        print("Known projects:", ", ".join(sorted(_equipa_constants.PROJECT_DIRS.keys())))
+        sys.exit(1)
+
+    if not Path(project_dir).exists():
+        print(f"ERROR: Project directory does not exist: {project_dir}")
+        sys.exit(1)
+
+    project_context = fetch_project_context(args.goal_project)
+
+    # Show goal info
+    print(f"\nGoal: {args.goal}")
+    print(f"Project: {project_info.get('name', 'Unknown')} (ID: {args.goal_project})")
+    print(f"Directory: {project_dir}")
+    print(f"Model: {args.model}")
+    print(f"Max turns/agent: {args.max_turns}")
+    print(f"Max rounds: {args.max_rounds}")
+
+    if args.dry_run:
+        planner_prompt = build_planner_prompt(
+            args.goal, args.goal_project, project_dir, project_context,
         )
-
-        # Print manager summary
-        print_manager_summary(args.goal, outcome, rounds, completed, blocked, cost, duration)
+        print("\n--- DRY RUN (Manager Mode) ---")
+        print(f"Planner prompt: {len(planner_prompt)} chars")
+        print(f"\nManager loop would run up to {args.max_rounds} rounds.")
+        print("Each round: Planner -> Dev+Test loop per task -> Evaluator")
+        print("\n--- END DRY RUN ---")
         return
 
-    # --- Parallel tasks mode ---
-    if args.tasks:
-        task_ids = parse_task_ids(args.tasks)
-        if not task_ids:
-            print("ERROR: Could not parse task IDs from --tasks argument.")
-            sys.exit(1)
-
-        if args.dry_run:
-            tasks = fetch_tasks_by_ids(task_ids)
-            print("\n--- DRY RUN (Parallel Tasks) ---")
-            print(f"Tasks: {len(tasks)}")
-            for t in tasks:
-                print(f"  - #{t['id']}: {t['title']} ({t.get('project_name', '?')})")
-            print("\n--- END DRY RUN ---")
+    # Confirm before running
+    if not args.yes:
+        response = input("\nProceed? (y/n): ").strip().lower()
+        if response != "y":
+            print("Aborted.")
             return
 
-        await run_parallel_tasks(task_ids, args)
+    # Run the manager loop
+    print(f"\nStarting Manager mode (max {args.max_rounds} rounds)...")
+    outcome, rounds, completed, blocked, cost, duration = await run_manager_loop(
+        args.goal, args.goal_project, project_dir, project_context, args,
+    )
+
+    print_manager_summary(args.goal, outcome, rounds, completed, blocked, cost, duration)
+
+
+async def run_mode_tasks(args: argparse.Namespace) -> None:
+    """Parallel tasks mode: run several task IDs concurrently."""
+    task_ids = parse_task_ids(args.tasks)
+    if not task_ids:
+        print("ERROR: Could not parse task IDs from --tasks argument.")
+        sys.exit(1)
+
+    if args.dry_run:
+        tasks = fetch_tasks_by_ids(task_ids)
+        print("\n--- DRY RUN (Parallel Tasks) ---")
+        print(f"Tasks: {len(tasks)}")
+        for t in tasks:
+            print(f"  - #{t['id']}: {t['title']} ({t.get('project_name', '?')})")
+        print("\n--- END DRY RUN ---")
         return
 
-    # --- Task/Project mode (Phase 1 & 2) ---
+    await run_parallel_tasks(task_ids, args)
 
+
+async def run_mode_task(args: argparse.Namespace) -> None:
+    """Single-task or single-project mode (Phase 1 & 2)."""
     # --- Fetch task ---
     if args.task:
         task = fetch_task(args.task)
@@ -778,6 +745,99 @@ async def async_main() -> None:
         print_summary(task, result, verified, verify_msg)
         if attempts > 1:
             print(f"  Attempts: {attempts}/{args.retries}")
+
+
+# --- Mode Dispatcher ---
+
+# Maps mode-detection predicate (callable on args) -> handler.
+# Order matters: first matching predicate wins. The default --task/--project
+# handler is selected last because args.task / args.project are always set
+# when no other mode flag is present.
+_MODE_DISPATCH: list[tuple[str, "callable"]] = [
+    ("mcp_server", run_mode_mcp_server),
+    ("regenerate_manifest", run_mode_regenerate_manifest),
+    ("add_project", run_mode_add_project),
+    ("setup_repos_or_project", run_mode_setup_repos),
+    ("auto_run", run_mode_auto_run),
+    ("parallel_goals", run_mode_parallel_goals),
+    ("goal", run_mode_goal),
+    ("tasks", run_mode_tasks),
+    ("task_or_project", run_mode_task),
+]
+
+
+def _select_mode_handler(args: argparse.Namespace) -> "callable":
+    """Pick the per-mode handler based on which mutually-exclusive flag is set.
+
+    The argparse mutually-exclusive group guarantees exactly one mode flag is
+    truthy, so this is a simple linear scan against the registry.
+    """
+    if args.mcp_server:
+        return run_mode_mcp_server
+    if args.regenerate_manifest:
+        return run_mode_regenerate_manifest
+    if args.add_project:
+        return run_mode_add_project
+    if args.setup_repos or args.setup_repos_project:
+        return run_mode_setup_repos
+    if args.auto_run:
+        return run_mode_auto_run
+    if args.parallel_goals:
+        return run_mode_parallel_goals
+    if args.goal:
+        return run_mode_goal
+    if args.tasks:
+        return run_mode_tasks
+    # Default: --task or --project
+    return run_mode_task
+
+
+async def async_main() -> None:
+    """Main entry point — parses args, validates, then dispatches to a mode handler."""
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    # Auto-detect non-TTY (nohup, SSH pipe, etc.) and default to --yes
+    if not args.yes and not sys.stdin.isatty():
+        args.yes = True
+        print("Non-interactive mode detected (stdin is not a TTY). Auto-enabling --yes.")
+
+    # Validate --goal requires --goal-project
+    if args.goal and not args.goal_project:
+        parser.error("--goal requires --goal-project <project_id>")
+
+    # Warn if --dev-test combined with --role
+    if args.dev_test and args.role != "developer":
+        print(f"WARNING: --dev-test mode ignores --role ('{args.role}'). "
+              f"Loop uses Developer + Tester automatically.")
+
+    # Load dispatch config globally so model tiering and adaptive turns work in all modes
+    args.dispatch_config = load_dispatch_config(args.dispatch_config)
+
+    # --- Auth availability check (Max subscription OR API key) ---
+    # Warn only when neither auth source is present. The Claude CLI accepts
+    # either an ANTHROPIC_API_KEY env var OR a Max subscription credential
+    # file at ~/.claude/.credentials.json.
+    provider = (args.dispatch_config or {}).get("provider", "claude")
+    if provider != "ollama" and args.provider != "ollama":
+        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        max_creds_path = Path.home() / ".claude" / ".credentials.json"
+        has_max_creds = max_creds_path.is_file()
+        if not has_api_key and not has_max_creds:
+            print(
+                "WARNING: No Claude credentials found.\n"
+                "  Neither ANTHROPIC_API_KEY is set nor ~/.claude/.credentials.json exists.\n"
+                "  Background/nohup processes do not source ~/.bashrc.\n"
+                "  Fix one of:\n"
+                "    - Sign in with `claude login` to use a Max subscription, OR\n"
+                "    - Create a .env file in the EQUIPA project root with:\n"
+                "        ANTHROPIC_API_KEY=sk-ant-...\n"
+                "    - Or export it in /etc/environment for system-wide access."
+            )
+
+    # Dispatch to the selected mode handler.
+    handler = _select_mode_handler(args)
+    await handler(args)
 
 
 def main() -> None:
