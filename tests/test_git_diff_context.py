@@ -33,10 +33,15 @@ def test_git_diff_integration_with_loops():
     helper_source = inspect.getsource(loops._capture_git_diff_context)
     source = loop_source + "\n" + helper_source
 
-    # Check for git diff capture — impl uses subprocess.run inside the helper
+    # Check for git diff capture — impl may call subprocess.run directly or
+    # delegate to equipa.git_ops.git_run (the unified git entry point post-S7).
     assert "git diff" in source.lower() or "git" in source.lower()
-    assert "_sp.run" in source or "subprocess.run" in source
-    assert '["git", "diff",' in source
+    assert (
+        "_sp.run" in source
+        or "subprocess.run" in source
+        or "git_run(" in source
+    )
+    assert '["git", "diff",' in source or '["diff",' in source
 
     # Check for context building
     assert "tester_extra_context" in loop_source

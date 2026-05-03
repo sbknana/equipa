@@ -12,6 +12,7 @@ from typing import Any
 
 from equipa.agent_runner import run_agent
 from equipa.constants import (
+    MANAGER_COST_LIMIT,
     MAX_FOLLOWUP_TASKS,
     MAX_TASKS_PER_PLAN,
     MCP_CONFIG,
@@ -214,6 +215,9 @@ async def run_manager_loop(
     Returns (outcome, total_rounds, all_completed, all_blocked, total_cost, total_duration).
     """
     max_rounds = args.max_rounds
+    cost_limit = getattr(args, "manager_cost_limit", None)
+    if cost_limit is None:
+        cost_limit = MANAGER_COST_LIMIT
     all_completed: list[dict] = []
     all_blocked: list[dict] = []
     total_cost = 0.0
@@ -298,7 +302,18 @@ async def run_manager_loop(
             log(f"\n  [Manager] Goal BLOCKED: {eval_parsed['blockers']}", output)
             return "goal_blocked", round_num, all_completed, all_blocked, total_cost, total_duration
 
-        elif eval_parsed["goal_status"] == "needs_more":
+        if total_cost >= cost_limit:
+            log(
+                f"\n  [Manager] Aggregate cost ${total_cost:.2f} reached limit "
+                f"${cost_limit:.2f}. Aborting.",
+                output,
+            )
+            return (
+                "cost_limit_exceeded", round_num, all_completed, all_blocked,
+                total_cost, total_duration,
+            )
+
+        if eval_parsed["goal_status"] == "needs_more":
             if round_num >= max_rounds:
                 log(f"\n  [Manager] Needs more work but max rounds reached.", output)
                 break

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from typing import Any
 
 from equipa.agent_runner import (
