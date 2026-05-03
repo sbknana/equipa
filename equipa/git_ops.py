@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from equipa.constants import (
+    GIT_DEFAULT_TIMEOUT,
     GITIGNORE_TEMPLATES,
     GITHUB_OWNER,
     PROJECT_DIRS,
@@ -173,16 +174,41 @@ def _get_repo_env() -> dict[str, str]:
     return env
 
 
-def _git_run(
+def _run_with_env(
     args_list: list[str],
     cwd: str | Path,
-    timeout: int = 30,
+    timeout: int,
 ) -> subprocess.CompletedProcess:
-    """Run a git/gh command with standard options. Returns subprocess result."""
+    """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only."""
     return subprocess.run(
         args_list, capture_output=True, text=True,
         cwd=str(cwd), timeout=timeout, env=_get_repo_env(),
     )
+
+
+def git_run(
+    args: list[str],
+    cwd: str | Path,
+    timeout: int = GIT_DEFAULT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run a git command with standard env (Windows PATH fix) and timeout.
+
+    The "git" prefix is added automatically — pass only the subcommand and
+    its arguments, e.g. ``git_run(["status", "--porcelain"], cwd=repo)``.
+
+    This is the single supported entry point for every git invocation in
+    EQUIPA. It guarantees consistent timeout handling and PATH resolution.
+    """
+    return _run_with_env(["git", *args], cwd, timeout)
+
+
+def _gh_run(
+    args: list[str],
+    cwd: str | Path,
+    timeout: int = GIT_DEFAULT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run a gh (GitHub CLI) command with the same env as git_run."""
+    return _run_with_env(["gh", *args], cwd, timeout)
 
 
 def _git_commit(
@@ -196,10 +222,10 @@ def _git_commit(
     Always injects -c user.name and -c user.email if configured,
     so commits are attributed correctly regardless of global git config.
     """
-    cmd = ["git"] + _git_identity_args() + ["commit", "-m", message]
+    args = [*_git_identity_args(), "commit", "-m", message]
     if extra_args:
-        cmd.extend(extra_args)
-    return _git_run(cmd, cwd, timeout=timeout)
+        args.extend(extra_args)
+    return git_run(args, cwd, timeout=timeout)
 
 
 def check_gh_installed() -> bool:
@@ -245,7 +271,7 @@ def setup_single_repo(
     has_git = (p / ".git").exists()
     if has_git:
         try:
-            r = _git_run(["git", "remote", "get-url", "origin"], p, timeout=10)
+            r = git_run(["remote", "get-url", "origin"], p, timeout=10)
             if r.returncode == 0 and r.stdout.strip():
                 return True, f"Already set up (remote: {r.stdout.strip()})"
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -278,14 +304,14 @@ def setup_single_repo(
 
     # git init
     if not has_git:
-        r = _git_run(["git", "init"], p)
+        r = git_run(["init"], p)
         if r.returncode != 0:
             return False, f"git init failed: {r.stderr.strip()}"
     else:
         print("    .git already exists, resuming setup")
 
     # git add (filter CRLF warnings)
-    r = _git_run(["git", "add", "."], p, timeout=300)
+    r = git_run(["add", "."], p, timeout=300)
     if r.returncode != 0:
         real_errors = [
             line for line in r.stderr.strip().splitlines()
@@ -295,33 +321,33 @@ def setup_single_repo(
             return False, f"git add failed: {chr(10).join(real_errors)}"
 
     # git commit
-    commit_cmd = ["git"] + _git_identity_args() + ["commit", "-m", "Initial commit"]
-    r = _git_run(commit_cmd, p, timeout=120)
+    commit_args = [*_git_identity_args(), "commit", "-m", "Initial commit"]
+    r = git_run(commit_args, p, timeout=120)
     if r.returncode != 0:
         if "nothing to commit" not in (r.stdout + r.stderr):
             return False, f"git commit failed: {r.stderr.strip()}"
         print("    Nothing to commit (empty or already committed)")
 
     # gh repo create
-    r = _git_run(
-        ["gh", "repo", "create", f"{owner}/{repo_name}",
+    r = _gh_run(
+        ["repo", "create", f"{owner}/{repo_name}",
          "--private", "--source=.", "--push"],
         p, timeout=300,
     )
     if r.returncode != 0:
         if "already exists" in r.stderr:
             print("    Repo already exists on GitHub, adding remote...")
-            _git_run(
-                ["git", "remote", "add", "origin",
+            git_run(
+                ["remote", "add", "origin",
                  f"https://github.com/{owner}/{repo_name}.git"],
                 p, timeout=10,
             )
-            pr = _git_run(
-                ["git", "push", "-u", "origin", "main"], p, timeout=120,
+            pr = git_run(
+                ["push", "-u", "origin", "main"], p, timeout=120,
             )
             if pr.returncode != 0:
-                _git_run(
-                    ["git", "push", "-u", "origin", "master"], p, timeout=120,
+                git_run(
+                    ["push", "-u", "origin", "master"], p, timeout=120,
                 )
         else:
             return False, f"gh repo create failed: {r.stderr.strip()}"
