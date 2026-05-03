@@ -10,9 +10,16 @@ and must never be synced from source. The deploy script snapshots them to
 `/tmp/equipa-prod-snapshot-<timestamp>/` before pulling and restores them
 after, so a `git pull` cannot silently overwrite production-tuned values.
 
-The list below is the source of truth and **must stay in sync** with the
-`PROD_ONLY_FILES` array in `scripts/deploy-equipa-prod.sh`. The deploy-script
-test (`tests/test_deploy_script.py`) enforces this.
+The list below is the human-readable source of truth and **must stay in sync** with:
+
+- `.deploy-allowlist` — the canonical, machine-readable form that the deploy
+  script reads at runtime (one path per line, `#` comments allowed).
+- The `PROD_ONLY_FILES` array in `scripts/deploy-equipa-prod.sh` — the
+  in-script fallback used when `.deploy-allowlist` is missing.
+- The `EXPECTED_PROD_ONLY_FILES` fixture in `tests/test_deploy_script.py`.
+
+The deploy-script test (`tests/test_deploy_script.py`) enforces all three
+agree.
 
 ## Files
 
@@ -55,19 +62,28 @@ test (`tests/test_deploy_script.py`) enforces this.
 
 1. Before `git pull`, every entry above is copied (with `cp -a`, preserving
    symlinks) into `/tmp/equipa-prod-snapshot-<timestamp>/`.
-2. `git pull --ff-only upstream-local master` runs.
-3. Each snapshotted file is restored to its original path. If `git pull`
-   introduced a tracked version of any of them, it is removed before the
-   snapshot is copied back.
-4. The snapshot directory is preserved after the deploy as a safety net.
+2. The script `git fetch`es upstream and inventories prod's dirty state:
+   - **Source drift** (modified/untracked files that *are* tracked upstream)
+     is silently overwritten via `git reset --hard <new-upstream-tip>`,
+     because production source files are never edited by hand — they only
+     ever land here via this script. The script logs:
+     `[deploy] Auto-bootstrapping: N source files reset to upstream`.
+   - **Allowlisted prod-only files** are left alone (already snapshotted).
+   - **Unknown files** (neither tracked upstream nor allowlisted) cause the
+     script to **abort** rather than risk destroying unrecognized work.
+3. If prod was clean, `git pull --ff-only upstream-local master` runs as
+   the regular fast-forward path.
+4. Each snapshotted prod-only file is restored to its original path.
+5. The snapshot directory is preserved after the deploy as a safety net.
 
 ## Adding a new prod-only file
 
-1. Add the relative path to the `PROD_ONLY_FILES` array in
-   `scripts/deploy-equipa-prod.sh`.
-2. Add a `### <filename>` section to this template documenting *what*,
+1. Add the relative path to `.deploy-allowlist` (the canonical list).
+2. Add the same path to the `PROD_ONLY_FILES` array in
+   `scripts/deploy-equipa-prod.sh` (the in-script fallback).
+3. Add a `### <filename>` section to this template documenting *what*,
    *why prod-only*, and *source template*.
-3. Update the fixture in `tests/test_deploy_script.py` so the lint test
+4. Update the fixture in `tests/test_deploy_script.py` so the lint test
    stays green.
-4. After deploy, the script will materialize the updated list into
+5. After deploy, the script will materialize the updated list into
    `Equipa-prod/PROD_ONLY.md`.
