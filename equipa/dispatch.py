@@ -16,9 +16,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from equipa.constants import (
     DEFAULT_MAX_TURNS,
@@ -663,6 +666,9 @@ async def run_project_dispatch(
                 project_summary, config, args, output=output,
             )
         except Exception as e:
+            # Justified broad catch: project task runner is the top-level safety net
+            # that prevents one bad project from killing the entire dispatch run.
+            logger.exception("[%s] project task dispatch failed", codename)
             log(f"[{codename}] EXCEPTION: {e}", output)
             result = {
                 "project_id": project_summary["project_id"],
@@ -852,6 +858,9 @@ async def run_single_goal(
                 goal_args, output=output,
             )
         except Exception as e:
+            # Justified broad catch: goal manager is the top-level safety net for one
+            # goal in a multi-goal run; isolate failures to prevent cascade.
+            logger.exception("[Goal %s] manager loop failed", index + 1)
             log(f"\n[Goal {index + 1}] EXCEPTION: {e}", output)
             return {
                 "index": index,
@@ -1057,8 +1066,8 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     worktree_dirs[t["id"]] = str(wt_path)
                     _copy_hooks_to_worktree(project_dir, str(wt_path))
                     print(f"  [Isolation] Task #{t['id']} -> {wt_path.name} (retry)")
-                except Exception:
-                    print(f"  [Isolation] WARNING: Could not create worktree for task #{t['id']}, using shared dir")
+                except (subprocess.CalledProcessError, OSError) as e:
+                    print(f"  [Isolation] WARNING: Could not create worktree for task #{t['id']} ({e}), using shared dir")
 
     async def run_one_task(task):
         output = []
@@ -1247,7 +1256,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 if had_stash:
                     subprocess.run(["git", "stash", "pop"], cwd=project_dir,
                                    capture_output=True, text=True)
-            except Exception as e:
+            except (subprocess.CalledProcessError, OSError) as e:
                 print(f"  [Isolation] Merge error for task #{task_id}: {e}")
 
     # Clean up worktrees — only delete branches that were successfully merged
@@ -1269,8 +1278,9 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 else:
                     # Branch was NOT merged — PRESERVE it so work isn't lost
                     print(f"  [Isolation] Keeping branch '{branch_name}' (unmerged work)")
-            except Exception:
-                pass
+            except (subprocess.CalledProcessError, OSError) as e:
+                # Worktree cleanup failure must not crash dispatch, but surface for ops grep.
+                logger.warning("[Isolation] worktree cleanup failed for task #%s: %s", task_id, e)
         # Clean up worktree base dir if empty
         try:
             worktree_base.rmdir()
