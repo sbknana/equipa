@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 8
+CURRENT_VERSION = 9
 
 
 # ============================================================
@@ -657,6 +657,78 @@ def migrate_v7_to_v8(conn):
     """)
 
 
+def migrate_v8_to_v9(conn):
+    """Add Task Flow tables (v8 -> v9).
+
+    Adds three tables for OpenClaw-inspired multi-step orchestration:
+
+    * ``flows``           - one row per multi-step orchestration. Tracks state
+                            (queued/running/paused/cancelled/done/failed) and
+                            a monotonic ``revision`` counter for optimistic
+                            concurrency / restart recovery.
+    * ``flow_revisions``  - append-only audit log of every state transition.
+    * ``flow_tasks``      - many-to-many between flows and managed/mirrored
+                            child tasks.
+
+    The schema is idempotent (CREATE TABLE IF NOT EXISTS) so it is safe to
+    re-run after partial failure.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS flows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            parent_task_id INTEGER,
+            title TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'queued'
+                CHECK (state IN ('queued','running','paused','cancelled','done','failed')),
+            revision INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            cancelled_at TEXT,
+            cancelled_reason TEXT,
+            completed_at TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_flows_project_state ON flows(project_id, state);
+        CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(state);
+
+        CREATE TABLE IF NOT EXISTS flow_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flow_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            event TEXT NOT NULL,
+            payload TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (flow_id) REFERENCES flows(id),
+            UNIQUE(flow_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_flow_revisions_flow
+            ON flow_revisions(flow_id, revision);
+
+        CREATE TABLE IF NOT EXISTS flow_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flow_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            role TEXT,
+            relationship TEXT NOT NULL DEFAULT 'managed'
+                CHECK (relationship IN ('managed','mirrored')),
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending','running','done','failed','cancelled')),
+            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            FOREIGN KEY (flow_id) REFERENCES flows(id),
+            FOREIGN KEY (task_id) REFERENCES tasks(id),
+            UNIQUE(flow_id, task_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_flow_tasks_flow ON flow_tasks(flow_id);
+        CREATE INDEX IF NOT EXISTS idx_flow_tasks_task ON flow_tasks(task_id);
+    """)
+    conn.commit()
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -667,6 +739,7 @@ MIGRATIONS = {
     6: ("Decision staleness tracking (v5 -> v6)", migrate_v5_to_v6),
     7: ("Decision type/status + resolution tracking (v6 -> v7)", migrate_v6_to_v7),
     8: ("Partial unique index on lessons_learned (v7 -> v8)", migrate_v7_to_v8),
+    9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
 }
 
 

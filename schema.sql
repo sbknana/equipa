@@ -610,8 +610,80 @@ CREATE INDEX IF NOT EXISTS idx_lesson_graph_src ON lesson_graph_edges(src_id);
 CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst ON lesson_graph_edges(dst_id);
 
 -- ============================================================
+-- TASK FLOW TABLES (OpenClaw-inspired multi-step orchestration)
+-- ============================================================
+-- A `flow` represents a multi-step orchestration spanning one or more child
+-- tasks (e.g. developer -> [security-reviewer, code-reviewer, tester] fanout).
+-- Each flow has an integer revision counter that is bumped on every state
+-- transition; this lets the orchestrator survive a Claudinator restart and
+-- detect interleaved updates from concurrent dispatchers (optimistic
+-- concurrency).
+--
+-- States:
+--   queued     - created, no child task started yet
+--   running    - at least one child is in flight
+--   paused     - user/admin pause; children may still finish but no new work
+--   cancelled  - sticky cancel; propagated to all children, no new work
+--   done       - terminal success (all children completed)
+--   failed     - terminal failure (one or more children failed and policy says abort)
+CREATE TABLE IF NOT EXISTS flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    parent_task_id INTEGER,            -- the task that spawned the fanout (nullable)
+    title TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued','running','paused','cancelled','done','failed')),
+    revision INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT,                     -- JSON blob: roles, fanout config, etc.
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    cancelled_at TEXT,
+    cancelled_reason TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_flows_project_state ON flows(project_id, state);
+CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(state);
+
+-- Append-only audit log of every flow state/revision transition. Survives
+-- restarts so recovery code can replay the last-known-good state.
+CREATE TABLE IF NOT EXISTS flow_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    event TEXT NOT NULL,               -- create, transition, child_added, child_done, cancel, resume, ...
+    payload TEXT,                      -- JSON blob: child task IDs, error, etc.
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (flow_id) REFERENCES flows(id),
+    UNIQUE(flow_id, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_revisions_flow ON flow_revisions(flow_id, revision);
+
+-- Many-to-many between flows and the tasks they manage. A child task may be
+-- "managed" (created by the flow) or "mirrored" (pre-existing task pulled in).
+CREATE TABLE IF NOT EXISTS flow_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    role TEXT,                         -- developer, security-reviewer, etc.
+    relationship TEXT NOT NULL DEFAULT 'managed'
+        CHECK (relationship IN ('managed','mirrored')),
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending','running','done','failed','cancelled')),
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (flow_id) REFERENCES flows(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    UNIQUE(flow_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_tasks_flow ON flow_tasks(flow_id);
+CREATE INDEX IF NOT EXISTS idx_flow_tasks_task ON flow_tasks(task_id);
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v7. Migrations handle upgrades from older versions.
-PRAGMA user_version = 7;
+-- Marks fresh installs as v9. Migrations handle upgrades from older versions.
+PRAGMA user_version = 9;
 
