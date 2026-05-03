@@ -122,9 +122,9 @@ MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns
 # Kill at 6 turns (not 7) — combined with 1.25x scaling cap in agent_runner,
 # max effective kill is 7 turns. Warn at 2 to catch early, final warn at 4.
 # On paralysis retries, threshold drops further (see loops.py reduced_kill).
-EARLY_TERM_WARN_TURNS = 2        # turns with no Edit/Write before first warning
-EARLY_TERM_FINAL_WARN_TURNS = 4  # turns with no Edit/Write before final warning
-EARLY_TERM_KILL_TURNS = 6        # turns with no Edit/Write before killing agent
+EARLY_TERM_WARN_TURNS = 12       # turns with no Edit/Write before first warning (loosened 2026-05-02 for 4.7 retest)
+EARLY_TERM_FINAL_WARN_TURNS = 20 # turns with no Edit/Write before final warning (loosened 2026-05-02 for 4.7 retest)
+EARLY_TERM_KILL_TURNS = 25       # turns with no Edit/Write before killing agent (loosened 2026-05-02 for 4.7 retest)
 EARLY_TERM_STUCK_PHRASES = [
     "i am unable to",
     "i cannot",
