@@ -918,3 +918,49 @@ class TestDeveloperLoosens:
         """Each loosen has a paired blocked-case; this collects them as a regression guard."""
         result = check_bash_command(cmd)
         assert not result.safe, f"REGRESSION: {cmd} should still be blocked"
+
+
+class TestMultiLineCommitRegression:
+    """Regression tests for #2158 — canonical Claude Code multi-line commit."""
+
+    def test_canonical_cat_heredoc_commit_is_safe(self) -> None:
+        # Single-quoted heredoc delimiter suppresses all expansion inside the
+        # body — cat can only emit literal text. Pre-fix this was blocked by
+        # check 12 (and check 19 once we fixed 12).
+        cmd = (
+            'git commit -m "$(cat <<\'EOF\'\n'
+            'fix: multi-line commit message\n'
+            '\n'
+            'Detailed body line 1\n'
+            'Detailed body line 2\n'
+            'EOF\n'
+            ')"'
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"canonical multi-line commit should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_simple_single_line_commit_is_safe(self) -> None:
+        result = check_bash_command('git commit -m "fix: simple one-liner"')
+        assert result.safe
+
+    def test_unquoted_heredoc_delim_still_blocked(self) -> None:
+        # Unquoted <<EOF still allows expansion — must remain blocked.
+        cmd = "$(cat <<EOF\ncontent with $HOME\nEOF\n)"
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.HEREDOC_IN_SUBSTITUTION
+
+    def test_malicious_chain_after_commit_still_blocked(self) -> None:
+        result = check_bash_command('git commit -m "msg" && rm -rf ~/.bashrc')
+        assert not result.safe
+
+    def test_plain_dollar_paren_substitution_still_blocked(self) -> None:
+        result = check_bash_command('git commit -m "$(evil)"')
+        assert not result.safe
+
+    def test_redirect_after_commit_still_blocked(self) -> None:
+        result = check_bash_command('git commit -m "msg" > /tmp/leak')
+        assert not result.safe
