@@ -49,8 +49,13 @@ def test_git_diff_integration_with_loops():
     assert "tester_extra_context" in loop_source
     assert "Developer Changes" in source
 
-    # Check for truncation logic (current impl caps at 8000 chars)
-    assert "3000" in source or "max_diff_chars" in source
+    # Check for truncation logic (current impl caps at 8000 chars via
+    # TESTER_GIT_DIFF_MAX_CHARS constant from equipa.constants).
+    assert (
+        "3000" in source
+        or "max_diff_chars" in source
+        or "TESTER_GIT_DIFF_MAX_CHARS" in source
+    )
 
     # Check that context is passed to tester
     assert "extra_context" in loop_source
