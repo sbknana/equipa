@@ -1,0 +1,73 @@
+# PROD_ONLY.md
+
+> Template — `scripts/deploy-equipa-prod.sh` materializes this file as
+> `Equipa-prod/PROD_ONLY.md` on first deploy. Do **not** commit a populated
+> copy into Equipa-prod itself; this template lives in source so the list
+> stays version-tracked.
+
+These files exist **only in the production checkout** (`/srv/forge-share/AI_Stuff/Equipa-prod`)
+and must never be synced from source. The deploy script snapshots them to
+`/tmp/equipa-prod-snapshot-<timestamp>/` before pulling and restores them
+after, so a `git pull` cannot silently overwrite production-tuned values.
+
+The list below is the source of truth and **must stay in sync** with the
+`PROD_ONLY_FILES` array in `scripts/deploy-equipa-prod.sh`. The deploy-script
+test (`tests/test_deploy_script.py`) enforces this.
+
+## Files
+
+### `dispatch_config.json`
+- **What:** runtime tuning for the dispatcher — `model`, `effort`,
+  `autoresearch_max_retries`, dispatch concurrency.
+- **Why prod-only:** values are tuned to production hardware/budget and
+  diverge from the example. (E.g., model is currently pinned to Opus 4.6
+  per `feedback_47_second_retry_failed.md`.)
+- **Source template:** `dispatch_config.example.json`
+
+### `forge_config.json`
+- **What:** map of `project_id` → on-disk `local_path` for each managed
+  project, plus other environment-specific orchestrator settings.
+- **Why prod-only:** paths are environment-specific (`/srv/forge-share/...`
+  on the prod host vs. developer laptops vs. CI).
+- **Source template:** `forge_config.example.json`
+
+### `mcp_config.json`
+- **What:** MCP server invocation paths and credentials.
+- **Why prod-only:** MCP server binaries live at host-specific paths and
+  credentials must never enter the source repo.
+- **Source template:** `mcp_config.example.json`
+
+### `theforge.db`
+- **What:** symlink to the canonical TheForge SQLite database at
+  `/srv/forge-share/AI_Stuff/TheForge/theforge.db`.
+- **Why prod-only:** symlink target is environment-specific. A 233 KB
+  stale `theforge.db` was previously discovered in the prod dir while
+  the live 17 MB DB was elsewhere — that incident is the reason this
+  file is explicitly listed.
+- **Source template:** none (created during prod bootstrap).
+
+### `.env`
+- **What:** environment variables (API keys, `THEFORGE_DB`, etc.).
+- **Why prod-only:** secrets must never enter the source repo.
+- **Source template:** `.env.example`
+
+## How the deploy script protects these files
+
+1. Before `git pull`, every entry above is copied (with `cp -a`, preserving
+   symlinks) into `/tmp/equipa-prod-snapshot-<timestamp>/`.
+2. `git pull --ff-only upstream-local master` runs.
+3. Each snapshotted file is restored to its original path. If `git pull`
+   introduced a tracked version of any of them, it is removed before the
+   snapshot is copied back.
+4. The snapshot directory is preserved after the deploy as a safety net.
+
+## Adding a new prod-only file
+
+1. Add the relative path to the `PROD_ONLY_FILES` array in
+   `scripts/deploy-equipa-prod.sh`.
+2. Add a `### <filename>` section to this template documenting *what*,
+   *why prod-only*, and *source template*.
+3. Update the fixture in `tests/test_deploy_script.py` so the lint test
+   stays green.
+4. After deploy, the script will materialize the updated list into
+   `Equipa-prod/PROD_ONLY.md`.

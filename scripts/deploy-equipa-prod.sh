@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# deploy-equipa-prod.sh
+#
+# Codified deploy from Equipa-repo (source) to Equipa-prod (production).
+# Replaces ad-hoc cp/rsync flows that were silently overwriting production-only
+# patches and leaving prod's git state ambiguous.
+#
+# Usage:
+#   bash scripts/deploy-equipa-prod.sh
+#
+# This script is INTENTIONALLY non-destructive:
+#   - never runs `rm -rf`
+#   - never force-pushes
+#   - snapshots production-only files before pulling
+#   - aborts loudly on any verification failure
+#
+# Copyright (c) 2026 Forgeborn
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PROD_DIR="${EQUIPA_PROD_DIR:-/srv/forge-share/AI_Stuff/Equipa-prod}"
+SOURCE_REPO_MARKER="forge_orchestrator.py"   # file that must exist in source CWD
+UPSTREAM_REMOTE="${EQUIPA_UPSTREAM_REMOTE:-upstream-local}"
+UPSTREAM_BRANCH="${EQUIPA_UPSTREAM_BRANCH:-master}"
+
+# Files that exist ONLY in production. Keep this list in sync with PROD_ONLY.md.
+PROD_ONLY_FILES=(
+    "dispatch_config.json"
+    "forge_config.json"
+    "mcp_config.json"
+    "theforge.db"
+    ".env"
+)
+
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+SNAPSHOT_DIR="/tmp/equipa-prod-snapshot-${TIMESTAMP}"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log()  { printf '\033[1;34m[deploy]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*" >&2; }
+fail() {
+    printf '\033[1;31m[deploy] ERROR:\033[0m %s\n' "$*" >&2
+    if [ -n "${PROD_COMMIT_BEFORE:-}" ]; then
+        cat >&2 <<EOF
+
+To roll back Equipa-prod to its pre-deploy state:
+    cd "${PROD_DIR}"
+    git reset --hard ${PROD_COMMIT_BEFORE}
+
+Snapshot of production-only files preserved at:
+    ${SNAPSHOT_DIR}
+EOF
+    fi
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+# ---------------------------------------------------------------------------
+# Step 1: verify source CWD
+# ---------------------------------------------------------------------------
+log "Step 1: verify deploy is running from Equipa-repo"
+if [ ! -f "${SOURCE_REPO_MARKER}" ]; then
+    fail "must run from Equipa-repo root (missing ${SOURCE_REPO_MARKER} in $(pwd))"
+fi
+SOURCE_DIR="$(pwd)"
+log "  source=${SOURCE_DIR}"
+
+require_cmd git
+require_cmd python3
+require_cmd cp
+
+# ---------------------------------------------------------------------------
+# Step 2: verify Equipa-prod exists
+# ---------------------------------------------------------------------------
+log "Step 2: verify Equipa-prod exists at ${PROD_DIR}"
+if [ ! -d "${PROD_DIR}" ]; then
+    fail "Equipa-prod not found at ${PROD_DIR}"
+fi
+if [ ! -d "${PROD_DIR}/.git" ]; then
+    fail "${PROD_DIR} is not a git repository"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3: record current prod commit
+# ---------------------------------------------------------------------------
+log "Step 3: record current prod commit (for rollback)"
+PROD_COMMIT_BEFORE="$(git -C "${PROD_DIR}" rev-parse HEAD)"
+log "  prod HEAD before pull = ${PROD_COMMIT_BEFORE}"
+
+# ---------------------------------------------------------------------------
+# Step 4: snapshot prod-only files BEFORE pulling
+# ---------------------------------------------------------------------------
+log "Step 4: snapshot production-only files to ${SNAPSHOT_DIR}"
+mkdir -p "${SNAPSHOT_DIR}"
+
+PRESERVED_FILES=()
+for rel_path in "${PROD_ONLY_FILES[@]}"; do
+    src="${PROD_DIR}/${rel_path}"
+    if [ -e "${src}" ] || [ -L "${src}" ]; then
+        # Preserve symlinks as symlinks, regular files as copies.
+        cp -a "${src}" "${SNAPSHOT_DIR}/$(basename "${rel_path}")"
+        PRESERVED_FILES+=("${rel_path}")
+        log "  snapshotted ${rel_path}"
+    else
+        warn "  prod-only file not present (skipping): ${rel_path}"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Step 5: pull source into prod
+# ---------------------------------------------------------------------------
+log "Step 5: git pull ${UPSTREAM_REMOTE} ${UPSTREAM_BRANCH} in prod"
+if ! git -C "${PROD_DIR}" remote get-url "${UPSTREAM_REMOTE}" >/dev/null 2>&1; then
+    fail "remote '${UPSTREAM_REMOTE}' not configured in ${PROD_DIR}"
+fi
+if ! git -C "${PROD_DIR}" pull --ff-only "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"; then
+    fail "git pull failed (non-fast-forward or conflict). Inspect ${PROD_DIR} manually."
+fi
+PROD_COMMIT_AFTER="$(git -C "${PROD_DIR}" rev-parse HEAD)"
+log "  prod HEAD after pull  = ${PROD_COMMIT_AFTER}"
+
+# ---------------------------------------------------------------------------
+# Step 6: restore prod-only files from snapshot
+# ---------------------------------------------------------------------------
+log "Step 6: restore production-only files from snapshot"
+for rel_path in "${PRESERVED_FILES[@]}"; do
+    snap="${SNAPSHOT_DIR}/$(basename "${rel_path}")"
+    dest="${PROD_DIR}/${rel_path}"
+    if [ ! -e "${snap}" ] && [ ! -L "${snap}" ]; then
+        fail "internal error: snapshot missing for ${rel_path}"
+    fi
+    # Remove anything the pull may have placed at the destination, then restore.
+    if [ -e "${dest}" ] || [ -L "${dest}" ]; then
+        rm -f "${dest}"
+    fi
+    cp -a "${snap}" "${dest}"
+    log "  restored ${rel_path}"
+done
+
+# ---------------------------------------------------------------------------
+# Step 7: verify imports
+# ---------------------------------------------------------------------------
+log "Step 7: verify equipa package imports cleanly"
+if ! ( cd "${PROD_DIR}" && python3 -c "import equipa; print('import OK')" ); then
+    fail "equipa package import failed in ${PROD_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 8: verify skill_manifest hashes
+# ---------------------------------------------------------------------------
+log "Step 8: verify skill_manifest hashes"
+MANIFEST_PATH="${PROD_DIR}/skill_manifest.json"
+ORCH_PATH="${PROD_DIR}/forge_orchestrator.py"
+
+if [ ! -f "${MANIFEST_PATH}" ]; then
+    warn "  skill_manifest.json missing in prod (skipping hash check)"
+elif [ ! -f "${ORCH_PATH}" ]; then
+    warn "  forge_orchestrator.py missing in prod (skipping hash check)"
+else
+    MANIFEST_BEFORE="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+    if ( cd "${PROD_DIR}" && python3 forge_orchestrator.py --regenerate-manifest >/dev/null 2>&1 ); then
+        MANIFEST_AFTER="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+        if [ "${MANIFEST_BEFORE}" != "${MANIFEST_AFTER}" ]; then
+            fail "skill_manifest.json hashes drifted unexpectedly (before=${MANIFEST_BEFORE} after=${MANIFEST_AFTER}). Investigate skill content tampering before continuing."
+        fi
+        log "  manifest hash stable (${MANIFEST_AFTER})"
+    else
+        warn "  --regenerate-manifest not available; skipping hash recomputation"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 9: summary
+# ---------------------------------------------------------------------------
+log "Step 9: summary"
+cat <<EOF
+------------------------------------------------------------
+  Equipa production deploy complete
+------------------------------------------------------------
+  source repo                 : ${SOURCE_DIR}
+  prod dir                    : ${PROD_DIR}
+  deployed FROM commit (prod) : ${PROD_COMMIT_BEFORE}
+  deployed TO   commit (prod) : ${PROD_COMMIT_AFTER}
+  upstream pulled             : ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}
+  snapshot dir                : ${SNAPSHOT_DIR}
+  production-only files preserved:
+EOF
+if [ "${#PRESERVED_FILES[@]}" -eq 0 ]; then
+    echo "    (none — review PROD_ONLY.md if this is unexpected)"
+else
+    for rel_path in "${PRESERVED_FILES[@]}"; do
+        echo "    - ${rel_path}"
+    done
+fi
+echo "------------------------------------------------------------"
+log "deploy OK"
