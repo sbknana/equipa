@@ -10,13 +10,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from equipa.agent_runner import run_agent
+from equipa.agent_runner import build_cli_command, run_agent
 from equipa.constants import (
     MANAGER_COST_LIMIT,
     MAX_FOLLOWUP_TASKS,
     MAX_TASKS_PER_PLAN,
-    MCP_CONFIG,
-    ROLE_PROMPTS,
 )
 from equipa.db import update_task_status
 from equipa.loops import run_dev_test_loop
@@ -109,19 +107,14 @@ async def run_planner_agent(
     log("\n  [Planner] Building prompt...", output)
     system_prompt = build_planner_prompt(goal, project_id, project_dir, project_context)
 
-    cmd = [
-        "claude",
-        "-p",
-        f"Break this goal into tasks. Project dir: {project_dir}",
-        "--output-format", "json",
-        "--model", args.model,
-        "--max-turns", str(get_role_turns("planner", args)),
-        "--no-session-persistence",
-        "--append-system-prompt", system_prompt,
-        "--mcp-config", str(MCP_CONFIG),
-        "--add-dir", str(project_dir),
-        "--permission-mode", "bypassPermissions",
-    ]
+    cmd = build_cli_command(
+        system_prompt,
+        project_dir,
+        get_role_turns("planner", args),
+        args.model,
+        role="planner",
+        prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
+    )
 
     log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
     result = await run_agent(cmd)
@@ -165,19 +158,16 @@ async def run_evaluator_agent(
         completed_tasks, blocked_tasks,
     )
 
-    cmd = [
-        "claude",
-        "-p",
-        f"Evaluate whether this goal is complete. Project dir: {project_dir}",
-        "--output-format", "json",
-        "--model", args.model,
-        "--max-turns", str(get_role_turns("evaluator", args)),
-        "--no-session-persistence",
-        "--append-system-prompt", system_prompt,
-        "--mcp-config", str(MCP_CONFIG),
-        "--add-dir", str(project_dir),
-        "--permission-mode", "bypassPermissions",
-    ]
+    cmd = build_cli_command(
+        system_prompt,
+        project_dir,
+        get_role_turns("evaluator", args),
+        args.model,
+        role="evaluator",
+        prompt_message=(
+            f"Evaluate whether this goal is complete. Project dir: {project_dir}"
+        ),
+    )
 
     log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
     result = await run_agent(cmd)
