@@ -40,6 +40,7 @@ def test_git_diff_integration_with_loops():
         "_sp.run" in source
         or "subprocess.run" in source
         or "git_run(" in source
+        or "git_run," in source  # post-#2145: invoked via asyncio.to_thread
     )
     assert '["git", "diff",' in source or '["diff",' in source
 
