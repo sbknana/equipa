@@ -19,8 +19,9 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 # Import constants and DB helper
 try:
@@ -59,14 +60,35 @@ def _send_error(request_id: int | str | None, code: int, message: str) -> None:
     })
 
 
-def _get_db_connection() -> sqlite3.Connection:
-    """Get connection to TheForge DB."""
+@contextmanager
+def _db_conn(write: bool = False) -> Iterator[sqlite3.Connection]:
+    """Context-managed connection to TheForge DB.
+
+    Replaces the bare connect/close pairs with a single ``with`` block that
+    always closes the handle, commits on clean exit when ``write=True`` and
+    rolls back on exception. Closes the QS-01 leak family in this module.
+    """
     db_path = THEFORGE_DB
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        if write:
+            conn.commit()
+    except Exception:
+        if write:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 # --- MCP Tool Handlers ---
@@ -130,8 +152,7 @@ def _handle_equipa_task_status(args: dict) -> dict:
     if not task_id:
         return {"error": "task_id required"}
 
-    conn = _get_db_connection()
-    try:
+    with _db_conn() as conn:
         row = conn.execute(
             """
             SELECT t.*, p.name as project_name
@@ -146,8 +167,6 @@ def _handle_equipa_task_status(args: dict) -> dict:
             return {"error": f"Task {task_id} not found"}
 
         return dict(row)
-    finally:
-        conn.close()
 
 
 def _handle_equipa_task_create(args: dict) -> dict:
@@ -170,8 +189,7 @@ def _handle_equipa_task_create(args: dict) -> dict:
     if not project_id or not title:
         return {"error": "project_id and title required"}
 
-    conn = _get_db_connection()
-    try:
+    with _db_conn(write=True) as conn:
         cursor = conn.execute(
             """
             INSERT INTO tasks (project_id, title, description, priority, status)
@@ -179,7 +197,6 @@ def _handle_equipa_task_create(args: dict) -> dict:
             """,
             (project_id, title, description, priority),
         )
-        conn.commit()
         task_id = cursor.lastrowid
 
         return {
@@ -188,8 +205,6 @@ def _handle_equipa_task_create(args: dict) -> dict:
             "project_id": project_id,
             "title": title,
         }
-    finally:
-        conn.close()
 
 
 def _handle_equipa_lessons(args: dict) -> dict:
@@ -205,8 +220,7 @@ def _handle_equipa_lessons(args: dict) -> dict:
     limit = args.get("limit", 20)
     error_type = args.get("error_type")
 
-    conn = _get_db_connection()
-    try:
+    with _db_conn() as conn:
         if error_type:
             rows = conn.execute(
                 """
@@ -233,8 +247,6 @@ def _handle_equipa_lessons(args: dict) -> dict:
             "lessons": [dict(r) for r in rows],
             "count": len(rows),
         }
-    finally:
-        conn.close()
 
 
 def _handle_equipa_agent_logs(args: dict) -> dict:
@@ -250,8 +262,7 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
     task_id = args.get("task_id")
     limit = args.get("limit", 10)
 
-    conn = _get_db_connection()
-    try:
+    with _db_conn() as conn:
         # Detect available columns — schema may have duration_s (db_migrate)
         # or duration_seconds (newer schema), and created_at may be absent.
         col_info = conn.execute("PRAGMA table_info(agent_runs)").fetchall()
@@ -284,8 +295,6 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
             "runs": [dict(r) for r in rows],
             "count": len(rows),
         }
-    finally:
-        conn.close()
 
 
 def _handle_equipa_project_context(args: dict) -> dict:
@@ -321,8 +330,7 @@ def _handle_equipa_session_notes(args: dict) -> dict:
     project_id = args.get("project_id")
     limit = args.get("limit", 5)
 
-    conn = _get_db_connection()
-    try:
+    with _db_conn() as conn:
         if project_id:
             rows = conn.execute(
                 """
@@ -349,8 +357,6 @@ def _handle_equipa_session_notes(args: dict) -> dict:
             "notes": [dict(r) for r in rows],
             "count": len(rows),
         }
-    finally:
-        conn.close()
 
 
 # --- Tool Registry ---
