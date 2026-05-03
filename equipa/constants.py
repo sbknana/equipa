@@ -251,3 +251,8 @@ GITIGNORE_TEMPLATES = {
         "nul", "tmpclaude-*", "~$*", "desktop.ini", ".DS_Store", "Thumbs.db",
     ]),
 }
+
+# --- Manager cost limit ---
+# Aggregate cost ceiling for run_manager_loop. Bootstrap-added 2026-05-03
+# to unblock M4 test (#2113); enforcement still TODO in manager.py.
+MANAGER_COST_LIMIT = 30.0
