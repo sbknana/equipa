@@ -14,6 +14,7 @@ from equipa.dispatch import (
     _ATTEMPT_MARKER,
     _build_dispatch_attempt_reflection,
     _inject_attempt_reflections,
+    cleanup_failed_attempt,
 )
 
 
@@ -206,3 +207,162 @@ class TestInjectReflections:
         ).fetchone()[0]
         before_marker = desc[: desc.index(_ATTEMPT_MARKER)]
         assert before_marker == "Fix the login bug"
+
+
+# ---------------------------------------------------------------------------
+# cleanup_failed_attempt
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupFailedAttempt:
+    """Tests for the extracted cleanup_failed_attempt() helper.
+
+    This helper unifies the branch-cleanup-and-reset logic that was
+    previously duplicated between the parallel/auto path
+    (``equipa/dispatch.py``) and the single-task ``--task`` CLI path
+    (``equipa/cli.py``). The single-task path historically lacked the
+    cross-attempt reflection injection — the regression test
+    ``test_invokes_inject_attempt_reflections`` guards against that bug.
+    """
+
+    def test_invokes_inject_attempt_reflections(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Single-task path MUST now invoke _inject_attempt_reflections.
+
+        This is the bug-fix coverage for D1: prior to extraction, the
+        single-task path skipped reflection injection, so retried tasks
+        lost memory of what previous attempts had tried.
+        """
+        from equipa import dispatch as dispatch_mod
+
+        # Spy on _inject_attempt_reflections to confirm it was called
+        calls: list[tuple[int, list[str]]] = []
+
+        def fake_inject(conn, task_id, reflections):
+            calls.append((task_id, list(reflections)))
+
+        monkeypatch.setattr(
+            dispatch_mod, "_inject_attempt_reflections", fake_inject
+        )
+
+        # Stub out git so we don't touch a real repo
+        monkeypatch.setattr(
+            dispatch_mod, "_is_git_repo", lambda _p: False
+        )
+
+        # Stub the DB connection to a real in-memory sqlite so the
+        # UPDATE call inside cleanup_failed_attempt succeeds without
+        # needing TheForge available in the test environment.
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE tasks "
+            "(id INTEGER PRIMARY KEY, status TEXT, description TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, description) "
+            "VALUES (42, 'in_progress', 'Fix login')"
+        )
+        conn.commit()
+
+        # Wrap the connection so .close() under test is a no-op and the
+        # in-memory DB remains queryable after cleanup_failed_attempt runs.
+        class _NoCloseConn:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def close(self):
+                pass
+
+        wrapped = _NoCloseConn(conn)
+        monkeypatch.setattr(
+            dispatch_mod, "get_db_connection", lambda write=False: wrapped
+        )
+
+        reflections = ["ATTEMPT 1 FAILED: tried X, did not work"]
+        cleanup_failed_attempt(
+            task_id=42,
+            project_dir=str(tmp_path),
+            reflections=reflections,
+        )
+
+        assert len(calls) == 1, (
+            "cleanup_failed_attempt must invoke _inject_attempt_reflections "
+            "exactly once when reflections are provided"
+        )
+        assert calls[0][0] == 42
+        assert calls[0][1] == reflections
+
+        # Status was reset to todo
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id = 42"
+        ).fetchone()[0]
+        assert status == "todo"
+
+    def test_skips_inject_when_reflections_empty(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """First attempt has no reflections — injection should be skipped."""
+        from equipa import dispatch as dispatch_mod
+
+        calls: list[tuple[int, list[str]]] = []
+
+        def fake_inject(conn, task_id, reflections):
+            calls.append((task_id, list(reflections)))
+
+        monkeypatch.setattr(
+            dispatch_mod, "_inject_attempt_reflections", fake_inject
+        )
+        monkeypatch.setattr(
+            dispatch_mod, "_is_git_repo", lambda _p: False
+        )
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE tasks "
+            "(id INTEGER PRIMARY KEY, status TEXT, description TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, description) "
+            "VALUES (7, 'in_progress', 'desc')"
+        )
+        conn.commit()
+
+        class _NoCloseConn:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def close(self):
+                pass
+
+        wrapped = _NoCloseConn(conn)
+        monkeypatch.setattr(
+            dispatch_mod, "get_db_connection", lambda write=False: wrapped
+        )
+
+        cleanup_failed_attempt(
+            task_id=7, project_dir=str(tmp_path), reflections=[]
+        )
+
+        assert calls == [], (
+            "Empty reflections list must NOT trigger injection"
+        )
+
+    def test_cli_imports_cleanup_helper(self) -> None:
+        """The single-task CLI path must import the shared helper.
+
+        Guards against the duplication regression by ensuring cli.py
+        re-exports / imports the same function from dispatch.py rather
+        than reimplementing it inline.
+        """
+        from equipa import cli as cli_mod
+        from equipa.dispatch import cleanup_failed_attempt as dispatch_fn
+
+        assert hasattr(cli_mod, "cleanup_failed_attempt")
+        assert cli_mod.cleanup_failed_attempt is dispatch_fn

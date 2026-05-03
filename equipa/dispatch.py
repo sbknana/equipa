@@ -202,6 +202,80 @@ def _inject_attempt_reflections(
     )
 
 
+def cleanup_failed_attempt(
+    task_id: int,
+    project_dir: str,
+    reflections: list[str],
+    output: list[str] | None = None,
+) -> None:
+    """Reset a failed task for a fresh autoresearch attempt.
+
+    Performs the 5-step cleanup shared by the parallel/auto dispatch path
+    and the single-task ``--task`` CLI path:
+
+    1. Verify ``project_dir`` is a git repo.
+    2. Detect default branch (``main`` then fall back to ``master``).
+    3. Checkout the default branch.
+    4. Force-delete the ``forge-task-<id>`` branch.
+    5. Reset the task's status to ``todo`` and inject any accumulated
+       cross-attempt reflections so the next attempt remembers what was
+       already tried.
+
+    Args:
+        task_id: Task ID being retried.
+        project_dir: Working directory containing the project's git repo.
+        reflections: Reflection strings from prior failed attempts. Empty
+            list is allowed (skips reflection injection).
+        output: Optional buffer for ``log()`` calls; if ``None``, prints.
+    """
+    branch_name = f"forge-task-{task_id}"
+
+    if _is_git_repo(project_dir):
+        try:
+            cp = subprocess.run(
+                ["git", "rev-parse", "--verify", "main"],
+                cwd=project_dir, capture_output=True,
+            )
+            default_branch = "main" if cp.returncode == 0 else "master"
+            subprocess.run(
+                ["git", "checkout", default_branch],
+                cwd=project_dir, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=project_dir, capture_output=True,
+            )
+            msg = f"  [Autoresearch] Cleaned up branch {branch_name}"
+            if output is not None:
+                log(msg, output)
+            else:
+                print(msg)
+        except (subprocess.SubprocessError, OSError) as e:
+            warn = f"  [Autoresearch] Git cleanup warning: {e}"
+            if output is not None:
+                log(warn, output)
+            else:
+                print(warn)
+
+    conn = get_db_connection(write=True)
+    try:
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        if reflections:
+            _inject_attempt_reflections(conn, task_id, reflections)
+        conn.commit()
+    finally:
+        conn.close()
+
+    reset_msg = (
+        f"  [Autoresearch] Reset task #{task_id} to todo with "
+        f"{len(reflections)} attempt reflection(s)"
+    )
+    if output is not None:
+        log(reset_msg, output)
+    else:
+        print(reset_msg)
+
+
 # --- DB Scanning & Scoring ---
 
 def scan_pending_work() -> list[dict]:
@@ -476,34 +550,10 @@ async def run_project_tasks(
             log(f"  [Autoresearch] Task #{task_id} failed ({outcome}). "
                 f"Retry {retry_count}/{max_retries}...", output)
 
-            # Clean up failed git branch
-            branch_name = f"forge-task-{task_id}"
-            if _is_git_repo(project_dir):
-                # Try main first, then master
-                cp = subprocess.run(
-                    ["git", "rev-parse", "--verify", "main"],
-                    cwd=project_dir, capture_output=True,
-                )
-                default_branch = "main" if cp.returncode == 0 else "master"
-                subprocess.run(
-                    ["git", "checkout", default_branch],
-                    cwd=project_dir, capture_output=True,
-                )
-                subprocess.run(
-                    ["git", "branch", "-D", branch_name],
-                    cwd=project_dir, capture_output=True,
-                )
-                log(f"  [Autoresearch] Cleaned up branch {branch_name}", output)
-
-            # Reset task to todo and inject cross-attempt memory
-            conn = get_db_connection(write=True)
-            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
-            if attempt_reflections:
-                _inject_attempt_reflections(conn, task_id, attempt_reflections)
-            conn.commit()
-            conn.close()
-            log(f"  [Autoresearch] Reset task #{task_id} to todo with "
-                f"{len(attempt_reflections)} attempt reflection(s)", output)
+            # Clean up failed git branch and reset task for next attempt
+            cleanup_failed_attempt(
+                task_id, project_dir, attempt_reflections, output=output,
+            )
 
             # Re-fetch task to get clean state (with injected reflections)
             task = fetch_task(task_id)
