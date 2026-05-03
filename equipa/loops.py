@@ -66,6 +66,7 @@ from equipa.monitoring import (
     has_session_commits,
 )
 from equipa.output import log
+from equipa.git_ops import git_run_async
 from equipa.parsing import (
     build_compaction_summary,
     build_test_failure_context,
@@ -77,7 +78,11 @@ from equipa.preflight import (
     preflight_build_check,
     _handle_preflight_failure,
 )
-from equipa.prompts import build_checkpoint_context, build_system_prompt
+from equipa.prompts import (
+    build_checkpoint_context,
+    build_system_prompt,
+    load_paralysis_template,
+)
 from equipa.roles import (
     _accumulate_cost,
     _apply_cost_totals,
@@ -505,8 +510,6 @@ def _build_paralysis_injection(paralysis_retries: int, reduced_kill: int) -> str
     The escalating prompt copy lives in prompts/_paralysis_attempt_*.md so it
     can be tuned and A/B-tested without engine code changes (S4 refactor).
     """
-    from equipa.prompts import load_paralysis_template
-
     template = load_paralysis_template(paralysis_retries)
     if paralysis_retries == 0 or paralysis_retries == 1:
         return template.substitute(reduced_kill=reduced_kill)
@@ -748,7 +751,6 @@ async def _resolve_head_sha(
     ``git diff <ref>`` without a None-check; the worst-case behavior is the
     legacy cumulative diff against the working HEAD.
     """
-    from equipa.git_ops import git_run_async
     try:
         result = await git_run_async(
             ["rev-parse", "HEAD"], project_dir, timeout=5,
@@ -779,7 +781,6 @@ async def _capture_git_diff_context(
     string when the diff is empty, the command fails, or times out. Diff is
     truncated at ``TESTER_GIT_DIFF_MAX_CHARS`` to avoid prompt bloat.
     """
-    from equipa.git_ops import git_run_async
     try:
         result = await git_run_async(
             ["diff", base_ref], project_dir, timeout=10,
