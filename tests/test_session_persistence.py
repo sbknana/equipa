@@ -1,282 +1,208 @@
 """B3 followup: integration tests for session persistence wiring.
 
-Covers PLAN-1067 §2.B3 requirements:
-1. Heartbeat carries files_changed across cycles for the same long task.
-2. Flow transitions are rate-limited (1 capture row per child task per 60s window).
-3. With the feature flag OFF, the dispatch loop performs no sessions table writes.
+Covers PLAN-1067 §2.B3 requirements (the implementation landed at d0cc482
+across equipa/flows.py, equipa/heartbeat.py and equipa/loops.py):
 
-These are additive coverage on top of the implementation that landed at d0cc482
-(equipa/flows.py, equipa/heartbeat.py, equipa/loops.py).
+1. Heartbeat cycles for a single long task: the resume prompt built for
+   cycle N must contain the ``files_changed`` set the task captured in cycle
+   N-1.
+2. Flow rate-limit: 5 transitions for the same child within a 60s window
+   must result in only 1 capture row per child task.
+3. Feature flag off: the dispatch loop's flow-revision capture path must
+   write nothing to the sessions table when ``session_persistence`` is off.
+
+These are additive coverage on top of a working implementation. The existing
+1439-test suite is green without these tests, so failure here means a feature
+gap, not master-broken.
 """
 
 from __future__ import annotations
 
-import sqlite3
-import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def session_db(tmp_path: Path) -> Path:
-    """Build a throwaway SQLite DB with the sessions schema the wiring uses."""
-    db_path = tmp_path / "sessions_test.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL,
-                cycle INTEGER NOT NULL,
-                files_changed TEXT,
-                created_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS flow_captures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                child_task_id INTEGER NOT NULL,
-                from_state TEXT NOT NULL,
-                to_state TEXT NOT NULL,
-                captured_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_task
-                ON sessions(task_id, cycle);
-            CREATE INDEX IF NOT EXISTS idx_flow_child
-                ON flow_captures(child_task_id, captured_at);
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
-
-
-def _read_sessions(db_path: Path, task_id: int) -> list[tuple[int, str | None]]:
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT cycle, files_changed FROM sessions WHERE task_id = ? ORDER BY cycle",
-            (task_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    return rows
-
-
-def _read_flow_captures(db_path: Path, child_task_id: int) -> int:
-    conn = sqlite3.connect(db_path)
-    try:
-        (count,) = conn.execute(
-            "SELECT COUNT(*) FROM flow_captures WHERE child_task_id = ?",
-            (child_task_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    return int(count)
+from equipa import flows, sessions
 
 
 # ---------------------------------------------------------------------------
-# Helpers — minimal session-persistence behaviour the wiring exercises.
+# Shared fixtures
 # ---------------------------------------------------------------------------
-#
-# The B3 implementation lives across equipa/heartbeat.py, equipa/flows.py and
-# equipa/loops.py. Rather than spin up the full dispatch loop for these tests,
-# we model the three behaviours using thin helpers that exercise the same DB
-# interactions the production code performs. This keeps the tests fast and
-# hermetic while still asserting the contract the implementation must honour.
 
-def record_heartbeat_cycle(
-    db_path: Path,
-    task_id: int,
-    cycle: int,
-    files_changed: list[str],
-) -> None:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "INSERT INTO sessions (task_id, cycle, files_changed, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, cycle, ",".join(sorted(files_changed)), time.time()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def previous_cycle_files(db_path: Path, task_id: int, current_cycle: int) -> set[str]:
-    conn = sqlite3.connect(db_path)
-    try:
-        row = conn.execute(
-            "SELECT files_changed FROM sessions "
-            "WHERE task_id = ? AND cycle < ? "
-            "ORDER BY cycle DESC LIMIT 1",
-            (task_id, current_cycle),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row or not row[0]:
-        return set()
-    return set(row[0].split(","))
-
-
-def record_flow_transition(
-    db_path: Path,
-    child_task_id: int,
-    from_state: str,
-    to_state: str,
-    rate_limit_seconds: float = 60.0,
-) -> bool:
-    """Insert a capture row unless one was inserted for this child within the window.
-
-    Returns True if a row was written, False if rate-limited.
-    """
-    now = time.time()
-    conn = sqlite3.connect(db_path)
-    try:
-        row = conn.execute(
-            "SELECT captured_at FROM flow_captures "
-            "WHERE child_task_id = ? "
-            "ORDER BY captured_at DESC LIMIT 1",
-            (child_task_id,),
-        ).fetchone()
-        if row is not None and (now - row[0]) < rate_limit_seconds:
-            return False
-        conn.execute(
-            "INSERT INTO flow_captures (child_task_id, from_state, to_state, captured_at) "
-            "VALUES (?, ?, ?, ?)",
-            (child_task_id, from_state, to_state, now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return True
+@pytest.fixture(autouse=True)
+def _reset_flow_capture_cache() -> None:
+    """Module-level rate-limit cache leaks across tests; clear it per test."""
+    flows._flow_capture_last_ts.clear()
+    yield
+    flows._flow_capture_last_ts.clear()
 
 
 # ---------------------------------------------------------------------------
 # Test 1 — heartbeat carries files_changed across cycles
 # ---------------------------------------------------------------------------
+#
+# The dispatch loop, on each heartbeat cycle, calls sessions.capture(...) to
+# snapshot state and (on the next cycle) calls sessions.restore() +
+# sessions.build_resume_prompt(state) to produce the prompt prefix the agent
+# resumes with. We assert the prompt prefix the *second* cycle would receive
+# contains the *first* cycle's files_changed set.
+#
+# build_resume_prompt is the same formatter used by both the soft-checkpoint
+# and orchestrator-cycle paths (delegates to checkpoints._format_recovery_prompt),
+# so exercising it directly with a state dict shaped like a captured session
+# is the right integration boundary — it does not touch the DB.
 
-def test_second_heartbeat_cycle_includes_first_cycle_files(session_db: Path) -> None:
-    task_id = 4242
+def test_second_cycle_resume_prompt_contains_first_cycle_files_changed() -> None:
     first_cycle_files = ["equipa/flows.py", "equipa/heartbeat.py"]
+    cycle_one_state: dict[str, Any] = {
+        "turn_count": 8,
+        "files_changed": first_cycle_files,
+        "files_read": ["equipa/loops.py"],
+        "compaction_count": 0,
+        "partial_reasoning": "",
+        "recent_tool_calls": [],
+    }
 
-    record_heartbeat_cycle(session_db, task_id, cycle=1, files_changed=first_cycle_files)
+    prompt = sessions.build_resume_prompt(cycle_one_state)
 
-    carried_over = previous_cycle_files(session_db, task_id, current_cycle=2)
-    assert carried_over == set(first_cycle_files), (
-        "Second cycle prompt prefix must contain the first cycle's files_changed set"
+    assert "Context Recovery After Compaction" in prompt
+    for path in first_cycle_files:
+        assert path in prompt, (
+            f"second-cycle resume prompt is missing first-cycle file {path!r}; "
+            f"files_changed must carry across heartbeat cycles"
+        )
+
+
+def test_resume_prompt_handles_missing_files_changed() -> None:
+    prompt = sessions.build_resume_prompt({"turn_count": 1, "compaction_count": 0})
+    assert "Context Recovery After Compaction" in prompt
+    assert "Files you already changed" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — flow rate-limit: one capture per child per 60s window
+# ---------------------------------------------------------------------------
+#
+# equipa.flows._flow_capture_should_fire is the rate-limit decision point
+# called by _capture_running_children_safe. It accepts an injectable ``now``
+# (monotonic seconds) so we can deterministically simulate 5 transitions
+# inside a 60s window without sleeping.
+
+def test_five_transitions_inside_window_yield_one_capture() -> None:
+    flow_id = 4242
+    child_task_id = 9001
+
+    # Five transitions evenly spaced across ~12 seconds — well inside the
+    # 60-second rate-limit window.
+    fire_decisions = [
+        flows._flow_capture_should_fire(flow_id, child_task_id, now=base)
+        for base in (0.0, 3.0, 6.0, 9.0, 12.0)
+    ]
+
+    assert fire_decisions == [True, False, False, False, False], (
+        f"Only the first transition in a {flows.FLOW_CAPTURE_RATE_LIMIT_SECONDS}s "
+        f"window may fire a capture; got {fire_decisions}"
     )
 
-    second_cycle_files = ["equipa/loops.py"]
-    record_heartbeat_cycle(session_db, task_id, cycle=2, files_changed=second_cycle_files)
 
-    rows = _read_sessions(session_db, task_id)
-    assert len(rows) == 2
-    assert rows[0] == (1, "equipa/flows.py,equipa/heartbeat.py")
-    assert rows[1] == (2, "equipa/loops.py")
-
-
-def test_first_cycle_has_no_prior_files(session_db: Path) -> None:
-    assert previous_cycle_files(session_db, task_id=1, current_cycle=1) == set()
+def test_rate_limit_is_per_child_task() -> None:
+    flow_id = 4242
+    for child_id in (1, 2, 3):
+        assert flows._flow_capture_should_fire(flow_id, child_id, now=0.0) is True
+    # Each child got its own first-fire — no cross-contamination.
+    for child_id in (1, 2, 3):
+        assert flows._flow_capture_should_fire(flow_id, child_id, now=1.0) is False
 
 
-# ---------------------------------------------------------------------------
-# Test 2 — flow transition rate limit
-# ---------------------------------------------------------------------------
-
-def test_flow_rate_limit_writes_one_capture_per_child_in_window(session_db: Path) -> None:
+def test_rate_limit_releases_after_window() -> None:
+    flow_id = 4242
     child_task_id = 9001
-    transitions = [
-        ("queued", "running"),
-        ("running", "blocked"),
-        ("blocked", "running"),
-        ("running", "done"),
-        ("done", "verified"),
-    ]
-
-    written = [
-        record_flow_transition(session_db, child_task_id, frm, to, rate_limit_seconds=60.0)
-        for frm, to in transitions
-    ]
-
-    assert sum(written) == 1, "Only the first transition in a 60s window may be captured"
-    assert _read_flow_captures(session_db, child_task_id) == 1
-
-
-def test_flow_rate_limit_is_per_child(session_db: Path) -> None:
-    for child_id in (1, 2, 3):
-        assert record_flow_transition(
-            session_db, child_id, "queued", "running", rate_limit_seconds=60.0
-        ) is True
-    for child_id in (1, 2, 3):
-        assert _read_flow_captures(session_db, child_id) == 1
-
-
-def test_flow_rate_limit_releases_after_window(session_db: Path) -> None:
-    child_task_id = 9002
-    assert record_flow_transition(
-        session_db, child_task_id, "queued", "running", rate_limit_seconds=0.0
-    ) is True
-    assert record_flow_transition(
-        session_db, child_task_id, "running", "done", rate_limit_seconds=0.0
-    ) is True
-    assert _read_flow_captures(session_db, child_task_id) == 2
+    assert flows._flow_capture_should_fire(flow_id, child_task_id, now=0.0) is True
+    assert flows._flow_capture_should_fire(flow_id, child_task_id, now=10.0) is False
+    just_after = flows.FLOW_CAPTURE_RATE_LIMIT_SECONDS + 0.1
+    assert flows._flow_capture_should_fire(flow_id, child_task_id, now=just_after) is True
 
 
 # ---------------------------------------------------------------------------
 # Test 3 — feature flag off => no sessions table writes
 # ---------------------------------------------------------------------------
+#
+# The dispatch loop's capture path is _capture_running_children_safe, which
+# guards every DB write behind is_feature_enabled(..., "session_persistence").
+# We assert the gate by patching equipa.sessions.capture and confirming it is
+# never called when the flag is off, even when running children are present.
 
-class _RecordingConnection:
-    """sqlite3.Connection stand-in that records every execute() call."""
-
-    def __init__(self) -> None:
-        self.executed: list[str] = []
-
-    def execute(self, sql: str, params: tuple = ()) -> MagicMock:  # noqa: ARG002
-        self.executed.append(sql)
-        return MagicMock()
-
-    def commit(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
+def _running_children() -> list[tuple[int, str | None, str]]:
+    return [
+        (101, "developer", "running"),
+        (102, "tester", "running"),
+        (103, "reviewer", "running"),
+    ]
 
 
-def _run_dispatch_loop(feature_flag_enabled: bool, conn: _RecordingConnection) -> None:
-    """Minimal stand-in for the dispatch loop's session-persistence checkpoint.
+def test_feature_flag_off_skips_session_capture() -> None:
+    dispatch_config = {"features": {"session_persistence": False}}
+    assert flows.is_feature_enabled(dispatch_config, "session_persistence") is False
 
-    Mirrors the gate in equipa/loops.py: only when the flag is on do we touch
-    the sessions / flow_captures tables.
-    """
-    if not feature_flag_enabled:
-        return
-    conn.execute(
-        "INSERT INTO sessions (task_id, cycle, files_changed, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (1, 1, "x.py", time.time()),
-    )
-    conn.commit()
+    with patch.object(sessions, "capture") as mock_capture:
+        flows._capture_running_children_safe(
+            flow_id=4242,
+            revision=2,
+            project_id=23,
+            children=_running_children(),
+            dispatch_config=dispatch_config,
+        )
 
-
-def test_dispatch_loop_writes_nothing_when_flag_off() -> None:
-    conn = _RecordingConnection()
-    _run_dispatch_loop(feature_flag_enabled=False, conn=conn)
-    assert conn.executed == [], (
-        "Dispatch loop must not touch sessions table when feature flag is off"
+    assert mock_capture.call_count == 0, (
+        "sessions.capture must NOT be invoked when session_persistence flag is off"
     )
 
 
-def test_dispatch_loop_writes_when_flag_on() -> None:
-    conn = _RecordingConnection()
-    _run_dispatch_loop(feature_flag_enabled=True, conn=conn)
-    assert any("INSERT INTO sessions" in sql for sql in conn.executed), (
-        "Dispatch loop must record session rows when feature flag is on"
+def test_feature_flag_on_invokes_session_capture_per_running_child() -> None:
+    dispatch_config = {"features": {"session_persistence": True}}
+    assert flows.is_feature_enabled(dispatch_config, "session_persistence") is True
+
+    children = _running_children()
+
+    with patch.object(sessions, "capture", return_value=1) as mock_capture:
+        flows._capture_running_children_safe(
+            flow_id=4242,
+            revision=2,
+            project_id=23,
+            children=children,
+            dispatch_config=dispatch_config,
+        )
+
+    assert mock_capture.call_count == len(children), (
+        f"expected one capture per running child ({len(children)}), "
+        f"got {mock_capture.call_count}"
     )
+    captured_task_ids = sorted(call.kwargs["task_id"] for call in mock_capture.call_args_list)
+    assert captured_task_ids == [101, 102, 103]
+    cycle_ids = {call.kwargs["cycle_id"] for call in mock_capture.call_args_list}
+    assert cycle_ids == {"flow:4242:2"}, (
+        f"cycle_id must encode (flow_id, revision); got {cycle_ids}"
+    )
+
+
+def test_terminal_children_are_skipped_even_when_flag_on() -> None:
+    dispatch_config = {"features": {"session_persistence": True}}
+    children = [
+        (201, "developer", "running"),
+        (202, "tester", "done"),
+        (203, "reviewer", "failed"),
+        (204, "planner", "cancelled"),
+    ]
+
+    with patch.object(sessions, "capture", return_value=1) as mock_capture:
+        flows._capture_running_children_safe(
+            flow_id=4242,
+            revision=3,
+            project_id=23,
+            children=children,
+            dispatch_config=dispatch_config,
+        )
+
+    assert mock_capture.call_count == 1
+    assert mock_capture.call_args_list[0].kwargs["task_id"] == 201
