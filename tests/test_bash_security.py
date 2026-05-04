@@ -884,6 +884,21 @@ class TestDeveloperLoosens:
     @pytest.mark.parametrize("cmd", [
         'python3 -c "import sys  # noqa\nprint(1)"',
         'python -c "x = 1  # this is fine\nprint(x)"',
+        # Task #2175: timeout/env/nohup wrapper prefixes (the actual failure
+        # observed during 2026-05-03 Wave B dispatch — tasks 2075 and 2077).
+        'timeout 30 python3 -c "print(x)\n# legitimate Python comment"',
+        'timeout 60 python3 -c "for x in y:\n    pass\n# done"',
+        'env PYTHONPATH=. python3 -c "import x\n# fine\nx.run()"',
+        'nohup python -c "x = 1\n# trailing comment"',
+        # Multi-line python heredoc starting with a newline (the literal
+        # pattern in the bug report: `python3 -c "<NL>...`).
+        'python3 -c "\nimport sys\n# this is a comment\nprint(sys.version)"',
+        # Other safe script interpreters.
+        'perl -e "print 1\n# perl comment"',
+        'ruby -e "puts 1\n# ruby comment"',
+        'node -e "console.log(1)\n// js style\n# also fine"',
+        # Chained after another command — interpreter still recognized.
+        'cd /tmp && python3 -c "print(1)\n# ok"',
     ])
     def test_python_heredoc_with_hash_comment_allowed(self, cmd: str) -> None:
         """# comments inside python -c heredocs are not shell comments."""
@@ -913,6 +928,15 @@ class TestDeveloperLoosens:
         'echo x > /etc/passwd',
         # Quoted-newline comment smuggling still blocked outside python -c.
         'bash -c "x\n# evil"',
+        # Task #2175: shell -c forms must remain blocked — # IS a comment in
+        # shells, so a quoted newline + # there is the original threat model.
+        'sh -c "real\n# hide"',
+        'zsh -c "real\n# hide"',
+        # `bash -c` with single-quoted body is still shell input — block.
+        "bash -c 'real\n# hide'",
+        # Lookalike interpreter names must not bypass the allowlist.
+        'mypython -c "x\n# evil"',
+        'fakeperl -e "x\n# evil"',
     ])
     def test_loosens_did_not_weaken_existing_checks(self, cmd: str) -> None:
         """Each loosen has a paired blocked-case; this collects them as a regression guard."""
