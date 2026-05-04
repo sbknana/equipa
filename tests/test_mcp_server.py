@@ -6,11 +6,97 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _build_isolated_db(db_path: Path) -> None:
+    """Create a self-contained TheForge DB with the minimum schema the MCP
+    server's tools touch. Keeping this inline (rather than running the full
+    migration suite) avoids coupling the MCP test to migration ordering and
+    keeps the fixture fast.
+
+    Mirrors the columns referenced by mcp_server._handle_* (tasks, projects,
+    lessons_learned, agent_runs, session_notes, open_questions, decisions).
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                codename TEXT,
+                status TEXT DEFAULT 'active'
+            );
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                priority TEXT DEFAULT 'medium',
+                status TEXT DEFAULT 'todo',
+                completed_at TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            );
+            CREATE TABLE lessons_learned (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lesson TEXT NOT NULL,
+                error_type TEXT,
+                error_signature TEXT,
+                times_seen INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                role TEXT,
+                outcome TEXT,
+                duration_seconds REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE session_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                summary TEXT,
+                next_steps TEXT,
+                session_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE open_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                question TEXT,
+                context TEXT,
+                resolved INTEGER DEFAULT 0
+            );
+            CREATE TABLE decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                topic TEXT,
+                decision TEXT,
+                rationale TEXT,
+                alternatives_considered TEXT,
+                decision_type TEXT DEFAULT 'general',
+                status TEXT DEFAULT 'open',
+                resolved_by_task_id INTEGER,
+                verified_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (id, name, codename) VALUES (23, 'Equipa', 'eq')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _send_request(proc: subprocess.Popen, method: str, params: dict | None = None, request_id: int = 1) -> dict:
@@ -45,8 +131,28 @@ def _send_notification(proc: subprocess.Popen, method: str, params: dict | None 
 
 
 @pytest.fixture
-def mcp_server():
-    """Spawn MCP server subprocess for testing."""
+def isolated_db(tmp_path: Path) -> Path:
+    """Create an isolated TheForge DB inside tmp_path.
+
+    The MCP server reads THEFORGE_DB at import time (equipa.constants),
+    so the fixture that spawns the server must export this env var BEFORE
+    starting the subprocess. Otherwise tests leak rows into the production
+    DB at /srv/forge-share/AI_Stuff/Equipa-repo/theforge.db.
+    """
+    db_path = tmp_path / "theforge.db"
+    _build_isolated_db(db_path)
+    return db_path
+
+
+@pytest.fixture
+def mcp_server(isolated_db: Path):
+    """Spawn MCP server subprocess for testing, pinned to an isolated DB.
+
+    THEFORGE_DB must be set in the subprocess env BEFORE Popen — the MCP
+    server resolves the DB path once at import time via equipa.constants.
+    """
+    env = os.environ.copy()
+    env["THEFORGE_DB"] = str(isolated_db)
     proc = subprocess.Popen(
         [sys.executable, "-m", "equipa.mcp_server"],
         stdin=subprocess.PIPE,
@@ -54,10 +160,15 @@ def mcp_server():
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=env,
     )
     yield proc
     proc.terminate()
-    proc.wait(timeout=2)
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
 
 
 def test_initialize(mcp_server):
@@ -240,8 +351,8 @@ def test_invalid_json(mcp_server):
     assert response["error"]["code"] == -32700
 
 
-def test_task_create_success(mcp_server):
-    """Test equipa_task_create creates a task."""
+def test_task_create_success(mcp_server, isolated_db):
+    """Test equipa_task_create creates a task in the ISOLATED DB only."""
     response = _send_request(mcp_server, "tools/call", {
         "name": "equipa_task_create",
         "arguments": {
@@ -258,6 +369,66 @@ def test_task_create_success(mcp_server):
     assert "task_id" in content
     assert content["status"] == "created"
     assert content["title"] == "MCP Test Task"
+
+    # Verify the row landed in the isolated DB, NOT the production DB.
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        row = conn.execute(
+            "SELECT title, description, priority, status FROM tasks WHERE id = ?",
+            (content["task_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "MCP Test Task"
+    assert row[1] == "Created by test_mcp_server.py"
+    assert row[2] == "low"
+    assert row[3] == "todo"
+
+
+def test_no_test_rows_in_production_db():
+    """Regression guard: the test suite must NEVER write 'MCP Test Task'
+    rows into the production TheForge DB.
+
+    Historically the mcp_server fixture inherited THEFORGE_DB from the
+    ambient environment, which in CI/dev runs from /srv/.../Equipa-repo
+    resolves to the live production DB. Every pytest run leaked an
+    'MCP Test Task' / 'Created by test_mcp_server.py' stub at project_id=23
+    (e.g. ids 2147, 2152, 2153, 2186, 2187, 2188, 2189 on 2026-05-03).
+
+    This test asserts no such rows exist after the suite runs against the
+    production DB at the canonical path. It is a no-op when the production
+    DB is absent (e.g. in CI without the live DB mounted).
+    """
+    prod_db = REPO_ROOT / "theforge.db"
+    if not prod_db.exists():
+        pytest.skip(f"Production DB not present at {prod_db}; nothing to guard.")
+
+    conn = sqlite3.connect(str(prod_db))
+    try:
+        # tasks table must exist on the production DB; if it does not,
+        # the path is not a real TheForge DB — skip rather than fail.
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()
+        if tbl is None:
+            pytest.skip(f"tasks table missing in {prod_db}; not a TheForge DB.")
+
+        leaked = conn.execute(
+            """
+            SELECT id, title FROM tasks
+            WHERE project_id = 23
+              AND title = 'MCP Test Task'
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert leaked == [], (
+        f"Found {len(leaked)} 'MCP Test Task' rows leaked into production DB "
+        f"({prod_db}): {leaked}. The mcp_server pytest fixture must isolate "
+        "THEFORGE_DB to a tmp_path."
+    )
 
 
 def test_dispatch_missing_arg(mcp_server):
