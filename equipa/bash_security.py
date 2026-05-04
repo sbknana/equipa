@@ -1045,36 +1045,55 @@ def _check_control_characters(command: str) -> BashSecurityResult:
     return _SAFE
 
 
-_PYTHON_HEREDOC_RE = re.compile(
-    r"""^\s*(?:python|python3|python2|py)\s+-c\s*['"]"""
+# Interpreters whose -c / -e argument is a script body — never re-parsed by
+# the shell, so a literal '#' inside the quoted body is the language's own
+# comment character (Python/Perl/Ruby/JS), not a shell-comment smuggling
+# primitive. Note: bash/sh/zsh are intentionally EXCLUDED — for those, the
+# quoted body IS shell input and '# evil' really can hide arguments.
+_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
+    r"(?:^|[\s;&|`(])"
+    r"(?:python|python2|python3|py|perl|ruby|node|nodejs)"
+    r"\s+-(?:c|e)\s*$"
 )
+
+
+def _is_inside_safe_interpreter_arg(command: str, quote_open_idx: int) -> bool:
+    """Return True if the quote at ``quote_open_idx`` opens the script-body
+    argument of a known-safe script interpreter (``python -c``, ``perl -e``,
+    etc.). The prefix may include arbitrary command wrappers like
+    ``timeout 30``, ``env FOO=bar``, ``nohup``, or chained commands —
+    anything as long as the immediate token-pair before the quote is
+    ``<interpreter> -c`` / ``<interpreter> -e``.
+    """
+    if quote_open_idx <= 0:
+        return False
+    prefix = command[:quote_open_idx]
+    return bool(_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE.search(prefix))
 
 
 def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
     """Check 23: Newline inside quotes where next line starts with #.
 
-    Threat model: ``bash -c "real_cmd # malicious_arg"`` — the ``#`` makes
+    Threat model: ``bash -c "real_cmd\\n# malicious_arg"`` — the ``#`` makes
     bash skip the rest of the line, hiding payload bytes from path
-    validation. BUT ``python3 -c "import x  # comment"`` is the standard
-    Python comment syntax; agents writing Python heredocs in task #2096
-    hit this constantly.
+    validation. BUT ``python3 -c "import x\\n# comment\\nprint(x)"`` is the
+    standard Python comment syntax; agents writing Python heredocs hit this
+    constantly (tasks #2075, #2077, #2096).
 
-    Loosen by allowlisting ``python -c`` / ``python3 -c`` heredoc forms,
-    where ``#`` is Python's legitimate comment character. The block stands
-    for bash/sh/zsh ``-c`` invocations, where ``#`` is the comment
-    smuggling primitive this check was designed to catch.
+    Loosen by allowlisting the ``-c``/``-e`` argument of script
+    interpreters whose body is NOT re-parsed by the shell: python, perl,
+    ruby, node. The check still fires for shells (``bash -c``,
+    ``sh -c``, ``zsh -c``) where ``#`` is the comment-smuggling primitive
+    this check was designed to catch, and for any other context where a
+    quoted ``\\n# ...`` could hide arguments.
     """
     if "\n" not in command or "#" not in command:
-        return _SAFE
-
-    # Python -c heredoc: # is a legit comment character inside the quoted
-    # script, not a bash-comment smuggling primitive.
-    if _PYTHON_HEREDOC_RE.match(command):
         return _SAFE
 
     in_single = False
     in_double = False
     escaped = False
+    quote_open_idx = -1
 
     for i, ch in enumerate(command):
         if escaped:
@@ -1084,9 +1103,13 @@ def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
             escaped = True
             continue
         if ch == "'" and not in_double:
+            if not in_single:
+                quote_open_idx = i
             in_single = not in_single
             continue
         if ch == '"' and not in_single:
+            if not in_double:
+                quote_open_idx = i
             in_double = not in_double
             continue
 
@@ -1094,6 +1117,8 @@ def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
         if (in_single or in_double) and ch == "\n":
             rest = command[i + 1:]
             if rest.lstrip().startswith("#"):
+                if _is_inside_safe_interpreter_arg(command, quote_open_idx):
+                    continue
                 return BashSecurityResult(
                     safe=False, check_id=CheckID.QUOTED_NEWLINE,
                     message="Quoted newline followed by # comment can hide arguments from validation",
