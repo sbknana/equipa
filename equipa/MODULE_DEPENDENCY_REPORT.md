@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **31,047 lines** of code across **11 dependency layers** (L0–L10). 27 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **52 Python modules** totaling **31,502 lines** of code across **11 dependency layers** (L0–L10). 28 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -55,7 +55,7 @@ The `equipa/` package contains **52 Python modules** totaling **31,047 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `mcp_server.py` | 888 | L3 | `constants.py`, `tasks.py` | — | 12 |
+| `mcp_server.py` | 1315 | L3 | `constants.py`, `tasks.py` | — | 20 |
 | `prompts.py` | 799 | L3 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 143 | L3 | `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 1952 | L4 | `abort_controller.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 21 |
@@ -63,11 +63,11 @@ The `equipa/` package contains **52 Python modules** totaling **31,047 lines** o
 | `loops.py` | 2269 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 11 |
 | `manager.py` | 312 | L7 | `agent_runner.py`, `constants.py`, `db.py`, `loops.py`, `output.py`, `prompts.py`, `roles.py`, `tasks.py` | — | 5 |
 | `dispatch.py` | 2520 | L8 | `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `scaffold.py` | 15 |
-| `cli.py` | 2074 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
-| `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
+| `cli.py` | 2082 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `mcp_server.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
+| `__init__.py` | 78 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `monitoring.py`, `prompts.py` | `mcp_server.py` | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 31,047 lines | 561 public exports
+**Total:** 31,502 lines | 569 public exports
 
 ## Modules by Layer
 
@@ -87,12 +87,13 @@ Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf m
 
 ## Late Import Inventory
 
-27 module(s) defer intra-package imports inside function bodies to avoid import cycles:
+28 module(s) defer intra-package imports inside function bodies to avoid import cycles:
 
 | Module | Late Imports |
 |---|---|
+| `__init__.py` | `mcp_server.py` |
 | `agent_runner.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` |
-| `cli.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` |
+| `cli.py` | `config_versions.py`, `initiative_runner.py`, `mcp_server.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` |
 | `db.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` |
 | `dispatch.py` | `flows.py`, `initiative.py`, `scaffold.py` |
 | `embeddings.py` | `db.py`, `graph.py` |
@@ -125,14 +126,14 @@ How many other `equipa` modules each module imports.
 
 | Module | Top-level | Late | Total |
 |---|---:|---:|---:|
-| `__init__.py` | 7 | 0 | **7** |
+| `__init__.py` | 6 | 1 | **7** |
 | `__main__.py` | 1 | 0 | **1** |
 | `abort_controller.py` | 0 | 0 | **0** |
 | `agent_runner.py` | 12 | 4 | **16** |
 | `bash_security.py` | 0 | 0 | **0** |
 | `checkpoints.py` | 1 | 0 | **1** |
 | `classifier.py` | 0 | 0 | **0** |
-| `cli.py` | 24 | 5 | **29** |
+| `cli.py` | 23 | 6 | **29** |
 | `config.py` | 1 | 0 | **1** |
 | `config_versions.py` | 2 | 0 | **2** |
 | `constants.py` | 0 | 0 | **0** |
