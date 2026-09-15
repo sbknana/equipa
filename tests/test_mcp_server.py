@@ -10,6 +10,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,8 +100,57 @@ def _build_isolated_db(db_path: Path) -> None:
         conn.close()
 
 
-def _send_request(proc: subprocess.Popen, method: str, params: dict | None = None, request_id: int = 1) -> dict:
-    """Send JSON-RPC request to MCP server and read response."""
+# How long any helper here will wait for one response line before giving up.
+# A wedged server must become a RED TEST, never a hung suite: a bare
+# proc.stdout.readline() blocks for ever, produces no output, and takes the whole
+# run down with it — a CI job then burns its entire time budget and reports
+# nothing about which call stalled. Generous enough that a loaded machine does
+# not trip it; short enough that a real wedge is reported in seconds.
+RESPONSE_TIMEOUT = 15.0
+
+
+def _exchange(proc: subprocess.Popen, payload: str, timeout: float) -> dict:
+    """Write *payload* and read one response line.
+
+    Returns the worker's result box, and the THREE outcomes stay distinguishable
+    because they need different words: {"line": ...} got an answer (possibly ""
+    for EOF), {"error": ...} the pipe broke, {} the deadline passed with the
+    worker still stuck. Collapsing them to None once already made a server that
+    had simply DIED report as one that was wedged — which is the same class of
+    misleading diagnostic this whole change exists to remove.
+
+    BOTH halves go on the daemon worker, and that is the point. The write can
+    wedge just as readily as the read: a server blocked on its own stderr stops
+    draining stdin, and once the stdin pipe buffer fills, the client blocks
+    inside write() having never reached the read at all. Bounding only the read
+    moves the hang, it does not remove it. One worker, one deadline, both halves
+    covered — the main thread keeps the right to give up and say so.
+    """
+    out: dict = {}
+
+    def _go() -> None:
+        try:
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            out["line"] = proc.stdout.readline()
+        except Exception as exc:  # pragma: no cover - pipe died under us
+            out["error"] = repr(exc)
+
+    worker = threading.Thread(target=_go, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    return out
+
+
+def _send_request(proc: subprocess.Popen, method: str, params: dict | None = None,
+                  request_id: int = 1, timeout: float = RESPONSE_TIMEOUT) -> dict:
+    """Send JSON-RPC request to MCP server and read response.
+
+    BOUNDED. This used to be a bare readline(), which is why a stalled server
+    turned the whole suite into a hang with nothing on stdout to say where it
+    stopped. The file already knew — _send_request_with_deadline was written for
+    exactly this reason — but only one of the thirty-odd call sites used it.
+    """
     request = {
         "jsonrpc": "2.0",
         "method": method,
@@ -109,12 +159,24 @@ def _send_request(proc: subprocess.Popen, method: str, params: dict | None = Non
     if params is not None:
         request["params"] = params
 
-    proc.stdin.write(json.dumps(request) + "\n")
-    proc.stdin.flush()
-
-    # Read response
-    response_line = proc.stdout.readline()
-    return json.loads(response_line)
+    res = _exchange(proc, json.dumps(request), timeout)
+    if "error" in res:
+        raise AssertionError(
+            f"pipe broke talking to the MCP server during {method!r}: "
+            f"{res['error']} (exit code {proc.poll()!r})"
+        )
+    line = res.get("line")
+    if line is None:
+        raise AssertionError(
+            f"MCP server sent no response to {method!r} within {timeout}s "
+            f"(params={str(params)[:200]!r}) — it is wedged, not slow"
+        )
+    if line == "":
+        raise AssertionError(
+            f"MCP server closed stdout without answering {method!r} "
+            f"(exit code {proc.poll()!r})"
+        )
+    return json.loads(line)
 
 
 def _send_notification(proc: subprocess.Popen, method: str, params: dict | None = None) -> None:
@@ -792,32 +854,17 @@ def test_cli_mcp_server_flag():
 # --- MCP-08: the tools/call log line must not deadlock the server -------------
 
 def _send_request_with_deadline(proc: subprocess.Popen, method: str,
-                                params: dict, timeout: float = 15.0) -> dict | None:
-    """Send a request and read one response, giving up after *timeout*.
+                                params: dict, timeout: float = RESPONSE_TIMEOUT) -> dict | None:
+    """Send a request and read one response, RETURNING None if it does not come.
 
-    _send_request blocks forever on a wedged server, which turns this failure
-    into a hung suite rather than a red test. Reading on a worker thread lets the
-    deadlock be observed and reported.
+    Kept distinct from _send_request even though both are bounded now, because
+    the return contract differs and the MCP-08 test depends on it: that test
+    ASSERTS on the silence, with its own message about an undrained stderr pipe,
+    so it needs the None rather than an exception raised out from under it.
     """
-    import threading
-
-    out: dict = {}
-
-    def _read() -> None:
-        try:
-            out["line"] = proc.stdout.readline()
-        except Exception as exc:  # pragma: no cover - reader died with the pipe
-            out["error"] = repr(exc)
-
-    reader = threading.Thread(target=_read, daemon=True)
-    reader.start()
-    proc.stdin.write(json.dumps({
+    line = _exchange(proc, json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-    }) + "\n")
-    proc.stdin.flush()
-    reader.join(timeout=timeout)
-
-    line = out.get("line")
+    }), timeout).get("line")
     return json.loads(line) if line else None
 
 
