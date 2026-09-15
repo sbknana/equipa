@@ -714,23 +714,45 @@ def _reject_tool_call_framing(fields: dict) -> dict | None:
         An {"error": ...} dict naming the offending field, or None if clean.
     """
     try:
-        from lesson_sanitizer import find_tool_call_framing
+        from lesson_sanitizer import find_tool_call_framing, find_field_tag_framing
     except Exception:  # pragma: no cover - fallback if sanitizer unavailable
         def find_tool_call_framing(text: Any) -> str | None:
-            marker = "<parameter name="
-            return marker if text and marker in str(text).lower() else None
+            for marker in ("<parameter name=", "</parameter>", "</invoke>"):
+                if text and marker in str(text).lower():
+                    return marker
+            return None
 
+        def find_field_tag_framing(value: Any, field_names) -> str | None:
+            if not value:
+                return None
+            low = str(value).lower()
+            for field in field_names:
+                for tag in (f"</{field}>", f"<{field}>"):
+                    if tag.lower() in low:
+                        return tag
+            return None
+
+    # TWO SHAPES, and the second is why this had to grow (2026-09-15). The original
+    # damage leaves a following parameter's OPENER inside the value. The other leaves the
+    # value's own CLOSER there instead, with the siblings following as bare field tags and
+    # no opener anywhere — invisible to the first check, and worse than it, because the
+    # absorbed fields are usually not recoverable afterwards: 26 of 33 damaged session
+    # notes had next_steps blank with the text never written at all.
+    names = list(fields)
     for name, value in fields.items():
-        marker = find_tool_call_framing(value)
+        marker = find_tool_call_framing(value) or find_field_tag_framing(value, names)
         if marker:
             return {
                 "error": (
                     f"{name} contains tool-call framing ({marker!r}); the call was "
-                    "malformed. A parameter was closed with a field name instead of "
-                    "</parameter>, so the parameters after it were absorbed into this "
-                    "value and would have been stored as part of it. Re-send with each "
-                    "parameter closed correctly. If the text quotes this marker on "
-                    "purpose, escape the angle brackets."
+                    "malformed, so the parameters after this one were absorbed into its "
+                    "value and would have been stored as part of it. Either a parameter "
+                    "was closed with a field name instead of </parameter>, or this value "
+                    "carries its own closing tag with the remaining fields trailing it. "
+                    "Re-send with each parameter closed correctly — and note that fields "
+                    "written BEFORE the long narrative ones survive this, which is a "
+                    "symptom of the ordering, not a way around it. If the text quotes "
+                    "this marker on purpose, escape the angle brackets."
                 ),
             }
     return None

@@ -21,6 +21,7 @@ from lesson_sanitizer import (
     sanitize_session_note,
     sanitize_error_signature,
     find_tool_call_framing,
+    find_field_tag_framing,
     validate_lesson_structure,
     wrap_lessons_in_task_input,
 )
@@ -429,6 +430,42 @@ def test_finds_tool_call_framing():
     print("PASS: tool-call framing detection")
 
 
+def test_finds_field_tag_framing():
+    """The closer variant: a value carrying its own tag, or a sibling's.
+
+    The shape above leaves a following parameter's OPENER inside the value, which
+    is what `<parameter name=` matches. There is a second shape with no opener
+    anywhere: the value ends with ITS OWN closing tag and the remaining fields
+    follow as bare `<field>...</field>` blocks. Measured on a live 700-row
+    session_notes table, 33 rows across six projects carried it over six weeks —
+    and 26 of those had next_steps blank with the text never written at all, so
+    unlike the opener variant it cannot be repaired after the fact. That is the
+    argument for refusing it at the boundary rather than cleaning up later.
+    """
+    print("\n--- Test: field-tag framing detection ---")
+    fields = ["summary", "next_steps", "key_points"]
+
+    # a value carrying its own closer
+    assert find_field_tag_framing("What happened.</summary>", fields) == "</summary>"
+    # ... or a sibling's opener, which is where the absorbed text begins
+    assert find_field_tag_framing("What happened.<next_steps>Do it.", fields) == "<next_steps>"
+    # case must not be an escape hatch
+    assert find_field_tag_framing("body</SUMMARY>", fields) is not None
+
+    # the generic closers need no field names — they are framing wherever they appear
+    for closer in ("body</parameter>", "body</invoke>", "body</function_calls>"):
+        assert find_tool_call_framing(closer) is not None, f"missed {closer!r}"
+
+    # Prose survives. A tag named after a field this call does not have is someone
+    # else's markup, not this call's framing.
+    for clean in ("", None, "Closed the <g> element.", "See the <summary> in the brief."):
+        assert find_field_tag_framing(clean, ["decision", "rationale"]) is None, \
+            f"False positive on: {clean!r}"
+
+    print("  OK: detects a field's own tags, ignores prose and foreign markup")
+    print("PASS: field-tag framing detection")
+
+
 def run_all_tests():
     """Execute all sanitization test cases."""
     print("=" * 70)
@@ -446,6 +483,7 @@ def run_all_tests():
         test_sanitize_has_no_length_cap()
         test_enforce_limit_is_loud_and_optional()
         test_finds_tool_call_framing()
+        test_finds_field_tag_framing()
         test_error_signature_sanitization()
         test_validate_lesson_structure_valid()
         test_validate_lesson_structure_invalid()

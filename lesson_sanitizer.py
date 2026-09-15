@@ -243,7 +243,46 @@ def sanitize_error_signature(sig):
 # The marker is structural, never prose. Prose that legitimately quotes it —
 # a decision record about this very bug, say — has to escape the angle brackets
 # to be written through the tool, and the rejection message says so.
-_TOOL_CALL_FRAMING = re.compile(r'<\s*parameter\s+name\s*=', re.IGNORECASE)
+_TOOL_CALL_FRAMING = re.compile(
+    r'<\s*parameter\s+name\s*='                       # a following parameter's OPENER
+    r'|<\s*/\s*(?:parameter|invoke|function_calls|function_results)\s*>'   # ... or any CLOSER
+    r'|<\s*/?\s*antml\s*:',                            # ... or the namespace itself
+    re.IGNORECASE,
+)
+
+# THE SECOND VARIANT, and the one the opener pattern above cannot see (2026-09-15).
+#
+# The damage MCP-07 was built for closes a parameter with a field name, so the next
+# parameter's `<parameter name=` opener lands inside the value and gives the guard
+# something to match. There is a second shape with no opener in it at all: the value
+# ends with ITS OWN closing tag and the siblings follow as bare `<field>...</field>`
+# blocks. Nothing in it looks like tool-call framing in general — but a `summary` that
+# contains `</summary>`, or a `<next_steps>` belonging to the same call, is structural
+# and never prose.
+#
+# Measured on a live 700-row session_notes table: 33 rows across six projects carried
+# this, over six weeks. 26 had next_steps blank with the content never written at all,
+# so unlike the opener variant it is not recoverable after the fact — which is exactly
+# why it has to be refused at the boundary instead of repaired later.
+def find_field_tag_framing(value, field_names):
+    """Return the first tag in *value* named after one of the call's own fields.
+
+    Args:
+        value: A raw field value, checked BEFORE sanitization.
+        field_names: Every field name in the same tool call — a value carrying
+            its own closer, or a sibling's opener, was never meant to hold one.
+
+    Returns:
+        The matched tag text, or None if the value carries no field framing.
+    """
+    if not value:
+        return None
+    low = str(value).lower()
+    for field in field_names:
+        for tag in (f"</{field}>", f"<{field}>"):
+            if tag.lower() in low:
+                return tag
+    return None
 
 
 def find_tool_call_framing(text):

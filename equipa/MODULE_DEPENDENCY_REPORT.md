@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **31,598 lines** of code across **11 dependency layers** (L0–L10). 28 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **52 Python modules** totaling **31,620 lines** of code across **11 dependency layers** (L0–L10). 28 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -55,7 +55,7 @@ The `equipa/` package contains **52 Python modules** totaling **31,598 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `mcp_server.py` | 1386 | L3 | `constants.py`, `tasks.py` | — | 20 |
+| `mcp_server.py` | 1408 | L3 | `constants.py`, `tasks.py` | — | 20 |
 | `prompts.py` | 799 | L3 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 143 | L3 | `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 1952 | L4 | `abort_controller.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 21 |
@@ -67,7 +67,7 @@ The `equipa/` package contains **52 Python modules** totaling **31,598 lines** o
 | `__init__.py` | 78 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `monitoring.py`, `prompts.py` | `mcp_server.py` | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 31,598 lines | 569 public exports
+**Total:** 31,620 lines | 569 public exports
 
 ## Modules by Layer
 

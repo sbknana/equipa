@@ -970,6 +970,38 @@ def test_decision_add_rejects_tool_call_framing(mcp_server, isolated_db):
     assert _row_count(isolated_db, "decisions") == before, "a malformed call was written"
 
 
+def test_write_tools_reject_the_closer_variant(mcp_server, isolated_db):
+    """The second shape: a value ending in its own tag, with no opener anywhere.
+
+    Nothing in this looks like tool-call framing in general, which is why the
+    `<parameter name=` pattern never saw it — 33 session notes across six projects
+    carried it for six weeks, 26 of them with next_steps blank and the text never
+    written at all. A `summary` holding `</summary>`, or a `<next_steps>` belonging
+    to the same call, is structural and never prose.
+    """
+    notes_before = _row_count(isolated_db, "session_notes")
+    decisions_before = _row_count(isolated_db, "decisions")
+
+    content = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_session_note_add",
+        "arguments": {
+            "auth_token": TEST_TOKEN,
+            "project_id": 23,
+            "summary": "What happened.</summary>\n<next_steps>The absorbed value.",
+        },
+    })
+    payload = json.loads(content["result"]["content"][0]["text"])
+    assert "error" in payload, payload
+    assert "tool-call framing" in payload["error"]
+
+    # the same shape on a decision, where it cost rationale and alternatives
+    assert "error" in _decision_add(
+        mcp_server, decision="A real body.</decision>\n<rationale>Because.")
+
+    assert _row_count(isolated_db, "session_notes") == notes_before
+    assert _row_count(isolated_db, "decisions") == decisions_before
+
+
 def test_decision_add_allows_prose_mentioning_parameters(mcp_server):
     """The guard must not block ordinary prose that talks about parameters."""
     content = _decision_add(
