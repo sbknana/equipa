@@ -172,6 +172,40 @@ def sanitize_session_note(text):
                                    label="session note")
 
 
+def sanitize_decision(text):
+    """Sanitize a decision's short fields (topic / rationale / alternatives).
+
+    Uses MAX_DECISION_LENGTH, which is sized for exactly these fields — the
+    constant's own comment reads "decision rationales". Measured against a
+    636-row decisions table the longest rationale was 4,355 chars and the
+    longest alternatives_considered 1,062, so the 8,000 cap has ample headroom
+    and will not truncate real records.
+
+    For the narrative ``decision`` body itself use sanitize_decision_body();
+    this cap *would* truncate it.
+    """
+    return sanitize_lesson_content(text, max_len=MAX_DECISION_LENGTH,
+                                   label="decision field")
+
+
+def sanitize_decision_body(text):
+    """Sanitize the narrative ``decision`` body without silent loss.
+
+    Decision bodies are narrative and *accrete* — amendments, corrections and
+    superseding notes are appended to an existing record rather than replacing
+    it — so they grow well past the rationale cap. Measured against a 636-row
+    decisions table, 12 rows (1.9%) already exceed MAX_DECISION_LENGTH and the
+    longest ran 32,344 chars. Capping the body at MAX_DECISION_LENGTH would
+    therefore destroy real content, which is the same failure mode the 500-char
+    lesson cap caused for session notes (Equipa task #100027).
+
+    Uses MAX_SESSION_NOTE_LENGTH: the body is narrative content of the same
+    class as a session-note summary.
+    """
+    return sanitize_lesson_content(text, max_len=MAX_SESSION_NOTE_LENGTH,
+                                   label="decision body")
+
+
 def sanitize_error_signature(sig):
     """Sanitize an error signature before using it in lesson generation.
 
@@ -189,6 +223,88 @@ def sanitize_error_signature(sig):
         return ""
     return enforce_limit(sanitize(sig), MAX_ERROR_SIGNATURE_LENGTH,
                          label="error signature")
+
+
+# --- Tool-call framing leakage ---
+# A malformed tool call can close a parameter with the FIELD's own name instead
+# of the generic closer — </decision> where </parameter> was meant. Everything
+# after that point, including the framing of every parameter that follows, then
+# lands inside the first field's value. Nothing downstream notices: the value is
+# a well-formed string, so injection-stripping passes, the length cap passes,
+# and the row is written with the later fields silently NULL.
+#
+# Measured on a live 640-row decisions table: 40 rows across 3 projects carried
+# this damage, accumulated over three weeks and several sessions. Every one had
+# rationale NULL — the field the write tool exists to capture — and some had
+# decision_type defaulted to 'general' because the intended value was inside the
+# body too. Every damaged row contained at least one literal `<parameter name=`,
+# which is what this matches.
+#
+# The marker is structural, never prose. Prose that legitimately quotes it —
+# a decision record about this very bug, say — has to escape the angle brackets
+# to be written through the tool, and the rejection message says so.
+_TOOL_CALL_FRAMING = re.compile(
+    r'<\s*parameter\s+name\s*='                       # a following parameter's OPENER
+    r'|<\s*/\s*(?:parameter|invoke|function_calls|function_results)\s*>'   # ... or any CLOSER
+    r'|<\s*/?\s*antml\s*:',                            # ... or the namespace itself
+    re.IGNORECASE,
+)
+
+# THE SECOND VARIANT, and the one the opener pattern above cannot see (2026-09-15).
+#
+# The damage MCP-07 was built for closes a parameter with a field name, so the next
+# parameter's `<parameter name=` opener lands inside the value and gives the guard
+# something to match. There is a second shape with no opener in it at all: the value
+# ends with ITS OWN closing tag and the siblings follow as bare `<field>...</field>`
+# blocks. Nothing in it looks like tool-call framing in general — but a `summary` that
+# contains `</summary>`, or a `<next_steps>` belonging to the same call, is structural
+# and never prose.
+#
+# Measured on a live 700-row session_notes table: 33 rows across six projects carried
+# this, over six weeks. 26 had next_steps blank with the content never written at all,
+# so unlike the opener variant it is not recoverable after the fact — which is exactly
+# why it has to be refused at the boundary instead of repaired later.
+def find_field_tag_framing(value, field_names):
+    """Return the first tag in *value* named after one of the call's own fields.
+
+    Args:
+        value: A raw field value, checked BEFORE sanitization.
+        field_names: Every field name in the same tool call — a value carrying
+            its own closer, or a sibling's opener, was never meant to hold one.
+
+    Returns:
+        The matched tag text, or None if the value carries no field framing.
+    """
+    if not value:
+        return None
+    low = str(value).lower()
+    for field in field_names:
+        for tag in (f"</{field}>", f"<{field}>"):
+            if tag.lower() in low:
+                return tag
+    return None
+
+
+def find_tool_call_framing(text):
+    """Return the first tool-call framing marker in *text*, or None if clean.
+
+    Presence of the marker means the caller's tool call was malformed and the
+    value now carries framing that was meant to delimit it. Such a write should
+    be REFUSED rather than repaired: a loud failure gets the call retried
+    correctly, whereas a silent repair hides the caller's bug and leaves behind
+    a record nobody knows to distrust.
+
+    Args:
+        text: A raw field value. Check BEFORE sanitization — sanitize()
+            collapses runs of whitespace, which can reshape the marker.
+
+    Returns:
+        The matched marker text, or None if the value carries no framing.
+    """
+    if not text:
+        return None
+    match = _TOOL_CALL_FRAMING.search(str(text))
+    return match.group(0) if match else None
 
 
 # --- Structural validation allowlist ---
