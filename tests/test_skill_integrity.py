@@ -191,3 +191,72 @@ def test_verify_fails_on_corrupt_json():
 
     # Restore
     SKILL_MANIFEST_FILE.write_text(original, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Coverage: executable skill content, added files, build debris
+# ---------------------------------------------------------------------------
+
+SKILLS_SECURITY = REPO_ROOT / "skills" / "security"
+
+
+def test_manifest_covers_non_markdown_skill_files():
+    """Skills ship runnable content; hashing only prose protects the wrong half.
+
+    A .py helper or .sh tool an agent is told to execute is a far better place
+    to hide a payload than a SKILL.md, so every file type must be hashed.
+    """
+    manifest = generate_skill_manifest()
+    suffixes = {Path(k).suffix for k in manifest}
+    assert ".md" in suffixes
+    for required in (".py", ".sh", ".json", ".yaml"):
+        assert required in suffixes, (
+            f"manifest covers no {required} file — executable/config skill "
+            f"content is unprotected. Covered: {sorted(suffixes)}"
+        )
+
+
+def test_verify_fails_on_file_added_to_skills():
+    """An ADDED skill file must fail verification.
+
+    Checking only the manifest's own entries catches edits but not additions —
+    and a dropped-in skill file is content an agent will read and act on while
+    every recorded hash still matches.
+    """
+    write_skill_manifest()
+    assert verify_skill_integrity() is True
+
+    intruder = SKILLS_SECURITY / "sharp-edges" / "INJECTED-BY-TEST.md"
+    intruder.write_text("# not in the manifest\n", encoding="utf-8")
+    try:
+        assert verify_skill_integrity() is False
+    finally:
+        intruder.unlink()
+
+    assert verify_skill_integrity() is True
+
+
+def test_build_debris_does_not_fail_verification(tmp_path):
+    """__pycache__ left behind by running a skill script must not brick dispatch.
+
+    Agents execute skill scripts in place, so .pyc debris is routine; failing
+    on it would refuse every later dispatch over a file nobody shipped.
+    """
+    write_skill_manifest()
+    cache_dir = SKILLS_SECURITY / "sharp-edges" / "__pycache__"
+    cache_dir.mkdir(exist_ok=True)
+    debris = cache_dir / "skill.cpython-313.pyc"
+    debris.write_bytes(b"\x00\x01compiled")
+    try:
+        assert verify_skill_integrity() is True
+    finally:
+        debris.unlink()
+        cache_dir.rmdir()
+
+
+def test_binary_content_is_hashed_without_line_ending_rewriting():
+    """0x0D inside binary content is data, not a line ending."""
+    from equipa.security import _hash_file_bytes
+
+    blob = b"\x00\x89PNG\r\n\x1a\n\r"
+    assert _hash_file_bytes(blob) == hashlib.sha256(blob).hexdigest()

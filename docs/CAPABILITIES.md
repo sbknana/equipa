@@ -189,7 +189,11 @@ Every agent run is recorded as an episode with a reinforcement learning Q-value.
 
 EQUIPA's security review capability is not a checkbox -- it is a full-depth analysis pipeline built on Trail of Bits security skills.
 
-### 7 Security Skills
+### Core Security Skills
+
+26 Trail of Bits plugins are installed under `skills/security/` (synced from
+`trailofbits/skills@123037ec8`, 2026-09-16). The ones the reviewer is told to
+use on every run:
 
 | Skill | What It Does |
 |-------|-------------|
@@ -197,16 +201,22 @@ EQUIPA's security review capability is not a checkbox -- it is a full-depth anal
 | **Audit Context Building** | Deep architectural analysis -- trust boundaries, data flows, external inputs |
 | **Variant Analysis** | Finds similar vulnerabilities across the entire codebase |
 | **Differential Review** | Security-focused review of code changes (diffs) |
-| **Fix Review** | Validates that security fixes are correct and complete |
+| **Post-Patch Validation** | Validates that security fixes are correct and complete (replaces the retired Fix Review) |
 | **Semgrep Rule Creator** | Generates custom detection rules for recurring vulnerability patterns |
 | **Sharp Edges** | Identifies dangerous APIs and footgun designs |
+
+The rest cover narrower ground and are pulled in when relevant: supply-chain
+auditing, false-positive verification, insecure defaults, entry-point analysis,
+YARA rule authoring, C/C++ and Rust review, crypto (constant-time, zeroize),
+vulnerability triage, spec-to-code compliance, and GitHub Actions agent audits.
 
 ### How It Works
 
 1. **Context building** -- The security reviewer reads the target codebase, maps trust boundaries, and identifies data flows
 2. **Automated scanning** -- Runs Bandit (Python), Semgrep, and CodeQL against the project
-3. **Manual deep review** -- 10-category manual analysis covering the OWASP Top 10 and beyond: injection, auth/authz, secrets exposure, input validation, cryptography, error handling, dependency risks, file operations, network security, and business logic
-4. **Findings logged** -- Each finding gets a severity rating (Critical/High/Medium/Low/Info) and is recorded in the database
+3. **Malware scanning** -- ClamAV signatures and YARA-X (YARA Forge rules) over files the change added or vendored in, because static analysis does not recognise known-malicious content that merely arrived
+4. **Manual deep review** -- 10-category manual analysis covering the OWASP Top 10 and beyond: injection, auth/authz, secrets exposure, input validation, cryptography, error handling, dependency risks, file operations, network security, and business logic
+5. **Findings logged** -- Each finding gets a severity rating (Critical/High/Medium/Low/Info) and is recorded in the database
 
 ### Configuration
 
