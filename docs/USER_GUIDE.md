@@ -125,7 +125,7 @@ Controls agent behavior across all modes — model selection, turn limits, concu
 | `priority_boost` | {} | Manual priority overrides: `{"myproject": 100}` |
 | `only_projects` | [] | Whitelist (empty = all projects) |
 | `security_review` | false | Auto-run security review after successful dev-test |
-| `security_review_tools` | "all" | Which ClaudeStick tools security reviewer can use |
+| `features.bash_security_pretooluse` | false | Block unsafe Bash commands *before* they run (PreToolUse hook), not just after |
 | `model_{role}` | — | Per-role model override (e.g. `model_tester: "haiku"`) |
 | `model_{complexity}` | — | Per-complexity model override (e.g. `model_epic: "opus"`) |
 

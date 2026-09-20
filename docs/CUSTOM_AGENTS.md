@@ -204,7 +204,7 @@ Skills are specialized knowledge loaded into agent prompts at task start. They t
 | `tester` | Framework detection, test generation (mocking patterns) |
 | `debugger` | Systematic debugging (hypothesis-driven 5-step) |
 | `code-reviewer` | Architecture review (5-point checklist), change-impact analysis (blast radius) |
-| `security-reviewer` | 7 Trail of Bits skills (static analysis, audit context, variant analysis, etc.) |
+| `security-reviewer` | 26 Trail of Bits skills (static analysis, audit context, variant analysis, post-patch validation, YARA authoring, etc.) |
 
 ### Creating Skills for Custom Agents
 

@@ -1,0 +1,20 @@
+{
+  "name": "c-review",
+  "version": "2.0.3",
+  "description": "Comprehensive C/C++ security code review, with coverage verified against a parse of the source",
+  "author": {
+    "name": "Paweł Płatek"
+  },
+  "keywords": [
+    "c",
+    "cpp",
+    "security",
+    "code-review",
+    "static-analysis",
+    "vulnerabilities",
+    "linux",
+    "macos",
+    "posix",
+    "windows"
+  ]
+}

@@ -1,115 +1,55 @@
 # Gemini CLI Invocation
 
-## Default Configuration
+Retain this path for an explicit Gemini CLI request or an account using
+Gemini Code Assist Standard/Enterprise, a paid Gemini API key, or Vertex
+AI. Use the account's configured authentication; do not print credentials.
 
-- Model: `gemini-3.1-pro-preview`
-- Extensions: `code-review`, `gemini-cli-security`
+If the service returns `UNSUPPORTED_CLIENT` and directs the user to
+Antigravity, report that this account no longer supports Gemini CLI.
+Reinstallation does not resolve that response. Ask before changing the
+requested CLI.
 
-## Key Flags
+## Command
 
-| Flag | Purpose |
-|------|---------|
-| `-p <prompt>` | Non-interactive (headless) mode |
-| `--yolo` / `-y` | Auto-approve all tool calls |
-| `-m <model>` | Model selection |
-| `-e <ext>` | Load specific extension(s) |
-
-## Scope-to-Diff Mapping
-
-Gemini does not have built-in scope flags like Codex. Map the
-user's scope choice to the correct `git diff` command:
-
-| Scope | Diff command |
-|-------|-------------|
-| Uncommitted | `git diff HEAD` (captures both staged and unstaged) |
-| Branch diff | `git diff <branch>...HEAD` |
-| Specific commit | `git diff <sha>~1..<sha>` |
-
-**Important:** For uncommitted scope, use `git diff HEAD` not
-bare `git diff`. Bare `git diff` misses staged changes.
-
-## Code Review (General, Performance, Error Handling)
-
-For uncommitted changes, the `/code-review` extension
-automatically picks up the working tree diff:
+The default remains `gemini-3.1-pro-preview`. Preserve an explicit model.
+With the shared prompt already written to `prompt_file`:
 
 ```bash
-gemini -p "/code-review" \
-  --yolo \
-  -e code-review \
-  -m gemini-3.1-pro-preview
+gemini \
+  --model gemini-3.1-pro-preview \
+  --approval-mode default \
+  --output-format text \
+  --prompt "Review the supplied changes and return the findings." \
+  < "$prompt_file" > "$output_file" 2> "$stderr_log"
 ```
 
-For branch diffs or specific commits, pipe the diff with a
-prompt header (avoids heredocs — diffs contain `$` and backticks
-that break shell expansion):
+The prompt flag selects headless mode and stdin supplies the captured
+patch, focus, and project context. These flags were checked with
+Gemini CLI 0.59.0 `--help` on 2026-09-14. See the
+[headless mode reference](https://geminicli.com/docs/cli/headless/).
 
-```bash
-git diff <branch>...HEAD > /tmp/review-diff.txt
-{ printf '%s\n\n' 'Review this diff for code quality issues. <focus prompt>'; \
-  cat /tmp/review-diff.txt; } \
-  | gemini -p - -m gemini-3.1-pro-preview --yolo
-```
+A plain prompt supports general, security, performance, and error-handling
+reviews without installing extensions. The shared diff preparation
+includes untracked files and supports branch and commit scopes.
 
-## Security Review
+## Permissions and results
 
-The `/security:analyze` extension is interactive-only, so use
-headless mode with a security-focused prompt instead:
+Keep `--approval-mode default`. Do not use `--yolo` or automatically
+trust a directory to get past an unattended approval failure. If the
+workspace requires trust, explain the error so the user can establish
+trust through their normal setup.
 
-```bash
-git diff HEAD > /tmp/review-diff.txt
-{ printf '%s\n\n' 'Analyze this diff for security vulnerabilities, including injection, auth bypass, data exposure, and input validation issues. Report each finding with severity, location, and remediation.'; \
-  cat /tmp/review-diff.txt; } \
-  | gemini -p - -e gemini-cli-security -m gemini-3.1-pro-preview --yolo
-```
+Existing user-installed extensions may still load according to the
+CLI's configuration. This invocation does not install extensions, run
+dependency scans, or change that configuration.
 
-When security focus is selected, only run the supply chain scan
-if the diff touches dependency manifest files:
+Read the prose response and diagnostics. Report a failed invocation,
+empty output, or denied inspection as an incomplete review. Do not
+reinterpret those outcomes as an absence of findings.
 
-```bash
-# Check whether dependency files changed before scanning
-git diff --name-only <scope> \
-  | grep -qiE '(package\.json|package-lock|yarn\.lock|pnpm-lock|Gemfile|\.gemspec|requirements\.txt|setup\.py|setup\.cfg|pyproject\.toml|poetry\.lock|uv\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|composer\.json|composer\.lock|Pipfile)' \
-  && gemini -p "/security:scan-deps" \
-       --yolo \
-       -e gemini-cli-security \
-       -m gemini-3.1-pro-preview
-```
-
-Skip the scan when only non-dependency files changed. The scan
-analyzes the entire project's dependency tree regardless of diff
-scope, so it adds significant time for no value when dependencies
-weren't touched.
-
-## Adding Project Context
-
-If project context was requested, prepend it to the prompt:
-
-```bash
-git diff HEAD > /tmp/review-diff.txt
-{ printf 'Project conventions:\n---\n'; \
-  cat CLAUDE.md; \
-  printf '\n---\n\n%s\n\n' '<review instructions and focus>'; \
-  cat /tmp/review-diff.txt; } \
-  | gemini -p - -m gemini-3.1-pro-preview --yolo
-```
-
-## Error Handling
-
-| Error | Action |
-|-------|--------|
-| `gemini: command not found` | Tell user: `npm i -g @google/gemini-cli` |
-| Extension missing | Tell user: `gemini extensions install <github-url>` |
-| `-e security` silently ignored | Use `-e gemini-cli-security` (the actual installed name) |
-| Timeout | Inform user, suggest scoping down the diff |
-
-## Extension Install Commands
-
-```bash
-gemini extensions install https://github.com/gemini-cli-extensions/code-review
-gemini extensions install https://github.com/gemini-cli-extensions/security
-```
-
-Note: The security extension installs as `gemini-cli-security`
-(not `security`). Always use `-e gemini-cli-security` when
-loading it.
+| Failure | Response |
+|---------|----------|
+| Executable missing | Report the installation command: `npm i -g @google/gemini-cli` |
+| `UNSUPPORTED_CLIENT` | Explain the account migration and offer Antigravity |
+| Workspace trust or tool approval required | Report the blocked operation without enabling automatic approvals |
+| Auth, quota, model, or timeout error | Report the error and retain any partial findings |

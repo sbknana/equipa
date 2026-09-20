@@ -792,8 +792,13 @@ python "{orch}" --help
 
 ## Agent Roles & Permission Tiers
 
-Each agent role has a specific permission tier that controls what tools it can use.
-All roles use `--permission-mode dontAsk` (auto-deny unless whitelisted).
+Each role's prompt tells it what it may touch. The table below is that
+**prompt-level** contract, not a sandbox: every role is currently dispatched
+with `--permission-mode bypassPermissions`, so the limits hold because the
+agent follows them, not because the CLI enforces them. Bash is the exception —
+it is filtered for genuinely unsafe commands by `equipa.bash_security`, both
+before execution (PreToolUse hook, `features.bash_security_pretooluse`) and
+reactively in the output stream.
 
 | Role | File | Job | Can Edit Files | DB Write | Bash Access |
 |------|------|-----|:-:|:-:|---|

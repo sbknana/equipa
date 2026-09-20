@@ -1,0 +1,10 @@
+{
+  "name": "post-patch-validation",
+  "version": "0.2.2",
+  "description": "Validates security patches against the reported bug, root-cause variants, and surrounding behavior. Returns reproducible failures to repair and validation gaps, with pinned inputs and saved evidence. Bundles a validate-patch dynamic workflow for Claude Code.",
+  "author": {
+    "name": "Scott Arciszewski",
+    "email": "opensource@trailofbits.com",
+    "url": "https://github.com/tob-scott-a"
+  }
+}
