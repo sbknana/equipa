@@ -191,11 +191,22 @@ def _settings_path(cmd: list[str]) -> str | None:
     return cmd[cmd.index("--settings") + 1]
 
 
-def test_flag_off_injects_no_settings():
-    """Flag OFF (explicit and default): argv carries no --settings — zero change."""
+def test_flag_off_injects_no_settings(monkeypatch):
+    """Flag OFF (explicit and default): argv carries no --settings — zero change.
+
+    An empty ``dispatch_config`` is falsy, so build_cli_command falls back to
+    ``load_dispatch_config(None)`` — the operator's real dispatch_config.json.
+    The loader is therefore stubbed here: without it this test asserts against
+    whatever the machine happens to have enabled, and it flips from pass to
+    fail the moment someone turns the gate on in their own config, which says
+    nothing about the code's default.
+    """
+    monkeypatch.setattr(
+        "equipa.agent_runner.load_dispatch_config", lambda _path: {}
+    )
     for dc in (
         {"features": {"bash_security_pretooluse": False}},
-        {},  # default config: DEFAULT_FEATURE_FLAGS has the flag False
+        {},  # no config at all: DEFAULT_FEATURE_FLAGS has the flag False
     ):
         with build_cli_command(
             "PROMPT",
