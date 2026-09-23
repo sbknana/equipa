@@ -29,10 +29,10 @@ from equipa.constants import (
 def _resolve_role_cfg(role: str, task: dict | None):
     """Best-effort RoleConfig for (role, the task's project). Never raises.
 
-    Resolution is project-aware: a role defined in the task's project overlay
-    (``<project_dir>/.equipa/roles/<role>.md``) shadows the base role of the
-    same name. Returns None if nothing resolves or anything goes wrong, so
-    callers cleanly fall back to base defaults.
+    Resolution is project-aware: a NEW role name may come from the task's
+    project overlay (``<project_dir>/.equipa/roles/<role>.md``); base role
+    names are never shadowed (SR-2994 S1). Returns None if nothing resolves
+    or anything goes wrong, so callers cleanly fall back to base defaults.
     """
     try:
         from equipa.role_resolver import resolve_role
