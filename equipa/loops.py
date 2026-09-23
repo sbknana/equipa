@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from equipa.agent_runner import (
+    OVERLOADED_OUTCOME,
     AgentResult,
     build_cli_command,
     dispatch_agent,
@@ -2033,6 +2034,14 @@ async def run_dev_test_loop(
             if cont_action == "exit":
                 return dev_result, cycle, cont_outcome  # type: ignore[return-value]
             # cont_action == "proceed" — fall through to normal flow
+
+            # Sustained 529/overloaded exhausted every retry on the configured
+            # model. Fail loudly with an explicit outcome — never downgrade.
+            if dev_result.get("outcome") == OVERLOADED_OUTCOME:
+                log(f"  [Cycle {cycle}] Developer agent FAILED: model overloaded "
+                    f"(529) through every retry. Not downgrading the model.",
+                    output)
+                return dev_result, cycle, OVERLOADED_OUTCOME
 
             # Check for agent failure
             if not dev_result["success"]:

@@ -202,8 +202,14 @@ from equipa.tasks import verify_task_updated
 # Retry configuration from Claude Code withRetry.ts
 BASE_DELAY_MS = 500
 MAX_BACKOFF_MS = 32000
-MAX_529_RETRIES = 3  # After 3x 529/overloaded, fall back to cheaper model
+# After this many consecutive 529/overloaded errors a loud warning is logged.
+# The run keeps retrying on the SAME model — EQUIPA never swaps or downgrades
+# the configured model (owner directive 2026-09-22, task #2992).
+MAX_529_RETRIES = 3
 JITTER_FACTOR = 0.25  # 25% jitter as per Claude Code
+
+# Outcome recorded when sustained 529/overloaded errors exhaust every retry.
+OVERLOADED_OUTCOME = "agent_overloaded"
 
 # Persistent retry mode (for unattended sessions)
 PERSISTENT_MAX_BACKOFF_MS = 5 * 60 * 1000  # 5 minutes
@@ -293,6 +299,50 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
         "504",
     ]
     return any(marker in combined for marker in retryable_markers)
+
+
+def _cmd_model(cmd: list[str]) -> str:
+    """Return the ``--model`` value of a claude command, or ``"<unset>"``."""
+    for index, arg in enumerate(cmd[:-1]):
+        if arg == "--model":
+            return cmd[index + 1]
+    return "<unset>"
+
+
+def _note_overloaded(cmd: list[str], consecutive_529_errors: int) -> None:
+    """Log loudly once sustained 529s cross MAX_529_RETRIES.
+
+    The retry continues on the SAME model; there is no fallback path.
+    """
+    if consecutive_529_errors == MAX_529_RETRIES:
+        print(f"  [Overloaded] {consecutive_529_errors} consecutive 529/overloaded "
+              f"errors on model {_cmd_model(cmd)} — retrying on the SAME model "
+              f"(model downgrades are forbidden)")
+
+
+def _fail_overloaded(
+    result: dict[str, Any],
+    cmd: list[str],
+    consecutive_529_errors: int,
+    max_retries: int,
+) -> dict[str, Any]:
+    """Mark a run as a loud OVERLOADED failure after retries are exhausted.
+
+    Sets ``outcome`` to OVERLOADED_OUTCOME so the dev loop records an
+    explicit overloaded failure instead of a generic one.
+    """
+    message = (
+        f"OVERLOADED: model {_cmd_model(cmd)} returned 529/overloaded on "
+        f"{consecutive_529_errors} consecutive attempt(s) and all "
+        f"{max_retries} retries are exhausted. Failing the run — EQUIPA never "
+        f"falls back to a different model."
+    )
+    result["success"] = False
+    result["overloaded"] = True
+    result["outcome"] = OVERLOADED_OUTCOME
+    result.setdefault("errors", []).append(message)
+    print(f"  [Overloaded] {message}")
+    return result
 
 
 # Path to the flag-gated PreToolUse Bash security gate hook. Resolved from
@@ -560,16 +610,17 @@ async def run_agent(
     cmd: list[str],
     timeout: int | None = None,
     max_retries: int = 10,
-    fallback_model: str | None = None,
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
 ) -> AgentResult:
-    """Spawn claude -p with retry logic, exponential backoff, and model fallback.
+    """Spawn claude -p with retry logic and exponential backoff.
 
     Implements Claude Code withRetry.ts pattern:
     - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
-    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
-    - Retries on 429, 5xx, connection errors, timeouts
+    - Retries on 429, 529/overloaded, 5xx, connection errors, timeouts
+    - 529/overloaded is retried on the SAME model; the --model argument is
+      never rewritten. If retries exhaust while overloaded the run fails
+      loudly with outcome OVERLOADED_OUTCOME.
     - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
       with higher backoff (5 min max) and periodic heartbeats
 
@@ -577,7 +628,6 @@ async def run_agent(
         cmd: Command list for subprocess
         timeout: Per-attempt timeout (default: PROCESS_TIMEOUT)
         max_retries: Maximum retry attempts (default: 10, ignored if persistent=True)
-        fallback_model: Model to fall back to after 3x 529 (e.g., "sonnet")
         persistent_retry: Enable persistent retry mode for unattended sessions
         abort_controller: Optional parent abort controller for cancellation hierarchy
 
@@ -588,7 +638,6 @@ async def run_agent(
     start_time = time.time()
     consecutive_529_errors = 0
     last_error = ""
-    model_fallback_triggered = False
     persistent_attempt = 0
 
     # Create child abort controller if parent provided
@@ -727,28 +776,16 @@ async def run_agent(
         if result["success"]:
             return result
 
-        # Check for 529/overloaded errors
-        if is_overloaded_error(stderr_text, stdout_text):
+        # 529/overloaded: keep retrying on the SAME model. Never swap --model.
+        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        if overloaded:
             consecutive_529_errors += 1
-            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
-                # Trigger model fallback
-                if not model_fallback_triggered:
-                    # Find --model flag in cmd and replace
-                    for i, arg in enumerate(cmd):
-                        if arg == "--model" and i + 1 < len(cmd):
-                            original_model = cmd[i + 1]
-                            cmd[i + 1] = fallback_model
-                            model_fallback_triggered = True
-                            print(f"  [Retry] Model fallback triggered: "
-                                  f"{original_model} -> {fallback_model} "
-                                  f"(after {consecutive_529_errors}x 529 errors)")
-                            consecutive_529_errors = 0  # Reset counter for new model
-                            break
+            _note_overloaded(cmd, consecutive_529_errors)
         else:
             consecutive_529_errors = 0  # Reset on non-529 error
 
-        # Check if error is retryable
-        if not is_retryable_error(stderr_text, stdout_text):
+        # Check if error is retryable (529/overloaded is transient capacity)
+        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
             # Non-retryable error, fail immediately
             return result
 
@@ -790,6 +827,9 @@ async def run_agent(
 
         # Last attempt exhausted (non-persistent mode)
         if attempt >= max_retries:
+            if overloaded:
+                return _fail_overloaded(
+                    result, cmd, consecutive_529_errors, max_retries)
             result["errors"].append(
                 f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
             )
@@ -1660,17 +1700,19 @@ async def run_agent_streaming_with_retry(
     cycle_number: int = 1,
     project_dir: str | None = None,
     max_retries: int = 10,
-    fallback_model: str | None = "sonnet",
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     paralysis_retry_count: int = 0,
 ) -> AgentResult:
-    """Wrap run_agent_streaming with retry logic + exponential backoff + model fallback.
+    """Wrap run_agent_streaming with retry logic + exponential backoff.
 
     Same retry architecture as run_agent():
     - Exponential backoff with 25% jitter (500ms base, 2^attempt, cap 32s)
-    - After 3 consecutive 529/overloaded errors, fall back to cheaper model
-    - Retryable errors: 429, 5xx, connection, timeout, ECONNRESET, EPIPE
+    - Retryable errors: 429, 529/overloaded, 5xx, connection, timeout,
+      ECONNRESET, EPIPE
+    - 529/overloaded is retried on the SAME model; the --model argument is
+      never rewritten. If retries exhaust while overloaded the run fails
+      loudly with outcome OVERLOADED_OUTCOME.
     - Non-retryable errors fail immediately
     - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
       with higher backoff (5 min max) and periodic heartbeats
@@ -1680,7 +1722,6 @@ async def run_agent_streaming_with_retry(
         abort_controller: Optional parent abort controller for cancellation hierarchy
     """
     consecutive_529_errors = 0
-    model_fallback_triggered = False
     last_error = ""
     persistent_attempt = 0
 
@@ -1718,28 +1759,16 @@ async def run_agent_streaming_with_retry(
             ):
                 return result
 
-        # Check for 529/overloaded errors
-        if is_overloaded_error(stderr_text, stdout_text):
+        # 529/overloaded: keep retrying on the SAME model. Never swap --model.
+        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        if overloaded:
             consecutive_529_errors += 1
-            if consecutive_529_errors >= MAX_529_RETRIES and fallback_model:
-                # Trigger model fallback
-                if not model_fallback_triggered:
-                    # Find --model flag in cmd and replace
-                    for i, arg in enumerate(cmd):
-                        if arg == "--model" and i + 1 < len(cmd):
-                            original_model = cmd[i + 1]
-                            cmd[i + 1] = fallback_model
-                            model_fallback_triggered = True
-                            print(f"  [Retry] Model fallback triggered: "
-                                  f"{original_model} -> {fallback_model} "
-                                  f"(after {consecutive_529_errors}x 529 errors)")
-                            consecutive_529_errors = 0  # Reset counter for new model
-                            break
+            _note_overloaded(cmd, consecutive_529_errors)
         else:
             consecutive_529_errors = 0  # Reset on non-529 error
 
-        # Check if error is retryable
-        if not is_retryable_error(stderr_text, stdout_text):
+        # Check if error is retryable (529/overloaded is transient capacity)
+        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
             # Non-retryable error, fail immediately
             return result
 
@@ -1781,6 +1810,9 @@ async def run_agent_streaming_with_retry(
 
         # Last attempt exhausted (non-persistent mode)
         if attempt >= max_retries:
+            if overloaded:
+                return _fail_overloaded(
+                    result, cmd, consecutive_529_errors, max_retries)
             result["errors"].append(
                 f"Max retries ({max_retries}) exhausted. Last error: {last_error}"
             )
@@ -1822,7 +1854,8 @@ async def run_agent_streaming(
     table for observability and ForgeSmith analysis.
 
     This function automatically includes retry logic with exponential backoff
-    and model fallback (after 3x 529 errors). Use run_agent_streaming_with_retry
+    (529/overloaded retried on the same model — never downgraded). Use
+    run_agent_streaming_with_retry
     directly if you need to customize retry parameters.
 
     Returns the same dict format as run_agent().
