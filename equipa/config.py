@@ -14,10 +14,15 @@ Exports:
     DEFAULT_DISPATCH_CONFIG
     is_feature_enabled
     load_dispatch_config
+    set_active_dispatch_config
+    get_active_dispatch_config
     get_configured_model
+    get_approved_model_upgrades
+    is_model_allowed
     DOWNGRADE_MODEL_FAMILIES
     is_downgrade_model
     resolve_claude_model
+    get_persistent_retry_max_attempts
 
 Copyright 2026 Forgeborn
 """
@@ -25,6 +30,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from equipa.constants import DEFAULT_MODEL, THEFORGE_DB
@@ -181,20 +187,121 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
     return config
 
 
+# --- Orchestrator dispatch config (model resolution source) -----------------
+#
+# Model resolution must read the SAME dispatch config the orchestrator loaded
+# for role resolution (``args.dispatch_config`` in equipa.cli), never a
+# ``dispatch_config.json`` that happens to sit in the process CWD (task #2994,
+# SECURITY-REVIEW-2992 S2). The orchestrator registers its loaded config via
+# set_active_dispatch_config(). Processes that never register one (MCP server,
+# ForgeSmith, standalone scripts) resolve, in order:
+#   1. the file named by $EQUIPA_DISPATCH_CONFIG, then
+#   2. <repo_root>/dispatch_config.json — next to this equipa/ package.
+
+DISPATCH_CONFIG_ENV_VAR = "EQUIPA_DISPATCH_CONFIG"
+REPO_DISPATCH_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "dispatch_config.json"
+)
+
+# Optional dispatch_config.json key: model ids an operator explicitly approves
+# in addition to the configured ``model``. Any other requested model resolves
+# to the configured one (allowlist, task #2994 S3).
+APPROVED_MODEL_UPGRADES_KEY = "approved_model_upgrades"
+
+_active_dispatch_config: dict | None = None
+
+
+def set_active_dispatch_config(dispatch_config: dict | None) -> None:
+    """Register the orchestrator's loaded dispatch config for model resolution.
+
+    Pass None to clear the registration (tests, or a process that reloads).
+    """
+    global _active_dispatch_config
+    if dispatch_config is not None and not isinstance(dispatch_config, dict):
+        raise TypeError(
+            f"dispatch_config must be a dict or None, got "
+            f"{type(dispatch_config).__name__}"
+        )
+    _active_dispatch_config = dispatch_config
+
+
+def resolve_model_config_path() -> Path:
+    """Return the dispatch_config.json path used when none is registered.
+
+    $EQUIPA_DISPATCH_CONFIG wins; otherwise the repo-root file next to the
+    equipa/ package. Deliberately never CWD-relative.
+    """
+    override = os.environ.get(DISPATCH_CONFIG_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+    return REPO_DISPATCH_CONFIG_PATH
+
+
+def get_active_dispatch_config() -> dict:
+    """Return the dispatch config that model resolution must use."""
+    if _active_dispatch_config is not None:
+        return _active_dispatch_config
+    return load_dispatch_config(resolve_model_config_path())
+
+
 def get_configured_model(dispatch_config: dict | None = None) -> str:
     """Return the configured Claude model for auxiliary (non-role) agent runs.
 
     Used by reflexion, RLM decomposition and any other helper that spawns
     ``claude`` outside the role-model resolution in equipa.roles. Reads
-    ``dispatch_config["model"]``, loading dispatch_config.json when no config
-    is passed. Falls back to the Opus-family DEFAULT_MODEL — EQUIPA never
-    picks a cheaper model on its own (task #2992).
+    ``dispatch_config["model"]``; with no config passed it reads the
+    orchestrator's registered config (see get_active_dispatch_config), never
+    a CWD-relative file. Falls back to the Opus-family DEFAULT_MODEL — EQUIPA
+    never picks a cheaper model on its own (task #2992).
     """
-    config = dispatch_config if dispatch_config is not None else load_dispatch_config(None)
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
     model = config.get("model")
     if isinstance(model, str) and model.strip():
         return model.strip()
     return DEFAULT_MODEL
+
+
+def get_approved_model_upgrades(dispatch_config: dict | None = None) -> frozenset[str]:
+    """Return the operator's explicit model-upgrade allowlist (may be empty).
+
+    Non-string and blank entries are ignored; a malformed (non-list) value is
+    treated as an empty list so a typo can never widen the allowlist.
+    """
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    raw = config.get(APPROVED_MODEL_UPGRADES_KEY, [])
+    if not isinstance(raw, list):
+        print(f"WARNING: dispatch config {APPROVED_MODEL_UPGRADES_KEY!r} must "
+              f"be a list of model ids; ignoring {type(raw).__name__} value")
+        return frozenset()
+    return frozenset(
+        entry.strip() for entry in raw
+        if isinstance(entry, str) and entry.strip()
+    )
+
+
+def is_model_allowed(model: object, dispatch_config: dict | None = None) -> bool:
+    """Return True only for the configured model or an approved upgrade.
+
+    Allowlist, not denylist (task #2994 S3): an older pinned generation such
+    as ``claude-opus-4-20250514`` or a bare alias such as ``opus`` is refused
+    just like ``sonnet`` — only the exact configured id is honoured.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return False
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    candidate = model.strip()
+    if candidate == get_configured_model(config):
+        return True
+    return candidate in get_approved_model_upgrades(config)
 
 
 # Model families EQUIPA must never select on its own (owner directive
@@ -217,18 +324,53 @@ def resolve_claude_model(
 ) -> str:
     """Return the model an auxiliary Claude call must run on.
 
-    ``requested`` (e.g. a ``model`` key in forgesmith_config.json) is honoured
-    only when it is set and is NOT a sonnet/haiku-family model. Anything else
-    resolves to the configured dispatch model (``get_configured_model``). A
-    refused request is reported on stdout so the substitution is never silent.
+    ``requested`` (e.g. a ``model`` key in forgesmith_config.json or a project
+    role's frontmatter) is honoured only when it equals the configured
+    dispatch model or appears in the operator's ``approved_model_upgrades``
+    list (see is_model_allowed). Anything else — sonnet, haiku, an older
+    pinned Opus, a bare alias — resolves to the configured model. A refused
+    request is reported on stdout so the substitution is never silent.
     """
-    configured = get_configured_model(dispatch_config)
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    configured = get_configured_model(config)
     if not isinstance(requested, str) or not requested.strip():
         return configured
     requested = requested.strip()
-    if is_downgrade_model(requested):
-        print(f"WARNING: refusing downgrade model {requested!r}; using the "
-              f"configured model {configured!r} (task #2992: EQUIPA never "
-              f"runs on sonnet/haiku)")
-        return configured
-    return requested
+    if is_model_allowed(requested, config):
+        return requested
+    print(f"WARNING: refusing non-configured model {requested!r}; using the "
+          f"configured model {configured!r} (task #2994: only the configured "
+          f"model or an approved upgrade is ever run)")
+    return configured
+
+
+# dispatch_config.json key bounding persistent-retry mode (task #2994 S9).
+# After this many consecutive capacity (429/529) failures a persistent-retry
+# run stops and fails loudly — with outcome agent_overloaded when the last
+# error was a 529 — instead of retrying forever on the same model.
+PERSISTENT_RETRY_MAX_ATTEMPTS_KEY = "persistent_retry_max_attempts"
+# Backoff caps at 5 min per wait, so 36 attempts is roughly 2.5 hours.
+DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS = 36
+
+
+def get_persistent_retry_max_attempts(dispatch_config: dict | None = None) -> int:
+    """Return the persistent-retry ceiling from config, validated.
+
+    Anything that is not a positive int (including bool) falls back to the
+    default rather than disabling the ceiling.
+    """
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    raw = config.get(PERSISTENT_RETRY_MAX_ATTEMPTS_KEY,
+                     DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        print(f"WARNING: dispatch config {PERSISTENT_RETRY_MAX_ATTEMPTS_KEY!r}="
+              f"{raw!r} is not a positive integer; using "
+              f"{DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS}")
+        return DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS
+    return raw
