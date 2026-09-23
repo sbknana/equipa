@@ -1828,7 +1828,8 @@ async def run_dev_test_loop(
                 "early_term_reason": f"build_broken ({autofix_summary})",
                 "cost": state.total_cost,
                 "duration": 0,
-            }, 0, "build_broken"
+            }, 0, (OVERLOADED_OUTCOME if autofix_summary == OVERLOADED_OUTCOME
+                   else "build_broken")
 
     tester_result: dict[str, Any] = {}
     dev_result: dict[str, Any] = {}

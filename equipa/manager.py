@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from equipa.agent_runner import build_cli_command, run_agent
+from equipa.agent_runner import (
+    OVERLOADED_OUTCOME,
+    build_cli_command,
+    is_overloaded_result,
+    run_agent,
+)
 from equipa.constants import (
     MANAGER_COST_LIMIT,
     MAX_FOLLOWUP_TASKS,
@@ -118,6 +123,10 @@ async def run_planner_agent(
         log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
         result = await run_agent(cmd)
 
+    if is_overloaded_result(result):
+        log("  [Planner] Agent FAILED: model overloaded (529) through every "
+            "retry. Not downgrading the model; no tasks planned.", output)
+        return result, []
     if not result["success"]:
         log(f"  [Planner] Agent failed: {result.get('errors', [])}", output)
         return result, []
@@ -170,6 +179,13 @@ async def run_evaluator_agent(
         log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
         result = await run_agent(cmd)
 
+    if is_overloaded_result(result):
+        # Never parse an overloaded run: it did no evaluation (#2994 S1).
+        log("  [Evaluator] Agent FAILED: model overloaded (529) through every "
+            "retry. Not downgrading the model; goal left blocked.", output)
+        return result, {"goal_status": "blocked", "tasks_created": [],
+                        "evaluation": "Evaluator agent failed: model overloaded",
+                        "blockers": OVERLOADED_OUTCOME}
     if not result["success"]:
         log(f"  [Evaluator] Agent failed: {result.get('errors', [])}", output)
         return result, {"goal_status": "blocked", "tasks_created": [],

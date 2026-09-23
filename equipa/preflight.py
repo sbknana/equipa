@@ -26,6 +26,27 @@ from equipa.constants import (
 )
 from equipa.output import log
 
+# Mirrors equipa.agent_runner.OVERLOADED_OUTCOME; this module imports
+# agent_runner lazily, so the value is duplicated and pinned by a test.
+OVERLOADED_OUTCOME = "agent_overloaded"
+
+
+def _autofix_overloaded(result: Any, label: str, output: Any = None) -> bool:
+    """Return True (after logging loudly) if an auto-fix agent hit sustained 529.
+
+    An overloaded debugger/planner did no work. Continuing would only burn
+    another full retry budget per phase on the same overloaded model, and an
+    overloaded planner's empty output must never be passed on as a fix plan
+    (task #2994 S1).
+    """
+    from equipa.agent_runner import is_overloaded_result
+
+    if not is_overloaded_result(result):
+        return False
+    log(f"  [AutoFix] {label} agent FAILED: model overloaded (529) through "
+        f"every retry. Not downgrading the model; abandoning auto-fix.", output)
+    return True
+
 
 async def _run_install_cmd(
     cmd: list[str],
@@ -242,10 +263,13 @@ async def _handle_preflight_failure(
                 f"Start writing fixes IMMEDIATELY — do not read more than 3 files."
             ),
         }
-        _, cost = await _dispatch_autofix_agent(
+        debugger_result, cost = await _dispatch_autofix_agent(
             "debugger", fix_task, project_dir, project_context,
             AUTOFIX_DEBUGGER_BUDGET, task_id, attempt, args, output)
         total_cost += cost
+
+        if _autofix_overloaded(debugger_result, "Debugger", output):
+            return False, total_cost, OVERLOADED_OUTCOME
 
         if total_cost >= AUTOFIX_COST_LIMIT:
             log(f"  [AutoFix] Cost limit reached (${total_cost:.2f}). Giving up.", output)
@@ -279,6 +303,11 @@ async def _handle_preflight_failure(
         AUTOFIX_PLANNER_BUDGET, task_id, AUTOFIX_MAX_DEBUGGER_CYCLES + 1, args, output)
     total_cost += cost
 
+    # An overloaded planner produced no plan; never hand its empty output to
+    # the guided debugger as if it were one.
+    if _autofix_overloaded(planner_result, "Planner", output):
+        return False, total_cost, OVERLOADED_OUTCOME
+
     if total_cost >= AUTOFIX_COST_LIMIT:
         log(f"  [AutoFix] Cost limit reached after planner (${total_cost:.2f}). Giving up.", output)
         return False, total_cost, "cost_limit_exceeded"
@@ -297,10 +326,13 @@ async def _handle_preflight_failure(
             f"Execute the plan. Fix the build. Verify it compiles. Start IMMEDIATELY."
         ),
     }
-    _, cost = await _dispatch_autofix_agent(
+    guided_result, cost = await _dispatch_autofix_agent(
         "debugger", guided_task, project_dir, project_context,
         AUTOFIX_DEBUGGER_BUDGET, task_id, AUTOFIX_MAX_DEBUGGER_CYCLES + 2, args, output)
     total_cost += cost
+
+    if _autofix_overloaded(guided_result, "Guided debugger", output):
+        return False, total_cost, OVERLOADED_OUTCOME
 
     fixed, _, _ = await preflight_build_check(project_dir, output=output)
     if fixed:
