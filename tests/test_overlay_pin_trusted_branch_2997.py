@@ -166,6 +166,20 @@ def test_repointed_origin_head_does_not_change_merge_target(project: Path, workt
     _git(project, "merge-base", "--is-ancestor", branch_sha, "refs/heads/main")
 
 
+def test_git_ops_merge_task_branch_targets_trusted_branch(project: Path, worktree: Path):
+    _write(worktree, "src/app.py", "print('hi')\n")
+    branch_sha = _commit_all(worktree, "code change")
+    _poison_origin_head_from(worktree)
+    # The helper checks the target out in the main checkout; free the branch.
+    _git(project, "worktree", "remove", "--force", str(worktree))
+
+    merge = git_ops.merge_task_branch(project, 1)
+
+    assert merge.returncode == 0, merge.stderr
+    assert _git(project, "branch", "--show-current") == "main"
+    _git(project, "merge-base", "--is-ancestor", branch_sha, "refs/heads/main")
+
+
 # --------------------------------------------------------------------------- #
 # S1 — get_trusted_default_branch contract.
 # --------------------------------------------------------------------------- #

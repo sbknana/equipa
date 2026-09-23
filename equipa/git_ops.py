@@ -237,7 +237,9 @@ def merge_task_branch(
         )
 
     if target_ref is None:
-        target_ref = get_default_branch(repo_path)
+        # SR-2997 S1: never merge into whatever origin/HEAD names (agent-
+        # writable); raises UntrustedDefaultBranchError (a RuntimeError).
+        target_ref = get_trusted_default_branch(repo_path)
 
     checkout = git_run(["checkout", "-q", target_ref], repo_path, timeout=30)
     if checkout.returncode != 0:
@@ -536,6 +538,10 @@ def get_default_branch(repo_path: str | Path, *, strict: bool = False) -> str:
          checked out.
       4. If ``strict=True``, raise :class:`DefaultBranchDetectionError`.
          Otherwise (default) emit a WARNING and fall back to ``"master"``.
+
+    NOT a trust decision: steps 1 and 3 read refs any agent worktree can
+    rewrite. Anything that picks a trusted commit (overlay pin, merge target,
+    gate diff base) must use :func:`get_trusted_default_branch` (SR-2997 S1).
 
     Results are cached per-process for 5 minutes keyed by the resolved
     absolute path of ``repo_path``. The TTL bounds the window where a
