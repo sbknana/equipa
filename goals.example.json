@@ -1,6 +1,6 @@
 {
     "max_concurrent": 3,
-    "model": "sonnet",
+    "model": "claude-opus-5-5[1m]",
     "goals": [
         {
             "goal": "Add a --version flag that prints the version from pyproject.toml",
@@ -10,7 +10,7 @@
         {
             "goal": "Write unit tests for the authentication module",
             "project_id": 2,
-            "model": "sonnet",
+            "model": "claude-opus-5-5[1m]",
             "comment": "Tester-heavy goal — Planner will create test tasks"
         },
         {

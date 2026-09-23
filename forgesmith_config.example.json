@@ -17,11 +17,7 @@
         "max_turns_floor": 10,
         "turn_increase_step": 10,
         "turn_decrease_step": 5,
-        "max_concurrency": 8,
-        "allowed_models": [
-            "sonnet",
-            "opus"
-        ]
+        "max_concurrency": 8
     },
     "protected_files": [],
     "backup_dir": ".forgesmith-backups",
@@ -83,7 +79,6 @@
     "rubric_version": 1,
     "opro": {
         "enabled": true,
-        "model": "sonnet",
         "timeout_seconds": 120,
         "max_proposals_per_role": 3,
         "min_runs_for_proposal": 5,
