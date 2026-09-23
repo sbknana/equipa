@@ -2050,7 +2050,7 @@ async def dispatch_agent(
                     project_dir=project_dir,
                     role=role,
                     repo_files=repo_files,
-                    mcp_config=mcp_config or "",
+                    mcp_config=str(MCP_CONFIG),
                     # Same model the role resolved to — never a cheaper one.
                     model=_cmd_model(cmd) or get_configured_model(dispatch_config),
                 )
