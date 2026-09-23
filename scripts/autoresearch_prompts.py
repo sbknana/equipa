@@ -6,13 +6,14 @@ agent failure telemetry. Writes improved prompts, backs up originals.
 
 Tiered approach:
   Tier 1: Ollama qwen3.5:9b (free, fast) — initial mutations
-  Tier 2: Anthropic Sonnet (if stuck below 80%)
+  Tier 2: Anthropic Opus (if stuck below 80%) — formerly Sonnet; EQUIPA never
+          runs on sonnet/haiku (owner directive 2026-09-22, task #2992)
   Tier 3: Anthropic Opus (final polish)
 
 Usage:
     python3 autoresearch_prompts.py                    # Run all agents via Ollama
     python3 autoresearch_prompts.py --role developer   # Single agent
-    python3 autoresearch_prompts.py --tier 2           # Use Anthropic Sonnet
+    python3 autoresearch_prompts.py --tier 2           # Use Anthropic Opus
     python3 autoresearch_prompts.py --dry-run          # Show proposals, don't write
     python3 autoresearch_prompts.py --rollback         # Restore backups
 
@@ -224,7 +225,11 @@ def call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         return ""
 
 
-def call_anthropic(prompt: str, model: str = "claude-sonnet-4-20250514") -> str:
+# Anthropic model for tiers 2 and 3. Opus only — no sonnet/haiku tier (#2992).
+ANTHROPIC_OPUS_MODEL = "claude-opus-4-20250514"
+
+
+def call_anthropic(prompt: str, model: str = ANTHROPIC_OPUS_MODEL) -> str:
     """Call Anthropic API for tier 2/3."""
     # Read API key from environment (preferred) or legacy key file
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -321,10 +326,8 @@ def optimize_agent(role: str, tier: int = 1, dry_run: bool = False) -> bool:
     # Call the appropriate LLM
     if tier == 1:
         new_prompt = call_ollama(meta_prompt)
-    elif tier == 2:
-        new_prompt = call_anthropic(meta_prompt, "claude-sonnet-4-20250514")
-    elif tier == 3:
-        new_prompt = call_anthropic(meta_prompt, "claude-opus-4-20250514")
+    elif tier in (2, 3):
+        new_prompt = call_anthropic(meta_prompt, ANTHROPIC_OPUS_MODEL)
     else:
         print(f"  ERROR: Unknown tier {tier}")
         return False
@@ -404,7 +407,7 @@ def main():
     parser = argparse.ArgumentParser(description="Autoresearch Prompt Optimizer")
     parser.add_argument("--role", type=str, help="Optimize a single role")
     parser.add_argument("--tier", type=int, default=1, choices=[1, 2, 3],
-                       help="LLM tier: 1=Ollama, 2=Sonnet, 3=Opus")
+                       help="LLM tier: 1=Ollama, 2=Opus, 3=Opus (no sonnet tier)")
     parser.add_argument("--dry-run", action="store_true", help="Show proposals without writing")
     parser.add_argument("--rollback", action="store_true", help="Restore from backups")
     parser.add_argument("--no-sync", action="store_true", help="Skip rsync to Claudinator")
