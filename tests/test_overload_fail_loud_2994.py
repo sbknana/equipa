@@ -518,11 +518,17 @@ class TestOverloadedOutcomeNeverSuccess:
 
 
 class TestPersistentRetryCeiling:
+    # Far above every ceiling used below (and the default of 36): if the
+    # ceiling is ever removed, the fakes fail fast instead of hanging forever.
+    SAFETY_CAP = 50
+
     def _run(self, monkeypatch, stderr: str, **kwargs) -> tuple[dict, int]:
         attempts = {"n": 0}
 
         async def always_capacity_error(_cmd, **_kw):
             attempts["n"] += 1
+            if attempts["n"] > self.SAFETY_CAP:
+                raise AssertionError("persistent retry has no ceiling")
             return {"success": False, "errors": [stderr], "result_text": "",
                     "num_turns": 0}
 
@@ -556,6 +562,37 @@ class TestPersistentRetryCeiling:
         assert result["success"] is False
         assert result.get("outcome") != OVERLOADED_OUTCOME
         assert any("Persistent retry ceiling" in e for e in result["errors"])
+
+    def test_non_streaming_run_agent_is_bounded_too(self, monkeypatch):
+        # run_agent has its own copy of the persistent-retry loop.
+        attempts = {"n": 0}
+
+        class _OverloadedProcess:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", OVERLOADED_STDERR.encode()
+
+            def kill(self):
+                pass
+
+        async def fake_exec(*_cmd, **_kw):
+            attempts["n"] += 1
+            if attempts["n"] > self.SAFETY_CAP:
+                raise AssertionError("persistent retry has no ceiling")
+            return _OverloadedProcess()
+
+        monkeypatch.setattr(agent_runner.asyncio, "create_subprocess_exec",
+                            fake_exec)
+        monkeypatch.setattr(agent_runner, "get_retry_delay", lambda *_a, **_k: 0.0)
+
+        result = asyncio.run(agent_runner.run_agent(
+            ["claude", "--model", CONFIGURED_MODEL], persistent_retry=True,
+            persistent_max_attempts=3))
+
+        assert attempts["n"] == 3
+        assert is_overloaded_result(result)
+        assert result["success"] is False
 
     @pytest.mark.parametrize("bad", [0, -1, True, "5", 2.5, None])
     def test_invalid_config_value_falls_back_to_default(self, bad):
