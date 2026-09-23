@@ -528,7 +528,7 @@ def test_dispatch_rejects_unknown_role(mcp_server):
 
 
 def test_dispatch_rejects_unknown_model(mcp_server):
-    """Models outside {opus, sonnet, haiku} are rejected before subprocess spawn."""
+    """Models outside the Opus-family allowlist are rejected before subprocess spawn."""
     response = _send_request(mcp_server, "tools/call", {
         "name": "equipa_dispatch",
         "arguments": {

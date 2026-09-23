@@ -34,7 +34,9 @@ from typing import Any, Iterator
 
 # Import constants and DB helper
 try:
+    from equipa.config import get_configured_model, is_downgrade_model
     from equipa.constants import (
+        DEFAULT_MODEL,
         DEFAULT_ROLE_MODELS,
         DEFAULT_ROLE_TURNS,
         ROLE_PROMPTS,
@@ -44,9 +46,19 @@ try:
 except ImportError:
     # Fallback if running as standalone
     THEFORGE_DB = Path(__file__).parent.parent / "theforge.db"
+    DEFAULT_MODEL = "claude-opus-5-5[1m]"
     DEFAULT_ROLE_MODELS = {}
     DEFAULT_ROLE_TURNS = {}
     ROLE_PROMPTS = {}
+
+    def get_configured_model(dispatch_config: dict | None = None) -> str:
+        """Standalone fallback: no dispatch config, use the Opus default."""
+        return DEFAULT_MODEL
+
+    def is_downgrade_model(model: object) -> bool:
+        """Standalone fallback for equipa.config.is_downgrade_model."""
+        name = model.lower() if isinstance(model, str) else ""
+        return "sonnet" in name or "haiku" in name
 
     def fetch_project_context(project_id: int) -> dict:
         """Minimal fallback for fetch_project_context."""
@@ -82,7 +94,19 @@ ALLOWED_ROLES = (
         "code-reviewer", "debugger", "frontend-designer", "integration-tester",
         "qa-tester"}
 )
-ALLOWED_MODELS = {"opus", "sonnet", "haiku"}
+# Opus-family only: sonnet/haiku are never dispatchable (owner directive
+# 2026-09-22, task #2992). The configured dispatch model is added at
+# validation time by _allowed_models().
+ALLOWED_MODELS = {"opus", DEFAULT_MODEL}
+
+
+def _allowed_models() -> set[str]:
+    """Static Opus allowlist plus the configured model (unless a downgrade)."""
+    allowed = set(ALLOWED_MODELS)
+    configured = get_configured_model()
+    if not is_downgrade_model(configured):
+        allowed.add(configured)
+    return allowed
 
 
 def _log(msg: str) -> None:
@@ -345,10 +369,11 @@ def _handle_equipa_dispatch(args: dict) -> dict:
         }
 
     model = args.get("model")
-    if model is not None and (not isinstance(model, str) or model not in ALLOWED_MODELS):
+    allowed_models = _allowed_models()
+    if model is not None and (not isinstance(model, str) or model not in allowed_models):
         return {
             "error": f"model {model!r} not in allowlist",
-            "allowed_models": sorted(ALLOWED_MODELS),
+            "allowed_models": sorted(allowed_models),
         }
 
     max_turns = args.get("max_turns")
@@ -661,7 +686,7 @@ TOOLS = {
                 "task_id": {"type": "integer", "description": "Task ID to dispatch"},
                 "role": {"type": "string", "description": "Agent role (default: developer)", "default": "developer"},
                 "max_turns": {"type": "integer", "description": "Max turns"},
-                "model": {"type": "string", "description": "Model override (opus/sonnet/haiku)"},
+                "model": {"type": "string", "description": "Model override (Opus family only; defaults to the configured model)"},
             },
             "required": ["auth_token", "task_id"],
         },
