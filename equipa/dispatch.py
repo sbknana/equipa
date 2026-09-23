@@ -52,7 +52,13 @@ from equipa.db import (
     update_task_status,
 )
 from equipa.hooks import fire_async as fire_hook
-from equipa.git_ops import _is_git_repo, get_default_branch, git_run_async
+from equipa.git_ops import (
+    UntrustedDefaultBranchError,
+    _is_git_repo,
+    get_default_branch,
+    get_trusted_default_branch,
+    git_run_async,
+)
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     _count_findings_in_review_file,
@@ -1305,14 +1311,31 @@ async def _pin_role_overlay_ref(project_dir: str) -> None:
     SR-2994 S1: overlays are agent instructions, so they are read from the
     stable project root at the commit the default branch had BEFORE any
     agent ran — nothing committed during the dispatch (even onto the default
-    branch) can change them. On failure no pin is recorded and role
-    resolution falls back to the default branch's current commit, which the
-    gate protects (a diff touching .equipa/roles/ never merges unreviewed).
-    """
-    from equipa.git_ops import get_default_branch
-    from equipa.role_resolver import pin_overlay_ref
+    branch) can change them.
 
-    default_branch = get_default_branch(project_dir)
+    SR-2997 S1: the branch is the operator-named one from
+    ``get_trusted_default_branch`` — never ``refs/remotes/origin/HEAD`` or the
+    checked-out HEAD, which any agent worktree can repoint. The pin must also
+    follow the previous pin: same branch, and a descendant of the previous
+    SHA. Any failure fails CLOSED (project overlays disabled) and a refused
+    pin raises a GATE-AUDIT alarm.
+    """
+    from equipa.git_ops import UntrustedDefaultBranchError, get_trusted_default_branch
+    from equipa.role_resolver import block_overlays, current_overlay_pin, pin_overlay_ref
+
+    def refuse(reason: str) -> None:
+        block_overlays(project_dir, reason)
+        print(f"  [Isolation] WARNING: role overlays DISABLED for {project_dir}: {reason}")
+        _gate_audit_log(
+            f"event=overlay-pin-refused project={project_dir} reason={reason}",
+            event="overlay-pin-refused",
+        )
+
+    try:
+        default_branch = get_trusted_default_branch(project_dir)
+    except UntrustedDefaultBranchError as exc:
+        refuse(str(exc))
+        return
     try:
         sha_res = await git_run_async(
             ["rev-parse", "--verify", "--quiet",
@@ -1320,18 +1343,36 @@ async def _pin_role_overlay_ref(project_dir: str) -> None:
             project_dir, timeout=10,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        print(f"  [Isolation] WARNING: could not pin role overlays to "
-              f"'{default_branch}': {exc}")
+        refuse(f"could not resolve '{default_branch}': {exc}")
         return
     sha = (sha_res.stdout or "").strip()
     if sha_res.returncode != 0 or not sha:
-        print(f"  [Isolation] WARNING: could not pin role overlays: "
-              f"'{default_branch}' did not resolve to a commit")
+        refuse(f"'{default_branch}' did not resolve to a commit")
         return
+    previous = current_overlay_pin(project_dir)
+    if previous is not None:
+        previous_branch, previous_sha = previous
+        if previous_branch is not None and previous_branch != default_branch:
+            refuse(f"default branch changed from '{previous_branch}' to "
+                   f"'{default_branch}' since the previous pin")
+            return
+        if previous_sha != sha:
+            try:
+                ancestry = await git_run_async(
+                    ["merge-base", "--is-ancestor", previous_sha, sha],
+                    project_dir, timeout=10,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                refuse(f"could not check ancestry of {sha[:12]}: {exc}")
+                return
+            if ancestry.returncode != 0:
+                refuse(f"'{default_branch}'@{sha[:12]} does not descend from "
+                       f"the previous pin {previous_sha[:12]}")
+                return
     try:
-        pin_overlay_ref(project_dir, sha)
+        pin_overlay_ref(project_dir, sha, branch=default_branch)
     except ValueError as exc:
-        print(f"  [Isolation] WARNING: could not pin role overlays: {exc}")
+        refuse(str(exc))
         return
     print(f"  [Isolation] Role overlays pinned to {default_branch}@{sha[:12]}")
 
@@ -1605,7 +1646,17 @@ async def _merge_task_branch(
         # generalises the previous empty-current_branch fallback to also cover
         # the single-task case, and matches parallel-mode behaviour (which
         # already runs the main checkout on the default branch).
-        default_branch = get_default_branch(project_dir)
+        # SR-2997 S1 sibling: the merge TARGET must be the operator-named
+        # branch, never origin/HEAD (agent-writable) — fail closed otherwise.
+        try:
+            default_branch = get_trusted_default_branch(project_dir)
+        except UntrustedDefaultBranchError as exc:
+            print(
+                f"  [Isolation] ERROR: Task #{task_id}: no trusted merge "
+                f"target: {exc}"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            return False
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
         )
