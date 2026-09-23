@@ -664,6 +664,35 @@ class TestModelAllowlist:
                   APPROVED_MODEL_UPGRADES_KEY: "claude-opus-4-20250514"}
         assert not is_model_allowed("claude-opus-4-20250514", config)
 
+    # SR-2994 S3: an operator-listed sonnet/haiku entry must never be run.
+    @pytest.mark.parametrize("downgrade", [
+        "sonnet", "haiku", "claude-sonnet-5", "claude-haiku-4-5-20251001",
+        "Claude-Sonnet-4-20250514",
+    ])
+    def test_listed_downgrade_family_is_still_refused(self, downgrade, capsys):
+        config = {"model": CONFIGURED_MODEL,
+                  APPROVED_MODEL_UPGRADES_KEY: [downgrade, APPROVED_UPGRADE]}
+        assert not is_model_allowed(downgrade, config)
+        assert resolve_claude_model(downgrade, config) == CONFIGURED_MODEL
+        # A legitimate upgrade listed alongside it is unaffected.
+        assert resolve_claude_model(APPROVED_UPGRADE, config) == APPROVED_UPGRADE
+        warning = capsys.readouterr().out
+        assert downgrade in warning and "sonnet/haiku" in warning
+
+    def test_listed_downgrade_is_dropped_from_upgrade_set(self):
+        config = {"model": CONFIGURED_MODEL,
+                  APPROVED_MODEL_UPGRADES_KEY: ["sonnet", "claude-haiku-4-5",
+                                                APPROVED_UPGRADE]}
+        assert equipa_config.get_approved_model_upgrades(config) == frozenset(
+            {APPROVED_UPGRADE})
+
+    def test_listed_downgrade_cannot_reach_project_role_frontmatter(self):
+        """The overlay path from the S3 report: role frontmatter model=sonnet."""
+        config = {"model": CONFIGURED_MODEL,
+                  APPROVED_MODEL_UPGRADES_KEY: ["sonnet"]}
+        set_active_dispatch_config(config)
+        assert resolve_claude_model("sonnet") == CONFIGURED_MODEL
+
     def test_forgesmith_refuses_non_configured_model_writes(self):
         import forgesmith
 

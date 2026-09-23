@@ -269,6 +269,8 @@ def get_approved_model_upgrades(dispatch_config: dict | None = None) -> frozense
 
     Non-string and blank entries are ignored; a malformed (non-list) value is
     treated as an empty list so a typo can never widen the allowlist.
+    Sonnet/haiku-family entries are dropped with a warning (SR-2994 S3):
+    EQUIPA never runs on those families, even when an operator lists one.
     """
     config = (
         dispatch_config if dispatch_config is not None
@@ -279,10 +281,18 @@ def get_approved_model_upgrades(dispatch_config: dict | None = None) -> frozense
         print(f"WARNING: dispatch config {APPROVED_MODEL_UPGRADES_KEY!r} must "
               f"be a list of model ids; ignoring {type(raw).__name__} value")
         return frozenset()
-    return frozenset(
-        entry.strip() for entry in raw
-        if isinstance(entry, str) and entry.strip()
-    )
+    approved: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        model = entry.strip()
+        if is_downgrade_model(model):
+            print(f"WARNING: dispatch config {APPROVED_MODEL_UPGRADES_KEY!r} "
+                  f"lists {model!r}, a sonnet/haiku-family model; ignoring it "
+                  f"(owner directive: EQUIPA never runs on sonnet/haiku)")
+            continue
+        approved.add(model)
+    return frozenset(approved)
 
 
 def is_model_allowed(model: object, dispatch_config: dict | None = None) -> bool:
@@ -301,6 +311,11 @@ def is_model_allowed(model: object, dispatch_config: dict | None = None) -> bool
     candidate = model.strip()
     if candidate == get_configured_model(config):
         return True
+    # A sonnet/haiku-family model is never an "upgrade", whatever the list
+    # says (SR-2994 S3). get_approved_model_upgrades already drops such
+    # entries; this guard keeps is_model_allowed correct on its own.
+    if is_downgrade_model(candidate):
+        return False
     return candidate in get_approved_model_upgrades(config)
 
 

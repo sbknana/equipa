@@ -377,11 +377,11 @@ def build_system_prompt(
 
     common_path = PROMPTS_DIR / "_common.md"
 
-    # Project-scoped role resolution: a role defined in the dispatching
-    # project's overlay (<project_dir>/.equipa/roles/<role>.md) shadows the base
-    # role of the same name; otherwise the shared base prompt is used. Two
-    # projects' same-named roles never collide — resolution is keyed on
-    # project_dir and holds no process-global state.
+    # Project-scoped role resolution: base roles always use the shared base
+    # prompt; a project overlay (.equipa/roles/<role>.md, read from the stable
+    # project root at a pinned commit, never the agent worktree) may only ADD
+    # new role names (SR-2994 S1). Two projects' same-named roles never
+    # collide — resolution is keyed on the project root.
     role_cfg = resolve_role(role, project_dir)
     if role_cfg is None:
         avail = ", ".join(available_roles(project_dir))

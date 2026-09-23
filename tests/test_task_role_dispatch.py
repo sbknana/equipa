@@ -46,11 +46,21 @@ def _write_role(project_dir, name, frontmatter):
     (roles_dir / f"{name}.md").write_text(f"---\n{fm}\n---\nbody\n", encoding="utf-8")
 
 
-def test_audit_type_includes_early_term_exempt_project_role(tmp_path):
+def test_audit_type_includes_early_term_exempt_project_role(tmp_path, monkeypatch):
+    import equipa.config as equipa_config
+    from equipa.role_resolver import EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY
+
     proj = tmp_path / "projA"
     _write_role(proj, "ip-analyst", {"early_term_exempt": "true"})
     _write_role(proj, "code-writer", {"early_term_exempt": "false"})
 
+    # SR-2994 S1: without the operator's allowlist the overlay's exemption is
+    # ignored, so the role keeps its tester cycle.
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config", {})
+    assert _is_audit_type_task({"task_type": "feature"}, "ip-analyst", str(proj)) is False
+
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config",
+                        {EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY: ["ip-analyst"]})
     # Report-writer (exempt) project role -> audit-type (tester gets skipped).
     assert _is_audit_type_task({"task_type": "feature"}, "ip-analyst", str(proj)) is True
     # Non-exempt project role -> keeps its tester cycle.

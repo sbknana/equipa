@@ -262,9 +262,20 @@ def test_nongit_empty_run_still_blocked(tmp_path: Path) -> None:
     assert outcome.is_blocked is True
 
 
-def test_nongit_project_overlay_report_role_classified(tmp_path: Path) -> None:
+def test_nongit_project_overlay_report_role_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A project-overlay role marked ``early_term_exempt: true`` is classified
-    as a report role (resolver-aware) and credited on its filesystem artifact."""
+    as a report role (resolver-aware) and credited on its filesystem artifact.
+
+    SR-2994 S1: the overlay's exemption only counts once the operator
+    allowlists the role name in dispatch config.
+    """
+    import equipa.config as equipa_config
+    from equipa.role_resolver import EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY
+
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config",
+                        {EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY: ["ip-analyst"]})
     roles_dir = tmp_path / ".equipa" / "roles"
     roles_dir.mkdir(parents=True)
     (roles_dir / "ip-analyst.md").write_text(

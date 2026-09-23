@@ -1299,6 +1299,43 @@ def _copy_hooks_to_worktree(main_repo_dir: str, worktree_dir: str) -> None:
         shutil.copy2(str(markers_src), str(markers_dst))
 
 
+async def _pin_role_overlay_ref(project_dir: str) -> None:
+    """Pin project role overlays to the pre-dispatch default-branch SHA.
+
+    SR-2994 S1: overlays are agent instructions, so they are read from the
+    stable project root at the commit the default branch had BEFORE any
+    agent ran — nothing committed during the dispatch (even onto the default
+    branch) can change them. On failure no pin is recorded and role
+    resolution falls back to the default branch's current commit, which the
+    gate protects (a diff touching .equipa/roles/ never merges unreviewed).
+    """
+    from equipa.git_ops import get_default_branch
+    from equipa.role_resolver import pin_overlay_ref
+
+    default_branch = get_default_branch(project_dir)
+    try:
+        sha_res = await git_run_async(
+            ["rev-parse", "--verify", "--quiet",
+             f"refs/heads/{default_branch}^{{commit}}"],
+            project_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"  [Isolation] WARNING: could not pin role overlays to "
+              f"'{default_branch}': {exc}")
+        return
+    sha = (sha_res.stdout or "").strip()
+    if sha_res.returncode != 0 or not sha:
+        print(f"  [Isolation] WARNING: could not pin role overlays: "
+              f"'{default_branch}' did not resolve to a commit")
+        return
+    try:
+        pin_overlay_ref(project_dir, sha)
+    except ValueError as exc:
+        print(f"  [Isolation] WARNING: could not pin role overlays: {exc}")
+        return
+    print(f"  [Isolation] Role overlays pinned to {default_branch}@{sha[:12]}")
+
+
 async def _create_isolation_worktrees(
     tasks: list[dict],
     project_dir: str,
@@ -1328,9 +1365,11 @@ async def _create_isolation_worktrees(
     the event loop while parallel task dispatch is queued.
     """
     from equipa.git_ops import WorktreeBranchConflictError, get_default_branch
+    from equipa.role_resolver import register_worktree_root
 
     worktree_dirs: dict[int, str] = {}
     worktree_base.mkdir(exist_ok=True)
+    await _pin_role_overlay_ref(project_dir)
     for t in tasks:
         task_id = t["id"]
         branch_name = f"forge-task-{task_id}"
@@ -1448,10 +1487,12 @@ async def _create_isolation_worktrees(
                     )
                     continue
                 worktree_dirs[task_id] = str(wt_path)
+                register_worktree_root(wt_path, project_dir)
                 _copy_hooks_to_worktree(project_dir, str(wt_path))
                 print(f"  [Isolation] Task #{task_id} -> {wt_path.name} (retry)")
             else:
                 worktree_dirs[task_id] = str(wt_path)
+                register_worktree_root(wt_path, project_dir)
                 _copy_hooks_to_worktree(project_dir, str(wt_path))
                 print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
         except WorktreeBranchConflictError:

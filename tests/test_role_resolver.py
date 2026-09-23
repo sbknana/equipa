@@ -11,6 +11,22 @@ import importlib
 import pytest
 
 from equipa import role_resolver as rr
+from equipa.config import set_active_dispatch_config
+
+
+@pytest.fixture(autouse=True)
+def _operator_config():
+    """Hermetic operator config: no caps/allowlist beyond the defaults.
+
+    Tests that need an allowlisted exemption re-register their own config.
+    Also clears the orchestrator's overlay registry so no pin leaks between
+    tests.
+    """
+    set_active_dispatch_config({})
+    rr.clear_overlay_registry()
+    yield
+    set_active_dispatch_config(None)
+    rr.clear_overlay_registry()
 
 
 def _write_role(project_dir, name, body, frontmatter=None):
@@ -114,7 +130,10 @@ def base_dir(tmp_path, monkeypatch):
     return base
 
 
-def test_project_role_overrides_base(tmp_path, base_dir):
+def test_project_role_cannot_override_base(tmp_path, base_dir):
+    # SR-2994 S1 inverted this test's original contract: a project overlay
+    # used to shadow a base role of the same name. Overlays may now only ADD
+    # role names, so the base prompt always wins.
     (base_dir / "planner.md").write_text("BASE planner", encoding="utf-8")
     proj = tmp_path / "projA"
     _write_role(proj, "planner", "PROJECT planner")
@@ -122,21 +141,26 @@ def test_project_role_overrides_base(tmp_path, base_dir):
     rc_base = rr.resolve_role("planner", None)
     rc_proj = rr.resolve_role("planner", str(proj))
     assert rc_base.body == "BASE planner" and rc_base.is_project_role is False
-    assert rc_proj.body == "PROJECT planner" and rc_proj.is_project_role is True
+    assert rc_proj.body == "BASE planner" and rc_proj.is_project_role is False
 
 
 def test_early_term_exempt_frontmatter_true(tmp_path):
+    # A project role's exemption is honoured only for operator-allowlisted
+    # role names (SR-2994 S1).
+    set_active_dispatch_config(
+        {rr.EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY: ["ip-analyst"]})
     proj = tmp_path / "projA"
     _write_role(proj, "ip-analyst", "body", {"early_term_exempt": "true"})
     assert rr.is_role_early_term_exempt("ip-analyst", str(proj)) is True
 
 
-def test_early_term_exempt_frontmatter_false_overrides_base(tmp_path, monkeypatch):
-    # Force "planner" into the base exempt set, then let a project role opt OUT.
+def test_early_term_exempt_frontmatter_false_cannot_override_base(tmp_path, monkeypatch):
+    # SR-2994 S1 inverted this test's original contract: a same-named overlay
+    # can no longer change a base role's exemption in either direction.
     monkeypatch.setattr(rr, "EARLY_TERM_EXEMPT_ROLES", {"planner"})
     proj = tmp_path / "projA"
     _write_role(proj, "planner", "body", {"early_term_exempt": "false"})
-    assert rr.is_role_early_term_exempt("planner", str(proj)) is False
+    assert rr.is_role_early_term_exempt("planner", str(proj)) is True
 
 
 def test_early_term_exempt_falls_back_to_base_set(tmp_path, monkeypatch, base_dir):
@@ -157,6 +181,9 @@ def test_example_role_pack_parses(tmp_path):
     pack = Path(__file__).resolve().parent.parent / "examples" / "roles"
     files = [p for p in pack.glob("*.md") if p.name != "README.md"]
     assert files, "expected example role files under examples/roles/"
+    # The pack's early_term_exempt is honoured once the operator allowlists it.
+    set_active_dispatch_config(
+        {rr.EARLY_TERM_EXEMPT_PROJECT_ROLES_KEY: [f.stem for f in files]})
     for f in files:
         # Copy into a throwaway project overlay and resolve it through the real path.
         proj = tmp_path / f.stem
