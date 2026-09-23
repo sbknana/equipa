@@ -24,17 +24,16 @@ from pathlib import Path
 
 import pytest
 
+# Only names that already existed before SR-2997 are imported at module level,
+# so on the unfixed code these tests FAIL behaviourally instead of erroring at
+# collection. New API is reached through the modules at call time.
+from equipa import git_ops
 from equipa import role_resolver as rr
+from equipa import security_gate
 from equipa.config import set_active_dispatch_config
 from equipa.dispatch import _gated_merge_task, _pin_role_overlay_ref
-from equipa.git_ops import (
-    PROJECT_DEFAULT_BRANCHES_CONFIG_KEY,
-    UntrustedDefaultBranchError,
-    _clear_default_branch_cache,
-    get_trusted_default_branch,
-)
+from equipa.git_ops import _clear_default_branch_cache
 from equipa.security_gate import (
-    agent_config_changes,
     decide_merge_gate,
     get_changed_files_for_branch,
     is_doc_only_diff,
@@ -138,9 +137,9 @@ def test_repointed_origin_head_does_not_steer_the_dispatch_pin(project: Path, wo
 
     asyncio.run(_pin_role_overlay_ref(str(project)))
 
+    assert _body(worktree) == OPERATOR_BODY
     main_sha = _git(project, "rev-parse", "refs/heads/main")
     assert rr.current_overlay_pin(project) == ("main", main_sha)
-    assert _body(worktree) == OPERATOR_BODY
 
 
 def test_repointed_origin_head_does_not_change_gate_diff_base(project: Path, worktree: Path):
@@ -173,8 +172,8 @@ def test_repointed_origin_head_does_not_change_merge_target(project: Path, workt
 
 def test_trusted_branch_ignores_origin_head(project: Path, worktree: Path):
     _poison_origin_head_from(worktree)
-    assert get_trusted_default_branch(project) == "main"
-    assert get_trusted_default_branch(worktree) == "main"
+    assert git_ops.get_trusted_default_branch(project) == "main"
+    assert git_ops.get_trusted_default_branch(worktree) == "main"
 
 
 def test_trusted_branch_accepts_lone_master(tmp_path: Path):
@@ -183,14 +182,14 @@ def test_trusted_branch_accepts_lone_master(tmp_path: Path):
     _git(repo, "init", "-q", "-b", "master")
     _write(repo, "a.txt", "a\n")
     _commit_all(repo, "init")
-    assert get_trusted_default_branch(repo) == "master"
+    assert git_ops.get_trusted_default_branch(repo) == "master"
 
 
 def test_trusted_branch_fails_closed_when_main_and_master_both_exist(project: Path):
     """An agent can create the second name, so the choice is ambiguous."""
     _git(project, "branch", "master")
-    with pytest.raises(UntrustedDefaultBranchError, match="main and master"):
-        get_trusted_default_branch(project)
+    with pytest.raises(git_ops.UntrustedDefaultBranchError, match="main and master"):
+        git_ops.get_trusted_default_branch(project)
 
 
 def test_trusted_branch_fails_closed_without_main_or_master(tmp_path: Path):
@@ -199,29 +198,29 @@ def test_trusted_branch_fails_closed_without_main_or_master(tmp_path: Path):
     _git(repo, "init", "-q", "-b", "trunk")
     _write(repo, "a.txt", "a\n")
     _commit_all(repo, "init")
-    with pytest.raises(UntrustedDefaultBranchError, match="neither main nor master"):
-        get_trusted_default_branch(repo)
+    with pytest.raises(git_ops.UntrustedDefaultBranchError, match="neither main nor master"):
+        git_ops.get_trusted_default_branch(repo)
 
 
 def test_operator_named_branch_wins_and_maps_worktrees(project: Path, worktree: Path):
     _git(project, "branch", "release")
     _poison_origin_head_from(worktree)
-    set_active_dispatch_config({PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "release"}})
-    assert get_trusted_default_branch(project) == "release"
-    assert get_trusted_default_branch(worktree) == "release"
+    set_active_dispatch_config({git_ops.PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "release"}})
+    assert git_ops.get_trusted_default_branch(project) == "release"
+    assert git_ops.get_trusted_default_branch(worktree) == "release"
 
 
 @pytest.mark.parametrize("configured", ["forge-task-1", "FORGE-TASK-9", "-evil", "a..b", 7])
 def test_operator_named_branch_rejects_agent_and_malformed_names(project: Path, worktree: Path, configured):
-    set_active_dispatch_config({PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): configured}})
-    with pytest.raises(UntrustedDefaultBranchError):
-        get_trusted_default_branch(project)
+    set_active_dispatch_config({git_ops.PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): configured}})
+    with pytest.raises(git_ops.UntrustedDefaultBranchError):
+        git_ops.get_trusted_default_branch(project)
 
 
 def test_operator_named_branch_must_exist(project: Path):
-    set_active_dispatch_config({PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "trunk"}})
-    with pytest.raises(UntrustedDefaultBranchError, match="does not exist"):
-        get_trusted_default_branch(project)
+    set_active_dispatch_config({git_ops.PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "trunk"}})
+    with pytest.raises(git_ops.UntrustedDefaultBranchError, match="does not exist"):
+        git_ops.get_trusted_default_branch(project)
 
 
 def test_ambiguous_default_disables_overlays_and_merge(project: Path, worktree: Path):
@@ -276,7 +275,7 @@ def test_non_descendant_pin_is_refused_with_gate_audit(project: Path, worktree: 
 def test_changed_default_branch_is_refused(project: Path, capsys):
     asyncio.run(_pin_role_overlay_ref(str(project)))
     _git(project, "branch", "release")
-    set_active_dispatch_config({PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "release"}})
+    set_active_dispatch_config({git_ops.PROJECT_DEFAULT_BRANCHES_CONFIG_KEY: {str(project): "release"}})
 
     asyncio.run(_pin_role_overlay_ref(str(project)))
 
@@ -351,7 +350,7 @@ def test_gate_blocks_claude_config_diff(path: str, review_enabled: bool):
     )
     assert decision.blocks_merge is True
     assert decision.reason == "agent-config-changed"
-    assert agent_config_changes([path]) == [path]
+    assert security_gate.agent_config_changes([path]) == [path]
 
 
 @pytest.mark.parametrize("path", [
