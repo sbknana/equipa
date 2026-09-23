@@ -2054,7 +2054,7 @@ async def dispatch_agent(
                     # Same model the role resolved to — never a cheaper one.
                     model=_cmd_model(cmd) or get_configured_model(dispatch_config),
                 )
-                return {
+                rlm_result = {
                     "success": decompose_result.success,
                     "result_text": decompose_result.output,
                     "num_turns": decompose_result.sub_queries_run,
@@ -2064,6 +2064,12 @@ async def dispatch_agent(
                     "rlm_decompose": True,
                     "files_examined": decompose_result.files_examined,
                 }
+                # Same loud outcome as the retry wrappers, so the tester and
+                # review call sites refuse it via is_overloaded_result (#2994).
+                if decompose_result.overloaded:
+                    rlm_result["success"] = False
+                    rlm_result["outcome"] = OVERLOADED_OUTCOME
+                return rlm_result
 
     # Default: Claude via run_agent_streaming (with retry wrapper)
     from equipa.role_resolver import is_role_early_term_exempt

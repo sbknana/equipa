@@ -77,11 +77,15 @@ class DecomposeResult:
         sub_queries_run: int,
         files_examined: int,
         errors: list[str],
+        overloaded: bool = False,
     ):
         self.output = output
         self.sub_queries_run = sub_queries_run
         self.files_examined = files_examined
         self.errors = errors
+        # True when the outer agent or any sub-query hit sustained 529. Such a
+        # session is never a success (it always carries an error too).
+        self.overloaded = overloaded
 
     @property
     def success(self) -> bool:
@@ -212,6 +216,23 @@ def validate_repl_code(code: str) -> list[str]:
 
 # --- Sub-Query Helper ---
 
+# Markers for a CLI call that failed with 529/overloaded. The outer marker
+# keeps the "[agent error:" prefix so the session loop still stops on it.
+# run_decompose_session turns either into DecomposeResult.overloaded, so the
+# dispatch layer reports agent_overloaded instead of a review built on
+# missing sub-query answers (task #2994 S1).
+SUB_QUERY_OVERLOADED_PREFIX = "[sub_query error: model overloaded (529)]"
+OUTER_AGENT_OVERLOADED_PREFIX = "[agent error: model overloaded (529)]"
+
+
+def _is_overloaded_cli_failure(stderr: str, stdout: str) -> bool:
+    """Return True if a failed claude CLI call was a 529/overloaded error."""
+    # Lazy import: agent_runner imports this module lazily from dispatch_agent.
+    from equipa.agent_runner import is_overloaded_error
+
+    return is_overloaded_error(stderr or "", stdout or "")
+
+
 def _run_sub_query(
     prompt: str,
     files: dict[str, str],
@@ -259,6 +280,8 @@ def _run_sub_query(
                 return data.get("result", result.stdout)
             except (ValueError, KeyError):
                 return result.stdout
+        if _is_overloaded_cli_failure(result.stderr, result.stdout):
+            return f"{SUB_QUERY_OVERLOADED_PREFIX} {result.stderr[:500]}"
         return f"[sub_query error: exit code {result.returncode}] {result.stderr[:500]}"
     except subprocess.TimeoutExpired:
         return "[sub_query error: timed out]"
@@ -292,6 +315,7 @@ class ReplSandbox:
         self.project_dir = project_dir
         self.mcp_config = mcp_config
         self.sub_queries_run = 0
+        self.overloaded_sub_queries = 0
         self.output_buffer = io.StringIO()
         self._model = model or get_configured_model()
         self._persistent_globals: dict[str, Any] | None = None
@@ -312,13 +336,16 @@ class ReplSandbox:
             f"  RLM sub-query #{self.sub_queries_run}: "
             f"{prompt[:80]}... ({len(files)} files)"
         )
-        return _run_sub_query(
+        answer = _run_sub_query(
             prompt=prompt,
             files=files,
             model=self._model,
             project_dir=self.project_dir,
             mcp_config=self.mcp_config,
         )
+        if answer.startswith(SUB_QUERY_OVERLOADED_PREFIX):
+            self.overloaded_sub_queries += 1
+        return answer
 
     def _build_globals(self) -> dict[str, Any]:
         """Build the restricted globals dict for exec."""
@@ -580,6 +607,8 @@ def _call_outer_agent(
         )
         if result.returncode == 0:
             return result.stdout
+        if _is_overloaded_cli_failure(result.stderr, result.stdout):
+            return f"{OUTER_AGENT_OVERLOADED_PREFIX} {result.stderr[:500]}"
         return f"[agent error: exit code {result.returncode}] {result.stderr[:500]}"
     except subprocess.TimeoutExpired:
         return "[agent error: timed out]"
@@ -647,6 +676,7 @@ def run_decompose_session(
     )
     all_outputs: list[str] = []
     errors: list[str] = []
+    overloaded = False
     conversation = decompose_prompt
 
     for turn in range(MAX_REPL_TURNS):
@@ -660,6 +690,7 @@ def run_decompose_session(
 
         if agent_response.startswith("[agent error:"):
             errors.append(agent_response)
+            overloaded = agent_response.startswith(OUTER_AGENT_OVERLOADED_PREFIX)
             break
 
         code_blocks = _extract_code_blocks(agent_response)
@@ -687,9 +718,22 @@ def run_decompose_session(
             f"or provide your final review (no code blocks = done)."
         )
 
+    # A review assembled from overloaded sub-queries is missing the answers
+    # it asked for; it must fail, not pass as a clean review (#2994 S1).
+    if sandbox.overloaded_sub_queries:
+        overloaded = True
+        errors.append(
+            f"{sandbox.overloaded_sub_queries} sub-query(ies) failed: model "
+            f"overloaded (529)"
+        )
+    if overloaded:
+        log("  RLM Decompose FAILED: model overloaded (529). Not downgrading "
+            "the model.")
+
     return DecomposeResult(
         output="\n\n---\n\n".join(all_outputs),
         sub_queries_run=sandbox.sub_queries_run,
         files_examined=len(repo_files),
         errors=errors,
+        overloaded=overloaded,
     )
