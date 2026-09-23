@@ -90,7 +90,9 @@ def role_overlay_changes(changed_files: list[str]) -> list[str]:
     """
     touched: list[str] = []
     for raw_path in changed_files:
-        parts = [p for p in raw_path.replace("\\", "/").split("/") if p not in ("", ".")]
+        # Case-insensitive (SR-2997 S6): never rely on the resolver's own
+        # case-sensitive lookup for the gate's safety.
+        parts = _path_parts(raw_path)
         for index, part in enumerate(parts):
             if part != ".equipa":
                 continue
@@ -99,6 +101,47 @@ def role_overlay_changes(changed_files: list[str]) -> list[str]:
                 touched.append(raw_path)
                 break
     return touched
+
+
+def _path_parts(raw_path: str) -> list[str]:
+    """Lower-cased, separator-normalised components of a diff path."""
+    return [
+        part for part in raw_path.replace("\\", "/").lower().split("/")
+        if part not in ("", ".")
+    ]
+
+
+# Basenames Claude Code / other agent CLIs load as standing instructions.
+_AGENT_INSTRUCTION_BASENAMES: frozenset[str] = frozenset({"claude.md", "agents.md"})
+
+
+def agent_config_changes(changed_files: list[str]) -> list[str]:
+    """Return the changed paths under a ``.claude`` directory, at any depth.
+
+    SR-2997 S3: ``.claude/skills|agents|commands/*.md`` and
+    ``.claude/settings*.json`` are loaded by the Claude CLI for every later
+    agent (gate roles included) that runs with the worktree as ``--add-dir``.
+    They are agent instructions (and hooks), so only the operator may merge
+    them — the gate fails closed on them exactly like ``.equipa/roles/``.
+    """
+    return [path for path in changed_files if ".claude" in _path_parts(path)]
+
+
+def is_agent_instruction_path(raw_path: str) -> bool:
+    """True for paths an agent CLI reads as instructions, never plain docs.
+
+    Covers any ``.claude`` / ``.equipa`` component and ``CLAUDE.md`` /
+    ``AGENTS.md`` at any depth. Such a ``.md`` must never be auto-merged as
+    "doc-only" without a security review (SR-2997 S3).
+    """
+    parts = _path_parts(raw_path)
+    if not parts:
+        return False
+    return (
+        ".claude" in parts
+        or ".equipa" in parts
+        or parts[-1] in _AGENT_INSTRUCTION_BASENAMES
+    )
 
 
 def decide_merge_gate(
@@ -175,6 +218,15 @@ def decide_merge_gate(
             expect_artifact=True,
             counts=None,
             reason="role-overlay-changed",
+            changed_files=list(changed_files),
+        )
+    if agent_config_changes(changed_files):
+        return GateDecision(
+            blocks_merge=True,
+            doc_only=False,
+            expect_artifact=True,
+            counts=None,
+            reason="agent-config-changed",
             changed_files=list(changed_files),
         )
     if not security_review_enabled:
@@ -332,10 +384,17 @@ def is_doc_only_diff(changed_files: list[str]) -> bool:
     Treating "no files reported" as "doc-only" would silently disable
     the gate on every such failure — exactly the silent-skip class of
     bug that task #2321 originally fixed.
+
+    Agent instruction files (``.claude/**``, ``.equipa/**``, ``CLAUDE.md``,
+    ``AGENTS.md``) are never doc-only even though they are ``.md``: they
+    steer later agents, so skipping review on them is an injection path
+    (SR-2997 S3).
     """
     if not changed_files:
         return False
     for path in changed_files:
+        if is_agent_instruction_path(path):
+            return False
         suffix = Path(path).suffix.lower()
         if suffix not in _DOC_EXTENSIONS:
             return False
@@ -384,11 +443,25 @@ async def get_changed_files_for_branch(
     the gate.
     """
     if base_ref is None:
-        from equipa.git_ops import get_default_branch
-        base_ref = get_default_branch(project_dir)
+        # SR-2997 S1 sibling: the diff base is the operator-named branch,
+        # never origin/HEAD — an agent that repoints origin/HEAD at its own
+        # branch would otherwise make the diff empty or arbitrary.
+        from equipa.git_ops import (
+            UntrustedDefaultBranchError,
+            get_trusted_default_branch,
+        )
+        try:
+            base_ref = get_trusted_default_branch(project_dir)
+        except UntrustedDefaultBranchError as exc:
+            logger.warning("[security-gate] no trusted diff base: %s", exc)
+            return []
     try:
+        # --no-renames: a rename OUT of a gated path (e.g. .equipa/roles/)
+        # must list the source path too, not only the destination (SR-2997
+        # S4). -z: paths verbatim, never C-quoted (SR-2997 S6).
         result = await git_run_async(
-            ["diff", "--name-only", f"{base_ref}...{head_ref}"],
+            ["diff", "--name-only", "--no-renames", "-z",
+             f"{base_ref}...{head_ref}"],
             project_dir,
             timeout=10,
         )
@@ -404,8 +477,4 @@ async def get_changed_files_for_branch(
             base_ref, result.returncode, (result.stderr or "")[:200],
         )
         return []
-    return [
-        line.strip()
-        for line in (result.stdout or "").splitlines()
-        if line.strip()
-    ]
+    return [path for path in (result.stdout or "").split("\0") if path.strip()]
