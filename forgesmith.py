@@ -28,7 +28,12 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from equipa.config import is_feature_enabled
+from equipa.config import (
+    get_configured_model,
+    is_downgrade_model,
+    is_feature_enabled,
+    resolve_claude_model,
+)
 from forgesmith_gepa import run_gepa
 
 # forgesmith_simba and forgesmith_impact were moved to scripts/ during
@@ -85,7 +90,8 @@ def load_config():
             "turn_increase_step": 10,
             "turn_decrease_step": 5,
             "max_concurrency": 8,
-            "allowed_models": ["sonnet", "opus"],
+            # "allowed_models" removed (task #2992): ForgeSmith never proposes
+            # or applies a model change, so it has no model allowlist.
         },
         "protected_files": [
             "_common.md",
@@ -167,7 +173,8 @@ def load_config():
         },
         "opro": {
             "enabled": True,
-            "model": "sonnet",
+            # No "model" key: OPRO runs on the configured dispatch model
+            # (equipa.config.resolve_claude_model, task #2992).
             # Raised from the previous hard-coded 120s default: the Claude
             # call routinely needs longer than 2 min to return proposals,
             # yielding 0 proposals every night. See bug #2532.
@@ -540,43 +547,32 @@ def analyze_turn_underuse(runs, cfg):
 
 
 def analyze_model_downgrade(runs, cfg):
-    """Detect simple tasks on opus that could use sonnet (>80% success rate)."""
-    threshold = cfg["thresholds"]["simple_task_success_rate"]
-    min_samples = cfg["min_sample_size"]
-    simple_opus = [r for r in runs
-                   if r["complexity"] == "simple" and r["model"] == "opus"]
-    if len(simple_opus) < min_samples:
-        return []
+    """Disabled: ForgeSmith never proposes a model downgrade.
 
-    success_count = sum(1 for r in simple_opus if r["success"])
-    rate = success_count / len(simple_opus)
-    if rate >= threshold:
-        # Group by role to see which roles are candidates
-        by_role = {}
-        for r in simple_opus:
-            role = r["role"]
-            if role not in by_role:
-                by_role[role] = {"total": 0, "success": 0}
-            by_role[role]["total"] += 1
-            if r["success"]:
-                by_role[role]["success"] += 1
-
-        findings = []
-        for role, stats in by_role.items():
-            if stats["total"] < min_samples:
-                continue
-            role_rate = stats["success"] / stats["total"]
-            if role_rate >= threshold:
-                findings.append({
-                    "pattern": "model_downgrade",
-                    "role": role,
-                    "success_rate": round(role_rate, 2),
-                    "samples": stats["total"],
-                    "current_model": "opus",
-                    "proposed_model": "sonnet",
-                })
-        return findings
+    This analyzer used to propose moving simple tasks from opus to sonnet
+    when opus succeeded often enough. Owner directive 2026-09-22 (task #2992)
+    forbids EQUIPA from ever selecting sonnet/haiku, so it now always returns
+    no findings. The signature is kept so run_analyze() and any external
+    caller keep working.
+    """
     return []
+
+
+def _refuse_dispatch_config_write(key, new_val):
+    """Return a refusal reason if ForgeSmith must not write ``key = new_val``.
+
+    ForgeSmith may tune numeric knobs in dispatch_config.json, but it must
+    never (task #2992):
+      * write a sonnet/haiku-family value into any ``model*`` key, or
+      * touch ``features`` — that is how a flag such as auto_model_routing
+        could be silently flipped back on.
+    Returns None when the write is allowed.
+    """
+    if key == "features":
+        return "ForgeSmith never edits feature flags"
+    if str(key).startswith("model") and is_downgrade_model(new_val):
+        return f"model downgrade to {new_val!r} is forbidden"
+    return None
 
 
 def analyze_repeat_errors(runs, cfg):
@@ -709,9 +705,15 @@ def apply_config_change(key, old_val, new_val, rationale, run_id, cfg, dry_run=F
     """Modify a value in dispatch_config.json.
 
     Runs change-impact analysis before applying. HIGH-risk changes are
-    blocked from auto-apply and logged for manual review.
+    blocked from auto-apply and logged for manual review. Model downgrades
+    and feature-flag edits are refused outright, even in dry-run (#2992).
     """
     target = str(DISPATCH_CONFIG)
+
+    refusal = _refuse_dispatch_config_write(key, new_val)
+    if refusal:
+        log(f"  [REFUSED] Config change {key}: {old_val} -> {new_val} — {refusal}")
+        return None
 
     # Run impact analysis before applying
     assessment = run_impact_analysis(
@@ -1078,28 +1080,12 @@ def apply_changes(findings, run_id, cfg, dry_run=False):
                     dispatch[key] = proposed
 
         elif pattern == "model_downgrade":
-            if finding["proposed_model"] not in limits["allowed_models"]:
-                continue
-            role = finding["role"]
-            key = f"model_{role.replace('-', '_')}"
-            current = dispatch.get(key, "opus")
-            if current == "opus":
-                # Check suppression — model downgrades that scored <= 0
-                sig = ("config_tune", "sonnet")
-                if sig in suppressed:
-                    log(f"  [SUPPRESSED] model downgrade opus->sonnet for {role} "
-                        f"(previously scored <= 0, cooldown active)")
-                    continue
-                rationale = (
-                    f"Role '{role}' succeeds {finding['success_rate']*100:.0f}% "
-                    f"on simple tasks with opus ({finding['samples']} runs). "
-                    f"Switching simple tasks to sonnet for cost savings."
-                )
-                # We use model_simple as the key for simple-task model override
-                change = apply_config_change(
-                    "model_simple", current, "sonnet", rationale, run_id, cfg, dry_run)
-                if change:
-                    changes.append(change)
+            # Defense in depth: analyze_model_downgrade is disabled, but a
+            # model_downgrade finding from any source is refused, never
+            # applied (task #2992).
+            log(f"  [REFUSED] model_downgrade finding for role "
+                f"{finding.get('role')!r} — ForgeSmith never downgrades models")
+            continue
 
         elif pattern == "repeat_error":
             if prompt_count >= max_prompts:
@@ -1369,6 +1355,13 @@ def rollback_change(change):
             # Find the key by comparing old/new values
             for key, val in config.items():
                 if str(val) == change["new_value"]:
+                    # Never restore a sonnet/haiku model or touch feature
+                    # flags, even when reverting (task #2992).
+                    refusal = _refuse_dispatch_config_write(key, change["old_value"])
+                    if refusal:
+                        log(f"  [REFUSED] Rollback of #{change['id']} on {key} "
+                            f"— {refusal}")
+                        continue
                     config[key] = json.loads(change["old_value"]) if change["old_value"].isdigit() else change["old_value"]
                     try:
                         config[key] = int(change["old_value"])
@@ -2096,7 +2089,8 @@ GHOST_SKILL_PATH = SCRIPT_DIR / "skills" / "security-reviewer" / "skills" \
     / "ghost-verification" / "SKILL.md"
 
 MAX_GHOST_VERIFICATIONS_PER_RUN = 5
-GHOST_SCOUT_MODEL = "haiku"
+# The ghost scout runs on the configured dispatch model (task #2992) — there
+# is deliberately no cheaper per-scout model constant.
 GHOST_SCOUT_MAX_TURNS = 10
 GHOST_SCOUT_TIMEOUT = 180  # seconds
 
@@ -2176,7 +2170,7 @@ def build_ghost_prompt(skill_prompt: str, finding: dict) -> str:
 
 def dispatch_ghost_scout(prompt: str) -> str | None:
     """Dispatch the security-reviewer agent with the ghost verification
-    skill context using the Haiku model for cost efficiency.
+    skill context on the configured dispatch model (never a downgrade).
 
     Returns the agent's raw output text or None on failure.
     """
@@ -2184,7 +2178,7 @@ def dispatch_ghost_scout(prompt: str) -> str | None:
         "claude",
         "-p", prompt,
         "--output-format", "json",
-        "--model", GHOST_SCOUT_MODEL,
+        "--model", get_configured_model(),
         "--max-turns", str(GHOST_SCOUT_MAX_TURNS),
         "--no-session-persistence",
     ]
@@ -2670,7 +2664,8 @@ def call_claude_for_proposals(prompt, cfg):
     Returns the parsed JSON response or None on failure.
     """
     opro_cfg = cfg.get("opro", {})
-    model = opro_cfg.get("model", "sonnet")
+    # Configured dispatch model unless opro.model names a non-downgrade model.
+    model = resolve_claude_model(opro_cfg.get("model"))
     timeout = opro_cfg.get("timeout_seconds", 300)
 
     cmd = [
