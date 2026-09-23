@@ -34,7 +34,11 @@ from typing import Any, Iterator
 
 # Import constants and DB helper
 try:
-    from equipa.config import get_configured_model, is_downgrade_model
+    from equipa.config import (
+        get_approved_model_upgrades,
+        get_configured_model,
+        is_downgrade_model,
+    )
     from equipa.constants import (
         DEFAULT_MODEL,
         DEFAULT_ROLE_MODELS,
@@ -54,6 +58,10 @@ except ImportError:
     def get_configured_model(dispatch_config: dict | None = None) -> str:
         """Standalone fallback: no dispatch config, use the Opus default."""
         return DEFAULT_MODEL
+
+    def get_approved_model_upgrades(dispatch_config: dict | None = None) -> frozenset:
+        """Standalone fallback: no dispatch config, so no approved upgrades."""
+        return frozenset()
 
     def is_downgrade_model(model: object) -> bool:
         """Standalone fallback for equipa.config.is_downgrade_model."""
@@ -94,18 +102,27 @@ ALLOWED_ROLES = (
         "code-reviewer", "debugger", "frontend-designer", "integration-tester",
         "qa-tester"}
 )
-# Opus-family only: sonnet/haiku are never dispatchable (owner directive
-# 2026-09-22, task #2992). The configured dispatch model is added at
-# validation time by _allowed_models().
-ALLOWED_MODELS = {"opus", DEFAULT_MODEL}
+# Exact-id allowlist: only the configured dispatch model and the operator's
+# approved_model_upgrades are dispatchable (tasks #2992, #2994 S3). The bare
+# "opus" alias is NOT allowed — the CLI may resolve it to a different Opus
+# (no 1M context, older generation) than the configured id. DEFAULT_MODEL is
+# the floor when no dispatch config exists.
+ALLOWED_MODELS = {DEFAULT_MODEL}
 
 
 def _allowed_models() -> set[str]:
-    """Static Opus allowlist plus the configured model (unless a downgrade)."""
-    allowed = set(ALLOWED_MODELS)
+    """Configured model plus approved upgrades — never sonnet/haiku.
+
+    The configured model and upgrade list come from the orchestrator's
+    dispatch config ($EQUIPA_DISPATCH_CONFIG or the repo-root file), never
+    a dispatch_config.json in the MCP client's CWD.
+    """
     configured = get_configured_model()
-    if not is_downgrade_model(configured):
-        allowed.add(configured)
+    allowed = {configured} if not is_downgrade_model(configured) else set(ALLOWED_MODELS)
+    allowed.update(
+        model for model in get_approved_model_upgrades()
+        if not is_downgrade_model(model)
+    )
     return allowed
 
 

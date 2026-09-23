@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import equipa.constants as _equipa_constants
-from equipa.config import is_feature_enabled
+from equipa.config import is_feature_enabled, resolve_claude_model
 
 logger = logging.getLogger(__name__)
 from equipa.constants import (
@@ -185,12 +185,17 @@ def get_role_model(
             role=role, tier_attempted=configured_floor_model(effective_config))
 
     # Frontmatter `model` on a project role is a DEFAULT-level fallback (below
-    # dispatch-config / CLI / auto-routing), letting project roles pick a model
-    # without a base constants.py edit.
+    # dispatch-config / CLI / auto-routing). A project overlay lives in the
+    # TARGET repo, so it is not operator-controlled: its model passes the same
+    # allowlist as every other non-operator source — anything but the
+    # configured model or an approved upgrade resolves to the configured
+    # model (task #2994 S7).
     rc = _resolve_role_cfg(role, task)
     if rc and rc.model:
-        logger.info("model: %s (source=role_frontmatter, role=%s)", rc.model, role)
-        return rc.model
+        model = resolve_claude_model(rc.model, effective_config or None)
+        logger.info("model: %s (source=role_frontmatter, requested=%s, role=%s)",
+                    model, rc.model, role)
+        return model
     model = DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
     logger.info("model: %s (source=DEFAULT_ROLE_MODELS, role=%s)", model, role)
     return model
