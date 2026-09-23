@@ -30,8 +30,12 @@ Overlays are now constrained four ways:
    pinned commit (the pre-dispatch default-branch SHA registered by the
    orchestrator via :func:`pin_overlay_ref`, else the default branch's
    current commit) — never from an agent worktree or a working tree an agent
-   can edit. Only a project that is not a git repository (and so can have no
-   worktrees) falls back to reading its overlay directory from disk.
+   can edit. "Default branch" is the operator-named branch from
+   ``git_ops.get_trusted_default_branch``, never the agent-writable
+   ``origin/HEAD`` (SR-2997 S1). Only a project with no ``.git`` entry at or
+   above its root and no registered pin (so it can have no worktrees) falls
+   back to reading its overlay directory from disk; any git error otherwise
+   disables overlays (SR-2997 S2).
 3. **Operator caps.** Overlay ``turns`` and ``effort`` are capped at operator
    dispatch-config values; ``early_term_exempt`` is honoured only for role
    names on the operator's ``early_term_exempt_project_roles`` allowlist.
@@ -115,6 +119,10 @@ _GIT_TIMEOUT_SECONDS = 15
 _registry_lock = threading.Lock()
 _worktree_roots: dict[str, str] = {}
 _pinned_refs: dict[str, str] = {}
+# Branch each pin was taken from, so the next pin can be checked against it.
+_pinned_branches: dict[str, str] = {}
+# Roots whose overlays the orchestrator refused to pin (fail closed): root -> reason.
+_blocked_roots: dict[str, str] = {}
 
 
 @dataclass
@@ -194,26 +202,55 @@ def register_worktree_root(
         _worktree_roots[_registry_key(worktree_dir)] = _registry_key(project_root)
 
 
-def pin_overlay_ref(project_root: str | os.PathLike, commit_sha: str) -> None:
+def pin_overlay_ref(
+    project_root: str | os.PathLike, commit_sha: str, *, branch: str | None = None,
+) -> None:
     """Pin the commit overlays for ``project_root`` are read from.
 
     The orchestrator calls this with the pre-dispatch default-branch SHA, so
     nothing an agent commits during the dispatch — even onto the default
-    branch — can change which role overlays apply.
+    branch — can change which role overlays apply. ``branch`` records which
+    trusted branch the SHA came from; pinning lifts any :func:`block_overlays`.
     """
     if not isinstance(commit_sha, str) or not re.fullmatch(
         r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha.strip(),
     ):
         raise ValueError(f"pin_overlay_ref needs a full commit SHA, got {commit_sha!r}")
+    key = _registry_key(project_root)
     with _registry_lock:
-        _pinned_refs[_registry_key(project_root)] = commit_sha.strip()
+        _pinned_refs[key] = commit_sha.strip()
+        if branch is not None:
+            _pinned_branches[key] = branch
+        _blocked_roots.pop(key, None)
+
+
+def current_overlay_pin(project_root: str | os.PathLike) -> tuple[str | None, str] | None:
+    """``(branch, sha)`` of the pin registered for ``project_root``, or None."""
+    key = _registry_key(project_root)
+    with _registry_lock:
+        sha = _pinned_refs.get(key)
+        return None if sha is None else (_pinned_branches.get(key), sha)
+
+
+def block_overlays(project_root: str | os.PathLike, reason: str) -> None:
+    """Disable every project overlay of ``project_root`` (fail closed).
+
+    Called by the orchestrator when it refuses to pin (no trusted default
+    branch, or the default branch moved in a way a pin may not follow). The
+    previous pin is kept so the next dispatch is still checked against it;
+    only a successful :func:`pin_overlay_ref` lifts the block.
+    """
+    with _registry_lock:
+        _blocked_roots[_registry_key(project_root)] = reason
 
 
 def clear_overlay_registry() -> None:
-    """Forget every registered worktree and pinned ref (tests / reload)."""
+    """Forget every registered worktree, pin and block (tests / reload)."""
     with _registry_lock:
         _worktree_roots.clear()
         _pinned_refs.clear()
+        _pinned_branches.clear()
+        _blocked_roots.clear()
 
 
 def stable_project_root(project_dir: str | os.PathLike) -> Path:
@@ -275,10 +312,17 @@ class _OverlaySource:
 
 
 def _default_branch_commit(root: Path) -> str | None:
-    """Current commit of ``root``'s default branch, or None if unresolvable."""
-    from equipa.git_ops import get_default_branch
+    """Current commit of ``root``'s trusted default branch, or None.
 
-    branch = get_default_branch(root)
+    Uses the operator-named branch (SR-2997 S1), never ``origin/HEAD``.
+    """
+    from equipa.git_ops import UntrustedDefaultBranchError, get_trusted_default_branch
+
+    try:
+        branch = get_trusted_default_branch(root)
+    except UntrustedDefaultBranchError as exc:
+        logger.warning("role overlay: %s; project overlays disabled", exc)
+        return None
     proc = _run_git(root, "rev-parse", "--verify", "--quiet",
                     f"refs/heads/{branch}^{{commit}}")
     if proc is None or proc.returncode != 0:
@@ -286,19 +330,40 @@ def _default_branch_commit(root: Path) -> str | None:
     return proc.stdout.decode("ascii", errors="replace").strip() or None
 
 
+def _has_git_entry(root: Path) -> bool:
+    """True if ``root`` or any parent has a ``.git`` entry (dir, file or link)."""
+    return any(os.path.lexists(directory / ".git") for directory in (root, *root.parents))
+
+
 def _overlay_source(project_dir: str | os.PathLike) -> _OverlaySource | None:
     """Trusted overlay source for ``project_dir``; None when there is none.
 
     A git project whose pinned/default commit cannot be resolved has NO
     overlay source (fail closed) rather than falling back to the filesystem.
+    SR-2997 S2: a failing git command is NOT proof of "not a git repo" — git
+    also fails on a corrupt ``.git/HEAD``, a broken worktree ``.git`` file or
+    ``safe.directory`` refusal. The disk fallback is therefore taken only when
+    no ``.git`` entry exists at or above the root and no pin is registered.
     """
     root = stable_project_root(project_dir)
+    with _registry_lock:
+        blocked_reason = _blocked_roots.get(str(root))
+        pinned = str(root) in _pinned_refs
+    if blocked_reason is not None:
+        logger.warning("role overlay: overlays for %s are blocked (%s)",
+                       root, blocked_reason)
+        return None
     prefix_proc = _run_git(root, "rev-parse", "--show-prefix")
     if prefix_proc is None:
         return None
     if prefix_proc.returncode != 0:
-        # Not inside any git repository: no worktrees can exist, so the
-        # project's own overlay directory is the only source.
+        if pinned or _has_git_entry(root):
+            stderr = prefix_proc.stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("role overlay: git failed in %s (%s); project "
+                           "overlays disabled", root, stderr[:300])
+            return None
+        # No git repository at all: no worktrees can exist, so the project's
+        # own overlay directory is the only source.
         return _OverlaySource(root=root)
     prefix = prefix_proc.stdout.decode("utf-8", errors="replace").strip()
     with _registry_lock:
@@ -470,11 +535,18 @@ def _build_role_config(
     turns = meta.get("turns")
     effort = meta.get("effort")
     exempt = meta.get("early_term_exempt")
+    skills = meta.get("skills") or []
     if is_project_role:
         config = _operator_config()
         turns = _cap_overlay_turns(role, turns, config)
         effort = _cap_overlay_effort(role, effort, config)
         exempt = _allowed_overlay_exemption(role, exempt, config)
+        # SR-2997 S7: overlay-supplied skill paths would be a traversal /
+        # injection vector the moment anything consumes them; drop them.
+        if skills:
+            logger.warning("role overlay %s: 'skills' is not honoured for "
+                           "project roles; ignored", role)
+        skills = []
     return RoleConfig(
         name=role,
         path=path,
@@ -483,7 +555,7 @@ def _build_role_config(
         turns=_positive_int(turns),
         effort=effort,
         early_term_exempt=exempt if isinstance(exempt, bool) else None,
-        skills=list(meta.get("skills") or []),
+        skills=list(skills),
         is_project_role=is_project_role,
     )
 
