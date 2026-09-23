@@ -23,6 +23,7 @@ from equipa.agent_runner import (
     AgentResult,
     build_cli_command,
     dispatch_agent,
+    is_overloaded_result,
     run_agent,
 )
 from equipa.checkpoints import (
@@ -356,6 +357,12 @@ async def run_security_review(
             count = _create_security_lessons(findings, project_id)
             if count > 0:
                 log(f"  Created {count} developer lesson(s) from security findings", output)
+    elif is_overloaded_result(sec_result):
+        # No review happened. The caller's merge gate must treat this as a
+        # loud failure, never as "no findings" (task #2994 S1).
+        log(f"  Security review agent FAILED: model overloaded (529) through "
+            f"every retry. Not downgrading the model; the merge gate will "
+            f"block this task.", output)
     else:
         log(f"  Security review agent failed.", output)
         for err in sec_result.get("errors", []):
@@ -772,6 +779,11 @@ async def run_code_review(
             count = _create_review_lessons(findings, project_id, source="code-reviewer")
             if count > 0:
                 log(f"  Created {count} developer lesson(s) from code review findings", output)
+    elif is_overloaded_result(cr_result):
+        # No review happened — never report this as "no findings" (#2994 S1).
+        log(f"  Code review agent FAILED: model overloaded (529) through "
+            f"every retry. Not downgrading the model; no review was done.",
+            output)
     else:
         log(f"  Code review agent failed.", output)
         for err in cr_result.get("errors", []):

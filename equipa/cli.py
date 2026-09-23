@@ -1562,6 +1562,7 @@ async def _run_security_review_and_gate(
         )
         review_skipped_doc_only = is_doc_only_diff(changed_files)
         review_crashed = False
+        sec_result = None
         if review_skipped_doc_only:
             print(
                 f"  [Task #{task['id']}] SECURITY GATE: skipping "
@@ -1575,7 +1576,7 @@ async def _run_security_review_and_gate(
             # re-authorise. Treat a crashed reviewer as fail-closed
             # regardless of artifact state.
             try:
-                await run_security_review(
+                sec_result = await run_security_review(
                     task, project_dir, project_context, args,
                 )
             except Exception:  # pragma: no cover - defensive
@@ -1613,6 +1614,18 @@ async def _run_security_review_and_gate(
                 f"operator review."
             )
             outcome = "security_review_blocked"
+        elif is_overloaded_result(sec_result):
+            # Task #2994 S1: the reviewer never ran (sustained 529), so any
+            # artifact on disk (stale, or absent with block_on_missing off)
+            # says nothing about THIS diff. Fail loudly as overloaded.
+            review_blocks_merge = True
+            print(
+                f"  [Task #{task['id']}] SECURITY GATE: blocking merge — "
+                f"security reviewer FAILED: model overloaded (529) through "
+                f"every retry. Not downgrading the model; branch "
+                f"forge-task-{task['id']} left unmerged."
+            )
+            outcome = OVERLOADED_OUTCOME
         elif review_blocks_merge:
             if review_counts is None:
                 print(
