@@ -201,15 +201,16 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
 
     # Override 5: DEFAULT_ROLE_MODELS (via role lookup)
     # When no overrides match, falls back to DEFAULT_ROLE_MODELS
-    # NOTE: DEFAULT_ROLE_MODELS includes "developer": "opus"
-    # This test verifies DEFAULT_ROLE_MODELS is checked after CLI but BEFORE auto-routing
-    # Use DEFAULT_MODEL (sonnet) for args.model to test DEFAULT_ROLE_MODELS activation
+    # NOTE: DEFAULT_ROLE_MODELS maps every role to the Opus-family DEFAULT_MODEL
+    # (task #2992). This test verifies DEFAULT_ROLE_MODELS is checked after CLI
+    # but BEFORE auto-routing.
+    from equipa.constants import DEFAULT_ROLE_MODELS
     config = {"features": {"auto_model_routing": True}}
     args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel; not an override)
-    # Developer has DEFAULT_ROLE_MODELS entry of "opus"
     # When CLI is default value, DEFAULT_ROLE_MODELS should activate
     result = get_role_model("developer", args, config=config, task=None)
-    assert result == "opus", "Expected DEFAULT_ROLE_MODELS (developer=opus) to activate when CLI is default"
+    assert result == DEFAULT_ROLE_MODELS["developer"], (
+        "Expected DEFAULT_ROLE_MODELS['developer'] to activate when CLI is default")
 
 
 def test_get_role_model_uses_auto_routing_when_no_overrides():

@@ -166,7 +166,11 @@ class AgentResult(_AgentResultRequired, total=False):
 
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
-from equipa.config import is_feature_enabled, load_dispatch_config
+from equipa.config import (
+    get_configured_model,
+    is_feature_enabled,
+    load_dispatch_config,
+)
 from equipa.constants import (
     EARLY_TERM_FINAL_WARN_TURNS,
     EARLY_TERM_KILL_TURNS,
@@ -301,12 +305,12 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     return any(marker in combined for marker in retryable_markers)
 
 
-def _cmd_model(cmd: list[str]) -> str:
-    """Return the ``--model`` value of a claude command, or ``"<unset>"``."""
+def _cmd_model(cmd: list[str]) -> str | None:
+    """Return the ``--model`` value of a claude command, or None if absent."""
     for index, arg in enumerate(cmd[:-1]):
         if arg == "--model":
             return cmd[index + 1]
-    return "<unset>"
+    return None
 
 
 def _note_overloaded(cmd: list[str], consecutive_529_errors: int) -> None:
@@ -316,7 +320,8 @@ def _note_overloaded(cmd: list[str], consecutive_529_errors: int) -> None:
     """
     if consecutive_529_errors == MAX_529_RETRIES:
         print(f"  [Overloaded] {consecutive_529_errors} consecutive 529/overloaded "
-              f"errors on model {_cmd_model(cmd)} — retrying on the SAME model "
+              f"errors on model {_cmd_model(cmd) or '<unset>'} — retrying on "
+              f"the SAME model "
               f"(model downgrades are forbidden)")
 
 
@@ -332,7 +337,8 @@ def _fail_overloaded(
     explicit overloaded failure instead of a generic one.
     """
     message = (
-        f"OVERLOADED: model {_cmd_model(cmd)} returned 529/overloaded on "
+        f"OVERLOADED: model {_cmd_model(cmd) or '<unset>'} returned "
+        f"529/overloaded on "
         f"{consecutive_529_errors} consecutive attempt(s) and all "
         f"{max_retries} retries are exhausted. Failing the run — EQUIPA never "
         f"falls back to a different model."
@@ -1960,6 +1966,8 @@ async def dispatch_agent(
                     role=role,
                     repo_files=repo_files,
                     mcp_config=mcp_config or "",
+                    # Same model the role resolved to — never a cheaper one.
+                    model=_cmd_model(cmd) or get_configured_model(dispatch_config),
                 )
                 return {
                     "success": decompose_result.success,

@@ -11,6 +11,7 @@ import json
 import shutil
 from typing import Any
 
+from equipa.config import get_configured_model
 from equipa.db import db_conn
 from equipa.lessons import record_agent_episode
 from equipa.output import log
@@ -35,6 +36,7 @@ async def run_reflexion_agent(
     outcome: str,
     role: str = "developer",
     output: Any = None,
+    model: str | None = None,
 ) -> None:
     """Spawn a lightweight agent to generate reflection when not in output.
 
@@ -42,7 +44,8 @@ async def run_reflexion_agent(
     structured output, we already have it. This function is only called
     when parse_reflection() returned None.
 
-    Uses minimal turns (max 2) and sonnet model to keep cost low.
+    Uses minimal turns (max 2) to keep cost low. Runs on ``model`` or, when
+    omitted, the configured dispatch model — never a downgraded one.
     The reflection is stored back into the most recent agent_episode.
     """
     # Late import to avoid circular dependency during transition
@@ -75,7 +78,7 @@ async def run_reflexion_agent(
             claude_bin,
             "-p", reflection_prompt,
             "--output-format", "json",
-            "--model", "sonnet",
+            "--model", model or get_configured_model(),
             "--max-turns", "2",
             "--no-session-persistence",
         ]

@@ -14,6 +14,7 @@ Exports:
     DEFAULT_DISPATCH_CONFIG
     is_feature_enabled
     load_dispatch_config
+    get_configured_model
 
 Copyright 2026 Forgeborn
 """
@@ -23,7 +24,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from equipa.constants import THEFORGE_DB
+from equipa.constants import DEFAULT_MODEL, THEFORGE_DB
 
 
 DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
@@ -69,7 +70,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
 
 DEFAULT_DISPATCH_CONFIG: dict = {
     "max_concurrent": 8,
-    "model": "sonnet",
+    "model": DEFAULT_MODEL,
     "max_turns": 25,
     "max_tasks_per_project": 3,
     "skip_projects": [],
@@ -175,3 +176,19 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
             config[key] = data[key]
 
     return config
+
+
+def get_configured_model(dispatch_config: dict | None = None) -> str:
+    """Return the configured Claude model for auxiliary (non-role) agent runs.
+
+    Used by reflexion, RLM decomposition and any other helper that spawns
+    ``claude`` outside the role-model resolution in equipa.roles. Reads
+    ``dispatch_config["model"]``, loading dispatch_config.json when no config
+    is passed. Falls back to the Opus-family DEFAULT_MODEL — EQUIPA never
+    picks a cheaper model on its own (task #2992).
+    """
+    config = dispatch_config if dispatch_config is not None else load_dispatch_config(None)
+    model = config.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return DEFAULT_MODEL

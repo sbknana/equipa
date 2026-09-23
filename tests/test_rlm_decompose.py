@@ -579,13 +579,18 @@ class TestBuildDecomposeSystemPrompt:
         result = build_decompose_system_prompt("Review.", "code-reviewer", "50 files, 10K lines")
         assert "50 files, 10K lines" in result
 
+    # Task #2992: sub-queries run on the configured model, never sonnet/haiku.
     def test_model_for_code_reviewer(self) -> None:
-        result = build_decompose_system_prompt("Review.", "code-reviewer", "summary")
-        assert "sonnet" in result
+        result = build_decompose_system_prompt(
+            "Review.", "code-reviewer", "summary", model="claude-opus-5-5[1m]")
+        assert "claude-opus-5-5[1m]" in result
+        assert "sonnet" not in result
 
     def test_model_for_integration_tester(self) -> None:
-        result = build_decompose_system_prompt("Review.", "integration-tester", "summary")
-        assert "haiku" in result
+        result = build_decompose_system_prompt(
+            "Review.", "integration-tester", "summary", model="claude-opus-5-5[1m]")
+        assert "claude-opus-5-5[1m]" in result
+        assert "haiku" not in result
 
 
 class TestBuildRepoSummary:

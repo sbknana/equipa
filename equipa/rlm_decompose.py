@@ -4,7 +4,7 @@ Ported from "Recursive Language Models" (Zhang/Kraska/Khattab, arxiv 2512.24601)
 When a code-reviewer or integration-tester task exceeds 100K tokens of context,
 this module switches from one-shot review to a REPL-based decomposition approach:
 the outer agent writes Python to filter/map/reduce across the repo, spawning
-cheaper sub-calls (Haiku or Sonnet) for focused sub-queries.
+focused sub-calls on the configured dispatch model (never a downgraded one).
 
 Gated behind: rlm_decompose_enabled feature flag AND token threshold.
 
@@ -23,6 +23,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from equipa.config import get_configured_model
 from equipa.output import log
 from equipa.parsing import estimate_tokens
 
@@ -31,12 +32,10 @@ from equipa.parsing import estimate_tokens
 TOKEN_THRESHOLD = 100_000
 CHARS_PER_TOKEN = 4
 
-SUB_QUERY_MODELS: dict[str, str] = {
-    "code-reviewer": "sonnet",
-    "integration-tester": "haiku",
-}
-
-DECOMPOSE_ELIGIBLE_ROLES = frozenset(SUB_QUERY_MODELS.keys())
+# Outer agent and sub-queries both run on the configured dispatch model
+# (equipa.config.get_configured_model). There is deliberately no per-role
+# cheaper-model map: EQUIPA never downgrades to sonnet/haiku (task #2992).
+DECOMPOSE_ELIGIBLE_ROLES = frozenset({"code-reviewer", "integration-tester"})
 
 MAX_SUB_QUERIES = 20
 MAX_SUB_QUERY_TURNS = 8
@@ -220,7 +219,7 @@ def _run_sub_query(
     project_dir: str,
     mcp_config: str,
 ) -> str:
-    """Spawn a sub-query to a cheaper model for focused analysis.
+    """Spawn a sub-query on the given (configured) model for focused analysis.
 
     This runs a Claude CLI call with a focused prompt and file subset.
     The sub-query has no REPL capability — it's a one-shot call.
@@ -274,7 +273,7 @@ class ReplSandbox:
 
     Pre-loaded with:
     - repo_files: dict[path, str] — all file contents
-    - sub_query(prompt, files) — spawns a cheaper sub-call
+    - sub_query(prompt, files) — spawns a focused sub-call (configured model)
     - Standard safe builtins (no exec/eval/open/import)
 
     Blocks: shell access, network access, file I/O, arbitrary imports.
@@ -286,6 +285,7 @@ class ReplSandbox:
         role: str,
         project_dir: str,
         mcp_config: str,
+        model: str | None = None,
     ):
         self.repo_files = dict(repo_files)
         self.role = role
@@ -293,11 +293,11 @@ class ReplSandbox:
         self.mcp_config = mcp_config
         self.sub_queries_run = 0
         self.output_buffer = io.StringIO()
-        self._model = SUB_QUERY_MODELS.get(role, "haiku")
+        self._model = model or get_configured_model()
         self._persistent_globals: dict[str, Any] | None = None
 
     def sub_query(self, prompt: str, files: dict[str, str]) -> str:
-        """Helper exposed to REPL code: spawn a cheaper sub-call."""
+        """Helper exposed to REPL code: spawn a focused sub-call."""
         if self.sub_queries_run >= MAX_SUB_QUERIES:
             return f"[sub_query limit reached: max {MAX_SUB_QUERIES}]"
 
@@ -462,14 +462,16 @@ def build_decompose_system_prompt(
     original_prompt: str,
     role: str,
     repo_summary: str,
+    model: str | None = None,
 ) -> str:
     """Build a system prompt for REPL decomposition mode.
 
     The outer agent receives instructions to write Python code
     that filters/maps/reduces across the repo using repo_files
-    and sub_query().
+    and sub_query(). Sub-queries run on ``model`` (default: the configured
+    dispatch model).
     """
-    sub_model = SUB_QUERY_MODELS.get(role, "haiku")
+    sub_model = model or get_configured_model()
 
     return f"""{original_prompt}
 
@@ -591,8 +593,12 @@ def run_decompose_session(
     role: str,
     repo_files: dict[str, str] | None = None,
     mcp_config: str = "",
+    model: str | None = None,
 ) -> DecomposeResult:
     """Run a full REPL decomposition session.
+
+    The outer agent and every sub-query run on ``model`` — the caller's
+    resolved role model, or the configured dispatch model when omitted.
 
     Multi-turn loop:
     1. Load repo files if not provided
@@ -623,20 +629,22 @@ def run_decompose_session(
         f"~{context_tokens:,} tokens, role={role}",
     )
 
+    outer_model = model or get_configured_model()
+
     sandbox = ReplSandbox(
         repo_files=repo_files,
         role=role,
         project_dir=project_dir,
         mcp_config=mcp_config,
+        model=outer_model,
     )
 
     decompose_prompt = build_decompose_system_prompt(
         original_prompt=system_prompt,
         role=role,
         repo_summary=summary,
+        model=outer_model,
     )
-
-    outer_model = SUB_QUERY_MODELS.get(role, "sonnet")
     all_outputs: list[str] = []
     errors: list[str] = []
     conversation = decompose_prompt

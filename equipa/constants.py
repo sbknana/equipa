@@ -52,7 +52,10 @@ ROLE_PROMPTS = {
 
 # --- Agent Defaults ---
 
-DEFAULT_MODEL = "sonnet"
+# Last-resort model when dispatch_config.json supplies none. Must stay an
+# Opus-family model: EQUIPA never silently runs on sonnet/haiku (owner
+# directive 2026-09-22, task #2992). The configured model always wins.
+DEFAULT_MODEL = "claude-opus-5-5[1m]"
 DEFAULT_MAX_TURNS = 25
 DEFAULT_MAX_RETRIES = 3
 PROCESS_TIMEOUT = 3600  # 60 minutes
@@ -109,18 +112,20 @@ EFFORT_BUDGET_MULTIPLIERS = {
     "max": 2.5,
 }
 
-# Default model per role (overridden by dispatch_config per-role or per-complexity keys)
+# Default model per role (overridden by dispatch_config per-role or per-complexity
+# keys). Every role gets the same Opus-family DEFAULT_MODEL — no role is ever
+# defaulted down to sonnet/haiku.
 DEFAULT_ROLE_MODELS = {
-    "developer": "opus",
-    "tester": "sonnet",
-    "security-reviewer": "opus",
-    "planner": "opus",
-    "evaluator": "sonnet",
-    "frontend-designer": "opus",
-    "integration-tester": "sonnet",
-    "debugger": "opus",
-    "code-reviewer": "sonnet",
-    "qa-tester": "sonnet",
+    "developer": DEFAULT_MODEL,
+    "tester": DEFAULT_MODEL,
+    "security-reviewer": DEFAULT_MODEL,
+    "planner": DEFAULT_MODEL,
+    "evaluator": DEFAULT_MODEL,
+    "frontend-designer": DEFAULT_MODEL,
+    "integration-tester": DEFAULT_MODEL,
+    "debugger": DEFAULT_MODEL,
+    "code-reviewer": DEFAULT_MODEL,
+    "qa-tester": DEFAULT_MODEL,
 }
 
 # Dev+Tester loop constants
