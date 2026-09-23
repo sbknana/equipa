@@ -15,6 +15,9 @@ Exports:
     is_feature_enabled
     load_dispatch_config
     get_configured_model
+    DOWNGRADE_MODEL_FAMILIES
+    is_downgrade_model
+    resolve_claude_model
 
 Copyright 2026 Forgeborn
 """
@@ -192,3 +195,40 @@ def get_configured_model(dispatch_config: dict | None = None) -> str:
     if isinstance(model, str) and model.strip():
         return model.strip()
     return DEFAULT_MODEL
+
+
+# Model families EQUIPA must never select on its own (owner directive
+# 2026-09-22, task #2992). Matched as substrings so both aliases ("sonnet")
+# and full ids ("claude-sonnet-4-20250514") are caught.
+DOWNGRADE_MODEL_FAMILIES: tuple[str, ...] = ("sonnet", "haiku")
+
+
+def is_downgrade_model(model: object) -> bool:
+    """Return True if ``model`` names a sonnet- or haiku-family model."""
+    if not isinstance(model, str):
+        return False
+    name = model.lower()
+    return any(family in name for family in DOWNGRADE_MODEL_FAMILIES)
+
+
+def resolve_claude_model(
+    requested: str | None = None,
+    dispatch_config: dict | None = None,
+) -> str:
+    """Return the model an auxiliary Claude call must run on.
+
+    ``requested`` (e.g. a ``model`` key in forgesmith_config.json) is honoured
+    only when it is set and is NOT a sonnet/haiku-family model. Anything else
+    resolves to the configured dispatch model (``get_configured_model``). A
+    refused request is reported on stdout so the substitution is never silent.
+    """
+    configured = get_configured_model(dispatch_config)
+    if not isinstance(requested, str) or not requested.strip():
+        return configured
+    requested = requested.strip()
+    if is_downgrade_model(requested):
+        print(f"WARNING: refusing downgrade model {requested!r}; using the "
+              f"configured model {configured!r} (task #2992: EQUIPA never "
+              f"runs on sonnet/haiku)")
+        return configured
+    return requested
