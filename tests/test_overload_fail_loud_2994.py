@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -737,6 +738,157 @@ class TestAutoresearchAnthropicCall:
     def test_refusal_returns_empty(self, autoresearch):
         assert autoresearch.extract_response_text(
             {"stop_reason": "refusal", "content": []}) == ""
+
+    def test_max_tokens_truncation_returns_empty(self, autoresearch):
+        # A truncated prompt must never be written back as the new role
+        # prompt; thinking shares max_tokens, so this is a real failure mode.
+        assert autoresearch.extract_response_text({
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": "PARTIAL PROMPT"}],
+        }) == ""
+
+
+# ===========================================================================
+# S1 — remaining call sites: retry wrapper, single-agent mode, code review
+# ===========================================================================
+
+
+class TestRunAgentWithRetriesOverload:
+    def test_overloaded_run_is_returned_without_a_rerun(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        async def fake_run_agent(cmd):
+            calls.append(cmd)
+            return _overloaded_result()
+
+        monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+
+        result, attempts = asyncio.run(agent_runner.run_agent_with_retries(
+            ["claude", "--model", CONFIGURED_MODEL], {"id": 1}, 3))
+
+        assert len(calls) == 1, "run_agent already spent its own 529 budget"
+        assert attempts == 1
+        assert is_overloaded_result(result)
+
+
+class TestSingleAgentOverload:
+    def test_single_agent_529_records_agent_overloaded(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        recorded: dict[str, Any] = {}
+
+        async def fake_streaming(_cmd, role=None):
+            return _overloaded_result()
+
+        async def fake_telemetry(_task, _result, outcome, **_kw):
+            recorded["outcome"] = outcome
+
+        @contextlib.contextmanager
+        def fake_cli(*_a, **_kw):
+            yield ["claude", "--model", CONFIGURED_MODEL]
+
+        import equipa.role_resolver as role_resolver
+        monkeypatch.setattr(role_resolver, "is_role_early_term_exempt",
+                            lambda *a, **kw: False)
+        monkeypatch.setattr(cli, "get_role_turns", lambda *a, **kw: 10)
+        monkeypatch.setattr(cli, "get_role_model",
+                            lambda *a, **kw: CONFIGURED_MODEL)
+        monkeypatch.setattr(cli, "calculate_dynamic_budget",
+                            lambda max_turns, effort=None: (max_turns, max_turns))
+        monkeypatch.setattr(cli, "build_system_prompt", lambda *a, **kw: "prompt")
+        monkeypatch.setattr(cli, "build_cli_command", fake_cli)
+        monkeypatch.setattr(cli, "run_agent_streaming", fake_streaming)
+        monkeypatch.setattr(cli, "_post_task_telemetry", fake_telemetry)
+        monkeypatch.setattr(cli, "verify_task_updated", lambda _tid: (True, "ok"))
+        monkeypatch.setattr(cli, "print_summary", lambda *a, **kw: None)
+
+        asyncio.run(cli._run_single_agent_mode(
+            {"id": 999_299_402, "title": "t", "description": "d"},
+            str(tmp_path), {},
+            SimpleNamespace(role="developer", retries=3, dispatch_config=None),
+        ))
+
+        # Before #2994 this was the generic "developer_failed".
+        assert recorded["outcome"] == OVERLOADED_OUTCOME
+        assert "FAILED: model overloaded (529)" in capsys.readouterr().out
+
+
+class TestCodeReviewOverload:
+    def test_overloaded_code_review_is_never_reported_clean(
+        self, monkeypatch, tmp_path,
+    ):
+        async def fake_run_agent(_cmd, timeout=None):
+            return _overloaded_result()
+
+        @contextlib.contextmanager
+        def fake_cli(*_a, **_kw):
+            yield ["claude", "--model", CONFIGURED_MODEL]
+
+        monkeypatch.setattr(loops, "get_role_turns", lambda *a, **kw: 5)
+        monkeypatch.setattr(loops, "get_role_model",
+                            lambda *a, **kw: CONFIGURED_MODEL)
+        monkeypatch.setattr(loops, "build_system_prompt", lambda *a, **kw: "prompt")
+        monkeypatch.setattr(loops, "build_cli_command", fake_cli)
+        monkeypatch.setattr(loops, "run_agent", fake_run_agent)
+        output: list[str] = []
+
+        result = asyncio.run(loops.run_code_review(
+            {"id": 999_299_403, "title": "t", "description": "d",
+             "project_id": 23},
+            str(tmp_path), {}, SimpleNamespace(dispatch_config=None),
+            output=output,
+        ))
+
+        assert is_overloaded_result(result)
+        assert any("Code review agent FAILED: model overloaded" in line
+                   for line in output), output
+        assert not any("no Critical or Important findings" in line
+                       for line in output)
+
+
+# ===========================================================================
+# S3 — ForgeSmith SIMBA model resolution
+# ===========================================================================
+
+
+class TestSimbaModelAllowlist:
+    @pytest.fixture
+    def simba(self):
+        import forgesmith_simba
+        return forgesmith_simba
+
+    def test_older_pinned_model_runs_on_configured(self, simba, monkeypatch):
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd, **_kw):
+            captured["cmd"] = cmd
+            return _completed(1, stderr="stop here")
+
+        monkeypatch.setattr(simba.subprocess, "run", fake_run)
+
+        simba.call_claude_for_rules(
+            "prompt", {"simba": {"model": "claude-opus-4-20250514"}})
+
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--model") + 1] == CONFIGURED_MODEL
+
+    def test_standalone_fallback_refuses_instead_of_bare_opus(
+        self, simba, monkeypatch,
+    ):
+        # Make every `from equipa.config import ...` fail, then load a fresh
+        # copy of the script so its module-level fallback is exercised.
+        monkeypatch.setitem(sys.modules, "equipa.config", None)
+        spec = importlib.util.spec_from_file_location(
+            "forgesmith_simba_standalone", simba.__file__)
+        standalone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(standalone)
+        run = MagicMock(side_effect=AssertionError("must not call claude"))
+        monkeypatch.setattr(standalone.subprocess, "run", run)
+
+        assert standalone.resolve_claude_model("claude-opus-4-20250514") is None
+        assert standalone.call_claude_for_rules(
+            "prompt", {"simba": {"model": "opus"}}) is None
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
