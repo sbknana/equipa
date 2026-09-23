@@ -2194,6 +2194,17 @@ async def run_dev_test_loop(
             state.total_cost += _accumulate_cost(
                 tester_result, f"[Cycle {cycle}] Tester", output)
 
+            # Sustained 529/overloaded exhausted every retry on the configured
+            # model. The tester produced no output, so parsing it would yield
+            # unknown/0 tests and be promoted to "no_tests" (a success) — the
+            # dev work would ship UNTESTED. Fail loudly instead (task #2994).
+            if tester_result.get("outcome") == OVERLOADED_OUTCOME:
+                log(f"  [Cycle {cycle}] Tester agent FAILED: model overloaded "
+                    f"(529) through every retry. Not downgrading the model and "
+                    f"NOT accepting the developer work as untested.", output)
+                _apply_cost_totals(tester_result, state.total_cost, state.total_duration)
+                return tester_result, cycle, OVERLOADED_OUTCOME
+
             # --- Lifecycle hooks: post_agent_finish (tester) ---
             await fire_hook(
                 "post_agent_finish",
