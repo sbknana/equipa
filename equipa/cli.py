@@ -29,10 +29,16 @@ from equipa.constants import (
     PROMPTS_DIR,
     THEFORGE_DB,
 )
-from equipa.agent_runner import build_cli_command, run_agent_streaming, run_agent_with_retries
+from equipa.agent_runner import (
+    OVERLOADED_OUTCOME,
+    build_cli_command,
+    is_overloaded_result,
+    run_agent_streaming,
+    run_agent_with_retries,
+)
 from equipa.checkpoints import load_checkpoint
 from equipa.db import log_gate_audit, record_agent_run, update_task_status
-from equipa.config import is_security_review_enabled
+from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
     _gated_merge_task,
@@ -1742,8 +1748,13 @@ async def _run_single_agent_mode(task, project_dir, project_context, args):
     result["turns_allocated"] = role_turns_allocated
     result["turns_max"] = role_turns_max
 
-    # Determine outcome
-    if result.get("early_terminated"):
+    # Determine outcome. Sustained 529 is checked first so it is recorded as
+    # the loud overloaded failure, never folded into a generic outcome.
+    if is_overloaded_result(result):
+        print(f"  [Task #{task['id']}] FAILED: model overloaded (529) through "
+              f"every retry. Not downgrading the model.")
+        single_outcome = OVERLOADED_OUTCOME
+    elif result.get("early_terminated"):
         single_outcome = "early_terminated"
     elif result["success"]:
         single_outcome = "tests_passed"
@@ -1936,6 +1947,10 @@ async def async_main() -> None:
 
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
+    # Auxiliary model resolution (reflexion, RLM, ForgeSmith helpers) must use
+    # THIS config — the one role resolution uses — never a CWD-relative file
+    # (task #2994 S2).
+    set_active_dispatch_config(args.dispatch_config)
 
     # --- Auth availability check (Max subscription OR API key) ---
     # Warn only when neither auth source is present. The Claude CLI accepts
