@@ -18,6 +18,7 @@ import threading
 
 import pytest
 
+from equipa.constants import DEFAULT_MODEL, DEFAULT_ROLE_MODELS
 from equipa.routing import (
     CB_FAILURE_THRESHOLD,
     CB_STATE_CLOSED,
@@ -31,6 +32,12 @@ from equipa.routing import (
     score_complexity,
     select_model_by_complexity,
 )
+
+
+# Task #2992: routing never selects below the configured model. RT-01/RT-02
+# ladder tests configure the cheapest tier explicitly so the scoring ladder and
+# the priority floor stay observable.
+LADDER_CONFIG = {"model": "haiku"}
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +77,7 @@ class TestRT01KeywordStuffing:
             "priority": "high",  # human-set priority: sonnet floor
         }
 
-        model = auto_select_model(task)
+        model = auto_select_model(task, LADDER_CONFIG)
 
         # Priority-implied floor for "high" is sonnet (TIER_ORDER index 1).
         priority_floor = TIER_ORDER.index("sonnet")
@@ -87,7 +94,7 @@ class TestRT01KeywordStuffing:
             "title": "spelling",
             "priority": "critical",
         }
-        model = auto_select_model(task)
+        model = auto_select_model(task, LADDER_CONFIG)
         assert model == "opus", (
             f"RT-01(c): critical priority must pin to opus, got {model!r}"
         )
@@ -160,7 +167,7 @@ class TestRT02FallbackNeverEscalates:
         assert _get_circuit_state("haiku") == CB_STATE_OPEN
 
         task = {"description": "fix typo", "title": "typo"}
-        model = auto_select_model(task)
+        model = auto_select_model(task, LADDER_CONFIG)
 
         assert model is None, (
             f"RT-02 violation: haiku open must fail closed, got {model!r}. "
@@ -171,17 +178,19 @@ class TestRT02FallbackNeverEscalates:
             f"RT-02: forbidden escalation to {model!r} on haiku breaker open"
         )
 
-    def test_sonnet_open_falls_to_haiku(self):
+    # Task #2992: an open circuit fails CLOSED at every tier. The old
+    # down-walk (opus->sonnet->haiku) was a silent model downgrade.
+    def test_sonnet_open_fails_closed_no_downgrade(self):
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("sonnet", success=False)
         task = {
             "description": "Implement validation endpoint with error handling",
             "title": "Add validation",
         }
-        model = auto_select_model(task)
-        assert model == "haiku", f"RT-02: sonnet->haiku expected, got {model!r}"
+        model = auto_select_model(task, {"model": "sonnet"})  # sonnet floor
+        assert model is None, f"#2992: sonnet open must fail closed, got {model!r}"
 
-    def test_opus_open_falls_to_sonnet(self):
+    def test_opus_open_fails_closed_no_downgrade(self):
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("opus", success=False)
         task = {
@@ -192,11 +201,11 @@ class TestRT02FallbackNeverEscalates:
             ),
             "title": "Security architecture",
         }
-        model = auto_select_model(task)
-        assert model == "sonnet", f"RT-02: opus->sonnet expected, got {model!r}"
+        model = auto_select_model(task, LADDER_CONFIG)
+        assert model is None, f"#2992: opus open must fail closed, got {model!r}"
 
-    def test_opus_and_sonnet_open_falls_to_haiku(self):
-        """Two open circuits at the top -> still walks down, never up."""
+    def test_opus_and_sonnet_open_fails_closed_no_downgrade(self):
+        """Two open circuits at the top -> fail closed, never walk down."""
         for tier in ("opus", "sonnet"):
             for _ in range(CB_FAILURE_THRESHOLD):
                 record_model_outcome(tier, success=False)
@@ -207,9 +216,9 @@ class TestRT02FallbackNeverEscalates:
             ),
             "title": "Security architecture",
         }
-        model = auto_select_model(task)
-        assert model == "haiku", (
-            f"RT-02: opus+sonnet open must fall all the way down to haiku, "
+        model = auto_select_model(task, LADDER_CONFIG)
+        assert model is None, (
+            f"#2992: opus+sonnet open must fail closed, never fall to haiku; "
             f"got {model!r}"
         )
 
@@ -218,29 +227,26 @@ class TestRT02FallbackNeverEscalates:
             for _ in range(CB_FAILURE_THRESHOLD):
                 record_model_outcome(tier, success=False)
         task = {"description": "fix typo", "title": "typo"}
-        model = auto_select_model(task)
+        model = auto_select_model(task, LADDER_CONFIG)
         assert model is None, (
             f"RT-02: every circuit open must fail closed, got {model!r}"
         )
 
-    def test_fallback_map_has_no_upward_arrows(self):
-        """Structural invariant: no entry in the fallback map points up.
+    def test_no_model_fallback_map_exists(self):
+        """Structural invariant: there is no fallback map at all.
 
-        This is the policy-level guarantee — even if a future edit changes
-        the ladder, this assertion catches any value that points to a
-        more-expensive tier.
+        RT-02 forbade upward arrows; task #2992 forbids downward ones too,
+        so the only compliant map is none. Any reintroduced fallback helper
+        fails this test.
         """
-        from equipa.routing import _FALLBACK_DOWN
+        from equipa import routing
 
-        for src, dst in _FALLBACK_DOWN.items():
-            if dst is None:
-                continue
-            src_idx = TIER_ORDER.index(src)
-            dst_idx = TIER_ORDER.index(dst)
-            assert dst_idx < src_idx, (
-                f"RT-02 invariant violated: fallback {src}->{dst} escalates "
-                f"(src_idx={src_idx} dst_idx={dst_idx})"
-            )
+        assert not hasattr(routing, "_FALLBACK_DOWN"), (
+            "#2992: routing must not define a model fallback map"
+        )
+        assert not hasattr(routing, "_fallback_when_open"), (
+            "#2992: routing must not define a model fallback helper"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +330,8 @@ class TestRT03Concurrency:
 
         assert len(results) == 10
         for r in results:
-            assert r is None or r in TIER_ORDER, (
+            # Default config: never below the configured model (#2992).
+            assert r is None or r == DEFAULT_MODEL, (
                 f"RT-03: concurrent auto_select_model returned {r!r}"
             )
 
@@ -367,7 +374,9 @@ class TestS1FailClosedPropagation:
         return Mock(model=None, dispatch_config=None)
 
     def _trip_all_circuits(self):
-        for tier in TIER_ORDER:
+        # Includes DEFAULT_MODEL: with no configured ``model`` key, routing
+        # resolves to it (#2992), so its circuit must be tripped too.
+        for tier in (*TIER_ORDER, DEFAULT_MODEL):
             for _ in range(CB_FAILURE_THRESHOLD):
                 record_model_outcome(tier, success=False)
 
@@ -399,10 +408,12 @@ class TestS1FailClosedPropagation:
     def test_get_role_model_raises_when_only_cheapest_attack_path_tripped(
         self, _mock_args,
     ):
-        """The exact RT-02 attack: trip ONLY haiku, dispatch a trivial task
-        that auto-routes to haiku. auto_select_model fails closed because
-        haiku's fallback is None. get_role_model must propagate that as
-        CircuitOpenError, NOT silently return DEFAULT_ROLE_MODELS=opus."""
+        """The old RT-02 attack (trip ONLY haiku so a haiku-routed task is
+        coerced elsewhere) no longer has a surface: routing never selects
+        below the configured model (#2992), so a trivial task resolves to
+        the configured DEFAULT_MODEL whether or not haiku is tripped. When
+        the CONFIGURED model's own circuit trips, get_role_model must still
+        raise CircuitOpenError rather than substitute any model."""
         from equipa.roles import get_role_model
         from equipa.routing import CircuitOpenError
 
@@ -410,12 +421,17 @@ class TestS1FailClosedPropagation:
             record_model_outcome("haiku", success=False)
 
         config = {"features": {"auto_model_routing": True}}
-        # Trivial task -> haiku tier -> only haiku circuit matters here.
         task = {"id": 2, "description": "fix typo", "title": "typo"}
 
-        # Pre-flight: confirm auto_select_model itself fails closed.
-        assert auto_select_model(task, config) is None
+        # A tripped haiku circuit cannot move dispatch off the configured model.
+        assert auto_select_model(task, config) == DEFAULT_MODEL
+        assert get_role_model(
+            "developer", _mock_args, config=config, task=task) == DEFAULT_MODEL
 
+        # Tripping the configured model itself fails closed — no fallback.
+        for _ in range(CB_FAILURE_THRESHOLD):
+            record_model_outcome(DEFAULT_MODEL, success=False)
+        assert auto_select_model(task, config) is None
         with pytest.raises(CircuitOpenError):
             get_role_model("developer", _mock_args, config=config, task=task)
 
@@ -431,7 +447,7 @@ class TestS1FailClosedPropagation:
 
         # Must NOT raise — auto-routing path is gated by the flag.
         result = get_role_model("developer", _mock_args, config=config, task=task)
-        assert result == "opus"  # DEFAULT_ROLE_MODELS["developer"]
+        assert result == DEFAULT_ROLE_MODELS["developer"]
 
     def test_get_role_model_does_not_raise_when_circuits_healthy(
         self, _mock_args,
@@ -443,8 +459,8 @@ class TestS1FailClosedPropagation:
         task = {"id": 4, "description": "fix typo in README", "title": "Fix typo"}
 
         result = get_role_model("developer", _mock_args, config=config, task=task)
-        # Trivial task routes to haiku.
-        assert result in TIER_ORDER
+        # Trivial task scores haiku but is clamped to the configured model.
+        assert result == DEFAULT_MODEL
 
     def test_circuit_open_error_carries_diagnostic_payload(self, _mock_args):
         """The exception must carry enough info for the dispatch wrapper
@@ -463,7 +479,8 @@ class TestS1FailClosedPropagation:
 
         exc = exc_info.value
         assert exc.role == "security-reviewer"
-        assert exc.tier_attempted == "haiku"
+        # The configured model the router tried (never a downgraded tier).
+        assert exc.tier_attempted == DEFAULT_MODEL
         # The string form mentions both the role and the fail-closed cause.
         msg = str(exc)
         assert "security-reviewer" in msg

@@ -162,18 +162,21 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
         "id": 1,
         "description": "fix typo in README",
         "title": "Fix typo",
-        "type": "trivial",
+        "complexity": "simple",
     }
     role = "developer"
 
-    # Override 1: model_epic (complexity-based)
+    # Override 1: model_<complexity> (complexity-based). Task #2992: the key
+    # must be a real complexity ("simple"); the old "model_trivial" key was
+    # never read and only passed because auto-routing happened to pick haiku.
     config = {
         "features": {"auto_model_routing": True},
-        "model_trivial": "haiku",  # explicit override
+        "model_simple": "complexity-override-model",  # explicit override
     }
     args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     result = get_role_model(role, args, config=config, task=task)
-    assert result == "haiku", "Expected complexity override to win over auto-routing"
+    assert result == "complexity-override-model", (
+        "Expected complexity override to win over auto-routing")
 
     # Override 2: model_developer (role-based)
     config = {
@@ -214,8 +217,15 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
 
 
 def test_get_role_model_uses_auto_routing_when_no_overrides():
-    """Test: get_role_model uses auto-routing when no overrides match and flag ON."""
-    # Trivial task: should route to haiku
+    """Test: get_role_model uses auto-routing when no overrides match and flag ON.
+
+    Task #2992: auto-routing never selects below the configured model. With
+    no ``model`` key the floor is the Opus-family DEFAULT_MODEL, so a trivial
+    task that scores haiku still resolves to DEFAULT_MODEL.
+    """
+    from equipa.constants import DEFAULT_MODEL
+
+    # Trivial task: scores haiku, clamped up to the configured floor
     trivial_task = {
         "id": 1,
         "description": "fix typo in README",
@@ -237,13 +247,15 @@ def test_get_role_model_uses_auto_routing_when_no_overrides():
     args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     role = "developer"
 
-    # Trivial task -> auto-route to haiku
+    # Trivial task -> never below the configured model
     result = get_role_model(role, args, config=config, task=trivial_task)
-    assert result == "haiku", f"Expected auto-routing to select haiku for trivial task, got {result}"
+    assert result == DEFAULT_MODEL, (
+        f"Auto-routing must not downgrade a trivial task below {DEFAULT_MODEL}, got {result}")
 
-    # Complex task -> auto-route to opus
+    # Complex task -> the configured Opus-family model
     result = get_role_model(role, args, config=config, task=complex_task)
-    assert result == "opus", f"Expected auto-routing to select opus for complex task, got {result}"
+    assert result == DEFAULT_MODEL, (
+        f"Expected configured model {DEFAULT_MODEL} for complex task, got {result}")
 
 
 def test_get_role_model_ignores_auto_routing_when_flag_off():
@@ -286,7 +298,9 @@ def test_circuit_breaker_fallback_never_escalates_cost():
         "title": "Fix typo",
     }
 
-    result = auto_select_model(task, config=None)
+    # Operator-configured haiku floor, so the trivial task genuinely selects
+    # haiku (task #2992: routing never goes below the configured model).
+    result = auto_select_model(task, config={"model": "haiku"})
     assert result is None, (
         f"RT-02 violation: haiku breaker open must fail closed (None), "
         f"got {result!r}. Falling UP to a more expensive tier on failure "

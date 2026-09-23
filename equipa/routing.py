@@ -8,17 +8,21 @@ used in place of raw count, low-tier keywords are capped so they cannot drag a
 genuinely complex task into the cheap tier, and task.priority is cross-validated
 against the scored tier so a "critical"/"high" priority cannot be downgraded.
 
+The scored tier is clamped UP to the configured model (task #2992, owner
+directive 2026-09-22): routing can never select a model below the configured
+one, so with an Opus-family configured model auto-routing always resolves to
+that model.
+
 Circuit breaker tracks consecutive failures per model with a 60s recovery
-window. Fallback direction is DOWN to a cheaper tier, never up (RT-02): an
-attacker who trips the cheap tier's breaker can never coerce dispatch onto the
-expensive tier. If the cheapest tier is itself unavailable we fail closed
-(``auto_select_model`` returns ``None``) rather than escalating cost.
+window. There is NO model fallback in either direction: when the chosen
+model's circuit is open, ``auto_select_model`` fails closed (returns
+``None``). It never walks down to a cheaper tier (task #2992) and never
+escalates cost (RT-02).
 
 The fail-closed return value of ``auto_select_model`` is propagated upward
-through ``equipa.roles.get_role_model`` as ``CircuitOpenError`` (2453-S1).
-This enforces the RT-02 invariant end-to-end: a tripped haiku circuit can
-NEVER coerce dispatch onto ``DEFAULT_ROLE_MODELS[role]`` (which maps most
-roles to opus). Dispatch entry points
+through ``equipa.roles.get_role_model`` as ``CircuitOpenError`` (2453-S1),
+so an open circuit can NEVER silently coerce dispatch onto
+``DEFAULT_ROLE_MODELS[role]`` or any other model. Dispatch entry points
 (``equipa.dispatch.run_dev_test_loop_with_autoresearch`` and
 ``equipa.cli.run_mode_task``) catch ``CircuitOpenError`` and demote the
 task outcome to ``circuit_breaker_blocked``.
@@ -62,14 +66,14 @@ class CircuitOpenError(RuntimeError):
 
     Attributes:
         role: The role name whose model resolution failed.
-        tier_attempted: The cheapest tier the router tried before failing
-            closed (informational only; may be ``None`` if unknown).
+        tier_attempted: The model the router tried before failing closed
+            (informational only; may be ``None`` if unknown).
     """
 
     def __init__(self, role: str, tier_attempted: str | None = None) -> None:
         self.role = role
         self.tier_attempted = tier_attempted
-        suffix = f" (cheapest tier attempted: {tier_attempted})" if tier_attempted else ""
+        suffix = f" (model attempted: {tier_attempted})" if tier_attempted else ""
         super().__init__(
             f"auto-routing fail-closed for role={role}: every suitable circuit is OPEN"
             f"{suffix}"
@@ -463,25 +467,30 @@ def _get_circuit_state(model: str) -> str:
         return state["state"]
 
 
-# RT-02: Fallback map ALWAYS goes DOWN to a cheaper tier. The cheapest tier
-# falls to None (fail closed). An attacker who trips a cheap tier's breaker
-# can NEVER coerce dispatch onto a more expensive tier — that is the policy
-# invariant this map encodes. Do not change a value to a more-expensive tier.
-_FALLBACK_DOWN: dict[str, str | None] = {
-    "opus": "sonnet",
-    "sonnet": "haiku",
-    "haiku": None,  # fail closed — never escalate
-}
+def model_tier_index(model: str | None) -> int:
+    """Map a model alias or full id (e.g. ``claude-opus-5-5[1m]``) onto TIER_ORDER.
 
-
-def _fallback_when_open(model: str) -> str | None:
-    """Return the cheaper-tier fallback for ``model`` (RT-02).
-
-    Returns None for the cheapest tier — caller MUST treat this as
-    "fail closed", not "use default". Callers that need a non-None
-    fallback should retry later, not coerce to a different model.
+    Matching is by family substring. A model that names no known family
+    (e.g. a newer flagship) is treated as the TOP tier, so the floor check
+    below can never mistake it for something cheaper.
     """
-    return _FALLBACK_DOWN.get(model, None)
+    name = (model or "").lower()
+    for index, tier in enumerate(TIER_ORDER):
+        if tier in name:
+            return index
+    return len(TIER_ORDER) - 1
+
+
+def configured_floor_model(config: dict[str, Any] | None) -> str:
+    """Return the configured model, which is the floor for auto-routing.
+
+    ``config["model"]`` when set, else the Opus-family DEFAULT_MODEL.
+    """
+    if config:
+        model = config.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return DEFAULT_MODEL
 
 
 def auto_select_model(
@@ -490,15 +499,22 @@ def auto_select_model(
 ) -> str | None:
     """Auto-select model for task using complexity scoring + circuit breaker.
 
+    Task #2992 (owner directive 2026-09-22): routing can NEVER select a model
+    below the configured one. The scored tier is clamped up to the configured
+    floor (``configured_floor_model``), and an OPEN circuit on the chosen
+    model fails closed instead of falling down to a cheaper tier. RT-02 still
+    holds — an open circuit never escalates cost either — because the model is
+    never swapped in either direction.
+
     Args:
         task: Task dict with "description", optional "title", optional
             "priority" keys.
         config: Optional dispatch config
 
     Returns:
-        Selected model name, or ``None`` if all suitable circuits are
-        open and no cheaper fallback is available (fail-closed). Callers
-        must handle ``None`` — typically by deferring the dispatch.
+        Selected model name (never a lower tier than the configured model),
+        or ``None`` if the chosen model's circuit is open (fail-closed).
+        Callers must handle ``None`` — typically by deferring the dispatch.
     """
     description = task.get("description", "")
     title = task.get("title", "")
@@ -509,30 +525,29 @@ def auto_select_model(
     uncertainty = _uncertainty_level(f"{title} {description}")
 
     # Select model tier (with priority cross-validation)
-    model = select_model_by_complexity(complexity, uncertainty, config, priority)
+    scored_model = select_model_by_complexity(complexity, uncertainty, config, priority)
 
-    # RT-02: walk DOWN the tier ladder while the chosen circuit is open.
-    # Bounded by len(TIER_ORDER) to prevent any loop pathology.
-    for _ in range(len(TIER_ORDER) + 1):
-        if model is None:
-            return None
-        if _get_circuit_state(model) != CB_STATE_OPEN:
-            return model
-        logger.warning(
-            "routing: circuit OPEN for %s — falling DOWN to cheaper tier",
+    # Floor: the configured model. A scored tier at or below it resolves to
+    # the configured model itself; only a strictly higher tier is honoured.
+    floor_model = configured_floor_model(config)
+    if model_tier_index(scored_model) <= model_tier_index(floor_model):
+        if scored_model != floor_model:
+            logger.info(
+                "routing: scored %s clamped up to configured model %s "
+                "(routing never selects below the configured model)",
+                scored_model, floor_model,
+            )
+        model = floor_model
+    else:
+        model = scored_model
+
+    # Open circuit: fail closed. There is deliberately no fallback map — a
+    # different model is never substituted, cheaper or more expensive.
+    if _get_circuit_state(model) == CB_STATE_OPEN:
+        logger.error(
+            "routing: circuit OPEN for %s — failing closed, deferring dispatch "
+            "(no model fallback)",
             model,
         )
-        model = _fallback_when_open(model)
-
-    # If we walked the entire ladder and every tier is open, fail closed.
-    logger.error(
-        "routing: every circuit is OPEN — failing closed, deferring dispatch"
-    )
-    return None
-
-
-# DEFAULT_MODEL is imported but only referenced here for compatibility with
-# downstream call sites that may want to know the configured default. We do
-# NOT use it as a fallback when all circuits are open — that would defeat the
-# RT-02 fail-closed guarantee.
-_ = DEFAULT_MODEL
+        return None
+    return model

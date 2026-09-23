@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from equipa.constants import DEFAULT_MODEL
 from equipa.routing import (
     CB_FAILURE_THRESHOLD,
     CB_RECOVERY_SECONDS,
@@ -216,12 +217,18 @@ class TestCircuitBreaker:
 class TestAutoSelectModel:
     """Test auto-select model integration."""
 
+    # Task #2992: routing never selects below the configured model. These
+    # ladder tests configure the cheapest tier explicitly so the full scoring
+    # ladder is observable; with the default (Opus-family) configuration every
+    # task resolves to DEFAULT_MODEL.
+    LADDER_CONFIG = {"model": "haiku"}
+
     def setup_method(self):
         _circuit_breaker_state.clear()
 
     def test_trivial_task_selects_haiku(self):
         task = {"description": "Fix typo", "title": "Typo fix"}
-        model = auto_select_model(task)
+        model = auto_select_model(task, self.LADDER_CONFIG)
         assert model == "haiku"
 
     def test_complex_task_selects_opus(self):
@@ -230,7 +237,7 @@ class TestAutoSelectModel:
             "authorization, and database migration across multiple microservices",
             "title": "Security architecture",
         }
-        model = auto_select_model(task)
+        model = auto_select_model(task, self.LADDER_CONFIG)
         assert model == "opus"
 
     def test_circuit_open_haiku_fails_closed(self):
@@ -243,14 +250,14 @@ class TestAutoSelectModel:
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("haiku", success=False)
 
-        model = auto_select_model(task)
+        model = auto_select_model(task, self.LADDER_CONFIG)
         assert model is None, (
             f"RT-02 violation: haiku breaker open must fail closed, got {model}"
         )
 
-    def test_opus_circuit_falls_down_to_sonnet(self):
-        # RT-02: when Opus is open, fall DOWN to sonnet (cheaper), never
-        # stay on Opus and never escalate.
+    def test_opus_circuit_open_fails_closed_no_downgrade(self):
+        # Task #2992: an open Opus circuit fails CLOSED. It must never fall
+        # down to sonnet (silent downgrade) nor escalate (RT-02).
         task = {
             "description": "Architect distributed authentication infrastructure with encryption, "
             "authorization, and database migration across multiple microservices",
@@ -260,13 +267,14 @@ class TestAutoSelectModel:
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("opus", success=False)
 
-        model = auto_select_model(task)
-        assert model == "sonnet", (
-            f"RT-02: opus open must fall DOWN to sonnet, got {model}"
+        model = auto_select_model(task, self.LADDER_CONFIG)
+        assert model is None, (
+            f"#2992: opus open must fail closed, never downgrade; got {model}"
         )
 
-    def test_sonnet_circuit_falls_down_to_haiku(self):
-        # RT-02: medium-tier task with Sonnet open must fall DOWN to Haiku.
+    def test_sonnet_circuit_open_fails_closed_no_downgrade(self):
+        # Task #2992: medium-tier task with Sonnet open fails CLOSED — it
+        # must never fall down to Haiku.
         task = {
             "description": "Implement validation endpoint with error handling",
             "title": "Add validation",
@@ -274,9 +282,9 @@ class TestAutoSelectModel:
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("sonnet", success=False)
 
-        model = auto_select_model(task)
-        assert model == "haiku", (
-            f"RT-02: sonnet open must fall DOWN to haiku, got {model}"
+        model = auto_select_model(task, {"model": "sonnet"})  # sonnet floor
+        assert model is None, (
+            f"#2992: sonnet open must fail closed, never downgrade; got {model}"
         )
 
     def test_all_circuits_open_fails_closed(self):
@@ -287,12 +295,12 @@ class TestAutoSelectModel:
             for _ in range(CB_FAILURE_THRESHOLD):
                 record_model_outcome(tier, success=False)
 
-        model = auto_select_model(task)
+        model = auto_select_model(task, self.LADDER_CONFIG)
         assert model is None
 
     def test_empty_task(self):
         task = {}
         model = auto_select_model(task)
-        # Empty task returns a model OR None — both are acceptable as long
-        # as the result is not coerced to a more-expensive tier.
-        assert model is None or model in ["haiku", "sonnet", "opus"]
+        # Empty task returns the configured model OR None (fail closed) —
+        # never a cheaper tier than the configured one.
+        assert model is None or model == DEFAULT_MODEL

@@ -170,12 +170,19 @@ def get_role_model(
     # pattern as ``security_review_blocked``. Auto-routing OFF is the
     # legacy path and still falls through to DEFAULT_ROLE_MODELS.
     if effective_config and task and is_feature_enabled(effective_config, "auto_model_routing"):
-        from equipa.routing import CircuitOpenError, auto_select_model
+        from equipa.routing import (
+            CircuitOpenError,
+            auto_select_model,
+            configured_floor_model,
+        )
+        # auto_select_model never returns a model below the configured one
+        # (task #2992); it may only return None on an open circuit.
         routed_model = auto_select_model(task, effective_config)
         if routed_model:
             logger.info("model: %s (source=auto_model_routing, role=%s)", routed_model, role)
             return routed_model
-        raise CircuitOpenError(role=role, tier_attempted="haiku")
+        raise CircuitOpenError(
+            role=role, tier_attempted=configured_floor_model(effective_config))
 
     # Frontmatter `model` on a project role is a DEFAULT-level fallback (below
     # dispatch-config / CLI / auto-routing), letting project roles pick a model
