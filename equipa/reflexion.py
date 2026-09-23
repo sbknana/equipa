@@ -49,7 +49,7 @@ async def run_reflexion_agent(
     The reflection is stored back into the most recent agent_episode.
     """
     # Late import to avoid circular dependency during transition
-    from equipa.agent_runner import run_agent
+    from equipa.agent_runner import is_overloaded_result, run_agent
 
     try:
         task_id = task.get("id") if isinstance(task, dict) else task
@@ -86,6 +86,11 @@ async def run_reflexion_agent(
         log(f"  [Reflexion] Spawning reflection agent for task #{task_id}...", output)
         ref_result = await run_agent(cmd, timeout=60)
 
+        if is_overloaded_result(ref_result):
+            log("  [Reflexion] Reflection agent FAILED: model overloaded (529) "
+                "through every retry. Not downgrading the model; no "
+                "reflection recorded.", output)
+            return
         if not ref_result.get("success"):
             log(f"  [Reflexion] Reflection agent failed: {ref_result.get('errors', [])}", output)
             return

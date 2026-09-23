@@ -168,6 +168,7 @@ from equipa.abort_controller import AbortController, create_child_abort_controll
 from equipa.bash_security import check_bash_command
 from equipa.config import (
     get_configured_model,
+    get_persistent_retry_max_attempts,
     is_feature_enabled,
     load_dispatch_config,
 )
@@ -348,6 +349,58 @@ def _fail_overloaded(
     result["outcome"] = OVERLOADED_OUTCOME
     result.setdefault("errors", []).append(message)
     print(f"  [Overloaded] {message}")
+    return result
+
+
+def is_overloaded_result(result: object) -> bool:
+    """Return True if an agent result is the loud sustained-529 failure.
+
+    Every dispatch call site must check this BEFORE parsing the agent output:
+    an overloaded run produced no work, so parsing it yields empty/unknown
+    values that downstream logic can mistake for "no tests" or "no findings"
+    (task #2994, SECURITY-REVIEW-2992 S1).
+    """
+    return isinstance(result, dict) and result.get("outcome") == OVERLOADED_OUTCOME
+
+
+def _resolve_persistent_ceiling(persistent_max_attempts: int | None) -> int:
+    """Return the persistent-retry ceiling: explicit arg, else config key."""
+    if persistent_max_attempts is not None:
+        if (isinstance(persistent_max_attempts, bool)
+                or not isinstance(persistent_max_attempts, int)
+                or persistent_max_attempts < 1):
+            raise ValueError(
+                f"persistent_max_attempts must be a positive int, got "
+                f"{persistent_max_attempts!r}"
+            )
+        return persistent_max_attempts
+    return get_persistent_retry_max_attempts()
+
+
+def _fail_persistent_exhausted(
+    result: dict[str, Any],
+    cmd: list[str],
+    overloaded: bool,
+    consecutive_529_errors: int,
+    persistent_attempts: int,
+    last_error: str,
+) -> dict[str, Any]:
+    """Fail a persistent-retry run loudly once its capacity ceiling is hit.
+
+    Sustained 529 fails with OVERLOADED_OUTCOME exactly like the bounded
+    path; a 429 ceiling fails as a plain run failure. Either way the run
+    stops instead of retrying forever (task #2994 S9).
+    """
+    print(f"  [PersistentRetry] Ceiling reached: {persistent_attempts} "
+          f"consecutive capacity failure(s). Giving up.")
+    if overloaded:
+        return _fail_overloaded(
+            result, cmd, consecutive_529_errors, persistent_attempts)
+    result["success"] = False
+    result.setdefault("errors", []).append(
+        f"Persistent retry ceiling ({persistent_attempts}) reached on "
+        f"capacity errors. Last error: {last_error}"
+    )
     return result
 
 
@@ -618,6 +671,7 @@ async def run_agent(
     max_retries: int = 10,
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
+    persistent_max_attempts: int | None = None,
 ) -> AgentResult:
     """Spawn claude -p with retry logic and exponential backoff.
 
@@ -627,15 +681,20 @@ async def run_agent(
     - 529/overloaded is retried on the SAME model; the --model argument is
       never rewritten. If retries exhaust while overloaded the run fails
       loudly with outcome OVERLOADED_OUTCOME.
-    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
-      with higher backoff (5 min max) and periodic heartbeats
+    - Persistent retry mode: for unattended sessions, retries 429/529 with
+      higher backoff (5 min max) and periodic heartbeats, up to a bounded
+      ceiling; sustained 529 then fails loudly with OVERLOADED_OUTCOME.
 
     Args:
         cmd: Command list for subprocess
         timeout: Per-attempt timeout (default: PROCESS_TIMEOUT)
-        max_retries: Maximum retry attempts (default: 10, ignored if persistent=True)
+        max_retries: Maximum retry attempts (default: 10). In persistent mode
+            429/529 capacity errors do not consume this budget.
         persistent_retry: Enable persistent retry mode for unattended sessions
         abort_controller: Optional parent abort controller for cancellation hierarchy
+        persistent_max_attempts: Ceiling on capacity-error retries in
+            persistent mode. None reads dispatch config
+            ``persistent_retry_max_attempts`` (default 36).
 
     Returns:
         Result dict with success, result_text, num_turns, duration, cost, errors
@@ -645,6 +704,10 @@ async def run_agent(
     consecutive_529_errors = 0
     last_error = ""
     persistent_attempt = 0
+    persistent_ceiling = (
+        _resolve_persistent_ceiling(persistent_max_attempts)
+        if persistent_retry else 0
+    )
 
     # Create child abort controller if parent provided
     child_controller = (
@@ -653,7 +716,10 @@ async def run_agent(
         else AbortController()
     )
 
-    for attempt in range(1, max_retries + 1):
+    # Counts only failures that consume the max_retries budget; persistent
+    # capacity retries are bounded separately by persistent_ceiling.
+    attempt = 0
+    while True:
         attempt_start = time.time()
 
         # Check if already aborted before spawning subprocess
@@ -795,10 +861,15 @@ async def run_agent(
             # Non-retryable error, fail immediately
             return result
 
-        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        # Persistent retry mode: retry 429/529 with high backoff, bounded by
+        # persistent_ceiling so a sustained outage still fails loudly.
         is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
+            if persistent_attempt >= persistent_ceiling:
+                return _fail_persistent_exhausted(
+                    result, cmd, overloaded, consecutive_529_errors,
+                    persistent_attempt, last_error)
             # In persistent mode, use separate attempt counter and higher backoff
             delay_seconds = get_retry_delay(
                 persistent_attempt,
@@ -811,7 +882,8 @@ async def run_agent(
                 delay_ms = PERSISTENT_RESET_CAP_MS
                 delay_seconds = delay_ms / 1000.0
 
-            print(f"  [PersistentRetry] Attempt {persistent_attempt} failed "
+            print(f"  [PersistentRetry] Attempt {persistent_attempt}/"
+                  f"{persistent_ceiling} failed "
                   f"({time.time() - attempt_start:.1f}s). "
                   f"Retrying in {delay_seconds:.1f}s... "
                   f"(error: {last_error[:80]})")
@@ -825,13 +897,10 @@ async def run_agent(
                 if remaining_ms > 0:
                     print(f"  [Heartbeat] Still retrying... "
                           f"{remaining_ms / 1000.0:.0f}s remaining")
-
-            # Clamp attempt counter so we never exit the loop in persistent mode
-            if attempt >= max_retries:
-                attempt = max_retries
             continue
 
-        # Last attempt exhausted (non-persistent mode)
+        # Last attempt exhausted
+        attempt += 1
         if attempt >= max_retries:
             if overloaded:
                 return _fail_overloaded(
@@ -849,9 +918,6 @@ async def run_agent(
               f"(error: {last_error[:80]})")
 
         await asyncio.sleep(delay_seconds)
-
-    # Should never reach here, but fallback return
-    return result
 
 
 async def _run_agent_streaming_impl(
@@ -1675,6 +1741,13 @@ async def run_agent_with_retries(
         # guard's TASKS_CREATED validation) have a real value, not None.
         result.setdefault("started_at", started_at)
 
+        # run_agent already exhausted its own 529 retries on the configured
+        # model. Re-running would only repeat that; surface the loud
+        # overloaded failure to the caller instead (task #2994).
+        if is_overloaded_result(result):
+            print("  Not retrying: model overloaded (529) through every retry")
+            return result, attempt
+
         # Check if output is valid
         is_valid, reason = validate_output(result)
 
@@ -1709,6 +1782,7 @@ async def run_agent_streaming_with_retry(
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     paralysis_retry_count: int = 0,
+    persistent_max_attempts: int | None = None,
 ) -> AgentResult:
     """Wrap run_agent_streaming with retry logic + exponential backoff.
 
@@ -1720,18 +1794,29 @@ async def run_agent_streaming_with_retry(
       never rewritten. If retries exhaust while overloaded the run fails
       loudly with outcome OVERLOADED_OUTCOME.
     - Non-retryable errors fail immediately
-    - Persistent retry mode: for unattended sessions, retries 429/529 indefinitely
-      with higher backoff (5 min max) and periodic heartbeats
+    - Persistent retry mode: for unattended sessions, retries 429/529 with
+      higher backoff (5 min max) and periodic heartbeats, up to a bounded
+      ceiling; sustained 529 then fails loudly with OVERLOADED_OUTCOME.
 
     Args:
         persistent_retry: Enable persistent retry mode for unattended sessions
         abort_controller: Optional parent abort controller for cancellation hierarchy
+        persistent_max_attempts: Ceiling on capacity-error retries in
+            persistent mode. None reads dispatch config
+            ``persistent_retry_max_attempts`` (default 36).
     """
     consecutive_529_errors = 0
     last_error = ""
     persistent_attempt = 0
+    persistent_ceiling = (
+        _resolve_persistent_ceiling(persistent_max_attempts)
+        if persistent_retry else 0
+    )
 
-    for attempt in range(1, max_retries + 1):
+    # Counts only failures that consume the max_retries budget; persistent
+    # capacity retries are bounded separately by persistent_ceiling.
+    attempt = 0
+    while True:
         attempt_start = time.time()
 
         # Execute streaming agent
@@ -1778,10 +1863,15 @@ async def run_agent_streaming_with_retry(
             # Non-retryable error, fail immediately
             return result
 
-        # Persistent retry mode: retry 429/529 indefinitely with high backoff
+        # Persistent retry mode: retry 429/529 with high backoff, bounded by
+        # persistent_ceiling so a sustained outage still fails loudly.
         is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
+            if persistent_attempt >= persistent_ceiling:
+                return _fail_persistent_exhausted(
+                    result, cmd, overloaded, consecutive_529_errors,
+                    persistent_attempt, last_error)
             # In persistent mode, use separate attempt counter and higher backoff
             delay_seconds = get_retry_delay(
                 persistent_attempt,
@@ -1794,7 +1884,8 @@ async def run_agent_streaming_with_retry(
                 delay_ms = PERSISTENT_RESET_CAP_MS
                 delay_seconds = delay_ms / 1000.0
 
-            print(f"  [PersistentRetry] Streaming attempt {persistent_attempt} failed "
+            print(f"  [PersistentRetry] Streaming attempt {persistent_attempt}/"
+                  f"{persistent_ceiling} failed "
                   f"({time.time() - attempt_start:.1f}s). "
                   f"Retrying in {delay_seconds:.1f}s... "
                   f"(error: {last_error[:80]})")
@@ -1808,13 +1899,10 @@ async def run_agent_streaming_with_retry(
                 if remaining_ms > 0:
                     print(f"  [Heartbeat] Still retrying... "
                           f"{remaining_ms / 1000.0:.0f}s remaining")
-
-            # Clamp attempt counter so we never exit the loop in persistent mode
-            if attempt >= max_retries:
-                attempt = max_retries
             continue
 
-        # Last attempt exhausted (non-persistent mode)
+        # Last attempt exhausted
+        attempt += 1
         if attempt >= max_retries:
             if overloaded:
                 return _fail_overloaded(
@@ -1832,9 +1920,6 @@ async def run_agent_streaming_with_retry(
               f"(error: {last_error[:80]})")
 
         await asyncio.sleep(delay_seconds)
-
-    # Should never reach here, but fallback return
-    return result
 
 
 async def run_agent_streaming(
@@ -1965,11 +2050,11 @@ async def dispatch_agent(
                     project_dir=project_dir,
                     role=role,
                     repo_files=repo_files,
-                    mcp_config=mcp_config or "",
+                    mcp_config=str(MCP_CONFIG),
                     # Same model the role resolved to — never a cheaper one.
                     model=_cmd_model(cmd) or get_configured_model(dispatch_config),
                 )
-                return {
+                rlm_result = {
                     "success": decompose_result.success,
                     "result_text": decompose_result.output,
                     "num_turns": decompose_result.sub_queries_run,
@@ -1979,6 +2064,12 @@ async def dispatch_agent(
                     "rlm_decompose": True,
                     "files_examined": decompose_result.files_examined,
                 }
+                # Same loud outcome as the retry wrappers, so the tester and
+                # review call sites refuse it via is_overloaded_result (#2994).
+                if decompose_result.overloaded:
+                    rlm_result["success"] = False
+                    rlm_result["outcome"] = OVERLOADED_OUTCOME
+                return rlm_result
 
     # Default: Claude via run_agent_streaming (with retry wrapper)
     from equipa.role_resolver import is_role_early_term_exempt

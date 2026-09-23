@@ -23,11 +23,14 @@ Copyright 2026, Forgeborn
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -225,65 +228,173 @@ def call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         return ""
 
 
-# Anthropic model for tiers 2 and 3. Opus only — no sonnet/haiku tier (#2992).
-ANTHROPIC_OPUS_MODEL = "claude-opus-4-20250514"
+# --- Anthropic (tiers 2 and 3) ---
+#
+# Tiers 2/3 run on the CONFIGURED dispatch model (dispatch_config.json
+# "model"), never a pinned literal (task #2994 S4). The request goes through
+# urllib with the API key in a header object, so the key never appears on any
+# command line (/proc/<pid>/cmdline) or inside a shell string (task #2994 S5).
+
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+ANTHROPIC_MAX_TOKENS = 16000
+ANTHROPIC_TIMEOUT_SECONDS = 600
+
+# Claude Code context-window suffix such as "[1m]". The Messages API does not
+# accept it; current-generation models serve their full context by default.
+_CLAUDE_CODE_SUFFIX = re.compile(r"\[[A-Za-z0-9]+\]$")
 
 
-def call_anthropic(prompt: str, model: str = ANTHROPIC_OPUS_MODEL) -> str:
-    """Call Anthropic API for tier 2/3."""
-    # Read API key from environment (preferred) or legacy key file
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+def configured_anthropic_model() -> str:
+    """Return the configured dispatch model as a Messages API model id.
 
-    if not api_key:
-        # Fallback: check legacy key file path from env or skip
-        key_file_path = os.environ.get("API_KEYS_FILE")
-        if key_file_path:
-            key_file = Path(key_file_path)
-            if key_file.exists():
-                for line in key_file.read_text().splitlines():
-                    if "anthropic" in line.lower() and "=" in line:
-                        api_key = line.split("=", 1)[1].strip()
-                        break
+    Imports equipa from the repo root derived from this file (never the CWD).
+    Raises RuntimeError rather than falling back to a pinned model: a silent
+    fallback is exactly the non-configured-model run this task removes.
+    """
+    try:
+        from equipa.config import get_configured_model
+    except ImportError:
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        try:
+            from equipa.config import get_configured_model
+        except ImportError as err:
+            raise RuntimeError(
+                "cannot import equipa.config to resolve the configured model; "
+                "refusing to guess a model id"
+            ) from err
+    return to_api_model_id(get_configured_model())
 
+
+def to_api_model_id(model: str) -> str:
+    """Convert a Claude Code model id to a Messages API model id.
+
+    Strips a trailing "[1m]"-style suffix. Bare CLI aliases ("opus") are not
+    API ids and are refused loudly instead of being sent.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model id must be a non-empty string")
+    api_id = _CLAUDE_CODE_SUFFIX.sub("", model.strip())
+    if not api_id.startswith("claude-"):
+        raise ValueError(
+            f"configured model {model!r} is a Claude Code alias, not a "
+            f"Messages API model id; set a full 'claude-...' id in "
+            f"dispatch_config.json"
+        )
+    return api_id
+
+
+def read_anthropic_api_key() -> str | None:
+    """Return the API key from $ANTHROPIC_API_KEY or the legacy key file."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    key_file_path = os.environ.get("API_KEYS_FILE")
+    if not key_file_path:
+        return None
+    key_file = Path(key_file_path)
+    if not key_file.is_file():
+        return None
+    for line in key_file.read_text().splitlines():
+        if "anthropic" in line.lower() and "=" in line:
+            return line.split("=", 1)[1].strip() or None
+    return None
+
+
+def build_anthropic_request(
+    prompt: str, model: str, api_key: str,
+) -> urllib.request.Request:
+    """Build the Messages API request. The key lives only in the headers.
+
+    No ``temperature``: sampling parameters are rejected on current Opus
+    models, and thinking (always on) shares the ``max_tokens`` budget.
+    """
+    payload = {
+        "model": model,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    return urllib.request.Request(
+        ANTHROPIC_MESSAGES_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+
+
+def extract_response_text(data: dict) -> str:
+    """Return the text of a Messages API response, or "" (with a log).
+
+    Iterates content blocks by type: the first block may be a thinking
+    block, so indexing content[0] would silently return nothing.
+    """
+    if data.get("stop_reason") == "refusal":
+        print(f"  ERROR: Anthropic refused the request: "
+              f"{data.get('stop_details')}")
+        return ""
+    if data.get("stop_reason") == "max_tokens":
+        # Thinking shares the max_tokens budget. A cut-off response is a
+        # truncated prompt; optimize_agent would write it to disk as the new
+        # role prompt, so fail loudly instead of returning the partial text.
+        print(f"  ERROR: Anthropic response truncated at max_tokens="
+              f"{ANTHROPIC_MAX_TOKENS}; discarding the partial prompt")
+        return ""
+    if "error" in data:
+        print(f"  ERROR: {data['error']}")
+        return ""
+    texts = [
+        block.get("text", "")
+        for block in data.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    return "".join(texts)
+
+
+def call_anthropic(prompt: str, model: str | None = None) -> str:
+    """Call the Anthropic Messages API for tier 2/3 on the configured model."""
+    try:
+        api_model = to_api_model_id(model) if model else configured_anthropic_model()
+    except (RuntimeError, ValueError) as err:
+        print(f"  ERROR: {err}")
+        return ""
+
+    api_key = read_anthropic_api_key()
     if not api_key:
         print("  ERROR: No Anthropic API key found")
         return ""
 
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": 8192,
-        "temperature": 0.7,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-
-    cmd = [
-        "wsl", "-e", "bash", "-c",
-        f"""curl -s https://api.anthropic.com/v1/messages \
-            -H 'x-api-key: {api_key}' \
-            -H 'anthropic-version: 2023-06-01' \
-            -H 'content-type: application/json' \
-            -d @- <<'PAYLOAD'
-{payload}
-PAYLOAD"""
-    ]
-
-    print(f"  Calling Anthropic ({model})...", flush=True)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-
-    if result.returncode != 0:
-        print(f"  ERROR: Anthropic call failed: {result.stderr[:200]}")
-        return ""
-
+    request = build_anthropic_request(prompt, api_model, api_key)
+    print(f"  Calling Anthropic ({api_model})...", flush=True)
     try:
-        data = json.loads(result.stdout)
-        if "content" in data and data["content"]:
-            return data["content"][0].get("text", "")
-        if "error" in data:
-            print(f"  ERROR: {data['error']}")
+        with urllib.request.urlopen(
+            request, timeout=ANTHROPIC_TIMEOUT_SECONDS,
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")[:300]
+        print(f"  ERROR: Anthropic API returned HTTP {err.code}: {body}")
+        return ""
+    except urllib.error.URLError as err:
+        print(f"  ERROR: Anthropic API unreachable: {err.reason}")
+        return ""
+    except TimeoutError:
+        print(f"  ERROR: Anthropic API timed out after "
+              f"{ANTHROPIC_TIMEOUT_SECONDS}s")
         return ""
     except json.JSONDecodeError:
-        print(f"  ERROR: Could not parse response")
+        print("  ERROR: Could not parse Anthropic response")
         return ""
+
+    if not isinstance(data, dict):
+        print("  ERROR: Unexpected Anthropic response shape")
+        return ""
+    return extract_response_text(data)
 
 
 def backup_prompt(role: str) -> Path:
@@ -327,7 +438,7 @@ def optimize_agent(role: str, tier: int = 1, dry_run: bool = False) -> bool:
     if tier == 1:
         new_prompt = call_ollama(meta_prompt)
     elif tier in (2, 3):
-        new_prompt = call_anthropic(meta_prompt, ANTHROPIC_OPUS_MODEL)
+        new_prompt = call_anthropic(meta_prompt)
     else:
         print(f"  ERROR: Unknown tier {tier}")
         return False

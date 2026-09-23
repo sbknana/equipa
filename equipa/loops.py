@@ -23,6 +23,7 @@ from equipa.agent_runner import (
     AgentResult,
     build_cli_command,
     dispatch_agent,
+    is_overloaded_result,
     run_agent,
 )
 from equipa.checkpoints import (
@@ -356,6 +357,12 @@ async def run_security_review(
             count = _create_security_lessons(findings, project_id)
             if count > 0:
                 log(f"  Created {count} developer lesson(s) from security findings", output)
+    elif is_overloaded_result(sec_result):
+        # No review happened. The caller's merge gate must treat this as a
+        # loud failure, never as "no findings" (task #2994 S1).
+        log(f"  Security review agent FAILED: model overloaded (529) through "
+            f"every retry. Not downgrading the model; the merge gate will "
+            f"block this task.", output)
     else:
         log(f"  Security review agent failed.", output)
         for err in sec_result.get("errors", []):
@@ -772,6 +779,11 @@ async def run_code_review(
             count = _create_review_lessons(findings, project_id, source="code-reviewer")
             if count > 0:
                 log(f"  Created {count} developer lesson(s) from code review findings", output)
+    elif is_overloaded_result(cr_result):
+        # No review happened — never report this as "no findings" (#2994 S1).
+        log(f"  Code review agent FAILED: model overloaded (529) through "
+            f"every retry. Not downgrading the model; no review was done.",
+            output)
     else:
         log(f"  Code review agent failed.", output)
         for err in cr_result.get("errors", []):
@@ -1816,7 +1828,8 @@ async def run_dev_test_loop(
                 "early_term_reason": f"build_broken ({autofix_summary})",
                 "cost": state.total_cost,
                 "duration": 0,
-            }, 0, "build_broken"
+            }, 0, (OVERLOADED_OUTCOME if autofix_summary == OVERLOADED_OUTCOME
+                   else "build_broken")
 
     tester_result: dict[str, Any] = {}
     dev_result: dict[str, Any] = {}
@@ -2193,6 +2206,17 @@ async def run_dev_test_loop(
             state.total_duration += tester_result.get("duration", 0)
             state.total_cost += _accumulate_cost(
                 tester_result, f"[Cycle {cycle}] Tester", output)
+
+            # Sustained 529/overloaded exhausted every retry on the configured
+            # model. The tester produced no output, so parsing it would yield
+            # unknown/0 tests and be promoted to "no_tests" (a success) — the
+            # dev work would ship UNTESTED. Fail loudly instead (task #2994).
+            if tester_result.get("outcome") == OVERLOADED_OUTCOME:
+                log(f"  [Cycle {cycle}] Tester agent FAILED: model overloaded "
+                    f"(529) through every retry. Not downgrading the model and "
+                    f"NOT accepting the developer work as untested.", output)
+                _apply_cost_totals(tester_result, state.total_cost, state.total_duration)
+                return tester_result, cycle, OVERLOADED_OUTCOME
 
             # --- Lifecycle hooks: post_agent_finish (tester) ---
             await fire_hook(

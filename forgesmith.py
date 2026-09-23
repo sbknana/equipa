@@ -29,9 +29,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from equipa.config import (
+    APPROVED_MODEL_UPGRADES_KEY,
     get_configured_model,
-    is_downgrade_model,
     is_feature_enabled,
+    is_model_allowed,
+    load_dispatch_config,
     resolve_claude_model,
 )
 from forgesmith_gepa import run_gepa
@@ -558,20 +560,34 @@ def analyze_model_downgrade(runs, cfg):
     return []
 
 
-def _refuse_dispatch_config_write(key, new_val):
+def _refuse_dispatch_config_write(key, new_val, dispatch_config=None):
     """Return a refusal reason if ForgeSmith must not write ``key = new_val``.
 
     ForgeSmith may tune numeric knobs in dispatch_config.json, but it must
-    never (task #2992):
-      * write a sonnet/haiku-family value into any ``model*`` key, or
+    never:
+      * write any value into a ``model*`` key other than the configured model
+        or an operator-approved upgrade — an allowlist, so older pinned
+        generations and bare aliases are refused as well as sonnet/haiku
+        (tasks #2992, #2994 S3),
+      * edit ``approved_model_upgrades`` — ForgeSmith must not widen the
+        operator's allowlist for itself, or
       * touch ``features`` — that is how a flag such as auto_model_routing
         could be silently flipped back on.
+
+    ``dispatch_config`` is the config being edited; it defaults to the
+    on-disk DISPATCH_CONFIG so "configured model" means that file's model.
     Returns None when the write is allowed.
     """
     if key == "features":
         return "ForgeSmith never edits feature flags"
-    if str(key).startswith("model") and is_downgrade_model(new_val):
-        return f"model downgrade to {new_val!r} is forbidden"
+    if key == APPROVED_MODEL_UPGRADES_KEY:
+        return "ForgeSmith never edits the operator's model-upgrade allowlist"
+    if str(key).startswith("model"):
+        config = (dispatch_config if dispatch_config is not None
+                  else load_dispatch_config(DISPATCH_CONFIG))
+        if not is_model_allowed(new_val, config):
+            return (f"model {new_val!r} is not the configured model "
+                    f"{get_configured_model(config)!r} or an approved upgrade")
     return None
 
 

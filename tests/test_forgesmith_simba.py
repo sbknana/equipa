@@ -490,24 +490,34 @@ def test_call_claude_for_rules_markdown_fences():
 
 
 def test_call_claude_for_rules_model_config():
-    """Test that model and timeout are read from config."""
+    """Model and timeout are read from config; the model passes the allowlist.
+
+    Task #2994 S3: simba.model is honoured only when it IS the configured
+    dispatch model (or an approved upgrade). A bare alias such as "opus" —
+    which the CLI may map to a different Opus — resolves to the configured
+    model instead.
+    """
+    from equipa.config import get_configured_model
+
+    configured = get_configured_model()
     mock_result = MagicMock()
     mock_result.returncode = 0
     mock_result.stdout = json.dumps({"result": "[]"})
     mock_result.stderr = ""
 
-    cfg = {"simba": {"model": "opus", "timeout_seconds": 60}}
-
-    with patch("forgesmith_simba.subprocess.run", return_value=mock_result) as mock_run:
-        call_claude_for_rules("test prompt", cfg)
-        # Verify the model flag was passed
-        call_args = mock_run.call_args
-        cmd = call_args[0][0]
-        assert "--model" in cmd
-        model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "opus"
-        # Verify timeout was passed
-        assert call_args[1]["timeout"] == 60
+    for requested in (configured, "opus"):
+        cfg = {"simba": {"model": requested, "timeout_seconds": 60}}
+        with patch("forgesmith_simba.subprocess.run",
+                   return_value=mock_result) as mock_run:
+            call_claude_for_rules("test prompt", cfg)
+            # Verify the model flag was passed
+            call_args = mock_run.call_args
+            cmd = call_args[0][0]
+            assert "--model" in cmd
+            model_idx = cmd.index("--model")
+            assert cmd[model_idx + 1] == configured, requested
+            # Verify timeout was passed
+            assert call_args[1]["timeout"] == 60
 
 
 # --- Test: store_rules ---
