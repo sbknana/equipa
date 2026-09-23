@@ -80,6 +80,27 @@ class GateDecision:
     changed_files: list[str] = field(default_factory=list)
 
 
+def role_overlay_changes(changed_files: list[str]) -> list[str]:
+    """Return the changed paths that touch a project role overlay.
+
+    Matches any path with a ``.equipa/roles`` component pair (at any depth, so
+    a monorepo sub-project is covered) and a bare ``.equipa`` or
+    ``.equipa/roles`` entry, which is how a symlink swapping out the overlay
+    directory shows up in ``git diff --name-only``.
+    """
+    touched: list[str] = []
+    for raw_path in changed_files:
+        parts = [p for p in raw_path.replace("\\", "/").split("/") if p not in ("", ".")]
+        for index, part in enumerate(parts):
+            if part != ".equipa":
+                continue
+            is_last = index == len(parts) - 1
+            if is_last or parts[index + 1] == "roles":
+                touched.append(raw_path)
+                break
+    return touched
+
+
 def decide_merge_gate(
     changed_files: list[str],
     *,
@@ -140,7 +161,22 @@ def decide_merge_gate(
     the decision logic remains unit-testable in isolation. It must have the
     signature ``(project_dir, task_id, *, block_on_missing) ->
     tuple[bool, dict | None]`` — i.e. ``dispatch._security_review_blocks_merge``.
+
+    ROLE OVERLAYS (SR-2994 S1): a diff that touches a project role overlay
+    (``.equipa/roles/``) ALWAYS blocks, checked before every other rule —
+    ``.md`` overlays would otherwise pass as doc-only, and an overlay is an
+    agent instruction set that only the operator may approve.
     """
+    overlay_files = role_overlay_changes(changed_files)
+    if overlay_files:
+        return GateDecision(
+            blocks_merge=True,
+            doc_only=False,
+            expect_artifact=True,
+            counts=None,
+            reason="role-overlay-changed",
+            changed_files=list(changed_files),
+        )
     if not security_review_enabled:
         return GateDecision(
             blocks_merge=False,
