@@ -35,17 +35,24 @@ from pathlib import Path
 # comes from dispatch_config.json (task #2992) and changes with each upgrade.
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9]+\])?$")
 
-# SIMBA runs on the configured dispatch model; sonnet/haiku are refused
-# (owner directive 2026-09-22, task #2992).
+# SIMBA runs on the configured dispatch model; only that model or an
+# operator-approved upgrade is ever honoured (tasks #2992, #2994 S3). A
+# standalone run imports equipa from the repo root derived from this file —
+# never the CWD. If that still fails there is no configured model to resolve
+# against, so SIMBA refuses to call Claude rather than guess (the old fallback
+# honoured any non-sonnet/haiku string and defaulted to the bare "opus" alias).
 try:
     from equipa.config import resolve_claude_model
-except ImportError:  # standalone run without the equipa package importable
-    def resolve_claude_model(requested=None, dispatch_config=None):
-        """Standalone fallback: honour a non-downgrade request, else opus."""
-        name = (requested or "").strip()
-        if not name or "sonnet" in name.lower() or "haiku" in name.lower():
-            return "opus"
-        return name
+except ImportError:
+    _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    try:
+        from equipa.config import resolve_claude_model
+    except ImportError:
+        def resolve_claude_model(requested=None, dispatch_config=None):
+            """Standalone fallback: no configured model is knowable; refuse."""
+            return None
 
 # --- Paths ---
 
@@ -349,7 +356,8 @@ def call_claude_for_rules(prompt, cfg=None):
     Uses the same subprocess pattern as OPRO's call_claude_for_proposals.
     """
     simba_cfg = (cfg or {}).get("simba", {})
-    # Configured dispatch model unless simba.model names a non-downgrade model.
+    # Configured dispatch model; simba.model is honoured only if it IS the
+    # configured model or an approved upgrade (allowlist, task #2994 S3).
     model = resolve_claude_model(simba_cfg.get("model"))
     timeout = simba_cfg.get("timeout_seconds", 120)
 

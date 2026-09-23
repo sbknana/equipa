@@ -338,6 +338,13 @@ def extract_response_text(data: dict) -> str:
         print(f"  ERROR: Anthropic refused the request: "
               f"{data.get('stop_details')}")
         return ""
+    if data.get("stop_reason") == "max_tokens":
+        # Thinking shares the max_tokens budget. A cut-off response is a
+        # truncated prompt; optimize_agent would write it to disk as the new
+        # role prompt, so fail loudly instead of returning the partial text.
+        print(f"  ERROR: Anthropic response truncated at max_tokens="
+              f"{ANTHROPIC_MAX_TOKENS}; discarding the partial prompt")
+        return ""
     if "error" in data:
         print(f"  ERROR: {data['error']}")
         return ""
