@@ -29,13 +29,23 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# H1 fix: Whitelist valid model identifiers to prevent command injection via --model
-ALLOWED_MODELS = frozenset({
-    "sonnet", "opus", "haiku",
-    "claude-sonnet-4-20250514", "claude-opus-4-20250514",
-    "claude-haiku-4-5-20251001",
-    "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
-})
+# H1 fix: validate the --model value so it can only ever be a plain model id
+# (alias or full id with an optional "[1m]"-style suffix) — never a flag or
+# shell metacharacter. A fixed allowlist is not used because the model now
+# comes from dispatch_config.json (task #2992) and changes with each upgrade.
+_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9]+\])?$")
+
+# SIMBA runs on the configured dispatch model; sonnet/haiku are refused
+# (owner directive 2026-09-22, task #2992).
+try:
+    from equipa.config import resolve_claude_model
+except ImportError:  # standalone run without the equipa package importable
+    def resolve_claude_model(requested=None, dispatch_config=None):
+        """Standalone fallback: honour a non-downgrade request, else opus."""
+        name = (requested or "").strip()
+        if not name or "sonnet" in name.lower() or "haiku" in name.lower():
+            return "opus"
+        return name
 
 # --- Paths ---
 
@@ -339,13 +349,14 @@ def call_claude_for_rules(prompt, cfg=None):
     Uses the same subprocess pattern as OPRO's call_claude_for_proposals.
     """
     simba_cfg = (cfg or {}).get("simba", {})
-    model = simba_cfg.get("model", "sonnet")
+    # Configured dispatch model unless simba.model names a non-downgrade model.
+    model = resolve_claude_model(simba_cfg.get("model"))
     timeout = simba_cfg.get("timeout_seconds", 120)
 
-    # H1 fix: Validate model against whitelist to prevent command injection
-    if model not in ALLOWED_MODELS:
-        log(f"ERROR: Model '{model}' not in ALLOWED_MODELS. "
-            f"Valid models: {sorted(ALLOWED_MODELS)}")
+    # H1 fix: reject anything that is not a plain model id (command injection)
+    if not isinstance(model, str) or not _MODEL_ID_PATTERN.match(model):
+        log(f"ERROR: Model {model!r} is not a valid model id. Refusing to "
+            f"call Claude.")
         return None
 
     cmd = [
