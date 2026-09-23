@@ -231,8 +231,12 @@ class TestResolveClaudeModel:
     def test_downgrade_or_missing_resolves_to_configured(self, configured_dispatch, requested):
         assert resolve_claude_model(requested) == CONFIGURED_MODEL
 
-    def test_non_downgrade_request_is_honoured(self, configured_dispatch):
-        assert resolve_claude_model("opus") == "opus"
+    def test_only_configured_request_is_honoured(self, configured_dispatch):
+        # Task #2994 S3 inverted the denylist to an allowlist: the configured
+        # model is honoured, but a bare "opus" alias (which the CLI may map to
+        # a different Opus) now resolves to the configured model too.
+        assert resolve_claude_model(CONFIGURED_MODEL) == CONFIGURED_MODEL
+        assert resolve_claude_model("opus") == CONFIGURED_MODEL
 
     def test_code_defaults_are_never_downgrades(self):
         assert not is_downgrade_model(DEFAULT_MODEL)
