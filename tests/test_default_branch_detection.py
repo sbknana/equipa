@@ -263,7 +263,8 @@ class TestNoHardcodedMasterInProduction:
     # their expected COUNT of code-line ``"master"`` occurrences. Bumping
     # a count is a deliberate decision that requires editing this map.
     EXPECTED_MASTER_COUNT: dict[str, int] = {
-        "equipa/git_ops.py": 4,
+        # +1: TRUSTED_DEFAULT_BRANCH_CANDIDATES (SR-2997 S1 trusted resolver).
+        "equipa/git_ops.py": 5,
         "equipa/single_agent_guard.py": 1,
         "equipa/monitoring.py": 1,
         "equipa/dispatch.py": 1,  # one legit "master" fallback remains (default-branch detection)

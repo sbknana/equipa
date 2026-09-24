@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **32,113 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **52 Python modules** totaling **32,451 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -34,11 +34,11 @@ The `equipa/` package contains **52 Python modules** totaling **32,113 lines** o
 | `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
 | `config.py` | 391 | L1 | `constants.py` | — | 20 |
 | `db.py` | 768 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
-| `git_ops.py` | 870 | L1 | `constants.py` | `tasks.py` | 15 |
+| `git_ops.py` | 1016 | L1 | `constants.py` | `config.py`, `role_resolver.py`, `tasks.py` | 22 |
 | `hooks/__init__.py` | 427 | L1 | `hooks/dispatcher.py` | — | 17 |
 | `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
 | `parsing.py` | 908 | L1 | `constants.py` | `tool_result_storage.py` | 20 |
-| `role_resolver.py` | 565 | L1 | `constants.py` | `config.py`, `git_ops.py` | 20 |
+| `role_resolver.py` | 637 | L1 | `constants.py` | `config.py`, `git_ops.py` | 22 |
 | `routing.py` | 553 | L1 | `constants.py` | — | 29 |
 | `security.py` | 137 | L1 | `constants.py` | — | 4 |
 | `config_versions.py` | 480 | L2 | `constants.py`, `db.py` | — | 8 |
@@ -51,7 +51,7 @@ The `equipa/` package contains **52 Python modules** totaling **32,113 lines** o
 | `monitoring.py` | 922 | L2 | `constants.py`, `hooks/__init__.py` | `parsing.py` | 12 |
 | `rlm_decompose.py` | 739 | L2 | `config.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
 | `roles.py` | 264 | L2 | `config.py`, `constants.py` | `output.py`, `role_resolver.py`, `routing.py`, `tasks.py` | 3 |
-| `security_gate.py` | 411 | L2 | `git_ops.py` | `db.py` | 8 |
+| `security_gate.py` | 480 | L2 | `git_ops.py` | `db.py` | 10 |
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
@@ -62,12 +62,12 @@ The `equipa/` package contains **52 Python modules** totaling **32,113 lines** o
 | `preflight.py` | 343 | L5 | `agent_runner.py`, `constants.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 2302 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 11 |
 | `manager.py` | 328 | L7 | `agent_runner.py`, `constants.py`, `db.py`, `loops.py`, `output.py`, `prompts.py`, `roles.py`, `tasks.py` | — | 5 |
-| `dispatch.py` | 2577 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 15 |
+| `dispatch.py` | 2628 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 15 |
 | `cli.py` | 2102 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
 | `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 32,113 lines | 596 public exports
+**Total:** 32,451 lines | 607 public exports
 
 ## Modules by Layer
 
@@ -97,7 +97,7 @@ Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf m
 | `dispatch.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` |
 | `embeddings.py` | `db.py`, `graph.py` |
 | `flows.py` | `sessions.py` |
-| `git_ops.py` | `tasks.py` |
+| `git_ops.py` | `config.py`, `role_resolver.py`, `tasks.py` |
 | `heartbeat.py` | `config.py`, `config_versions.py`, `db.py`, `sessions.py` |
 | `hooks/vacuous_pass.py` | `monitoring.py` |
 | `initiative.py` | `security.py` |
@@ -143,7 +143,7 @@ How many other `equipa` modules each module imports.
 | `embeddings.py` | 2 | 2 | **4** |
 | `env_loader.py` | 0 | 0 | **0** |
 | `flows.py` | 2 | 1 | **3** |
-| `git_ops.py` | 1 | 1 | **2** |
+| `git_ops.py` | 1 | 3 | **4** |
 | `graph.py` | 1 | 0 | **1** |
 | `heartbeat.py` | 0 | 4 | **4** |
 | `hooks/__init__.py` | 1 | 0 | **1** |

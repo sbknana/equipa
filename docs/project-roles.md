@@ -8,10 +8,11 @@ two projects' same-named roles fully isolated.
 
 For a role named `<role>` dispatched against a project, resolution is:
 
-1. `<project_dir>/.equipa/roles/<role>.md` — the project's private overlay (**wins**)
-2. `<equipa>/prompts/<role>.md` — the shared base role (fallback)
+1. `<equipa>/prompts/<role>.md` — the shared base role. It always wins; base names are reserved.
+2. `<project_dir>/.equipa/roles/<role>.md` — the project's private overlay, for NEW role names only.
+   It is read from the default branch as committed (see [Trust boundary](#trust-boundary-sr-2994-sr-2997)).
 
-A project overlay **shadows** a base role of the same name, but only for that project.
+A project overlay can add a role for that project. It can never shadow a base role.
 
 ## Isolation guarantee
 
@@ -61,6 +62,36 @@ For `early_term_exempt`, a role file's frontmatter value (when set) wins over th
 
 No base-code changes, no merge conflicts on Equipa updates. See
 [`examples/roles/`](../examples/roles/) for ready-to-copy starting points.
+
+## Trust boundary (SR-2994, SR-2997)
+
+Overlays are agent instructions in a repo that agents can write, so they are constrained:
+
+- **Add-only.** An overlay may never shadow a base role name (anything in `prompts/`,
+  `ROLE_PROMPTS`, or the reserved gate roles). It can only add new role names; a same-named
+  overlay is ignored.
+- **Committed on the operator's default branch only.** Overlays are read with git from the
+  project root at the SHA the default branch had before the dispatch. Worktrees, uncommitted
+  files, and agent task branches are never read. "Default branch" is decided from operator-controlled
+  sources only, never from `refs/remotes/origin/HEAD` or the checked-out `HEAD`, because any agent
+  worktree can repoint those:
+  1. `project_default_branches` in `dispatch_config.json`, e.g.
+     `{"project_default_branches": {"/srv/forge-share/AI_Stuff/HomeNetwork": "main"}}`. The value
+     must be a plain branch name that exists as `refs/heads/<name>`. `forge-task-*` is rejected.
+  2. Otherwise, exactly one of `main` / `master` must exist. If both exist, or neither does, the
+     choice is ambiguous and it **fails closed**. Configure the project explicitly.
+  The same trusted branch is the merge target and the security gate's diff base.
+- **Fail closed.** If there is no trusted branch, a git error in the project (a corrupt
+  `.git/HEAD`, a broken worktree `.git` file), or a new pin that switches branch or does not
+  descend from the previous pin, every project overlay is disabled. A refused pin is logged as
+  `[GATE-AUDIT] event=overlay-pin-refused`. Only a project with no `.git` anywhere above it
+  reads `.equipa/roles/` from disk.
+- **Capped.** Overlay `turns`/`effort` are capped by `project_role_max_turns` /
+  `project_role_max_effort`. `early_term_exempt` is honoured only for roles listed in
+  `early_term_exempt_project_roles`. Overlay `skills` is ignored.
+- **Operator-merged.** A diff touching `.equipa/roles/` or any `.claude/` directory always blocks
+  the automatic merge. `CLAUDE.md`, `AGENTS.md`, `.claude/**` and `.equipa/**` are never
+  treated as doc-only, so they always get a security review.
 
 ## Dispatching by stored role (`tasks.role`)
 

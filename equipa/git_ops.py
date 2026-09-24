@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -236,7 +237,9 @@ def merge_task_branch(
         )
 
     if target_ref is None:
-        target_ref = get_default_branch(repo_path)
+        # SR-2997 S1: never merge into whatever origin/HEAD names (agent-
+        # writable); raises UntrustedDefaultBranchError (a RuntimeError).
+        target_ref = get_trusted_default_branch(repo_path)
 
     checkout = git_run(["checkout", "-q", target_ref], repo_path, timeout=30)
     if checkout.returncode != 0:
@@ -536,6 +539,10 @@ def get_default_branch(repo_path: str | Path, *, strict: bool = False) -> str:
       4. If ``strict=True``, raise :class:`DefaultBranchDetectionError`.
          Otherwise (default) emit a WARNING and fall back to ``"master"``.
 
+    NOT a trust decision: steps 1 and 3 read refs any agent worktree can
+    rewrite. Anything that picks a trusted commit (overlay pin, merge target,
+    gate diff base) must use :func:`get_trusted_default_branch` (SR-2997 S1).
+
     Results are cached per-process for 5 minutes keyed by the resolved
     absolute path of ``repo_path``. The TTL bounds the window where a
     branch rename remains undetected in a long-lived orchestrator
@@ -620,6 +627,145 @@ def _clear_default_branch_cache() -> None:
     SECURITY-REVIEW-2479).
     """
     _DEFAULT_BRANCH_CACHE.clear()
+
+
+# --- Trusted default branch (SR-2997 S1) -------------------------------------
+#
+# ``get_default_branch`` above is a best-effort DETECTOR: it trusts
+# ``refs/remotes/origin/HEAD`` first and the checked-out HEAD last. Both live in
+# the git dir that every agent worktree shares and can write, so an agent can
+# point them at its own ``forge-task-*`` branch. Anything that decides WHICH
+# commit is trusted — the role-overlay pin, the merge target, the security
+# gate's diff base — must use ``get_trusted_default_branch`` instead.
+
+TRUSTED_DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
+AGENT_BRANCH_PREFIXES: tuple[str, ...] = ("forge-task-",)
+PROJECT_DEFAULT_BRANCHES_CONFIG_KEY = "project_default_branches"
+_SAFE_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+class UntrustedDefaultBranchError(DefaultBranchDetectionError):
+    """No operator-trusted default branch could be resolved.
+
+    Callers on a trust path must fail closed: no role overlays, no merge.
+    """
+
+
+def is_agent_branch_name(name: str) -> bool:
+    """True if ``name`` is a per-task agent branch (never a default branch)."""
+    return name.lower().startswith(AGENT_BRANCH_PREFIXES)
+
+
+def _is_safe_branch_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(_SAFE_BRANCH_NAME_RE.fullmatch(name))
+        and ".." not in name
+        and "//" not in name
+        and not name.endswith((".lock", "/", "."))
+    )
+
+
+def configured_default_branch(repo_path: str | Path) -> str | None:
+    """Operator-named default branch of the project containing ``repo_path``.
+
+    Read from the dispatch config key ``project_default_branches``: a mapping
+    of project root path to branch name, e.g.
+    ``{"/srv/forge-share/AI_Stuff/Equipa-repo": "main"}``. A path inside an
+    agent worktree maps to its project root first. Returns None when the
+    project has no entry.
+
+    Raises:
+        UntrustedDefaultBranchError: the entry exists but is not a string.
+    """
+    from equipa.config import get_active_dispatch_config
+    from equipa.role_resolver import stable_project_root
+
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("could not load dispatch config for %s: %s",
+                       PROJECT_DEFAULT_BRANCHES_CONFIG_KEY, exc)
+        return None
+    mapping = config.get(PROJECT_DEFAULT_BRANCHES_CONFIG_KEY) if isinstance(config, dict) else None
+    if not isinstance(mapping, dict):
+        return None
+    root = stable_project_root(repo_path)
+    for raw_path, branch in mapping.items():
+        try:
+            matches = Path(str(raw_path)).expanduser().resolve() == root
+        except (OSError, RuntimeError):
+            continue
+        if not matches:
+            continue
+        if not isinstance(branch, str):
+            raise UntrustedDefaultBranchError(
+                f"{PROJECT_DEFAULT_BRANCHES_CONFIG_KEY}[{raw_path!r}] must be a "
+                f"branch name, got {branch!r}"
+            )
+        return branch.strip()
+    return None
+
+
+def _trusted_branch_exists(repo_path: str | Path, branch: str) -> bool:
+    """True if ``refs/heads/<branch>`` names a commit; raises if git cannot run.
+
+    A git failure must not read as "branch absent": that could turn an
+    ambiguous main+master repo into a single-candidate one.
+    """
+    try:
+        result = git_run(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"],
+            repo_path, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise UntrustedDefaultBranchError(
+            f"could not check refs/heads/{branch} in {repo_path!s}: {exc}"
+        ) from exc
+    return result.returncode == 0
+
+
+def get_trusted_default_branch(repo_path: str | Path) -> str:
+    """Default branch of ``repo_path`` from operator-controlled sources only.
+
+    Never reads ``refs/remotes/origin/HEAD`` or the checked-out HEAD, and is
+    never cached, so a symbolic ref repointed from an agent worktree has no
+    effect. Resolution:
+
+      1. The operator-named branch in ``project_default_branches``. It must be
+         a plain branch name, must not be a ``forge-task-*`` agent branch, and
+         must exist as ``refs/heads/<name>``.
+      2. Otherwise exactly one of ``main`` / ``master`` must exist locally.
+         Both existing is ambiguous (an agent can create either), so it fails
+         closed rather than guessing.
+
+    Raises:
+        UntrustedDefaultBranchError: nothing trusted resolved; fail closed.
+    """
+    configured = configured_default_branch(repo_path)
+    if configured is not None:
+        if not _is_safe_branch_name(configured) or is_agent_branch_name(configured):
+            raise UntrustedDefaultBranchError(
+                f"configured default branch {configured!r} for {repo_path!s} is "
+                f"not an operator branch name"
+            )
+        if not _trusted_branch_exists(repo_path, configured):
+            raise UntrustedDefaultBranchError(
+                f"configured default branch {configured!r} does not exist in "
+                f"{repo_path!s}"
+            )
+        return configured
+    existing = [
+        candidate for candidate in TRUSTED_DEFAULT_BRANCH_CANDIDATES
+        if _trusted_branch_exists(repo_path, candidate)
+    ]
+    if len(existing) == 1:
+        return existing[0]
+    found = " and ".join(existing) if existing else "neither main nor master"
+    raise UntrustedDefaultBranchError(
+        f"no trusted default branch for {repo_path!s} ({found} exist); set "
+        f"{PROJECT_DEFAULT_BRANCHES_CONFIG_KEY} in the dispatch config"
+    )
 
 
 def _git_commit(
