@@ -8,6 +8,8 @@
     "only_projects": [],
     "security_review": true,
     "security_review_timeout": 900,
+    "security_review_timeout_max": 5400,
+    "security_review_max_attempts": 2,
     "model_developer": "claude-opus-5-5[1m]",
     "model_tester": "claude-opus-5-5[1m]",
     "model_planner": "opus",
