@@ -90,6 +90,9 @@ from equipa.security_gate import (
     format_counts,
     get_changed_files_for_branch,
     is_doc_only_diff,
+    record_reviewer_skipped_doc_only,
+    reviewer_run_failure,
+    verify_reviewer_provenance,
 )
 from equipa.single_agent_guard import (
     SingleAgentOutcome,
@@ -1604,6 +1607,21 @@ async def _merge_task_branch(
             event="defensive-invariant-skipped",
         )
     else:
+        provenance = verify_reviewer_provenance(task_id, review_path)
+        if not provenance.trusted:
+            _gate_audit_log(
+                f"task={task_id} event=defensive-invariant-fired "
+                f"reason={provenance.reason} "
+                f"{provenance.fingerprint.describe()}",
+                task_id=task_id,
+                event="defensive-invariant-fired",
+            )
+            raise SecurityGateBypassError(
+                f"Refusing to merge branch {branch_name!r}: "
+                f"SECURITY-REVIEW-{task_id}.md was not written by this "
+                f"cycle's security-reviewer run ({provenance.reason}). The "
+                f"defensive invariant fails closed (task #3041)."
+            )
         counts = _count_findings_in_review_file(review_path, task_id=task_id)
         if counts is None:
             _gate_audit_log(
@@ -1932,15 +1950,35 @@ def _security_review_blocks_merge(
     # Task 2476: read from .equipa-artifacts/ first, then fall back to
     # the legacy repo-root path so in-flight artifacts still parse.
     review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
-    counts = _count_findings_in_review_file(review_path, task_id=task_id)
+    # Task #3041: only an artifact written by THIS cycle's reviewer run is
+    # parsed. A failed/timed-out reviewer, or a file the reviewer did not
+    # write (a developer self-review on the branch, a stale prior review),
+    # blocks REGARDLESS of block_on_missing — that flag is about a missing
+    # review, and an untrusted file is not a review.
+    provenance = verify_reviewer_provenance(task_id, review_path)
+    counts = (
+        _count_findings_in_review_file(review_path, task_id=task_id)
+        if provenance.trusted else None
+    )
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "
         f"artifact_exists={review_path.exists()} "
+        f"{provenance.fingerprint.describe()} "
+        f"provenance={provenance.reason} "
         f"{format_counts(counts)} block_on_missing={block_on_missing}",
         task_id=task_id,
         event="blocks-merge-eval",
         counts=counts,
     )
+    if not provenance.trusted:
+        _gate_audit_log(
+            f"task={task_id} event={provenance.audit_event} "
+            f"reason={provenance.reason} {provenance.fingerprint.describe()} "
+            f"— merge blocked regardless of artifact contents",
+            task_id=task_id,
+            event=provenance.audit_event,
+        )
+        return True, None
     if counts is None:
         if block_on_missing:
             logger.warning(
@@ -2320,6 +2358,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 review_crashed = False
                 sec_result = None
                 if review_skipped_doc_only:
+                    record_reviewer_skipped_doc_only(task["id"])
                     log(
                         f"[Task #{task['id']}] SECURITY GATE: skipping "
                         f"review — doc-only change "
@@ -2423,6 +2462,24 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                         output,
                     )
                     outcome = OVERLOADED_OUTCOME
+                elif (
+                    not review_skipped_doc_only
+                    and reviewer_run_failure(task["id"]) is not None
+                ):
+                    # Task #3041: the reviewer failed or timed out (after its
+                    # retry). Any artifact on disk is NOT this run's review —
+                    # on #3035 it was the developer's self-review — so block
+                    # regardless of what it says.
+                    review_blocks_merge = True
+                    log(
+                        f"[Task #{task['id']}] SECURITY GATE: blocking merge "
+                        f"— security reviewer FAILED "
+                        f"({reviewer_run_failure(task['id'])}); no artifact "
+                        f"on disk is trusted. Branch forge-task-{task['id']} "
+                        f"left unmerged for operator review.",
+                        output,
+                    )
+                    outcome = "security_review_blocked"
                 elif review_blocks_merge:
                     if review_counts is None:
                         log(

@@ -56,7 +56,11 @@ from equipa.dispatch import (
     score_project,
     validate_goals,
 )
-from equipa.security_gate import SecurityGateBypassError
+from equipa.security_gate import (
+    SecurityGateBypassError,
+    record_reviewer_skipped_doc_only,
+    reviewer_run_failure,
+)
 from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
@@ -1564,6 +1568,7 @@ async def _run_security_review_and_gate(
         review_crashed = False
         sec_result = None
         if review_skipped_doc_only:
+            record_reviewer_skipped_doc_only(task["id"])
             print(
                 f"  [Task #{task['id']}] SECURITY GATE: skipping "
                 f"review — doc-only change "
@@ -1626,6 +1631,21 @@ async def _run_security_review_and_gate(
                 f"forge-task-{task['id']} left unmerged."
             )
             outcome = OVERLOADED_OUTCOME
+        elif (
+            not review_skipped_doc_only
+            and reviewer_run_failure(task["id"]) is not None
+        ):
+            # Task #3041: the reviewer failed or timed out (after its retry),
+            # so no artifact on disk is this run's review — block regardless.
+            review_blocks_merge = True
+            print(
+                f"  [Task #{task['id']}] SECURITY GATE: blocking merge — "
+                f"security reviewer FAILED "
+                f"({reviewer_run_failure(task['id'])}); no artifact on disk "
+                f"is trusted. Branch forge-task-{task['id']} left unmerged "
+                f"for operator review."
+            )
+            outcome = "security_review_blocked"
         elif review_blocks_merge:
             if review_counts is None:
                 print(

@@ -249,6 +249,38 @@ def verify_reviewer_provenance(
     return ProvenanceVerdict(True, "verified", fingerprint)
 
 
+def record_reviewer_skipped_doc_only(task_id: int | str) -> None:
+    """Record that the caller skipped the reviewer for a doc-only diff.
+
+    Replaces any earlier run for the task, so if the gate later evaluates a
+    CODE diff for it (the caller's diff and the gate's diff disagree), the
+    artifact is rejected rather than trusted from a previous cycle.
+    """
+    record_reviewer_run(ReviewerRunRecord(
+        task_id=task_id,
+        nonce="",
+        status=REVIEWER_STATUS_SKIPPED_DOC_ONLY,
+        started_at=0.0,
+    ))
+
+
+def reviewer_run_failure(task_id: int | str) -> str | None:
+    """Failure reason when the task's recorded reviewer run did not succeed.
+
+    ``None`` when the run succeeded, was skipped as doc-only, or none was
+    recorded. A run still marked ``running`` (the reviewer raised before
+    finishing) reports ``crashed``.
+    """
+    record = get_reviewer_run(task_id)
+    if record is None or record.status in (
+        REVIEWER_STATUS_SUCCEEDED, REVIEWER_STATUS_SKIPPED_DOC_ONLY,
+    ):
+        return None
+    if record.status == REVIEWER_STATUS_RUNNING:
+        return "crashed"
+    return record.failure_reason or record.status
+
+
 def audit_reviewer_run(record: ReviewerRunRecord) -> None:
     """Emit the GATE-AUDIT line summarising a finished reviewer run.
 

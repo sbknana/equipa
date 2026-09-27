@@ -73,7 +73,20 @@ from equipa.monitoring import (
 )
 from equipa.output import log
 from equipa.git_ops import git_run_async
-from equipa.security_gate import _gate_audit_log, format_counts
+from equipa.security_gate import (
+    REVIEWER_STATUS_FAILED,
+    REVIEWER_STATUS_RUNNING,
+    REVIEWER_STATUS_SUCCEEDED,
+    ReviewerRunRecord,
+    _gate_audit_log,
+    audit_reviewer_run,
+    fingerprint_artifact,
+    format_counts,
+    new_reviewer_nonce,
+    record_reviewer_run,
+    reviewer_nonce_line,
+    verify_reviewer_provenance,
+)
 from equipa.parsing import (
     build_compaction_summary,
     build_test_failure_context,
@@ -214,6 +227,113 @@ def run_quality_scoring(
         log(f"  [Quality] WARNING: Quality scoring failed: {e}", output)
 
 
+SECURITY_REVIEW_DEFAULT_TIMEOUT = 900
+SECURITY_REVIEW_DEFAULT_MAX_TIMEOUT = 5400
+SECURITY_REVIEW_DEFAULT_MAX_ATTEMPTS = 2
+# Timeout multiplier per task complexity: complex/epic tasks get 3x (the
+# 2700s the #3041 timeouts called for when the base is 900s).
+_REVIEW_TIMEOUT_COMPLEXITY_FACTORS: dict[str, float] = {
+    "simple": 1.0,
+    "medium": 1.5,
+    "complex": 3.0,
+    "epic": 3.0,
+}
+# (minimum changed lines, minimum multiplier), largest threshold first.
+_REVIEW_TIMEOUT_DIFF_TIERS: tuple[tuple[int, float], ...] = (
+    (4000, 3.0),
+    (1500, 2.0),
+)
+# A retried attempt gets this much more time than the attempt that failed.
+_REVIEW_RETRY_TIMEOUT_FACTOR = 1.5
+_SHORTSTAT_RE = re.compile(r"(\d+) (?:insertion|deletion)")
+
+
+def _config_int(config: dict | None, key: str, default: int) -> int:
+    """Read a positive int from dispatch config, falling back on bad values."""
+    raw = (config or {}).get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log(f"  WARNING: dispatch config {key}={raw!r} is not an integer; "
+            f"using {default}")
+        return default
+    if value <= 0:
+        log(f"  WARNING: dispatch config {key}={value} must be positive; "
+            f"using {default}")
+        return default
+    return value
+
+
+def compute_security_review_timeout(
+    base_timeout: int, complexity: str, changed_lines: int, max_timeout: int,
+) -> int:
+    """Scale the reviewer timeout by task complexity and diff size.
+
+    The larger of the complexity factor and the diff-size tier wins. The
+    result is capped at ``max_timeout`` but never drops below
+    ``base_timeout`` (an operator's explicit base always holds).
+    """
+    factor = _REVIEW_TIMEOUT_COMPLEXITY_FACTORS.get(complexity, 1.0)
+    for threshold, tier_factor in _REVIEW_TIMEOUT_DIFF_TIERS:
+        if changed_lines >= threshold:
+            factor = max(factor, tier_factor)
+            break
+    return max(base_timeout, min(int(base_timeout * factor), max_timeout))
+
+
+def compute_security_review_retry_timeout(timeout: int, max_timeout: int) -> int:
+    """Timeout for the single retry: longer, capped, never shorter."""
+    return max(timeout, min(int(timeout * _REVIEW_RETRY_TIMEOUT_FACTOR), max_timeout))
+
+
+def describe_reviewer_failure(sec_result: dict[str, Any] | None) -> str:
+    """One-token reason for a failed reviewer result, for logs and audit."""
+    if not sec_result:
+        return "no-result"
+    if is_overloaded_result(sec_result):
+        return "overloaded"
+    errors = [str(err) for err in sec_result.get("errors") or []]
+    if any("timed out" in err.lower() for err in errors):
+        return "timeout"
+    return "agent-error" if errors else "unsuccessful"
+
+
+async def _measure_review_diff_lines(project_dir: str) -> int:
+    """Lines added + deleted on HEAD vs the trusted default branch; 0 if unknown.
+
+    Only sizes the reviewer timeout, so any failure (not a git repo, no
+    trusted default branch, git timeout) falls back to 0 = no diff scaling.
+    """
+    from equipa.git_ops import get_trusted_default_branch
+
+    try:
+        base_ref = get_trusted_default_branch(project_dir)
+        result = await git_run_async(
+            ["diff", "--shortstat", f"{base_ref}...HEAD"],
+            project_dir,
+            timeout=10,
+        )
+    except Exception as exc:  # sizing only — never break the reviewer run
+        log(f"  Reviewer diff size unavailable ({type(exc).__name__}: {exc}); "
+            f"timeout not scaled by diff size")
+        return 0
+    if result.returncode != 0:
+        return 0
+    return sum(int(count) for count in _SHORTSTAT_RE.findall(result.stdout or ""))
+
+
+def _reviewer_nonce_instructions(nonce: str) -> str:
+    """Prompt text binding the artifact to this reviewer attempt (#3041)."""
+    return (
+        f"PROVENANCE (mandatory): the FIRST line of the review file MUST be "
+        f"exactly `{reviewer_nonce_line(nonce)}` on its own line. It proves "
+        f"this review run wrote the file. If the file already exists (for "
+        f"example a developer self-review), do NOT reuse or trust it: "
+        f"overwrite it with your own independent review. A file without "
+        f"this exact line is rejected and the merge is BLOCKED. "
+    )
+
+
 async def run_security_review(
     task: dict[str, Any],
     project_dir: str,
@@ -257,7 +377,7 @@ async def run_security_review(
     # downstream repo root. Ensure the dir exists before the agent runs.
     ensure_artifacts_dir(project_dir)
     review_filename = review_artifact_relpath("SECURITY-REVIEW", task_id)
-    security_task["description"] = (
+    review_instructions = (
         f"Security review of code written for: {task['title']}. "
         f"Review ALL files changed in the project directory. "
         f"YOU MUST use ALL ClaudeStick security tools: static-analysis, "
@@ -303,28 +423,127 @@ async def run_security_review(
         f"IN PROGRESS, skeleton or TODO is treated as unfinished and also "
         f"BLOCKS the merge. A review with no findings must say so in its "
         f"Summary (for example 'No findings.'). "
-        f"Original task description: {task['description']}"
     )
+    original_description = f"Original task description: {task['description']}"
 
     sec_turns = get_role_turns("security-reviewer", args, task=task)
-    sec_prompt = build_system_prompt(
-        security_task, project_context, project_dir,
-        role="security-reviewer",
-        dispatch_config=getattr(args, "dispatch_config", None),
-        max_turns=sec_turns,
-    )
     sec_model = get_role_model("security-reviewer", args, task=task)
-    # Use security_review_timeout from dispatch config (default 15 min)
+    # Task #3041: the timeout scales with task complexity and diff size (a
+    # flat 900s timed out on three tasks in one day), and a failed attempt
+    # is retried once with a longer timeout before the gate blocks.
     dc = load_dispatch_config(None)
-    sec_timeout = dc.get("security_review_timeout", 900)
-    with build_cli_command(
-        sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
-    ) as sec_cmd:
-        sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
+    base_timeout = _config_int(
+        dc, "security_review_timeout", SECURITY_REVIEW_DEFAULT_TIMEOUT,
+    )
+    max_timeout = _config_int(
+        dc, "security_review_timeout_max", SECURITY_REVIEW_DEFAULT_MAX_TIMEOUT,
+    )
+    max_attempts = max(1, _config_int(
+        dc, "security_review_max_attempts", SECURITY_REVIEW_DEFAULT_MAX_ATTEMPTS,
+    ))
+    changed_lines = await _measure_review_diff_lines(project_dir)
+    complexity = get_task_complexity(task)
+    sec_timeout = compute_security_review_timeout(
+        base_timeout, complexity, changed_lines, max_timeout,
+    )
+    log(
+        f"  Reviewer timeout {sec_timeout}s (base {base_timeout}s, "
+        f"complexity={complexity}, diff={changed_lines} lines, "
+        f"max attempts {max_attempts})",
+        output,
+    )
+
+    # Task #3041: fingerprint whatever sits at the artifact path BEFORE the
+    # reviewer starts (e.g. a developer self-review committed on the branch)
+    # so the gate can reject it if the reviewer never replaces it.
+    pre_artifact = fingerprint_artifact(
+        find_review_artifact(project_dir, "SECURITY-REVIEW", task_id),
+    )
+    run_started = time.monotonic()
+    run_started_wall = time.time()
+    attempt_timeouts: list[int] = []
+    nonce = ""
+    sec_result: dict[str, Any] = {}
+    for attempt in range(1, max_attempts + 1):
+        # A fresh nonce per attempt: a partial file left by a timed-out
+        # attempt carries the old nonce and is not accepted.
+        nonce = new_reviewer_nonce()
+        attempt_timeouts.append(sec_timeout)
+        record_reviewer_run(ReviewerRunRecord(
+            task_id=task_id,
+            nonce=nonce,
+            status=REVIEWER_STATUS_RUNNING,
+            started_at=time.time(),
+            pre_artifact=pre_artifact,
+            attempts=attempt,
+            timeouts=tuple(attempt_timeouts),
+        ))
+        security_task["description"] = (
+            f"{review_instructions}{_reviewer_nonce_instructions(nonce)}"
+            f"{original_description}"
+        )
+        sec_prompt = build_system_prompt(
+            security_task, project_context, project_dir,
+            role="security-reviewer",
+            dispatch_config=getattr(args, "dispatch_config", None),
+            max_turns=sec_turns,
+        )
+        with build_cli_command(
+            sec_prompt, project_dir, sec_turns, sec_model,
+            role="security-reviewer",
+        ) as sec_cmd:
+            sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
+        if (
+            sec_result.get("success")
+            or is_overloaded_result(sec_result)
+            or attempt == max_attempts
+        ):
+            break
+        retry_timeout = compute_security_review_retry_timeout(
+            sec_timeout, max_timeout,
+        )
+        log(
+            f"  Security review attempt {attempt} failed "
+            f"({describe_reviewer_failure(sec_result)}); retrying once with "
+            f"timeout {retry_timeout}s before the gate blocks",
+            output,
+        )
+        sec_timeout = retry_timeout
+
+    review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
+    run_record = ReviewerRunRecord(
+        task_id=task_id,
+        nonce=nonce,
+        status=(
+            REVIEWER_STATUS_SUCCEEDED if sec_result.get("success")
+            else REVIEWER_STATUS_FAILED
+        ),
+        started_at=run_started_wall,
+        pre_artifact=pre_artifact,
+        post_artifact=fingerprint_artifact(review_path),
+        attempts=len(attempt_timeouts),
+        duration=time.monotonic() - run_started,
+        timeouts=tuple(attempt_timeouts),
+        failure_reason=(
+            None if sec_result.get("success")
+            else describe_reviewer_failure(sec_result)
+        ),
+    )
+    record_reviewer_run(run_record)
+    audit_reviewer_run(run_record)
 
     if sec_result["success"]:
         log(f"  Security review completed in {sec_result.get('duration', 0):.1f}s", output)
         result_text = sec_result.get("result_text", "")
+        provenance = verify_reviewer_provenance(task_id, review_path)
+        if not provenance.trusted:
+            log(
+                f"  WARNING: security-review artifact was not written by this "
+                f"reviewer run (provenance={provenance.reason}; "
+                f"{provenance.fingerprint.describe()}) — the merge gate will "
+                f"block",
+                output,
+            )
 
         # Extract finding counts from the SECURITY-REVIEW-NNNN.md artifact, NOT
         # from raw agent stdout. The stdout contains the agent's intermediate
@@ -337,6 +556,13 @@ async def run_security_review(
             project_dir, "SECURITY-REVIEW", task_id,
         )
         counts = _count_findings_in_review_file(review_path, task_id=task_id)
+        # Task #3041: name the exact bytes these counts came from, so a
+        # counts/file mismatch against the gate's line is visible.
+        log(
+            f"  Security review counts {format_counts(counts)} from "
+            f"{provenance.fingerprint.describe()}",
+            output,
+        )
         if counts is None and review_path.is_file():
             # Task #3033: the reviewer DID write a file, but it is a fallback
             # dump, its footer disagrees with its finding headers, or it is
@@ -393,7 +619,13 @@ async def run_security_review(
             f"every retry. Not downgrading the model; the merge gate will "
             f"block this task.", output)
     else:
-        log(f"  Security review agent failed.", output)
+        log(
+            f"  Security review agent failed after {run_record.attempts} "
+            f"attempt(s) in {run_record.duration:.1f}s "
+            f"({run_record.failure_reason}). The merge gate will block this "
+            f"task regardless of any artifact on disk.",
+            output,
+        )
         for err in sec_result.get("errors", []):
             log(f"    Error: {err[:200]}", output)
 
@@ -463,9 +695,15 @@ def _persist_security_review_artifact(
             # task supersedes any stale file at the stable path.
             dst.write_text(src_text, encoding="utf-8")
             kind = "fallback dump" if is_fallback else "structured artifact"
+            # Task #3041: say whether the copied file is THIS reviewer run's
+            # output. On #3035 this line read "structured artifact" for a
+            # developer self-review the timed-out reviewer never wrote.
+            provenance = verify_reviewer_provenance(task_id, dst)
             log(
                 f"  Persisted security-review {kind} to stable path "
-                f"{dst} (survives worktree teardown)",
+                f"{dst} (survives worktree teardown; "
+                f"provenance={provenance.reason}; "
+                f"{provenance.fingerprint.describe()})",
                 output,
             )
         else:

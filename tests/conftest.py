@@ -26,6 +26,19 @@ _SCRIPTS_DIR = REPO_ROOT / "scripts"
 if _SCRIPTS_DIR.is_dir():
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import pytest  # noqa: E402  (sys.path must be set before any equipa import)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_reviewer_run_registry():
+    """Task #3041: reviewer-run provenance is process-global; a run recorded
+    by one test must never decide another test's gate for the same task id."""
+    from equipa.security_gate import clear_reviewer_runs
+
+    clear_reviewer_runs()
+    yield
+    clear_reviewer_runs()
+
 
 def _make_idempotent(schema_sql: str) -> str:
     """Rewrite CREATE statements to be idempotent (IF NOT EXISTS).
