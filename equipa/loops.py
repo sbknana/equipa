@@ -623,11 +623,16 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 # prose ("**No CRITICAL or HIGH findings.**", "**Medium (30 min):**") and a
 # severity after the bold span ("**Severity:** HIGH"), which belongs to an
 # enclosing heading that is itself a candidate.
+# An unbracketed tag ("S1", "SR29-00", "RT-01") is matched only up to its
+# FIRST digit; the lazy [^*\n]*? covers the rest. Spelling the tail out as
+# "\d+[\w-]*" matched the same lines but let three overlapping quantifiers
+# backtrack cubically: one "**S1" + 1000-digit line took 17 s and hung the
+# gate (task #3038 ReDoS). Every alternative must stay linear per line.
 _FINDING_CANDIDATE_RE = re.compile(
     r"^[ \t]{0,3}(?:"
     r"#{1,6}[ \t][^\n]*?"
     r"|(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?\*\*[ \t]*(?:"
-    r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)[^*\n]*?"
+    r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d)[^*\n]*?"
     r"|[\[(]?[ \t]*(?=(?-i:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-]))"
     r")"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
