@@ -599,18 +599,20 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 )
 
 # Task #3038 (S3033-02): detection-only tally of finding-shaped lines the
-# strict level-3 header regex cannot see: a severity word (any case) in a
-# heading of level 2-6, or after a finding tag inside a bold line / bullet
-# ("- **[S1] HIGH** —", "**S1 (HIGH):**", "- [S1] HIGH —"). It never adds to
-# the merge counts; a severity it sees that neither the footer nor the
-# strict headers count makes the review a count-mismatch (fail closed).
-# Checklist boxes ("- [x] XSS: PASS") are not finding tags.
+# strict level-3 header regex cannot see: a severity word (any case)
+# anywhere in a heading of ANY level (the strict regex stops at 80 chars),
+# inside the leading bold span of a line, bullet or numbered item
+# ("**HIGH — nonce reuse**", "1. **[S1] HIGH** —", "**S1 (HIGH):**"), or
+# after a bracketed tag on a bullet ("- [S1] HIGH —"). It never adds to the
+# merge counts; a severity it sees that neither the footer nor the strict
+# headers count makes the review a count-mismatch (fail closed).
+# Checklist boxes ("- [x] XSS: PASS") are not finding tags, and a severity
+# after the bold span ("**Severity:** HIGH") belongs to an enclosing
+# heading, which is itself a candidate.
 _FINDING_CANDIDATE_RE = re.compile(
     r"^[ \t]{0,3}(?:"
-    r"#{2,6}[ \t][^\n]{0,80}?"
-    r"|(?:[-*+][ \t]+)?\*\*[ \t]*"
-    r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)"
-    r"[^*\n]{0,40}?"
+    r"#{1,6}[ \t][^\n]*?"
+    r"|(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?\*\*[^*\n]*?"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
     r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
     re.MULTILINE | re.IGNORECASE,
