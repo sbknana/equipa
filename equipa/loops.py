@@ -573,15 +573,17 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 # but mark it resolved and leave it out of the footer, e.g.
 #   ### SR29-00 HIGH (fixed, verified, not counted) — ...
 #   ### SR-2996 S1 (MEDIUM) — FIXED, verified
+#   ### [2775-S01] HIGH — requestPayout ... → **FIXED**   (CCGNinja #2780)
 # Such headings are not live findings and are excluded from the header
 # tally. Deliberately narrow: a (...)/[...] group must START with
-# fixed/resolved or say "not counted", or an UPPERCASE status must follow a
-# separator. So "Fixed-size buffer overflow" and StockForge #3032's live
+# fixed/resolved or say "not counted", or an UPPERCASE status (optionally
+# bold/italic) must follow a separator. So "Fixed-size buffer overflow" and
+# StockForge #3032's live
 # "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed)" still count.
 _RESOLVED_FINDING_HEADER_RE = re.compile(
     r"[(\[][ \t]*(?i:fixed|resolved)\b[^)\]\n]*[)\]]"
     r"|[(\[][^)\]\n]*\b(?i:not[ \t]+counted)\b[^)\]\n]*[)\]]"
-    r"|[—–:-][ \t]*(?:FIXED|RESOLVED)\b",
+    r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b",
 )
 
 # Task #3033: a review with zero finding headers, an all-zero (or absent)

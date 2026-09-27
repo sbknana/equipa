@@ -306,6 +306,9 @@ def test_matching_footer_and_headers_pass(
         "### SR29-00 HIGH (fixed, verified, not counted) — duplicate key\n",
         "### SR-2996 S1 (MEDIUM) — FIXED, verified\n",
         "### [S1] HIGH [RESOLVED] — token leak\n",
+        # CCGNinja #2780: arrow + bold status; the #3033 audit found this
+        # would otherwise false-block a correct re-review.
+        "### [2775-S01] HIGH — payout claims ALREADY_SENT → **FIXED**\n",
     ],
 )
 def test_resolved_fix_verification_headings_are_not_live_findings(
