@@ -32,11 +32,23 @@ import pytest  # noqa: E402  (sys.path must be set before any equipa import)
 @pytest.fixture(autouse=True)
 def _isolate_reviewer_run_registry():
     """Task #3041: reviewer-run provenance is process-global; a run recorded
-    by one test must never decide another test's gate for the same task id."""
-    from equipa.security_gate import clear_reviewer_runs
+    by one test must never decide another test's gate for the same task id.
+
+    Task #3063 (SR41-03): production BLOCKS a gate evaluation that has no
+    reviewer record. The many hermetic gate tests that exercise count parsing
+    on a hand-written artifact, without running a reviewer, opt in to the
+    pre-#3041 artifact-only trust here — explicitly, and only for tests.
+    Tests of the no-record block itself turn it back off (see
+    tests/test_gate_provenance_3063.py)."""
+    from equipa.security_gate import (
+        clear_reviewer_runs,
+        set_unrecorded_reviewer_runs_permitted,
+    )
 
     clear_reviewer_runs()
+    previous = set_unrecorded_reviewer_runs_permitted(True)
     yield
+    set_unrecorded_reviewer_runs_permitted(previous)
     clear_reviewer_runs()
 
 

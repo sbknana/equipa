@@ -1622,7 +1622,13 @@ async def _merge_task_branch(
                 f"cycle's security-reviewer run ({provenance.reason}). The "
                 f"defensive invariant fails closed (task #3041)."
             )
-        counts = _count_findings_in_review_file(review_path, task_id=task_id)
+        # Task #3063 (SR41-02): parse the exact bytes provenance verified.
+        counts = (
+            _count_findings_in_review_file(
+                review_path, task_id=task_id, text=provenance.text,
+            )
+            if provenance.text is not None else None
+        )
         if counts is None:
             _gate_audit_log(
                 f"task={task_id} event=defensive-invariant-fired "
@@ -1658,6 +1664,7 @@ async def _merge_task_branch(
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-passed "
             f"provenance={provenance.reason} "
+            f"{provenance.describe_reviewer()} "
             f"{provenance.fingerprint.describe()} {format_counts(counts)}",
             task_id=task_id,
             event="defensive-invariant-passed",
@@ -1965,16 +1972,20 @@ def _security_review_blocks_merge(
     # write (a developer self-review on the branch, a stale prior review),
     # blocks REGARDLESS of block_on_missing — that flag is about a missing
     # review, and an untrusted file is not a review.
+    # Task #3063: no reviewer record for this cycle BLOCKS (SR41-03), and the
+    # counts are parsed from the same bytes provenance hashed (SR41-02).
     provenance = verify_reviewer_provenance(task_id, review_path)
     counts = (
-        _count_findings_in_review_file(review_path, task_id=task_id)
-        if provenance.trusted else None
+        _count_findings_in_review_file(
+            review_path, task_id=task_id, text=provenance.text,
+        )
+        if provenance.trusted and provenance.text is not None else None
     )
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "
-        f"artifact_exists={review_path.exists()} "
+        f"artifact_exists={provenance.fingerprint.exists} "
         f"{provenance.fingerprint.describe()} "
-        f"provenance={provenance.reason} "
+        f"provenance={provenance.reason} {provenance.describe_reviewer()} "
         f"{format_counts(counts)} block_on_missing={block_on_missing}",
         task_id=task_id,
         event="blocks-merge-eval",

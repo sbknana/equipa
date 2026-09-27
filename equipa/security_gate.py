@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -104,26 +105,133 @@ class ArtifactFingerprint:
         )
 
 
+# SR41-01 (task #3063): a review is a few KiB of markdown. Anything larger is
+# not a review, and reading it unbounded (e.g. a symlink to /dev/zero) would
+# exhaust memory, so it is treated as unreadable.
+MAX_REVIEW_ARTIFACT_BYTES = 2 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    """One read of a review artifact: its fingerprint and the exact bytes.
+
+    SR41-02 (task #3063): provenance is verified and findings are counted from
+    this single buffer, so the sha256 in the audit log is the sha256 of the
+    bytes that were parsed — a file swapped between two reads cannot be
+    verified on one version and counted on another.
+    """
+
+    fingerprint: ArtifactFingerprint
+    data: bytes | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def text(self) -> str | None:
+        """The bytes decoded as UTF-8 (lossy), or None when unreadable."""
+        if self.data is None:
+            return None
+        return self.data.decode("utf-8", errors="replace")
+
+
+def _read_regular_file(path: str) -> tuple[bytes, float] | None:
+    """Read ``path`` only if it is a small regular file; never block.
+
+    SR41-01 (task #3063): the developer agent controls the worktree before
+    the reviewer runs and could plant a FIFO, device or symlink at the
+    artifact path. ``Path.read_bytes`` on a FIFO blocks the event loop thread
+    forever, freezing every task in parallel mode. So: ``lstat`` first and
+    refuse anything that is not a regular file (symlinks included), then open
+    with ``O_NOFOLLOW | O_NONBLOCK`` and re-check the opened descriptor, which
+    closes the swap-after-lstat race. Reads are capped at
+    :data:`MAX_REVIEW_ARTIFACT_BYTES`. Returns ``(data, mtime)`` or None.
+    """
+    try:
+        link_stat = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("[security-gate] cannot stat artifact %s: %s", path, exc)
+        return None
+    if not stat.S_ISREG(link_stat.st_mode):
+        logger.warning(
+            "[security-gate] refusing artifact %s: not a regular file "
+            "(mode=%o) — treated as missing",
+            path, link_stat.st_mode,
+        )
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        logger.warning("[security-gate] cannot open artifact %s: %s", path, exc)
+        return None
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            logger.warning(
+                "[security-gate] refusing artifact %s: replaced by a "
+                "non-regular file while opening — treated as missing",
+                path,
+            )
+            return None
+        chunks: list[bytes] = []
+        remaining = MAX_REVIEW_ARTIFACT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, _READ_CHUNK_BYTES))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as exc:
+        logger.warning("[security-gate] cannot read artifact %s: %s", path, exc)
+        return None
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if len(data) > MAX_REVIEW_ARTIFACT_BYTES:
+        logger.warning(
+            "[security-gate] refusing artifact %s: larger than %d bytes — "
+            "treated as missing",
+            path, MAX_REVIEW_ARTIFACT_BYTES,
+        )
+        return None
+    return data, opened_stat.st_mtime
+
+
+def snapshot_artifact(path: str | os.PathLike) -> ArtifactSnapshot:
+    """Read ``path`` once; fingerprint and bytes come from the same read."""
+    artifact = os.fspath(path)
+    result = _read_regular_file(artifact)
+    if result is None:
+        # Missing, special, oversized or unreadable: not a review. Report it
+        # as absent so every caller fails closed.
+        return ArtifactSnapshot(ArtifactFingerprint(path=artifact, exists=False))
+    data, mtime = result
+    return ArtifactSnapshot(
+        ArtifactFingerprint(
+            path=artifact,
+            exists=True,
+            sha256=hashlib.sha256(data).hexdigest(),
+            mtime=mtime,
+            size=len(data),
+        ),
+        data=data,
+    )
+
+
 def fingerprint_artifact(path: str | os.PathLike) -> ArtifactFingerprint:
     """Hash ``path`` and capture its mtime; ``exists=False`` when unreadable."""
-    artifact = Path(path)
-    try:
-        data = artifact.read_bytes()
-        mtime = artifact.stat().st_mtime
-    except FileNotFoundError:
-        return ArtifactFingerprint(path=str(artifact), exists=False)
-    except OSError as exc:
-        # A directory or permission error at the artifact path is not a
-        # review — report it as absent so every caller fails closed.
-        logger.warning("[security-gate] cannot read artifact %s: %s", artifact, exc)
-        return ArtifactFingerprint(path=str(artifact), exists=False)
-    return ArtifactFingerprint(
-        path=str(artifact),
-        exists=True,
-        sha256=hashlib.sha256(data).hexdigest(),
-        mtime=mtime,
-        size=len(data),
-    )
+    return snapshot_artifact(path).fingerprint
+
+
+def read_artifact_text(path: str | os.PathLike) -> str | None:
+    """The artifact decoded as UTF-8, or None when missing / not safe to read."""
+    return snapshot_artifact(path).text
 
 
 @dataclass(frozen=True)
@@ -140,31 +248,102 @@ class ReviewerRunRecord:
     duration: float = 0.0
     timeouts: tuple[int, ...] = ()
     failure_reason: str | None = None
+    # SR41-04 (task #3063): the nonce proves a reviewer process wrote the
+    # file, not that the review was independent. These name WHICH reviewer
+    # (run id, model, exact prompt) so an audit can check that afterwards.
+    run_id: str = ""
+    model: str | None = None
+    prompt_sha256: str | None = None
+
+    def describe_identity(self) -> str:
+        """Render as ``reviewer_run=<id> model=<m> prompt_sha256=<16 hex>``."""
+        return (
+            f"reviewer_run={self.run_id or '-'} model={self.model or '-'} "
+            f"prompt_sha256={(self.prompt_sha256 or '-')[:16]}"
+        )
+
+
+# SR41-03 (task #3063): the verdict when the gate finds no reviewer record
+# for the task in this process. It blocks — trusting the file on disk is the
+# #3035 failure mode — and is audited as its own event.
+REVIEWER_RECORD_MISSING_REASON = "reviewer-record-missing"
 
 
 @dataclass(frozen=True)
 class ProvenanceVerdict:
-    """Whether the gate may believe the artifact at ``fingerprint.path``."""
+    """Whether the gate may believe the artifact at ``fingerprint.path``.
+
+    ``text`` is the decoded content of the exact bytes ``fingerprint`` hashed
+    (SR41-02): callers count findings from it rather than re-reading the
+    path, so the verified bytes and the parsed bytes are the same bytes.
+    """
 
     trusted: bool
     reason: str
     fingerprint: ArtifactFingerprint
+    text: str | None = field(default=None, repr=False, compare=False)
+    record: ReviewerRunRecord | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     @property
     def audit_event(self) -> str:
         """GATE-AUDIT event name for an untrusted verdict."""
+        if self.reason == REVIEWER_RECORD_MISSING_REASON:
+            return "reviewer-record-missing"
         if self.reason in _REVIEWER_FAILED_REASONS:
             return "reviewer-failed"
         return "artifact-provenance-rejected"
+
+    def describe_reviewer(self) -> str:
+        """Identity of the reviewer run this verdict rests on (SR41-04)."""
+        if self.record is None:
+            return "reviewer_run=none"
+        return self.record.describe_identity()
 
 
 _REVIEWER_RUNS: dict[str, ReviewerRunRecord] = {}
 _REVIEWER_RUNS_LOCK = threading.Lock()
 
+# SR41-03 (task #3063): hermetic callers that exercise count parsing without
+# running a reviewer (the legacy gate tests) must opt in to the pre-#3041
+# artifact-only trust explicitly. Production code never sets this.
+_UNRECORDED_RUNS_PERMITTED = False
+
+
+def set_unrecorded_reviewer_runs_permitted(permitted: bool) -> bool:
+    """Allow (True) or forbid (False) gating with no reviewer record.
+
+    For hermetic tests only. Returns the previous setting so a caller can
+    restore it. Every trusted-without-record verdict is still logged with
+    reason ``no-reviewer-run-recorded``.
+    """
+    global _UNRECORDED_RUNS_PERMITTED
+    with _REVIEWER_RUNS_LOCK:
+        previous = _UNRECORDED_RUNS_PERMITTED
+        _UNRECORDED_RUNS_PERMITTED = bool(permitted)
+    return previous
+
+
+def unrecorded_reviewer_runs_permitted() -> bool:
+    """Whether a gate evaluation with no reviewer record may trust the file."""
+    with _REVIEWER_RUNS_LOCK:
+        return _UNRECORDED_RUNS_PERMITTED
+
 
 def new_reviewer_nonce() -> str:
     """Mint a fresh 128-bit reviewer-run nonce (32 lowercase hex chars)."""
     return secrets.token_hex(16)
+
+
+def new_reviewer_run_id() -> str:
+    """Mint an identifier for one reviewer run (16 lowercase hex chars)."""
+    return secrets.token_hex(8)
+
+
+def reviewer_prompt_sha256(prompt: str) -> str:
+    """sha256 of the exact prompt a reviewer attempt was started with."""
+    return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
 
 
 def reviewer_nonce_line(nonce: str) -> str:
@@ -213,40 +392,47 @@ def verify_reviewer_provenance(
       * ``reviewer-nonce-missing`` — the file lacks this run's nonce line;
       * ``artifact-changed-after-review`` — edited after the reviewer ended.
 
-    When no run was recorded for the task in this process the verdict is
-    trusted with reason ``no-reviewer-run-recorded``: both production gate
-    paths run (or explicitly skip) the reviewer in-process first, so this
-    only covers direct gate callers, which keep the pre-#3041 artifact-only
-    behaviour. The reason is logged so such a gate evaluation is visible.
+      * ``reviewer-record-missing`` — no reviewer run was recorded for the
+        task in this process (SR41-03, task #3063). Both production gate
+        paths run (or explicitly skip as doc-only) the reviewer in-process
+        first, so a missing record means the gate was reached some other way
+        — a resume, a re-gate, a merge after a restart — and the file on disk
+        is exactly what #3035 wrongly trusted. Only hermetic callers that
+        opted in via :func:`set_unrecorded_reviewer_runs_permitted` get the
+        pre-#3041 artifact-only trust (reason ``no-reviewer-run-recorded``).
+
+    The artifact is read ONCE (SR41-02): the fingerprint, the nonce check and
+    the returned ``text`` all come from the same bytes.
     """
-    fingerprint = fingerprint_artifact(review_path)
+    snapshot = snapshot_artifact(review_path)
+    fingerprint = snapshot.fingerprint
+    text = snapshot.text
     record = get_reviewer_run(task_id)
+
+    def verdict(trusted: bool, reason: str) -> ProvenanceVerdict:
+        return ProvenanceVerdict(
+            trusted, reason, fingerprint, text=text, record=record,
+        )
+
     if record is None:
-        return ProvenanceVerdict(True, "no-reviewer-run-recorded", fingerprint)
+        if unrecorded_reviewer_runs_permitted():
+            return verdict(True, "no-reviewer-run-recorded")
+        return verdict(False, REVIEWER_RECORD_MISSING_REASON)
     if record.status != REVIEWER_STATUS_SUCCEEDED:
-        return ProvenanceVerdict(False, f"reviewer-{record.status}", fingerprint)
-    if not fingerprint.exists:
-        return ProvenanceVerdict(False, "artifact-missing", fingerprint)
+        return verdict(False, f"reviewer-{record.status}")
+    if not fingerprint.exists or text is None:
+        return verdict(False, "artifact-missing")
     post = record.post_artifact
     if post is None or not post.exists:
-        return ProvenanceVerdict(
-            False, "artifact-not-written-by-reviewer", fingerprint,
-        )
+        return verdict(False, "artifact-not-written-by-reviewer")
     pre = record.pre_artifact
     if pre is not None and pre.exists and pre.sha256 == fingerprint.sha256:
-        return ProvenanceVerdict(False, "artifact-pre-existing", fingerprint)
-    try:
-        text = Path(review_path).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        logger.warning("[security-gate] cannot read artifact %s: %s", review_path, exc)
-        return ProvenanceVerdict(False, "artifact-missing", fingerprint)
+        return verdict(False, "artifact-pre-existing")
     if record.nonce not in artifact_nonces(text):
-        return ProvenanceVerdict(False, "reviewer-nonce-missing", fingerprint)
+        return verdict(False, "reviewer-nonce-missing")
     if post.sha256 != fingerprint.sha256:
-        return ProvenanceVerdict(
-            False, "artifact-changed-after-review", fingerprint,
-        )
-    return ProvenanceVerdict(True, "verified", fingerprint)
+        return verdict(False, "artifact-changed-after-review")
+    return verdict(True, "verified")
 
 
 def record_reviewer_skipped_doc_only(task_id: int | str) -> None:
@@ -297,6 +483,7 @@ def audit_reviewer_run(record: ReviewerRunRecord) -> None:
         f"task={record.task_id} event={event} status={record.status} "
         f"attempts={record.attempts} duration={record.duration:.1f}s "
         f"timeouts={timeouts} nonce={record.nonce[:8]} "
+        f"{record.describe_identity()} "
         f"{post.describe() if post is not None else 'artifact=unknown'}"
     )
     if failed:

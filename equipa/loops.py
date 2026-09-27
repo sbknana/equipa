@@ -83,8 +83,11 @@ from equipa.security_gate import (
     fingerprint_artifact,
     format_counts,
     new_reviewer_nonce,
+    new_reviewer_run_id,
+    read_artifact_text,
     record_reviewer_run,
     reviewer_nonce_line,
+    reviewer_prompt_sha256,
     verify_reviewer_provenance,
 )
 from equipa.parsing import (
@@ -471,6 +474,11 @@ async def run_security_review(
     )
     run_started = time.monotonic()
     run_started_wall = time.time()
+    # SR41-04 (task #3063): the audit line names which reviewer ran — a run
+    # id, the model and the sha256 of the exact prompt — so independence can
+    # be checked afterwards, not just that some reviewer touched the file.
+    run_id = new_reviewer_run_id()
+    prompt_sha256: str | None = None
     attempt_timeouts: list[int] = []
     nonce = ""
     sec_result: dict[str, Any] = {}
@@ -487,6 +495,8 @@ async def run_security_review(
             pre_artifact=pre_artifact,
             attempts=attempt,
             timeouts=tuple(attempt_timeouts),
+            run_id=run_id,
+            model=sec_model,
         ))
         security_task["description"] = (
             f"{review_instructions}{_reviewer_nonce_instructions(nonce)}"
@@ -498,6 +508,7 @@ async def run_security_review(
             dispatch_config=getattr(args, "dispatch_config", None),
             max_turns=sec_turns,
         )
+        prompt_sha256 = reviewer_prompt_sha256(str(sec_prompt))
         with build_cli_command(
             sec_prompt, project_dir, sec_turns, sec_model,
             role="security-reviewer",
@@ -538,6 +549,9 @@ async def run_security_review(
             None if sec_result.get("success")
             else describe_reviewer_failure(sec_result)
         ),
+        run_id=run_id,
+        model=sec_model,
+        prompt_sha256=prompt_sha256,
     )
     record_reviewer_run(run_record)
     audit_reviewer_run(run_record)
@@ -562,10 +576,14 @@ async def run_security_review(
         # mentions in prose, and so on (see task 2315 root-cause analysis).
         # Task 2476: prefer the new .equipa-artifacts/ location, fall back
         # to the legacy repo-root path so in-flight artifacts still parse.
-        review_path = find_review_artifact(
-            project_dir, "SECURITY-REVIEW", task_id,
+        # Task #3063 (SR41-02): count from the bytes provenance was verified
+        # on, never from a second read of the path.
+        counts = (
+            _count_findings_in_review_file(
+                review_path, task_id=task_id, text=provenance.text,
+            )
+            if provenance.text is not None else None
         )
-        counts = _count_findings_in_review_file(review_path, task_id=task_id)
         # Task #3041: name the exact bytes these counts came from, so a
         # counts/file mismatch against the gate's line is visible.
         log(
@@ -697,8 +715,10 @@ def _persist_security_review_artifact(
     ensure_artifacts_dir(stable_dir)
 
     try:
-        if src.is_file():
-            src_text = src.read_text(encoding="utf-8", errors="replace")
+        # Task #3063 (SR41-01): the non-blocking, regular-file-only reader —
+        # a FIFO or device planted in the worktree is treated as absent.
+        src_text = read_artifact_text(src)
+        if src_text is not None:
             is_fallback = SECURITY_REVIEW_FALLBACK_MARKER in src_text
             # Copy the worktree artifact to the stable path. Always
             # overwrite — the agent's just-written artifact for THIS
@@ -1083,7 +1103,11 @@ def _heading_tally_severities(match: re.Match[str]) -> list[str] | None:
     return reported
 
 
-def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
+def _analyze_review_file(
+    review_path: Path,
+    *,
+    text: str | None = None,
+) -> ReviewCountAnalysis:
     """Parse a SECURITY-REVIEW-NNNN.md artifact without trusting any one source.
 
     Task #3033 (fail-closed): the ``## Counts`` footer and the ``###``
@@ -1111,13 +1135,19 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
     ``### [S1] HIGH — Prompt Injection via Database Content``, never from
     prose, so "[S1] LOW — this is NOT a CRITICAL because…" is not a CRITICAL
     (task 2315).
+
+    ``text`` (task #3063, SR41-02): the content the caller already read and
+    verified provenance on. When given, the path is NOT re-read, so the
+    counts come from the exact bytes whose sha256 the gate logged. When
+    omitted the path is read with the non-blocking, regular-file-only reader
+    (SR41-01), so a FIFO or device at the path cannot hang the event loop.
     """
-    try:
-        text = review_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        # FileNotFoundError included: a missing file and an unreadable one
-        # are the same thing to the gate.
-        return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
+    if text is None:
+        # A missing, special, oversized and unreadable file are all the same
+        # thing to the gate: not a review.
+        text = read_artifact_text(review_path)
+        if text is None:
+            return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
     # structured artifacts — the merge gate must still fail-closed on them.
@@ -1302,8 +1332,12 @@ def _count_findings_in_review_file(
     review_path: Path,
     *,
     task_id: int | None = None,
+    text: str | None = None,
 ) -> dict[str, int] | None:
     """Count findings per severity in a SECURITY-REVIEW-NNNN.md artifact.
+
+    Pass ``text`` (the content provenance was verified on) so the counts are
+    parsed from those same bytes instead of a second read (SR41-02).
 
     Returns a dict with keys CRITICAL/HIGH/MEDIUM/LOW/INFO, or None when the
     artifact must be treated as missing: it does not exist, is an
@@ -1315,7 +1349,7 @@ def _count_findings_in_review_file(
     (``event=count-mismatch`` or ``event=review-incomplete``) carrying both
     tallies, so the log records why a review that exists was not believed.
     """
-    analysis = _analyze_review_file(review_path)
+    analysis = _analyze_review_file(review_path, text=text)
     if analysis.trusted:
         return analysis.counts
     if analysis.verdict in (
@@ -1363,7 +1397,10 @@ def _write_security_review_fallback(
     Refuses to overwrite a pre-existing file (the agent may have written a
     real artifact between our check and this call).
     """
-    if review_path.exists():
+    # Task #3063: a dangling symlink planted at the path must not be
+    # followed (exists() is False for it) and a FIFO must not be opened for
+    # writing — any entry at all means "do not write here".
+    if review_path.is_symlink() or review_path.exists():
         return
     body = (
         f"# SECURITY-REVIEW fallback (orchestrator-saved, task {task_id})\n"
