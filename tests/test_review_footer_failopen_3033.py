@@ -299,20 +299,24 @@ def test_matching_footer_and_headers_pass(
 
 
 @pytest.mark.parametrize(
-    "resolved_heading",
+    ("resolved_heading", "expected"),
     [
-        # Shapes seen on StockForge #3029 and 3DGenerator #3000, which the
-        # audit found merged correctly with the footer excluding them.
-        "### SR29-00 HIGH (fixed, verified, not counted) — duplicate key\n",
-        "### SR-2996 S1 (MEDIUM) — FIXED, verified\n",
-        "### [S1] HIGH [RESOLVED] — token leak\n",
-        # CCGNinja #2780: arrow + bold status; the #3033 audit found this
-        # would otherwise false-block a correct re-review.
-        "### [2775-S01] HIGH — payout claims ALREADY_SENT → **FIXED**\n",
+        # Task #3038 (S3033-01): the status token must END the heading, and
+        # a resolved heading still counts toward the merge decision; the
+        # footer is merely allowed to omit it.
+        ("### SR29-00 HIGH — duplicate key (fixed, verified, not counted)\n",
+         _counts(high=1, low=1)),
+        ("### SR-2996 S1 (MEDIUM) — FIXED, verified\n",
+         _counts(medium=1, low=1)),
+        ("### [S1] HIGH — token leak [RESOLVED]\n", _counts(high=1, low=1)),
+        # CCGNinja #2780: arrow + bold status.
+        ("### [2775-S01] HIGH — payout claims ALREADY_SENT → **FIXED**\n",
+         _counts(high=1, low=1)),
     ],
 )
-def test_resolved_fix_verification_headings_are_not_live_findings(
-    tmp_path: Path, persisted_audit_events: list[dict], resolved_heading: str,
+def test_resolved_heading_may_be_omitted_from_footer_but_still_counts(
+    tmp_path: Path, persisted_audit_events: list[dict],
+    resolved_heading: str, expected: dict[str, int],
 ) -> None:
     path = _write_review(
         tmp_path,
@@ -323,7 +327,24 @@ def test_resolved_fix_verification_headings_are_not_live_findings(
         "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0\n",
     )
 
-    assert _count_findings_in_review_file(path) == _counts(low=1)
+    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
+    assert _count_findings_in_review_file(path) == expected
+
+
+def test_mid_heading_resolved_status_is_a_live_finding(
+    tmp_path: Path, persisted_audit_events: list[dict],
+) -> None:
+    # Task #3038: "(fixed ...)" before the title is not in end position, so
+    # the heading is live and a footer that omits it is stale.
+    path = _write_review(
+        tmp_path,
+        "# Security Re-review\n\nSummary: prior findings verified fixed.\n\n"
+        "### SR29-00 HIGH (fixed, verified, not counted) — duplicate key\n"
+        "Verified.\n\n" + ZERO_FOOTER,
+    )
+
+    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert _count_findings_in_review_file(path) is None
 
 
 def test_fixed_word_in_title_is_still_a_live_finding(

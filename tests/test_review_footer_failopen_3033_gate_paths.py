@@ -411,34 +411,39 @@ def test_footer_outside_resolved_window_is_mismatch(
     assert _count_findings_in_review_file(path, task_id=TASK_ID) is None
 
 
-def test_all_findings_resolved_with_zero_footer_is_clean(
+def test_all_findings_resolved_with_zero_footer_still_counts_them(
     tmp_path: Path, persisted_audit_events: list[dict],
 ) -> None:
+    # Task #3038 (S3033-01): a zero footer may omit resolved headings (the
+    # review is trusted), but the merge decision still counts them, so a
+    # mislabelled live HIGH over-blocks instead of merging.
     path = _write_artifact(
         tmp_path,
         "# Security Re-review\n\nSummary: all prior findings verified.\n\n"
-        "### [S1] HIGH (fixed, verified) — token leak\nVerified.\n\n"
-        "### [S2] MEDIUM [RESOLVED] — weak hash\nVerified.\n\n"
+        "### [S1] HIGH — token leak (fixed, verified)\nVerified.\n\n"
+        "### [S2] MEDIUM — weak hash [RESOLVED]\nVerified.\n\n"
         + ZERO_FOOTER,
     )
 
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
     assert _security_review_blocks_merge(str(tmp_path), TASK_ID) == (
-        False, _counts(),
+        True, _counts(high=1, medium=1),
     )
 
 
-def test_resolved_heading_without_footer_is_not_counted(
+def test_resolved_heading_without_footer_is_counted(
     tmp_path: Path, persisted_audit_events: list[dict],
 ) -> None:
+    # Task #3038 (S3033-01): with no footer there is nothing that may omit
+    # the resolved heading; it is never subtracted.
     path = _write_artifact(
         tmp_path,
         "# Security Re-review\n\nSummary: done.\n\n"
-        "### [S1] CRITICAL (resolved) — RCE in upload\nVerified.\n\n"
+        "### [S1] CRITICAL — RCE in upload (resolved)\nVerified.\n\n"
         "### [S2] LOW — new issue\nBody.\n",
     )
 
-    assert _count_findings_in_review_file(path) == _counts(low=1)
+    assert _count_findings_in_review_file(path) == _counts(critical=1, low=1)
 
 
 # ---------- Summary scoping ----------
