@@ -230,7 +230,7 @@ def test_defensive_invariant_rejects_untrusted_artifact(tmp_path):
 
 
 def test_single_task_call_site_demotes_outcome_on_failed_reviewer(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, capsys,
 ):
     _write_developer_self_review(tmp_path, 3102)
     merge_outcomes: list[str] = []
@@ -261,6 +261,9 @@ def test_single_task_call_site_demotes_outcome_on_failed_reviewer(
 
     assert outcome == "security_review_blocked"
     assert merge_outcomes == ["security_review_blocked"]
+    # The operator must see WHY: a reviewer failure, not a finding count or
+    # a "missing artifact" (the developer's file IS on disk).
+    assert "security reviewer FAILED (timeout)" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
