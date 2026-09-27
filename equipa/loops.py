@@ -373,6 +373,16 @@ async def run_security_review(
     # frequently logged as "artifact missing" and discarded.
     security_task = dict(task)  # copy
     task_id = task.get("id")
+    # Task #3041: supersede any earlier cycle's record BEFORE anything below
+    # can raise. A crash during setup then leaves this run marked running
+    # (the gate blocks as reviewer-failed) instead of a previous cycle's
+    # SUCCEEDED record that still verifies against the file on disk.
+    record_reviewer_run(ReviewerRunRecord(
+        task_id=task_id,
+        nonce="",
+        status=REVIEWER_STATUS_RUNNING,
+        started_at=time.time(),
+    ))
     # Task 2476: write under .equipa-artifacts/ to avoid polluting the
     # downstream repo root. Ensure the dir exists before the agent runs.
     ensure_artifacts_dir(project_dir)

@@ -295,6 +295,37 @@ def test_reviewer_crash_mid_run_blocks_as_reviewer_failed(
     )
 
 
+def test_reviewer_setup_crash_supersedes_previous_cycles_success(
+    tmp_path, reviewer_harness, monkeypatch, capsys,
+):
+    """Cycle 1's reviewer succeeds; cycle 2's reviewer crashes during setup,
+    before its first attempt. Cycle 1's artifact is still on disk, unchanged
+    and nonce-bearing — it must NOT verify as this cycle's review."""
+    reviewer_harness.task_id = 3113
+    reviewer_harness.behaviours = [_writes_review(tmp_path)]
+    _run_review(3113, tmp_path)
+    assert verify_reviewer_provenance(
+        3113, _artifact(tmp_path, 3113),
+    ).trusted
+
+    def config_unreadable(_path):
+        raise OSError("dispatch_config.json unreadable")
+
+    monkeypatch.setattr(loops, "load_dispatch_config", config_unreadable)
+    with pytest.raises(OSError, match="unreadable"):
+        _run_review(3113, tmp_path)
+
+    assert reviewer_run_failure(3113) == "crashed"
+    capsys.readouterr()  # discard cycle 1's output
+    blocks, counts = _security_review_blocks_merge(
+        str(tmp_path), 3113, block_on_missing=False,
+    )
+    assert (blocks, counts) == (True, None)
+    assert "event=reviewer-failed reason=reviewer-running" in (
+        capsys.readouterr().err
+    )
+
+
 # ---------------------------------------------------------------------------
 # (2) only an artifact written by this cycle's reviewer run is accepted
 # ---------------------------------------------------------------------------
