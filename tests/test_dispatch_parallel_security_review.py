@@ -34,6 +34,14 @@ from equipa.dispatch import (
     _security_review_blocks_merge,
     run_parallel_tasks,
 )
+from equipa.security_gate import (
+    REVIEWER_STATUS_FAILED,
+    REVIEWER_STATUS_SKIPPED_DOC_ONLY,
+    REVIEWER_STATUS_SUCCEEDED,
+    ReviewerRunRecord,
+    get_reviewer_run,
+    record_reviewer_run,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -854,3 +862,100 @@ import contextlib  # noqa: E402 (kept near use to stay close to caller)
 def caplog_at_warning():
     """No-op context — placeholder for future log-content assertions."""
     yield
+
+
+# ---------------------------------------------------------------------------
+# Task #3041 — reviewer-run provenance at the parallel-mode call site
+# ---------------------------------------------------------------------------
+
+
+def _two_tasks_patch(first_id: int):
+    return patch(
+        "equipa.dispatch.fetch_tasks_by_ids",
+        return_value=[
+            {"id": first_id, "project_id": 1, "title": "t1",
+             "description": "d", "role": "developer"},
+            {"id": first_id + 1, "project_id": 1, "title": "t2",
+             "description": "d", "role": "developer"},
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_reviewer_blocks_despite_clean_developer_artifact(
+    tmp_path, capsys,
+):
+    """#3035 shape: the reviewer timed out after its retry, but a clean
+    developer self-review sits at the artifact path. Parallel mode must
+    demote the outcome and tell the operator the REVIEWER failed."""
+    args = _make_args(
+        security_review=True,
+        dispatch_config={"security_review": True},
+    )
+
+    def writer(task_dir: Path, task_id: int):
+        _write_review(task_dir / f"SECURITY-REVIEW-{task_id}.md")
+
+    async def timed_out_review(task, project_dir, project_context, args,
+                               output=None, stable_project_dir=None):
+        writer(Path(stable_project_dir or project_dir), task["id"])
+        record_reviewer_run(ReviewerRunRecord(
+            task_id=task["id"], nonce="3" * 32,
+            status=REVIEWER_STATUS_FAILED, started_at=0.0, attempts=2,
+            failure_reason="timeout",
+        ))
+        return {"success": False, "duration": 0.0, "result_text": "",
+                "errors": ["Process timed out after 900 seconds"]}
+
+    patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = _two_tasks_patch(3041)
+    patches[5] = patch(
+        "equipa.dispatch.run_security_review", side_effect=timed_out_review,
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+         patches[5], patches[6], patches[7], patches[8], \
+         patches[9] as mock_status, patches[10], patches[11], patches[12], \
+         patches[13]:
+        await run_parallel_tasks([3041, 3042], args)
+
+    assert merge_calls == []
+    assert [c[0][1] for c in mock_status.call_args_list] == [
+        "security_review_blocked", "security_review_blocked",
+    ]
+    assert "security reviewer FAILED (timeout)" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_docs_only_skip_is_recorded_for_the_gate(tmp_path):
+    """The parallel call site must record its doc-only skip, replacing an
+    earlier cycle's 'succeeded' run that could otherwise vouch for it."""
+    args = _make_args(
+        security_review=True,
+        dispatch_config={"security_review": True},
+    )
+    for task_id in (3043, 3044):
+        record_reviewer_run(ReviewerRunRecord(
+            task_id=task_id, nonce="4" * 32,
+            status=REVIEWER_STATUS_SUCCEEDED, started_at=0.0,
+        ))
+
+    def writer(task_dir: Path, task_id: int):  # pragma: no cover
+        raise AssertionError("security reviewer must not run on doc-only diff")
+
+    patches, _merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = _two_tasks_patch(3043)
+    patches[13] = patch(
+        "equipa.dispatch.get_changed_files_for_branch",
+        new=AsyncMock(return_value=["README.md"]),
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+         patches[5], patches[6], patches[7], patches[8], patches[9], \
+         patches[10], patches[11], patches[12], patches[13]:
+        await run_parallel_tasks([3043, 3044], args)
+
+    for task_id in (3043, 3044):
+        assert get_reviewer_run(task_id).status == (
+            REVIEWER_STATUS_SKIPPED_DOC_ONLY
+        )

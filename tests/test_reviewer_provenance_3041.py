@@ -42,6 +42,7 @@ from equipa.loops import (
 )
 from equipa.security_gate import (
     REVIEWER_STATUS_FAILED,
+    REVIEWER_STATUS_SKIPPED_DOC_ONLY,
     REVIEWER_STATUS_SUCCEEDED,
     ReviewerRunRecord,
     SecurityGateBypassError,
@@ -266,6 +267,34 @@ def test_single_task_call_site_demotes_outcome_on_failed_reviewer(
     assert "security reviewer FAILED (timeout)" in capsys.readouterr().out
 
 
+def test_reviewer_crash_mid_run_blocks_as_reviewer_failed(
+    tmp_path, reviewer_harness, capsys,
+):
+    """run_agent raises: the run never finishes, so no reviewer-run audit
+    line is written and the record stays 'running'. The gate's own
+    provenance check must still block and label it event=reviewer-failed."""
+    _write_developer_self_review(tmp_path, 3112)
+
+    def crashes(_task_id, _nonce):
+        raise RuntimeError("reviewer subprocess died")
+
+    reviewer_harness.task_id = 3112
+    reviewer_harness.behaviours = [crashes]
+
+    with pytest.raises(RuntimeError, match="subprocess died"):
+        _run_review(3112, tmp_path)
+
+    assert reviewer_run_failure(3112) == "crashed"
+    capsys.readouterr()  # discard the reviewer's own output
+    blocks, counts = _security_review_blocks_merge(
+        str(tmp_path), 3112, block_on_missing=False,
+    )
+    assert (blocks, counts) == (True, None)
+    assert "event=reviewer-failed reason=reviewer-running" in (
+        capsys.readouterr().err
+    )
+
+
 # ---------------------------------------------------------------------------
 # (2) only an artifact written by this cycle's reviewer run is accepted
 # ---------------------------------------------------------------------------
@@ -343,6 +372,38 @@ def test_doc_only_skip_then_code_diff_gate_blocks(tmp_path):
         str(tmp_path), 3106, block_on_missing=False,
     )
     assert blocks is True
+
+
+def test_single_task_doc_only_skip_replaces_prior_reviewer_run(
+    tmp_path, monkeypatch,
+):
+    """The single-task call site must record its doc-only skip, so an earlier
+    cycle's 'succeeded' run cannot vouch for a later gate evaluation."""
+    record_reviewer_run(ReviewerRunRecord(
+        task_id=3113, nonce="2" * 32, status=REVIEWER_STATUS_SUCCEEDED,
+        started_at=0.0,
+    ))
+
+    async def must_not_review(*_args, **_kwargs):
+        raise AssertionError("reviewer ran for a doc-only diff")
+
+    async def doc_diff(*_args, **_kwargs):
+        return ["README.md"]
+
+    async def fake_post_merge(**_kwargs):
+        return "skipped"
+
+    monkeypatch.setattr(cli, "run_security_review", must_not_review)
+    monkeypatch.setattr(cli, "get_changed_files_for_branch", doc_diff)
+    monkeypatch.setattr(cli, "is_security_review_enabled", lambda _a: True)
+    monkeypatch.setattr(cli, "_gated_post_merge", fake_post_merge)
+    args = SimpleNamespace(dispatch_config={"security_review": True},
+                           dev_test=True)
+
+    asyncio.run(cli._run_security_review_and_gate(
+        {"id": 3113}, str(tmp_path), {}, args, "tests_passed"))
+
+    assert get_reviewer_run(3113).status == REVIEWER_STATUS_SKIPPED_DOC_ONLY
 
 
 def test_no_recorded_run_keeps_artifact_only_behaviour(tmp_path, capsys):
