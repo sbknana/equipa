@@ -560,7 +560,8 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # of a Summary line (after emphasis/brackets), so a finished review whose
 # Summary reads "Reviewed the TODO-list API" is not held as unfinished.
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
-    r"^[ \t*_\[(:—–-]*(?:IN[ \t_-]*PROGRESS|skeleton|TODO)\b", re.IGNORECASE,
+    r"^[ \t*_\[(:—–-]*(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b",
+    re.IGNORECASE,
 )
 _SUMMARY_HEADING_RE = re.compile(
     r"^#{1,6}[ \t]*\**[ \t]*Summary\b(.*)$", re.IGNORECASE,
@@ -610,8 +611,14 @@ _FINDING_CANDIDATE_RE = re.compile(
     r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)"
     r"[^\n]{0,40}?"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
-    r")(?<![A-Za-z])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z])",
+    r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
     re.MULTILINE | re.IGNORECASE,
+)
+# A fix-verification recap whose heading / bold lead-in ENDS in an UPPERCASE
+# status ("- **F1 (HIGH, renderer SSRF): FIXED.**") is not a live candidate.
+# UPPERCASE only: lowercase "(fixed at zero)" title wording never exempts.
+_RESOLVED_CANDIDATE_TAIL_RE = re.compile(
+    r"[—–:→.)-][ \t*_]*(?:FIXED|RESOLVED)\b[^*\n]{0,40}$",
 )
 
 # Task #3038 (S3033-03): unreplaced placeholders from the report skeleton in
@@ -721,6 +728,24 @@ def _blank_code(text: str) -> str:
     return "\n".join(visible)
 
 
+def _is_resolved_candidate(match: re.Match[str]) -> bool:
+    """True when a finding candidate's title span ends in a resolved status.
+
+    The title span is the whole line for a heading, else the bold lead-in
+    (up to its closing ``**``) of a bullet or bold line.
+    """
+    text = match.string
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.start())
+    line = text[line_start:line_end if line_end != -1 else None]
+    if not line.lstrip().startswith("#"):
+        bold_open = line.find("**")
+        bold_close = line.find("**", bold_open + 2) if bold_open != -1 else -1
+        if bold_close != -1:
+            line = line[:bold_close]
+    return bool(_RESOLVED_CANDIDATE_TAIL_RE.search(line.rstrip(" \t*_#")))
+
+
 def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
     """Parse a SECURITY-REVIEW-NNNN.md artifact without trusting any one source.
 
@@ -778,7 +803,8 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
 
     candidate_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _FINDING_CANDIDATE_RE.finditer(visible_text):
-        candidate_counts[match.group(1).upper()] += 1
+        if not _is_resolved_candidate(match):
+            candidate_counts[match.group(1).upper()] += 1
 
     # S3033-04: the LAST footer wins, so an earlier quoted/skeleton footer
     # cannot mask the reviewer's final tally.
