@@ -29,16 +29,247 @@ must go through that one path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import secrets
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from equipa.git_ops import git_run_async
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Task #3041 — reviewer-run provenance.
+#
+# Observed on CryptoTrader #3035: the security reviewer timed out, the
+# orchestrator then copied the DEVELOPER's self-review (committed on the task
+# branch at the reviewer's artifact path) to the stable path, and the gate
+# parsed it as the reviewer's verdict and merged. The gate must only trust an
+# artifact written BY the reviewer run of this cycle. The trust anchor is an
+# in-process record the agents cannot reach:
+#
+#   * a nonce minted when each reviewer attempt starts. It appears ONLY in
+#     that attempt's prompt, so an artifact carrying it was written by that
+#     run — never by the developer, whose session ended before it existed;
+#   * the artifact fingerprint (path, sha256, mtime) before the run started
+#     and after it finished, so a pre-existing file or one edited after the
+#     review is rejected and every gate line names the exact bytes it parsed;
+#   * the run status. A failed / timed-out / crashed run blocks the merge
+#     regardless of any artifact on disk.
+# ---------------------------------------------------------------------------
+
+REVIEWER_STATUS_RUNNING = "running"
+REVIEWER_STATUS_SUCCEEDED = "succeeded"
+REVIEWER_STATUS_FAILED = "failed"
+REVIEWER_STATUS_SKIPPED_DOC_ONLY = "skipped-doc-only"
+
+# Provenance reasons that mean "no usable reviewer run happened", logged as
+# GATE-AUDIT event=reviewer-failed. Every other untrusted reason is an
+# artifact problem, logged as event=artifact-provenance-rejected.
+_REVIEWER_FAILED_REASONS: frozenset[str] = frozenset({
+    f"reviewer-{REVIEWER_STATUS_FAILED}",
+    f"reviewer-{REVIEWER_STATUS_RUNNING}",
+})
+
+_REVIEWER_NONCE_LINE_TEMPLATE = "<!-- EQUIPA-REVIEWER-RUN: {nonce} -->"
+_REVIEWER_NONCE_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*EQUIPA-REVIEWER-RUN:[ \t]*([0-9a-f]{32})[ \t]*-->[ \t]*$",
+    re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class ArtifactFingerprint:
+    """What a review artifact looked like at one instant."""
+
+    path: str
+    exists: bool
+    sha256: str | None = None
+    mtime: float | None = None
+    size: int | None = None
+
+    def describe(self) -> str:
+        """Render as ``artifact=<path> sha256=<16 hex> mtime=<ts> size=<n>``."""
+        if not self.exists:
+            return f"artifact={self.path} exists=False"
+        return (
+            f"artifact={self.path} sha256={(self.sha256 or '')[:16]} "
+            f"mtime={self.mtime:.3f} size={self.size}"
+        )
+
+
+def fingerprint_artifact(path: str | os.PathLike) -> ArtifactFingerprint:
+    """Hash ``path`` and capture its mtime; ``exists=False`` when unreadable."""
+    artifact = Path(path)
+    try:
+        data = artifact.read_bytes()
+        mtime = artifact.stat().st_mtime
+    except FileNotFoundError:
+        return ArtifactFingerprint(path=str(artifact), exists=False)
+    except OSError as exc:
+        # A directory or permission error at the artifact path is not a
+        # review — report it as absent so every caller fails closed.
+        logger.warning("[security-gate] cannot read artifact %s: %s", artifact, exc)
+        return ArtifactFingerprint(path=str(artifact), exists=False)
+    return ArtifactFingerprint(
+        path=str(artifact),
+        exists=True,
+        sha256=hashlib.sha256(data).hexdigest(),
+        mtime=mtime,
+        size=len(data),
+    )
+
+
+@dataclass(frozen=True)
+class ReviewerRunRecord:
+    """The orchestrator's own record of one task's security-reviewer run."""
+
+    task_id: int | str
+    nonce: str
+    status: str
+    started_at: float
+    pre_artifact: ArtifactFingerprint | None = None
+    post_artifact: ArtifactFingerprint | None = None
+    attempts: int = 0
+    duration: float = 0.0
+    timeouts: tuple[int, ...] = ()
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ProvenanceVerdict:
+    """Whether the gate may believe the artifact at ``fingerprint.path``."""
+
+    trusted: bool
+    reason: str
+    fingerprint: ArtifactFingerprint
+
+    @property
+    def audit_event(self) -> str:
+        """GATE-AUDIT event name for an untrusted verdict."""
+        if self.reason in _REVIEWER_FAILED_REASONS:
+            return "reviewer-failed"
+        return "artifact-provenance-rejected"
+
+
+_REVIEWER_RUNS: dict[str, ReviewerRunRecord] = {}
+_REVIEWER_RUNS_LOCK = threading.Lock()
+
+
+def new_reviewer_nonce() -> str:
+    """Mint a fresh 128-bit reviewer-run nonce (32 lowercase hex chars)."""
+    return secrets.token_hex(16)
+
+
+def reviewer_nonce_line(nonce: str) -> str:
+    """The exact line a reviewer run must write into its artifact."""
+    return _REVIEWER_NONCE_LINE_TEMPLATE.format(nonce=nonce)
+
+
+def artifact_nonces(text: str) -> set[str]:
+    """Every reviewer-run nonce line present in ``text``."""
+    return set(_REVIEWER_NONCE_RE.findall(text or ""))
+
+
+def record_reviewer_run(record: ReviewerRunRecord) -> None:
+    """Store ``record`` as the current reviewer run for its task."""
+    with _REVIEWER_RUNS_LOCK:
+        _REVIEWER_RUNS[str(record.task_id)] = record
+
+
+def get_reviewer_run(task_id: int | str) -> ReviewerRunRecord | None:
+    """The current reviewer run recorded for ``task_id`` in this process."""
+    with _REVIEWER_RUNS_LOCK:
+        return _REVIEWER_RUNS.get(str(task_id))
+
+
+def clear_reviewer_runs() -> None:
+    """Forget every recorded reviewer run (test isolation)."""
+    with _REVIEWER_RUNS_LOCK:
+        _REVIEWER_RUNS.clear()
+
+
+def verify_reviewer_provenance(
+    task_id: int | str, review_path: str | os.PathLike,
+) -> ProvenanceVerdict:
+    """Decide whether the artifact at ``review_path`` is this cycle's review.
+
+    Untrusted (the merge must block, whatever ``block_on_missing`` says):
+
+      * ``reviewer-failed`` / ``reviewer-running`` — the run failed, timed
+        out or crashed before finishing;
+      * ``reviewer-skipped-doc-only`` — the caller skipped the reviewer as
+        doc-only, yet the gate is evaluating a code diff;
+      * ``artifact-missing`` / ``artifact-not-written-by-reviewer`` — nothing
+        on disk, or the reviewer left nothing at its path when it finished;
+      * ``artifact-pre-existing`` — the bytes equal the file that was there
+        before the reviewer started (e.g. a developer self-review);
+      * ``reviewer-nonce-missing`` — the file lacks this run's nonce line;
+      * ``artifact-changed-after-review`` — edited after the reviewer ended.
+
+    When no run was recorded for the task in this process the verdict is
+    trusted with reason ``no-reviewer-run-recorded``: both production gate
+    paths run (or explicitly skip) the reviewer in-process first, so this
+    only covers direct gate callers, which keep the pre-#3041 artifact-only
+    behaviour. The reason is logged so such a gate evaluation is visible.
+    """
+    fingerprint = fingerprint_artifact(review_path)
+    record = get_reviewer_run(task_id)
+    if record is None:
+        return ProvenanceVerdict(True, "no-reviewer-run-recorded", fingerprint)
+    if record.status != REVIEWER_STATUS_SUCCEEDED:
+        return ProvenanceVerdict(False, f"reviewer-{record.status}", fingerprint)
+    if not fingerprint.exists:
+        return ProvenanceVerdict(False, "artifact-missing", fingerprint)
+    post = record.post_artifact
+    if post is None or not post.exists:
+        return ProvenanceVerdict(
+            False, "artifact-not-written-by-reviewer", fingerprint,
+        )
+    pre = record.pre_artifact
+    if pre is not None and pre.exists and pre.sha256 == fingerprint.sha256:
+        return ProvenanceVerdict(False, "artifact-pre-existing", fingerprint)
+    try:
+        text = Path(review_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.warning("[security-gate] cannot read artifact %s: %s", review_path, exc)
+        return ProvenanceVerdict(False, "artifact-missing", fingerprint)
+    if record.nonce not in artifact_nonces(text):
+        return ProvenanceVerdict(False, "reviewer-nonce-missing", fingerprint)
+    if post.sha256 != fingerprint.sha256:
+        return ProvenanceVerdict(
+            False, "artifact-changed-after-review", fingerprint,
+        )
+    return ProvenanceVerdict(True, "verified", fingerprint)
+
+
+def audit_reviewer_run(record: ReviewerRunRecord) -> None:
+    """Emit the GATE-AUDIT line summarising a finished reviewer run.
+
+    ``event=reviewer-failed`` for a failed run (so the block is explained
+    before the gate even runs), ``event=reviewer-run`` otherwise. Duration,
+    attempts and per-attempt timeouts are always included so reviewer
+    timeouts are visible without reading the raw agent log.
+    """
+    failed = record.status != REVIEWER_STATUS_SUCCEEDED
+    event = "reviewer-failed" if failed else "reviewer-run"
+    timeouts = ",".join(str(value) for value in record.timeouts) or "-"
+    post = record.post_artifact
+    line = (
+        f"task={record.task_id} event={event} status={record.status} "
+        f"attempts={record.attempts} duration={record.duration:.1f}s "
+        f"timeouts={timeouts} nonce={record.nonce[:8]} "
+        f"{post.describe() if post is not None else 'artifact=unknown'}"
+    )
+    if failed:
+        line += f" reason={record.failure_reason or 'unknown'}"
+    _gate_audit_log(line, task_id=record.task_id, event=event)
 
 
 @dataclass(frozen=True)
