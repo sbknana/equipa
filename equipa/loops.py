@@ -279,18 +279,30 @@ async def run_security_review(
         # (merge blocked). The instructions below say so, so a reviewer
         # knows a skeleton footer or a severity word in a non-finding
         # "###" heading will block the merge.
+        # Task #3038: the parser now also scans headings of every level and
+        # bold lead-ins, counts resolved headings, requires the footer to be
+        # the final section, rejects template placeholders and needs a
+        # zero-finding review to say so. Stated here so an honest reviewer
+        # does not trip those checks.
         f"Give EVERY finding its own heading formatted as "
         f"`### [TAG-NN] SEVERITY — title`, and do NOT put the words "
-        f"CRITICAL, HIGH, MEDIUM, LOW or INFO in any other `###` heading. "
+        f"CRITICAL, HIGH, MEDIUM, LOW or INFO in any other heading (any "
+        f"`#` level) or at the start of any other bold lead-in such as "
+        f"`- **[S1] HIGH** —`. A finding heading still counts even when "
+        f"it is marked fixed or resolved, so describe already-fixed "
+        f"upstream findings in prose or a table, not as severity headings. "
         f"The review MUST end with a footer formatted EXACTLY as:\n"
         f"## Counts\n"
         f"CRITICAL: N | HIGH: N | MEDIUM: N | LOW: N | INFO: N\n"
         f"where each N is the integer count of findings at that "
         f"severity. The orchestrator counts BOTH the footer and the "
         f"finding headings: if they disagree the merge is BLOCKED. Update "
-        f"the footer last, after every finding is written. A review whose "
-        f"Summary still says IN PROGRESS, skeleton or TODO is treated as "
-        f"unfinished and also BLOCKS the merge. "
+        f"the footer last, after every finding is written; nothing may "
+        f"follow it. Replace every template placeholder such as "
+        f"[SEVERITY] or [PASS/FAIL]. A review whose Summary still says "
+        f"IN PROGRESS, skeleton or TODO is treated as unfinished and also "
+        f"BLOCKS the merge. A review with no findings must say so in its "
+        f"Summary (for example 'No findings.'). "
         f"Original task description: {task['description']}"
     )
 

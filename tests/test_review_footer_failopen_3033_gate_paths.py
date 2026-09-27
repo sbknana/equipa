@@ -290,6 +290,14 @@ async def test_security_reviewer_prompt_states_fail_closed_rules(
     assert "if they disagree the merge is BLOCKED" in description
     assert "Update the footer last" in description
     assert "IN PROGRESS, skeleton or TODO" in description
+    # Task #3038: the rules the stricter parser added are stated too.
+    assert "any other heading (any `#` level)" in description
+    assert "still counts even when it is marked fixed or resolved" in (
+        description
+    )
+    assert "nothing may follow it" in description
+    assert "[PASS/FAIL]" in description
+    assert "A review with no findings must say so" in description
     # The pre-#3033 claim that the footer wins must be gone.
     assert "falls back to header counting" not in description
 
