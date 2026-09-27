@@ -624,6 +624,13 @@ _TEMPLATE_PLACEHOLDER_RE = re.compile(
     r"|\[X (?:findings|pattern matches|files inspected)",
     re.IGNORECASE,
 )
+# Positive completion signal for a zero-finding review without a Summary,
+# e.g. "No blocking findings." / "No security issues found." / "Findings: none".
+_NO_FINDINGS_STATEMENT_RE = re.compile(
+    r"\bno\b[^\n.]{0,40}?\b(?:findings?|issues?|vulnerabilit(?:y|ies))\b"
+    r"|\b(?:findings?|issues?)\b[ \t]*[:—–-][ \t]*\**none\b",
+    re.IGNORECASE,
+)
 _CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _ANY_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.MULTILINE)
@@ -775,10 +782,9 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
 
     # S3033-04: the LAST footer wins, so an earlier quoted/skeleton footer
     # cannot mask the reviewer's final tally.
+    footer_matches = list(_REVIEW_COUNTS_FOOTER_RE.finditer(visible_text))
+    footer = footer_matches[-1] if footer_matches else None
     footer_counts: dict[str, int] | None = None
-    footer = None
-    for footer in _REVIEW_COUNTS_FOOTER_RE.finditer(visible_text):
-        pass
     if footer is not None:
         footer_counts = {
             severity: int(footer.group(index))
@@ -886,12 +892,16 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
                 f"near-empty review ({nonblank_lines} non-blank lines, "
                 f"no findings)",
             )
-        # S3033-03: a zero-finding review must say what it concluded. A
-        # missing or empty Summary is a skeleton the reviewer never filled.
-        if not any(line.strip(" \t*_:—–-") for line in summary_lines):
+        # S3033-03: a zero-finding review must say what it concluded, in a
+        # non-empty Summary or an explicit "no findings" statement. Neither
+        # means a skeleton the reviewer never filled.
+        has_summary = any(line.strip(" \t*_:—–-") for line in summary_lines)
+        if not has_summary and not _NO_FINDINGS_STATEMENT_RE.search(
+            visible_text,
+        ):
             return _verdict(
                 REVIEW_VERDICT_INCOMPLETE,
-                "zero-finding review has no Summary content",
+                "zero-finding review has no Summary or no-findings statement",
             )
 
     return _verdict(REVIEW_VERDICT_OK)
