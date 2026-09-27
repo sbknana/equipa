@@ -600,19 +600,24 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 
 # Task #3038 (S3033-02): detection-only tally of finding-shaped lines the
 # strict level-3 header regex cannot see: a severity word (any case)
-# anywhere in a heading of ANY level (the strict regex stops at 80 chars),
-# inside the leading bold span of a line, bullet or numbered item
-# ("**HIGH — nonce reuse**", "1. **[S1] HIGH** —", "**S1 (HIGH):**"), or
-# after a bracketed tag on a bullet ("- [S1] HIGH —"). It never adds to the
-# merge counts; a severity it sees that neither the footer nor the strict
-# headers count makes the review a count-mismatch (fail closed).
-# Checklist boxes ("- [x] XSS: PASS") are not finding tags, and a severity
-# after the bold span ("**Severity:** HIGH") belongs to an enclosing
-# heading, which is itself a candidate.
+# anywhere in a heading of ANY level (the strict regex stops at 80 chars);
+# in the leading bold span of a line, bullet or numbered item, either after
+# a finding tag ("1. **[S1] ... HIGH** —", "**S1 (HIGH):**") or as an
+# UPPERCASE status that opens the span ("**HIGH — nonce reuse**",
+# "- **(HIGH)** ..."); or after a bracketed tag on a bullet ("- [S1] HIGH
+# —"). It never adds to the merge counts; a severity it sees that neither
+# the footer nor the strict headers count makes the review a count-mismatch
+# (fail closed). Not candidates: checklist boxes ("- [x] XSS: PASS"), bold
+# prose ("**No CRITICAL or HIGH findings.**", "**Medium (30 min):**") and a
+# severity after the bold span ("**Severity:** HIGH"), which belongs to an
+# enclosing heading that is itself a candidate.
 _FINDING_CANDIDATE_RE = re.compile(
     r"^[ \t]{0,3}(?:"
     r"#{1,6}[ \t][^\n]*?"
-    r"|(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?\*\*[^*\n]*?"
+    r"|(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?\*\*[ \t]*(?:"
+    r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)[^*\n]*?"
+    r"|[\[(]?[ \t]*(?=(?-i:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-]))"
+    r")"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
     r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
     re.MULTILINE | re.IGNORECASE,
