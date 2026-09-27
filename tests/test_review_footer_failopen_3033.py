@@ -298,6 +298,46 @@ def test_matching_footer_and_headers_pass(
     )
 
 
+@pytest.mark.parametrize(
+    "resolved_heading",
+    [
+        # Shapes seen on StockForge #3029 and 3DGenerator #3000, which the
+        # audit found merged correctly with the footer excluding them.
+        "### SR29-00 HIGH (fixed, verified, not counted) — duplicate key\n",
+        "### SR-2996 S1 (MEDIUM) — FIXED, verified\n",
+        "### [S1] HIGH [RESOLVED] — token leak\n",
+    ],
+)
+def test_resolved_fix_verification_headings_are_not_live_findings(
+    tmp_path: Path, persisted_audit_events: list[dict], resolved_heading: str,
+) -> None:
+    path = _write_review(
+        tmp_path,
+        "# Security Re-review\n\nSummary: prior findings verified fixed.\n\n"
+        + resolved_heading + "Verified.\n\n"
+        "### [V1] LOW — new minor issue\n\n"
+        "## Counts\n"
+        "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0\n",
+    )
+
+    assert _count_findings_in_review_file(path) == _counts(low=1)
+
+
+def test_fixed_word_in_title_is_still_a_live_finding(
+    tmp_path: Path, persisted_audit_events: list[dict],
+) -> None:
+    # "Fixed-size" is part of the title, not a resolution status: with a
+    # stale zero footer this must still be a mismatch, never a clean merge.
+    _write_review(
+        tmp_path,
+        "# Security Review\n\nSummary: done.\n\n"
+        "### [S1] HIGH — Fixed-size buffer overflow in frame parser\n"
+        "Body.\n\n" + ZERO_FOOTER,
+    )
+
+    assert _security_review_blocks_merge(str(tmp_path), TASK_ID) == (True, None)
+
+
 def test_headers_without_footer_use_header_counts(
     tmp_path: Path, persisted_audit_events: list[dict],
 ) -> None:

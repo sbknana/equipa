@@ -569,6 +569,19 @@ _SUMMARY_FIELD_RE = re.compile(
 )
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 
+# Task #3033: fix-verification re-reviews keep the prior finding's heading
+# but mark it resolved and leave it out of the footer, e.g.
+#   ### SR29-00 HIGH (fixed, verified, not counted) — ...
+#   ### SR-2996 S1 (MEDIUM) — FIXED, verified
+# Such headings are not live findings and are excluded from the header
+# tally. Deliberately narrow: the marker must sit in a (...)/[...] group or
+# be an UPPERCASE status right after a separator, so a title like
+# "Fixed-size buffer overflow" is still counted.
+_RESOLVED_FINDING_HEADER_RE = re.compile(
+    r"[(\[][^)\]\n]*\b(?i:fixed|resolved|not[ \t]+counted)\b[^)\]\n]*[)\]]"
+    r"|[—–:-][ \t]*(?:FIXED|RESOLVED)\b",
+)
+
 # Task #3033: a review with zero finding headers, an all-zero (or absent)
 # footer and fewer non-blank lines than this is a skeleton, not a clean
 # review. Deliberately low: a terse "no findings" review (title, one line of
@@ -661,6 +674,10 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
 
     header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
+        line_end = text.find("\n", match.start())
+        header_line = text[match.start():line_end if line_end != -1 else None]
+        if _RESOLVED_FINDING_HEADER_RE.search(header_line):
+            continue
         header_counts[match.group(1)] += 1
 
     footer_counts: dict[str, int] | None = None
