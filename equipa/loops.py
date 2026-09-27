@@ -594,22 +594,23 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
     r"|[(\[][^)\]\n]*\b(?i:not[ \t]+counted)\b[^)\]\n]*[)\]]"
     r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
     r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
+    r"(?:[ \t]*\([^()\n]{0,60}\))?"
     r")[ \t*_.\r]*$",
 )
 
 # Task #3038 (S3033-02): detection-only tally of finding-shaped lines the
 # strict level-3 header regex cannot see: a severity word (any case) in a
-# heading of ANY level, or after a finding tag in a bold line / bullet
+# heading of level 2-6, or after a finding tag inside a bold line / bullet
 # ("- **[S1] HIGH** —", "**S1 (HIGH):**", "- [S1] HIGH —"). It never adds to
 # the merge counts; a severity it sees that neither the footer nor the
 # strict headers count makes the review a count-mismatch (fail closed).
 # Checklist boxes ("- [x] XSS: PASS") are not finding tags.
 _FINDING_CANDIDATE_RE = re.compile(
     r"^[ \t]{0,3}(?:"
-    r"#{1,6}[ \t][^\n]{0,80}?"
+    r"#{2,6}[ \t][^\n]{0,80}?"
     r"|(?:[-*+][ \t]+)?\*\*[ \t]*"
     r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)"
-    r"[^\n]{0,40}?"
+    r"[^*\n]{0,40}?"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
     r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
     re.MULTILINE | re.IGNORECASE,
@@ -634,8 +635,10 @@ _TEMPLATE_PLACEHOLDER_RE = re.compile(
 # Positive completion signal for a zero-finding review without a Summary,
 # e.g. "No blocking findings." / "No security issues found." / "Findings: none".
 _NO_FINDINGS_STATEMENT_RE = re.compile(
-    r"\bno\b[^\n.]{0,40}?\b(?:findings?|issues?|vulnerabilit(?:y|ies))\b"
-    r"|\b(?:findings?|issues?)\b[ \t]*[:—–-][ \t]*\**none\b",
+    r"(?<![A-Za-z])no(?![A-Za-z])[^\n.]{0,40}?"
+    r"(?<![A-Za-z])(?:findings?|issues?|vulnerabilit(?:y|ies))(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:findings?|issues?)[ \t]*[:—–-][ \t]*[*_]*none"
+    r"(?![A-Za-z])",
     re.IGNORECASE,
 )
 _CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
