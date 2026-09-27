@@ -574,11 +574,13 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 #   ### SR29-00 HIGH (fixed, verified, not counted) — ...
 #   ### SR-2996 S1 (MEDIUM) — FIXED, verified
 # Such headings are not live findings and are excluded from the header
-# tally. Deliberately narrow: the marker must sit in a (...)/[...] group or
-# be an UPPERCASE status right after a separator, so a title like
-# "Fixed-size buffer overflow" is still counted.
+# tally. Deliberately narrow: a (...)/[...] group must START with
+# fixed/resolved or say "not counted", or an UPPERCASE status must follow a
+# separator. So "Fixed-size buffer overflow" and StockForge #3032's live
+# "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed)" still count.
 _RESOLVED_FINDING_HEADER_RE = re.compile(
-    r"[(\[][^)\]\n]*\b(?i:fixed|resolved|not[ \t]+counted)\b[^)\]\n]*[)\]]"
+    r"[(\[][ \t]*(?i:fixed|resolved)\b[^)\]\n]*[)\]]"
+    r"|[(\[][^)\]\n]*\b(?i:not[ \t]+counted)\b[^)\]\n]*[)\]]"
     r"|[—–:-][ \t]*(?:FIXED|RESOLVED)\b",
 )
 
@@ -673,12 +675,14 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
         return ReviewCountAnalysis(verdict=REVIEW_VERDICT_FALLBACK)
 
     header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    resolved_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         line_end = text.find("\n", match.start())
         header_line = text[match.start():line_end if line_end != -1 else None]
         if _RESOLVED_FINDING_HEADER_RE.search(header_line):
-            continue
-        header_counts[match.group(1)] += 1
+            resolved_counts[match.group(1)] += 1
+        else:
+            header_counts[match.group(1)] += 1
 
     footer_counts: dict[str, int] | None = None
     footer = _REVIEW_COUNTS_FOOTER_RE.search(text)
@@ -705,17 +709,23 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
             detail=detail,
         )
 
-    headers_total = sum(header_counts.values())
+    headers_total = sum(header_counts.values()) + sum(resolved_counts.values())
     footer_total = sum(footer_counts.values()) if footer_counts else 0
 
     # A footer that disagrees with non-empty headers is stale or wrong, and
     # there is no way to tell which side is right — fail closed. Zero headers
-    # with a non-zero footer is the one tolerated disagreement.
-    if (
-        footer_counts is not None
-        and headers_total > 0
-        and footer_counts != header_counts
-    ):
+    # with a non-zero footer is the one tolerated disagreement. The footer
+    # may or may not count resolved fix-verification headings, so per
+    # severity it must lie in [live, live + resolved].
+    footer_disagrees = footer_counts is not None and any(
+        not (
+            header_counts[severity]
+            <= footer_counts[severity]
+            <= header_counts[severity] + resolved_counts[severity]
+        )
+        for severity in _REVIEW_SEVERITIES
+    )
+    if headers_total > 0 and footer_disagrees:
         return _verdict(
             REVIEW_VERDICT_COUNT_MISMATCH,
             "footer and finding headers disagree",

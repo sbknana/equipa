@@ -338,6 +338,35 @@ def test_fixed_word_in_title_is_still_a_live_finding(
     assert _security_review_blocks_merge(str(tmp_path), TASK_ID) == (True, None)
 
 
+def test_fixed_inside_a_live_finding_note_is_still_counted(
+    tmp_path: Path, persisted_audit_events: list[dict],
+) -> None:
+    # Shape from StockForge #3032: a live LOW whose note mentions "fixed".
+    _write_review(
+        tmp_path,
+        "# Security Review\n\nSummary: done.\n\n"
+        "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed) — carry\n"
+        "Body.\n\n" + ZERO_FOOTER,
+    )
+
+    assert _security_review_blocks_merge(str(tmp_path), TASK_ID) == (True, None)
+
+
+def test_footer_may_count_a_resolved_heading(
+    tmp_path: Path, persisted_audit_events: list[dict],
+) -> None:
+    path = _write_review(
+        tmp_path,
+        "# Security Re-review\n\nSummary: done.\n\n"
+        "### [S0] LOW (fixed, verified) — old issue\n"
+        "### [S1] LOW — new issue\n\n"
+        "## Counts\n"
+        "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 2 | INFO: 0\n",
+    )
+
+    assert _count_findings_in_review_file(path) == _counts(low=2)
+
+
 def test_headers_without_footer_use_header_counts(
     tmp_path: Path, persisted_audit_events: list[dict],
 ) -> None:
