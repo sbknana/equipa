@@ -811,9 +811,19 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
     # Code blocks and inline code are examples, never the review's structure.
     visible_text = _blank_code(text)
 
+    # The document title (a level-1 FIRST heading) of a fix review names the
+    # upstream finding being fixed ("# Review: CT-FIX-F7 ... (D5-01 HIGH)");
+    # it is not a finding of this review. Any later level-1 heading is.
+    first_heading = _ANY_MARKDOWN_HEADING_RE.search(visible_text)
+    title_start = (
+        first_heading.start()
+        if first_heading is not None
+        and first_heading.group(0).lstrip().startswith("# ")
+        else -1
+    )
     candidate_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _FINDING_CANDIDATE_RE.finditer(visible_text):
-        if not _is_resolved_candidate(match):
+        if match.start() != title_start and not _is_resolved_candidate(match):
             candidate_counts[match.group(1).upper()] += 1
 
     # S3033-04: the LAST footer wins, so an earlier quoted/skeleton footer
