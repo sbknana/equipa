@@ -556,8 +556,11 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # Task #3033: markers of an unfinished review, searched ONLY inside the
 # review's Summary (a "Summary:" field line or a "## Summary" section). The
 # observed fail-open artifact read "Summary: IN PROGRESS - initial skeleton".
+# Task #3038 (S3033-05): the marker must sit in status position, at the START
+# of a Summary line (after emphasis/brackets), so a finished review whose
+# Summary reads "Reviewed the TODO-list API" is not held as unfinished.
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
-    r"\b(?:IN[ \t_-]*PROGRESS|skeleton|TODO)\b", re.IGNORECASE,
+    r"^[ \t*_\[(:—–-]*(?:IN[ \t_-]*PROGRESS|skeleton|TODO)\b", re.IGNORECASE,
 )
 _SUMMARY_HEADING_RE = re.compile(
     r"^#{1,6}[ \t]*\**[ \t]*Summary\b(.*)$", re.IGNORECASE,
@@ -574,17 +577,56 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 #   ### SR29-00 HIGH (fixed, verified, not counted) — ...
 #   ### SR-2996 S1 (MEDIUM) — FIXED, verified
 #   ### [2775-S01] HIGH — requestPayout ... → **FIXED**   (CCGNinja #2780)
-# Such headings are not live findings and are excluded from the header
-# tally. Deliberately narrow: a (...)/[...] group must START with
-# fixed/resolved or say "not counted", or an UPPERCASE status (optionally
-# bold/italic) must follow a separator. So "Fixed-size buffer overflow" and
-# StockForge #3032's live
-# "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed)" still count.
+# Such headings may be omitted from the footer (see _analyze_review_file).
+# Task #3038 (S3033-01): the resolved form is ONLY a footer-tolerance hint;
+# it never lowers the merge counts, which are max(live + resolved, footer),
+# so a live "HIGH — AES-GCM nonce (fixed at zero)" can over-block but never
+# merge. The status token must also be the LAST thing on the heading: a
+# (fixed...)/[resolved...]/(... not counted) group, or an UPPERCASE
+# FIXED/RESOLVED after a separator optionally followed by a short
+# ", verified" tail. So "Fixed-size buffer overflow", "nonce (fixed at zero)
+# allows forgery", "key: FIXED string in config.py" and StockForge #3032's
+# "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed)" stay live.
 _RESOLVED_FINDING_HEADER_RE = re.compile(
+    r"(?:"
     r"[(\[][ \t]*(?i:fixed|resolved)\b[^)\]\n]*[)\]]"
     r"|[(\[][^)\]\n]*\b(?i:not[ \t]+counted)\b[^)\]\n]*[)\]]"
-    r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b",
+    r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
+    r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
+    r")[ \t*_.\r]*$",
 )
+
+# Task #3038 (S3033-02): detection-only tally of finding-shaped lines the
+# strict level-3 header regex cannot see: a severity word (any case) in a
+# heading of ANY level, or after a finding tag in a bold line / bullet
+# ("- **[S1] HIGH** —", "**S1 (HIGH):**", "- [S1] HIGH —"). It never adds to
+# the merge counts; a severity it sees that neither the footer nor the
+# strict headers count makes the review a count-mismatch (fail closed).
+# Checklist boxes ("- [x] XSS: PASS") are not finding tags.
+_FINDING_CANDIDATE_RE = re.compile(
+    r"^[ \t]{0,3}(?:"
+    r"#{1,6}[ \t][^\n]{0,80}?"
+    r"|(?:[-*+][ \t]+)?\*\*[ \t]*"
+    r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d+[\w-]*)"
+    r"[^\n]{0,40}?"
+    r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
+    r")(?<![A-Za-z])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z])",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Task #3038 (S3033-03): unreplaced placeholders from the report skeleton in
+# prompts/security-reviewer.md. A file still carrying them is an unfilled
+# template, not a finished review. Searched outside code (fences and inline
+# backticks), so a review that quotes the template is not held.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(
+    r"\[1-2 sentences|\[SEVERITY\]|\[PASS/FAIL\]|\[list\]|\[date\]"
+    r"|\[Project Name\]|path/to/file\.ext"
+    r"|\[X (?:findings|pattern matches|files inspected)",
+    re.IGNORECASE,
+)
+_CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_ANY_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.MULTILINE)
 
 # Task #3033: a review with zero finding headers, an all-zero (or absent)
 # footer and fewer non-blank lines than this is a skeleton, not a clean
@@ -644,6 +686,34 @@ def _review_summary_text(text: str) -> str:
     return "\n".join(collected)
 
 
+def _blank_code(text: str) -> str:
+    """Blank fenced code blocks and inline code spans, keeping line numbers.
+
+    Quoted footers, templates and PoC markdown inside code are examples, not
+    the review's own structure. An unterminated fence blanks nothing after
+    it, so a stray fence can never hide a footer or finding (fail closed).
+    """
+    lines = text.split("\n")
+    visible: list[str] = []
+    fence: str | None = None
+    fence_start = 0
+    for index, line in enumerate(lines):
+        opener = _CODE_FENCE_RE.match(line)
+        if fence is None:
+            if opener is not None:
+                fence, fence_start = opener.group(1)[0], index
+                visible.append("")
+            else:
+                visible.append(_INLINE_CODE_RE.sub("", line))
+        else:
+            if opener is not None and opener.group(1)[0] == fence:
+                fence = None
+            visible.append("")
+    if fence is not None:
+        visible[fence_start:] = lines[fence_start:]
+    return "\n".join(visible)
+
+
 def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
     """Parse a SECURITY-REVIEW-NNNN.md artifact without trusting any one source.
 
@@ -652,8 +722,18 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
 
       * the tallies agree, or there are no finding headers and the footer is
         non-zero (a reviewer that wrote findings as prose but counted them);
-      * its Summary carries no IN PROGRESS / skeleton / TODO marker;
-      * it is not a near-empty file with zero headers and a zero footer.
+      * no finding-shaped line of any heading level / bold-tag form carries a
+        severity that neither the footer nor the strict headers count
+        (task #3038, S3033-02);
+      * the footer, when present, is the LAST footer outside code and no
+        heading or finding follows it (S3033-04);
+      * no reviewer-template placeholder is left unreplaced (S3033-03);
+      * its Summary does not START with IN PROGRESS / skeleton / TODO;
+      * a zero-finding review has a non-empty Summary and is not near-empty.
+
+    The merge counts are ``max(live + resolved, footer)`` per severity:
+    resolved fix-verification headings only widen what the footer may omit,
+    they never lower the counts (S3033-01).
 
     Anything else is ``count-mismatch`` or ``incomplete`` and the caller must
     treat the artifact as missing. Header counts come from lines like
@@ -686,17 +766,35 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
         else:
             header_counts[match.group(1)] += 1
 
+    # Code blocks and inline code are examples, never the review's structure.
+    visible_text = _blank_code(text)
+
+    candidate_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    for match in _FINDING_CANDIDATE_RE.finditer(visible_text):
+        candidate_counts[match.group(1).upper()] += 1
+
+    # S3033-04: the LAST footer wins, so an earlier quoted/skeleton footer
+    # cannot mask the reviewer's final tally.
     footer_counts: dict[str, int] | None = None
-    footer = _REVIEW_COUNTS_FOOTER_RE.search(text)
+    footer = None
+    for footer in _REVIEW_COUNTS_FOOTER_RE.finditer(visible_text):
+        pass
     if footer is not None:
         footer_counts = {
             severity: int(footer.group(index))
             for index, severity in enumerate(_REVIEW_SEVERITIES, start=1)
         }
 
+    # S3033-01: resolved headings are never subtracted from the merge
+    # counts. A live finding mislabelled as resolved over-blocks instead of
+    # merging, with or without a footer.
+    strict_counts = {
+        severity: header_counts[severity] + resolved_counts[severity]
+        for severity in _REVIEW_SEVERITIES
+    }
     merged_counts = {
         severity: max(
-            header_counts[severity],
+            strict_counts[severity],
             footer_counts[severity] if footer_counts else 0,
         )
         for severity in _REVIEW_SEVERITIES
@@ -733,26 +831,68 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
             "footer and finding headers disagree",
         )
 
-    summary_marker = _INCOMPLETE_REVIEW_MARKER_RE.search(
-        _review_summary_text(text),
-    )
-    if summary_marker is not None:
+    # S3033-02: a severity seen only in finding-shaped lines the strict
+    # tally cannot count (## / #### / title-case / bold-tag bullets) means
+    # neither source can be trusted to have counted it.
+    uncounted = [
+        severity for severity in _REVIEW_SEVERITIES
+        if candidate_counts[severity] > 0 and merged_counts[severity] == 0
+    ]
+    if uncounted:
         return _verdict(
-            REVIEW_VERDICT_INCOMPLETE,
-            f"summary marker {summary_marker.group(0)!r}",
+            REVIEW_VERDICT_COUNT_MISMATCH,
+            "finding-shaped lines not counted by footer or headers: "
+            + ", ".join(
+                f"{severity}={candidate_counts[severity]}"
+                for severity in uncounted
+            ),
         )
 
-    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
-    if (
-        headers_total == 0
-        and footer_total == 0
-        and nonblank_lines < _REVIEW_MIN_NONBLANK_LINES
-    ):
+    # S3033-04: the footer closes the review. A heading or finding after it
+    # means the footer was written first (a skeleton) and never updated.
+    if footer is not None:
+        trailing = visible_text[footer.end():]
+        if (
+            _ANY_MARKDOWN_HEADING_RE.search(trailing)
+            or _FINDING_CANDIDATE_RE.search(trailing)
+        ):
+            return _verdict(
+                REVIEW_VERDICT_INCOMPLETE,
+                "Counts footer is not the final section",
+            )
+
+    # S3033-03: an unfilled reviewer template is not a finished review.
+    placeholder = _TEMPLATE_PLACEHOLDER_RE.search(visible_text)
+    if placeholder is not None:
         return _verdict(
             REVIEW_VERDICT_INCOMPLETE,
-            f"near-empty review ({nonblank_lines} non-blank lines, "
-            f"no findings)",
+            f"unreplaced template placeholder {placeholder.group(0)!r}",
         )
+
+    summary_lines = _review_summary_text(visible_text).splitlines()
+    for summary_line in summary_lines:
+        summary_marker = _INCOMPLETE_REVIEW_MARKER_RE.match(summary_line)
+        if summary_marker is not None:
+            return _verdict(
+                REVIEW_VERDICT_INCOMPLETE,
+                f"summary marker {summary_marker.group(0).strip()!r}",
+            )
+
+    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+    if headers_total == 0 and footer_total == 0:
+        if nonblank_lines < _REVIEW_MIN_NONBLANK_LINES:
+            return _verdict(
+                REVIEW_VERDICT_INCOMPLETE,
+                f"near-empty review ({nonblank_lines} non-blank lines, "
+                f"no findings)",
+            )
+        # S3033-03: a zero-finding review must say what it concluded. A
+        # missing or empty Summary is a skeleton the reviewer never filled.
+        if not any(line.strip(" \t*_:—–-") for line in summary_lines):
+            return _verdict(
+                REVIEW_VERDICT_INCOMPLETE,
+                "zero-finding review has no Summary content",
+            )
 
     return _verdict(REVIEW_VERDICT_OK)
 
