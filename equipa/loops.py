@@ -73,6 +73,7 @@ from equipa.monitoring import (
 )
 from equipa.output import log
 from equipa.git_ops import git_run_async
+from equipa.security_gate import _gate_audit_log, format_counts
 from equipa.parsing import (
     build_compaction_summary,
     build_test_failure_context,
@@ -271,21 +272,25 @@ async def run_security_review(
         f"path; if you write a different filename the findings will be lost. "
         f"The `.equipa-artifacts/` directory has been pre-created for you. "
         f"Rate each finding: CRITICAL, HIGH, MEDIUM, LOW, INFO. "
-        # Task #2451 Phase I-b (F-02): MANDATE a final Counts footer so the
-        # orchestrator gate can read finding counts from a tamper-evident
-        # location rather than relying on header pattern-matching. The
-        # parser prefers this footer when present (equipa/loops.py
-        # _count_findings_in_review_file) so a footer mismatch with
-        # in-body headers ALWAYS resolves in the footer's favour. Mid-
-        # review prose like "### Summary of HIGH-impact findings" can
-        # then no longer false-positive as a HIGH finding.
+        # Task #2451 Phase I-b (F-02): MANDATE a final Counts footer.
+        # Task #3033: the footer no longer wins over the finding headers —
+        # the parser (_analyze_review_file) tallies both and treats any
+        # disagreement, or an unfinished Summary, as a missing artifact
+        # (merge blocked). The instructions below say so, so a reviewer
+        # knows a skeleton footer or a severity word in a non-finding
+        # "###" heading will block the merge.
+        f"Give EVERY finding its own heading formatted as "
+        f"`### [TAG-NN] SEVERITY — title`, and do NOT put the words "
+        f"CRITICAL, HIGH, MEDIUM, LOW or INFO in any other `###` heading. "
         f"The review MUST end with a footer formatted EXACTLY as:\n"
         f"## Counts\n"
         f"CRITICAL: N | HIGH: N | MEDIUM: N | LOW: N | INFO: N\n"
         f"where each N is the integer count of findings at that "
-        f"severity. The orchestrator reads this footer to gate the "
-        f"merge — if you omit it or change the format the gate falls "
-        f"back to header counting which is brittle against prose. "
+        f"severity. The orchestrator counts BOTH the footer and the "
+        f"finding headings: if they disagree the merge is BLOCKED. Update "
+        f"the footer last, after every finding is written. A review whose "
+        f"Summary still says IN PROGRESS, skeleton or TODO is treated as "
+        f"unfinished and also BLOCKS the merge. "
         f"Original task description: {task['description']}"
     )
 
@@ -319,8 +324,20 @@ async def run_security_review(
         review_path = find_review_artifact(
             project_dir, "SECURITY-REVIEW", task_id,
         )
-        counts = _count_findings_in_review_file(review_path)
-        if counts is None:
+        counts = _count_findings_in_review_file(review_path, task_id=task_id)
+        if counts is None and review_path.is_file():
+            # Task #3033: the reviewer DID write a file, but it is a fallback
+            # dump, its footer disagrees with its finding headers, or it is
+            # unfinished. Leave it on disk for the operator; the merge gate
+            # treats it as missing and blocks.
+            log(
+                f"  WARNING: security-review artifact {review_path.name} is "
+                f"not a trustworthy finished review (count mismatch, "
+                f"unfinished, or fallback dump) — the merge gate will treat "
+                f"it as missing and block",
+                output,
+            )
+        elif counts is None:
             log(
                 f"  WARNING: security-review artifact missing — expected "
                 f"{ARTIFACTS_DIR_NAME}/{review_path.name} (agent did not save it)",
@@ -506,13 +523,15 @@ _REVIEW_FINDING_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 
-# Tamper-evident footer the security-review prompt is required to emit
-# at the end of every SECURITY-REVIEW-NNNN.md artifact. When present the
-# parser PREFERS the footer numbers over header counting, so a reviewer
-# that mis-formats individual finding headers but still emits the
-# explicit footer survives format drift. Format:
+# Footer the security-review prompt is required to emit at the end of every
+# SECURITY-REVIEW-NNNN.md artifact. Format:
 #   ## Counts
 #   CRITICAL: 0 | HIGH: 0 | MEDIUM: 4 | LOW: 3 | INFO: 2
+# Task #3033: the footer is NOT trusted over the finding headers. A reviewer
+# that writes the footer first (as a skeleton) and then adds findings leaves
+# a stale all-zero footer behind; preferring it merged an unfinished review
+# with MEDIUM/LOW headers as clean. Both tallies are now computed and must
+# agree (see _analyze_review_file).
 _REVIEW_COUNTS_FOOTER_RE = re.compile(
     r"^##\s+Counts\s*\n[^\n]*?"
     r"CRITICAL\s*:\s*(\d+)[^\n]*?"
@@ -532,26 +551,105 @@ _REVIEW_COUNTS_FOOTER_RE = re.compile(
 SECURITY_REVIEW_FALLBACK_MARKER = "<!-- EQUIPA-SECURITY-REVIEW-FALLBACK -->"
 
 
-def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
-    """Count findings per severity in a SECURITY-REVIEW-NNNN.md artifact.
+_REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 
-    Returns a dict with keys CRITICAL/HIGH/MEDIUM/LOW/INFO, or None if the
-    artifact does not exist OR is an orchestrator-saved fallback dump (caller
-    should emit a "missing artifact" warning rather than a counterfeit count —
-    see task 2315 and task 2412).
+# Task #3033: markers of an unfinished review, searched ONLY inside the
+# review's Summary (a "Summary:" field line or a "## Summary" section). The
+# observed fail-open artifact read "Summary: IN PROGRESS - initial skeleton".
+_INCOMPLETE_REVIEW_MARKER_RE = re.compile(
+    r"\b(?:IN[ \t_-]*PROGRESS|skeleton|TODO)\b", re.IGNORECASE,
+)
+_SUMMARY_HEADING_RE = re.compile(
+    r"^#{1,6}[ \t]*\**[ \t]*Summary\b(.*)$", re.IGNORECASE,
+)
+_SUMMARY_FIELD_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*Summary[ \t]*\**[ \t]*"
+    r"[:—–-][ \t]*\**(.*)$",
+    re.IGNORECASE,
+)
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 
-    Counts are derived from finding section headers like:
-        ### [S1] HIGH — Prompt Injection via Database Content
-    This avoids the false-positive class where the orchestrator previously
-    counted substring occurrences of "critical"/"high" in raw agent stdout —
-    e.g. counting "[S1] LOW — this is NOT a CRITICAL because…" as a CRITICAL.
+# Task #3033: a review with zero finding headers, an all-zero (or absent)
+# footer and fewer non-blank lines than this is a skeleton, not a clean
+# review. Deliberately low: a terse "no findings" review (title, one line of
+# prose, footer) must still pass; the Summary markers and the header/footer
+# agreement check are the primary signals.
+_REVIEW_MIN_NONBLANK_LINES = 4
+
+REVIEW_VERDICT_OK = "ok"
+REVIEW_VERDICT_MISSING = "missing"
+REVIEW_VERDICT_FALLBACK = "fallback"
+REVIEW_VERDICT_COUNT_MISMATCH = "count-mismatch"
+REVIEW_VERDICT_INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True)
+class ReviewCountAnalysis:
+    """Everything the parser learned about a SECURITY-REVIEW artifact.
+
+    ``counts`` is the per-severity MAX of the footer and header tallies, so
+    it never under-reports whichever source saw more findings. It is only
+    handed to the merge gate when ``verdict`` is ``REVIEW_VERDICT_OK``; any
+    other verdict makes :func:`_count_findings_in_review_file` return None
+    and the fail-closed ``block_on_missing`` gate fires.
+    """
+
+    verdict: str
+    counts: dict[str, int] | None = None
+    footer_counts: dict[str, int] | None = None
+    header_counts: dict[str, int] | None = None
+    detail: str = ""
+
+    @property
+    def trusted(self) -> bool:
+        return self.verdict == REVIEW_VERDICT_OK
+
+
+def _review_summary_text(text: str) -> str:
+    """Return the review's Summary field lines and Summary section bodies."""
+    collected: list[str] = []
+    in_summary_section = False
+    for line in text.splitlines():
+        heading = _SUMMARY_HEADING_RE.match(line)
+        if heading is not None:
+            in_summary_section = True
+            collected.append(heading.group(1))
+            continue
+        if _MARKDOWN_HEADING_RE.match(line):
+            in_summary_section = False
+            continue
+        if in_summary_section:
+            collected.append(line)
+            continue
+        field_match = _SUMMARY_FIELD_RE.match(line)
+        if field_match is not None:
+            collected.append(field_match.group(1))
+    return "\n".join(collected)
+
+
+def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
+    """Parse a SECURITY-REVIEW-NNNN.md artifact without trusting any one source.
+
+    Task #3033 (fail-closed): the ``## Counts`` footer and the ``###``
+    finding headers are BOTH tallied. The artifact is trusted only when:
+
+      * the tallies agree, or there are no finding headers and the footer is
+        non-zero (a reviewer that wrote findings as prose but counted them);
+      * its Summary carries no IN PROGRESS / skeleton / TODO marker;
+      * it is not a near-empty file with zero headers and a zero footer.
+
+    Anything else is ``count-mismatch`` or ``incomplete`` and the caller must
+    treat the artifact as missing. Header counts come from lines like
+    ``### [S1] HIGH — Prompt Injection via Database Content``, never from
+    prose, so "[S1] LOW — this is NOT a CRITICAL because…" is not a CRITICAL
+    (task 2315).
     """
     try:
         text = review_path.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return None
     except OSError:
-        return None
+        # FileNotFoundError included: a missing file and an unreadable one
+        # are the same thing to the gate.
+        return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
     # structured artifacts — the merge gate must still fail-closed on them.
@@ -559,25 +657,122 @@ def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
     # so a real review file that documents the marker string in its prose
     # body cannot self-DoS the gate.
     if SECURITY_REVIEW_FALLBACK_MARKER in text[:512]:
-        return None
+        return ReviewCountAnalysis(verdict=REVIEW_VERDICT_FALLBACK)
 
-    # Task #2451 Phase D: prefer the explicit Counts footer when present.
-    # A reviewer that mis-formats individual finding headers but emits the
-    # footer still produces correct counts; the footer is tamper-evident.
+    header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
+        header_counts[match.group(1)] += 1
+
+    footer_counts: dict[str, int] | None = None
     footer = _REVIEW_COUNTS_FOOTER_RE.search(text)
     if footer is not None:
-        return {
-            "CRITICAL": int(footer.group(1)),
-            "HIGH": int(footer.group(2)),
-            "MEDIUM": int(footer.group(3)),
-            "LOW": int(footer.group(4)),
-            "INFO": int(footer.group(5)),
+        footer_counts = {
+            severity: int(footer.group(index))
+            for index, severity in enumerate(_REVIEW_SEVERITIES, start=1)
         }
 
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
-        counts[match.group(1)] += 1
-    return counts
+    merged_counts = {
+        severity: max(
+            header_counts[severity],
+            footer_counts[severity] if footer_counts else 0,
+        )
+        for severity in _REVIEW_SEVERITIES
+    }
+
+    def _verdict(verdict: str, detail: str = "") -> ReviewCountAnalysis:
+        return ReviewCountAnalysis(
+            verdict=verdict,
+            counts=merged_counts,
+            footer_counts=footer_counts,
+            header_counts=header_counts,
+            detail=detail,
+        )
+
+    headers_total = sum(header_counts.values())
+    footer_total = sum(footer_counts.values()) if footer_counts else 0
+
+    # A footer that disagrees with non-empty headers is stale or wrong, and
+    # there is no way to tell which side is right — fail closed. Zero headers
+    # with a non-zero footer is the one tolerated disagreement.
+    if (
+        footer_counts is not None
+        and headers_total > 0
+        and footer_counts != header_counts
+    ):
+        return _verdict(
+            REVIEW_VERDICT_COUNT_MISMATCH,
+            "footer and finding headers disagree",
+        )
+
+    summary_marker = _INCOMPLETE_REVIEW_MARKER_RE.search(
+        _review_summary_text(text),
+    )
+    if summary_marker is not None:
+        return _verdict(
+            REVIEW_VERDICT_INCOMPLETE,
+            f"summary marker {summary_marker.group(0)!r}",
+        )
+
+    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+    if (
+        headers_total == 0
+        and footer_total == 0
+        and nonblank_lines < _REVIEW_MIN_NONBLANK_LINES
+    ):
+        return _verdict(
+            REVIEW_VERDICT_INCOMPLETE,
+            f"near-empty review ({nonblank_lines} non-blank lines, "
+            f"no findings)",
+        )
+
+    return _verdict(REVIEW_VERDICT_OK)
+
+
+def _count_findings_in_review_file(
+    review_path: Path,
+    *,
+    task_id: int | None = None,
+) -> dict[str, int] | None:
+    """Count findings per severity in a SECURITY-REVIEW-NNNN.md artifact.
+
+    Returns a dict with keys CRITICAL/HIGH/MEDIUM/LOW/INFO, or None when the
+    artifact must be treated as missing: it does not exist, is an
+    orchestrator-saved fallback dump (tasks 2315 / 2412), its footer and
+    finding headers disagree, or it is an unfinished review (task #3033).
+    None makes the ``block_on_missing`` merge gate fail closed.
+
+    Untrusted-but-present artifacts emit a ``[GATE-AUDIT]`` line
+    (``event=count-mismatch`` or ``event=review-incomplete``) carrying both
+    tallies, so the log records why a review that exists was not believed.
+    """
+    analysis = _analyze_review_file(review_path)
+    if analysis.trusted:
+        return analysis.counts
+    if analysis.verdict in (
+        REVIEW_VERDICT_COUNT_MISMATCH, REVIEW_VERDICT_INCOMPLETE,
+    ):
+        event = (
+            "count-mismatch"
+            if analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
+            else "review-incomplete"
+        )
+        footer_text = (
+            format_counts(analysis.footer_counts)
+            if analysis.footer_counts is not None
+            else "absent"
+        )
+        _gate_audit_log(
+            f"task={task_id} event={event} artifact={review_path.name} "
+            f"footer=[{footer_text}] "
+            f"headers=[{format_counts(analysis.header_counts)}] "
+            f"max=[{format_counts(analysis.counts)}] "
+            f"detail={analysis.detail!r} "
+            f"action=treat-as-missing",
+            task_id=task_id,
+            event=event,
+            counts=analysis.counts,
+        )
+    return None
 
 
 def _write_security_review_fallback(

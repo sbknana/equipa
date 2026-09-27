@@ -1604,7 +1604,7 @@ async def _merge_task_branch(
             event="defensive-invariant-skipped",
         )
     else:
-        counts = _count_findings_in_review_file(review_path)
+        counts = _count_findings_in_review_file(review_path, task_id=task_id)
         if counts is None:
             _gate_audit_log(
                 f"task={task_id} event=defensive-invariant-fired "
@@ -1932,7 +1932,7 @@ def _security_review_blocks_merge(
     # Task 2476: read from .equipa-artifacts/ first, then fall back to
     # the legacy repo-root path so in-flight artifacts still parse.
     review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
-    counts = _count_findings_in_review_file(review_path)
+    counts = _count_findings_in_review_file(review_path, task_id=task_id)
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "
         f"artifact_exists={review_path.exists()} "
