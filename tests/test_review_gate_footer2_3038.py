@@ -199,6 +199,19 @@ def test_last_footer_wins_over_quoted_zero_footer(tmp_path: Path) -> None:
     assert _count_findings_in_review_file(path) == _counts(high=1)
 
 
+def test_last_unfenced_footer_wins(tmp_path: Path) -> None:
+    # An early all-zero footer outside any code fence (e.g. the review's own
+    # skeleton quoted as a section) must not mask the final footer.
+    path = _write(
+        tmp_path,
+        "# Security Review\n\n## Summary\nOne HIGH.\n" + ZERO_FOOTER
+        + "\n## Findings\n\n### [S1] HIGH — SQL injection\nDetail.\n"
+        + HIGH_FOOTER,
+    )
+
+    assert _count_findings_in_review_file(path) == _counts(high=1)
+
+
 def test_footer_followed_by_a_finding_is_incomplete(tmp_path: Path) -> None:
     # The footer was written first and more sections appended after it;
     # the tallies agree, so only the footer-position rule can catch it.
