@@ -1626,7 +1626,7 @@ async def _merge_task_branch(
         if counts is None:
             _gate_audit_log(
                 f"task={task_id} event=defensive-invariant-fired "
-                f"artifact={review_path.name} "
+                f"{provenance.fingerprint.describe()} "
                 f"reason=artifact-unparseable-or-missing "
                 f"{format_counts(None)}",
                 task_id=task_id,
@@ -1642,7 +1642,7 @@ async def _merge_task_branch(
         if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
             _gate_audit_log(
                 f"task={task_id} event=defensive-invariant-fired "
-                f"artifact={review_path.name} {format_counts(counts)}",
+                f"{provenance.fingerprint.describe()} {format_counts(counts)}",
                 task_id=task_id,
                 event="defensive-invariant-fired",
                 counts=counts,
@@ -1653,6 +1653,16 @@ async def _merge_task_branch(
                 f"{counts.get('CRITICAL', 0)} CRITICAL, "
                 f"{counts.get('HIGH', 0)} HIGH finding(s)."
             )
+        # Task #3041: the last gate step before the merge names the exact
+        # bytes it cleared, so a counts/file mismatch is visible in the log.
+        _gate_audit_log(
+            f"task={task_id} event=defensive-invariant-passed "
+            f"provenance={provenance.reason} "
+            f"{provenance.fingerprint.describe()} {format_counts(counts)}",
+            task_id=task_id,
+            event="defensive-invariant-passed",
+            counts=counts,
+        )
     try:
         # Task #2493: always merge INTO the repo's DEFAULT branch, never the
         # branch HEAD happens to sit on. In single-task (--task) mode the main

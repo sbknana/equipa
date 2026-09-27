@@ -230,6 +230,71 @@ def test_defensive_invariant_rejects_untrusted_artifact(tmp_path):
         ))
 
 
+def _sha16(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def test_defensive_invariant_high_finding_line_names_file_and_sha(
+    tmp_path, reviewer_harness, capsys,
+):
+    def writes_high_review(task_id, nonce):
+        path = _artifact(tmp_path, task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"{reviewer_nonce_line(nonce)}\n# Security Review\n\n"
+            f"## Summary\nOne high-severity finding.\n\n"
+            f"### [R1] HIGH — command injection in runner\nDetails.\n\n"
+            f"## Counts\n"
+            f"CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n",
+            encoding="utf-8",
+        )
+        return {"success": True, "result_text": "done", "errors": []}
+
+    reviewer_harness.task_id = 3114
+    reviewer_harness.behaviours = [writes_high_review]
+    _run_review(3114, tmp_path)
+    capsys.readouterr()
+
+    with pytest.raises(SecurityGateBypassError, match="1 HIGH"):
+        asyncio.run(_merge_task_branch(
+            str(tmp_path), 3114, "forge-task-3114", expect_artifact=True,
+        ))
+    err = capsys.readouterr().err
+    path = _artifact(tmp_path, 3114)
+    assert "event=defensive-invariant-fired" in err
+    assert f"artifact={path} sha256={_sha16(path)}" in err
+
+
+def test_defensive_invariant_pass_line_names_file_sha_and_counts(
+    tmp_path, reviewer_harness, monkeypatch, capsys,
+):
+    """A clean artifact passes the invariant; the audit line must say which
+    bytes were cleared so a later counts/file mismatch is visible."""
+    reviewer_harness.task_id = 3115
+    reviewer_harness.behaviours = [_writes_review(tmp_path)]
+    _run_review(3115, tmp_path)
+    capsys.readouterr()
+
+    def no_trusted_branch(_project_dir):
+        # Stop _merge_task_branch right after the invariant, before any git.
+        raise dispatch.UntrustedDefaultBranchError("test: stop before git")
+
+    monkeypatch.setattr(dispatch, "get_trusted_default_branch", no_trusted_branch)
+    asyncio.run(_merge_task_branch(
+        str(tmp_path), 3115, "forge-task-3115", expect_artifact=True,
+    ))
+    err = capsys.readouterr().err
+    path = _artifact(tmp_path, 3115)
+    passed = [
+        line for line in err.splitlines()
+        if "event=defensive-invariant-passed" in line
+    ]
+    assert len(passed) == 1
+    assert "provenance=verified" in passed[0]
+    assert f"artifact={path} sha256={_sha16(path)}" in passed[0]
+    assert "C=0 H=0 M=0 L=1 I=0" in passed[0]
+
+
 def test_single_task_call_site_demotes_outcome_on_failed_reviewer(
     tmp_path, monkeypatch, capsys,
 ):
