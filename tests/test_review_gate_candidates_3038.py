@@ -1,0 +1,141 @@
+"""Task #3038 (S3033-02): finding candidates at any heading level / bold form.
+
+A live finding the footer does not count must never merge under a stale
+all-zero footer, whatever markdown form the reviewer used for it:
+
+    * a heading of ANY level, including a severity past the 80 characters
+      the strict level-3 regex scans;
+    * a bold span, bullet or numbered item led by an UPPERCASE severity
+      ("**HIGH — nonce (fixed at zero)**"), or carrying a finding tag.
+
+And the widening must not hold finished clean reviews whose bold prose
+merely mentions a severity, nor a fix review whose document title names the
+upstream finding being fixed.
+
+Copyright 2026 Forgeborn.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from equipa.loops import (
+    REVIEW_VERDICT_COUNT_MISMATCH,
+    REVIEW_VERDICT_OK,
+    _analyze_review_file,
+)
+
+TITLE = "# Security Review — Task 9999\n\n"
+BODY = "## Summary\nReviewed the crypto module.\n\n## Findings\n\n"
+ZERO_FOOTER = (
+    "\n\n## Counts\nCRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+)
+PADDING = "x" * 90
+
+
+def _write_review(tmp_path: Path, markdown: str) -> Path:
+    path = tmp_path / "SECURITY-REVIEW-9999.md"
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "finding_line",
+    [
+        "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**",
+        "**HIGH:** AES-GCM nonce (fixed at zero) allows forgery",
+        "- **HIGH** — AES-GCM nonce fixed at zero",
+        "**(HIGH) AES-GCM nonce fixed at zero**",
+        "1. **[S1] HIGH** — AES-GCM nonce fixed at zero",
+        "2) **HIGH: AES-GCM nonce fixed at zero**",
+        f"**[S1] AES-GCM nonce {PADDING[:50]} (HIGH)**",
+        "# HIGH — AES-GCM nonce (fixed at zero) allows forgery",
+        f"## [S1] AES-GCM nonce {PADDING} — HIGH",
+        f"### S1 AES-GCM nonce {PADDING} (HIGH)",
+        f"#### S1 AES-GCM nonce {PADDING} (HIGH)",
+    ],
+    ids=[
+        "bold-untagged", "bold-untagged-colon", "bullet-bold-untagged",
+        "bold-severity-paren", "numbered-bold-tag", "numbered-bold-untagged",
+        "bold-tag-long", "h1-after-title", "h2-long", "h3-long", "h4-long",
+    ],
+)
+def test_uncounted_finding_form_blocks_under_zero_footer(
+    tmp_path: Path, finding_line: str,
+) -> None:
+    review = _write_review(
+        tmp_path,
+        TITLE + BODY + finding_line + "\nImpact paragraph.\n" + ZERO_FOOTER,
+    )
+
+    analysis = _analyze_review_file(review)
+
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert "HIGH=1" in analysis.detail
+
+
+@pytest.mark.parametrize(
+    "prose_line",
+    [
+        "**No CRITICAL or HIGH findings.** The change is security-positive.",
+        "**7 findings: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW / 0 INFO.**",
+        "4. **Medium (30 min):** move the patch target.",
+        "6. **High value (2-4 hr):** replace Test 1.",
+        "**The reported HIGH is fixed, and fixed in depth.**",
+        "- **Why not MEDIUM:** the primitive is unreachable.",
+        "- **Severity:** HIGH is not reachable from this diff.",
+    ],
+)
+def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
+    tmp_path: Path, prose_line: str,
+) -> None:
+    review = _write_review(
+        tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
+    )
+
+    assert _analyze_review_file(review).verdict == REVIEW_VERDICT_OK
+
+
+def test_fix_review_title_naming_upstream_finding_is_not_a_candidate(
+    tmp_path: Path,
+) -> None:
+    # cryptotrader-v2 SECURITY-REVIEW-2872.md shape: the title cites the
+    # finding the task fixed; this review itself found nothing blocking.
+    review = _write_review(
+        tmp_path,
+        "# Security Review: CT-FIX-F7 — phantom fill (D5-01 HIGH)\n\n"
+        + BODY + "No blocking findings.\n" + ZERO_FOOTER,
+    )
+
+    assert _analyze_review_file(review).verdict == REVIEW_VERDICT_OK
+
+
+def test_title_exemption_covers_only_the_first_heading(tmp_path: Path) -> None:
+    review = _write_review(
+        tmp_path,
+        "## Preamble\nContext.\n\n"
+        "# Review: CT-FIX-F7 — phantom fill (D5-01 HIGH)\n\n"
+        + BODY + ZERO_FOOTER,
+    )
+
+    analysis = _analyze_review_file(review)
+
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert "HIGH=1" in analysis.detail
+
+
+def test_counted_untagged_bold_finding_is_trusted(tmp_path: Path) -> None:
+    review = _write_review(
+        tmp_path,
+        TITLE + BODY
+        + "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**\n"
+        + "\n## Counts\nCRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n",
+    )
+
+    analysis = _analyze_review_file(review)
+
+    assert analysis.verdict == REVIEW_VERDICT_OK
+    assert analysis.counts is not None
+    assert analysis.counts["HIGH"] == 1
