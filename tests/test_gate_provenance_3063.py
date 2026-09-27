@@ -223,13 +223,13 @@ def test_no_reviewer_record_review_disabled_path_still_merges(
         ["equipa/dispatch.py"],
         security_review_blocks_merge=must_not_evaluate,
         project_dir=str(tmp_path),
-        task_id=3205,
+        task_id=3210,
         security_review_enabled=False,
     )
     assert decision.blocks_merge is False
     assert decision.expect_artifact is False
     assert decision.reason == "security-review-disabled"
-    assert get_reviewer_run(3205) is None
+    assert get_reviewer_run(3210) is None
 
 
 def test_hermetic_opt_in_is_the_only_way_to_trust_an_unrecorded_artifact(
@@ -295,6 +295,34 @@ def test_symlinked_artifact_is_treated_as_missing(tmp_path):
 
     assert fingerprint_artifact(link).exists is False
     assert _count_findings_in_review_file(link) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+@pytest.mark.parametrize("kind", ["fifo", "symlink"])
+def test_special_artifact_is_refused_before_it_is_opened(
+    tmp_path, monkeypatch, kind,
+):
+    """The lstat check must refuse a non-regular entry WITHOUT opening it:
+    opening a planted FIFO releases a writer blocked on it, and opening a
+    device node can have side effects. O_NOFOLLOW / fstat are only the
+    backstop for an entry swapped in after the lstat."""
+    path = _artifact(tmp_path, 3209)
+    path.parent.mkdir(parents=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.symlink_to(_write(tmp_path / "elsewhere.md", _review_body(None)))
+    opened: list[str] = []
+    real_open = os.open
+
+    def recording_open(target, *args, **kwargs):
+        opened.append(os.fspath(target))
+        return real_open(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    assert fingerprint_artifact(path).exists is False
+    assert str(path) not in opened
 
 
 def test_oversized_artifact_is_treated_as_missing(tmp_path):
