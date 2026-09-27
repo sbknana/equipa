@@ -210,6 +210,28 @@ def test_no_reviewer_record_doc_only_path_still_merges(
     assert "event=defensive-invariant-skipped" in capsys.readouterr().err
 
 
+def test_no_reviewer_record_review_disabled_path_still_merges(
+    tmp_path, require_reviewer_record,
+):
+    """With security review switched off no reviewer ever runs, so there is
+    never a record. The no-record block must not turn that operator setting
+    into "every code merge blocks": the gate never evaluates the artifact."""
+    def must_not_evaluate(*_args, **_kwargs):
+        raise AssertionError("review-disabled gate must not evaluate the artifact")
+
+    decision = decide_merge_gate(
+        ["equipa/dispatch.py"],
+        security_review_blocks_merge=must_not_evaluate,
+        project_dir=str(tmp_path),
+        task_id=3205,
+        security_review_enabled=False,
+    )
+    assert decision.blocks_merge is False
+    assert decision.expect_artifact is False
+    assert decision.reason == "security-review-disabled"
+    assert get_reviewer_run(3205) is None
+
+
 def test_hermetic_opt_in_is_the_only_way_to_trust_an_unrecorded_artifact(
     tmp_path, require_reviewer_record,
 ):
