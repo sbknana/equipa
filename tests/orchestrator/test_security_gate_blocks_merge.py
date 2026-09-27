@@ -435,7 +435,12 @@ def test_non_doc_diff_blocks_when_artifact_missing(gated_repo, monkeypatch):
 
 
 def test_counts_footer_preferred_over_headers(gated_repo, monkeypatch):
-    """GATE-04: explicit Counts footer wins over header counting."""
+    """GATE-04: a Counts footer is honoured when there are no finding headers.
+
+    Task #3033 narrowed this: the footer no longer wins over headers that
+    disagree with it (that fails closed), but zero headers + a non-zero
+    footer is still read from the footer.
+    """
     from equipa import dispatch
 
     repo = gated_repo["repo"]
@@ -461,14 +466,20 @@ def test_counts_footer_preferred_over_headers(gated_repo, monkeypatch):
     assert _git(repo, "rev-parse", "HEAD") == master_head
 
 
-def test_phase_i_prose_headers_yield_to_counts_footer(gated_repo, monkeypatch):
-    """Phase I-b (F-02): the Counts footer overrides false-positive prose.
+def test_phase_i_prose_headers_disagreeing_with_footer_block(
+    gated_repo, monkeypatch, capsys,
+):
+    """Task #3033 supersedes Phase I-b (F-02): a disagreement BLOCKS.
 
-    Concrete F-02 example: a section heading like
-    ``### Summary of HIGH-impact findings`` matched the loosened Phase-D
-    finding-header regex and falsely contributed +1 HIGH. With the
-    mandated tamper-evident footer (CRITICAL: 0 | HIGH: 0 | ...) the
-    parser must prefer the footer numbers and let the merge proceed.
+    F-02 made a heading like ``### Summary of HIGH-impact findings`` yield
+    to an all-zero Counts footer and merge. That same "footer wins" rule is
+    what merged task #3031's unfinished review: its stale skeleton footer
+    (all 0) beat real ``### [S3031-01] MEDIUM`` headers, and a HIGH header
+    written the same way would have merged too. The parser cannot tell a
+    prose heading from a real finding that the footer forgot, so any
+    disagreement is now treated as a missing artifact (fail closed, loud
+    ``event=count-mismatch``). The reviewer prompt forbids severity words
+    in non-finding ``###`` headings.
     """
     from equipa import dispatch
 
@@ -493,5 +504,6 @@ def test_phase_i_prose_headers_yield_to_counts_footer(gated_repo, monkeypatch):
         project_context={"id": 23},
     ))
 
-    assert result == "merged"
-    assert _git(repo, "rev-parse", "HEAD") != master_head
+    assert result == "blocked"
+    assert _git(repo, "rev-parse", "HEAD") == master_head
+    assert "event=count-mismatch" in capsys.readouterr().err

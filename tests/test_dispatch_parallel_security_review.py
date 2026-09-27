@@ -101,9 +101,12 @@ def _write_review(path: Path, *, critical: int = 0, high: int = 0,
     """Build a synthetic SECURITY-REVIEW-NNNN.md with N findings per severity.
 
     Uses the canonical ``### [TAG-NN] SEVERITY — desc`` header format
-    that ``_count_findings_in_review_file`` matches.
+    that ``_count_findings_in_review_file`` matches, plus the mandated
+    ``## Counts`` footer agreeing with those headers. Task #3033: a
+    title-only file with no findings and no footer is an unfinished
+    skeleton and blocks, so a zero-finding review needs real content.
     """
-    sections = ["# Security Review", ""]
+    sections = ["# Security Review", "", "Summary: review complete.", ""]
     for label, n in (
         ("CRITICAL", critical), ("HIGH", high), ("MEDIUM", medium),
         ("LOW", low), ("INFO", info),
@@ -112,7 +115,12 @@ def _write_review(path: Path, *, critical: int = 0, high: int = 0,
             sections.append(f"### [{label[0]}{i + 1}] {label} — finding {i + 1}")
             sections.append("Some prose describing the finding.")
             sections.append("")
-    path.write_text("\n".join(sections), encoding="utf-8")
+    sections.append("## Counts")
+    sections.append(
+        f"CRITICAL: {critical} | HIGH: {high} | MEDIUM: {medium} | "
+        f"LOW: {low} | INFO: {info}"
+    )
+    path.write_text("\n".join(sections) + "\n", encoding="utf-8")
 
 
 def test_blocks_when_critical_present(tmp_path):
