@@ -503,8 +503,10 @@ def test_single_task_doc_only_skip_replaces_prior_reviewer_run(
 
 
 def test_no_recorded_run_keeps_artifact_only_behaviour(tmp_path, capsys):
-    """Direct gate callers with no reviewer run keep pre-#3041 semantics,
-    and the audit line says the provenance was not verified."""
+    """Hermetic gate callers that opted in (conftest, task #3063) keep
+    pre-#3041 semantics with no reviewer run, and the audit line says the
+    provenance was not verified. Production blocks instead — see
+    tests/test_gate_provenance_3063.py."""
     _write_developer_self_review(tmp_path, 3107)
     blocks, counts = _security_review_blocks_merge(str(tmp_path), 3107)
     assert blocks is False and counts["LOW"] == 2
