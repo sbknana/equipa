@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **33,566 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **52 Python modules** totaling **33,801 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -51,7 +51,7 @@ The `equipa/` package contains **52 Python modules** totaling **33,566 lines** o
 | `monitoring.py` | 922 | L2 | `constants.py`, `hooks/__init__.py` | `parsing.py` | 12 |
 | `rlm_decompose.py` | 739 | L2 | `config.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
 | `roles.py` | 264 | L2 | `config.py`, `constants.py` | `output.py`, `role_resolver.py`, `routing.py`, `tasks.py` | 3 |
-| `security_gate.py` | 743 | L2 | `git_ops.py` | `db.py` | 28 |
+| `security_gate.py` | 930 | L2 | `git_ops.py` | `db.py` | 37 |
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
@@ -60,14 +60,14 @@ The `equipa/` package contains **52 Python modules** totaling **33,566 lines** o
 | `reflexion.py` | 151 | L3 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 2084 | L4 | `abort_controller.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 23 |
 | `preflight.py` | 343 | L5 | `agent_runner.py`, `constants.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
-| `loops.py` | 3067 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
+| `loops.py` | 3104 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
 | `manager.py` | 328 | L7 | `agent_runner.py`, `constants.py`, `db.py`, `loops.py`, `output.py`, `prompts.py`, `roles.py`, `tasks.py` | — | 5 |
-| `dispatch.py` | 2695 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 15 |
+| `dispatch.py` | 2706 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 15 |
 | `cli.py` | 2122 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
 | `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 33,566 lines | 637 public exports
+**Total:** 33,801 lines | 646 public exports
 
 ## Modules by Layer
 
