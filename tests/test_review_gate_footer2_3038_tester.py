@@ -190,7 +190,9 @@ def test_fixed_inside_bold_span_resolves_bullet_recap(tmp_path: Path) -> None:
     )
 
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
-    assert _count_findings_in_review_file(path) == _counts()
+    # Task #3038 fix-forward (IR38-01): resolved, so the zero footer may
+    # omit it, but it is ADDED to the merge counts and blocks (HIGH=1).
+    assert _count_findings_in_review_file(path) == _counts(high=1)
 
 
 def test_candidate_in_inline_code_is_ignored(tmp_path: Path) -> None:
@@ -242,7 +244,11 @@ def test_strict_finding_header_inside_code_fence_still_counts(
 
 
 def test_later_footer_after_real_one_is_the_one_used(tmp_path: Path) -> None:
-    """Two footers: the later (all-zero) one wins, and the headers disagree."""
+    """Two footers: the per-severity MAXIMUM is used (task #3038 IR38-02).
+
+    "Last footer wins" let a later all-zero footer mask the real one; the
+    maximum keeps HIGH=1, which agrees with the header and blocks.
+    """
     path = _write(
         tmp_path,
         BODY + "### [S1] HIGH — Token replay\nDetail.\n"
@@ -251,9 +257,9 @@ def test_later_footer_after_real_one_is_the_one_used(tmp_path: Path) -> None:
 
     analysis = _analyze_review_file(path)
 
-    assert analysis.footer_counts == _counts()
-    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
-    assert _count_findings_in_review_file(path) is None
+    assert analysis.footer_counts == _counts(high=1)
+    assert analysis.verdict == REVIEW_VERDICT_OK
+    assert _count_findings_in_review_file(path) == _counts(high=1)
 
 
 def test_trailing_level_one_heading_after_footer_is_incomplete(

@@ -617,9 +617,12 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 # a finding tag ("1. **[S1] ... HIGH** —", "**S1 (HIGH):**") or as an
 # UPPERCASE status that opens the span ("**HIGH — nonce reuse**",
 # "- **(HIGH)** ..."); or after a bracketed tag on a bullet ("- [S1] HIGH
-# —"). It never adds to the merge counts; a severity it sees that neither
-# the footer nor the strict headers count makes the review a count-mismatch
-# (fail closed). Not candidates: checklist boxes ("- [x] XSS: PASS"), bold
+# —"). A live candidate never adds to the merge counts; a severity it sees
+# that neither the footer nor the strict headers count makes the review a
+# count-mismatch (fail closed). A candidate whose title span ends in the
+# strict resolved status (_RESOLVED_FINDING_HEADER_RE) is ADDED to the
+# merge counts, exactly like a resolved level-3 heading (IR38-01).
+# Not candidates: checklist boxes ("- [x] XSS: PASS"), bold
 # prose ("**No CRITICAL or HIGH findings.**", "**Medium (30 min):**") and a
 # severity after the bold span ("**Severity:** HIGH"), which belongs to an
 # enclosing heading that is itself a candidate.
@@ -639,11 +642,26 @@ _FINDING_CANDIDATE_RE = re.compile(
     r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
     re.MULTILINE | re.IGNORECASE,
 )
-# A fix-verification recap whose heading / bold lead-in ENDS in an UPPERCASE
-# status ("- **F1 (HIGH, renderer SSRF): FIXED.**") is not a live candidate.
-# UPPERCASE only: lowercase "(fixed at zero)" title wording never exempts.
-_RESOLVED_CANDIDATE_TAIL_RE = re.compile(
-    r"[—–:→.)-][ \t*_]*(?:FIXED|RESOLVED)\b[^*\n]{0,40}$",
+# Task #3038 (IR38-05): headings that report a tally or an overall risk
+# label are not findings. A heading is a TALLY when every severity word in
+# it is directly preceded by a count ("## Findings — 0 CRITICAL / 0 HIGH /
+# 1 MEDIUM"); its zero entries are skipped and each NON-zero entry is a
+# candidate of that severity. A section number ("3.2 HIGH") is not a
+# count. "Overall risk: LOW" / "— INFO" is exempt; a CRITICAL/HIGH/MEDIUM
+# risk label stays a candidate. Both are linear: one pass over the line.
+_SEVERITY_WORD_RE = re.compile(
+    r"(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
+    re.IGNORECASE,
+)
+_TALLY_COUNT_BEFORE_RE = re.compile(r"(\d{1,4})[ \t]{1,3}$")
+# A count must stand alone: "S0 HIGH", "SR-0 HIGH" and "3.2 HIGH" are tags
+# or section numbers, not tallies.
+_TALLY_COUNT_PRECEDERS = frozenset(" \t([/|")
+_OVERALL_RISK_LOW_HEADING_RE = re.compile(
+    r"^[ \t]{0,3}#{1,6}[ \t]+(?:\d+(?:\.\d+)*\.?[ \t]+)?[*_]{0,2}"
+    r"overall[ \t]+risk(?:[ \t]+(?:rating|level|assessment))?[*_]{0,2}"
+    r"[ \t]*[:—–-][ \t]*[*_]{0,2}(?:LOW|INFO)[*_]{0,2}[ \t.\r]*$",
+    re.IGNORECASE,
 )
 
 # Task #3038 (S3033-03): unreplaced placeholders from the report skeleton in
@@ -755,22 +773,66 @@ def _blank_code(text: str) -> str:
     return "\n".join(visible)
 
 
+_RESOLVED_CANDIDATE_TAIL_CHARS = 200
+
+
+def _candidate_line(match: re.Match[str]) -> str:
+    """Return the full line a finding candidate was matched on."""
+    text = match.string
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.start())
+    return text[line_start:line_end if line_end != -1 else None]
+
+
 def _is_resolved_candidate(match: re.Match[str]) -> bool:
     """True when a finding candidate's title span ends in a resolved status.
 
     The title span is the whole line for a heading, else the bold lead-in
-    (up to its closing ``**``) of a bullet or bold line.
+    (up to its closing ``**``) of a bullet or bold line. Task #3038
+    (IR38-01): the status grammar is the strict, end-anchored level-3 one
+    (``_RESOLVED_FINDING_HEADER_RE``), and a resolved candidate is ADDED to
+    the merge counts by the caller, never dropped.
     """
-    text = match.string
-    line_start = text.rfind("\n", 0, match.start()) + 1
-    line_end = text.find("\n", match.start())
-    line = text[line_start:line_end if line_end != -1 else None]
+    line = _candidate_line(match)
     if not line.lstrip().startswith("#"):
         bold_open = line.find("**")
         bold_close = line.find("**", bold_open + 2) if bold_open != -1 else -1
         if bold_close != -1:
             line = line[:bold_close]
-    return bool(_RESOLVED_CANDIDATE_TAIL_RE.search(line.rstrip(" \t*_#")))
+    # The status must end the span, so only its tail is searched. This keeps
+    # the strict regex (quadratic on long bracket runs, IR38-04) linear here;
+    # a cut can only miss a match, which leaves the candidate live (stricter).
+    tail = line.rstrip(" \t#")[-_RESOLVED_CANDIDATE_TAIL_CHARS:]
+    return bool(_RESOLVED_FINDING_HEADER_RE.search(tail))
+
+
+def _heading_tally_severities(match: re.Match[str]) -> list[str] | None:
+    """Severities a tally / overall-risk HEADING really reports (IR38-05).
+
+    Returns None when the candidate is not such a heading (the caller
+    counts it normally). Otherwise returns the severities with a NON-zero
+    count, which the caller counts as live candidates; zero entries and a
+    LOW/INFO overall-risk label contribute nothing.
+    """
+    line = _candidate_line(match)
+    if not line.lstrip(" \t").startswith("#"):
+        return None
+    if _OVERALL_RISK_LOW_HEADING_RE.match(line):
+        return []
+    reported: list[str] = []
+    for word in _SEVERITY_WORD_RE.finditer(line):
+        window = line[max(0, word.start() - 12):word.start()]
+        count = _TALLY_COUNT_BEFORE_RE.search(window)
+        if count is None:
+            return None
+        count_start = word.start() - len(count.group(0))
+        if count_start > 0 and (
+            line[count_start - 1] not in _TALLY_COUNT_PRECEDERS
+        ):
+            return None
+        if int(count.group(1)) > 0:
+            reported.append(word.group(1).upper())
+    return reported
 
 
 def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
@@ -784,15 +846,17 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
       * no finding-shaped line of any heading level / bold-tag form carries a
         severity that neither the footer nor the strict headers count
         (task #3038, S3033-02);
-      * the footer, when present, is the LAST footer outside code and no
-        heading or finding follows it (S3033-04);
+      * no heading or finding follows the last footer outside code; with
+        several footers the per-severity maximum is used (S3033-04,
+        IR38-02);
       * no reviewer-template placeholder is left unreplaced (S3033-03);
       * its Summary does not START with IN PROGRESS / skeleton / TODO;
       * a zero-finding review has a non-empty Summary and is not near-empty.
 
-    The merge counts are ``max(live + resolved, footer)`` per severity:
-    resolved fix-verification headings only widen what the footer may omit,
-    they never lower the counts (S3033-01).
+    The merge counts are ``max(live + resolved, footer, resolved
+    candidates)`` per severity: resolved fix-verification headings and
+    candidates only widen what the footer may omit, they never lower the
+    counts (S3033-01, IR38-01).
 
     Anything else is ``count-mismatch`` or ``incomplete`` and the caller must
     treat the artifact as missing. Header counts come from lines like
@@ -839,18 +903,33 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
         else -1
     )
     candidate_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    resolved_candidate_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _FINDING_CANDIDATE_RE.finditer(visible_text):
-        if match.start() != title_start and not _is_resolved_candidate(match):
+        if match.start() == title_start:
+            continue
+        tally = _heading_tally_severities(match)
+        if tally is not None:
+            for severity in tally:
+                candidate_counts[severity] += 1
+        elif _is_resolved_candidate(match):
+            # IR38-01: a resolved candidate is counted, never dropped.
+            resolved_candidate_counts[match.group(1).upper()] += 1
+        else:
             candidate_counts[match.group(1).upper()] += 1
 
-    # S3033-04: the LAST footer wins, so an earlier quoted/skeleton footer
-    # cannot mask the reviewer's final tally.
+    # S3033-04 / IR38-02: with several footers outside code, the counts are
+    # the per-severity MAXIMUM over all of them. An earlier quoted skeleton
+    # cannot mask the final tally, and a later quoted all-zero footer cannot
+    # mask an earlier correct one. The LAST footer is still the one that
+    # must close the review.
     footer_matches = list(_REVIEW_COUNTS_FOOTER_RE.finditer(visible_text))
     footer = footer_matches[-1] if footer_matches else None
     footer_counts: dict[str, int] | None = None
-    if footer is not None:
+    if footer_matches:
         footer_counts = {
-            severity: int(footer.group(index))
+            severity: max(
+                int(match.group(index)) for match in footer_matches
+            )
             for index, severity in enumerate(_REVIEW_SEVERITIES, start=1)
         }
 
@@ -865,6 +944,7 @@ def _analyze_review_file(review_path: Path) -> ReviewCountAnalysis:
         severity: max(
             strict_counts[severity],
             footer_counts[severity] if footer_counts else 0,
+            resolved_candidate_counts[severity],
         )
         for severity in _REVIEW_SEVERITIES
     }

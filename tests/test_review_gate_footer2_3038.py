@@ -278,7 +278,10 @@ def test_uppercase_resolved_recap_bullet_is_not_a_live_candidate(
         "\n## Counts\nCRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0\n",
     )
 
-    assert _count_findings_in_review_file(path) == _counts(low=1)
+    # Task #3038 fix-forward (IR38-01): the recap is resolved, so the footer
+    # may omit it, but like a resolved level-3 heading it is ADDED to the
+    # merge counts, never dropped. HIGH=1 blocks the merge.
+    assert _count_findings_in_review_file(path) == _counts(high=1, low=1)
 
 
 def test_lowercase_fixed_wording_in_bullet_stays_live(tmp_path: Path) -> None:
@@ -289,7 +292,12 @@ def test_lowercase_fixed_wording_in_bullet_stays_live(tmp_path: Path) -> None:
         "forgery\n" + ZERO_FOOTER,
     )
 
-    assert _count_findings_in_review_file(path) is None
+    # Task #3038 fix-forward (IR38-01): the bold span ends in "(fixed at
+    # zero)", which the strict level-3 grammar reads as a resolved status,
+    # and a resolved candidate is COUNTED, never dropped: HIGH=1 blocks.
+    counts = _count_findings_in_review_file(path)
+    assert counts is None or counts["HIGH"] >= 1
+    assert counts == _counts(high=1)
 
 
 def test_hyphenated_severity_word_is_not_a_candidate(tmp_path: Path) -> None:
