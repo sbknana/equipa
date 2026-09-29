@@ -81,10 +81,15 @@ def test_feature_flag_can_disable_config_top_level():
     assert is_security_review_enabled(args) is False
 
 
-def test_default_disabled_when_unset():
-    """No CLI flag, no dispatch_config = disabled."""
+def test_default_enabled_when_unset():
+    """No CLI flag, no dispatch_config = ENABLED.
+
+    Inverted 2026-09-29: this test used to pin the fail-open default (review
+    off when nothing says otherwise), which the EQUIPA review flagged as
+    gate-08 / cli-02. Opting out now takes an explicit False.
+    """
     args = _args(security_review=None, dispatch_config={})
-    assert is_security_review_enabled(args) is False
+    assert is_security_review_enabled(args) is True
 
 
 def test_explicit_dispatch_config_arg_overrides_args_attr():
@@ -116,3 +121,29 @@ def test_none_dispatch_config_uses_args_fallback():
         dispatch_config={"security_review": True},
     )
     assert is_security_review_enabled(args, dispatch_config=None) is True
+
+
+def test_review_is_on_when_config_is_silent():
+    """No CLI flag and no security_review key means review RUNS.
+
+    EQUIPA review 2026-09-29 (gate-08 / cli-02): the old default was False,
+    so a fresh install (setup writes a config without this key) or a missing
+    dispatch_config.json merged code diffs with no security review.
+    """
+    from types import SimpleNamespace
+
+    from equipa.config import DEFAULT_DISPATCH_CONFIG, is_security_review_enabled
+
+    assert DEFAULT_DISPATCH_CONFIG["security_review"] is True
+    args = SimpleNamespace(security_review=None, dispatch_config=None)
+    assert is_security_review_enabled(args, {}) is True
+    assert is_security_review_enabled(args, {"features": {}}) is True
+
+
+def test_explicit_opt_out_still_disables():
+    from types import SimpleNamespace
+
+    from equipa.config import is_security_review_enabled
+
+    args = SimpleNamespace(security_review=None, dispatch_config=None)
+    assert is_security_review_enabled(args, {"security_review": False}) is False
