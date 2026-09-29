@@ -88,6 +88,11 @@ def project(tmp_path: Path) -> Path:
     repo = tmp_path / "project"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
+    # Repo-local identity: git_ops.merge_task_branch (production code) makes a
+    # merge commit without passing one, and a CI runner has no global git
+    # identity. This test only ever passed on machines that had one.
+    _git(repo, "config", "user.name", "EQUIPA Test")
+    _git(repo, "config", "user.email", "test@forgeborn.invalid")
     (repo / ".git" / "info" / "exclude").write_text(".forge-worktrees/\n", encoding="utf-8")
     _write(repo, "README.md", "project\n")
     _write_overlay(repo, "infra-operator", OPERATOR_BODY)
