@@ -7,9 +7,12 @@ schema.sql with CREATE TABLE IF NOT EXISTS semantics.
 Copyright 2026 Forgeborn
 """
 
+import os
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 # Add parent directory (repo root) to path for imports
@@ -27,6 +30,116 @@ if _SCRIPTS_DIR.is_dir():
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import pytest  # noqa: E402  (sys.path must be set before any equipa import)
+
+# --- Test-DB isolation (EQUIPA review 2026-09-29: LRN-01 / mcpdb-04 / claims-06) ---
+#
+# On the owner's hosts the repo-root theforge.db is a SYMLINK to the live
+# TheForge database, and this suite runs DELETEs and schema changes against
+# whatever THEFORGE_DB resolves to. Running pytest in the source checkout
+# therefore wiped the live agent_episodes / lessons_learned tables, repeatedly.
+#
+# So before ANY equipa module is imported, THEFORGE_DB is pointed at a fresh
+# throwaway file. The ambient value is overridden ON PURPOSE: no test needs a
+# real TheForge DB, and an inherited production path is exactly how the
+# damage happened. _assert_db_isolated() then checks every loaded module's
+# binding and stops the run before any test executes if one escaped.
+_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="equipa-test-db-"))
+TEST_DB_PATH = _TEST_DB_DIR / "theforge-test.db"
+os.environ["THEFORGE_DB"] = str(TEST_DB_PATH)
+
+
+def _is_safe_test_db(path) -> bool:
+    """True only for a DB path that cannot be a real TheForge database.
+
+    The path must not itself be a symlink, and after resolving any symlinks
+    in its parents it must sit inside the system temp directory (where this
+    conftest's DB and every tmp_path live). A repo-root theforge.db that is a
+    symlink to production fails both tests. Nothing inside the repo counts
+    as safe either, even when the checkout itself lives under /tmp: the
+    repo-root default is never a test DB.
+    """
+    p = Path(path)
+    if p.is_symlink():
+        return False
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved = p.resolve()
+    except OSError:
+        return False
+    if resolved.is_relative_to(REPO_ROOT):
+        return False
+    return resolved.is_relative_to(tmp_root)
+
+
+def _db_bindings():
+    """Yield (module name, value) for every THEFORGE_DB binding in loaded
+    project modules (equipa.* plus repo-root scripts), excluding tests.
+
+    Several modules import THEFORGE_DB by value at import time, so checking
+    equipa.constants alone would miss a stale copy (see mcpdb-03)."""
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not _is_project_module(name, mod):
+            continue
+        value = getattr(mod, "THEFORGE_DB", None)
+        if value is not None:
+            yield name, value
+
+
+# Module name -> "lives in this repo, outside tests/". Resolving every loaded
+# module's path around each of ~3,000 tests is slow, so it is decided once.
+_PROJECT_MODULE_CACHE: dict = {}
+
+
+def _is_project_module(name, mod) -> bool:
+    cached = _PROJECT_MODULE_CACHE.get(name)
+    if cached is not None and cached[0] is mod:
+        return cached[1]
+    result = False
+    mod_file = getattr(mod, "__file__", None)
+    if mod_file:
+        try:
+            mod_path = Path(mod_file).resolve()
+            result = (mod_path.is_relative_to(REPO_ROOT)
+                      and not mod_path.is_relative_to(REPO_ROOT / "tests"))
+        except OSError:
+            result = False
+    _PROJECT_MODULE_CACHE[name] = (mod, result)
+    return result
+
+
+def _assert_db_isolated(stage: str) -> None:
+    """Abort the whole run if any loaded module points outside the temp dir."""
+    escaped = [f"{name}.THEFORGE_DB = {value}"
+               for name, value in _db_bindings()
+               if not _is_safe_test_db(value)]
+    if escaped:
+        pytest.exit(
+            f"[conftest] REFUSING TO RUN ({stage}): a TheForge DB path escaped "
+            "the test sandbox and could point at a real database:\n  "
+            + "\n  ".join(escaped),
+            returncode=3,
+        )
+
+
+
+@pytest.fixture(autouse=True)
+def _restore_db_bindings():
+    """Undo any THEFORGE_DB swap a test makes, whether or not it cleans up.
+
+    Several tests point equipa.constants / equipa.db (and friends) at their
+    own temp DB by hand; some never restore it, which leaked an empty DB into
+    every later test and made results depend on test order. Snapshot every
+    binding (and the env var) before each test and put them back after.
+    """
+    saved = [(sys.modules[name], value) for name, value in _db_bindings()]
+    saved_env = os.environ.get("THEFORGE_DB")
+    yield
+    for module, value in saved:
+        module.THEFORGE_DB = value
+    if saved_env is None:
+        os.environ.pop("THEFORGE_DB", None)
+    else:
+        os.environ["THEFORGE_DB"] = saved_env
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +219,15 @@ def _ensure_full_schema():
 
 def pytest_configure(config):
     """Ensure database schema exists before any tests collect."""
+    from equipa import constants as equipa_constants
+
+    if Path(equipa_constants.THEFORGE_DB) != TEST_DB_PATH:
+        pytest.exit(
+            "[conftest] REFUSING TO RUN: equipa.constants was imported before "
+            f"the test DB was set (THEFORGE_DB={equipa_constants.THEFORGE_DB}).",
+            returncode=3,
+        )
+    _assert_db_isolated("configure")
     try:
         from equipa import db as equipa_db
 
@@ -124,7 +246,10 @@ def pytest_collection_modifyitems(session, config, items):
     """After collection, call setup_test_data() for modules that define it.
 
     This replaces the manual setup that was done in each module's run_all_tests().
+    Every test module is imported by now, so the isolation check runs first:
+    setup_test_data() itself writes to the DB.
     """
+    _assert_db_isolated("collection")
     setup_modules = set()
     for item in items:
         module = item.module
@@ -134,3 +259,8 @@ def pytest_collection_modifyitems(session, config, items):
             except Exception as e:
                 print(f"  [conftest] WARNING: setup_test_data() failed for {module.__name__}: {e}")
             setup_modules.add(module)
+
+
+def pytest_unconfigure(config):
+    """Remove this run's throwaway DB directory."""
+    shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
