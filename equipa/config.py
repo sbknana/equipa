@@ -85,7 +85,10 @@ DEFAULT_DISPATCH_CONFIG: dict = {
     "skip_projects": [],
     "priority_boost": {},
     "only_projects": [],
-    "security_review": False,
+    # Default ON (EQUIPA review 2026-09-29, gate-08 / cli-02): with no config,
+    # or a config missing this key, code diffs used to merge unreviewed.
+    # Turning review off is now an explicit opt-out.
+    "security_review": True,
     "features": dict(DEFAULT_FEATURE_FLAGS),
     "autoresearch_max_retries": 3,
 }
@@ -134,7 +137,7 @@ def is_security_review_enabled(args, dispatch_config: dict | None = None) -> boo
         dc = getattr(args, "dispatch_config", None) or {}
     enabled = getattr(args, "security_review", None)
     if enabled is None:
-        enabled = dc.get("security_review", False)
+        enabled = dc.get("security_review", True)
     if not is_feature_enabled(dc, "security_review"):
         enabled = False
     return bool(enabled)

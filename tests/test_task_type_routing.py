@@ -18,21 +18,21 @@ from pathlib import Path
 
 
 def test_task_type_field_exists():
-    """Test that task_type field exists in tasks table with 'feature' default."""
-    db_path = Path(__file__).parent.parent / "theforge.db"
-    if not db_path.exists():
-        # Database not available locally, skip gracefully
-        return
+    """Test that task_type field exists in tasks table with 'feature' default.
 
-    conn = sqlite3.connect(db_path)
+    Reads the suite's own schema-applied DB (conftest points THEFORGE_DB at a
+    temp file). It used to open the repo-root theforge.db, which on the
+    owner's hosts is a symlink to the live database, and to return early
+    ("skip gracefully") when that file was missing: a pass that tested nothing.
+    """
+    from equipa.constants import THEFORGE_DB
+
+    conn = sqlite3.connect(THEFORGE_DB)
     cursor = conn.execute("PRAGMA table_info(tasks)")
     columns = {row[1]: row for row in cursor.fetchall()}
     conn.close()
 
-    if not columns:
-        # Empty/stub database — real DB accessed via MCP, skip gracefully
-        return
-
+    assert columns, f"tasks table missing from the test DB at {THEFORGE_DB}"
     assert 'task_type' in columns, "task_type field not found in tasks table"
 
     col_info = columns['task_type']

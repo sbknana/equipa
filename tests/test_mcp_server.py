@@ -476,49 +476,32 @@ def test_task_create_success(mcp_server, isolated_db):
     assert row[3] == "todo"
 
 
-def test_no_test_rows_in_production_db():
-    """Regression guard: the test suite must NEVER write 'MCP Test Task'
-    rows into the production TheForge DB.
+def test_suite_db_is_isolated():
+    """Regression guard: the suite must never resolve a real TheForge DB.
 
-    Historically the mcp_server fixture inherited THEFORGE_DB from the
-    ambient environment, which in CI/dev runs from /srv/.../Equipa-repo
-    resolves to the live production DB. Every pytest run leaked an
-    'MCP Test Task' / 'Created by test_mcp_server.py' stub at project_id=23
-    (e.g. ids 2147, 2152, 2153, 2186, 2187, 2188, 2189 on 2026-05-03).
+    Historically the suite inherited THEFORGE_DB (or the repo-root default)
+    and leaked 'MCP Test Task' rows into production, and on the owner's hosts
+    the repo-root theforge.db is a symlink to the live DB, so test DELETEs
+    wiped real memory tables (EQUIPA review 2026-09-29, LRN-01). The old guard
+    here opened that live DB to look for leaked rows, which was itself a
+    write-capable connection to production, and skipped everywhere else.
 
-    This test asserts no such rows exist after the suite runs against the
-    production DB at the canonical path. It is a no-op when the production
-    DB is absent (e.g. in CI without the live DB mounted).
+    Now conftest forces a temp DB before equipa is imported; this asserts it
+    held for the modules that bind the path by value.
     """
-    prod_db = REPO_ROOT / "theforge.db"
-    if not prod_db.exists():
-        pytest.skip(f"Production DB not present at {prod_db}; nothing to guard.")
+    import tempfile
 
-    conn = sqlite3.connect(str(prod_db))
-    try:
-        # tasks table must exist on the production DB; if it does not,
-        # the path is not a real TheForge DB — skip rather than fail.
-        tbl = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
-        ).fetchone()
-        if tbl is None:
-            pytest.skip(f"tasks table missing in {prod_db}; not a TheForge DB.")
+    from equipa import constants, db
 
-        leaked = conn.execute(
-            """
-            SELECT id, title FROM tasks
-            WHERE project_id = 23
-              AND title = 'MCP Test Task'
-            """
-        ).fetchall()
-    finally:
-        conn.close()
-
-    assert leaked == [], (
-        f"Found {len(leaked)} 'MCP Test Task' rows leaked into production DB "
-        f"({prod_db}): {leaked}. The mcp_server pytest fixture must isolate "
-        "THEFORGE_DB to a tmp_path."
-    )
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    repo_db = (REPO_ROOT / "theforge.db").resolve()
+    for label, value in (("constants", constants.THEFORGE_DB),
+                         ("db", db.THEFORGE_DB)):
+        resolved = Path(value).resolve()
+        assert resolved.is_relative_to(tmp_root), (
+            f"equipa.{label}.THEFORGE_DB={value} is outside {tmp_root}")
+        assert resolved != repo_db, (
+            f"equipa.{label}.THEFORGE_DB resolves to the repo-root DB {repo_db}")
 
 
 def test_dispatch_missing_arg(mcp_server):

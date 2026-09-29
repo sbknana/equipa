@@ -94,9 +94,10 @@ def test_feature_flag_can_disable_top_level_key():
     assert _is_security_review_enabled(args) is False
 
 
-def test_disabled_when_no_flag_and_no_config():
+def test_enabled_when_no_flag_and_no_config():
+    """Inverted 2026-09-29 (gate-08): silence now means review runs."""
     args = _make_args()
-    assert _is_security_review_enabled(args) is False
+    assert _is_security_review_enabled(args) is True
 
 
 # ---------------------------------------------------------------------------
