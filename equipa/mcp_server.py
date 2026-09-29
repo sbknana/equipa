@@ -14,8 +14,15 @@ Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-02: equipa_task_create validates project existence + status, caps
   description size, is rate-limited, and honours EQUIPA_MCP_PROJECT_IDS allowlist.
 - MCP-03: All query handlers clamp caller-supplied ``limit`` to MAX_QUERY_LIMIT.
+- MCP-08: the tools/call log line caps the arguments it echoes. Logged verbatim,
+  a payload larger than the client's stderr pipe buffer blocked the server's
+  write and deadlocked it — the response was never sent and the client waited on
+  stdout forever. Numbered 08 to avoid colliding with MCP-04..07, claimed by
+  write-tool branches already in flight.
 
 Stderr is used for logging only. Stdout is reserved for JSON-RPC messages.
+A corollary of that split: stdout must stay drainable, and so must stderr —
+nothing written to either may be unbounded in a caller-controlled way.
 
 Copyright 2026 Forgeborn
 """
@@ -81,6 +88,13 @@ MAX_QUERY_LIMIT = 500
 
 # Maximum bytes accepted in equipa_task_create description payload (UTF-8 encoded).
 MAX_DESCRIPTION_BYTES = 32 * 1024  # 32 KB
+
+# Maximum characters of caller-supplied arguments echoed into the stderr log
+# line for a tools/call. Deliberately far below any plausible pipe buffer — the
+# smallest observed was roughly 4 KB, on Windows — because exceeding the buffer
+# does not merely spam the log, it deadlocks the server against a client that
+# is not draining stderr. See _handle_tools_call and MCP-08.
+MAX_LOG_ARGS_CHARS = 500
 
 # Token-bucket rate limits (refills continuously up to capacity).
 DISPATCH_RATE_CAPACITY = 10          # 10 dispatches
@@ -837,9 +851,21 @@ def _handle_tools_call(params: dict, request_id: int | str) -> None:
     tool_name = params.get("name")
     args = params.get("arguments", {})
 
-    # Avoid logging the auth_token verbatim.
+    # Avoid logging the auth_token verbatim, and cap the rest.
+    #
+    # The cap is not tidiness, it is liveness. This log goes to stderr, and a
+    # client that opens stderr as a pipe and does not drain it — which is what
+    # subprocess.PIPE gives you by default — leaves us only the pipe's buffer
+    # before a write blocks. Logging the arguments verbatim therefore let ANY
+    # tool call carrying more than that buffer wedge the server permanently:
+    # the write to stderr blocks, the response is never sent, and the client
+    # waits on stdout forever. See MCP-08.
     redacted = {k: ("***" if k == "auth_token" else v) for k, v in args.items()}
-    _log(f"Received tools/call: {tool_name} with args {redacted}")
+    summary = repr(redacted)
+    if len(summary) > MAX_LOG_ARGS_CHARS:
+        summary = (f"{summary[:MAX_LOG_ARGS_CHARS]}... "
+                   f"[{len(summary)} chars, truncated for logging]")
+    _log(f"Received tools/call: {tool_name} with args {summary}")
 
     if tool_name not in TOOLS:
         _send_error(request_id, -32601, f"Unknown tool: {tool_name}")

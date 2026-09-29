@@ -10,6 +10,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,8 +100,57 @@ def _build_isolated_db(db_path: Path) -> None:
         conn.close()
 
 
-def _send_request(proc: subprocess.Popen, method: str, params: dict | None = None, request_id: int = 1) -> dict:
-    """Send JSON-RPC request to MCP server and read response."""
+# How long any helper here will wait for one response line before giving up.
+# A wedged server must become a RED TEST, never a hung suite: a bare
+# proc.stdout.readline() blocks for ever, produces no output, and takes the whole
+# run down with it — a CI job then burns its entire time budget and reports
+# nothing about which call stalled. Generous enough that a loaded machine does
+# not trip it; short enough that a real wedge is reported in seconds.
+RESPONSE_TIMEOUT = 15.0
+
+
+def _exchange(proc: subprocess.Popen, payload: str, timeout: float) -> dict:
+    """Write *payload* and read one response line.
+
+    Returns the worker's result box, and the THREE outcomes stay distinguishable
+    because they need different words: {"line": ...} got an answer (possibly ""
+    for EOF), {"error": ...} the pipe broke, {} the deadline passed with the
+    worker still stuck. Collapsing them to None once already made a server that
+    had simply DIED report as one that was wedged — which is the same class of
+    misleading diagnostic this whole change exists to remove.
+
+    BOTH halves go on the daemon worker, and that is the point. The write can
+    wedge just as readily as the read: a server blocked on its own stderr stops
+    draining stdin, and once the stdin pipe buffer fills, the client blocks
+    inside write() having never reached the read at all. Bounding only the read
+    moves the hang, it does not remove it. One worker, one deadline, both halves
+    covered — the main thread keeps the right to give up and say so.
+    """
+    out: dict = {}
+
+    def _go() -> None:
+        try:
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            out["line"] = proc.stdout.readline()
+        except Exception as exc:  # pragma: no cover - pipe died under us
+            out["error"] = repr(exc)
+
+    worker = threading.Thread(target=_go, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    return out
+
+
+def _send_request(proc: subprocess.Popen, method: str, params: dict | None = None,
+                  request_id: int = 1, timeout: float = RESPONSE_TIMEOUT) -> dict:
+    """Send JSON-RPC request to MCP server and read response.
+
+    BOUNDED. This used to be a bare readline(), which is why a stalled server
+    turned the whole suite into a hang with nothing on stdout to say where it
+    stopped. The file already knew — _send_request_with_deadline was written for
+    exactly this reason — but only one of the thirty-odd call sites used it.
+    """
     request = {
         "jsonrpc": "2.0",
         "method": method,
@@ -109,12 +159,24 @@ def _send_request(proc: subprocess.Popen, method: str, params: dict | None = Non
     if params is not None:
         request["params"] = params
 
-    proc.stdin.write(json.dumps(request) + "\n")
-    proc.stdin.flush()
-
-    # Read response
-    response_line = proc.stdout.readline()
-    return json.loads(response_line)
+    res = _exchange(proc, json.dumps(request), timeout)
+    if "error" in res:
+        raise AssertionError(
+            f"pipe broke talking to the MCP server during {method!r}: "
+            f"{res['error']} (exit code {proc.poll()!r})"
+        )
+    line = res.get("line")
+    if line is None:
+        raise AssertionError(
+            f"MCP server sent no response to {method!r} within {timeout}s "
+            f"(params={str(params)[:200]!r}) — it is wedged, not slow"
+        )
+    if line == "":
+        raise AssertionError(
+            f"MCP server closed stdout without answering {method!r} "
+            f"(exit code {proc.poll()!r})"
+        )
+    return json.loads(line)
 
 
 def _send_notification(proc: subprocess.Popen, method: str, params: dict | None = None) -> None:
@@ -787,3 +849,67 @@ def test_cli_mcp_server_flag():
     import equipa.mcp_server
     assert hasattr(equipa.mcp_server, "run_server")
     assert callable(equipa.mcp_server.run_server)
+
+
+# --- MCP-08: the tools/call log line must not deadlock the server -------------
+
+def _send_request_with_deadline(proc: subprocess.Popen, method: str,
+                                params: dict, timeout: float = RESPONSE_TIMEOUT) -> dict | None:
+    """Send a request and read one response, RETURNING None if it does not come.
+
+    Kept distinct from _send_request even though both are bounded now, because
+    the return contract differs and the MCP-08 test depends on it: that test
+    ASSERTS on the silence, with its own message about an undrained stderr pipe,
+    so it needs the None rather than an exception raised out from under it.
+    """
+    line = _exchange(proc, json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    }), timeout).get("line")
+    return json.loads(line) if line else None
+
+
+def test_large_tool_args_do_not_deadlock_the_server(isolated_db):
+    """A payload bigger than the stderr pipe buffer must still get a response.
+
+    The server logs every tools/call to stderr. When it logged the arguments
+    verbatim, a client holding stderr as an undrained pipe — plain
+    subprocess.PIPE, which is what this harness and most MCP clients use — gave
+    the server only the pipe's buffer before its write blocked. The response was
+    then never written to stdout and the client waited forever.
+
+    The buffer size is the whole reason this hid: measured on Windows the
+    ceiling was roughly 4 KB of arguments, while a platform with a larger pipe
+    buffer swallows the same payload and the bug never shows.
+
+    Deliberately NOT using the mcp_server fixture's helper: the point is to hold
+    stderr open and unread, exactly as a real client does.
+    """
+    proc = _spawn_server(isolated_db)
+    try:
+        response = _send_request_with_deadline(proc, "tools/call", {
+            "name": "equipa_task_create",
+            "arguments": {
+                "auth_token": TEST_TOKEN,
+                "project_id": 23,
+                "title": "large but legal",
+                # comfortably past every pipe buffer we have measured, and still
+                # under MAX_DESCRIPTION_BYTES so the call is otherwise valid
+                "description": "x" * 24_000,
+            },
+        })
+        assert response is not None, (
+            "server never responded: it is blocked writing its log line to an "
+            "undrained stderr pipe"
+        )
+        assert "result" in response, response
+    finally:
+        _stop_server(proc)
+
+
+def test_tool_call_log_line_is_capped():
+    """The log line itself is bounded, whatever the caller sends."""
+    from equipa.mcp_server import MAX_LOG_ARGS_CHARS
+
+    assert MAX_LOG_ARGS_CHARS < 4_000, (
+        "cap must stay well under the smallest observed pipe buffer (~4 KB)"
+    )
