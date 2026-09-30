@@ -1787,6 +1787,40 @@ def _shape_candidates(
     return found
 
 
+# Task 3137 (SR3130-01): one CommonMark container marker at the start of a
+# line: a blockquote ">" or a list bullet / number with its spaces.
+_CONTAINER_MARKER_RE = re.compile(r">[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]{1,4}")
+_THEMATIC_BREAK_RE = re.compile(r"[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
+
+
+def _innermost_container_line(line: str) -> str:
+    """``line`` with nested container markers reduced to the innermost one.
+
+    A renderer shows "- 1. HIGH: SQLi" as a list item holding a numbered
+    item "HIGH: SQLi", and "> > > > > HIGH:" as a quote holding "HIGH:".
+    The line rules read one marker (and at most four ">"), so the nested
+    form merged. "<li>1. HIGH: SQLi</li>" became "- 1. HIGH: SQLi" once
+    task 3130 gave HTML list items their bullet, and a review that blocked
+    before merged (SR3130-01). Keeping only the innermost marker leaves the
+    finding in the position every rule reads. A thematic break ("- - -") and
+    a line whose inner item is empty are left alone. Linear: one pass.
+    """
+    stripped = line.lstrip(" \t")
+    indent = len(line) - len(stripped)
+    first = _CONTAINER_MARKER_RE.match(line, indent)
+    if first is None:
+        return line
+    innermost = _CONTAINER_MARKER_RE.match(line, first.end())
+    if innermost is None or _THEMATIC_BREAK_RE.fullmatch(line):
+        return line
+    while (inner := _CONTAINER_MARKER_RE.match(line, innermost.end())) is not None:
+        innermost = inner
+    content = line[innermost.end():]
+    if not content.strip():
+        return line
+    return line[:indent] + innermost.group(0) + content
+
+
 def _html_as_markdown(html_line: str) -> str:
     """Rewrite inline HTML as the Markdown a renderer would show (task 3122)."""
     markdown = _HTML_BOLD_TAG_RE.sub("**", html_line)
@@ -1807,6 +1841,8 @@ def _html_candidates(
     rewritten pieces keep the number of the line they came from, and a
     severity ``seen`` already holds for that line is not reported again.
     Heading lines are left to the heading rules, which read through tags.
+    A list item that opens with its own marker ("<li>1. HIGH: SQLi") keeps
+    only the innermost marker (task 3137, SR3130-01).
     """
     source_lines: list[int] = []
     pieces: list[str] = []
@@ -1819,7 +1855,7 @@ def _html_candidates(
             pieces.append("")
         for piece in _html_as_markdown(line).split("\n"):
             source_lines.append(line_number)
-            pieces.append(piece)
+            pieces.append(_innermost_container_line(piece))
     if not pieces:
         return []
     markdown = "\n".join(pieces)
