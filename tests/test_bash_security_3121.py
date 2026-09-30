@@ -232,8 +232,81 @@ class TestDoubleQuotedSubstitution:
         assert backtick.check_id == CheckID.COMMAND_SUBSTITUTION
         assert "backticks" in backtick.message
 
+    def test_scanner_ignores_inert_forms(self):
+        for command in (
+            "echo plain",
+            "echo '\"$(id)\"'",          # double quotes inside single quotes
+            "echo $'\"$(id)\"'",         # ANSI-C string
+            'echo "\\$(id) \\`id\\`"',   # escaped inside double quotes
+            "echo $(date)",              # unquoted: check 8's job
+        ):
+            assert bash_security._double_quoted_substitutions(command) == [], command
+
     def test_scanner_reports_inner_text(self):
         found = bash_security._double_quoted_substitutions(
             'a "x $(grep "y z" f | wc -l) `id`" $(date) \'$(no)\''
         )
         assert found == [("$(", 'grep "y z" f | wc -l'), ("`", "id")]
+
+
+# ---------------------------------------------------------------------------
+# sandbox-08: redirect targets must stay in the tree or /tmp
+# ---------------------------------------------------------------------------
+
+TRAVERSAL_REDIRECTS = [
+    "echo x >> /tmp/../home/someone/.bashrc",
+    "echo x > ./../../../x",
+    "echo x > a/../../../x",
+    "echo x > ..",
+    "echo x >> ../../x.log",               # the *.log append allowance too
+    "echo x >> /srv/other-project/app.log",  # absolute outside /tmp
+    "echo x 2>> /srv/other-project/err.log",
+    "echo x > /opt/sentinel.txt",
+    # Quoted parts are joined into the same word by bash.
+    'echo x > /tmp/x"/../../home/someone/.bashrc"',
+    "echo x > /tmp/'..'/etc-sentinel",
+    "echo x > /tmp/x\\/..\\/..\\/y",
+    # Unknowable targets: variable, glob (.* matches ..), unterminated quote.
+    "echo x > /tmp/$SUB/y",
+    "echo x > .*/.*/y",
+    "echo x &> ../x",
+    "echo x >| ../x",
+    "echo x >&../x",
+    "cat <> ../x",
+]
+
+CONTAINED_REDIRECTS = [
+    "echo x > out/result.txt",
+    "echo x > ./result.txt",
+    "echo x >> /tmp/run.log",
+    "echo x > /tmp/sub/dir/file.txt",
+    "echo x >> build.log",
+    "cmd 2>/dev/null",
+    "cmd > /dev/null 2>&1",
+    "echo x..y > notes..txt",  # '..' inside a name is not a path component
+]
+
+
+class TestRedirectTargets:
+
+    @pytest.mark.parametrize("command", TRAVERSAL_REDIRECTS)
+    def test_traversal_or_outside_target_blocks(self, command: str):
+        result = check_bash_command(command)
+        assert not result.safe, f"allowed: {command!r}"
+        assert result.check_id in (
+            CheckID.OUTPUT_REDIRECTION, CheckID.INPUT_REDIRECTION
+        ), result
+
+    @pytest.mark.parametrize("command", CONTAINED_REDIRECTS)
+    def test_contained_target_allowed(self, command: str):
+        result = check_bash_command(command)
+        assert result.safe, f"false positive on {command!r}: {result.message}"
+
+    def test_word_reader_joins_quoted_parts(self):
+        literal, dynamic, _ = bash_security._read_shell_word(
+            '/tmp/x"/../"\'..\'/y z', 0
+        )
+        assert (literal, dynamic) == ("/tmp/x/../../y", False)
+
+    def test_fd_duplication_is_not_a_file_target(self):
+        assert bash_security._shell_redirects("cmd 2>&1 >&2 <&0 >&-") == []

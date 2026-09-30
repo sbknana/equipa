@@ -1338,6 +1338,173 @@ def _check_double_quoted_substitution(command: str) -> BashSecurityResult:
     return _SAFE
 
 
+_WORD_BREAK_CHARS = frozenset(" \t\n;&|<>()")
+# Characters that make a redirect target unknowable before run time.
+_DYNAMIC_WORD_CHARS = frozenset("$`*?[")
+# Absolute redirect targets allowed besides /tmp/...
+_ALLOWED_DEVICE_TARGETS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+
+
+def _read_shell_word(command: str, start: int) -> tuple[str, bool, int]:
+    """Read the shell word starting at *start*.
+
+    Returns ``(literal, dynamic, end)``. Unquoted, single-quoted and
+    double-quoted parts are joined the way bash joins them into one word, so
+    ``/tmp/x"/../../y"`` reads as ``/tmp/x/../../y``. ``dynamic`` is True
+    when the real value is only known at run time - a ``$`` or backtick
+    expansion, an unquoted glob character (``.*`` matches ``..``), or an
+    unterminated quote.
+    """
+    parts: list[str] = []
+    dynamic = False
+    length = len(command)
+    index = start
+    while index < length:
+        ch = command[index]
+        if ch in _WORD_BREAK_CHARS:
+            break
+        if ch == "\\":
+            if index + 1 < length:
+                parts.append(command[index + 1])
+            index += 2
+            continue
+        if ch == "'":
+            close = command.find("'", index + 1)
+            if close < 0:
+                return "".join(parts), True, length
+            parts.append(command[index + 1:close])
+            index = close + 1
+            continue
+        if ch == '"':
+            inner = index + 1
+            while inner < length and command[inner] != '"':
+                if command[inner] == "\\" and inner + 1 < length:
+                    parts.append(command[inner + 1])
+                    inner += 2
+                    continue
+                if command[inner] in "$`":
+                    dynamic = True
+                parts.append(command[inner])
+                inner += 1
+            if inner >= length:
+                return "".join(parts), True, length
+            index = inner + 1
+            continue
+        if ch in _DYNAMIC_WORD_CHARS:
+            dynamic = True
+        parts.append(ch)
+        index += 1
+    return "".join(parts), dynamic, index
+
+
+def _shell_redirects(command: str) -> list[tuple[str, str, bool]]:
+    """Return ``(direction, target, dynamic)`` for each file redirection.
+
+    *direction* is ``"in"`` (``<``, ``<&file``) or ``"out"`` (``>``, ``>>``,
+    ``>|``, ``<>``, ``&>``, ``&>>``, ``>&file``). Only shell-level operators
+    count: quoted text is skipped, and so are heredoc/here-string operators,
+    ``<(``/``>(`` process substitutions (check 8 judges those) and fd
+    duplications such as ``2>&1`` or ``>&-``. Text inside unquoted ``$(...)``
+    is scanned, because bash performs those redirections too. Redirections
+    inside a double-quoted ``"$(...)"`` are checked when that substitution's
+    inner command goes through the full pipeline (check 8, double-quoted).
+    """
+    redirects: list[tuple[str, str, bool]] = []
+    length = len(command)
+    in_double = False
+    index = 0
+    while index < length:
+        ch = command[index]
+        if ch == "\\":
+            index += 2
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            index += 1
+            continue
+        if ch == "'":
+            close = command.find("'", index + 1)
+            index = length if close < 0 else close + 1
+            continue
+        if ch == '"':
+            in_double = True
+            index += 1
+            continue
+
+        is_dup = False
+        if ch == "&" and command.startswith("&>", index):
+            direction = "out"
+            op_end = index + (3 if command.startswith("&>>", index) else 2)
+        elif ch == "<":
+            if command.startswith("<<<", index):
+                index += 3
+                continue
+            if command.startswith("<<", index):
+                index += 3 if command.startswith("<<-", index) else 2
+                continue
+            if command.startswith("<(", index):
+                index += 2
+                continue
+            if command.startswith("<>", index):
+                direction, op_end = "out", index + 2
+            elif command.startswith("<&", index):
+                direction, op_end, is_dup = "in", index + 2, True
+            else:
+                direction, op_end = "in", index + 1
+        elif ch == ">":
+            if command.startswith(">(", index):
+                index += 2
+                continue
+            if command.startswith(">>", index) or command.startswith(">|", index):
+                direction, op_end = "out", index + 2
+            elif command.startswith(">&", index):
+                direction, op_end, is_dup = "out", index + 2, True
+            else:
+                direction, op_end = "out", index + 1
+        else:
+            index += 1
+            continue
+
+        word_start = op_end
+        while word_start < length and command[word_start] in " \t":
+            word_start += 1
+        target, dynamic, word_end = _read_shell_word(command, word_start)
+        index = max(word_end, op_end)
+        if is_dup and not dynamic and (target.isdigit() or target == "-"):
+            continue  # 2>&1, >&2, <&0, >&- : fd duplication, not a file
+        redirects.append((direction, target, dynamic))
+    return redirects
+
+
+def _redirect_target_problem(direction: str, target: str, dynamic: bool) -> str | None:
+    """Explain why a redirect target is refused, or return None if allowed.
+
+    Allowed: a literal relative path with no ``..`` component (it stays in the
+    working directory), a literal ``/tmp/...`` path with no ``..`` component,
+    and ``/dev/null``/``/dev/stdout``/``/dev/stderr``. The check is textual:
+    a symlink inside the tree that points elsewhere is NOT detected.
+    """
+    if dynamic:
+        return (
+            "target is only known at run time (variable, substitution, glob "
+            "or unterminated quote); use a literal path"
+        )
+    if not target:
+        return "target is missing or empty"
+    if target.startswith("~"):
+        return "target is in a home directory"
+    if ".." in target.split("/"):
+        return "target contains a '..' path component"
+    if target.startswith("/"):
+        if target in _ALLOWED_DEVICE_TARGETS:
+            return None
+        if target.startswith("/tmp/") and target.strip("/") != "tmp":
+            return None
+        return "target is an absolute path outside /tmp"
+    return None
+
+
 def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
     """Checks 9-10: Input and output redirection in unquoted content.
 
@@ -1394,6 +1561,27 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
             message="Command redirects output to a sensitive system path",
         )
 
+    # Word-level target validation (sandbox-08, sandbox-13). The target is
+    # read the way bash reads it - quoted parts joined - so neither
+    # `>> /tmp/../home/u/.bashrc` nor `> /tmp/x"/../../home/u/.bashrc"` can
+    # hide a traversal from the textual allowlist below. Input redirection
+    # from a literal relative path (`sort < data/in.txt`) is allowed: it
+    # reads nothing the process could not read anyway, while absolute, home
+    # and `..` sources stay blocked.
+    for direction, target, dynamic in _shell_redirects(command):
+        problem = _redirect_target_problem(direction, target, dynamic)
+        if problem is None:
+            continue
+        if direction == "in":
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.INPUT_REDIRECTION,
+                message=f"Command contains input redirection (<) whose {problem}",
+            )
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.OUTPUT_REDIRECTION,
+            message=f"Command contains output redirection (>) whose {problem}",
+        )
+
     # Strip safe stderr/stdout redirection patterns before the literal-char check
     safe_patterns = [
         # Heredoc / here-string operators MUST be stripped BEFORE bare-< check.
@@ -1401,6 +1589,18 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
         # so the third < is not misread as a heredoc body word boundary.
         r"<<<",                            # <<<word here-string operator
         r"<<-?\s*\\?['\"]?[\w-]+['\"]?",   # <<EOF, <<-EOF, <<'EOF', <<\EOF
+        # A heredoc operator whose quoted delimiter was removed by
+        # _extract_unquoted (`cat <<'EOF' > f` -> `cat << > f`).
+        r"<<-?",
+        # <(...) process substitution: check 8 already judged its inner.
+        r"<\(",
+        # Input from a literal relative, /tmp or /dev/null path: every
+        # target was validated word by word above (no `..`, no ~, no
+        # absolute path outside /tmp, nothing dynamic).
+        r"<\s*/dev/null",
+        r"<\s*/tmp/[\w./-]+",
+        r"<\s*\./[\w./-]+",
+        r"<\s*[A-Za-z0-9_][\w./-]*",
         r"2\s*>\s*&\s*1",                  # 2>&1
         r"2\s*>\s*/dev/null",              # 2>/dev/null
         r">\s*/dev/null",                  # >/dev/null
