@@ -292,8 +292,11 @@ REVIEW_BYTES = 200 * 1024
 
 @pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n", " ",
                                         " \n", "\t\n"])
-def test_200kb_of_line_breaks_parses_in_half_a_second(line_break):
-    body = [line_break * (REVIEW_BYTES // len(line_break))]
+@pytest.mark.parametrize("section", [[], ["## Findings"]])
+def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
+    # Inside the Summary section, and after a heading that ends it (where
+    # every line is also checked for a "Summary:" field).
+    body = section + [line_break * (REVIEW_BYTES // len(line_break))]
     text = review("No findings.", body, ZERO, low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
     started = time.perf_counter()
@@ -340,6 +343,17 @@ ADVERSARIAL_BODIES = {
     "inline-tags-with-backticks": ["<a title='`'> `x` " * (REVIEW_BYTES // 18)],
     "unclosed-tag-openers": ["<a`" * (REVIEW_BYTES // 3)],
     "long-unclosed-tags": _padded_lines("<a " + "`" * 600),
+    # Long blank runs, which folding turns into one blank line, split every
+    # possible way by "[ \t]*\**[ \t]*" before task 3137 (quadratic).
+    "blank-line-after-heading": ["## Findings", " " * REVIEW_BYTES],
+    "tab-line-after-heading": ["## Findings", "\t" * REVIEW_BYTES],
+    "bullet-then-blanks": ["## Findings", "- " + " " * REVIEW_BYTES + "x"],
+    "hash-then-blanks": ["#" + " " * REVIEW_BYTES + "x"],
+    "summary-status-blanks": ["status" + " " * REVIEW_BYTES + "x"],
+    "summary-draft-blanks": ["DRAFT" + " " * REVIEW_BYTES + "x"],
+    "summary-field-blanks": ["## Notes", "Summary" + " " * REVIEW_BYTES + "x"],
+    "marker-comment-blanks": ["<!-- EQUIPA-X" + " " * REVIEW_BYTES + "x"],
+    "table-delimiter-blanks": ["| a | b |", "|---" + " " * REVIEW_BYTES + "| x"],
 }
 
 

@@ -1032,10 +1032,14 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # "Preliminary checks passed" are ordinary prose in finished reviews. The
 # completion sentinel is the real proof a review finished; these markers are
 # a second line of defence and must not block honest reviews.
-_STATUS_END = r"(?=[ \t]*(?:$|[:—–(\[.;,]|-(?!\w)|only\b))"
+# Task 3137: every whitespace run is matched once. "[ \t]*[*_]{0,2}[ \t]*"
+# and a "[ \t*_\])]*" run followed by a "[ \t]*" lookahead split one long
+# run in every possible way (quadratic); the forms below read the same lines.
+# _STATUS_END follows a maximal "[ \t*_\])]*" run, so its blanks are gone.
+_STATUS_END = r"(?![ \t*_\])])(?=$|[:—–(\[.;,]|-(?!\w)|only\b)"
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
     r"^[ \t*_\[(:—–-]*"
-    r"(?:status[ \t]*[*_]{0,2}[ \t]*[:=—–-][ \t]*[*_]{0,2}[ \t]*)?(?:"
+    r"(?:status[ \t]*(?:[*_]{1,2}[ \t]*)?[:=—–-][ \t]*(?:[*_]{1,2}[ \t]*)?)?(?:"
     r"(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b"
     r"|(?:DRAFT|WIP|PRELIMINARY)"
     r"(?:[ \t]+(?:review|findings?|pass|scan))?[ \t*_\])]*" + _STATUS_END +
@@ -1055,11 +1059,14 @@ _PENDING_REVIEW_RE = re.compile(
     r")(?![A-Za-z])",
     re.IGNORECASE,
 )
+# Task 3137: "[ \t]*\**[ \t]*" split a long blank run in every possible way,
+# so a line of 20 000 spaces outside the Summary took 3.75 s (quadratic).
+# "[ \t]*(?:\*+[ \t]*)?" reads the same lines and matches each run once.
 _SUMMARY_HEADING_RE = re.compile(
-    r"^#{1,6}[ \t]*\**[ \t]*Summary\b(.*)$", re.IGNORECASE,
+    r"^#{1,6}[ \t]*(?:\*+[ \t]*)?Summary\b(.*)$", re.IGNORECASE,
 )
 _SUMMARY_FIELD_RE = re.compile(
-    r"^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*Summary[ \t]*\**[ \t]*"
+    r"^[ \t]*(?:[-*+][ \t]+)?(?:\*+[ \t]*)?Summary[ \t]*(?:\*+[ \t]*)?"
     r"[:—–-][ \t]*\**(.*)$",
     re.IGNORECASE,
 )
@@ -1964,7 +1971,7 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
 # inside a word ("HI<!-- EQUIPA-X -->GH: SQLi") joins the word when rendered,
 # so that review must be parsed as rendered too.
 _STANDALONE_MARKER_COMMENT_RE = re.compile(
-    r"^[ \t]{0,3}<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}"
+    r"^[ \t]{0,3}<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?(?:[ \t]*[0-9A-Fa-f]{1,64})?"
     r"[ \t]*-->[ \t]*$",
     re.MULTILINE,
 )
@@ -2090,9 +2097,6 @@ _HTML_BLOCK_START_RE = re.compile(
     r"|p|pre|script|section|style|summary|table|tbody|td|textarea|tfoot|th"
     r"|thead|tr|ul)(?:[ \t>]|/>|$)",
     re.IGNORECASE,
-)
-_TABLE_DELIMITER_ROW_RE = re.compile(
-    r"[ \t]{0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*",
 )
 _BACKTICK_RUN_RE = re.compile(r"`+")
 # Inline constructs that open where they start: a backtick run, an HTML
@@ -2249,7 +2253,8 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
         if (index + 1 < len(lines) and "|" in stripped
                 and not _CONTAINER_MARKER_RE.match(stripped)
                 and "|" in lines[index + 1]
-                and _TABLE_DELIMITER_ROW_RE.fullmatch(lines[index + 1])):
+                and all(_TABLE_DELIMITER_CELL_RE.fullmatch(cell)
+                        for cell in _table_cells(lines[index + 1]) or [""])):
             in_table = True
             blocks.table_rows.add(index)
             continue
