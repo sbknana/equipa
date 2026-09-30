@@ -6,6 +6,10 @@ classifies a shell command as safe/unsafe with about two dozen checks
 whitespace, redirect targets, etc.). It is a pure classifier — it never
 runs anything itself.
 
+Quoting is read ONCE by a shared tokenizer (``_scan_shell``) that follows
+bash's parser; every quote-sensitive check reads its classification, and a
+command it cannot parse cleanly is refused (check 25) instead of guessed at.
+
 What it is NOT: a permission policy or a sandbox. It looks for
 parser-confusion and substitution tricks; plainly destructive commands
 (``rm -rf build/``, ``bash script.sh``, ``git push --force``) pass. Redirect
@@ -2435,54 +2439,6 @@ _SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
     r"(?:python|python2|python3|py|perl|ruby|node|nodejs)"
     r"\s+-(?:c|e)\s*$"
 )
-
-
-# Broader allowlist used by check 7 (newlines): any interpreter or DB CLI
-# whose ``-c``/``-e``/``-x``/``--command`` argument is a multi-statement
-# script body where embedded newlines are legitimate (consumed by the
-# interpreter, not the shell). This includes shell interpreters
-# (``bash``/``sh``/``zsh``) — unlike the comment-smuggling check, a bare
-# newline inside ``bash -c "..."`` is NOT a shell-token boundary at the
-# outer shell level (the whole quoted body is ONE token to ``bash``).
-# The ``\n#`` smuggling primitive is still caught for shells by check 23
-# via ``_is_inside_safe_interpreter_arg`` (which intentionally excludes
-# the shells), so this looser list does not weaken that defense.
-#
-# The optional path prefix ``(?:[^\s]*/)?`` mirrors the same fix applied
-# to ``_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE`` — virtualenv forms like
-# ``./venv/bin/python3 -c`` must also pass the newline check (bug 2603).
-_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
-    r"(?:^|[\s;&|`(])"
-    r"(?:[^\s]*/)?(?:python|python2|python3|py|perl|ruby|node|nodejs|"
-    r"bash|sh|zsh|ksh|dash|fish|"
-    r"psql|mysql|mariadb|sqlite|sqlite3|"
-    r"awk|gawk|sed|"
-    r"php|lua|tclsh|R|Rscript)"
-    r"\s+-(?:c|e|x|-command)\s*$"
-)
-
-
-def _is_inside_quoted_arg_value(command: str, quote_open_idx: int) -> bool:
-    """Return True if the quote at ``quote_open_idx`` opens the body of a
-    script-interpreter or DB-CLI ``-c``/``-e`` argument where embedded
-    newlines are legitimate (``python3 -c``, ``bash -c``, ``psql -c``,
-    ``perl -e``, ``awk -e``, etc.).
-
-    Used by check 7 (``_check_newlines``) to ensure it only fires when the
-    newline is at a true shell-token boundary, not when it is inside a
-    quoted-string argument value being passed to a known interpreter. The
-    shell sees the whole quoted argument as one token, so newlines inside
-    are consumed by the interpreter — they cannot separate shell commands.
-
-    Mirrors ``_is_inside_safe_interpreter_arg`` (used by check 23) but
-    includes shell and DB CLIs because a newline alone is not the
-    comment-smuggling primitive — that primitive (``\\n#``) is what
-    check 23 catches with the narrower allowlist.
-    """
-    if quote_open_idx <= 0:
-        return False
-    prefix = command[:quote_open_idx]
-    return bool(_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE.search(prefix))
 
 
 def _is_inside_safe_interpreter_arg(command: str, quote_open_idx: int) -> bool:
