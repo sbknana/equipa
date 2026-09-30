@@ -866,8 +866,25 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # Task #3038 (S3033-05): the marker must sit in status position, at the START
 # of a Summary line (after emphasis/brackets), so a finished review whose
 # Summary reads "Reviewed the TODO-list API" is not held as unfinished.
+# gate-07: "Draft", "WIP", "Preliminary" and "Initial automated scan only"
+# opened Summaries of unfinished reviews that parsed ``ok``. ``(?![\w-])``
+# keeps "Drafted" and "Draft-mode endpoint lacks auth" finished.
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
-    r"^[ \t*_\[(:—–-]*(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b",
+    r"^[ \t*_\[(:—–-]*(?:"
+    r"(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b"
+    r"|(?:DRAFT|WIP|PRELIMINARY)(?![\w-])"
+    r"|INITIAL[ \t]+(?:AUTOMATED[ \t]+)?(?:SCAN|PASS|REVIEW)(?![\w-])"
+    r")",
+    re.IGNORECASE,
+)
+# gate-07: a Summary that says the review itself is still to be done, in any
+# position ("Initial automated scan only; manual review pending").
+_PENDING_REVIEW_RE = re.compile(
+    r"(?<![A-Za-z])(?:"
+    r"review[ \t]+(?:is[ \t]+)?(?:still[ \t]+)?(?:pending|in[ \t]+progress"
+    r"|incomplete|not[ \t]+(?:yet[ \t]+)?(?:complete|completed|finished|done))"
+    r"|(?:pending|awaiting)[ \t]+(?:manual[ \t]+|full[ \t]+)?review"
+    r")(?![A-Za-z])",
     re.IGNORECASE,
 )
 _SUMMARY_HEADING_RE = re.compile(
@@ -934,7 +951,9 @@ _FINDING_CANDIDATE_RE = re.compile(
     r"|[\[(]?[ \t]*(?=(?-i:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-]))"
     r")"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
-    r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
+    r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)"
+    # gate-06: "High-level design" is not a severity, "High-severity" is.
+    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))",
     re.MULTILINE | re.IGNORECASE,
 )
 # Task #3038 (IR38-05): headings that report a tally or an overall risk
@@ -945,7 +964,8 @@ _FINDING_CANDIDATE_RE = re.compile(
 # count. "Overall risk: LOW" / "— INFO" is exempt; a CRITICAL/HIGH/MEDIUM
 # risk label stays a candidate. Both are linear: one pass over the line.
 _SEVERITY_WORD_RE = re.compile(
-    r"(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-])",
+    r"(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)"
+    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))",
     re.IGNORECASE,
 )
 _TALLY_COUNT_BEFORE_RE = re.compile(r"(\d{1,4})[ \t]{1,3}$")
@@ -981,6 +1001,57 @@ _NO_FINDINGS_STATEMENT_RE = re.compile(
 _CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _ANY_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.MULTILINE)
+
+# gate-06 / loop-11: finding forms the candidates above cannot see, each of
+# which merged a HIGH behind an all-zero footer. Like every candidate they
+# never add to the merge counts; a severity they see that neither the footer
+# nor the strict headers count is a count mismatch (fail closed).
+#
+# A ``Severity:`` field, e.g. "**Severity:** HIGH" or "- Severity — High".
+# The heading it belongs to ("### Finding 1") may carry no severity at all.
+_SEVERITY_FIELD_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?[*_]{0,3}"
+    r"[ \t]*severity(?:[ \t]+(?:rating|level))?[ \t]*[*_]{0,3}[ \t]*[:=—–-]"
+    r"[^A-Za-z0-9\n]{0,8}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
+    re.MULTILINE | re.IGNORECASE,
+)
+# A list item whose severity sits in a parenthesis or bracket anywhere on
+# the line: "1. SQL injection in login (HIGH)", "- [High] token leak".
+# "(low risk)" is prose, so the severity must close the group.
+_LIST_ITEM_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t][^\n]*?[(\[][ \t]*[*_]{0,2}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_]{0,2}[ \t]*"
+    r"[)\],;:]",
+    re.MULTILINE | re.IGNORECASE,
+)
+# A table cell that IS a severity (fullmatch): "HIGH", "**High**",
+# "🔴 HIGH", "High-severity", "HIGH (CVSS 7.5)". A description cell that
+# merely starts with "High memory use" is not.
+_TABLE_SEVERITY_CELL_RE = re.compile(
+    r"[^A-Za-z0-9]{0,8}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?"
+    r"[^A-Za-z0-9]{0,8}(?:\([^()\n]{0,60}\)[^A-Za-z0-9]{0,4})?",
+    re.IGNORECASE,
+)
+_TABLE_COUNT_CELL_RE = re.compile(r"[^A-Za-z0-9]{0,4}(\d{1,6})[^A-Za-z0-9]{0,4}")
+_TABLE_DELIMITER_CELL_RE = re.compile(r"[ \t]*:?-+:?[ \t]*")
+_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+_OVERALL_RISK_RE = re.compile(r"overall[ \t]+risk", re.IGNORECASE)
+# Setext and HTML headings, rewritten as ``#`` headings by
+# _canonicalize_headings so every heading rule (title, tally, overall
+# risk, trailing-footer, Summary) applies to them unchanged.
+_HTML_HEADING_RE = re.compile(
+    r"<h([1-6])\b[^>\n]{0,200}>(.{0,500}?)</h\1[ \t]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^<>\n]{0,200}>")
+_SETEXT_UNDERLINE_RE = re.compile(r"[ \t]{0,3}(?:=+|-+)[ \t]*")
+# Lines that cannot be (part of) a setext heading's text: headings, table
+# rows (a "|" line over "---" is a GFM table), block quotes, HTML blocks and
+# list items. The Counts line holds "|", so a "---" under the footer stays
+# a thematic break.
+_SETEXT_NON_TEXT_RE = re.compile(
+    r"[ \t]{0,3}(?:#|>|<|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$))|.*\|"
+)
 
 # Task #3033: a review with zero finding headers, an all-zero (or absent)
 # footer and fewer non-blank lines than this is a skeleton, not a clean
@@ -1130,6 +1201,124 @@ def _heading_tally_severities(match: re.Match[str]) -> list[str] | None:
     return reported
 
 
+def _html_heading_as_markdown(match: re.Match[str]) -> str:
+    """``<h3 ...>[S1] <b>HIGH</b></h3>`` as ``### [S1] HIGH`` on its own line."""
+    inner = " ".join(_HTML_TAG_RE.sub(" ", match.group(2)).split())
+    return f"\n{'#' * int(match.group(1))} {inner}\n"
+
+
+def _canonicalize_headings(visible_text: str) -> str:
+    """Rewrite HTML and setext headings as ``#`` headings (gate-06).
+
+    Both render as headings, so a finding written as ``<h3>[S1] HIGH</h3>``
+    or as a line underlined with ``===`` / ``---`` must meet the same rules
+    as ``### [S1] HIGH``. Run on code-blanked text only: a heading quoted in
+    a code block stays an example.
+    """
+    lines = _HTML_HEADING_RE.sub(_html_heading_as_markdown, visible_text).split(
+        "\n",
+    )
+    for index, line in enumerate(lines):
+        if index == 0 or not _SETEXT_UNDERLINE_RE.fullmatch(line):
+            continue
+        # The heading text is the whole paragraph above the underline.
+        first = index
+        while (
+            first > 0
+            and lines[first - 1].strip()
+            and not _SETEXT_NON_TEXT_RE.match(lines[first - 1])
+            and not _SETEXT_UNDERLINE_RE.fullmatch(lines[first - 1])
+        ):
+            first -= 1
+        if first == index:
+            continue  # blank line or non-paragraph above: a thematic break
+        level = 1 if line.strip().startswith("=") else 2
+        title = " ".join(part.strip() for part in lines[first:index])
+        lines[first] = f"{'#' * level} {title}"
+        for blanked in range(first + 1, index + 1):
+            lines[blanked] = ""
+    return "\n".join(lines)
+
+
+def _table_cells(line: str) -> list[str] | None:
+    """The stripped cells of a Markdown table row, or None for any other line."""
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _table_candidate_severities(visible_text: str) -> list[str]:
+    """Severities of table rows that report a finding (gate-06 / loop-11).
+
+    A row with a severity cell (``| S1 | HIGH | SQL injection |``) is a
+    finding. Rows that only TALLY are not, unless a count is non-zero:
+    ``| HIGH | 0 |`` and a ``| CRITICAL | HIGH | ... |`` column header over a
+    ``| 0 | 1 | ... |`` row report only their non-zero columns (a column
+    whose cell is not a number counts, fail closed). A LOW/INFO "Overall
+    risk" row is exempt, as the heading form is.
+    """
+    severities: list[str] = []
+    severity_columns: dict[int, str] | None = None
+    for line in visible_text.split("\n"):
+        cells = _table_cells(line)
+        if cells is None:
+            severity_columns = None
+            continue
+        if all(_TABLE_DELIMITER_CELL_RE.fullmatch(cell) for cell in cells):
+            continue
+        if severity_columns is not None:
+            for column, severity in severity_columns.items():
+                cell = cells[column] if column < len(cells) else ""
+                count = _TABLE_COUNT_CELL_RE.fullmatch(cell)
+                if count is not None:
+                    if int(count.group(1)) > 0:
+                        severities.append(severity)
+                elif _ALNUM_RE.search(cell):
+                    severities.append(severity)
+            continue
+        severity_cells: dict[int, str] = {}
+        for column, cell in enumerate(cells):
+            match = _TABLE_SEVERITY_CELL_RE.fullmatch(cell)
+            if match is not None:
+                severity_cells[column] = match.group(1).upper()
+        if not severity_cells:
+            continue
+        other_cells = [
+            cell for column, cell in enumerate(cells)
+            if column not in severity_cells and _ALNUM_RE.search(cell)
+        ]
+        if not other_cells and len(severity_cells) > 1:
+            severity_columns = severity_cells
+            continue
+        counts = [_TABLE_COUNT_CELL_RE.fullmatch(cell) for cell in other_cells]
+        if other_cells and all(count is not None for count in counts):
+            if any(int(count.group(1)) > 0 for count in counts):
+                severities.extend(severity_cells.values())
+            continue
+        if any(_OVERALL_RISK_RE.search(cell) for cell in other_cells) and all(
+            severity in ("LOW", "INFO") for severity in severity_cells.values()
+        ):
+            continue
+        severities.extend(severity_cells.values())
+    return severities
+
+
+def _extra_candidate_severities(visible_text: str) -> list[str]:
+    """Severities of Severity-field, list-item and table-row findings."""
+    severities = [
+        match.group(1).upper()
+        for regex in (_SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE)
+        for match in regex.finditer(visible_text)
+    ]
+    severities.extend(_table_candidate_severities(visible_text))
+    return severities
+
+
 def _analyze_review_file(
     review_path: Path,
     *,
@@ -1175,6 +1364,11 @@ def _analyze_review_file(
         text = read_artifact_text(review_path)
         if text is None:
             return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
+    # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
+    # heading after a lone CR or U+2028 were all invisible to the regexes
+    # below. Idempotent, so text the provenance check already normalised
+    # passes through unchanged.
+    text = normalize_review_text(text)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
     # structured artifacts — the merge gate must still fail-closed on them.
@@ -1195,7 +1389,8 @@ def _analyze_review_file(
             header_counts[match.group(1)] += 1
 
     # Code blocks and inline code are examples, never the review's structure.
-    visible_text = _blank_code(text)
+    # Setext and HTML headings become "#" headings (gate-06).
+    visible_text = _canonicalize_headings(_blank_code(text))
 
     # The document title (a level-1 FIRST heading) of a fix review names the
     # upstream finding being fixed ("# Review: CT-FIX-F7 ... (D5-01 HIGH)");
@@ -1221,6 +1416,9 @@ def _analyze_review_file(
             resolved_candidate_counts[match.group(1).upper()] += 1
         else:
             candidate_counts[match.group(1).upper()] += 1
+    # gate-06 / loop-11: table rows, Severity fields and "(HIGH)" list items.
+    for severity in _extra_candidate_severities(visible_text):
+        candidate_counts[severity] += 1
 
     # S3033-04 / IR38-02: with several footers outside code, the counts are
     # the per-severity MAXIMUM over all of them. An earlier quoted skeleton
@@ -1309,6 +1507,7 @@ def _analyze_review_file(
         if (
             _ANY_MARKDOWN_HEADING_RE.search(trailing)
             or _FINDING_CANDIDATE_RE.search(trailing)
+            or _extra_candidate_severities(trailing)
         ):
             return _verdict(
                 REVIEW_VERDICT_INCOMPLETE,
@@ -1326,6 +1525,8 @@ def _analyze_review_file(
     summary_lines = _review_summary_text(visible_text).splitlines()
     for summary_line in summary_lines:
         summary_marker = _INCOMPLETE_REVIEW_MARKER_RE.match(summary_line)
+        if summary_marker is None:
+            summary_marker = _PENDING_REVIEW_RE.search(summary_line)
         if summary_marker is not None:
             return _verdict(
                 REVIEW_VERDICT_INCOMPLETE,
