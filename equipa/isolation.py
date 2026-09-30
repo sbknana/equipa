@@ -1556,7 +1556,12 @@ async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
                                    "the reviewer before it")
             await _flock_when_free(units, fcntl.LOCK_EX, wait,
                                    "the running isolated agents to end")
-            while scopes := live_agent_scopes(app_slice):
+            while True:
+                # A scope whose orchestrator died is killed, not waited for.
+                sweep_stale_scopes(app_slice)
+                scopes = live_agent_scopes(app_slice)
+                if not scopes:
+                    break
                 await wait.pause(f"agent scopes {', '.join(sorted(scopes))}")
             logger.warning("[Isolation] %s runs alone: new isolated agents "
                            "wait until it ends (shared agent UID, review "
@@ -1887,6 +1892,7 @@ async def spawn_isolated_agent(
     settings = load_isolation_settings(dispatch_config)
     identity = resolve_agent_identity(settings)
     check_host(settings, identity)
+    sweep_stale_scopes()
     unit = make_unit_name()
     role = current_unit_role()
     slot = await acquire_unit_slot(
@@ -1905,7 +1911,6 @@ async def _spawn_in_slot(cmd: Sequence[str], cwd: str | None,
                          ) -> tuple[asyncio.subprocess.Process, IsolatedAgent]:
     """spawn_isolated_agent once the unit may run; the agent handle owns
     ``slot`` from its creation."""
-    sweep_stale_scopes()
     oauth_token = resolve_oauth_token(settings)
     worktree = (await asyncio.to_thread(describe_worktree, cwd)
                 if cwd else None)

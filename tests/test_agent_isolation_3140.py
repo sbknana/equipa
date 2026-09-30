@@ -625,6 +625,8 @@ def slots(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(isolation, "_SLOT_POLL_SECONDS", 0.01)
     monkeypatch.setattr(isolation, "live_agent_scopes",
                         lambda app_slice=None: list(scopes))
+    monkeypatch.setattr(isolation, "sweep_stale_scopes",
+                        lambda app_slice=None: [])
 
     def acquire(label: str, exclusive: bool, timeout: float = 5.0):
         return isolation.acquire_unit_slot(label, exclusive=exclusive,
