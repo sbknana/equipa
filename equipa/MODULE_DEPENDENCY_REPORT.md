@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **57 Python modules** totaling **40,028 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **57 Python modules** totaling **40,067 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -30,7 +30,7 @@ The `equipa/` package contains **57 Python modules** totaling **40,028 lines** o
 | `mcp_health.py` | 112 | L0 | — | — | 5 |
 | `plugins.py` | 69 | L0 | — | — | 3 |
 | `reactive_check.py` | 322 | L0 | — | `bash_security.py` | 6 |
-| `redact.py` | 239 | L0 | — | — | 5 |
+| `redact.py` | 260 | L0 | — | — | 5 |
 | `scaffold.py` | 633 | L0 | — | `db.py` | 8 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
@@ -52,7 +52,7 @@ The `equipa/` package contains **57 Python modules** totaling **40,028 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `mcp_server.py` | 956 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
+| `mcp_server.py` | 960 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `merge_safety.py` | 265 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 890 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
 | `parsing.py` | 903 | L3 | `constants.py`, `git_ops.py` | `tool_result_storage.py` | 20 |
@@ -63,7 +63,7 @@ The `equipa/` package contains **57 Python modules** totaling **40,028 lines** o
 | `rlm_decompose.py` | 744 | L4 | `config.py`, `env_loader.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
 | `prompts.py` | 871 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 158 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
-| `agent_runner.py` | 3033 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 26 |
+| `agent_runner.py` | 3047 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 26 |
 | `preflight.py` | 347 | L7 | `agent_runner.py`, `constants.py`, `env_loader.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 3533 | L8 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
 | `manager.py` | 445 | L9 | `agent_runner.py`, `constants.py`, `db.py`, `git_ops.py`, `loops.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `prompts.py`, `roles.py`, `single_agent_guard.py`, `tasks.py` | `dispatch.py` | 6 |
@@ -72,7 +72,7 @@ The `equipa/` package contains **57 Python modules** totaling **40,028 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 40,028 lines | 750 public exports
+**Total:** 40,067 lines | 750 public exports
 
 ## Modules by Layer
 
