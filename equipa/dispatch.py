@@ -2714,7 +2714,9 @@ async def _gated_merge_task(
         return finish("blocked", f"defensive invariant: {exc}")
     if merged:
         landed_sha = attempt.merged_sha or merge_sha
-        if landed_sha is None or not await guard.record_merge(task_id, landed_sha):
+        if landed_sha is None or not await guard.record_merge(
+            task_id, landed_sha, post_head=attempt.post_head,
+        ):
             return finish(
                 "blocked",
                 guard.alert or "merged commit could not be verified on the "
