@@ -11,11 +11,16 @@ and again before injection.
 
 Policy (reject, never strip-and-keep):
 
-* Text is first normalised for matching: HTML entities decoded, compatibility
-  forms folded (NFKD: fullwidth / mathematical letters), combining marks,
-  zero-width and bidi control characters removed, and common Cyrillic / Greek
-  homoglyphs mapped to their Latin lookalikes. Matching runs on that
-  normalised copy, so ``ig<ZWSP>nore`` and Cyrillic ``іgnоre`` are caught.
+* Input longer than MAX_SANITIZE_INPUT_LENGTH is truncated, with a visible
+  marker, before any matching, and every pattern is linear in the input
+  length: this text is agent-writable and scanned on every prompt build.
+* Text is then normalised for matching: HTML entities decoded, compatibility
+  forms folded (NFKD: fullwidth / mathematical letters), combining marks and
+  every format (Cf) character removed, and confusable letters (small
+  capitals, IPA, Armenian, Cyrillic, Greek) mapped to Latin. Keyword
+  patterns also run with hyphen / underscore / dot joiners between letters
+  deleted and spaced. So ``ig<ZWSP>nore``, Cyrillic ``іgnоre``, small-capital
+  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught.
 * If ANY injection pattern matches, the whole text is REJECTED: ``sanitize()``
   returns ``""`` and logs the reason at WARNING. Stripping the matched phrase
   and keeping the rest is the defect sandbox-09 describes — "Ignore previous
@@ -25,11 +30,13 @@ Policy (reject, never strip-and-keep):
   are escaped to ``&lt;`` / ``&gt;``. Stored content can therefore never open
   or close a ``<task-input>`` tag or a ``<<<UNTRUSTED_*>>>`` delimiter.
 
-The keyword patterns are a secondary control. The primary control is the
-wrapper every DB-sourced block is injected in: ``<task-input ...>`` tags plus
-an unpredictable per-prompt ``<<<UNTRUSTED_xxxxxxxx>>>`` delimiter, with
-``prompts/_common.md`` telling the agent that content inside is data, not
-instructions. The escaping above is what keeps content inside that wrapper.
+The keyword patterns are a secondary control and not a guarantee: they only
+catch known shapes, and paraphrases or new command forms get through. The
+primary control is the wrapper every DB-sourced block is injected in:
+``<task-input ...>`` tags plus an unpredictable per-prompt
+``<<<UNTRUSTED_xxxxxxxx>>>`` delimiter, with ``prompts/_common.md`` telling
+the agent that content inside is data, not instructions. The escaping above
+is what keeps content inside that wrapper.
 
 Copyright 2026 Forgeborn.
 """
