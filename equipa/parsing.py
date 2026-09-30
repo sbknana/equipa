@@ -61,30 +61,6 @@ def compute_keyword_overlap(text_a: str, text_b: str) -> float:
     return len(intersection) / len(union)
 
 
-def _compute_ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
-    """Compute n-gram Jaccard similarity between two texts.
-
-    Uses character n-grams for fuzzy matching (catches typos, variations).
-    Returns similarity score 0.0-1.0.
-    """
-    if not text_a or not text_b:
-        return 0.0
-
-    def ngrams(s: str, n: int) -> set[str]:
-        s_lower = s.lower()
-        return set(s_lower[i:i+n] for i in range(len(s_lower) - n + 1))
-
-    ngrams_a = ngrams(text_a, n)
-    ngrams_b = ngrams(text_b, n)
-
-    if not ngrams_a or not ngrams_b:
-        return 0.0
-
-    intersection = ngrams_a & ngrams_b
-    union = ngrams_a | ngrams_b
-    return len(intersection) / len(union)
-
-
 def deduplicate_lessons(lessons: list[dict]) -> list[dict]:
     """Remove semantically duplicate lessons based on 60%+ word overlap.
 
@@ -140,44 +116,45 @@ def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
     return "\n".join(lines[:max_lines]).strip()
 
 
-def _deduplicate_log_lines(lines: list[str], threshold: float = 0.85) -> list[str]:
-    """Deduplicate similar log lines using n-gram Jaccard similarity.
+_DIGIT_RUN = re.compile(r"\d+")
 
-    Groups identical or nearly-identical lines, showing count instead of repeating.
+
+def _log_line_key(line: str) -> str:
+    """Grouping key for a log line: case, spacing and numbers (timestamps,
+    counters, line numbers) do not make two log lines different."""
+    return _DIGIT_RUN.sub("#", " ".join(line.lower().split()))
+
+
+def _deduplicate_log_lines(lines: list[str]) -> list[str]:
+    """Group repeated log lines, showing a count instead of repeating them.
+
+    Lines are grouped by _log_line_key() in a dict, so the cost is linear in
+    the number of lines. The fuzzy n-gram comparison this replaced compared
+    every line with every earlier group (17 s on 1000 distinct lines) on the
+    compaction path of every checkpoint (review N5 of task 3129).
     Example: "Error: timeout\n" × 50 → "Error: timeout (×50)"
     """
     if not lines:
         return lines
 
     result: list[str] = []
-    line_groups: dict[str, int] = {}  # line → count
-    group_reps: list[str] = []  # first representative of each group
+    group_counts: dict[str, int] = {}  # key → count
+    group_reps: dict[str, str] = {}  # key → first line seen (insertion order)
 
     for line in lines:
         if not line.strip():
             result.append(line)
             continue
-
-        # Find matching group
-        matched_idx = -1
-        for idx, rep in enumerate(group_reps):
-            sim = _compute_ngram_jaccard(line, rep)
-            if sim >= threshold:
-                matched_idx = idx
-                break
-
-        if matched_idx >= 0:
-            # Increment existing group
-            rep = group_reps[matched_idx]
-            line_groups[rep] += 1
+        key = _log_line_key(line)
+        if key in group_counts:
+            group_counts[key] += 1
         else:
-            # New group
-            group_reps.append(line)
-            line_groups[line] = 1
+            group_counts[key] = 1
+            group_reps[key] = line
 
     # Emit deduplicated lines with counts
-    for rep in group_reps:
-        count = line_groups[rep]
+    for key, rep in group_reps.items():
+        count = group_counts[key]
         if count > 1:
             result.append(f"{rep.rstrip()} (×{count})")
         else:
