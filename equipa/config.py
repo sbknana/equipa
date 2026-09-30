@@ -30,10 +30,29 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from equipa.constants import DEFAULT_MODEL, THEFORGE_DB
+
+logger = logging.getLogger(__name__)
+
+# Strings accepted as flag values besides JSON booleans (see is_feature_enabled).
+_FLAG_TRUE_STRINGS = frozenset({"true", "1"})
+_FLAG_FALSE_STRINGS = frozenset({"false", "0"})
+
+# Key load_dispatch_config sets when the config file exists but cannot be read
+# or parsed. Its value is the error text. Consumers must not treat such a
+# config as "the operator chose the defaults".
+CONFIG_LOAD_ERROR_KEY = "_config_load_error"
+
+# Security gates that must stay ON when the config cannot be read: the file
+# might have enabled them, and a gate that silently turns off on a corrupt
+# config is fail-open (EQUIPA review 2026-09-29, sandbox-06).
+FAIL_CLOSED_FEATURE_FLAGS: frozenset[str] = frozenset({
+    "bash_security_pretooluse",
+})
 
 
 DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
@@ -94,18 +113,74 @@ DEFAULT_DISPATCH_CONFIG: dict = {
 }
 
 
+def _coerce_feature_flag(value: object, feature_name: str, default: bool) -> bool:
+    """Strictly coerce a configured flag value to bool.
+
+    Accepts JSON booleans and the strings "true"/"false"/"1"/"0" (case and
+    surrounding whitespace ignored). Anything else - "yes", "off", 1, null, a
+    list - is a config mistake: log a warning and use the documented default
+    instead of letting Python truthiness decide ("false" is truthy).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _FLAG_TRUE_STRINGS:
+            return True
+        if normalized in _FLAG_FALSE_STRINGS:
+            return False
+    logger.warning(
+        "Feature flag %r has invalid value %r (expected true/false or "
+        '"true"/"false"/"1"/"0"); using default %s',
+        feature_name, value, default,
+    )
+    return default
+
+
 def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
     """Check if a feature flag is enabled.
 
     Reads from dispatch_config["features"][feature_name]. Falls back to
-    DEFAULT_FEATURE_FLAGS if the feature is not in the config.
+    DEFAULT_FEATURE_FLAGS if the feature is not in the config. Values are
+    coerced strictly (see _coerce_feature_flag); an invalid value logs a
+    warning and uses the default.
+
+    Security flags in FAIL_CLOSED_FEATURE_FLAGS resolve to True when the
+    dispatch config could not be read (load_dispatch_config marks it with
+    CONFIG_LOAD_ERROR_KEY): an unreadable config must never switch a gate off
+    silently, so an ERROR is logged and the gate stays on.
 
     Returns True/False. Unknown features default to False.
     """
+    default = DEFAULT_FEATURE_FLAGS.get(feature_name, False)
     if dispatch_config is None:
-        return DEFAULT_FEATURE_FLAGS.get(feature_name, False)
+        return default
+    if not isinstance(dispatch_config, dict):
+        logger.warning(
+            "dispatch_config is %s, not a dict; feature %r uses default %s",
+            type(dispatch_config).__name__, feature_name, default,
+        )
+        return default
+
+    load_error = dispatch_config.get(CONFIG_LOAD_ERROR_KEY)
+    if load_error and feature_name in FAIL_CLOSED_FEATURE_FLAGS:
+        logger.error(
+            "dispatch config could not be loaded (%s); security feature %r "
+            "is forced ON (fail-closed) instead of silently turning off",
+            load_error, feature_name,
+        )
+        return True
+
     features = dispatch_config.get("features", {})
-    return features.get(feature_name, DEFAULT_FEATURE_FLAGS.get(feature_name, False))
+    if not isinstance(features, dict):
+        logger.warning(
+            "dispatch_config['features'] is %s, not a dict; feature %r uses "
+            "default %s", type(features).__name__, feature_name, default,
+        )
+        return default
+    if feature_name not in features:
+        return default
+    return _coerce_feature_flag(features[feature_name], feature_name, default)
 
 
 def is_security_review_enabled(args, dispatch_config: dict | None = None) -> bool:
@@ -165,9 +240,17 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
 
     try:
         data = json.loads(filepath.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"top-level JSON is {type(data).__name__}, expected an object"
+            )
+    except (OSError, ValueError) as e:
+        # ValueError covers JSONDecodeError and UnicodeDecodeError. Mark the
+        # config so fail-closed security flags stay on (is_feature_enabled).
+        logger.error("Could not load dispatch config '%s': %s", filepath, e)
         print(f"WARNING: Could not load dispatch config '{filepath}': {e}")
-        print("  Using defaults.")
+        print("  Using defaults; security gates fail closed.")
+        config[CONFIG_LOAD_ERROR_KEY] = f"{filepath}: {e}"
         return config
 
     # Merge loaded values over defaults
