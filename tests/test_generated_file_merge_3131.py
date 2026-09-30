@@ -302,6 +302,50 @@ def test_branch_that_changed_the_generator_is_not_run(repo, tmp_path, capsys):
     assert "event=generated-files-not-regenerated" in capsys.readouterr().err
 
 
+# --- branch-written code in the merged tree is data, never run ----------------
+
+
+def test_branch_modules_in_the_merged_tree_are_never_imported(repo, tmp_path):
+    """The unchanged generator only parses the tree: a branch that plants
+    stdlib shadows next to it, site hooks at the root, or a feature module
+    with import-time code gets its report regenerated without any of it
+    running."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    worktree = _add_task_worktree(repo)
+
+    def plant(rel: str, name: str) -> None:
+        _write(worktree, rel, (
+            "import pathlib\n"
+            f"pathlib.Path({str(markers / name)!r}).write_text('ran')\n"
+            "from equipa import core\n"
+        ))
+
+    plant("equipa/feature_b.py", "feature-b")
+    # The branch's report is generated before the shadows exist: the
+    # fixture runs the generator without -I, so they would break it here.
+    _run_real_generator(worktree)
+    for rel, name in (
+        ("scripts/ast.py", "shadow-ast"),
+        ("scripts/argparse.py", "shadow-argparse"),
+        ("scripts/usercustomize.py", "usercustomize"),
+        ("sitecustomize.py", "sitecustomize"),
+    ):
+        plant(rel, name)
+    branch_sha = _commit_all(worktree, "feature b with planted modules")
+    _write(repo, "equipa/feature_c.py", "from equipa import core\n")
+    _run_real_generator(repo)
+    main_sha = _commit_all(repo, "feature c")
+    assert _merge_tree(repo, main_sha, branch_sha)[2] == [REPORT]
+
+    status, guard = _gate(repo, worktree)
+
+    assert status == "merged", guard.outcomes[TASK]
+    assert sorted(path.name for path in markers.iterdir()) == []
+    report = (repo / REPORT).read_text(encoding="utf-8")
+    assert "feature_b" in report and "feature_c" in report
+
+
 # --- generator fails or times out ---------------------------------------------
 
 
@@ -414,6 +458,12 @@ def test_generator_runs_scrubbed_isolated_and_outside_the_checkout(
     assert repo.resolve() not in (cwd, *cwd.parents)
     assert seen["argv"] == ["--repo-root", seen["cwd"], "--stdout"]
     assert str(repo) not in seen["path"] and seen["cwd"] not in seen["path"]
+    # Neither the export nor the generator's own directory (scripts/) is
+    # importable, so a merged-tree ``scripts/ast.py`` cannot shadow stdlib.
+    for entry in seen["path"]:
+        # Relative (and empty) entries are relative to the generator's cwd.
+        resolved = (cwd / entry).resolve()
+        assert cwd not in (resolved, *resolved.parents), entry
     assert not cwd.exists(), "the private export is removed afterwards"
 
 
