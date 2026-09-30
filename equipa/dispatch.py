@@ -22,6 +22,7 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -324,57 +325,257 @@ def _inject_attempt_reflections(
     )
 
 
+class AttemptCleanupError(RuntimeError):
+    """The git reset between two autoresearch attempts failed.
+
+    Raised instead of logging a warning and carrying on: a half-finished
+    reset leaves the next attempt on the wrong branch or on the failed
+    attempt's commits (dispatch-02/12). The caller must stop retrying and
+    leave the task blocked.
+    """
+
+
+async def _git_checked(
+    args: list[str],
+    cwd: str,
+    *,
+    timeout: int,
+    action: str,
+) -> str:
+    """Run git and return its stripped stdout; raise if it did not succeed.
+
+    Raises:
+        AttemptCleanupError: git exited non-zero, timed out, or could not be
+            started. ``action`` names the step in the error message.
+    """
+    try:
+        result = await git_run_async(args, cwd, timeout=timeout)
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"{action} in {cwd}: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise AttemptCleanupError(
+            f"{action} in {cwd} failed (rc={result.returncode}): {detail}"
+        )
+    return (result.stdout or "").strip()
+
+
+async def _current_branch(cwd: str) -> str | None:
+    """Short name of the branch checked out in ``cwd``; None when detached.
+
+    Raises:
+        AttemptCleanupError: git could not be run in ``cwd``.
+    """
+    try:
+        result = await git_run_async(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"read HEAD in {cwd}: {exc}") from exc
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise AttemptCleanupError(
+            f"read HEAD in {cwd} failed (rc={result.returncode}): "
+            f"{(result.stderr or '').strip()[:300]}"
+        )
+    return (result.stdout or "").strip() or None
+
+
+async def _is_linked_worktree(cwd: str) -> bool:
+    """True when ``cwd`` is a linked worktree rather than the main checkout.
+
+    A linked worktree has its own git dir under the shared common dir.
+    """
+    dirs = await _git_checked(
+        ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+        cwd, timeout=10, action="locate git dirs",
+    )
+    lines = dirs.splitlines()
+    if len(lines) != 2:
+        raise AttemptCleanupError(f"unexpected rev-parse output in {cwd}: {dirs!r}")
+    return Path(lines[0]).resolve() != Path(lines[1]).resolve()
+
+
+async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
+    """Paths of every worktree (main checkout included) on ``branch_name``."""
+    listing = await _git_checked(
+        ["worktree", "list", "--porcelain"], cwd, timeout=10,
+        action="list worktrees",
+    )
+    holders: list[str] = []
+    current_path: str | None = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch_name}" and current_path:
+            holders.append(current_path)
+    return holders
+
+
+async def _reset_task_worktree(
+    worktree_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """Discard a failed attempt inside its own worktree, staying on its branch.
+
+    The worktree never leaves ``branch_name``: checking out the default
+    branch here would let the next attempt commit straight onto it, and the
+    branch cannot be deleted while this worktree holds it (dispatch-02).
+    """
+    current = await _current_branch(worktree_dir)
+    if current != branch_name:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"not {branch_name!r}; refusing to reset it"
+        )
+    if not base_sha:
+        # No recorded base: fall back to the fork point from the operator's
+        # default branch, never the checked-out HEAD or origin/HEAD.
+        try:
+            default_branch = get_trusted_default_branch(worktree_dir)
+        except UntrustedDefaultBranchError as exc:
+            raise AttemptCleanupError(str(exc)) from exc
+        base_sha = await _git_checked(
+            ["merge-base", "HEAD", f"refs/heads/{default_branch}"],
+            worktree_dir, timeout=10,
+            action=f"find the fork point of {branch_name} from {default_branch}",
+        )
+    failed_head = await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action="read the failed attempt's HEAD",
+    )
+    await _git_checked(
+        ["reset", "--hard", base_sha], worktree_dir, timeout=60,
+        action=f"reset {branch_name} to {base_sha[:12]}",
+    )
+    await _git_checked(
+        ["clean", "-fd"], worktree_dir, timeout=60,
+        action=f"clean untracked files from {branch_name}",
+    )
+    after_branch = await _current_branch(worktree_dir)
+    after_head = await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action="read HEAD after the reset",
+    )
+    if after_branch != branch_name or after_head != base_sha:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} ended on {after_branch!r}@{after_head[:12]} "
+            f"after the reset, expected {branch_name!r}@{base_sha[:12]}"
+        )
+    emit(
+        f"  [Autoresearch] Reset worktree branch {branch_name} "
+        f"{failed_head[:12]} -> {base_sha[:12]} (failed attempt recoverable "
+        f"via reflog)"
+    )
+
+
+async def _delete_task_branch_in_main_checkout(
+    project_dir: str,
+    branch_name: str,
+    emit: Callable[[str], None],
+) -> None:
+    """Drop a failed attempt's branch when the agent ran in the main checkout.
+
+    Leaves ``branch_name`` for the operator-trusted default branch only if
+    the main checkout is on it, and refuses to delete the branch while any
+    worktree still holds it.
+    """
+    try:
+        default_branch = get_trusted_default_branch(project_dir)
+    except UntrustedDefaultBranchError as exc:
+        raise AttemptCleanupError(str(exc)) from exc
+    if await _current_branch(project_dir) == branch_name:
+        await _git_checked(
+            ["checkout", default_branch], project_dir, timeout=30,
+            action=f"check out {default_branch} to leave {branch_name}",
+        )
+    try:
+        exists = await git_run_async(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            project_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"look up {branch_name}: {exc}") from exc
+    if exists.returncode != 0:
+        emit(f"  [Autoresearch] Branch {branch_name} does not exist; nothing to delete")
+        return
+    holders = await _worktrees_holding_branch(project_dir, branch_name)
+    if holders:
+        raise AttemptCleanupError(
+            f"{branch_name} is checked out in {', '.join(holders)}; "
+            f"refusing to delete it"
+        )
+    failed_head = (exists.stdout or "").strip()
+    await _git_checked(
+        ["branch", "-D", branch_name], project_dir, timeout=10,
+        action=f"delete {branch_name}",
+    )
+    emit(
+        f"  [Autoresearch] Cleaned up branch {branch_name} (was "
+        f"{failed_head[:12]}, recoverable via reflog)"
+    )
+
+
 async def cleanup_failed_attempt(
     task_id: int,
     project_dir: str,
     reflections: list[str],
     output: list[str] | None = None,
+    *,
+    base_sha: str | None = None,
 ) -> None:
     """Reset a failed task for a fresh autoresearch attempt.
 
-    Performs the 5-step cleanup shared by the parallel/auto dispatch path
-    and the single-task ``--task`` CLI path:
+    Shared by the parallel/auto dispatch path and the single-task ``--task``
+    CLI path. The git step depends on where the agent ran:
 
-    1. Verify ``project_dir`` is a git repo.
-    2. Detect default branch (``main`` then fall back to ``master``).
-    3. Checkout the default branch.
-    4. Force-delete the ``forge-task-<id>`` branch.
-    5. Reset the task's status to ``todo`` and inject any accumulated
-       cross-attempt reflections so the next attempt remembers what was
-       already tried.
+    * ``project_dir`` is the task's isolation worktree: reset it with
+      ``reset --hard <base_sha>`` plus ``clean -fd`` and keep it on
+      ``forge-task-<id>``. The default branch is never checked out there
+      and the branch is never deleted. Without ``base_sha`` the fork point
+      from the trusted default branch is used.
+    * ``project_dir`` is the main checkout: leave ``forge-task-<id>`` for the
+      trusted default branch if it is checked out, then delete it unless a
+      worktree still holds it.
+
+    Every git step is checked. On failure :class:`AttemptCleanupError` is
+    raised BEFORE the task is reset to ``todo``; the task must not be
+    retried on top of a half-finished reset.
+
+    After the git step, the task's status is reset to ``todo`` and any
+    accumulated cross-attempt reflections are injected so the next attempt
+    remembers what was already tried.
 
     Args:
         task_id: Task ID being retried.
-        project_dir: Working directory containing the project's git repo.
+        project_dir: Worktree or main checkout the attempt ran in.
         reflections: Reflection strings from prior failed attempts. Empty
             list is allowed (skips reflection injection).
         output: Optional buffer for ``log()`` calls; if ``None``, prints.
+        base_sha: Commit the task worktree was created on.
+
+    Raises:
+        AttemptCleanupError: a git step failed or the worktree is not on
+            ``forge-task-<id>``.
     """
     branch_name = f"forge-task-{task_id}"
 
+    def emit(message: str) -> None:
+        if output is not None:
+            log(message, output)
+        else:
+            print(message)
+
     if _is_git_repo(project_dir):
-        try:
-            cp = await git_run_async(
-                ["rev-parse", "--verify", "main"], project_dir, timeout=10,
+        if await _is_linked_worktree(project_dir):
+            await _reset_task_worktree(project_dir, branch_name, base_sha, emit)
+        else:
+            await _delete_task_branch_in_main_checkout(
+                project_dir, branch_name, emit,
             )
-            default_branch = "main" if cp.returncode == 0 else "master"
-            await git_run_async(
-                ["checkout", default_branch], project_dir, timeout=30,
-            )
-            await git_run_async(
-                ["branch", "-D", branch_name], project_dir, timeout=10,
-            )
-            msg = f"  [Autoresearch] Cleaned up branch {branch_name}"
-            if output is not None:
-                log(msg, output)
-            else:
-                print(msg)
-        except (subprocess.SubprocessError, OSError) as e:
-            warn = f"  [Autoresearch] Git cleanup warning: {e}"
-            if output is not None:
-                log(warn, output)
-            else:
-                print(warn)
 
     conn = get_db_connection(write=True)
     try:
@@ -385,14 +586,10 @@ async def cleanup_failed_attempt(
     finally:
         conn.close()
 
-    reset_msg = (
+    emit(
         f"  [Autoresearch] Reset task #{task_id} to todo with "
         f"{len(reflections)} attempt reflection(s)"
     )
-    if output is not None:
-        log(reset_msg, output)
-    else:
-        print(reset_msg)
 
 
 # --- DB Scanning & Scoring ---
@@ -504,6 +701,39 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
         )
 
 
+async def _require_task_branch(worktree_dir: str, task_branch: str) -> str:
+    """Return HEAD's SHA if ``worktree_dir`` is on ``task_branch``.
+
+    Raises:
+        AttemptCleanupError: the worktree is on another branch, detached, or
+            git could not be run there.
+    """
+    current = await _current_branch(worktree_dir)
+    if current != task_branch:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"expected {task_branch!r}"
+        )
+    return await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action=f"read the HEAD of {task_branch}",
+    )
+
+
+def _audit_task_abort(
+    task_id: int,
+    event: str,
+    detail: object,
+    output: list[str] | None,
+) -> None:
+    """Log a task abort to the operator output and the durable gate audit."""
+    # git stderr can span lines; keep each audit record on one line.
+    single_line_detail = " ".join(str(detail).split())
+    line = f"task={task_id} event={event} detail={single_line_detail}"
+    log(f"  [GATE-AUDIT] {line}", output)
+    log_gate_audit(line, task_id, event=event)
+
+
 async def run_dev_test_loop_with_autoresearch(
     task: dict,
     project_dir: str,
@@ -511,6 +741,8 @@ async def run_dev_test_loop_with_autoresearch(
     args,
     config: dict,
     output: list[str] | None = None,
+    *,
+    task_branch: str | None = None,
 ):
     """Run run_dev_test_loop with autoresearch retry on failure.
 
@@ -518,6 +750,15 @@ async def run_dev_test_loop_with_autoresearch(
     run_dispatch (single-task path). run_parallel_tasks did not have this
     wrapper, so any failure in --tasks N,M,O dispatch was final. This
     helper is the canonical retry entry point - both call sites use it.
+
+    ``task_branch`` is set when ``project_dir`` is the task's isolation
+    worktree. Before every attempt the worktree must still be on that
+    branch; otherwise the task is aborted with outcome
+    ``worktree_branch_mismatch`` instead of letting the agent commit
+    elsewhere. The HEAD seen before the first attempt is the base the
+    worktree is reset to between attempts. A failed reset aborts the task
+    with outcome ``attempt_cleanup_failed``. Both outcomes leave the task
+    blocked.
 
     Returns:
         (result, cycles, outcome, loop_total_cost, loop_total_duration, task)
@@ -534,8 +775,20 @@ async def run_dev_test_loop_with_autoresearch(
     attempt_reflections: list[str] = []
     loop_total_cost = 0.0
     loop_total_duration = 0.0
+    base_sha: str | None = None
+    result: dict = {"cost": 0.0, "duration": 0.0}
+    cycles = 0
 
     while True:
+        if task_branch is not None:
+            try:
+                head_sha = await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(task_id, "worktree-branch-mismatch", exc, output)
+                outcome = "worktree_branch_mismatch"
+                break
+            if base_sha is None:
+                base_sha = head_sha
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args, output=output,
@@ -604,9 +857,15 @@ async def run_dev_test_loop_with_autoresearch(
         )
 
         # Clean up failed git branch and reset task for next attempt.
-        await cleanup_failed_attempt(
-            task_id, project_dir, attempt_reflections, output,
-        )
+        try:
+            await cleanup_failed_attempt(
+                task_id, project_dir, attempt_reflections, output,
+                base_sha=base_sha,
+            )
+        except AttemptCleanupError as exc:
+            _audit_task_abort(task_id, "attempt-cleanup-failed", exc, output)
+            outcome = "attempt_cleanup_failed"
+            break
 
         # Re-fetch task to get clean state (with injected reflections)
         refreshed = fetch_task(task_id)
@@ -1386,170 +1645,192 @@ async def _create_isolation_worktrees(
     worktree_base: Path,
     *,
     force: bool = False,
+    refusals: dict[int, str] | None = None,
 ) -> dict[int, str]:
     """Create per-task git worktrees for filesystem isolation.
 
-    Returns a map of task_id -> worktree directory path. Tasks for which
-    worktree creation fails are omitted from the returned map (they will
-    fall back to sharing project_dir).
+    Returns a map of task_id -> worktree directory path. A task missing
+    from the map has NO isolation worktree and must not run at all: the
+    caller refuses it rather than running it in ``project_dir``, where its
+    commits would bypass the security gate (dispatch-01). The reason for
+    each missing task is stored in ``refusals`` when the caller passes a
+    dict.
 
-    Conflict-handling policy (task #2490, hardening of #2488):
-    When ``git worktree add -b`` reports that ``forge-task-<id>`` already
-    exists, the default behaviour is the SAFE one: raise
-    :class:`WorktreeBranchConflictError` (from :mod:`equipa.git_ops`) so
-    the caller can route the task to the shared-dir fallback explicitly.
-    Before raising, the unmerged-commit count on the conflicting branch
-    (``git rev-list --count <default>..<branch>``) is logged so the
-    operator can recover the work via ``git reflog`` if needed. The prior
-    destructive behaviour (``git branch -D``) is preserved only when the
-    caller passes ``force=True``; in that case the unmerged commits the
-    delete would discard are still logged first.
+    Stale-branch policy (tasks #2490, #3107): when ``forge-task-<id>``
+    already exists, the task is refused and nothing is touched — neither
+    the branch nor a leftover worktree holding it. The unmerged commits on
+    the branch are logged as a recovery anchor. Only ``force=True`` deletes
+    the branch (after logging the commits it would discard) and recreates
+    the worktree.
+
+    A leftover worktree directory is removed only after its uncommitted
+    work has been stashed. If that fails, or the directory is not a
+    registered worktree, the task is refused and the directory kept
+    (dispatch-13).
 
     Uses ``git_run_async`` so the per-task git invocations do not block
     the event loop while parallel task dispatch is queued.
     """
-    from equipa.git_ops import WorktreeBranchConflictError, get_default_branch
     from equipa.role_resolver import register_worktree_root
 
     worktree_dirs: dict[int, str] = {}
     worktree_base.mkdir(exist_ok=True)
     await _pin_role_overlay_ref(project_dir)
+
+    def refuse(task_id: int, reason: str) -> None:
+        print(f"  [Isolation] WARNING: task #{task_id} REFUSED, not run: {reason}")
+        if refusals is not None:
+            refusals[task_id] = reason
+
     for t in tasks:
         task_id = t["id"]
         branch_name = f"forge-task-{task_id}"
         wt_path = worktree_base / f"task-{task_id}"
         try:
+            branch_res = await git_run_async(
+                ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+                project_dir, timeout=10,
+            )
+            if branch_res.returncode not in (0, 1):
+                refuse(task_id, (
+                    f"could not check for a stale branch {branch_name} "
+                    f"(rc={branch_res.returncode}: "
+                    f"{(branch_res.stderr or '').strip()[:200]})"
+                ))
+                continue
+            branch_exists = branch_res.returncode == 0
+            if branch_exists:
+                await _log_stale_branch_commits(project_dir, branch_name)
+                if not force:
+                    refuse(task_id, (
+                        f"stale branch {branch_name} exists; preserved, "
+                        f"resolve by hand"
+                    ))
+                    continue
             if wt_path.exists():
-                await git_run_async(
-                    ["worktree", "remove", "--force", str(wt_path)],
-                    project_dir, timeout=30,
+                leftover_problem = await _retire_leftover_worktree(
+                    project_dir, wt_path, task_id, branch_name,
                 )
+                if leftover_problem:
+                    refuse(task_id, leftover_problem)
+                    continue
+            if branch_exists:
+                print(
+                    f"  [Isolation] WARNING: force=True, deleting stale "
+                    f"branch '{branch_name}' for task #{task_id}"
+                )
+                delete_res = await git_run_async(
+                    ["branch", "-D", branch_name], project_dir, timeout=10,
+                )
+                if delete_res.returncode != 0:
+                    refuse(task_id, (
+                        f"could not delete stale branch {branch_name}: "
+                        f"{(delete_res.stderr or '').strip()[:200]}"
+                    ))
+                    continue
             add_res = await git_run_async(
                 ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
                 project_dir, timeout=60,
             )
             if add_res.returncode != 0:
-                # Distinguish "branch already exists" (conflict — apply
-                # the safe-default raise policy) from other git failures
-                # (broken repo, disk full, etc — log warning + skip).
-                branch_exists_res = await git_run_async(
-                    ["rev-parse", "--verify", "--quiet",
-                     f"refs/heads/{branch_name}"],
-                    project_dir, timeout=10,
+                err_preview = (
+                    add_res.stderr.strip()[:200] if add_res.stderr
+                    else f"rc={add_res.returncode}"
                 )
-                if branch_exists_res.returncode != 0:
-                    err_preview = (
-                        add_res.stderr[:200] if add_res.stderr
-                        else f"rc={add_res.returncode}"
-                    )
-                    print(
-                        f"  [Isolation] WARNING: Could not create worktree "
-                        f"for task #{task_id}, using shared dir "
-                        f"(worktree add failed: {err_preview})"
-                    )
-                    continue
-
-                # Conflict path. Log the unmerged-commit count on the
-                # pre-existing branch so the operator has a recovery
-                # anchor for `git reflog` even if force=True wipes the
-                # ref.
-                default_branch = get_default_branch(project_dir)
-                unmerged_count = "unknown"
-                unmerged_shas = ""
-                try:
-                    count_res = await git_run_async(
-                        ["rev-list", "--count",
-                         f"{default_branch}..{branch_name}"],
-                        project_dir, timeout=10,
-                    )
-                    if count_res.returncode == 0:
-                        unmerged_count = (count_res.stdout or "").strip() or "0"
-                    sha_res = await git_run_async(
-                        ["rev-list", f"{default_branch}..{branch_name}"],
-                        project_dir, timeout=10,
-                    )
-                    if sha_res.returncode == 0:
-                        unmerged_shas = (sha_res.stdout or "").strip()
-                except (subprocess.SubprocessError, OSError) as inspect_err:
-                    print(
-                        f"  [Isolation] WARNING: could not inspect "
-                        f"'{branch_name}' before conflict handling: "
-                        f"{inspect_err}"
-                    )
-
-                conflict_msg = (
-                    f"task #{task_id} branch '{branch_name}' already "
-                    f"exists with {unmerged_count} unmerged commit(s) "
-                    f"ahead of '{default_branch}'"
-                )
-                if unmerged_shas:
-                    print(
-                        f"  [Isolation] Unmerged SHAs for '{branch_name}' "
-                        f"(recoverable via reflog): "
-                        f"{unmerged_shas.replace(chr(10), ' ')}"
-                    )
-
-                if not force:
-                    # Safe default: raise so the caller routes to the
-                    # shared-dir fallback. Matches equipa.git_ops
-                    # create_task_worktree policy.
-                    print(
-                        f"  [Isolation] ERROR: {conflict_msg}; "
-                        f"refusing to force-delete (force=False). "
-                        f"Routing task to shared dir fallback."
-                    )
-                    raise WorktreeBranchConflictError(
-                        f"refusing to create worktree for task "
-                        f"{task_id}: branch '{branch_name}' already "
-                        f"exists with {unmerged_count} unmerged "
-                        f"commit(s). Pass force=True to override or "
-                        f"delete the branch manually after recovering "
-                        f"the commits."
-                    )
-
-                print(
-                    f"  [Isolation] WARNING: {conflict_msg}; "
-                    f"force=True, deleting branch and retrying "
-                    f"(stderr: {add_res.stderr[:200]})"
-                )
-                await git_run_async(
-                    ["branch", "-D", branch_name], project_dir, timeout=10,
-                )
-                retry_res = await git_run_async(
-                    ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                    project_dir, timeout=60,
-                )
-                if retry_res.returncode != 0:
-                    err_preview = (
-                        retry_res.stderr[:200] if retry_res.stderr
-                        else f"rc={retry_res.returncode}"
-                    )
-                    print(
-                        f"  [Isolation] WARNING: Could not create worktree for "
-                        f"task #{task_id}, using shared dir "
-                        f"(retry failed: {err_preview})"
-                    )
-                    continue
-                worktree_dirs[task_id] = str(wt_path)
-                register_worktree_root(wt_path, project_dir)
-                _copy_hooks_to_worktree(project_dir, str(wt_path))
-                print(f"  [Isolation] Task #{task_id} -> {wt_path.name} (retry)")
-            else:
-                worktree_dirs[task_id] = str(wt_path)
-                register_worktree_root(wt_path, project_dir)
-                _copy_hooks_to_worktree(project_dir, str(wt_path))
-                print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
-        except WorktreeBranchConflictError:
-            # Safe-default conflict path: the WARNING/ERROR was already
-            # logged above. Skip the task (it will use shared dir) so
-            # the rest of the batch can still be isolated.
-            continue
+                refuse(task_id, f"could not create worktree ({err_preview})")
+                continue
+            worktree_dirs[task_id] = str(wt_path)
+            register_worktree_root(wt_path, project_dir)
+            _copy_hooks_to_worktree(project_dir, str(wt_path))
+            print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
         except (subprocess.SubprocessError, OSError) as e:
-            print(
-                f"  [Isolation] WARNING: Worktree creation errored for "
-                f"task #{task_id}: {e}"
-            )
+            refuse(task_id, f"worktree creation errored: {e}")
     return worktree_dirs
+
+
+async def _log_stale_branch_commits(project_dir: str, branch_name: str) -> None:
+    """Log the commits on a stale task branch that are not on the default.
+
+    Gives the operator a recovery anchor (``git reflog``) before the branch
+    is refused or, with ``force=True``, deleted.
+    """
+    default_branch = get_default_branch(project_dir)
+    try:
+        sha_res = await git_run_async(
+            ["rev-list", f"{default_branch}..{branch_name}"],
+            project_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"  [Isolation] WARNING: could not inspect '{branch_name}': {exc}")
+        return
+    if sha_res.returncode != 0:
+        print(
+            f"  [Isolation] WARNING: could not inspect '{branch_name}': "
+            f"{(sha_res.stderr or '').strip()[:200]}"
+        )
+        return
+    unmerged = (sha_res.stdout or "").split()
+    print(
+        f"  [Isolation] Branch '{branch_name}' already exists with "
+        f"{len(unmerged)} unmerged commit(s) ahead of '{default_branch}'"
+    )
+    if unmerged:
+        print(
+            f"  [Isolation] Unmerged SHAs for '{branch_name}' "
+            f"(recoverable via reflog): {' '.join(unmerged)}"
+        )
+
+
+async def _retire_leftover_worktree(
+    project_dir: str,
+    wt_path: Path,
+    task_id: int,
+    branch_name: str,
+) -> str | None:
+    """Remove a leftover task worktree without losing uncommitted work.
+
+    Uncommitted changes (untracked files included) are stashed first. The
+    worktree is force-removed only once ``git status`` reads clean.
+
+    Returns:
+        None once the worktree is gone, otherwise the reason it was kept.
+    """
+    wt = str(wt_path)
+    toplevel = await git_run_async(["rev-parse", "--show-toplevel"], wt, timeout=10)
+    toplevel_path = (toplevel.stdout or "").strip()
+    if toplevel.returncode != 0 or Path(toplevel_path).resolve() != wt_path.resolve():
+        # Not a worktree of its own: git run there would act on the
+        # enclosing checkout, so neither stash nor remove it.
+        if wt_path.is_dir() and not any(wt_path.iterdir()):
+            wt_path.rmdir()
+            return None
+        return (
+            f"leftover {wt} is not a registered worktree; preserved, "
+            f"resolve by hand"
+        )
+    status = await git_run_async(["status", "--porcelain"], wt, timeout=15)
+    if status.returncode != 0:
+        return (
+            f"could not read the status of leftover worktree {wt}; "
+            f"preserved, resolve by hand"
+        )
+    if status.stdout.strip():
+        await _stash_uncommitted_in_worktree(wt, task_id, branch_name)
+        recheck = await git_run_async(["status", "--porcelain"], wt, timeout=15)
+        if recheck.returncode != 0 or recheck.stdout.strip():
+            return (
+                f"leftover worktree {wt} has uncommitted work that could not "
+                f"be stashed; preserved, resolve by hand"
+            )
+    remove = await git_run_async(
+        ["worktree", "remove", "--force", wt], project_dir, timeout=30,
+    )
+    if remove.returncode != 0:
+        return (
+            f"could not remove leftover worktree {wt}: "
+            f"{(remove.stderr or '').strip()[:200]}"
+        )
+    return None
 
 
 async def _merge_task_branch(
@@ -2175,6 +2456,43 @@ async def _gated_merge_task(
     return "merge_failed"
 
 
+def _refuse_task_without_worktree(
+    task: dict,
+    reason: str,
+    flow_id: int | None,
+    output: list[str],
+) -> dict:
+    """Block a task that has no isolation worktree instead of running it.
+
+    Records the refusal in the gate audit, sets the task to ``blocked``
+    (outcome ``worktree_refused``) and returns the per-task result that
+    ``run_parallel_tasks`` collects. No agent runs and nothing is merged.
+    """
+    task_id = task["id"]
+    log(f"\n[Task #{task_id}] REFUSED: {reason}", output)
+    _audit_task_abort(task_id, "worktree-refused", reason, output)
+    outcome = "worktree_refused"
+    update_task_status(task_id, outcome, output=output)
+    if flow_id is not None:
+        try:
+            from equipa import flows as _flows
+            _flows.update_child_state(
+                flow_id, task_id, "failed",
+                payload={"outcome": outcome, "reason": reason},
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("[flows] child refused update failed")
+    return {
+        "task": task,
+        "result": {"cost": 0, "duration": 0},
+        "cycles": 0,
+        "outcome": outcome,
+        "output": output,
+        "merge_ok": False,
+        "needs_merge": False,
+    }
+
+
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
@@ -2281,15 +2599,28 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # Worktree creation issues 2-3 git commands per task. The helper is
     # natively async (uses git_run_async) so the event loop is not
     # blocked while subprocesses run.
+    worktree_refusals: dict[int, str] = {}
     worktree_dirs: dict[int, str] = (
-        await _create_isolation_worktrees(tasks, project_dir, worktree_base)
+        await _create_isolation_worktrees(
+            tasks, project_dir, worktree_base, refusals=worktree_refusals,
+        )
         if use_worktrees else {}
     )
 
     async def run_one_task(task):
         output = []
-        # Use worktree if available, otherwise shared project_dir
-        task_dir = worktree_dirs.get(task["id"], project_dir)
+        task_dir = worktree_dirs.get(task["id"])
+        if task_dir is None and use_worktrees:
+            # dispatch-01: never fall back to the shared main checkout. A
+            # task run there commits straight onto whatever it has checked
+            # out, and the merge loop never gates it.
+            reason = worktree_refusals.get(
+                task["id"], "no isolation worktree was created",
+            )
+            return _refuse_task_without_worktree(task, reason, flow_id, output)
+        if task_dir is None:
+            # Not a git repo: there are no branches to protect.
+            task_dir = project_dir
         # Honour sticky cancel: if the flow was cancelled before we reached
         # this task, skip the dev-test loop entirely.
         if flow_id is not None:
@@ -2343,6 +2674,10 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             result, cycles, outcome, _, _, task = (
                 await run_dev_test_loop_with_autoresearch(
                     task, task_dir, project_context, args, _config_for_loop, output=output,
+                    task_branch=(
+                        f"forge-task-{task['id']}"
+                        if task["id"] in worktree_dirs else None
+                    ),
                 )
             )
 

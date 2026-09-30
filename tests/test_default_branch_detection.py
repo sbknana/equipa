@@ -267,7 +267,9 @@ class TestNoHardcodedMasterInProduction:
         "equipa/git_ops.py": 5,
         "equipa/single_agent_guard.py": 1,
         "equipa/monitoring.py": 1,
-        "equipa/dispatch.py": 1,  # one legit "master" fallback remains (default-branch detection)
+        # equipa/dispatch.py is NOT listed: its last fallback (the main ->
+        # master guess in cleanup_failed_attempt) was replaced by
+        # get_trusted_default_branch (task #3107), so it is held to zero.
     }
 
     @staticmethod
