@@ -94,8 +94,9 @@ def test_restrict_to_read_only_tools_appends_last_and_leaves_input_alone() -> No
 
     restricted = manager_mod.restrict_to_read_only_tools(original)
 
-    assert restricted[:-2] == original
-    assert restricted[-2:] == ["--tools", READ_ONLY_TOOLS]
+    # R3119-03 (task #3126): --strict-mcp-config comes before the allowlist.
+    assert restricted[:-3] == original
+    assert restricted[-3:] == ["--strict-mcp-config", "--tools", READ_ONLY_TOOLS]
     assert original == ["/usr/bin/claude", "-p", "plan", "--add-dir", "/proj"]
 
 

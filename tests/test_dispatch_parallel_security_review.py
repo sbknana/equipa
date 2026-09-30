@@ -353,6 +353,11 @@ def _pretend_git_repo():
                 side_effect=lambda project_dir: Path(project_dir),
             ), \
             patch(
+                # Task #3126: the gated merge runs git at the work-tree root.
+                "equipa.dispatch.git_toplevel_async",
+                new=AsyncMock(side_effect=lambda project_dir: Path(project_dir)),
+            ), \
+            patch(
                 "equipa.dispatch.DefaultBranchGuard.snapshot",
                 new=AsyncMock(side_effect=lambda *_a, **_k: _FakeMergeGuard()),
             ), \

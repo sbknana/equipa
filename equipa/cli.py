@@ -41,6 +41,7 @@ from equipa.agent_runner import (
 from equipa.checkpoints import load_checkpoint
 from equipa.db import log_gate_audit, record_agent_run, update_task_status
 from equipa.git_ops import (
+    GitRepositoryUnreadableError,
     GlobalConfigPinError,
     _is_git_repo,
     pin_global_git_config,
@@ -369,13 +370,26 @@ async def _gated_post_merge(
     )
 
 
+def _is_git_project(project_dir: str) -> bool:
+    """:func:`_is_git_repo`, refusing the dispatch when git cannot read it.
+
+    R3119-02 (task #3126): a repository git cannot read is never run as a
+    non-git project (no worktree, no guard, no gate); the CLI exits with
+    ``EXIT_DISPATCH_REFUSED`` instead.
+    """
+    try:
+        return _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        refuse_dispatch(str(exc))
+
+
 async def _snapshot_merge_guard(project_dir: str) -> DefaultBranchGuard | None:
     """Pin the default branch before the dev-test loop (dispatch-03).
 
     ``None`` when the project is not a git repo or its default branch cannot
     be pinned; the gated merge then refuses to mark the task done.
     """
-    if not _is_git_repo(project_dir):
+    if not _is_git_project(project_dir):
         return None
     try:
         guard = await DefaultBranchGuard.snapshot(project_dir)
@@ -1776,7 +1790,7 @@ async def _run_security_review_and_gate(
         # artifact itself. ``review_blocks_merge`` / ``review_skipped_doc_
         # only`` above still drive the DB-status outcome demotion and the
         # operator log lines, but they NO LONGER steer the merge decision.
-        if guard is None and _is_git_repo(project_dir):
+        if guard is None and _is_git_project(project_dir):
             # MI-06 (task #3116): the default branch was not pinned before
             # the agents ran, so a fresh snapshot now would adopt whatever
             # they did as the baseline. Parallel mode merges nothing in this
@@ -1821,7 +1835,7 @@ async def _run_security_review_and_gate(
                 f"  [Task #{task['id']}] MERGE: skipped — security gate "
                 f"blocked merge of {merge_branch}."
             )
-        if merge_eligible and _is_git_repo(project_dir):
+        if merge_eligible and _is_git_project(project_dir):
             if guard is not None:
                 await guard.verify("end-of-run", task_id=task["id"])
             merge_outcome = (
@@ -2160,7 +2174,7 @@ async def run_mode_task(args: argparse.Namespace) -> None:
 
     # --- Execute ---
 
-    if _is_git_repo(project_dir):
+    if _is_git_project(project_dir):
         # dispatch-04/07 (task #3112): in a git project the agent works in a
         # forge-task-<id> worktree and its commits reach the default branch
         # only through the gated merge — never by committing in the project

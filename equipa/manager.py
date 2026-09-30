@@ -25,7 +25,7 @@ from equipa.constants import (
     MAX_TASKS_PER_PLAN,
 )
 from equipa.db import get_db_connection, update_task_status
-from equipa.git_ops import _is_git_repo
+from equipa.git_ops import GitRepositoryUnreadableError, _is_git_repo
 from equipa.loops import run_dev_test_loop
 from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
 from equipa.merge_safety import report_leftover_dispatch_state, shutdown_requested
@@ -59,10 +59,16 @@ def restrict_to_read_only_tools(cmd: list[str]) -> list[str]:
 
     ``--tools`` is an allowlist of built-in tools, so a tool added to the
     CLI later is excluded too; MCP tools (TheForge) stay available.
+
+    ``--tools`` does not cover MCP servers. ``--strict-mcp-config`` keeps
+    only the servers EQUIPA passes with ``--mcp-config``, so no user- or
+    project-scope server (one that writes files, for example) reaches the
+    read-only agents (R3119-03, task #3126).
     """
     if "--tools" in cmd:
         raise ValueError("agent command already selects its tools (--tools)")
-    return [*cmd, "--tools", ",".join(GOAL_AGENT_READ_ONLY_TOOLS)]
+    strict_mcp = [] if "--strict-mcp-config" in cmd else ["--strict-mcp-config"]
+    return [*cmd, *strict_mcp, "--tools", ",".join(GOAL_AGENT_READ_ONLY_TOOLS)]
 
 
 def _read_only_notice(project_dir: str) -> str:
@@ -320,7 +326,13 @@ async def run_manager_loop(
     # branch moved anyway, the goal stops, nothing further is merged and the
     # CLI exits non-zero (GOAL_REFUSED_OUTCOMES).
     goal_guard: DefaultBranchGuard | None = None
-    if _is_git_repo(project_dir):
+    try:
+        is_git_project = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        log(f"\n  [Manager] {exc} Not running the goal.", output)
+        return "merge_integrity_failed", 0, all_completed, all_blocked, total_cost, total_duration
+    if is_git_project:
         # Imported here: equipa.dispatch imports this module.
         from equipa.dispatch import run_task_in_isolation
 
