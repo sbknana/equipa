@@ -185,6 +185,8 @@ from equipa.constants import (
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
+from equipa.env_loader import build_agent_env
+from equipa.redact import redact_secrets, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
     save_soft_checkpoint,
@@ -571,6 +573,75 @@ def _gate_canary_ok(hook_command: str) -> bool:
     return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
 
 
+class AgentDispatchRefused(RuntimeError):
+    """The agent must not be started; the message says why and how to fix it."""
+
+
+def _cmd_option(cmd: list[str], flag: str) -> str | None:
+    """Value following the FIRST ``flag`` in ``cmd``, or None."""
+    try:
+        return cmd[cmd.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _check_mcp_db_paths(mcp_config: str | os.PathLike[str]) -> None:
+    """Refuse an MCP config that gives a server a relative ``--db-path``.
+
+    The agent CLI runs in the project directory (sandbox-11), and the MCP
+    servers it starts inherit that cwd, so a relative path would silently
+    open a different database. Fail closed rather than guess which one was
+    meant. A missing config is left to the CLI, which reports it itself.
+
+    Raises:
+        AgentDispatchRefused: relative ``--db-path``, or an unreadable config.
+    """
+    path = Path(mcp_config)
+    if not path.is_file():
+        return
+    try:
+        servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
+        entries = list(servers.items())
+    except (OSError, ValueError, AttributeError) as exc:
+        raise AgentDispatchRefused(
+            f"cannot read MCP config {path} to verify its --db-path: {exc}"
+        ) from exc
+    for name, server in entries:
+        args = server.get("args") if isinstance(server, dict) else None
+        if not isinstance(args, list):
+            continue
+        for index, arg in enumerate(args):
+            if arg == "--db-path":
+                db_path = args[index + 1] if index + 1 < len(args) else ""
+            elif isinstance(arg, str) and arg.startswith("--db-path="):
+                db_path = arg.split("=", 1)[1]
+            else:
+                continue
+            if not isinstance(db_path, str) or not os.path.isabs(db_path):
+                raise AgentDispatchRefused(
+                    f"MCP server {name!r} in {path} has a relative --db-path "
+                    f"{db_path!r}. Agents run in the project directory, so it "
+                    f"would open a different database. Set an absolute "
+                    f"--db-path in the MCP config."
+                )
+
+
+def _agent_subprocess_env() -> dict[str, str]:
+    """Allowlisted environment for an agent CLI (loop-03 / sandbox-03).
+
+    The passthrough list comes from the active dispatch config. If that
+    cannot be loaded, no names are added: fewer variables, never more.
+    """
+    try:
+        from equipa.config import get_active_dispatch_config
+        dispatch_config = get_active_dispatch_config()
+    except (ImportError, OSError, ValueError, TypeError, AttributeError):
+        logger.warning("dispatch config unavailable; agent env passthrough "
+                       "disabled for this run", exc_info=True)
+        dispatch_config = None
+    return build_agent_env(dispatch_config)
+
+
 @contextlib.contextmanager
 def build_cli_command(
     system_prompt: str | PromptResult,
@@ -614,6 +685,8 @@ def build_cli_command(
         f"Execute the task described in your system prompt. Work in: {project_dir}"
     )
     claude_bin = shutil.which("claude") or "claude"
+    # sandbox-11: checked before any tempfile exists, so a refusal leaks none.
+    _check_mcp_db_paths(MCP_CONFIG)
 
     # Write system prompt to a temp file to avoid Windows command-line length
     # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
@@ -1115,15 +1188,30 @@ def _track_live_agent(agent: _ContainedAgent) -> None:
 
 
 async def _spawn_agent_process(
-    cmd: list[str], **kwargs: Any,
+    cmd: list[str], project_dir: str | None = None, **kwargs: Any,
 ) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
     """Start the agent CLI with piped stdout/stderr, contained where possible.
 
+    The CLI (and the launcher in front of it) gets the allowlisted
+    environment and runs in the project directory: ``project_dir``, else the
+    first ``--add-dir`` of ``cmd`` (sandbox-03, sandbox-11).
+
     Returns the process to read from and its containment handle (None on
     platforms without the launcher). Raises FileNotFoundError when the
-    command is not on PATH, as a direct spawn would, and AgentContainmentError
-    when the launcher cannot be verified; the launcher is stopped first.
+    command is not on PATH, as a direct spawn would, AgentDispatchRefused
+    when the project directory is missing or the MCP config has a relative
+    --db-path, and AgentContainmentError when the launcher cannot be
+    verified; the launcher is stopped first.
     """
+    cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if cwd is not None and not os.path.isdir(cwd):
+        raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
+    mcp_config = _cmd_option(cmd, "--mcp-config")
+    if mcp_config:
+        _check_mcp_db_paths(mcp_config)
+    kwargs["env"] = _agent_subprocess_env()
+    kwargs["cwd"] = cwd
+
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
@@ -1215,6 +1303,19 @@ def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:
     }
 
 
+def _dispatch_refused_result(exc: AgentDispatchRefused) -> AgentResult:
+    logger.error("[Dispatch] agent refused: %s", exc)
+    return {
+        "success": False,
+        "result_text": "",
+        "num_turns": 0,
+        "duration": 0,
+        "cost": None,
+        "errors": [f"Agent dispatch refused: {exc}"],
+        "files_changed_set": [],
+    }
+
+
 async def run_agent(
     cmd: list[str],
     timeout: int | None = None,
@@ -1222,6 +1323,7 @@ async def run_agent(
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     persistent_max_attempts: int | None = None,
+    project_dir: str | None = None,
 ) -> AgentResult:
     """Spawn claude -p with retry logic and exponential backoff.
 
@@ -1245,6 +1347,8 @@ async def run_agent(
         persistent_max_attempts: Ceiling on capacity-error retries in
             persistent mode. None reads dispatch config
             ``persistent_retry_max_attempts`` (default 36).
+        project_dir: Working directory for the CLI. None uses the first
+            ``--add-dir`` of ``cmd`` (what build_cli_command puts there).
 
     Returns:
         Result dict with success, result_text, num_turns, duration, cost, errors
@@ -1289,7 +1393,8 @@ async def run_agent(
             }
 
         try:
-            process, contained = await _spawn_agent_process(cmd)
+            process, contained = await _spawn_agent_process(
+                cmd, project_dir=project_dir)
 
             # Register abort handler to stop the agent's whole process tree
             def abort_handler(
@@ -1353,6 +1458,8 @@ async def run_agent(
             }
         except AgentContainmentError as exc:
             return _containment_failure_result(exc)
+        except AgentDispatchRefused as exc:
+            return _dispatch_refused_result(exc)
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -1630,6 +1737,7 @@ async def _run_agent_streaming_impl(
     try:
         process, contained = await _spawn_agent_process(
             cmd,
+            project_dir=project_dir,
             limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
         )
 
@@ -1653,6 +1761,8 @@ async def _run_agent_streaming_impl(
         }
     except AgentContainmentError as exc:
         return _containment_failure_result(exc)
+    except AgentDispatchRefused as exc:
+        return _dispatch_refused_result(exc)
 
     try:
         # Read stdout line-by-line with overall timeout
@@ -2727,4 +2837,4 @@ async def dispatch_agent(
             task_id=task_id, cycle_number=cycle, project_dir=project_dir,
             paralysis_retry_count=paralysis_retry_count)
     else:
-        return await run_agent(cmd)
+        return await run_agent(cmd, project_dir=project_dir)
