@@ -206,6 +206,36 @@ def _aggressive_compress_code(text: str) -> str:
     return "\n".join(compressed)
 
 
+AGENT_OUTPUT_LINE_WITHHELD: str = "[line withheld: failed sanitization]"
+
+
+def _sanitize_lines(section_text: str, marker: str) -> str:
+    """Reject-mode sanitize each line of a list section on its own.
+
+    *section_text* starts with ``MARKER:`` (see _extract_section). A rejected
+    line is replaced by AGENT_OUTPUT_LINE_WITHHELD, under the fixed marker
+    for the header line and as a bullet otherwise, so the other entries
+    still reach the next agent. The joined result gets the lesson length
+    cap, as a whole section would.
+    """
+    from lesson_sanitizer import MAX_LESSON_LENGTH, enforce_limit, sanitize
+
+    label = f"agent output {marker}"
+    kept: list[str] = []
+    for index, line in enumerate(section_text.split("\n")):
+        if not line.strip():
+            kept.append("")
+            continue
+        clean = sanitize(line, label=label)
+        if clean:
+            kept.append(clean)
+        elif index == 0:
+            kept.append(f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}")
+        else:
+            kept.append(f"- {AGENT_OUTPUT_LINE_WITHHELD}")
+    return enforce_limit("\n".join(kept).strip(), MAX_LESSON_LENGTH, label=label)
+
+
 def compact_agent_output(
     raw_output: str,
     max_words: int = 200,
@@ -270,14 +300,20 @@ def compact_agent_output(
     # (PS-02). The sanitizer rejects rather than strips, so a rejected section
     # comes back empty and is recorded here: it must be reported as withheld,
     # never replaced by the raw text it was extracted from (review F1).
+    # FILES_CHANGED is a list of independent entries, so it is sanitized per
+    # line: one rejected path withholds that line, not the section (N4).
     rejected: list[str] = []
     for key, section_text in sections.items():
-        if section_text:
+        if not section_text:
+            continue
+        if key == "FILES_CHANGED":
+            sections[key] = _sanitize_lines(section_text, key)
+        else:
             sections[key] = sanitize_lesson_content(
                 section_text, label=f"agent output {key}"
             )
-            if not sections[key]:
-                rejected.append(key)
+        if not sections[key]:
+            rejected.append(key)
 
     parts: list[str] = []
     if sections["SUMMARY"]:
