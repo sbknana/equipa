@@ -737,7 +737,7 @@ async def test_docs_only_diff_skips_security_gate(tmp_path):
     patches[13] = patch(
         "equipa.dispatch.get_changed_files_for_branch",
         new=AsyncMock(return_value=[
-            "CRYPTOTRADER-V3-ARCHITECTURE.md",
+            "docs/CRYPTOTRADER-V3-ARCHITECTURE.md",
             "docs/notes.txt",
         ]),
     )

@@ -952,8 +952,12 @@ async def run_agent(
                 # Check for error subtypes
                 subtype = data.get("subtype", "")
                 if subtype == "error_max_turns":
-                    # Agent ran out of turns but may have done useful work
+                    # Agent ran out of turns but may have done useful work.
+                    # gate-07: the run did NOT finish, so a caller whose
+                    # output must be complete (the security reviewer) reads
+                    # ``hit_max_turns`` and treats the run as failed.
                     result["success"] = True
+                    result["hit_max_turns"] = True
                     result["errors"].append("Agent hit max turns limit")
                 elif data.get("is_error"):
                     result["success"] = False

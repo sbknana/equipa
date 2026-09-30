@@ -128,7 +128,7 @@ def test_single_task_devtest_doc_only_skips_gate(tmp_path: Path) -> None:
     (test_doc_only_diff_skips_gate_end_to_end) covers the wiring end-to-end.
     """
     # All-docs diff: gate must skip.
-    assert is_doc_only_diff(["README.md", "docs/spec.md", "notes.txt", "x.rst"]) is True
+    assert is_doc_only_diff(["README.md", "docs/spec.md", "docs/notes.txt", "docs/x.rst"]) is True
 
     # A single code file in an otherwise-doc diff: gate must run.
     assert is_doc_only_diff(["README.md", "src/foo.py"]) is False

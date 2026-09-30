@@ -291,11 +291,23 @@ async def test_security_reviewer_prompt_states_fail_closed_rules(
     assert "Update the footer last" in description
     assert "IN PROGRESS, skeleton or TODO" in description
     # Task #3038: the rules the stricter parser added are stated too.
-    assert "any other heading (any `#` level)" in description
+    # gate-06: so are the forms it now counts (table cells, Severity fields,
+    # setext and HTML headings, list-item parentheses).
+    assert (
+        "in any other heading, bold lead-in, table cell, `Severity:` field "
+        "(at any list depth), list item that starts with a severity, or "
+        "parenthesis of a list item: each of those is counted as a finding"
+    ) in description
+    assert "no `===`/`---` underlined or HTML headings" in description
     assert "still counts even when it is marked fixed or resolved" in (
         description
     )
-    assert "nothing may follow it" in description
+    # gate-07: only the completion sentinel may follow the footer, and it
+    # must be the last line.
+    assert "nothing may follow it except the COMPLETION line" in description
+    assert "COMPLETION (mandatory)" in description
+    assert "as the LAST line of the file" in description
+    assert "prose or a table" not in description
     assert "[PASS/FAIL]" in description
     assert "A review with no findings must say so" in description
     # The pre-#3033 claim that the footer wins must be gone.

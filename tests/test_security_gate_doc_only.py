@@ -29,7 +29,7 @@ class TestIsDocOnlyDiff:
         assert security_gate.is_doc_only_diff(["README.md", "docs/spec.md"]) is True
 
     def test_mixed_md_and_txt_is_doc_only(self) -> None:
-        assert security_gate.is_doc_only_diff(["README.md", "NOTES.txt", "x.rst"]) is True
+        assert security_gate.is_doc_only_diff(["README.md", "docs/NOTES.txt", "docs/x.rst"]) is True
 
     def test_single_py_file_is_not_doc_only(self) -> None:
         assert security_gate.is_doc_only_diff(["src/foo.py"]) is False

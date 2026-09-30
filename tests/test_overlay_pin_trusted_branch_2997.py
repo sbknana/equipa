@@ -382,7 +382,7 @@ def test_agent_instruction_markdown_is_never_doc_only(path: str):
 
 
 def test_plain_docs_are_still_doc_only():
-    assert is_doc_only_diff(["docs/guide.md", "README.md", "notes/claude-notes.md"]) is True
+    assert is_doc_only_diff(["docs/guide.md", "README.md", "docs/claude-notes.md"]) is True
 
 
 def test_claude_md_diff_requires_security_review():

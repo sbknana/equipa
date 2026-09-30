@@ -50,6 +50,7 @@ from equipa.security_gate import (
     get_reviewer_run,
     record_reviewer_run,
     record_reviewer_skipped_doc_only,
+    review_complete_line,
     reviewer_nonce_line,
     reviewer_run_failure,
     verify_reviewer_provenance,
@@ -63,8 +64,13 @@ TIMEOUT_RESULT = {
 
 
 def _review_body(nonce: str | None, *, low: int = 1) -> str:
-    """A complete, parser-trusted review; nonce line first when given."""
+    """A complete, parser-trusted review; nonce line first when given.
+
+    With a nonce the completion sentinel is the last line, as the reviewer
+    prompt requires of a finished review (gate-07).
+    """
     header = f"{reviewer_nonce_line(nonce)}\n" if nonce else ""
+    trailer = f"{review_complete_line(nonce)}\n" if nonce else ""
     findings = "".join(
         f"### [R{index}] LOW — verbose error message {index}\n"
         f"Details of finding {index}.\n\n"
@@ -76,6 +82,7 @@ def _review_body(nonce: str | None, *, low: int = 1) -> str:
         f"{findings}"
         f"## Counts\n"
         f"CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: {low} | INFO: 0\n"
+        f"{trailer}"
     )
 
 
@@ -245,7 +252,8 @@ def test_defensive_invariant_high_finding_line_names_file_and_sha(
             f"## Summary\nOne high-severity finding.\n\n"
             f"### [R1] HIGH — command injection in runner\nDetails.\n\n"
             f"## Counts\n"
-            f"CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n",
+            f"CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+            f"{review_complete_line(nonce)}\n",
             encoding="utf-8",
         )
         return {"success": True, "result_text": "done", "errors": []}

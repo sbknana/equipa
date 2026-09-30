@@ -55,6 +55,7 @@ from equipa.security_gate import (
     new_reviewer_nonce,
     record_reviewer_run,
     record_reviewer_skipped_doc_only,
+    review_complete_line,
     reviewer_nonce_line,
     reviewer_run_failure,
     verify_reviewer_provenance,
@@ -65,14 +66,23 @@ NONCE_RE = re.compile(r"EQUIPA-REVIEWER-RUN: ([0-9a-f]{32})")
 
 
 def _review_body(nonce_line: str | None) -> str:
-    """A complete, parser-trusted one-LOW review, optional leading line."""
+    """A complete, parser-trusted one-LOW review, optional leading line.
+
+    When the leading line carries a nonce, the completion sentinel for that
+    nonce is the last line, as a finished review requires (gate-07).
+    """
     header = f"{nonce_line}\n" if nonce_line else ""
+    nonce_match = NONCE_RE.search(nonce_line or "")
+    trailer = (
+        f"{review_complete_line(nonce_match.group(1))}\n" if nonce_match else ""
+    )
     return (
         f"{header}# Security Review\n\n"
         f"## Summary\n1 low-severity finding.\n\n"
         f"### [E1] LOW — verbose error message\nDetails.\n\n"
         f"## Counts\n"
         f"CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0\n"
+        f"{trailer}"
     )
 
 
@@ -161,7 +171,10 @@ def test_nonce_quoted_in_prose_is_rejected_by_provenance(tmp_path):
 def test_nonce_line_anywhere_on_its_own_line_is_trusted(tmp_path):
     """The prompt asks for the FIRST line, but the gate's proof is the nonce
     itself; a reviewer that put a title above it still wrote the file."""
-    body = _review_body(None) + f"\n{reviewer_nonce_line(NONCE)}\n"
+    body = (
+        _review_body(None)
+        + f"\n{reviewer_nonce_line(NONCE)}\n{review_complete_line(NONCE)}\n"
+    )
     path = _write(_artifact(tmp_path, 4002), body)
     _succeeded_record(4002, path)
 

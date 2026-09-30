@@ -4,7 +4,8 @@ This module owns the small, pure decisions the parallel and single-task
 dispatch paths need to make about the security-review gate:
 
   * ``is_doc_only_diff(changed_files)`` — True when every changed file is
-    a documentation file (.md/.txt/.rst/...). Such diffs cannot introduce
+    prose: .md/.rst/.txt under docs/, or a root README*/CHANGELOG*/LICENSE*
+    (gate-04; see :func:`is_doc_path`). Such diffs cannot introduce
     code-level vulnerabilities, so the security gate must not block them
     on prose-matching false positives. Concrete trigger: task #2358, a
     pure CRYPTOTRADER-V3-ARCHITECTURE.md spec, was blocked because the
@@ -37,8 +38,9 @@ import secrets
 import stat
 import sys
 import threading
+import unicodedata
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import PurePosixPath
 
 from equipa.git_ops import git_run_async
 
@@ -84,6 +86,46 @@ _REVIEWER_NONCE_RE = re.compile(
     re.MULTILINE,
 )
 
+# gate-07: the reviewer writes this line LAST, only once the review is done.
+# A review whose final line is not the sentinel carrying this run's nonce was
+# cut off (max turns, timeout, a turn-2 draft) and blocks as incomplete.
+_REVIEW_COMPLETE_LINE_TEMPLATE = "<!-- EQUIPA-REVIEW-COMPLETE {nonce} -->"
+_REVIEW_COMPLETE_RE = re.compile(
+    r"[ \t]*<!--[ \t]*EQUIPA-REVIEW-COMPLETE[ \t]+([0-9a-f]{32})[ \t]*-->[ \t]*",
+)
+REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
+
+# gate-09 / gate-14: every line break Python's str.splitlines() honours, so
+# the regex ``^``/``$`` anchors and splitlines() see the same lines. A CR-only
+# or U+2028 review otherwise hid a finding heading from the MULTILINE regexes
+# while splitlines() still split it.
+_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
+# gate-06: invisible characters that split a severity word ("HI​GH") so
+# no regex sees it, while the operator reading the rendered file does. Covers
+# the Unicode Cf (format) characters that occur in text, the combining
+# grapheme joiner, variation selectors and the Hangul fillers.
+_INVISIBLE_CHARS_RE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏"
+    "​-‏‪-‮⁠-⁤⁦-⁯ㅤ"
+    "︀-️﻿ﾠ￹-￻\U000e0000-\U000e007f"
+    "\U000e0100-\U000e01ef]"
+)
+
+
+def normalize_review_text(text: str) -> str:
+    """Canonical form of a review artifact for the nonce checks and parser.
+
+    Strips invisible characters, applies Unicode NFKC (fullwidth ``ＨＩＧＨ``
+    and mathematical ``𝐇𝐈𝐆𝐇`` become ``HIGH``) and maps every line break to
+    ``\\n``. Idempotent, so a caller that already normalised can pass the
+    result through again without changing it.
+    """
+    text = _INVISIBLE_CHARS_RE.sub("", text)
+    text = unicodedata.normalize("NFKC", text)
+    # NFKC can itself produce invisible characters (U+3164 -> U+1160).
+    text = _INVISIBLE_CHARS_RE.sub("", text)
+    return _LINE_BREAK_RE.sub("\n", text)
+
 
 @dataclass(frozen=True)
 class ArtifactFingerprint:
@@ -127,7 +169,13 @@ class ArtifactSnapshot:
 
     @property
     def text(self) -> str | None:
-        """The bytes decoded as UTF-8 (lossy), or None when unreadable."""
+        """The bytes decoded as UTF-8 (lossy), or None when unreadable.
+
+        Deliberately NOT normalised: the stable-path copy is written from
+        this text and must keep the reviewer's exact bytes, or its sha256
+        would no longer match the reviewer run's post-fingerprint.
+        :func:`verify_reviewer_provenance` normalises for the checks.
+        """
         if self.data is None:
             return None
         return self.data.decode("utf-8", errors="replace")
@@ -293,6 +341,8 @@ class ProvenanceVerdict:
             return "reviewer-record-missing"
         if self.reason in _REVIEWER_FAILED_REASONS:
             return "reviewer-failed"
+        if self.reason == REVIEW_COMPLETION_SENTINEL_MISSING_REASON:
+            return "review-incomplete"
         return "artifact-provenance-rejected"
 
     def describe_reviewer(self) -> str:
@@ -353,7 +403,24 @@ def reviewer_nonce_line(nonce: str) -> str:
 
 def artifact_nonces(text: str) -> set[str]:
     """Every reviewer-run nonce line present in ``text``."""
-    return set(_REVIEWER_NONCE_RE.findall(text or ""))
+    return set(_REVIEWER_NONCE_RE.findall(normalize_review_text(text or "")))
+
+
+def review_complete_line(nonce: str) -> str:
+    """The completion sentinel a reviewer run must write as its LAST line."""
+    return _REVIEW_COMPLETE_LINE_TEMPLATE.format(nonce=nonce)
+
+
+def review_completion_nonce(text: str | None) -> str | None:
+    """The nonce of the completion sentinel ending ``text``, else None.
+
+    Only the last non-blank line counts (gate-07): a sentinel followed by
+    anything else means the review kept going after it was declared done,
+    and a sentinel quoted mid-file proves nothing.
+    """
+    lines = normalize_review_text(text or "").rstrip().rsplit("\n", 1)
+    match = _REVIEW_COMPLETE_RE.fullmatch(lines[-1])
+    return match.group(1) if match is not None else None
 
 
 def record_reviewer_run(record: ReviewerRunRecord) -> None:
@@ -390,6 +457,9 @@ def verify_reviewer_provenance(
       * ``artifact-pre-existing`` — the bytes equal the file that was there
         before the reviewer started (e.g. a developer self-review);
       * ``reviewer-nonce-missing`` — the file lacks this run's nonce line;
+      * ``review-completion-sentinel-missing`` — its last line is not this
+        run's ``<!-- EQUIPA-REVIEW-COMPLETE <nonce> -->`` sentinel, so the
+        review was never finished (gate-07);
       * ``artifact-changed-after-review`` — edited after the reviewer ended.
 
       * ``reviewer-record-missing`` — no reviewer run was recorded for the
@@ -402,11 +472,16 @@ def verify_reviewer_provenance(
         pre-#3041 artifact-only trust (reason ``no-reviewer-run-recorded``).
 
     The artifact is read ONCE (SR41-02): the fingerprint, the nonce check and
-    the returned ``text`` all come from the same bytes.
+    the returned ``text`` all come from the same bytes. The text is
+    normalised ONCE here (gate-09 / gate-14) with
+    :func:`normalize_review_text`, so the nonce check, the completion
+    sentinel and the finding parser all see the same ``\\n``-separated lines
+    whatever line breaks or invisible characters the file used.
     """
     snapshot = snapshot_artifact(review_path)
     fingerprint = snapshot.fingerprint
-    text = snapshot.text
+    raw_text = snapshot.text
+    text = normalize_review_text(raw_text) if raw_text is not None else None
     record = get_reviewer_run(task_id)
 
     def verdict(trusted: bool, reason: str) -> ProvenanceVerdict:
@@ -432,6 +507,8 @@ def verify_reviewer_provenance(
         return verdict(False, "reviewer-nonce-missing")
     if post.sha256 != fingerprint.sha256:
         return verdict(False, "artifact-changed-after-review")
+    if review_completion_nonce(text) != record.nonce:
+        return verdict(False, REVIEW_COMPLETION_SENTINEL_MISSING_REASON)
     return verdict(True, "verified")
 
 
@@ -562,34 +639,63 @@ def _path_parts(raw_path: str) -> list[str]:
 
 
 # Basenames Claude Code / other agent CLIs load as standing instructions.
-_AGENT_INSTRUCTION_BASENAMES: frozenset[str] = frozenset({"claude.md", "agents.md"})
+_AGENT_INSTRUCTION_BASENAMES: frozenset[str] = frozenset({
+    "claude.md", "agents.md", "gemini.md",
+})
+# gate-04: repository-root directories whose files EQUIPA loads as role
+# prompts, skills and standing orders (``prompts/`` and ``skills/`` are the
+# trees skill_manifest.json integrity-protects). A change there rewrites the
+# instructions of later agents, the security reviewer included.
+_AGENT_INSTRUCTION_ROOT_DIRS: frozenset[str] = frozenset({
+    "prompts", "standing_orders", "skills",
+})
+# ``*SKILL.md`` at any depth: the skill file convention of every agent CLI.
+_SKILL_FILE_SUFFIX = "skill.md"
 
 
-def agent_config_changes(changed_files: list[str]) -> list[str]:
-    """Return the changed paths under a ``.claude`` directory, at any depth.
-
-    SR-2997 S3: ``.claude/skills|agents|commands/*.md`` and
-    ``.claude/settings*.json`` are loaded by the Claude CLI for every later
-    agent (gate roles included) that runs with the worktree as ``--add-dir``.
-    They are agent instructions (and hooks), so only the operator may merge
-    them — the gate fails closed on them exactly like ``.equipa/roles/``.
-    """
-    return [path for path in changed_files if ".claude" in _path_parts(path)]
-
-
-def is_agent_instruction_path(raw_path: str) -> bool:
-    """True for paths an agent CLI reads as instructions, never plain docs.
-
-    Covers any ``.claude`` / ``.equipa`` component and ``CLAUDE.md`` /
-    ``AGENTS.md`` at any depth. Such a ``.md`` must never be auto-merged as
-    "doc-only" without a security review (SR-2997 S3).
-    """
+def _is_agent_config_path(raw_path: str) -> bool:
+    """True for a path whose change only the operator may merge."""
     parts = _path_parts(raw_path)
     if not parts:
         return False
     return (
         ".claude" in parts
+        or parts[0] in _AGENT_INSTRUCTION_ROOT_DIRS
+        or parts[-1].endswith(_SKILL_FILE_SUFFIX)
+    )
+
+
+def agent_config_changes(changed_files: list[str]) -> list[str]:
+    """Return the changed paths that configure or instruct later agents.
+
+    SR-2997 S3: ``.claude/skills|agents|commands/*.md`` and
+    ``.claude/settings*.json`` (at any depth) are loaded by the Claude CLI
+    for every later agent (gate roles included) that runs with the worktree
+    as ``--add-dir``. gate-04 adds EQUIPA's own instruction paths: anything
+    under a root ``prompts/``, ``standing_orders/`` or ``skills/`` directory
+    and any ``*SKILL.md``. They are agent instructions (and hooks), so only
+    the operator may merge them — the gate fails closed on them exactly like
+    ``.equipa/roles/``.
+    """
+    return [path for path in changed_files if _is_agent_config_path(path)]
+
+
+def is_agent_instruction_path(raw_path: str) -> bool:
+    """True for paths an agent CLI reads as instructions, never plain docs.
+
+    Covers every agent-config path (:func:`agent_config_changes`), any
+    ``.equipa`` component, a root ``.github`` directory (Copilot instructions
+    and CI workflows) and ``CLAUDE.md`` / ``AGENTS.md`` / ``GEMINI.md`` at any
+    depth. Such a file must never be auto-merged as "doc-only" without a
+    security review (SR-2997 S3, gate-04).
+    """
+    parts = _path_parts(raw_path)
+    if not parts:
+        return False
+    return (
+        _is_agent_config_path(raw_path)
         or ".equipa" in parts
+        or parts[0] == ".github"
         or parts[-1] in _AGENT_INSTRUCTION_BASENAMES
     )
 
@@ -807,26 +913,53 @@ def format_counts(counts: dict | None) -> str:
         f"I={counts.get('INFO', 0)}"
     )
 
-# Extensions that carry executable code or executable configuration.
-# A diff containing ANY file with one of these extensions cannot be
-# considered "doc-only" — the security gate must run normally.
-#
-# Conservative by design: only well-known doc extensions skip the gate.
-# An unfamiliar extension (Makefile, .toml, .yaml, .json, .lock, etc.)
-# is treated as code so we never silently skip a gate the operator
-# expected to run.
-_DOC_EXTENSIONS: frozenset[str] = frozenset({
-    ".md",
-    ".markdown",
-    ".rst",
-    ".txt",
-    ".adoc",
-    ".asciidoc",
-})
+# gate-04: "doc-only" is an ALLOWLIST of locations, not of extensions. By
+# extension alone, ``.txt`` / ``.md`` covered dependency manifests
+# (requirements.txt), build scripts (CMakeLists.txt) and agent prompts, and
+# all of them merged with no review. Prose means one of these extensions
+# under the root ``docs/`` directory, or a root README* / CHANGELOG* /
+# LICENSE* file. Everything else is reviewed.
+_DOC_PROSE_EXTENSIONS: frozenset[str] = frozenset({".md", ".rst", ".txt"})
+_ROOT_DOC_BASENAME_PREFIXES: tuple[str, ...] = ("readme", "changelog", "license")
+_ROOT_DOC_EXTENSIONS: frozenset[str] = _DOC_PROSE_EXTENSIONS | {""}
+_DOCS_ROOT_DIR = "docs"
+# Build and dependency inputs that carry a prose extension, and git
+# attribute/submodule files. Never doc-only, wherever they sit.
+_NEVER_DOC_BASENAME_RE = re.compile(
+    r"(?:requirements|constraints)[^/]*\.txt|cmakelists\.txt"
+    r"|\.gitattributes|\.gitmodules",
+)
+
+
+def is_doc_path(raw_path: str) -> bool:
+    """True when ``raw_path`` is prose a security review may skip (gate-04).
+
+    Case-insensitive, like every other gate path check, so ``Docs/`` or
+    ``ReadMe.md`` cannot sidestep a rule the lower-case spelling obeys.
+    """
+    parts = _path_parts(raw_path)
+    if not parts or ".." in parts:
+        return False
+    if is_agent_instruction_path(raw_path):
+        return False
+    basename = parts[-1]
+    if _NEVER_DOC_BASENAME_RE.fullmatch(basename):
+        return False
+    suffix = PurePosixPath(basename).suffix
+    if len(parts) == 1:
+        return (
+            basename.startswith(_ROOT_DOC_BASENAME_PREFIXES)
+            and suffix in _ROOT_DOC_EXTENSIONS
+        )
+    return parts[0] == _DOCS_ROOT_DIR and suffix in _DOC_PROSE_EXTENSIONS
 
 
 def is_doc_only_diff(changed_files: list[str]) -> bool:
-    """Return True iff every path in ``changed_files`` is a documentation file.
+    """Return True iff every path in ``changed_files`` is prose (gate-04).
+
+    Prose is a ``.md`` / ``.rst`` / ``.txt`` file under the root ``docs/``
+    directory, or a root ``README*`` / ``CHANGELOG*`` / ``LICENSE*`` file
+    (see :func:`is_doc_path`).
 
     An empty list returns False on purpose: callers fetch the file list
     from ``git diff --name-only`` and an empty result usually means the
@@ -835,20 +968,17 @@ def is_doc_only_diff(changed_files: list[str]) -> bool:
     the gate on every such failure — exactly the silent-skip class of
     bug that task #2321 originally fixed.
 
-    Agent instruction files (``.claude/**``, ``.equipa/**``, ``CLAUDE.md``,
-    ``AGENTS.md``) are never doc-only even though they are ``.md``: they
-    steer later agents, so skipping review on them is an injection path
-    (SR-2997 S3).
+    Never doc-only, whatever the extension or location: agent instruction
+    paths (``.claude/**``, ``.equipa/**``, ``.github/**``, root
+    ``prompts/`` / ``standing_orders/`` / ``skills/``, ``*SKILL.md``,
+    ``CLAUDE.md``, ``AGENTS.md``, ``GEMINI.md``), which steer later agents
+    (SR-2997 S3), and ``requirements*.txt`` / ``constraints*.txt`` /
+    ``CMakeLists.txt`` / ``.gitattributes`` / ``.gitmodules``, which change
+    what gets installed, built or checked out.
     """
     if not changed_files:
         return False
-    for path in changed_files:
-        if is_agent_instruction_path(path):
-            return False
-        suffix = Path(path).suffix.lower()
-        if suffix not in _DOC_EXTENSIONS:
-            return False
-    return True
+    return all(is_doc_path(path) for path in changed_files)
 
 
 class SecurityGateBypassError(RuntimeError):
