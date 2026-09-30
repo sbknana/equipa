@@ -119,6 +119,14 @@ _STATE_IDENTITY = {
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 # Agent-side layout under the agent user's HOME.
 AGENT_STATE_DIRNAME = ".equipa-agent"
+# Per-user locations the launcher points into the unit's own state directory;
+# values for them in the handoff environment are never used.
+_UNIT_ENV_NAMES = frozenset({
+    "HOME", "CLAUDE_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "TMPDIR", "PWD",
+})
+# Everything in a unit's state directory except the clone. Removed even when
+# the export fails and the clone is kept for recovery.
+_UNIT_PRIVATE_ENTRIES = ("home", "gitconfig", "files", "tmp")
 # Exported bundles older than this are removed from the exchange directory.
 _STALE_EXPORT_SECONDS = 24 * 3600
 _GIT_TIMEOUT_SECONDS = 900
@@ -716,6 +724,8 @@ class _IsolatedSession:
         self.shell = "/bin/sh"
         self.state_dir: Path | None = None
         self.repo_dir: Path | None = None
+        self.unit_home: Path | None = None
+        self.unit_git_config: Path | None = None
 
     def _parse_workspace(self, workspace: Mapping) -> None:
         self.handoff_ref = _field(workspace, "handoff_ref", str)
@@ -770,14 +780,18 @@ class _IsolatedSession:
             if gid in groups:
                 raise IsolationRefused(f"the agent user is in the privileged "
                                        f"group {name!r}")
-        try:
-            home_stat = os.stat(entry.pw_dir)
-        except OSError as exc:
-            raise IsolationRefused(f"agent HOME {entry.pw_dir!r} is "
-                                   f"unusable: {exc}") from exc
-        if not os.path.isabs(entry.pw_dir) or home_stat.st_uid != uid:
+        # The passwd HOME is shared by every unit, so the agent must not be
+        # able to write it: anything planted there (~/.ssh/config, which ssh
+        # reads from passwd rather than $HOME, dot-files, caches) would reach
+        # later units (review ISO-02). Units get their own HOME below it.
+        if not os.path.isabs(entry.pw_dir) or not os.path.isdir(entry.pw_dir):
             raise IsolationRefused(f"agent HOME {entry.pw_dir!r} must be an "
-                                   f"absolute directory owned by the agent")
+                                   f"existing absolute directory")
+        if os.access(entry.pw_dir, os.W_OK):
+            raise IsolationRefused(
+                f"the agent user can write its passwd HOME {entry.pw_dir}; "
+                f"make it root-owned and not agent-writable "
+                f"(docs/AGENT_ISOLATION.md step 1)")
         self.home = entry.pw_dir
         self.shell = next((shell for shell in ("/bin/bash", "/bin/sh")
                            if os.access(shell, os.X_OK)), "/bin/sh")
@@ -820,6 +834,9 @@ class _IsolatedSession:
                if not name.endswith("_TOKEN")}
         env.update(extra_env or {})
         env.update(self.git_env)
+        # The launcher's own git (clone, export) reads no global config at
+        # all, not even the unit's, which the agent could edit while it ran.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
         where = cwd if cwd is not None else self.repo_dir
         try:
             result = subprocess.run(
@@ -839,8 +856,14 @@ class _IsolatedSession:
         """Create the private state directory, store the handoff bundle and
         build the agent's own clone from it."""
         root = Path(self.home) / AGENT_STATE_DIRNAME
-        with contextlib.suppress(FileExistsError):
+        try:
             root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except PermissionError as exc:
+            raise IsolationRefused(
+                f"cannot create {root}; with a root-owned HOME the operator "
+                f"creates it (docs/AGENT_ISOLATION.md step 1)") from exc
         root_stat = os.lstat(root)
         if not os.path.isdir(root) or os.path.islink(root) \
                 or root_stat.st_uid != os.getuid():
@@ -856,6 +879,7 @@ class _IsolatedSession:
         (self.state_dir / "files").mkdir(mode=0o700)
         (self.state_dir / "tmp").mkdir(mode=0o700)
         self.repo_dir = self.state_dir / "repo"
+        self._create_unit_home()
         if not self.has_workspace:
             if bundle_size:
                 raise IsolationRefused("a bundle was sent without a workspace")
@@ -876,6 +900,27 @@ class _IsolatedSession:
         self._build_clone(bundle_path)
         os.unlink(bundle_path)
         _remove_stale_exports(Path(self.export_path).parent)
+
+    def _create_unit_home(self) -> None:
+        """A fresh, empty HOME and git global config for this unit only.
+
+        HOME, CLAUDE_CONFIG_DIR and the XDG directories point into it (see
+        build_env), so settings, hooks, CLAUDE.md, git config, shell rc
+        files and caches one agent leaves behind are never loaded by a later
+        developer, tester or reviewer (review ISO-02). ``discard`` removes
+        it. The git global config holds only the identity the orchestrator
+        handed over.
+        """
+        self.unit_home = self.state_dir / "home"
+        self.unit_home.mkdir(mode=0o700)
+        (self.unit_home / ".claude").mkdir(mode=0o700)
+        self.unit_git_config = self.state_dir / "gitconfig"
+        fd = os.open(self.unit_git_config,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        for key, value in self.git_identity.items():
+            self._git(["config", "--file", str(self.unit_git_config),
+                       key.replace("_", "."), value], cwd=self.state_dir)
 
     def _build_clone(self, bundle_path: Path) -> None:
         self._git(["init", "-q", str(self.repo_dir)], cwd=self.state_dir)
@@ -918,12 +963,26 @@ class _IsolatedSession:
         return argv
 
     def build_env(self) -> dict[str, str]:
-        env = dict(self.env)
+        """The CLI's environment. Once the unit's state directory exists,
+        every per-user location (HOME, CLAUDE_CONFIG_DIR, XDG directories,
+        TMPDIR, the git global config) is inside it."""
+        env = {name: value for name, value in self.env.items()
+               if name not in _UNIT_ENV_NAMES and not name.startswith("XDG_")}
         env.update(HOME=self.home, USER=self.user, LOGNAME=self.user,
                    SHELL=self.shell)
         if self.state_dir is not None:
-            env["TMPDIR"] = str(self.state_dir / "tmp")
-            env["PWD"] = str(self.repo_dir)
+            home = self.unit_home
+            env.update(
+                HOME=str(home),
+                CLAUDE_CONFIG_DIR=str(home / ".claude"),
+                XDG_CONFIG_HOME=str(home / ".config"),
+                XDG_CACHE_HOME=str(home / ".cache"),
+                XDG_DATA_HOME=str(home / ".local" / "share"),
+                XDG_STATE_HOME=str(home / ".local" / "state"),
+                GIT_CONFIG_GLOBAL=str(self.unit_git_config),
+                TMPDIR=str(self.state_dir / "tmp"),
+                PWD=str(self.repo_dir),
+            )
         return env
 
     def export(self) -> None:
@@ -946,6 +1005,20 @@ class _IsolatedSession:
     def discard(self) -> None:
         if self.state_dir is not None and self.state_dir.exists():
             _remove_tree(self.state_dir)
+
+    def discard_private(self) -> None:
+        """Remove the unit's HOME, git config, handed-over files (the
+        system prompt with the review nonces) and TMPDIR, keeping only the
+        clone for recovery after a failed export."""
+        if self.state_dir is None:
+            return
+        for name in _UNIT_PRIVATE_ENTRIES:
+            path = self.state_dir / name
+            if path.is_dir() and not path.is_symlink():
+                _remove_tree(path)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -1035,6 +1108,7 @@ def _run_isolated() -> int:
     except (IsolationRefused, OSError) as exc:
         _report(f"export failed; the agent's work is kept in "
                 f"{session.repo_dir}: {exc}")
+        session.discard_private()
     else:
         session.discard()
     return _exit_like(status)

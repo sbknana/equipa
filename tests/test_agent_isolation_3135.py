@@ -928,7 +928,9 @@ def test_isolated_agent_end_to_end(repo: dict[str, Path], tmp_path: Path,
     result = json.loads(output.decode().splitlines()[0])
     clone = home / agent_launcher.AGENT_STATE_DIRNAME / UNIT / "repo"
     assert result["cwd"] == str(clone)
-    assert result["home"] == str(home)
+    # ISO-02 (task 3136): the unit's own HOME, not the shared passwd HOME.
+    assert result["home"] == str(clone.parent / "home")
+    assert result["home"] != str(home)
     assert result["token"] == "test-token" and result["leak"] is None
     assert result["argv"] == ["-p", f"Work in: {clone}", "--add-dir", str(clone)]
     assert agent.closed and agent.imported
