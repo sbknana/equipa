@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 import sys
 from pathlib import Path
 
@@ -324,57 +325,257 @@ def _inject_attempt_reflections(
     )
 
 
+class AttemptCleanupError(RuntimeError):
+    """The git reset between two autoresearch attempts failed.
+
+    Raised instead of logging a warning and carrying on: a half-finished
+    reset leaves the next attempt on the wrong branch or on the failed
+    attempt's commits (dispatch-02/12). The caller must stop retrying and
+    leave the task blocked.
+    """
+
+
+async def _git_checked(
+    args: list[str],
+    cwd: str,
+    *,
+    timeout: int,
+    action: str,
+) -> str:
+    """Run git and return its stripped stdout; raise if it did not succeed.
+
+    Raises:
+        AttemptCleanupError: git exited non-zero, timed out, or could not be
+            started. ``action`` names the step in the error message.
+    """
+    try:
+        result = await git_run_async(args, cwd, timeout=timeout)
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"{action} in {cwd}: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise AttemptCleanupError(
+            f"{action} in {cwd} failed (rc={result.returncode}): {detail}"
+        )
+    return (result.stdout or "").strip()
+
+
+async def _current_branch(cwd: str) -> str | None:
+    """Short name of the branch checked out in ``cwd``; None when detached.
+
+    Raises:
+        AttemptCleanupError: git could not be run in ``cwd``.
+    """
+    try:
+        result = await git_run_async(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"read HEAD in {cwd}: {exc}") from exc
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise AttemptCleanupError(
+            f"read HEAD in {cwd} failed (rc={result.returncode}): "
+            f"{(result.stderr or '').strip()[:300]}"
+        )
+    return (result.stdout or "").strip() or None
+
+
+async def _is_linked_worktree(cwd: str) -> bool:
+    """True when ``cwd`` is a linked worktree rather than the main checkout.
+
+    A linked worktree has its own git dir under the shared common dir.
+    """
+    dirs = await _git_checked(
+        ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+        cwd, timeout=10, action="locate git dirs",
+    )
+    lines = dirs.splitlines()
+    if len(lines) != 2:
+        raise AttemptCleanupError(f"unexpected rev-parse output in {cwd}: {dirs!r}")
+    return Path(lines[0]).resolve() != Path(lines[1]).resolve()
+
+
+async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
+    """Paths of every worktree (main checkout included) on ``branch_name``."""
+    listing = await _git_checked(
+        ["worktree", "list", "--porcelain"], cwd, timeout=10,
+        action="list worktrees",
+    )
+    holders: list[str] = []
+    current_path: str | None = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch_name}" and current_path:
+            holders.append(current_path)
+    return holders
+
+
+async def _reset_task_worktree(
+    worktree_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """Discard a failed attempt inside its own worktree, staying on its branch.
+
+    The worktree never leaves ``branch_name``: checking out the default
+    branch here would let the next attempt commit straight onto it, and the
+    branch cannot be deleted while this worktree holds it (dispatch-02).
+    """
+    current = await _current_branch(worktree_dir)
+    if current != branch_name:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"not {branch_name!r}; refusing to reset it"
+        )
+    if not base_sha:
+        # No recorded base: fall back to the fork point from the operator's
+        # default branch, never the checked-out HEAD or origin/HEAD.
+        try:
+            default_branch = get_trusted_default_branch(worktree_dir)
+        except UntrustedDefaultBranchError as exc:
+            raise AttemptCleanupError(str(exc)) from exc
+        base_sha = await _git_checked(
+            ["merge-base", "HEAD", f"refs/heads/{default_branch}"],
+            worktree_dir, timeout=10,
+            action=f"find the fork point of {branch_name} from {default_branch}",
+        )
+    failed_head = await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action="read the failed attempt's HEAD",
+    )
+    await _git_checked(
+        ["reset", "--hard", base_sha], worktree_dir, timeout=60,
+        action=f"reset {branch_name} to {base_sha[:12]}",
+    )
+    await _git_checked(
+        ["clean", "-fd"], worktree_dir, timeout=60,
+        action=f"clean untracked files from {branch_name}",
+    )
+    after_branch = await _current_branch(worktree_dir)
+    after_head = await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action="read HEAD after the reset",
+    )
+    if after_branch != branch_name or after_head != base_sha:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} ended on {after_branch!r}@{after_head[:12]} "
+            f"after the reset, expected {branch_name!r}@{base_sha[:12]}"
+        )
+    emit(
+        f"  [Autoresearch] Reset worktree branch {branch_name} "
+        f"{failed_head[:12]} -> {base_sha[:12]} (failed attempt recoverable "
+        f"via reflog)"
+    )
+
+
+async def _delete_task_branch_in_main_checkout(
+    project_dir: str,
+    branch_name: str,
+    emit: Callable[[str], None],
+) -> None:
+    """Drop a failed attempt's branch when the agent ran in the main checkout.
+
+    Leaves ``branch_name`` for the operator-trusted default branch only if
+    the main checkout is on it, and refuses to delete the branch while any
+    worktree still holds it.
+    """
+    try:
+        default_branch = get_trusted_default_branch(project_dir)
+    except UntrustedDefaultBranchError as exc:
+        raise AttemptCleanupError(str(exc)) from exc
+    if await _current_branch(project_dir) == branch_name:
+        await _git_checked(
+            ["checkout", default_branch], project_dir, timeout=30,
+            action=f"check out {default_branch} to leave {branch_name}",
+        )
+    try:
+        exists = await git_run_async(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            project_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"look up {branch_name}: {exc}") from exc
+    if exists.returncode != 0:
+        emit(f"  [Autoresearch] Branch {branch_name} does not exist; nothing to delete")
+        return
+    holders = await _worktrees_holding_branch(project_dir, branch_name)
+    if holders:
+        raise AttemptCleanupError(
+            f"{branch_name} is checked out in {', '.join(holders)}; "
+            f"refusing to delete it"
+        )
+    failed_head = (exists.stdout or "").strip()
+    await _git_checked(
+        ["branch", "-D", branch_name], project_dir, timeout=10,
+        action=f"delete {branch_name}",
+    )
+    emit(
+        f"  [Autoresearch] Cleaned up branch {branch_name} (was "
+        f"{failed_head[:12]}, recoverable via reflog)"
+    )
+
+
 async def cleanup_failed_attempt(
     task_id: int,
     project_dir: str,
     reflections: list[str],
     output: list[str] | None = None,
+    *,
+    base_sha: str | None = None,
 ) -> None:
     """Reset a failed task for a fresh autoresearch attempt.
 
-    Performs the 5-step cleanup shared by the parallel/auto dispatch path
-    and the single-task ``--task`` CLI path:
+    Shared by the parallel/auto dispatch path and the single-task ``--task``
+    CLI path. The git step depends on where the agent ran:
 
-    1. Verify ``project_dir`` is a git repo.
-    2. Detect default branch (``main`` then fall back to ``master``).
-    3. Checkout the default branch.
-    4. Force-delete the ``forge-task-<id>`` branch.
-    5. Reset the task's status to ``todo`` and inject any accumulated
-       cross-attempt reflections so the next attempt remembers what was
-       already tried.
+    * ``project_dir`` is the task's isolation worktree: reset it with
+      ``reset --hard <base_sha>`` plus ``clean -fd`` and keep it on
+      ``forge-task-<id>``. The default branch is never checked out there
+      and the branch is never deleted. Without ``base_sha`` the fork point
+      from the trusted default branch is used.
+    * ``project_dir`` is the main checkout: leave ``forge-task-<id>`` for the
+      trusted default branch if it is checked out, then delete it unless a
+      worktree still holds it.
+
+    Every git step is checked. On failure :class:`AttemptCleanupError` is
+    raised BEFORE the task is reset to ``todo``; the task must not be
+    retried on top of a half-finished reset.
+
+    After the git step, the task's status is reset to ``todo`` and any
+    accumulated cross-attempt reflections are injected so the next attempt
+    remembers what was already tried.
 
     Args:
         task_id: Task ID being retried.
-        project_dir: Working directory containing the project's git repo.
+        project_dir: Worktree or main checkout the attempt ran in.
         reflections: Reflection strings from prior failed attempts. Empty
             list is allowed (skips reflection injection).
         output: Optional buffer for ``log()`` calls; if ``None``, prints.
+        base_sha: Commit the task worktree was created on.
+
+    Raises:
+        AttemptCleanupError: a git step failed or the worktree is not on
+            ``forge-task-<id>``.
     """
     branch_name = f"forge-task-{task_id}"
 
+    def emit(message: str) -> None:
+        if output is not None:
+            log(message, output)
+        else:
+            print(message)
+
     if _is_git_repo(project_dir):
-        try:
-            cp = await git_run_async(
-                ["rev-parse", "--verify", "main"], project_dir, timeout=10,
+        if await _is_linked_worktree(project_dir):
+            await _reset_task_worktree(project_dir, branch_name, base_sha, emit)
+        else:
+            await _delete_task_branch_in_main_checkout(
+                project_dir, branch_name, emit,
             )
-            default_branch = "main" if cp.returncode == 0 else "master"
-            await git_run_async(
-                ["checkout", default_branch], project_dir, timeout=30,
-            )
-            await git_run_async(
-                ["branch", "-D", branch_name], project_dir, timeout=10,
-            )
-            msg = f"  [Autoresearch] Cleaned up branch {branch_name}"
-            if output is not None:
-                log(msg, output)
-            else:
-                print(msg)
-        except (subprocess.SubprocessError, OSError) as e:
-            warn = f"  [Autoresearch] Git cleanup warning: {e}"
-            if output is not None:
-                log(warn, output)
-            else:
-                print(warn)
 
     conn = get_db_connection(write=True)
     try:
@@ -385,14 +586,10 @@ async def cleanup_failed_attempt(
     finally:
         conn.close()
 
-    reset_msg = (
+    emit(
         f"  [Autoresearch] Reset task #{task_id} to todo with "
         f"{len(reflections)} attempt reflection(s)"
     )
-    if output is not None:
-        log(reset_msg, output)
-    else:
-        print(reset_msg)
 
 
 # --- DB Scanning & Scoring ---
