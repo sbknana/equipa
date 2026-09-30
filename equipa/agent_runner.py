@@ -185,7 +185,7 @@ from equipa.constants import (
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
-from equipa.env_loader import build_agent_env
+from equipa.env_loader import build_agent_env, protect_orchestrator_process
 from equipa.redact import redact_secrets, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
@@ -1232,6 +1232,15 @@ async def _spawn_agent_process(
     mcp_config = _cmd_option(cmd, "--mcp-config")
     if mcp_config:
         _check_mcp_db_paths(mcp_config)
+    # P2A-05: the scrubbed env below is pointless if the agent can read ours
+    # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
+    # failure refuses the dispatch instead of starting an agent anyway.
+    if (not protect_orchestrator_process()
+            and sys.platform.startswith("linux")):
+        raise AgentDispatchRefused(
+            "cannot make the orchestrator non-dumpable (PR_SET_DUMPABLE); "
+            "an agent could read its environment from /proc"
+        )
     kwargs["env"] = _agent_subprocess_env()
     kwargs["cwd"] = cwd
 

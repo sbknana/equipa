@@ -13,8 +13,10 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -165,6 +167,73 @@ def _passthrough_names(dispatch_config: Mapping[str, Any] | None) -> set[str]:
     return names
 
 
+# --- /proc/<pid>/environ protection (review finding P2A-05) ---
+#
+# Agents run as the orchestrator's UID. For a DUMPABLE process the kernel lets
+# any same-UID process read /proc/<pid>/environ (the environment the process
+# was started with) and /proc/<pid>/mem (everything load_dotenv() put in
+# memory), so the allowlist above would only stop accidental leaks. With
+# PR_SET_DUMPABLE 0 those files belong to root and ptrace attach is refused.
+# execve() resets dumpability, so the agents themselves are unaffected.
+#
+# This is defence in depth for a shared UID. The complete fix is running
+# agents under a separate UID.
+
+# prctl(2) option numbers from <linux/prctl.h>.
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+
+_orchestrator_non_dumpable = False
+
+
+def _prctl(option: int, value: int = 0) -> int:
+    """Call prctl(2) through libc; raises OSError with errno on failure."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(option, ctypes.c_ulong(value), ctypes.c_ulong(0),
+                        ctypes.c_ulong(0), ctypes.c_ulong(0))
+    if result < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    return result
+
+
+def protect_orchestrator_process() -> bool:
+    """Make this process non-dumpable before it starts less-trusted children.
+
+    Idempotent. Linux only: on other platforms it logs at debug level and
+    returns False. On Linux a failure is logged as an error and returns
+    False, so callers that must fail closed can refuse to continue.
+
+    Returns:
+        True when this process is non-dumpable (its /proc/<pid>/environ and
+        /proc/<pid>/mem are unreadable to same-UID processes).
+    """
+    global _orchestrator_non_dumpable
+    if _orchestrator_non_dumpable:
+        return True
+    if not sys.platform.startswith("linux"):
+        logger.debug(
+            "PR_SET_DUMPABLE is Linux-only; /proc environ protection skipped "
+            "on %s", sys.platform,
+        )
+        return False
+    try:
+        _prctl(_PR_SET_DUMPABLE, 0)
+        dumpable = _prctl(_PR_GET_DUMPABLE)
+    except (OSError, AttributeError) as exc:
+        logger.error(
+            "prctl(PR_SET_DUMPABLE, 0) failed: %s; agents could read this "
+            "process's /proc/<pid>/environ", exc,
+        )
+        return False
+    if dumpable != 0:
+        logger.error("process is still dumpable after PR_SET_DUMPABLE 0 "
+                     "(PR_GET_DUMPABLE=%d)", dumpable)
+        return False
+    _orchestrator_non_dumpable = True
+    return True
+
+
 def build_agent_env(
     dispatch_config: Mapping[str, Any] | None = None,
     environ: Mapping[str, str] | None = None,
@@ -177,11 +246,16 @@ def build_agent_env(
     including DATABASE_URL, PG*, ANTHROPIC_API_KEY, GITHUB_TOKEN/GH_TOKEN and
     any *_TOKEN, *_KEY, *SECRET* or *PASSWORD* name.
 
+    Building a scrubbed env means a less-trusted child is about to start, so
+    this also calls :func:`protect_orchestrator_process`: without it the
+    child could read the unscrubbed environment from /proc/<ppid>/environ.
+
     Args:
         dispatch_config: Active dispatch config (for the passthrough list and
             ``agent_allow_api_key``). None means no additions.
         environ: Source environment; defaults to ``os.environ``.
     """
+    protect_orchestrator_process()
     source = os.environ if environ is None else environ
     passthrough = _passthrough_names(dispatch_config)
     env: dict[str, str] = {}
