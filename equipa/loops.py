@@ -1191,8 +1191,9 @@ _SEVERITY_FIELD_RE = re.compile(
 # A list item whose severity sits in a parenthesis or bracket anywhere on
 # the line: "1. SQL injection in login (HIGH)", "- [High] token leak".
 # "(low risk)" is prose, so the severity must close the group.
+# Task 3122: a blockquoted list item ("> - SQLi (HIGH)") is a list item too.
 _LIST_ITEM_SEVERITY_RE = re.compile(
-    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t][^\n]*?[(\[][ \t]{0,8}[*_]{0,2}"
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t][^\n]*?[(\[][ \t]{0,8}[*_]{0,2}"
     r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_]{0,2}[ \t]{0,8}"
     r"[)\],;:]",
     re.MULTILINE | re.IGNORECASE,
@@ -1213,8 +1214,9 @@ _LIST_ITEM_LEADING_SEVERITY_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 # Fix-forward of 3117: a table cell holding a Severity field ("Severity: HIGH").
+# Task 3122: a dash also separates ("Severity - HIGH"); whitespace is bounded.
 _TABLE_SEVERITY_FIELD_CELL_RE = re.compile(
-    r"severity[*_]{0,3}[ \t]*[:=][*_]{0,3}[ \t]*[*_]{0,3}"
+    r"severity[*_]{0,3}[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
     r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
     re.IGNORECASE,
 )
@@ -1226,7 +1228,100 @@ _TABLE_SEVERITY_CELL_RE = re.compile(
     r"[^A-Za-z0-9]{0,8}(?:\([^()\n]{0,60}\)[^A-Za-z0-9]{0,4})?",
     re.IGNORECASE,
 )
-_TABLE_COUNT_CELL_RE = re.compile(r"[^A-Za-z0-9]{0,4}(\d{1,6})[^A-Za-z0-9]{0,4}")
+
+# Task 3122 (follow-ups of the 3117 review): finding shapes the rules above
+# still merged behind an all-zero footer. Like every candidate they never add
+# to the merge counts. A severity word WITHOUT a field label counts only in
+# UPPER case, and in every rule below LOW / INFO count only in UPPER case
+# (PR #40), so "coverage is high", "Risk: low" and "more info" stay prose.
+# Every quantifier is bounded or anchored so each rule stays linear per line.
+#
+# A list item that ENDS with a severity after a separator: "- SQLi in the
+# search endpoint - HIGH", "- **Token leak** — CRITICAL". A LOW/INFO
+# "- Overall risk: LOW" item rates the review and is skipped by
+# _shape_candidate_severities.
+_LIST_ITEM_TRAILING_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}"
+    r"[^\n]*?[^\s|](?:[ \t]{0,4}[:,—–]|[ \t]{1,4}-)[ \t]{1,4}[*_\[(]{0,3}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
+    r"[*_\])]{0,3}[ \t.]{0,4}$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# A Severity field anywhere on a line: "Finding 3: open redirect, severity
+# HIGH, in auth.py", "- SQLi in search. **Severity:** High", "- Missing CSRF
+# token - Severity: Medium". Without a colon the severity must be UPPER case
+# and end the clause, so "no finding reached severity HIGH or above" and
+# "ordered by severity (HIGH first)" are prose.
+_SEVERITY_FIELD_ANYWHERE_RE = re.compile(
+    r"(?<![A-Za-z_-])severity(?:[ \t]{1,8}(?:rating|level))?"
+    r"(?:[ \t]{0,4}\([^()\n]{0,40}\))?[*_]{0,3}[ \t]{0,8}(?:"
+    r"[:=][*_]{0,3}[ \t]{0,8}[*_]{0,3}(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
+    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
+    r"|(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))[*_]{0,3}"
+    r"(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w)))"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Aliases of the Severity field: "Risk: High", "- **Impact:** CRITICAL",
+# "Sev: HIGH". The label must open the line or list item ("Overall risk:
+# LOW" rates the review) and be followed by a separator. "High-value"
+# after "Impact:" is prose, "High-severity" is not.
+_SEVERITY_ALIAS_FIELD_RE = re.compile(
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
+    r"[*_]{0,3}[ \t]{0,8}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?"
+    r"[*_]{0,3}[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
+    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))",
+    re.MULTILINE | re.IGNORECASE,
+)
+# A line that is not a list item and OPENS with an UPPER-case severity and a
+# separator, optionally after a blockquote marker, an emoji or a finding ID:
+# "HIGH: SQL injection", "> CRITICAL - RCE", "🔴 HIGH: ...", "S2 (HIGH):
+# XSS", or that holds only an ID and a severity ("S1: HIGH"). A severity
+# followed by a number ("CRITICAL: 0 | HIGH: 0", the Counts footer) is a
+# tally, not a finding.
+_BARE_LEADING_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?){0,4}"
+    r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?"
+    r"(?:[\[(`]?[A-Za-z]{1,4}-?\d{1,3}[\])`]?[ \t]{0,2}[:—–-]?[ \t]{1,4})?"
+    r"[*_\[(]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
+    r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w)|$)(?![ \t]{0,4}\d)",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Table cells (all matched against one stripped cell): a severity qualified
+# as a risk or impact ("High risk", "**Critical impact**", fullmatch); a
+# cell that opens with an UPPER-case severity and a separator ("HIGH: SQL
+# injection", match); a Severity-field alias opening the cell ("Risk:
+# HIGH", "Sev: High", match). "Low risk" and "High memory use" are prose.
+_TABLE_QUALIFIED_SEVERITY_CELL_RE = re.compile(
+    r"[^A-Za-z0-9]{0,8}(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
+    r"[ \t-]{1,3}(?:risk|impact)[^A-Za-z0-9]{0,8}",
+    re.IGNORECASE,
+)
+_TABLE_LEADING_SEVERITY_CELL_RE = re.compile(
+    r"[^\w\s|]{0,4}[ \t]{0,2}[*_\[(]{0,3}(CRITICAL|HIGH|MEDIUM|LOW|INFO)"
+    r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w))(?![ \t]{0,4}\d)",
+)
+_TABLE_ALIAS_FIELD_CELL_RE = re.compile(
+    r"[*_]{0,3}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}"
+    r"[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))(?![A-Za-z_])",
+    re.IGNORECASE,
+)
+# Inline HTML a Markdown renderer shows as a finding: "<details><summary>
+# <b>HIGH</b> ...</summary>", "<p><b>Severity:</b> High</p>", "<li>HIGH:
+# ...</li>", "<td>HIGH</td>". Lines that carry a tag are rewritten as
+# Markdown (bold tags as "**", table cells as "|", block tags as line
+# breaks, any other tag as a space) and scanned again by
+# _html_candidate_severities; every other line is left to the rules above.
+_HTML_BOLD_TAG_RE = re.compile(r"</?(?:b|strong)\b[^<>\n]{0,200}>", re.IGNORECASE)
+_HTML_CELL_OPEN_TAG_RE = re.compile(r"<t[dh]\b[^<>\n]{0,200}>", re.IGNORECASE)
+_HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:summary|details|li|ul|ol|p|div|tr|table|thead|tbody|dl|dt|dd"
+    r"|blockquote|h[1-6])\b[^<>\n]{0,200}>",
+    re.IGNORECASE,
+)
+_TABLE_COUNT_CELL_RE =re.compile(r"[^A-Za-z0-9]{0,4}(\d{1,6})[^A-Za-z0-9]{0,4}")
 _TABLE_DELIMITER_CELL_RE = re.compile(r"[ \t]*:?-+:?[ \t]*")
 _ALNUM_RE = re.compile(r"[A-Za-z0-9]")
 _OVERALL_RISK_RE = re.compile(r"overall[ \t]+risk", re.IGNORECASE)
@@ -1478,7 +1573,10 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
         severity_cells: dict[int, str] = {}
         for column, cell in enumerate(cells):
             match = (_TABLE_SEVERITY_CELL_RE.fullmatch(cell)
-                     or _TABLE_SEVERITY_FIELD_CELL_RE.search(cell))
+                     or _TABLE_QUALIFIED_SEVERITY_CELL_RE.fullmatch(cell)
+                     or _TABLE_LEADING_SEVERITY_CELL_RE.match(cell)
+                     or _TABLE_SEVERITY_FIELD_CELL_RE.search(cell)
+                     or _TABLE_ALIAS_FIELD_CELL_RE.match(cell))
             if match is not None:
                 severity_cells[column] = match.group(1).upper()
         if not severity_cells:
@@ -1503,11 +1601,20 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
     return severities
 
 
-def _extra_candidate_severities(visible_text: str) -> list[str]:
-    """Severities of Severity-field, list-item and table-row findings."""
+def _matched_severity(match: re.Match[str]) -> str:
+    """The severity a candidate regex captured, whichever group caught it."""
+    return next(group for group in match.groups() if group).upper()
+
+
+def _shape_candidate_severities(visible_text: str) -> list[str]:
+    """Severities of Severity-field, list-item, bare-line and table findings."""
     severities = [
-        match.group(1).upper()
-        for regex in (_SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE)
+        _matched_severity(match)
+        for regex in (
+            _SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE,
+            _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
+            _BARE_LEADING_SEVERITY_RE,
+        )
         for match in regex.finditer(visible_text)
     ]
     for match in _LIST_ITEM_LEADING_SEVERITY_RE.finditer(visible_text):
@@ -1515,8 +1622,52 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
         if _FINDING_CANDIDATE_RE.match(visible_text, line_start):
             continue  # already counted as a bold lead-in candidate
         severities.append(match.group(1).upper())
+    for match in _LIST_ITEM_TRAILING_SEVERITY_RE.finditer(visible_text):
+        severity = match.group(1)
+        if severity in ("LOW", "INFO") and _OVERALL_RISK_RE.search(match.group(0)):
+            continue  # "- Overall risk: LOW" rates the review, not a finding
+        severities.append(severity)
     severities.extend(_table_candidate_severities(visible_text))
     return severities
+
+
+def _html_as_markdown(html_lines: str) -> str:
+    """Rewrite inline HTML as the Markdown a renderer would show (task 3122)."""
+    markdown = _HTML_BOLD_TAG_RE.sub("**", html_lines)
+    markdown = _HTML_CELL_OPEN_TAG_RE.sub("|", markdown)
+    markdown = _HTML_BLOCK_TAG_RE.sub("\n", markdown)
+    return _HTML_TAG_RE.sub(" ", markdown)
+
+
+def _html_candidate_severities(visible_text: str) -> list[str]:
+    """Severities of findings written in inline HTML (task 3122).
+
+    Only lines that carry a tag are rewritten and rescanned, so the document
+    title exemption and every other rule see the text they saw before.
+    Heading lines are left to the heading rules, which already read through
+    inline tags.
+    """
+    html_lines = "\n".join(
+        line for line in visible_text.split("\n") if "<" in line
+    )
+    if not _HTML_TAG_RE.search(html_lines):
+        return []
+    markdown = _html_as_markdown(html_lines)
+    severities = [
+        match.group(1).upper()
+        for match in _FINDING_CANDIDATE_RE.finditer(markdown)
+        if not _candidate_line(match).lstrip(" \t").startswith("#")
+    ]
+    severities.extend(_shape_candidate_severities(markdown))
+    return severities
+
+
+def _extra_candidate_severities(visible_text: str) -> list[str]:
+    """Severities of findings in every non-heading shape, Markdown or HTML."""
+    return (
+        _shape_candidate_severities(visible_text)
+        + _html_candidate_severities(visible_text)
+    )
 
 
 def _analyze_review_file(
