@@ -65,10 +65,10 @@ _FLAG_VALUE = (
 # Names that hold credentials by convention: anything containing SECRET,
 # PASSWORD or PASSWD (PGPASSWORD, DB_PASSWORD, CLIENT_SECRET_ID, ...), PASS
 # as a whole ``_``-separated word (PASS, DB_PASS, SMTP_PASS_1; not BYPASS or
-# COMPASS), and anything ending in _TOKEN or _KEY (GITHUB_TOKEN,
-# ANTHROPIC_API_KEY, ...). Upper-case only: environment variables are
-# upper-case, and matching lower-case identifiers would mangle ordinary code
-# such as ``sort_key=len``.
+# COMPASS), and anything ending in _TOKEN, _KEY or _AUTH (GITHUB_TOKEN,
+# ANTHROPIC_API_KEY, REDISCLI_AUTH, ...). Upper-case only: environment
+# variables are upper-case, and matching lower-case identifiers would mangle
+# ordinary code such as ``sort_key=len``.
 #
 # Linear (IR-05): the keyword is found by a lookahead that scans the name run
 # once, then the run is consumed once. The earlier ``X*KEYWORD X*`` shape
@@ -76,7 +76,7 @@ _FLAG_VALUE = (
 _SECRET_NAME = (
     r"(?:(?=[A-Z0-9_]*?(?:SECRET|PASSWORD|PASSWD|(?<![A-Z0-9])PASS(?![A-Z0-9])))"
     r"[A-Z0-9_]+"
-    r"|[A-Z0-9_]*_(?:TOKEN|KEY)|TOKEN)"
+    r"|[A-Z0-9_]*_(?:TOKEN|KEY|AUTH)|TOKEN)"
 )
 
 # Start of a name: not preceded by an identifier character, or preceded by a
@@ -95,16 +95,19 @@ _SECRET_KEY = (
     r"|access[-_]?key|private[-_]?key))[a-z0-9_.-]+|[a-z0-9_.-]*token)"
 )
 
-# How far a command-scoped flag pattern (``mysql ... -p``) looks from the
-# command word to the flag. Bounded so a text repeating the command word
-# cannot make the search quadratic (IR-05).
-_FLAG_REACH = r"[^\n;&|]{0,1024}?"
+# The rest of one shell command after its command word: up to the next
+# newline, ``;``, ``&`` or ``|``, except inside quotes, which a password may
+# contain. It ends its pattern, so the greedy run never backtracks (RR-01).
+_COMMAND_REST = r"(?:[^\n;&|\"']+|\"[^\"]*\"?|'[^']*'?)*"
 
 # A .pgpass line (``host:port:database:user:password``, IR-06): the port
-# field is a number or ``*``. The password may hold ``\:`` escapes.
+# field is ``*`` or a port number of three to five digits. Postgres never
+# listens below 100, and requiring that keeps ``a:1:b:c:d`` or
+# ``time:12:30:45:x`` intact (RR-06). The password may hold ``\:`` escapes.
 _PGPASS_START = r"(?:(?<![^\s'\"=>])|(?<=\\[nrt]))"
 _PGPASS_LINE = re.compile(
-    rf"{_PGPASS_START}((?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9_.*-]+):(?:\d{{1,5}}|\*)"
+    rf"{_PGPASS_START}((?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9_.*-]+)"
+    r":(?:[1-9]\d{2,4}|\*)"
     r":[^:\s'\"]+:[^:\s'\"]+:)"
     r"(?!\[REDACTED\])((?:\\[^\"\s]|[^\s'\"\\])+)"
 )
@@ -145,6 +148,106 @@ def _redact_pem(match: re.Match[str]) -> str:
     return f"-----BEGIN {match.group(1)}PRIVATE KEY-----{REDACTED}"
 
 
+class _CommandScoped:
+    """Password flags redacted only inside the command that means them.
+
+    ``-p`` is a password to mysql and a port to ssh, so each flag pattern is
+    scoped to its command. A ``command <gap> flag`` regex restarts its gap at
+    every repeat of the command word, so text repeating that word cost
+    O(n x gap): 0.2-0.5 s per pattern on 64 KB with one bounded gap, 51 s
+    with two chained gaps (RR-01). Here one pass finds the command word and
+    consumes the rest of its command (``_COMMAND_REST``); the flag patterns
+    then run once over that rest. Every step is linear in its input.
+
+    Args:
+        command: regex source of the command word (``\\bsshpass``).
+        flags: ``(pattern, replacement)`` pairs substituted in the rest of
+            the command, in order.
+        after: an optional word that must follow the command first (the
+            ``login`` of ``docker login``); flags are only looked for after it.
+        first_only: substitute only the first match of each flag pattern.
+    """
+
+    def __init__(self, command: str,
+                 flags: tuple[tuple[re.Pattern[str], str], ...],
+                 after: re.Pattern[str] | None = None,
+                 first_only: bool = False) -> None:
+        self.pattern = re.compile(rf"({command}\b)({_COMMAND_REST})")
+        self.flags = flags
+        self.after = after
+        self.count = 1 if first_only else 0
+
+    def __call__(self, match: re.Match[str]) -> str:
+        head, rest = match.group(1), match.group(2)
+        start = 0
+        if self.after is not None:
+            found = self.after.search(rest)
+            if found is None:
+                return match.group(0)
+            start = found.end()
+        tail = rest[start:]
+        for pattern, replacement in self.flags:
+            tail = pattern.sub(replacement, tail, count=self.count)
+        return head + rest[:start] + tail
+
+
+def _flag(prefix: str, value: str = _FLAG_VALUE) -> tuple[re.Pattern[str], str]:
+    """A flag pattern for _CommandScoped: ``prefix`` kept, the value redacted.
+
+    The value ends the pattern, so its greedy match never backtracks.
+    """
+    return (re.compile(rf"({prefix})(?!\[REDACTED\])({value})"),
+            r"\1" + REDACTED)
+
+
+# Password flags scoped to the commands that mean them (IR-06, RR-06):
+# mysql -p<value>, sshpass -p, docker / podman / nerdctl login -p, az ... -p,
+# sqlcmd -P, redis-cli -a / --pass, mongo* -p, htpasswd -b, curl -u / -U /
+# -b. Elsewhere these letters mean ports, paths or "all".
+_COMMAND_RULES: tuple[_CommandScoped, ...] = (
+    # mysql -p<value>: attached, bare or quoted. A bare -p prompts and is
+    # left alone.
+    _CommandScoped(r"(?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))",
+                   (_flag(r"\s-p"),)),
+    # sshpass -p <value> / -p<value>. Scoped to sshpass: ssh -p is a port.
+    _CommandScoped(r"\bsshpass", (_flag(r"\s-p\s*"),)),
+    _CommandScoped(r"\b(?:docker|podman|nerdctl)",
+                   (_flag(r"\s-p(?:\s+|=)"),),
+                   after=re.compile(r"\blogin\b")),
+    # az needs a subcommand word before the flag.
+    _CommandScoped(r"\baz(?=\s+[a-z])", (_flag(r"\s-p(?:\s+|=)"),)),
+    _CommandScoped(r"(?i:\bsqlcmd)", (_flag(r"\s-P\s*"),)),
+    _CommandScoped(r"\bredis-cli", (_flag(r"\s(?:-a|--pass)\s+"),)),
+    # mongosh / mongo / mongodump ... -p <value>; a -p followed by another
+    # option prompts.
+    _CommandScoped(r"\bmongo[a-z]*", (_flag(r"\s-p(?:\s+|=)(?![-\[])"),)),
+    # htpasswd -b [other flags] file user PASSWORD: the password is the first
+    # word after the -b flag that ends the command. The value is matched
+    # atomically (lookahead + backreference), so a failed end check never
+    # backtracks into it.
+    _CommandScoped(
+        r"\bhtpasswd",
+        ((re.compile(rf"(\s)(?!\[REDACTED\])(?=({_FLAG_VALUE}))\2"
+                     r"(?=[ \t]*(?:[\n;&|)`\"\\]|$))"),
+          r"\1" + REDACTED),),
+        after=re.compile(r"\s-(?=[A-Za-z]*b)[A-Za-z]+(?=\s)"),
+        first_only=True),
+    # curl -u / --user and -U / --proxy-user user:password (no colon: curl
+    # prompts); -b / --cookie NAME=value (without "=" the value is a cookie
+    # file and is left alone). A quoted cookie string is redacted to its
+    # closing quote, so every cookie in it goes.
+    _CommandScoped(r"\bcurl", (
+        _flag(r"\s(?:-u\s*|--user(?:=|\s+)|-U\s*|--proxy-user(?:=|\s+))"
+              r"(?:\\?[\"'])?[^\s:'\"\\]*:",
+              r"[^\s'\"\\;&|]+"),
+        _flag(r"\s(?:-b\s*|--cookie(?:=|\s+))\\?[\"'][^\s=;'\"\\]+=",
+              r"[^'\"\\\n]+"),
+        _flag(r"\s(?:-b\s*|--cookie(?:=|\s+))[^\s=;'\"\\]+=",
+              r"[^\s'\"\\;&|]+"),
+    )),
+)
+
+
 _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # PEM private keys: header kept, body (to END, or to the end) replaced.
     (_PEM_PRIVATE_KEY, _redact_pem),
@@ -155,8 +258,11 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-" + REDACTED),
     # AWS access key ids.
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
-    # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-...).
-    (re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"), REDACTED),
+    # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-...) and Slack
+    # app-level tokens (xapp-, RR-06).
+    (re.compile(r"\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]{10,}"), REDACTED),
+    # Hugging Face access tokens (RR-06).
+    (re.compile(r"\bhf_[A-Za-z0-9]{30,}"), REDACTED),
     # Google API keys.
     (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), REDACTED),
     # GitLab personal / project / group access tokens.
@@ -172,52 +278,12 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # --password VALUE / --api-key VALUE (the = form is covered below).
     (re.compile(rf"{_KEY_START}(--{_SECRET_KEY}\s+)(?![-\[])({_VALUE})"),
      r"\1" + REDACTED),
-    # mysql -p<value> (attached, bare or quoted; a bare -p prompts and is left
-    # alone). Scoped to the mysql/mariadb clients: -p means something else to
-    # most tools.
-    (re.compile(
-        rf"((?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))\b{_FLAG_REACH}\s-p)"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    # sshpass -p <value> / -p<value>. Scoped to sshpass: ssh -p is a port.
-    (re.compile(
-        rf"(\bsshpass\b{_FLAG_REACH}\s-p\s*)"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    # Password flags scoped to the command that means it (IR-06): docker /
-    # podman / nerdctl login -p, az ... -p, sqlcmd -P, redis-cli -a / --pass.
-    # Elsewhere these letters mean ports, paths or "all".
-    (re.compile(
-        rf"(\b(?:docker|podman|nerdctl)\b{_FLAG_REACH}\blogin\b{_FLAG_REACH}"
-        r"\s-p(?:\s+|=))"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    (re.compile(
-        rf"(\baz\s+[a-z]{_FLAG_REACH}\s-p(?:\s+|=))"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    (re.compile(
-        rf"((?i:\bsqlcmd)\b{_FLAG_REACH}\s-P\s*)"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    (re.compile(
-        rf"(\bredis-cli\b{_FLAG_REACH}\s(?:-a|--pass)\s+)"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
-    # htpasswd -b [other flags] file user PASSWORD: the password is the last
-    # word of the command (IR-06).
-    (re.compile(
-        rf"(\bhtpasswd\b{_FLAG_REACH}\s-[A-Za-z]*b[A-Za-z]*\s{_FLAG_REACH}\s)"
-        rf"(?!\[REDACTED\])({_FLAG_VALUE})"
-        r"(?=[ \t]*(?:[\n;&|)`\"\\]|$))"),
-     r"\1" + REDACTED),
-    # curl -u / --user and -U / --proxy-user user:password (no colon: curl
-    # prompts).
-    (re.compile(
-        rf"(\bcurl\b{_FLAG_REACH}\s"
-        r"(?:-u\s*|--user(?:=|\s+)|-U\s*|--proxy-user(?:=|\s+))"
-        r"(?:\\?[\"'])?[^\s:'\"\\]*:)"
-        r"(?!\[REDACTED\])([^\s'\"\\;&|]+)"),
+    # Password flags scoped to their command (see _COMMAND_RULES).
+    *((rule.pattern, rule) for rule in _COMMAND_RULES),
+    # openssl -pass / -passin / -passout pass:<value> (RR-06). The pass:
+    # prefix names a literal password; env: and file: forms are left alone.
+    (re.compile(r"(\s-pass(?:in|out)?\s+(?:\\?[\"'])?pass:)"
+                rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
      r"\1" + REDACTED),
     # .pgpass lines: host:port:database:user:password.
     (_PGPASS_LINE, r"\1" + REDACTED),
@@ -250,12 +316,13 @@ def redact_secrets(text: str) -> str:
     ``scheme://user:password@`` URLs (passwords containing ``/`` or ``@``
     too); ``Authorization``/``Bearer`` headers; ``sk-...`` API keys, GitHub
     ``ghp_``/``gho_``/``github_pat_`` tokens, AWS ``AKIA`` key ids, JWTs and
-    PEM private-key bodies; also Slack ``xox?-``, Google ``AIza`` and GitLab
-    ``glpat-`` tokens, ``PASS=``/``*_PASS=``, ``docker login -p``,
-    ``htpasswd -b``, ``az -p``, ``sqlcmd -P``, ``redis-cli -a``, curl
-    ``--proxy-user``, ``.pgpass`` lines and ``Cookie``/``Set-Cookie``
-    headers. Idempotent. Non-string input is returned unchanged so a
-    malformed tool payload never breaks logging.
+    PEM private-key bodies; also Slack ``xox?-``/``xapp-``, Hugging Face
+    ``hf_``, Google ``AIza`` and GitLab ``glpat-`` tokens,
+    ``PASS=``/``*_PASS=``/``*_AUTH=``, ``docker login -p``, ``htpasswd -b``,
+    ``az -p``, ``sqlcmd -P``, ``redis-cli -a``, ``mongosh -p``, openssl
+    ``pass:``, curl ``--proxy-user`` and ``-b NAME=value``, ``.pgpass`` lines
+    and ``Cookie``/``Set-Cookie`` headers. Idempotent. Non-string input is
+    returned unchanged so a malformed tool payload never breaks logging.
 
     Text longer than ``MAX_REDACT_INPUT`` is cut to that length (ending in
     ``TRUNCATED_MARKER``) before any pattern runs, so no caller can hand the
