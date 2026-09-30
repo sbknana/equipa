@@ -21,8 +21,8 @@ import json
 import logging
 import os
 import subprocess
-from collections.abc import Callable
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -701,6 +701,37 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
         )
 
 
+async def _require_task_branch(worktree_dir: str, task_branch: str) -> str:
+    """Return HEAD's SHA if ``worktree_dir`` is on ``task_branch``.
+
+    Raises:
+        AttemptCleanupError: the worktree is on another branch, detached, or
+            git could not be run there.
+    """
+    current = await _current_branch(worktree_dir)
+    if current != task_branch:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"expected {task_branch!r}"
+        )
+    return await _git_checked(
+        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
+        action=f"read the HEAD of {task_branch}",
+    )
+
+
+def _audit_task_abort(
+    task_id: int,
+    event: str,
+    detail: object,
+    output: list[str] | None,
+) -> None:
+    """Log a task abort to the operator output and the durable gate audit."""
+    line = f"task={task_id} event={event} detail={detail}"
+    log(f"  [GATE-AUDIT] {line}", output)
+    log_gate_audit(line, task_id, event=event)
+
+
 async def run_dev_test_loop_with_autoresearch(
     task: dict,
     project_dir: str,
@@ -708,6 +739,8 @@ async def run_dev_test_loop_with_autoresearch(
     args,
     config: dict,
     output: list[str] | None = None,
+    *,
+    task_branch: str | None = None,
 ):
     """Run run_dev_test_loop with autoresearch retry on failure.
 
@@ -715,6 +748,15 @@ async def run_dev_test_loop_with_autoresearch(
     run_dispatch (single-task path). run_parallel_tasks did not have this
     wrapper, so any failure in --tasks N,M,O dispatch was final. This
     helper is the canonical retry entry point - both call sites use it.
+
+    ``task_branch`` is set when ``project_dir`` is the task's isolation
+    worktree. Before every attempt the worktree must still be on that
+    branch; otherwise the task is aborted with outcome
+    ``worktree_branch_mismatch`` instead of letting the agent commit
+    elsewhere. The HEAD seen before the first attempt is the base the
+    worktree is reset to between attempts. A failed reset aborts the task
+    with outcome ``attempt_cleanup_failed``. Both outcomes leave the task
+    blocked.
 
     Returns:
         (result, cycles, outcome, loop_total_cost, loop_total_duration, task)
@@ -731,8 +773,20 @@ async def run_dev_test_loop_with_autoresearch(
     attempt_reflections: list[str] = []
     loop_total_cost = 0.0
     loop_total_duration = 0.0
+    base_sha: str | None = None
+    result: dict = {"cost": 0.0, "duration": 0.0}
+    cycles = 0
 
     while True:
+        if task_branch is not None:
+            try:
+                head_sha = await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(task_id, "worktree-branch-mismatch", exc, output)
+                outcome = "worktree_branch_mismatch"
+                break
+            if base_sha is None:
+                base_sha = head_sha
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args, output=output,
@@ -801,9 +855,15 @@ async def run_dev_test_loop_with_autoresearch(
         )
 
         # Clean up failed git branch and reset task for next attempt.
-        await cleanup_failed_attempt(
-            task_id, project_dir, attempt_reflections, output,
-        )
+        try:
+            await cleanup_failed_attempt(
+                task_id, project_dir, attempt_reflections, output,
+                base_sha=base_sha,
+            )
+        except AttemptCleanupError as exc:
+            _audit_task_abort(task_id, "attempt-cleanup-failed", exc, output)
+            outcome = "attempt_cleanup_failed"
+            break
 
         # Re-fetch task to get clean state (with injected reflections)
         refreshed = fetch_task(task_id)
