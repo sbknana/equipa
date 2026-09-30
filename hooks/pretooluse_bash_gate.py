@@ -19,12 +19,18 @@ Contract (Claude Code PreToolUse hook, exit-code form)
 
 * Exit 0  -> allow the tool call.
 * Exit 2  -> block the tool call; stderr is fed back to the agent so it can
-             see WHY and self-correct. Used only for genuinely unsafe commands.
-* Any other tool (``tool_name != "Bash"``), an empty command, unparseable
-  stdin, or a failure to load the checker -> exit 0 (fail-OPEN). A hook
-  infrastructure error must never brick the agent on every command; the
-  reactive stream check in agent_runner remains as defense-in-depth. Only a
-  command that the checker positively flags as unsafe is blocked.
+             see WHY and self-correct.
+* Another tool (``tool_name`` is a string other than ``"Bash"``) or an empty
+  command -> exit 0: there is nothing for this gate to judge.
+* The gate FAILS CLOSED (exit 2, reason on stderr) on everything else:
+  unparseable stdin, a Bash payload without a string ``command``, a checker
+  that cannot be loaded (ImportError, SyntaxError, ...), an exception raised
+  inside ``check_bash_command``, or a result without a boolean ``safe``.
+  Claude Code treats any exit code other than 2 (including the exit 1 an
+  uncaught exception produces) as a non-blocking error and runs the command,
+  so every failure is mapped to exit 2 explicitly. Do NOT assume another
+  layer catches what this gate lets through: the reactive stream check does
+  not run for every role (non-streaming roles are never checked by it).
 
 Import resolution
 -----------------
@@ -113,66 +119,108 @@ def _load_check_bash_command() -> Callable[[str], Any]:
     return check_bash_command
 
 
+class PayloadError(ValueError):
+    """The hook payload cannot be interpreted; the gate must block."""
+
+
+def _block(reason: str) -> int:
+    """Print *reason* for the agent (stderr) and return the block exit code.
+
+    A broken stderr must not turn the block into an exception (exit 1).
+    """
+    try:
+        print(
+            f"pretooluse_bash_gate: {reason} - command blocked (the gate "
+            "fails closed).",
+            file=sys.stderr,
+        )
+    except (OSError, ValueError):
+        pass
+    return EXIT_BLOCK
+
+
 def _read_tool_input() -> dict[str, Any]:
     """Parse the PreToolUse payload from stdin.
 
-    Returns the decoded object (expected to be a dict). Returns an empty dict
-    on any read/parse error so the caller can fail-open.
+    Raises:
+        PayloadError: stdin is unreadable, empty, not JSON, or not an object.
     """
     try:
         raw = sys.stdin.read()
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as exc:
+        raise PayloadError(f"could not read hook stdin ({exc})") from exc
     if not raw or not raw.strip():
-        return {}
+        raise PayloadError("empty hook payload on stdin")
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except ValueError as exc:
+        raise PayloadError(f"hook payload is not valid JSON ({exc})") from exc
+    if not isinstance(payload, dict):
+        raise PayloadError(
+            f"hook payload is a JSON {type(payload).__name__}, not an object"
+        )
+    return payload
 
 
 def _extract_bash_command(payload: dict[str, Any]) -> str | None:
-    """Return the Bash command to check, or None if this call is not our gate.
+    """Return the Bash command to check, or None when there is nothing to judge.
 
-    None means "not a Bash tool call, or no command present" — the caller
-    treats that as allow (this hook only guards the Bash tool).
+    None means "a different tool" or "an empty command" - both are allowed.
+
+    Raises:
+        PayloadError: the payload claims to be (or might be) a Bash call but
+            its shape is wrong, so the command cannot be judged.
     """
-    if payload.get("tool_name") != "Bash":
+    tool_name = payload.get("tool_name")
+    if not isinstance(tool_name, str):
+        raise PayloadError("hook payload has no string tool_name")
+    if tool_name != "Bash":
         return None
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
-        return None
+        raise PayloadError("Bash payload has no tool_input object")
     command = tool_input.get("command")
-    if not isinstance(command, str) or not command.strip():
+    if not isinstance(command, str):
+        raise PayloadError("Bash payload has no string command")
+    if not command.strip():
         return None
     return command
 
 
 def main() -> int:
     """Run the gate. Returns the process exit code (0 allow / 2 block)."""
-    payload = _read_tool_input()
-    command = _extract_bash_command(payload)
+    try:
+        command = _extract_bash_command(_read_tool_input())
+    except PayloadError as exc:
+        return _block(str(exc))
     if command is None:
-        # Not a Bash tool call (or nothing to check) — allow.
         return EXIT_ALLOW
 
     try:
         check_bash_command = _load_check_bash_command()
-    except (ImportError, OSError, AttributeError) as exc:
-        # Infrastructure failure loading the checker. Fail OPEN so the agent
-        # is not wedged on every command; the reactive stream check in
-        # agent_runner still provides detect-and-terminate coverage.
-        print(
-            f"pretooluse_bash_gate: could not load checker ({exc}); allowing "
-            "command (reactive stream check remains active)",
-            file=sys.stderr,
+    except BaseException as exc:  # noqa: BLE001 - fail closed on ANY load error
+        # ImportError, SyntaxError from a bad deploy, OSError, even SystemExit
+        # raised at import: without a checker nothing can be judged.
+        return _block(
+            f"could not load the bash security checker "
+            f"({type(exc).__name__}: {exc})"
         )
-        return EXIT_ALLOW
 
-    result = check_bash_command(command)
-    if getattr(result, "safe", True):
+    try:
+        result = check_bash_command(command)
+    except BaseException as exc:  # noqa: BLE001 - fail closed on ANY error
+        return _block(
+            f"the bash security checker raised {type(exc).__name__}: {exc}"
+        )
+
+    safe = getattr(result, "safe", None)
+    if safe is True:
         return EXIT_ALLOW
+    if safe is not False:
+        return _block(
+            f"the bash security checker returned an unusable result "
+            f"({type(result).__name__} without a boolean 'safe')"
+        )
 
     check_id = getattr(result, "check_id", 0)
     message = getattr(result, "message", "unsafe command")
@@ -185,5 +233,13 @@ def main() -> int:
     return EXIT_BLOCK
 
 
+def _run() -> int:
+    """Entry point: map ANY escape from main() to a block, never exit 1."""
+    try:
+        return main()
+    except BaseException as exc:  # noqa: BLE001 - exit 1 would allow the call
+        return _block(f"internal gate error ({type(exc).__name__}: {exc})")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())
