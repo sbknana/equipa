@@ -607,6 +607,24 @@ def test_verify_script_passes_a_closed_db_directory(
                 and line.startswith("FAIL")]
 
 
+@pytest.mark.parametrize("item, markers", [
+    ("DB/backup directory closed", ["--deny-dir)", '[ -r "$directory" ] || [ -x "$directory" ]']),
+    ("readable copies searched as the agent", ["-readable -print", "*.db[-._]*"]),
+    ("every copy probed by name", ["--db-copy)", "agent can read the database copy"]),
+    ("project secrets", ["--secret-root)", "-name '.env'", "credentials*.json"]),
+    ("orchestrator HOME not enterable", ['[ -x "$orchestrator_home" ]']),
+    ("per-unit HOME", ["*/.equipa-agent/equipa-agent-*/home)", "CLAUDE_CONFIG_DIR"]),
+    ("passwd HOME read-only", ['getent passwd "$user"', "can write its passwd HOME"]),
+    ("unit git config", ["*/.equipa-agent/equipa-agent-*/gitconfig)"]),
+])
+def test_verify_script_contains_each_3136_check(item: str,
+                                                markers: list[str]) -> None:
+    assert VERIFY_SCRIPT.is_file() and os.access(VERIFY_SCRIPT, os.X_OK)
+    text = VERIFY_SCRIPT.read_text()
+    for marker in markers:
+        assert marker in text, f"{item}: {marker!r} missing"
+
+
 # --- ISO-05: secret files below the project roots ---------------------------------------
 
 
