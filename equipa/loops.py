@@ -433,8 +433,8 @@ async def run_security_review(
         # does not trip those checks.
         # gate-06 / gate-13: table rows, Severity fields, setext and HTML
         # headings, "(HIGH)" list items and "High-severity" are counted as
-        # findings too, so the old advice to put fixed upstream findings
-        # "in prose or a table" would now block every such review.
+        # findings too (_extra_candidate_severities), so fixed upstream
+        # findings are referred to by ID only, never with a severity word.
         f"Give EVERY finding its own heading formatted as "
         f"`### [TAG-NN] SEVERITY — title`, using `#` headings only (no "
         f"`===`/`---` underlined or HTML headings). Do NOT put the words "
@@ -451,7 +451,8 @@ async def run_security_review(
         f"severity. The orchestrator counts BOTH the footer and the "
         f"finding headings: if they disagree the merge is BLOCKED. Update "
         f"the footer last, after every finding is written; nothing may "
-        f"follow it. Replace every template placeholder such as "
+        f"follow it except the COMPLETION line described below. Replace "
+        f"every template placeholder such as "
         f"[SEVERITY] or [PASS/FAIL]. A review whose Summary still says "
         f"IN PROGRESS, skeleton or TODO is treated as unfinished and also "
         f"BLOCKS the merge. A review with no findings must say so in its "
