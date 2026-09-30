@@ -54,7 +54,10 @@ def assert_blocks_behind_zero_footer(body: list[str],
     analysis = analyze(review("No findings.", body, ZERO, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         body, analysis.detail)
-    assert f"{severity}=" in analysis.detail, (body, analysis.detail)
+    # Either a candidate rule saw the severity, or a strict finding heading
+    # counted it and the zero footer disagrees.
+    assert (f"{severity}=" in analysis.detail
+            or analysis.header_counts[severity] > 0), (body, analysis.detail)
 
 
 def assert_prose_merges(body: list[str]) -> None:
@@ -376,8 +379,10 @@ def _prompt_format_rule() -> str:
 def test_prompt_tells_reviewers_to_write_upper_case_without_an_escape_hint():
     rule = _prompt_format_rule()
     assert "other cases in most" not in rule
+    assert "other cases" not in rule
     assert "Always write every severity word in UPPER case" in rule
-    assert "in any case" in rule
+    # The instruction comes before the list of places, not as a caveat on it.
+    assert rule.index("UPPER case") < rule.index("in: any other heading")
 
 
 def test_prompt_keeps_every_other_format_obligation():
