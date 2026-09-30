@@ -206,6 +206,15 @@ def test_standalone_marker_comments_still_parse_once(monkeypatch):
     # A backtick inside an inline tag or autolink opens no code span.
     ['See <a href="x`y">the report</a> - severity: HIGH `z'],
     ["See <https://example.test/a`b> - severity: HIGH `c"],
+    # A comment that opens mid-line cannot reach into the next list item or
+    # across a blank line, so it hides nothing the renderer shows.
+    ["- a <!--", "- SQL injection `` ` `` severity: HIGH `x`", "- -->"],
+    ["text <!-- x", "", "SQL injection `` ` `` severity: HIGH `x`", "", "-->"],
+    # An indented "<!--" is code, not a comment block.
+    ["", "        <!--", "", "SQL injection `` ` `` severity: HIGH `x`", "",
+     "-->"],
+    # A comment joins a word across the lines of one quoted paragraph.
+    ["> SQL injection in login", "> HI<!--", "> -->GH: token leak"],
 ])
 def test_markdown_the_renderer_shows_as_text_fails_closed(body):
     severity = "CRITICAL" if any("CRITICAL" in line for line in body) else "HIGH"

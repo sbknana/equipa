@@ -2119,9 +2119,12 @@ class _RenderedBlocks:
     lines: list[str]
     # Opener line -> closer line of every fenced block that is closed.
     fences: dict[int, int] = field(default_factory=dict)
-    # Lines that open a block: a code span never runs into one of them.
+    # Lines that open a block: a code span or an inline comment never runs
+    # into one of them.
     breaks: set[int] = field(default_factory=set)
     table_rows: set[int] = field(default_factory=set)
+    # Lines that open an HTML comment block (it may run across blank lines).
+    comment_openers: set[int] = field(default_factory=set)
 
 
 def _closes_fence(stripped: str, fence: str) -> bool:
@@ -2176,7 +2179,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
     item_columns: list[int] = []  # content column of each open list item
     fence = ""  # the run that opened the open fence
     fence_start = fence_column = 0
-    in_paragraph = in_html_block = in_table = False
+    in_paragraph = in_html_block = in_table = quoted_paragraph = False
     comment_end = 0  # offset where the open HTML comment block ends
     no_comment_end_from = len(text) + 1  # no "-->" at or after this offset
     next_line_start = 0
@@ -2188,7 +2191,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             continue  # inside an HTML comment block
         stripped = line.lstrip(" \t")
         if not stripped:
-            in_paragraph = in_html_block = in_table = False
+            in_paragraph = in_html_block = in_table = quoted_paragraph = False
             continue
         indent = len(line) - len(stripped)
         if indent and "\t" in line[:indent]:
@@ -2217,6 +2220,12 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             blocks.breaks.add(index)
             continue
         in_table = False
+        if quoted_paragraph and stripped[0] == ">":
+            quoted_text = stripped.lstrip("> \t")
+            if quoted_text and not _BLOCK_START_RE.match(quoted_text):
+                # The quoted paragraph above goes on: "> HI<!--" / "> -->GH".
+                lines[index] = _innermost_container_line(line)
+                continue
         if in_paragraph and not opens_block and not (
             stripped[0] in "=-" and _SETEXT_UNDERLINE_RE.fullmatch(line)
         ):
@@ -2226,7 +2235,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             item_columns.pop()
         base = item_columns[-1] if item_columns else 0
         relative = indent - base
-        in_paragraph = False
+        in_paragraph = quoted_paragraph = False
         if relative >= 4:
             if "`" in line:
                 lines[index] = _neutralize_backticks(line)  # indented code
@@ -2240,6 +2249,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                     no_comment_end_from = opener + 4
             if end != -1:
                 comment_end = end
+                blocks.comment_openers.add(index)
                 closing = index + text.count("\n", opener, end)
                 # The rest of the closing line is HTML, not Markdown.
                 lines[closing] = _neutralize_backticks(lines[closing])
@@ -2288,6 +2298,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                 _THEMATIC_BREAK_RE.fullmatch(content)
                 or _SETEXT_UNDERLINE_RE.fullmatch(content)))
         )
+        quoted_paragraph = quoted and in_paragraph
         if base or footnote is not None:
             lines[index] = " " * relative + (
                 _innermost_container_line(content) if markers > 1 else content
@@ -2338,8 +2349,9 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
     * an HTML comment is removed with no replacement, so the word it split is
       joined ("HI<!-- x -->GH" reads HIGH), and its line breaks are carried
       to the end of the line it closed on, so every later line keeps its
-      number. A comment that opens a line may run across blank lines (an
-      HTML block); any other must close inside its run of non-blank lines.
+      number. A comment block (one that opens a line, see _rendered_blocks)
+      may run across blank lines; any other must close inside its block, as
+      a code span must ("- a <!--" does not hide the next list item).
       "<!-->" and "<!--->" are empty. An unclosed comment stays, visible.
 
     Every backtick left is shown as text, and so is a tilde fence line, so
@@ -2359,23 +2371,19 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
     for line in lines:
         line_starts.append(offset)
         offset += len(line) + 1
-    # Per line: where its code-span block ends, and where its run of
-    # non-blank lines ends (the reach of a comment that opens mid-line).
+    # Per line: where its block ends. A code span or a comment that opens
+    # mid-line must close before it.
     span_limits = [0] * len(lines)
-    comment_limits = [0] * len(lines)
     blank = [not line.strip() for line in lines] + [True]
-    span_end = run_end = 0
+    span_end = 0
     for index in range(len(lines) - 1, -1, -1):
         if blank[index]:
             continue
-        line_end = line_starts[index] + len(lines[index])
         following = index + 1
-        if blank[following]:
-            span_end = run_end = line_end
-        elif following in blocks.breaks or index in blocks.table_rows:
-            span_end = line_end
+        if (blank[following] or following in blocks.breaks
+                or index in blocks.table_rows):
+            span_end = line_starts[index] + len(lines[index])
         span_limits[index] = span_end
-        comment_limits[index] = run_end
 
     closers_by_length: dict[int, deque[int]] = {}
     for run in _BACKTICK_RUN_RE.finditer(text):
@@ -2404,11 +2412,9 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
                 line, _unescaped_pipes(text, line_start, line_end),
             )
             next_pipe = bisect.bisect_right(pipes, start)
-            span_limit = comment_limit = (
-                pipes[next_pipe] if next_pipe < len(pipes) else line_end
-            )
+            span_limit = pipes[next_pipe] if next_pipe < len(pipes) else line_end
         else:
-            span_limit, comment_limit = span_limits[line], comment_limits[line]
+            span_limit = span_limits[line]
         escaped = (start > line_start and text[start - 1] == "\\"
                    and _is_escaped(text, start, line_start))
         if token.group(0)[0] == "<" and token.group(0) != "<!--":
@@ -2418,7 +2424,8 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
             position = token.end()
             continue
         if token.group(0) == "<!--":
-            if not escaped and line not in blocks.table_rows and not (
+            comment_limit = span_limit
+            if line in blocks.comment_openers and not (
                 text[line_start:start].strip(" \t")
             ):
                 comment_limit = len(text)  # an HTML comment block
