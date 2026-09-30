@@ -1,20 +1,23 @@
 {
   "_comment": "EQUIPA MCP server hardening (task 2452): privileged tool calls (equipa_dispatch, equipa_task_create) require EQUIPA_MCP_TOKEN. EQUIPA_MCP_COST_CAP_USD bounds 24h dispatch spend. EQUIPA_MCP_PROJECT_IDS optionally restricts task_create targets to a comma-separated allowlist.",
+  "_comment_paths": "Agents run in the project directory and MCP servers inherit it (tasks 3120/3127). Every command, script, cwd, PYTHONPATH entry and --db-path must therefore be ABSOLUTE, and python -m needs -I or -P plus an absolute cwd; anything else refuses the dispatch. The Claude CLI currently ignores a per-server cwd and starts every server in the project directory, so -P (never put the cwd on sys.path) with an absolute PYTHONPATH is what makes -m load the trusted checkout; cwd is still required for CLIs that honour it. Replace every /path/to placeholder.",
   "mcpServers": {
     "theforge": {
       "type": "stdio",
-      "command": "REPLACE_WITH_UVX_PATH",
+      "command": "/path/to/uvx",
       "args": [
         "mcp-server-sqlite",
         "--db-path",
-        "theforge.db"
+        "/path/to/theforge.db"
       ]
     },
     "equipa": {
       "type": "stdio",
-      "command": "python3",
-      "args": ["-m", "equipa.mcp_server"],
+      "command": "/usr/bin/python3",
+      "args": ["-P", "-m", "equipa.mcp_server"],
+      "cwd": "/path/to/equipa-checkout",
       "env": {
+        "PYTHONPATH": "/path/to/equipa-checkout",
         "EQUIPA_MCP_TOKEN": "REPLACE_WITH_LONG_RANDOM_TOKEN",
         "EQUIPA_MCP_COST_CAP_USD": "50.0",
         "EQUIPA_MCP_PROJECT_IDS": ""

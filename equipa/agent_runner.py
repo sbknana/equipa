@@ -169,7 +169,7 @@ class AgentResult(_AgentResultRequired, total=False):
 
 from equipa import agent_launcher
 from equipa.abort_controller import AbortController, create_child_abort_controller
-from equipa.bash_security import check_bash_command
+from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
     get_configured_model,
     get_persistent_retry_max_attempts,
@@ -185,6 +185,8 @@ from equipa.constants import (
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
+from equipa.env_loader import active_agent_env, protect_orchestrator_process
+from equipa.redact import redact_secrets, redact_tool_input, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
     save_soft_checkpoint,
@@ -550,11 +552,14 @@ def _gate_fingerprint() -> str | None:
     return h.hexdigest()
 
 
-def _gate_canary_ok(hook_command: str) -> bool:
+def _gate_canary_ok(hook_command: str, cwd: str | None = None) -> bool:
     """Run the hook on a command it must refuse; True only on a correct refusal.
 
     If the gate cannot load, crashes or allows the canary, it would also fail
     open for real commands, so the reactive check must keep killing on sight.
+    The canary runs with the agent's allowlisted environment and working
+    directory, the conditions the CLI runs the real hook under, so a pass
+    means the hook is active for THIS run (sandbox-04).
     """
     payload = json.dumps({
         "tool_name": "Bash",
@@ -564,11 +569,254 @@ def _gate_canary_ok(hook_command: str) -> bool:
     try:
         proc = subprocess.run(
             shlex.split(hook_command), input=payload, capture_output=True,
-            text=True, timeout=30,
+            text=True, timeout=30, env=_agent_subprocess_env(), cwd=cwd,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
     return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
+
+
+# One persistent checker process per orchestrator (P2A-01). Tests replace it
+# with a ReactiveBashChecker that loads a fake checker file.
+_REACTIVE_CHECKER = ReactiveBashChecker()
+
+
+async def _reactive_bash_check(bash_cmd: str) -> Any | None:
+    """``check_bash_command`` in a separate process; None when it failed.
+
+    The check is regex-bound and ``re`` holds the GIL, so a worker thread
+    would still freeze the event loop that monitors every parallel agent
+    (sandbox-07 iii, P2A-01). It runs in a persistent worker process with a
+    ``_SLOW_CHECK_SECONDS`` deadline instead; a missed deadline kills and
+    recycles the worker. Past the deadline the hook (same check, same input)
+    may itself have timed out and let the command run, so the caller treats
+    None (timeout, crash or malformed verdict) as a block.
+    """
+    return await _REACTIVE_CHECKER.check(bash_cmd, _SLOW_CHECK_SECONDS)
+
+
+class AgentDispatchRefused(RuntimeError):
+    """The agent must not be started; the message says why and how to fix it."""
+
+
+def _cmd_option(cmd: list[str], flag: str) -> str | None:
+    """Value following the FIRST ``flag`` in ``cmd``, or None."""
+    try:
+        return cmd[cmd.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _check_mcp_servers(mcp_config: str | os.PathLike[str]) -> None:
+    """Refuse an MCP config whose servers would resolve inside the project.
+
+    The agent CLI runs in the project directory (sandbox-11), and the stdio
+    MCP servers it starts inherit that cwd. Anything a server resolves
+    relative to its cwd is therefore agent-writable: a relative
+    ``--db-path`` silently opens a different database, and a relative
+    command, a relative script or ``python -m`` (which puts the cwd first on
+    ``sys.path``) runs agent-planted code holding the server's credentials,
+    such as the EQUIPA_MCP_TOKEN (P2A-02). Fail closed rather than guess. A
+    missing config is left to the CLI, which reports it itself.
+
+    Raises:
+        AgentDispatchRefused: a cwd-relative server, or an unreadable config.
+    """
+    path = Path(mcp_config)
+    if not path.is_file():
+        return
+    try:
+        servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
+        entries = list(servers.items())
+    except (OSError, ValueError, AttributeError) as exc:
+        raise AgentDispatchRefused(
+            f"cannot read MCP config {path} to verify its servers: {exc}"
+        ) from exc
+    for name, server in entries:
+        if not isinstance(server, dict):
+            continue
+        _check_mcp_db_path(name, server, path)
+        _check_mcp_launch(name, server, path)
+
+
+# Interpreters whose first non-option argument is a script path.
+_MCP_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# JavaScript package runners and package managers. Started in the project
+# they resolve code from it: npx runs <cwd>/node_modules/.bin/<name> when the
+# project provides one, and .npmrc, .yarnrc.yml (yarnPath) and bunfig.toml
+# (preload) in the cwd are read as configuration.
+_MCP_PACKAGE_RUNNERS = frozenset({"npx", "pnpx", "bunx", "npm", "pnpm",
+                                  "yarn", "bun"})
+# Python options that take a value (from ``python --help``).
+_PYTHON_VALUE_OPTIONS = frozenset("cmWX")
+_PYTHON_LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs"})
+# Suffixes that make a relative argument a script or module file.
+_SCRIPT_SUFFIXES = (".py", ".pyc", ".pyz", ".js", ".mjs", ".cjs", ".ts", ".mts",
+                    ".sh", ".bash", ".rb", ".pl", ".php", ".jar")
+
+
+def _is_python_command(command: str) -> bool:
+    """True for python, python3, python3.12, pypy3 and the like."""
+    name = os.path.basename(command).lower().removesuffix(".exe")
+    for prefix in ("python", "pypy"):
+        if name.startswith(prefix):
+            return all(char.isdigit() or char == "."
+                       for char in name[len(prefix):])
+    return False
+
+
+def _python_invocation(args: list[str]) -> tuple[str, str | None, set[str]]:
+    """How ``python <args>`` picks its code: (mode, target, single-letter flags).
+
+    mode is "module" (-m), "code" (-c), "stdin" (no script, or ``-``) or
+    "script". Clustered short options (``-IBm mod``) are honoured.
+    """
+    flags: set[str] = set()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "-":
+            return "stdin", None, flags
+        if arg == "--":
+            return ("script", following, flags) if following else ("stdin", None, flags)
+        if arg.startswith("--"):
+            index += 2 if arg in _PYTHON_LONG_VALUE_OPTIONS else 1
+            continue
+        if not arg.startswith("-"):
+            return "script", arg, flags
+        cluster = arg[1:]
+        for position, letter in enumerate(cluster):
+            if letter not in _PYTHON_VALUE_OPTIONS:
+                flags.add(letter)
+                continue
+            attached = cluster[position + 1:]
+            value = attached or following
+            if letter == "m":
+                return "module", value, flags
+            if letter == "c":
+                return "code", value, flags
+            if not attached:
+                index += 1  # -W / -X consumed the next argument
+            break
+        index += 1
+    return "stdin", None, flags
+
+
+def _looks_like_relative_path(arg: str) -> bool:
+    if os.path.isabs(arg) or arg.startswith("-"):
+        return False
+    return (arg.startswith(("./", "../", "~")) or arg in (".", "..")
+            or arg.lower().endswith(_SCRIPT_SUFFIXES))
+
+
+def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
+    """Refuse a stdio server that would load code relative to its cwd."""
+    if server.get("type") in ("http", "sse") or (
+            "url" in server and "command" not in server):
+        return  # remote server: nothing is started in the project directory
+
+    def refuse(problem: str, fix: str) -> AgentDispatchRefused:
+        return AgentDispatchRefused(
+            f"MCP server {name!r} in {config_path} {problem}. Agents run in "
+            f"the project directory and MCP servers inherit it, so this "
+            f"would run agent-writable code. {fix}"
+        )
+
+    command = server.get("command")
+    args = server.get("args", [])
+    cwd = server.get("cwd")
+    if not isinstance(command, str) or not os.path.isabs(command):
+        raise refuse(f"has a relative command {command!r}",
+                     "Use an absolute path to the executable.")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise refuse("has non-string args", "Use a list of strings.")
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise refuse(f"has a relative cwd {cwd!r}", "Use an absolute cwd.")
+    basename = os.path.basename(command)
+    if basename == "env":
+        raise refuse("is started through env(1), which resolves its target "
+                     "through PATH", 'Use an absolute command and the "env" key.')
+    runner = basename.lower().removesuffix(".exe").removesuffix(".cmd")
+    if runner in _MCP_PACKAGE_RUNNERS:
+        raise refuse(
+            f"is started through the package runner {basename!r}, which "
+            f"resolves the package and its configuration in the project "
+            f"first (node_modules/.bin, .npmrc, .yarnrc.yml, bunfig.toml)",
+            "Install the server outside the project and run its entry script "
+            "by absolute path with an absolute node.")
+    if _is_python_command(command):
+        _check_python_launch(server, args, cwd, refuse)
+    elif basename in _MCP_SHELLS:
+        options = [a for a in args if a.startswith("-")]
+        if any("c" in option.lstrip("-") for option in options
+               if not option.startswith("--")):
+            raise refuse("runs an inline shell command (-c), which cannot be "
+                         "verified", "Point the shell at an absolute script.")
+        script = next((a for a in args if not a.startswith("-")), None)
+        if script is not None and not os.path.isabs(script):
+            raise refuse(f"runs the relative script {script!r}",
+                         "Use an absolute script path.")
+    for arg in args:
+        if _looks_like_relative_path(arg):
+            raise refuse(f"has the relative path argument {arg!r}",
+                         "Use an absolute path.")
+
+
+def _check_python_launch(server: dict, args: list[str], cwd: str | None,
+                         refuse: Any) -> None:
+    mode, target, flags = _python_invocation(args)
+    if mode == "script":
+        if not target or not os.path.isabs(target):
+            raise refuse(f"runs the relative Python script {target!r}",
+                         "Use an absolute script path.")
+    elif not (flags & {"I", "P"}) or cwd is None:
+        shown = {"module": f"-m {target}", "code": "-c ...",
+                 "stdin": "(stdin)"}[mode]
+        raise refuse(
+            f"runs python {shown} without both an isolation flag (-I or -P) "
+            f"and an absolute \"cwd\"; Python would put the project directory "
+            f"first on sys.path",
+            'Add "-I" or "-P" before -m and an absolute "cwd" (with PYTHONPATH '
+            'in "env" pointing at the trusted checkout if needed), or run an '
+            "absolute script path.",
+        )
+    env = server.get("env")
+    pythonpath = env.get("PYTHONPATH") if isinstance(env, dict) else None
+    if pythonpath is not None:
+        entries = str(pythonpath).split(os.pathsep)
+        if not all(entry and os.path.isabs(entry) for entry in entries):
+            raise refuse(f"has a relative PYTHONPATH entry in {pythonpath!r}",
+                         "Use absolute PYTHONPATH entries only.")
+
+
+def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
+    """Refuse a relative ``--db-path`` (sandbox-11)."""
+    args = server.get("args")
+    if isinstance(args, list):
+        for index, arg in enumerate(args):
+            if arg == "--db-path":
+                db_path = args[index + 1] if index + 1 < len(args) else ""
+            elif isinstance(arg, str) and arg.startswith("--db-path="):
+                db_path = arg.split("=", 1)[1]
+            else:
+                continue
+            if not isinstance(db_path, str) or not os.path.isabs(db_path):
+                raise AgentDispatchRefused(
+                    f"MCP server {name!r} in {path} has a relative --db-path "
+                    f"{db_path!r}. Agents run in the project directory, so it "
+                    f"would open a different database. Set an absolute "
+                    f"--db-path in the MCP config."
+                )
+
+
+def _agent_subprocess_env() -> dict[str, str]:
+    """Allowlisted environment for an agent CLI (loop-03 / sandbox-03).
+
+    The passthrough list comes from the active dispatch config. If that
+    cannot be loaded, no names are added: fewer variables, never more.
+    """
+    return active_agent_env()
 
 
 @contextlib.contextmanager
@@ -614,6 +862,8 @@ def build_cli_command(
         f"Execute the task described in your system prompt. Work in: {project_dir}"
     )
     claude_bin = shutil.which("claude") or "claude"
+    # sandbox-11: checked before any tempfile exists, so a refusal leaks none.
+    _check_mcp_servers(MCP_CONFIG)
 
     # Write system prompt to a temp file to avoid Windows command-line length
     # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
@@ -1115,15 +1365,39 @@ def _track_live_agent(agent: _ContainedAgent) -> None:
 
 
 async def _spawn_agent_process(
-    cmd: list[str], **kwargs: Any,
+    cmd: list[str], project_dir: str | None = None, **kwargs: Any,
 ) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
     """Start the agent CLI with piped stdout/stderr, contained where possible.
 
+    The CLI (and the launcher in front of it) gets the allowlisted
+    environment and runs in the project directory: ``project_dir``, else the
+    first ``--add-dir`` of ``cmd`` (sandbox-03, sandbox-11).
+
     Returns the process to read from and its containment handle (None on
     platforms without the launcher). Raises FileNotFoundError when the
-    command is not on PATH, as a direct spawn would, and AgentContainmentError
-    when the launcher cannot be verified; the launcher is stopped first.
+    command is not on PATH, as a direct spawn would, AgentDispatchRefused
+    when the project directory is missing or the MCP config has a relative
+    --db-path, and AgentContainmentError when the launcher cannot be
+    verified; the launcher is stopped first.
     """
+    cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if cwd is not None and not os.path.isdir(cwd):
+        raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
+    mcp_config = _cmd_option(cmd, "--mcp-config")
+    if mcp_config:
+        _check_mcp_servers(mcp_config)
+    # P2A-05: the scrubbed env below is pointless if the agent can read ours
+    # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
+    # failure refuses the dispatch instead of starting an agent anyway.
+    if (not protect_orchestrator_process()
+            and sys.platform.startswith("linux")):
+        raise AgentDispatchRefused(
+            "cannot make the orchestrator non-dumpable (PR_SET_DUMPABLE); "
+            "an agent could read its environment from /proc"
+        )
+    kwargs["env"] = _agent_subprocess_env()
+    kwargs["cwd"] = cwd
+
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
@@ -1215,6 +1489,19 @@ def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:
     }
 
 
+def _dispatch_refused_result(exc: AgentDispatchRefused) -> AgentResult:
+    logger.error("[Dispatch] agent refused: %s", exc)
+    return {
+        "success": False,
+        "result_text": "",
+        "num_turns": 0,
+        "duration": 0,
+        "cost": None,
+        "errors": [f"Agent dispatch refused: {exc}"],
+        "files_changed_set": [],
+    }
+
+
 async def run_agent(
     cmd: list[str],
     timeout: int | None = None,
@@ -1222,6 +1509,7 @@ async def run_agent(
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     persistent_max_attempts: int | None = None,
+    project_dir: str | None = None,
 ) -> AgentResult:
     """Spawn claude -p with retry logic and exponential backoff.
 
@@ -1245,6 +1533,8 @@ async def run_agent(
         persistent_max_attempts: Ceiling on capacity-error retries in
             persistent mode. None reads dispatch config
             ``persistent_retry_max_attempts`` (default 36).
+        project_dir: Working directory for the CLI. None uses the first
+            ``--add-dir`` of ``cmd`` (what build_cli_command puts there).
 
     Returns:
         Result dict with success, result_text, num_turns, duration, cost, errors
@@ -1289,7 +1579,8 @@ async def run_agent(
             }
 
         try:
-            process, contained = await _spawn_agent_process(cmd)
+            process, contained = await _spawn_agent_process(
+                cmd, project_dir=project_dir)
 
             # Register abort handler to stop the agent's whole process tree
             def abort_handler(
@@ -1353,6 +1644,8 @@ async def run_agent(
             }
         except AgentContainmentError as exc:
             return _containment_failure_result(exc)
+        except AgentDispatchRefused as exc:
+            return _dispatch_refused_result(exc)
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -1582,8 +1875,13 @@ async def _run_agent_streaming_impl(
     # judged by its tool_result (refused vs executed), not killed on sight.
     hook_command = _pretooluse_hook_command(cmd)
     gate_fingerprint = _gate_fingerprint() if hook_command else None
-    if hook_command and (gate_fingerprint is None
-                         or not _gate_canary_ok(hook_command)):
+    agent_cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if agent_cwd is not None and not os.path.isdir(agent_cwd):
+        agent_cwd = None  # the spawn below refuses it with a clear error
+    if hook_command and (
+        gate_fingerprint is None
+        or not await asyncio.to_thread(_gate_canary_ok, hook_command, agent_cwd)
+    ):
         log("  [BashSecurity] pre-execution gate failed its canary; flagged "
             "commands will be killed on sight", output)
         hook_command = None
@@ -1630,6 +1928,7 @@ async def _run_agent_streaming_impl(
     try:
         process, contained = await _spawn_agent_process(
             cmd,
+            project_dir=project_dir,
             limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
         )
 
@@ -1653,6 +1952,8 @@ async def _run_agent_streaming_impl(
         }
     except AgentContainmentError as exc:
         return _containment_failure_result(exc)
+    except AgentDispatchRefused as exc:
+        return _dispatch_refused_result(exc)
 
     try:
         # Read stdout line-by-line with overall timeout
@@ -1733,18 +2034,17 @@ async def _run_agent_streaming_impl(
                         turn_count += 1
                         turn_has_tool_calls = True
 
-                        # Record action entry for action logging
-                        try:
-                            input_str = json.dumps(tool_input, default=str)
-                        except (TypeError, ValueError):
-                            input_str = str(tool_input)
+                        # Record action entry for action logging. Preview and
+                        # hash are persisted to agent_actions: string values
+                        # are redacted before serialising, and the hash is no
+                        # oracle for what was redacted (sandbox-12, P2A-04/08).
+                        input_preview, input_hash = redact_tool_input(
+                            tool_input, 200)
                         action_log.append({
                             "turn": turn_count,
                             "tool": tool_name,
-                            "input_preview": input_str[:200],
-                            "input_hash": hashlib.sha256(
-                                input_str.encode("utf-8", errors="replace")
-                            ).hexdigest(),
+                            "input_preview": input_preview,
+                            "input_hash": input_hash,
                             "timestamp": time.time(),
                         })
 
@@ -1767,27 +2067,37 @@ async def _run_agent_streaming_impl(
                         elif tool_name == "Bash":
                             bash_cmd = tool_input.get("command", "")
 
-                            # --- Bash security pre-execution filter ---
-                            _check_started = time.monotonic()
-                            sec_result = check_bash_command(bash_cmd)
-                            slow_check = (time.monotonic() - _check_started
-                                          > _SLOW_CHECK_SECONDS)
+                            # --- Bash security reactive check ---
+                            # Off the event loop, with a deadline (sandbox-07).
+                            # Commands and checker messages are redacted before
+                            # they reach a log line or a result (sandbox-12).
+                            sec_result = await _reactive_bash_check(bash_cmd)
+                            cmd_preview = redacted_preview(bash_cmd, 120)
                             tool_use_id = block.get("id")
-                            if (not sec_result.safe and hook_command and tool_use_id
-                                    and not slow_check):
+                            if sec_result is None:
+                                early_term_reason = (
+                                    f"Bash security: the reactive check did not "
+                                    f"finish within {_SLOW_CHECK_SECONDS:g}s; "
+                                    f"failing closed"
+                                )
+                                log(f"  [BashSecurity] BLOCKED: {early_term_reason} "
+                                    f"— cmd={cmd_preview}", output)
+                            elif not sec_result.safe and hook_command and tool_use_id:
                                 # The gate ran this same check before execution;
                                 # its tool_result says whether it was refused.
+                                check_msg = redact_secrets(sec_result.message)
                                 pending_flagged[tool_use_id] = (
-                                    sec_result.check_id, sec_result.message)
+                                    sec_result.check_id, check_msg)
                                 log(f"  [BashSecurity] flagged check={sec_result.check_id}: "
-                                    f"{sec_result.message} (awaiting pre-execution gate) "
-                                    f"— cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} (awaiting pre-execution gate) "
+                                    f"— cmd={cmd_preview}", output)
                             elif not sec_result.safe:
+                                check_msg = redact_secrets(sec_result.message)
                                 log(f"  [BashSecurity] BLOCKED check={sec_result.check_id}: "
-                                    f"{sec_result.message} — cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} — cmd={cmd_preview}", output)
                                 early_term_reason = (
                                     f"Bash security violation (check {sec_result.check_id}): "
-                                    f"{sec_result.message}"
+                                    f"{check_msg}"
                                 )
 
                             if any(kw in bash_cmd for kw in [
@@ -2166,17 +2476,19 @@ async def _run_agent_streaming_impl(
                                     if _t:
                                         tool_output_text_chunks.append(_t)
 
+                        # Error output often echoes the command; it is
+                        # persisted as agent_actions.error_summary (sandbox-12).
                         error_text = None
                         if is_error:
                             if isinstance(content, str):
-                                error_text = content[:200]
+                                error_text = redacted_preview(content, 200)
                             elif isinstance(content, list):
                                 texts = []
                                 for c in content:
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         texts.append(c.get("text", ""))
                                 if texts:
-                                    error_text = " ".join(texts)[:200]
+                                    error_text = redacted_preview(" ".join(texts), 200)
 
                         tool_errors.append(error_text)
 
@@ -2246,8 +2558,13 @@ async def _run_agent_streaming_impl(
     # Runs on every exit path. After a normal exit the launcher has already
     # swept whatever the agent left running; this confirms and releases.
     was_running = process.returncode is None
-    if was_running:
+    if was_running and early_term_reason:
         log(f"  [EarlyTerm] Killing agent process (reason: {early_term_reason})", output)
+    elif was_running:
+        # A normal finish: the stream ended (result event or EARLY_COMPLETE)
+        # while the CLI or the launcher's sweep was still winding down.
+        log("  [Cleanup] Agent stream finished; stopping the agent process "
+            "tree", output)
     await _terminate_agent(process, contained)
     if was_running:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, OSError):
@@ -2727,4 +3044,4 @@ async def dispatch_agent(
             task_id=task_id, cycle_number=cycle, project_dir=project_dir,
             paralysis_retry_count=paralysis_retry_count)
     else:
-        return await run_agent(cmd)
+        return await run_agent(cmd, project_dir=project_dir)

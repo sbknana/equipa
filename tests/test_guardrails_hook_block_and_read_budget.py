@@ -35,8 +35,11 @@ from equipa.config import set_active_dispatch_config
 FLAGGED_CMD = "ls -la <(echo hi)"  # check 8: process substitution
 FLAGGED_CHECK = 8
 
+# The agent env is allowlisted (loop-03), so the script finds its stream next
+# to itself rather than through an inherited variable.
 FAKE_CLI = '''import json, os, sys, time
-for line in open(os.environ["FAKE_STREAM"], encoding="utf-8"):
+_here = os.path.dirname(os.path.abspath(__file__))
+for line in open(os.path.join(_here, "stream.jsonl"), encoding="utf-8"):
     sys.stdout.write(line)
     sys.stdout.flush()
     time.sleep(0.01)
@@ -95,15 +98,10 @@ def _run(tmp_path, events, extra_args=()):
     stream.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
     fake = tmp_path / "fake_claude.py"
     fake.write_text(FAKE_CLI, encoding="utf-8")
-    import os
-    os.environ["FAKE_STREAM"] = str(stream)
-    try:
-        return asyncio.run(_run_agent_streaming_impl(
-            [sys.executable, str(fake), *extra_args],
-            role="developer", timeout=60, output=None, max_turns=40,
-        ))
-    finally:
-        os.environ.pop("FAKE_STREAM", None)
+    return asyncio.run(_run_agent_streaming_impl(
+        [sys.executable, str(fake), *extra_args],
+        role="developer", timeout=60, output=None, max_turns=40,
+    ))
 
 
 # --- 1. hook-refused commands ------------------------------------------------
@@ -291,7 +289,7 @@ def test_hook_at_another_path_is_not_trusted(tmp_path):
 
 def test_gate_failing_its_canary_means_kill_on_sight(tmp_path, settings, monkeypatch):
     path, hook_command = settings
-    monkeypatch.setattr(agent_runner, "_gate_canary_ok", lambda cmd: False)
+    monkeypatch.setattr(agent_runner, "_gate_canary_ok", lambda cmd, cwd=None: False)
     result = _run(tmp_path, [
         _assistant_bash("t1", FLAGGED_CMD),
         _result("t1", _refusal(hook_command), is_error=True),

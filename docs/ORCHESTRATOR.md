@@ -151,6 +151,59 @@ python forge_orchestrator.py --help
 | `security_review_timeout` | Timeout for security reviews in seconds |
 | `max_concurrent_agents` | Parallel dispatch limit (default: 4) |
 | `task_type_prompts` | Per-task-type prompt supplements |
+| `agent_env_passthrough` | Exact extra environment variable names agents (and preflight builds) receive. No wildcards |
+| `agent_allow_api_key` | Must be `true` to pass through any `ANTHROPIC_*` or `CLAUDE_CODE_USE_*` name (API billing or another endpoint) |
+| `agent_allow_credentials` | Must be `true` to pass through any other credential-shaped name (`DATABASE_URL`, `PG*`, `*_TOKEN`, `*_KEY`, `*SECRET*`, `*PASSWORD*`) |
+
+### MCP server config
+
+Agents run in the project directory, and the MCP servers the agent CLI starts
+inherit that directory. Every dispatch is therefore refused unless each stdio
+server in the MCP config uses an absolute `command`, absolute script paths, an
+absolute `cwd`, absolute `PYTHONPATH` entries and an absolute `--db-path`.
+`python -m` (or `-c`) additionally needs `-I` or `-P` and an absolute `cwd`,
+because Python would otherwise put the project directory first on `sys.path`
+and run an agent-planted module holding the server's token. `env` wrappers and
+inline `sh -c` commands are refused because they cannot be verified. JavaScript
+package runners and managers (`npx`, `pnpx`, `bunx`, `npm`, `pnpm`, `yarn`,
+`bun`) are refused too: started in the project, `npx <name>` runs the project's
+own `node_modules/.bin/<name>`, and `.npmrc`, `.yarnrc.yml` and `bunfig.toml`
+are read from it. Install such a server outside the project and point an
+absolute `node` at its entry script. See `mcp_config.example.json` for the
+accepted form.
+
+The Claude CLI currently ignores a per-server `cwd` and starts every stdio
+server in its own working directory, the project. For `python -m` servers the
+isolation therefore comes from `-P` (or `-I`) with absolute `PYTHONPATH`
+entries, not from `cwd`. The `equipa` MCP server starts its dispatch child
+(`python -m equipa.cli`) from its own checkout for the same reason.
+
+## Agent isolation: what is and is not covered
+
+Agents run as the orchestrator's Unix user. The current controls are defence
+in depth for that shared UID:
+
+- Agent CLIs, operator hooks, preflight install/build commands and the RLM
+  `claude -p` calls get an allowlisted environment (`equipa/env_loader.py`),
+  never the orchestrator's.
+- Before the first agent starts, the orchestrator makes itself non-dumpable
+  (`PR_SET_DUMPABLE` 0, Linux only), so an agent cannot read the
+  orchestrator's `/proc/<pid>/environ` or `/proc/<pid>/mem`. Children regain
+  dumpability when they exec, so agents are unaffected. Keep credentials in
+  the `.env` file rather than the environment of the shell that starts the
+  orchestrator: other same-UID processes, such as that shell, stay readable.
+- The reactive Bash check runs in a separate worker process
+  (`equipa/reactive_check.py`); a check that misses its deadline is a block
+  and the worker is recycled.
+- Tool inputs are redacted before they are persisted to `agent_actions`.
+
+None of this stops a same-UID process from reading files the orchestrator's
+user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`). Nor does it
+cover short-lived orchestrator helpers that exec with the full environment
+(git, docker): after exec they are dumpable again, so their
+`/proc/<pid>/environ` is readable while they run. **The
+complete fix is running agents under a separate Unix user** without access to
+those files. That is planned for a later wave.
 
 ### Ollama (Local Models)
 

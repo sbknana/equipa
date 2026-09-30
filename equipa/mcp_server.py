@@ -421,13 +421,17 @@ def _handle_equipa_dispatch(args: dict) -> dict:
 
     _log(f"Spawning: {' '.join(cmd)}")
 
-    # Spawn detached subprocess
+    # Spawn detached subprocess. The Claude CLI starts this server in the
+    # agent's project directory, and -m puts the child's cwd first on
+    # sys.path, so the child runs from this checkout, never from the project
+    # (a planted equipa/cli.py would otherwise get EQUIPA_MCP_TOKEN; P2A-02).
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
     )
 
     return {
