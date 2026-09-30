@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from equipa.constants import CHECKPOINT_DIR
+from equipa.parsing import AGENT_OUTPUT_WITHHELD, wrap_agent_output
 
 
 def save_checkpoint(
@@ -189,6 +190,20 @@ def load_soft_checkpoint(
         return None
 
 
+def _sanitize_agent_text(text: object, label: str) -> str:
+    """Reject-mode sanitize agent-authored free text for a recovery prompt."""
+    from lesson_sanitizer import sanitize  # HARD dependency
+
+    return sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
+
+
+def _join_paths(paths: list) -> str:
+    """Comma-join agent-supplied paths with every wrapper token escaped."""
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
+    return neutralize_boundaries(", ".join(str(path) for path in paths))
+
+
 def _format_recovery_prompt(
     state: dict,
     forge_state: dict | None = None,
@@ -202,7 +217,16 @@ def _format_recovery_prompt(
     only exist on the session side (``open_files``, ``recent_tool_calls``,
     ``partial_reasoning``) are rendered when present and silently skipped
     otherwise.
+
+    The last output and the ``.forge-state.json`` fields are agent-authored
+    and this prompt joins compaction history, so they get the same treatment
+    as the compaction summary: reject-mode sanitize (a rejected field becomes
+    AGENT_OUTPUT_WITHHELD) inside an escaped ``<task-input>`` block. File
+    paths and tool names are agent-chosen too and are boundary-escaped
+    (review N3 of task 3129).
     """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
     parts: list[str] = []
 
     parts.append(
@@ -231,21 +255,23 @@ def _format_recovery_prompt(
 
     if files_changed:
         parts.append(
-            f"**Files you already changed:** {', '.join(files_changed)}"
+            f"**Files you already changed:** {_join_paths(files_changed)}"
         )
 
     if files_read:
         parts.append(
             f"**Files you already read (do NOT re-read):** "
-            f"{', '.join(files_read)}"
+            f"{_join_paths(files_read)}"
         )
 
     if open_files:
-        parts.append(f"**Open files:** {', '.join(open_files)}")
+        parts.append(f"**Open files:** {_join_paths(open_files)}")
 
     if last_text:
+        safe_last_text = _sanitize_agent_text(last_text, "checkpoint last output")
         parts.append(
-            f"\n**Your last output (truncated):**\n```\n{last_text}\n```"
+            "\n**Your last output (truncated):**\n"
+            + wrap_agent_output("last-output", safe_last_text)
         )
 
     if recent_tool_calls:
@@ -259,27 +285,39 @@ def _format_recovery_prompt(
             rendered_calls.append(f"- turn {turn_num}: {tool} (ok={ok})")
         if rendered_calls:
             parts.append(
-                "\n**Recent tool calls:**\n" + "\n".join(rendered_calls)
+                "\n**Recent tool calls:**\n"
+                + neutralize_boundaries("\n".join(rendered_calls))
             )
 
     if forge_state:
-        parts.append("\n**Agent state file (.forge-state.json):**")
+        state_lines: list[str] = []
         current_step = forge_state.get("current_step", "")
         if current_step:
-            parts.append(f"- Current step: {current_step}")
+            state_lines.append(
+                f"- Current step: "
+                f"{_sanitize_agent_text(current_step, 'forge-state current_step')}"
+            )
         next_action = forge_state.get("next_action", "")
         if next_action:
-            parts.append(f"- Next action: {next_action}")
+            state_lines.append(
+                f"- Next action: "
+                f"{_sanitize_agent_text(next_action, 'forge-state next_action')}"
+            )
         state_decisions = forge_state.get("decisions", [])
         if state_decisions:
-            parts.append(
-                f"- Decisions made: {', '.join(str(d) for d in state_decisions[:5])}"
+            decisions_text = ", ".join(str(d) for d in state_decisions[:5])
+            state_lines.append(
+                f"- Decisions made: "
+                f"{_sanitize_agent_text(decisions_text, 'forge-state decisions')}"
             )
         state_files = forge_state.get("files_changed", [])
         if state_files:
-            parts.append(
-                f"- Files changed (from state): {', '.join(state_files)}"
+            state_lines.append(
+                f"- Files changed (from state): {_join_paths(state_files)}"
             )
+        if state_lines:
+            parts.append("\n**Agent state file (.forge-state.json):**")
+            parts.append(wrap_agent_output("forge-state", "\n".join(state_lines)))
 
     parts.append(
         "\n**RESUME NOW.** Pick up from your next action. "
