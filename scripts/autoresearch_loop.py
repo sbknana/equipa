@@ -25,6 +25,7 @@ Copyright 2026, Forgeborn
 import argparse
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -32,6 +33,27 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# IR-01 / RR-08: never let project-scope settings, CLAUDE.md or .mcp.json
+# reach the Claude CLI. Imported from the repo root derived from this file;
+# the fallback repeats equipa.cli_isolation's flags for a copy of this script
+# run without the equipa package.
+try:
+    from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+except ImportError:
+    _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    try:
+        from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+    except ImportError:
+        CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
+                                     "--strict-mcp-config")
+
+# The prompt-mutation call, as one shell command (it reads the prompt file
+# on stdin, locally or over SSH).
+CLAUDE_MUTATE_COMMAND = shlex.join(
+    ["claude", "--print", "--model", "opus", *CLAUDE_CLI_ISOLATION_ARGS])
 
 
 def is_on_claudinator() -> bool:
@@ -367,7 +389,7 @@ Output the raw prompt text only."""
     try:
         if is_on_claudinator():
             result = subprocess.run(
-                ["bash", "-c", f'claude --print --model opus < "{tmp_path}"'],
+                ["bash", "-c", f'{CLAUDE_MUTATE_COMMAND} < "{tmp_path}"'],
                 capture_output=True, text=True, timeout=300
             )
         else:
@@ -379,7 +401,7 @@ Output the raw prompt text only."""
             )
             result = subprocess.run(
                 ["ssh", "-i", SSH_KEY, CLAUDINATOR,
-                 f'claude --print --model opus < "{remote_tmp}"'],
+                 f'{CLAUDE_MUTATE_COMMAND} < "{remote_tmp}"'],
                 capture_output=True, text=True, timeout=300
             )
 
