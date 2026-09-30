@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 
 from equipa.constants import CHECKPOINT_DIR
-from equipa.parsing import AGENT_OUTPUT_WITHHELD, wrap_agent_output
 
 
 def save_checkpoint(
@@ -193,6 +192,8 @@ def load_soft_checkpoint(
 def _sanitize_agent_text(text: object, label: str) -> str:
     """Reject-mode sanitize agent-authored free text for a recovery prompt."""
     from lesson_sanitizer import sanitize  # HARD dependency
+    # Late import keeps this module free of parsing's git_ops dependency.
+    from equipa.parsing import AGENT_OUTPUT_WITHHELD
 
     return sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
 
@@ -226,6 +227,8 @@ def _format_recovery_prompt(
     (review N3 of task 3129).
     """
     from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+    # Late import keeps this module free of parsing's git_ops dependency.
+    from equipa.parsing import wrap_agent_output
 
     parts: list[str] = []
 
