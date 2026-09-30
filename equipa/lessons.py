@@ -64,15 +64,19 @@ def format_lessons_for_injection(
 
     lines = []
     for lesson in lessons:
-        # Sanitize lesson text before injecting into prompt
+        # Sanitize lesson text before injecting into prompt. The sanitizer
+        # runs in reject mode: "" means the lesson matched an injection
+        # pattern (reason already logged) and must not be shown at all.
         safe_lesson = sanitize_lesson_content(lesson['lesson'])
         if not safe_lesson:
             continue
         lines.append(f"- {safe_lesson}")
-        # Sanitize error signature context too
+        # Sanitize error signature context too; a rejected signature drops
+        # the context line rather than showing an empty one.
         if lesson.get('error_signature'):
             safe_sig = sanitize_error_signature(lesson['error_signature'])
-            lines.append(f"  (Error: {safe_sig}, seen {lesson['times_seen']}x)")
+            if safe_sig:
+                lines.append(f"  (Error: {safe_sig}, seen {lesson['times_seen']}x)")
 
     formatted = "\n".join(lines)
 
@@ -127,6 +131,73 @@ def update_lesson_injection_count(lesson_ids: list[int]) -> None:
 # after the task completes. Keyed by task_id, value is list of episode IDs.
 _injected_episodes_by_task: dict[int, list[int]] = {}
 
+# Agent-authored episode fields. Both are sanitized in reject mode when the
+# episode is stored AND again when it is injected (review finding sandbox-10).
+_EPISODE_TEXT_FIELDS = ("approach_summary", "reflection")
+
+
+def sanitize_episode_text(text: str | None, field: str) -> str | None:
+    """Sanitize one agent-authored episode field in reject mode.
+
+    Args:
+        text: Raw reflection or approach summary (agent output).
+        field: Field name, used in the rejection log line.
+
+    Returns:
+        The escaped text, or None when the input is empty or matched an
+        injection pattern (the sanitizer logs the reason). None is what the
+        episode tables store for "no reflection", so a rejected reflection
+        also keeps the episode out of retrieval.
+    """
+    if not text:
+        return None
+    from lesson_sanitizer import sanitize  # HARD dependency — no silent fallback
+
+    safe = sanitize(text, label=f"episode {field}")
+    return safe or None
+
+
+def filter_injectable_episodes(episodes: list[dict]) -> list[dict]:
+    """Return sanitized copies of the episodes that are safe to inject.
+
+    An episode whose reflection or approach summary matches an injection
+    pattern is dropped whole: both fields come from the same agent run, so a
+    poisoned field taints the episode. Copies are returned so the caller's
+    dicts are not mutated. Idempotent: filtering twice gives the same result.
+    """
+    safe_episodes: list[dict] = []
+    for episode in episodes:
+        safe_episode = dict(episode)
+        rejected = False
+        for field in _EPISODE_TEXT_FIELDS:
+            raw = episode.get(field)
+            safe = sanitize_episode_text(raw, field)
+            if raw and not safe:
+                rejected = True
+                break
+            safe_episode[field] = safe
+        if rejected:
+            logger.warning(
+                "[Lessons] Episode %s not injected: agent-authored text "
+                "matched a prompt-injection pattern", episode.get("id"),
+            )
+            continue
+        safe_episodes.append(safe_episode)
+    return safe_episodes
+
+
+def cross_project_episodes_enabled(dispatch_config: dict | None) -> bool:
+    """True only when ``features.episodes_cross_project`` is literally True.
+
+    Episodes are agent-authored, so by default they are only retrieved from
+    the project that produced them. Strict ``is True`` so a string such as
+    "false" in a hand-edited config cannot switch cross-project retrieval on.
+    """
+    if not dispatch_config:
+        return False
+    features = dispatch_config.get("features") or {}
+    return features.get("episodes_cross_project") is True
+
 
 def get_active_simba_rules():
     """Load active SIMBA-synthesized rules from lessons_learned."""
@@ -157,7 +228,9 @@ def get_relevant_episodes(
 ) -> list[dict]:
     """Fetch relevant past episodes for injection into agent prompts.
 
-    Matches by: same role + same project + optionally similar task_type.
+    Matches by: same role + same project. Episodes from other projects with
+    the same role + task_type are used as a fallback only when the
+    ``features.episodes_cross_project`` flag is True (default False).
     Filters by q_value > min_q_value (only inject useful experiences).
 
     Scoring combines:
@@ -200,8 +273,14 @@ def get_relevant_episodes(
 
         episodes = [dict(r) for r in rows]
 
-        # If we got fewer than limit, try matching by role + task_type across projects
-        if len(episodes) < limit and task_type:
+        # If we got fewer than limit, optionally fall back to role + task_type
+        # across projects. Off by default: another project's agent-authored
+        # reflections must not reach this project's prompts (sandbox-10).
+        if (
+            len(episodes) < limit
+            and task_type
+            and cross_project_episodes_enabled(dispatch_config)
+        ):
             existing_ids = {e["id"] for e in episodes}
             remaining = limit - len(episodes)
             cross_rows = conn.execute(
@@ -366,7 +445,12 @@ def format_episodes_for_injection(
     Returns:
         Formatted string under "## Past Experience" heading (2-3 sentences each),
         wrapped in untrusted content markers when delimiter is provided.
+        Episodes whose agent-authored text is rejected by the sanitizer are
+        left out; if none remain, returns "".
     """
+    # Re-sanitize at injection: rows stored before reject mode existed, or
+    # written by another path, must not reach the prompt raw (sandbox-10).
+    episodes = filter_injectable_episodes(episodes or [])
     if not episodes:
         return ""
 
@@ -445,8 +529,12 @@ def record_agent_episode(
                     text_parts.append(msg.get("text", ""))
             result_text = "\n".join(text_parts)
 
-        reflection = parse_reflection(result_text)
-        approach = parse_approach_summary(result_text)
+        # Reflection and approach are agent-authored and are injected into
+        # future prompts, so they are sanitized in reject mode before storage.
+        reflection = sanitize_episode_text(parse_reflection(result_text), "reflection")
+        approach = sanitize_episode_text(
+            parse_approach_summary(result_text), "approach_summary"
+        )
         error_patterns = parse_error_patterns(result, outcome=outcome, result_text=result_text)
         q_value = compute_initial_q_value(outcome)
 
