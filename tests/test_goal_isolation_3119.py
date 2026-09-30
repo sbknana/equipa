@@ -307,7 +307,10 @@ def test_nested_project_is_a_git_project(tmp_path: Path) -> None:
     assert git_ops_mod._is_git_repo(outer)
     assert not git_ops_mod._is_git_repo(plain)
     assert not git_ops_mod._is_git_repo(tmp_path / "missing")
-    assert not git_ops_mod._is_git_repo(outer / ".git")
+    # R3119-02 (task #3126): a ".git" directory is inside a repository but
+    # has no work tree; it is refused, never "not git".
+    with pytest.raises(git_ops_mod.GitRepositoryUnreadableError):
+        git_ops_mod._is_git_repo(outer / ".git")
 
 
 @pytest.mark.parametrize("review_high", [1, 0], ids=["review-blocks", "review-clean"])

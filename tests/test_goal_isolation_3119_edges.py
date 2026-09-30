@@ -272,7 +272,9 @@ def test_unreadable_created_at_is_rejected(created_at: Any) -> None:
 # 3. LOW: refusal bookkeeping for --auto-run and --parallel-goals
 # ---------------------------------------------------------------------------
 
-def test_collect_refusals_labels_each_refusal_and_ignores_crashes() -> None:
+def test_collect_refusals_labels_each_refusal_and_counts_crashes() -> None:
+    # R3119-04 (task #3126): a crash returned by gather() used to be ignored,
+    # so the run exited 0; it is now a refusal of its own.
     results = [
         {"codename": "alpha", "refusals": ["task #1 worktree_refused: stale branch"]},
         RuntimeError("goal crashed"),
@@ -284,6 +286,7 @@ def test_collect_refusals_labels_each_refusal_and_ignores_crashes() -> None:
 
     assert dispatch_mod.collect_refusals(results) == [
         "alpha: task #1 worktree_refused: stale branch",
+        "exception: RuntimeError: goal crashed",
         "Beta: goal stopped: merge_integrity_failed",
         "?: no directory mapped for the project",
     ]

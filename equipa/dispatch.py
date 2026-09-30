@@ -58,6 +58,7 @@ from equipa.db import (
 )
 from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import (
+    GitRepositoryUnreadableError,
     UntrustedDefaultBranchError,
     _is_git_repo,
     get_default_branch,
@@ -65,6 +66,7 @@ from equipa.git_ops import (
     git_run,
     git_run_async,
     git_toplevel,
+    git_toplevel_async,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
@@ -594,9 +596,23 @@ async def cleanup_failed_attempt(
         else:
             print(message)
 
-    if _is_git_repo(project_dir):
+    try:
+        is_git = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        raise AttemptCleanupError(str(exc)) from exc
+    if is_git:
         if await _is_linked_worktree(project_dir):
-            await _reset_task_worktree(project_dir, branch_name, base_sha, emit)
+            # R3119-07 (task #3126): a nested project's attempt ran in a
+            # sub-directory of its worktree; ``git clean`` there would leave
+            # the rest of the worktree dirty for the next attempt.
+            worktree_root = await git_toplevel_async(project_dir)
+            if worktree_root is None:
+                raise AttemptCleanupError(
+                    f"no work-tree root for {project_dir}; not resetting"
+                )
+            await _reset_task_worktree(
+                str(worktree_root), branch_name, base_sha, emit,
+            )
         else:
             await _delete_task_branch_in_main_checkout(
                 project_dir, branch_name, emit,
@@ -1148,7 +1164,23 @@ async def run_project_tasks(
     # One guard per project: every orchestrator merge advances it, anything
     # else trips it and the remaining tasks are refused.
     project_guard: DefaultBranchGuard | None = None
-    use_isolation = _is_git_repo(project_dir)
+    try:
+        use_isolation = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        log(f"  [{codename}] REFUSED: {exc}", output)
+        return {
+            "project_id": project_id,
+            "codename": codename,
+            "tasks_attempted": 0,
+            "tasks_completed": [],
+            "tasks_blocked": [],
+            "tasks_skipped": len(tasks),
+            "error": str(exc),
+            "refusals": [str(exc)],
+            "total_cost": 0.0,
+            "total_duration": 0.0,
+        }
     if use_isolation:
         await report_leftover_dispatch_state(project_dir)
         try:
@@ -1347,6 +1379,8 @@ async def run_project_dispatch(
                 "tasks_blocked": [],
                 "tasks_skipped": project_summary["total_todo"],
                 "error": str(e),
+                # R3119-04 (task #3126): a crashed project exits non-zero.
+                "refusals": [f"exception: {e}"],
                 "total_cost": 0.0,
                 "total_duration": 0.0,
             }
@@ -1552,6 +1586,8 @@ async def run_single_goal(
                 "project_id": project_id,
                 "outcome": "exception",
                 "error": str(e),
+                # R3119-04 (task #3126): a crashed goal exits non-zero.
+                "refusals": [f"exception: {e}"],
                 "rounds": 0,
                 "completed": [],
                 "blocked": [],
@@ -1922,6 +1958,13 @@ def project_dir_in_worktree(
             f"'{relative}' is not tracked by the enclosing repository "
             f"{toplevel}, so the task worktree has no such directory"
         )
+    # R3119-06 (task #3126): no component of ``relative`` may be a symlink,
+    # or the agent would run wherever it points (e.g. the main checkout).
+    if nested_dir.resolve() != Path(worktree_dir).resolve() / relative:
+        return None, (
+            f"'{relative}' in the task worktree resolves to "
+            f"{nested_dir.resolve()}, outside the worktree's own '{relative}'"
+        )
     return str(nested_dir), ""
 
 
@@ -2023,8 +2066,14 @@ async def _merge_task_branch(
     merge_sha: str | None = None,
     worktree_dir: str | None = None,
     merge_record: MergeAttempt | None = None,
+    artifact_dir: str | None = None,
 ) -> bool:
     """Merge a single task branch into the main repo's current branch.
+
+    ``project_dir`` is where git runs (the work-tree root); ``artifact_dir``,
+    when given, is where the review artifact is read from — the project's
+    own directory, which for a project nested in its repository is a
+    sub-directory of that root (R3119-01, task #3126).
 
     Task #3111 (gate-01): the merge target is a commit SHA, never the branch
     name. ``merge_sha`` is the commit the gate approved (the reviewed SHA);
@@ -2076,7 +2125,7 @@ async def _merge_task_branch(
     # legacy repo-root artifacts via find_review_artifact for in-flight
     # runs still on the old layout.
     review_path = find_review_artifact(
-        os.fspath(project_dir), "SECURITY-REVIEW", task_id,
+        os.fspath(artifact_dir or project_dir), "SECURITY-REVIEW", task_id,
     )
     if not expect_artifact:
         _gate_audit_log(
@@ -2747,13 +2796,33 @@ async def _gated_merge_task(
         )
         return finish("skipped", f"outcome {outcome} is not merge-eligible")
 
+    # R3119-01 (task #3126): every git call of the gate and the merge runs
+    # at the work-tree ROOT. A project nested in a sub-directory of its
+    # repository keeps ``project_dir`` only for its review artifact; from
+    # the sub-directory, agent-written config could narrow the gate diff.
+    repo_root = await git_toplevel_async(project_dir)
+    worktree_root = (
+        await git_toplevel_async(worktree_dir) if worktree_dir is not None else None
+    )
+    if repo_root is None or (worktree_dir is not None and worktree_root is None):
+        unreadable = project_dir if repo_root is None else worktree_dir
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=no-work-tree-root "
+            f"dir={unreadable}",
+            task_id=task_id,
+            event="merge-skipped",
+        )
+        return finish("blocked", f"no readable git work tree at {unreadable}")
+    git_dir = str(repo_root)
+    git_worktree_dir = str(worktree_root) if worktree_root is not None else None
+
     # Task #3111: repository state the hardened git helper cannot neutralise
     # blocks before ANY gate evaluation — the reviewer agent's git honours
     # replace refs, and driver config runs programs during the merge. The
     # task worktree is scanned too: the rebase fallback runs git there, and
     # its own config.worktree is invisible from the main checkout.
     hazards: list[str] = []
-    for scan_dir in (project_dir, worktree_dir):
+    for scan_dir in (git_dir, git_worktree_dir):
         if scan_dir is None:
             continue
         for hazard in await find_repo_execution_hazards(scan_dir):
@@ -2774,7 +2843,7 @@ async def _gated_merge_task(
 
     if guard is None:
         try:
-            guard = await DefaultBranchGuard.snapshot(project_dir)
+            guard = await DefaultBranchGuard.snapshot(git_dir)
         except MergeIntegrityError as exc:
             _gate_audit_log(
                 f"task={task_id} event=merge-skipped "
@@ -2788,7 +2857,7 @@ async def _gated_merge_task(
 
     # gate-01: pin the branch to ONE commit. The gate diffs that commit and
     # the merge names it, so the branch moving afterwards changes nothing.
-    branch_sha = await resolve_commit(project_dir, f"refs/heads/{branch}")
+    branch_sha = await resolve_commit(git_dir, f"refs/heads/{branch}")
 
     # === Single GateDecision, computed from ground truth (task #2706) ===
     # Diff the task BRANCH ref (not HEAD) so the file list is identical in
@@ -2796,7 +2865,7 @@ async def _gated_merge_task(
     # (main checkout on the default branch, work on a shared branch ref).
     # base_ref omitted -> auto-detect default branch (#2479).
     changed_files = await get_changed_files_for_branch(
-        project_dir, head_ref=branch_sha or branch,
+        git_dir, head_ref=branch_sha or branch,
     )
     decision: GateDecision = decide_merge_gate(
         changed_files,
@@ -2851,7 +2920,7 @@ async def _gated_merge_task(
             merge_sha = review_record.reviewed_sha
 
     if merge_sha is not None and await is_ancestor(
-        project_dir, merge_sha, guard.expected_sha,
+        git_dir, merge_sha, guard.expected_sha,
     ):
         _gate_audit_log(
             f"task={task_id} event=merge-noop branch={branch} "
@@ -2897,13 +2966,14 @@ async def _gated_merge_task(
         # the artifact requirement; everything else demands it fail-closed.
         # dispatch-06: SIGTERM/SIGINT are deferred for the merge, so it
         # finishes or is aborted before the orchestrator acts on them.
-        async with MergeSignalShield(project_dir, context=f"merge of {branch}"):
+        async with MergeSignalShield(git_dir, context=f"merge of {branch}"):
             merged = await _merge_task_branch(
-                project_dir, task_id, branch,
+                git_dir, task_id, branch,
                 expect_artifact=decision.expect_artifact,
                 merge_sha=merge_sha,
-                worktree_dir=worktree_dir,
+                worktree_dir=git_worktree_dir,
                 merge_record=attempt,
+                artifact_dir=project_dir,
             )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
@@ -3252,7 +3322,12 @@ async def run_task_in_isolation(
         base_sha = await resolve_commit(worktree_dir, "HEAD")
         result, cycles, agent_outcome = await execute(agent_dir, task_branch)
         if agent_dir != worktree_dir:
-            (Path(agent_dir) / ".forge-state.json").unlink(missing_ok=True)
+            # R3119-05 (task #3126): the agent controls this path; only a
+            # regular file is removed, so a directory there cannot abort the
+            # review, gate and audit record below.
+            state_file = Path(agent_dir) / ".forge-state.json"
+            if state_file.is_file() and not state_file.is_symlink():
+                state_file.unlink()
         # Task #3111 (3107 review R1): an agent that left its worktree on
         # another branch must not have that branch's commits treated as the
         # task's result.
@@ -3527,9 +3602,15 @@ def collect_refusals(results: list) -> list[str]:
     refused its worktree, a goal stopped because the default branch moved)
     used to leave the process exiting 0. Each entry is prefixed with its
     project so the CLI can name it when it exits non-zero.
+
+    R3119-04 (task #3126): an exception returned by
+    ``gather(..., return_exceptions=True)`` is a refusal too.
     """
     refusals: list[str] = []
     for entry in results:
+        if isinstance(entry, BaseException):
+            refusals.append(f"exception: {type(entry).__name__}: {entry}")
+            continue
         if not isinstance(entry, dict):
             continue
         label = entry.get("codename") or entry.get("project_name") or "?"
@@ -3666,7 +3747,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # historical `len(tasks) > 1` guard silently dropped isolation for N=1
     # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
-    use_worktrees = _is_git_repo(project_dir)
+    try:
+        use_worktrees = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        refuse_dispatch(str(exc))
     if use_worktrees:
         # dispatch-06: surface what earlier runs left behind (report only).
         await report_leftover_dispatch_state(project_dir)

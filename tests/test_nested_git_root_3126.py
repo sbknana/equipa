@@ -257,7 +257,11 @@ class GitCwdRecorder:
         found = []
         for argv, cwd in self.calls:
             index = git_ops_mod._git_subcommand_index(argv[1:])
-            subcommand = argv[1 + index] if index is not None else ""
+            if index is None:
+                continue
+            subcommand, rest = argv[1 + index], argv[2 + index:]
+            if subcommand == "stash" and rest[:1] == ["list"]:
+                continue  # ``stash list`` prints reflog entries, no paths
             if subcommand in PATH_SCOPED_SUBCOMMANDS and cwd.resolve() in directories:
                 found.append(f"git {subcommand} in {cwd}")
         return found
