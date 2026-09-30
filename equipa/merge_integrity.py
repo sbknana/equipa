@@ -81,6 +81,14 @@ _REDIRECT_CONFIG_KEYS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^includeif\..+\.path$"), "conditional include"),
 )
 
+# R3119-01 (task #3126): keys that make git report paths relative to the
+# directory it runs in. From a nested project's sub-directory,
+# ``diff.relative=true`` drops every change outside it from the gate diff.
+# The hardened helper pins both off; a scope switching them on is refused
+# (an explicit false value is harmless). ``git config --list`` lowercases keys.
+_PATH_SCOPE_CONFIG_KEYS = frozenset({"diff.relative", "status.relativepaths"})
+_GIT_FALSE_VALUES = frozenset({"false", "no", "off", "0", ""})
+
 # Task #3116 (MI-04): driver programs allowed in any config scope, by exact
 # key AND value. An agent redefining filter.lfs.smudge to its own program is
 # still refused. Extend only with programs the operator installed.
@@ -284,6 +292,18 @@ def _redirect_hazard(key: str) -> str | None:
     return None
 
 
+def _path_scope_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``key`` switches on cwd-relative path output, else None.
+
+    A key with no ``=`` (value None) is boolean true to git.
+    """
+    if key.lower() not in _PATH_SCOPE_CONFIG_KEYS:
+        return None
+    if value is not None and value.strip().lower() in _GIT_FALSE_VALUES:
+        return None
+    return "cwd-relative path output"
+
+
 def _parse_scoped_config_z(raw: str) -> list[tuple[str, str, str | None]] | None:
     """(scope, key, value) triples from ``config --list --show-scope -z``.
 
@@ -424,7 +444,8 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
       system config is switched off), including files pulled in via
       ``include``, that defines a filter, merge or diff driver program
       outside :data:`DRIVER_CONFIG_ALLOWLIST`, or sets ``core.worktree``,
-      ``attr.tree`` or an ``includeIf``.
+      ``attr.tree`` or an ``includeIf``, or switches on ``diff.relative`` /
+      ``status.relativePaths`` (R3119-01, task #3126).
     * ``info/attributes`` or the global attributes file selecting a driver
       outside the built-in / git-lfs set.
     * submodule git dirs defining or selecting such a driver (MI-05).
@@ -467,7 +488,11 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
     for scope, key, value in entries:
         if scope in _TRUSTED_SCOPES:
             continue
-        label = _driver_hazard(key, value) or _redirect_hazard(key)
+        label = (
+            _driver_hazard(key, value)
+            or _redirect_hazard(key)
+            or _path_scope_hazard(key, value)
+        )
         if label:
             hazards.append(f"{scope} config defines {label} '{key}'")
 
@@ -526,8 +551,15 @@ async def index_flag_problem(worktree_dir: str | os.PathLike) -> str | None:
     copy on disk then reads as clean. ``git ls-files -v`` tags a normal
     entry ``H``; skip-worktree is ``S``, assume-unchanged lowercase, and
     any other tag (unmerged, ...) is not a clean tree either.
+
+    ``git ls-files`` lists only the directory it runs in, so it runs at the
+    work-tree root: for a nested project the reviewer's ``worktree_dir`` is
+    a sub-directory (R3119-07, task #3126).
     """
-    result = await git_run_async(["ls-files", "-v", "-z"], worktree_dir, timeout=30)
+    root = await _git_path(worktree_dir, "--show-toplevel")
+    if root is None:
+        return f"could not locate the work-tree root of {os.fspath(worktree_dir)}"
+    result = await git_run_async(["ls-files", "-v", "-z"], root, timeout=30)
     if result.returncode != 0:
         return (
             f"git ls-files failed rc={result.returncode}: "

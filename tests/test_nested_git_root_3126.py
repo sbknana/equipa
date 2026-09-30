@@ -155,7 +155,8 @@ def test_hazard_scan_refuses_relative_path_config(
     _git(repo, "config", key, value)
 
     hazards = asyncio.run(find_repo_execution_hazards(repo))
-    assert any(key in hazard for hazard in hazards), hazards
+    # git config --list reports keys lowercased.
+    assert any(key.lower() in hazard for hazard in hazards), hazards
 
 
 def test_hazard_scan_accepts_relative_paths_switched_off_control(tmp_path: Path) -> None:
