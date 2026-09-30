@@ -727,7 +727,9 @@ def _audit_task_abort(
     output: list[str] | None,
 ) -> None:
     """Log a task abort to the operator output and the durable gate audit."""
-    line = f"task={task_id} event={event} detail={detail}"
+    # git stderr can span lines; keep each audit record on one line.
+    single_line_detail = " ".join(str(detail).split())
+    line = f"task={task_id} event={event} detail={single_line_detail}"
     log(f"  [GATE-AUDIT] {line}", output)
     log_gate_audit(line, task_id, event=event)
 
@@ -1752,8 +1754,6 @@ async def _log_stale_branch_commits(project_dir: str, branch_name: str) -> None:
     Gives the operator a recovery anchor (``git reflog``) before the branch
     is refused or, with ``force=True``, deleted.
     """
-    from equipa.git_ops import get_default_branch
-
     default_branch = get_default_branch(project_dir)
     try:
         sha_res = await git_run_async(
