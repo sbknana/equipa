@@ -186,7 +186,7 @@ from equipa.constants import (
 )
 from equipa.db import bulk_log_agent_actions, classify_error
 from equipa.env_loader import build_agent_env, protect_orchestrator_process
-from equipa.redact import redact_secrets, redacted_preview
+from equipa.redact import redact_secrets, redact_tool_input, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
     save_soft_checkpoint,
@@ -2027,19 +2027,17 @@ async def _run_agent_streaming_impl(
                         turn_count += 1
                         turn_has_tool_calls = True
 
-                        # Record action entry for action logging. The preview
-                        # is persisted to agent_actions: redact it (sandbox-12).
-                        try:
-                            input_str = json.dumps(tool_input, default=str)
-                        except (TypeError, ValueError):
-                            input_str = str(tool_input)
+                        # Record action entry for action logging. Preview and
+                        # hash are persisted to agent_actions: string values
+                        # are redacted before serialising, and the hash is no
+                        # oracle for what was redacted (sandbox-12, P2A-04/08).
+                        input_preview, input_hash = redact_tool_input(
+                            tool_input, 200)
                         action_log.append({
                             "turn": turn_count,
                             "tool": tool_name,
-                            "input_preview": redacted_preview(input_str, 200),
-                            "input_hash": hashlib.sha256(
-                                input_str.encode("utf-8", errors="replace")
-                            ).hexdigest(),
+                            "input_preview": input_preview,
+                            "input_hash": input_hash,
                             "timestamp": time.time(),
                         })
 
