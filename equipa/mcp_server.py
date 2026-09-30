@@ -39,6 +39,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+if __name__ == "__main__" and not __package__:
+    # Started as a script (``python3 -I /abs/equipa/mcp_server.py``, the only
+    # python MCP launch the dispatch check accepts besides -I -m; IR-03):
+    # import the equipa package from THIS checkout. -I keeps the cwd (the
+    # agent's project) and PYTHONPATH off sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # Import constants and DB helper
 try:
     from equipa.config import (

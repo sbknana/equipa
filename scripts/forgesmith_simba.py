@@ -54,6 +54,15 @@ except ImportError:
             """Standalone fallback: no configured model is knowable; refuse."""
             return None
 
+# IR-01: never let project-scope settings, CLAUDE.md or .mcp.json reach the
+# Claude CLI. The fallback repeats equipa.cli_isolation's flags for a
+# standalone run where equipa cannot be imported.
+try:
+    from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+except ImportError:
+    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
+                                 "--strict-mcp-config")
+
 # --- Paths ---
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -374,6 +383,7 @@ def call_claude_for_rules(prompt, cfg=None):
         "--model", model,
         "--max-turns", "2",
         "--no-session-persistence",
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
     try:

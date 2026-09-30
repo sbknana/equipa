@@ -458,8 +458,9 @@ def test_run_agent_flags_a_run_that_hit_max_turns(
 ):
     """The CLI's ``error_max_turns`` result is reported as ``hit_max_turns``.
 
-    ``success`` stays True for callers that keep partial work; the security
-    reviewer reads the flag and treats the run as failed (gate-07).
+    The security reviewer reads the flag and treats the run as failed
+    (gate-07). Since task 3134 (F8) the run is also not a success, as on the
+    streaming path: it was cut off, not finished.
     """
     result_file = tmp_path / "result.json"
     result_file.write_text(json.dumps({
@@ -473,7 +474,7 @@ def test_run_agent_flags_a_run_that_hit_max_turns(
         [sys.executable, str(fake_cli)], timeout=30, max_retries=0,
     ))
 
-    assert result["success"] is True
+    assert result["success"] is (not expect_max_turns)
     assert bool(result.get("hit_max_turns")) is expect_max_turns
     assert ("Agent hit max turns limit" in result["errors"]) is expect_max_turns
 

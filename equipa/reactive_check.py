@@ -77,9 +77,17 @@ class ReactiveBashChecker:
         self,
         checker_file: str | os.PathLike[str] = DEFAULT_CHECKER_FILE,
         checker_func: str = DEFAULT_CHECKER_FUNC,
+        max_command_bytes: int | None = None,
     ) -> None:
+        """
+        Args:
+            max_command_bytes: Size cap applied before the worker sees a
+                command. None uses ``bash_security.MAX_COMMAND_BYTES``, the
+                cap the checker itself enforces (IR-10).
+        """
         self.checker_file = Path(checker_file).resolve()
         self.checker_func = checker_func
+        self.max_command_bytes = max_command_bytes
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[bytes] | None = None
         self._owner_pid = os.getpid()
@@ -101,6 +109,14 @@ class ReactiveBashChecker:
         """Synchronous :meth:`check`, for callers outside an event loop."""
         if not isinstance(command, str):
             raise TypeError(f"command must be str, not {type(command).__name__}")
+        try:
+            oversize = self._oversize_verdict(command)
+        except (ImportError, AttributeError) as exc:
+            logger.error("[BashSecurity] cannot load the command size cap; "
+                         "failing closed: %s", exc)
+            return None
+        if oversize is not None:
+            return oversize
         with self._lock:
             try:
                 proc = self._ensure_worker()
@@ -111,6 +127,40 @@ class ReactiveBashChecker:
                 self._discard_worker()
                 return None
         return _to_result(reply)
+
+    def _oversize_verdict(self, command: str) -> Any | None:
+        """A block verdict for a command over the size cap, else None.
+
+        The checker refuses such a command anyway (check 24), but only after
+        it has been encoded, piped and decoded; a multi-megabyte command
+        could miss the deadline on a loaded host and be killed as a timeout
+        with a misleading reason. Refusing here is immediate and says why
+        (IR-10). Still a block: the caller handles it like any flagged
+        command.
+        """
+        from equipa.bash_security import (
+            MAX_COMMAND_BYTES,
+            BashSecurityResult,
+            CheckID,
+        )
+
+        limit = (MAX_COMMAND_BYTES if self.max_command_bytes is None
+                 else self.max_command_bytes)
+        if len(command) * 4 <= limit:
+            return None  # even all-4-byte UTF-8 fits: skip the encode
+        size = (len(command) if len(command) > limit
+                else len(command.encode("utf-8", errors="surrogatepass")))
+        if size <= limit:
+            return None
+        logger.warning("[BashSecurity] command over the %d-byte limit blocked "
+                       "before the reactive check", limit)
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.COMMAND_TOO_LONG,
+            message=(f"Command is over the {limit}-byte limit of the Bash "
+                     f"security check ({size}+ bytes); blocked before the "
+                     f"check ran. Write long content to a file and run a "
+                     f"short command that reads it"),
+        )
 
     def worker_pid(self) -> int | None:
         """Pid of the live worker, if any (for diagnostics and tests)."""
@@ -246,7 +296,7 @@ def _to_result(reply: dict) -> Any | None:
     safe, check_id, message = (reply.get("safe"), reply.get("check_id"),
                                reply.get("message"))
     if (not isinstance(safe, bool) or not isinstance(check_id, int)
-            or not isinstance(message, str)):
+            or isinstance(check_id, bool) or not isinstance(message, str)):
         logger.error("[BashSecurity] malformed checker verdict; failing closed")
         return None
     return BashSecurityResult(safe=safe, check_id=check_id, message=message)
@@ -310,9 +360,13 @@ def _worker_main(argv: list[str]) -> int:
             continue
         try:
             result = check(command)
-            _reply(out, {"safe": bool(result.safe),
-                         "check_id": int(result.check_id),
-                         "message": str(result.message)})
+            # Sent as returned, never coerced (IR-09): bool("yes") is True,
+            # so a checker answering anything but a real bool must reach
+            # _to_result's type check and fail closed there. A value JSON
+            # cannot encode raises here and is reported as an error.
+            _reply(out, {"safe": result.safe,
+                         "check_id": result.check_id,
+                         "message": result.message})
         except Exception as exc:  # noqa: BLE001 - any checker crash is a verdict
             _reply(out, {"error": f"{type(exc).__name__}: {exc}"})
     return 0

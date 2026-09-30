@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import random
+import re
 import select
 import shlex
 import shutil
@@ -25,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -169,6 +170,11 @@ class AgentResult(_AgentResultRequired, total=False):
 
 from equipa import agent_launcher
 from equipa.abort_controller import AbortController, create_child_abort_controller
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    is_claude_cli,
+    isolate_claude_argv,
+)
 from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
     get_configured_model,
@@ -182,6 +188,7 @@ from equipa.constants import (
     EARLY_TERM_WARN_TURNS,
     MCP_CONFIG,
     PROCESS_TIMEOUT,
+    PROJECT_DIRS,
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
@@ -261,13 +268,34 @@ def is_overloaded_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is an overloaded/529 error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in [
-        "529",
-        "overloaded",
-        "overloaded_error",
-        "temporarily overloaded",
-    ])
+    return bool(_OVERLOADED_RE.search(f"{stderr} {stdout}"))
+
+
+# Retry classifiers (F1, task 3134). A status code only counts as a whole
+# token: "529" inside "15290 tokens" or "500" inside "1500" is not an API
+# error. Callers pass structured error fields (stderr, the CLI's error
+# result), never the agent's own RESULT text.
+_OVERLOADED_RE = re.compile(r"\b529\b|overloaded", re.IGNORECASE)
+_CAPACITY_RE = re.compile(r"\b(?:429|529)\b|rate limit|overloaded", re.IGNORECASE)
+_RETRYABLE_RE = re.compile(
+    r"\b(?:429|500|502|503|504)\b|rate limit|connection|timeout|econnreset"
+    r"|epipe", re.IGNORECASE)
+# The error entry both result builders add for an error_max_turns run.
+_MAX_TURNS_ERROR = "Agent hit max turns limit"
+
+
+def _structured_error_text(result: Mapping[str, Any]) -> str:
+    """The error fields the retry classifiers may read (F1, task 3134).
+
+    ``errors`` holds what the orchestrator recorded: CLI stderr, the CLI's
+    error result (an API error message), early-termination reasons. The
+    agent's ``result_text`` is never included: a RESULT block that mentions
+    "timeout" or "HTTP 500" is not an API error, and matching it relaunched
+    a finished agent up to ten times.
+    """
+    errors = result.get("errors") or []
+    return " ".join(error for error in errors
+                    if isinstance(error, str) and error != _MAX_TURNS_ERROR)
 
 
 def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
@@ -282,8 +310,7 @@ def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is a 429 or 529 capacity error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in ["429", "rate limit", "529", "overloaded"])
+    return bool(_CAPACITY_RE.search(f"{stderr} {stdout}"))
 
 
 def is_retryable_error(stderr: str, stdout: str) -> bool:
@@ -296,20 +323,7 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if error should be retried
     """
-    combined = f"{stderr} {stdout}".lower()
-    retryable_markers = [
-        "429",
-        "rate limit",
-        "connection",
-        "timeout",
-        "econnreset",
-        "epipe",
-        "500",
-        "502",
-        "503",
-        "504",
-    ]
-    return any(marker in combined for marker in retryable_markers)
+    return bool(_RETRYABLE_RE.search(f"{stderr} {stdout}"))
 
 
 def _cmd_model(cmd: list[str]) -> str | None:
@@ -607,84 +621,183 @@ def _cmd_option(cmd: list[str], flag: str) -> str | None:
         return None
 
 
-def _check_mcp_servers(mcp_config: str | os.PathLike[str]) -> None:
-    """Refuse an MCP config whose servers would resolve inside the project.
+def _check_mcp_servers(
+    mcp_config: str | os.PathLike[str],
+    project_dirs: Iterable[str | os.PathLike[str] | None] = (),
+) -> None:
+    """Refuse an MCP config unless every stdio server is on the allowlist.
 
     The agent CLI runs in the project directory (sandbox-11), and the stdio
     MCP servers it starts inherit that cwd. Anything a server resolves
     relative to its cwd is therefore agent-writable: a relative
-    ``--db-path`` silently opens a different database, and a relative
-    command, a relative script or ``python -m`` (which puts the cwd first on
-    ``sys.path``) runs agent-planted code holding the server's credentials,
-    such as the EQUIPA_MCP_TOKEN (P2A-02). Fail closed rather than guess. A
-    missing config is left to the CLI, which reports it itself.
+    ``--db-path`` silently opens a different database, and a launcher that
+    loads code from its cwd runs agent-planted code holding the server's
+    credentials, such as the EQUIPA_MCP_TOKEN (P2A-02). A denylist of such
+    launchers kept missing some (``timeout python3 -m``, ``uv run``, ``node
+    -r``; IR-03), so only these shapes are accepted (see _check_mcp_launch):
+
+    * an absolute python with ``-I`` running an absolute script, or ``-I
+      -m`` with an absolute cwd outside every project directory;
+    * an absolute node running an absolute script, with no preload, loader
+      or eval option;
+    * any other absolute executable file that is not a wrapper, shell,
+      language runtime or package runner.
+
+    Nothing may live inside a project directory (``project_dirs`` plus every
+    configured PROJECT_DIRS entry), and the server env may not set a
+    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, ...). Fail
+    closed rather than guess. A missing config is left to the CLI, which
+    reports it itself.
 
     Raises:
-        AgentDispatchRefused: a cwd-relative server, or an unreadable config.
+        AgentDispatchRefused: a server off the allowlist, or an unreadable
+            or malformed config.
     """
     path = Path(mcp_config)
     if not path.is_file():
         return
     try:
         servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
-        entries = list(servers.items())
     except (OSError, ValueError, AttributeError) as exc:
         raise AgentDispatchRefused(
             f"cannot read MCP config {path} to verify its servers: {exc}"
         ) from exc
-    for name, server in entries:
+    if not isinstance(servers, dict):
+        raise AgentDispatchRefused(
+            f"MCP config {path}: \"mcpServers\" must be a JSON object")
+    roots = _project_roots(project_dirs)
+    for name, server in servers.items():
         if not isinstance(server, dict):
-            continue
+            raise AgentDispatchRefused(
+                f"MCP server {name!r} in {path} is not a JSON object "
+                f"(R3127-07); fix or remove that entry")
         _check_mcp_db_path(name, server, path)
-        _check_mcp_launch(name, server, path)
+        _check_mcp_launch(name, server, path, roots)
 
 
-# Interpreters whose first non-option argument is a script path.
-_MCP_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
-# JavaScript package runners and package managers. Started in the project
-# they resolve code from it: npx runs <cwd>/node_modules/.bin/<name> when the
-# project provides one, and .npmrc, .yarnrc.yml (yarnPath) and bunfig.toml
-# (preload) in the cwd are read as configuration.
-_MCP_PACKAGE_RUNNERS = frozenset({"npx", "pnpx", "bunx", "npm", "pnpm",
-                                  "yarn", "bun"})
-# Python options that take a value (from ``python --help``).
+def _project_roots(
+    project_dirs: Iterable[str | os.PathLike[str] | None],
+) -> list[str]:
+    """Every agent-writable project root, lexically and with symlinks resolved."""
+    roots: set[str] = set()
+    for directory in [*project_dirs, *PROJECT_DIRS.values()]:
+        if not directory:
+            continue
+        expanded = os.path.expanduser(os.fspath(directory))
+        if os.path.isabs(expanded):
+            roots.update({os.path.normpath(expanded), os.path.realpath(expanded)})
+    return sorted(roots)
+
+
+def _project_root_holding(path: str, roots: list[str]) -> str | None:
+    """The project root ``path`` lies in (as written or resolved), or None."""
+    for candidate in {os.path.normpath(path), os.path.realpath(path)}:
+        for root in roots:
+            try:
+                if os.path.commonpath([candidate, root]) == root:
+                    return root
+            except ValueError:  # different drives (Windows)
+                continue
+    return None
+
+
+# Programs that run another program, shells, language runtimes other than
+# python and node, and package/task runners: each resolves code (or its
+# configuration) from its arguments, environment or cwd in ways the check
+# cannot follow, so none may start an MCP server (IR-03). Names are compared
+# without version suffixes (ruby3.1 -> ruby, python3-dbg -> python).
+_MCP_REFUSED_LAUNCHERS = frozenset({
+    "env", "timeout", "nice", "ionice", "stdbuf", "setsid", "nohup", "chrt",
+    "taskset", "unshare", "nsenter", "sudo", "doas", "su", "runuser", "xargs",
+    "watch", "script", "flock", "time", "strace", "ltrace", "gdb", "valgrind",
+    "firejail", "bwrap", "chroot", "busybox", "toybox", "exec",
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh", "pwsh",
+    "powershell", "cmd",
+    "uv", "poetry", "pipx", "pdm", "hatch", "rye", "pipenv", "conda", "mamba",
+    "micromamba", "tox", "nox", "ipython", "jupyter",
+    "npx", "pnpx", "bunx", "npm", "pnpm", "yarn", "bun", "corepack", "deno",
+    "tsx", "ts-node",
+    "go", "cargo", "rustup", "make", "gmake", "cmake", "ninja", "just", "rake",
+    "docker", "podman", "nerdctl", "kubectl",
+    "ruby", "irb", "perl", "php", "java", "jshell", "lua", "luajit", "tclsh",
+    "wish", "rscript", "julia", "osascript", "dotnet", "mono", "erl",
+    "elixir", "iex", "mix", "gradle", "mvn", "sbt", "scala", "kotlin",
+    "groovy", "swift",
+})
+# Server env variables that make an interpreter or the dynamic loader run
+# extra code (IR-03).
+_MCP_REFUSED_ENV = frozenset({
+    "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "BASH_ENV", "ENV", "PERL5OPT",
+    "PERL5LIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+})
+_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_")
+# Python options accepted before the script or -m. -I is also required.
+# -W takes a value; -c, -m and -X are handled or refused separately.
+_PYTHON_ALLOWED_FLAGS = frozenset("IBbdEOPqRsSuvW")
 _PYTHON_VALUE_OPTIONS = frozenset("cmWX")
-_PYTHON_LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs"})
-# Suffixes that make a relative argument a script or module file.
+# Node options accepted before the script: resource limits and diagnostics.
+# Anything else (-r, --require, --import, --loader, -e, -p, -i, --env-file,
+# --inspect ...) can load code or open a debugger and is refused.
+_NODE_ALLOWED_OPTIONS = frozenset({
+    "--max-old-space-size", "--max-semi-space-size", "--stack-size",
+    "--enable-source-maps", "--no-warnings", "--no-deprecation",
+    "--trace-warnings", "--trace-deprecation", "--trace-uncaught",
+    "--unhandled-rejections", "--dns-result-order",
+})
+# Suffixes that make a relative argument a script, module or config file.
 _SCRIPT_SUFFIXES = (".py", ".pyc", ".pyz", ".js", ".mjs", ".cjs", ".ts", ".mts",
-                    ".sh", ".bash", ".rb", ".pl", ".php", ".jar")
+                    ".sh", ".bash", ".rb", ".pl", ".php", ".jar", ".toml",
+                    ".cfg", ".ini", ".json", ".yaml", ".yml", ".env", ".pth")
 
 
-def _is_python_command(command: str) -> bool:
-    """True for python, python3, python3.12, pypy3 and the like."""
-    name = os.path.basename(command).lower().removesuffix(".exe")
-    for prefix in ("python", "pypy"):
-        if name.startswith(prefix):
-            return all(char.isdigit() or char == "."
-                       for char in name[len(prefix):])
-    return False
+def _launcher_stem(command: str) -> str:
+    """``command``'s basename, lower-case, without .exe and version suffixes."""
+    name = os.path.basename(command).lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        name = name.removesuffix(suffix)
+    return re.sub(r"[0-9.]*(?:-(?:dbg|debug))?$", "", name) or name
 
 
-def _python_invocation(args: list[str]) -> tuple[str, str | None, set[str]]:
-    """How ``python <args>`` picks its code: (mode, target, single-letter flags).
+def _launcher_kind(command: str) -> str:
+    """"python", "node", "refused" or "executable", judged on the name as
+    written AND the resolved target (a symlink named srv -> python3)."""
+    stems = {_launcher_stem(command), _launcher_stem(os.path.realpath(command))}
+    if stems & {"python", "pypy"}:
+        return "python"
+    if stems & {"node", "nodejs"}:
+        return "node"
+    if stems & _MCP_REFUSED_LAUNCHERS:
+        return "refused"
+    return "executable"
 
-    mode is "module" (-m), "code" (-c), "stdin" (no script, or ``-``) or
-    "script". Clustered short options (``-IBm mod``) are honoured.
+
+def _python_invocation(
+        args: list[str]) -> tuple[str, str | None, set[str], list[str]]:
+    """How ``python <args>`` picks its code.
+
+    Returns (mode, target, single-letter flags, refused options). mode is
+    "module" (-m), "code" (-c), "stdin" (no script, or ``-``) or "script".
+    Clustered short options (``-IBm mod``) are honoured.
     """
     flags: set[str] = set()
+    refused: list[str] = []
     index = 0
     while index < len(args):
         arg = args[index]
         following = args[index + 1] if index + 1 < len(args) else None
         if arg == "-":
-            return "stdin", None, flags
+            return "stdin", None, flags, refused
         if arg == "--":
-            return ("script", following, flags) if following else ("stdin", None, flags)
+            mode = "script" if following else "stdin"
+            return mode, following, flags, refused
         if arg.startswith("--"):
-            index += 2 if arg in _PYTHON_LONG_VALUE_OPTIONS else 1
+            refused.append(arg)  # --check-hash-based-pycs, --help, ...
+            index += 1
             continue
         if not arg.startswith("-"):
-            return "script", arg, flags
+            return "script", arg, flags, refused
         cluster = arg[1:]
         for position, letter in enumerate(cluster):
             if letter not in _PYTHON_VALUE_OPTIONS:
@@ -693,14 +806,15 @@ def _python_invocation(args: list[str]) -> tuple[str, str | None, set[str]]:
             attached = cluster[position + 1:]
             value = attached or following
             if letter == "m":
-                return "module", value, flags
+                return "module", value, flags, refused
             if letter == "c":
-                return "code", value, flags
+                return "code", value, flags, refused
+            flags.add(letter)
             if not attached:
                 index += 1  # -W / -X consumed the next argument
             break
         index += 1
-    return "stdin", None, flags
+    return "stdin", None, flags, refused
 
 
 def _looks_like_relative_path(arg: str) -> bool:
@@ -710,11 +824,13 @@ def _looks_like_relative_path(arg: str) -> bool:
             or arg.lower().endswith(_SCRIPT_SUFFIXES))
 
 
-def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
-    """Refuse a stdio server that would load code relative to its cwd."""
+def _check_mcp_launch(name: str, server: dict, config_path: Path,
+                      roots: list[str] | None = None) -> None:
+    """Refuse a stdio server that is not on the launch allowlist (IR-03)."""
     if server.get("type") in ("http", "sse") or (
             "url" in server and "command" not in server):
         return  # remote server: nothing is started in the project directory
+    roots = roots if roots is not None else _project_roots(())
 
     def refuse(problem: str, fix: str) -> AgentDispatchRefused:
         return AgentDispatchRefused(
@@ -723,9 +839,17 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
             f"would run agent-writable code. {fix}"
         )
 
+    def refuse_inside_project(what: str, value: str) -> None:
+        root = _project_root_holding(value, roots)
+        if root is not None:
+            raise refuse(f"has its {what} {value!r} inside the project "
+                         f"directory {root!r}, which agents can write",
+                         f"Install it outside every project directory.")
+
     command = server.get("command")
     args = server.get("args", [])
     cwd = server.get("cwd")
+    env = server.get("env", {})
     if not isinstance(command, str) or not os.path.isabs(command):
         raise refuse(f"has a relative command {command!r}",
                      "Use an absolute path to the executable.")
@@ -733,65 +857,103 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
         raise refuse("has non-string args", "Use a list of strings.")
     if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
         raise refuse(f"has a relative cwd {cwd!r}", "Use an absolute cwd.")
-    basename = os.path.basename(command)
-    if basename == "env":
-        raise refuse("is started through env(1), which resolves its target "
-                     "through PATH", 'Use an absolute command and the "env" key.')
-    runner = basename.lower().removesuffix(".exe").removesuffix(".cmd")
-    if runner in _MCP_PACKAGE_RUNNERS:
+    if not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in env.items()):
+        raise refuse("has an env that is not an object of strings",
+                     'Use "env": {"NAME": "value"}.')
+    for key in env:
+        if key in _MCP_REFUSED_ENV or key.startswith(_MCP_REFUSED_ENV_PREFIXES):
+            raise refuse(f"sets {key} in its env, which makes the server load "
+                         f"extra code", f"Remove {key} from the env block.")
+    refuse_inside_project("command", command)
+    if cwd is not None:
+        refuse_inside_project("cwd", cwd)
+
+    kind = _launcher_kind(command)
+    if kind == "refused":
         raise refuse(
-            f"is started through the package runner {basename!r}, which "
-            f"resolves the package and its configuration in the project "
-            f"first (node_modules/.bin, .npmrc, .yarnrc.yml, bunfig.toml)",
-            "Install the server outside the project and run its entry script "
-            "by absolute path with an absolute node.")
-    if _is_python_command(command):
-        _check_python_launch(server, args, cwd, refuse)
-    elif basename in _MCP_SHELLS:
-        options = [a for a in args if a.startswith("-")]
-        if any("c" in option.lstrip("-") for option in options
-               if not option.startswith("--")):
-            raise refuse("runs an inline shell command (-c), which cannot be "
-                         "verified", "Point the shell at an absolute script.")
-        script = next((a for a in args if not a.startswith("-")), None)
-        if script is not None and not os.path.isabs(script):
-            raise refuse(f"runs the relative script {script!r}",
-                         "Use an absolute script path.")
+            f"is started through {os.path.basename(command)!r}, a wrapper, "
+            f"shell, runtime or package runner that resolves code the check "
+            f"cannot verify",
+            "Run the server's own executable, an absolute python -I with an "
+            "absolute script, or an absolute node with an absolute script.")
+    if kind == "python":
+        _check_python_launch(args, cwd, refuse, refuse_inside_project)
+    elif kind == "node":
+        _check_node_launch(args, refuse, refuse_inside_project)
+    elif os.path.lexists(command) and not (
+            os.path.isfile(command) and os.access(command, os.X_OK)):
+        raise refuse(f"has the command {command!r}, which is not an "
+                     f"executable file", "Point it at the server executable.")
     for arg in args:
         if _looks_like_relative_path(arg):
             raise refuse(f"has the relative path argument {arg!r}",
                          "Use an absolute path.")
 
 
-def _check_python_launch(server: dict, args: list[str], cwd: str | None,
-                         refuse: Any) -> None:
-    mode, target, flags = _python_invocation(args)
+def _check_python_launch(args: list[str], cwd: str | None, refuse: Any,
+                         refuse_inside_project: Any) -> None:
+    mode, target, flags, long_options = _python_invocation(args)
+    if long_options:
+        raise refuse(f"passes python the option {long_options[0]!r}",
+                     "Use only short isolation and warning flags (-I, -B, "
+                     "-u, -W ...).")
+    unknown = sorted(flags - _PYTHON_ALLOWED_FLAGS)
+    if unknown:
+        raise refuse(f"passes python the option -{unknown[0]}, which is not "
+                     f"allowed", "Use only -I and -B, -b, -d, -E, -O, -P, -q, "
+                     "-R, -s, -S, -u, -v, -W.")
+    shown = {"module": f"-m {target}", "code": "-c ...", "stdin": "(stdin)",
+             "script": str(target)}[mode]
+    if mode in ("code", "stdin"):
+        raise refuse(f"runs python {shown}, which cannot be verified",
+                     "Run an absolute script with python -I.")
+    if "I" not in flags:
+        raise refuse(
+            f"runs python {shown} without -I; Python would read PYTHON* "
+            f"variables and put the project directory first on sys.path",
+            'Add "-I" and run an absolute script (or -m with an absolute '
+            '"cwd" outside every project directory).')
     if mode == "script":
         if not target or not os.path.isabs(target):
             raise refuse(f"runs the relative Python script {target!r}",
                          "Use an absolute script path.")
-    elif not (flags & {"I", "P"}) or cwd is None:
-        shown = {"module": f"-m {target}", "code": "-c ...",
-                 "stdin": "(stdin)"}[mode]
-        raise refuse(
-            f"runs python {shown} without both an isolation flag (-I or -P) "
-            f"and an absolute \"cwd\"; Python would put the project directory "
-            f"first on sys.path",
-            'Add "-I" or "-P" before -m and an absolute "cwd" (with PYTHONPATH '
-            'in "env" pointing at the trusted checkout if needed), or run an '
-            "absolute script path.",
-        )
-    env = server.get("env")
-    pythonpath = env.get("PYTHONPATH") if isinstance(env, dict) else None
-    if pythonpath is not None:
-        entries = str(pythonpath).split(os.pathsep)
-        if not all(entry and os.path.isabs(entry) for entry in entries):
-            raise refuse(f"has a relative PYTHONPATH entry in {pythonpath!r}",
-                         "Use absolute PYTHONPATH entries only.")
+        refuse_inside_project("script", target)
+    elif cwd is None:
+        raise refuse(f"runs python {shown} without an absolute \"cwd\"; the "
+                     f"project directory would be its working directory "
+                     f"(sys.path)",
+                     'Add an absolute "cwd" outside every project directory, '
+                     "or run an absolute script.")
+
+
+def _check_node_launch(args: list[str], refuse: Any,
+                       refuse_inside_project: Any) -> None:
+    script = None
+    for index, arg in enumerate(args):
+        if arg == "--":
+            script = args[index + 1] if index + 1 < len(args) else None
+            break
+        if not arg.startswith("-") or arg == "-":
+            script = arg
+            break
+        option = arg.split("=", 1)[0]
+        if option not in _NODE_ALLOWED_OPTIONS:
+            raise refuse(f"passes node the option {arg!r}, which can load "
+                         f"code (preload, loader, eval, env file, debugger)",
+                         "Remove it; bundle what it loads into the server "
+                         "script.")
+    if script is None or script == "-":
+        raise refuse("runs node without a script", "Run an absolute script.")
+    if not os.path.isabs(script):
+        raise refuse(f"runs the relative node script {script!r}",
+                     "Use an absolute script path.")
+    refuse_inside_project("script", script)
 
 
 def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
-    """Refuse a relative ``--db-path`` (sandbox-11)."""
+    """Refuse a relative ``--db-path`` (sandbox-11), saying how to fix it."""
     args = server.get("args")
     if isinstance(args, list):
         for index, arg in enumerate(args):
@@ -802,11 +964,21 @@ def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
             else:
                 continue
             if not isinstance(db_path, str) or not os.path.isabs(db_path):
+                # IR-02: name the file and the exact edit. The suggestion is
+                # where the relative path resolved before agents ran in the
+                # project directory (the orchestrator's cwd).
+                suggestion = (
+                    os.path.abspath(os.path.expanduser(db_path))
+                    if isinstance(db_path, str) and db_path
+                    else "/absolute/path/to/theforge.db")
                 raise AgentDispatchRefused(
                     f"MCP server {name!r} in {path} has a relative --db-path "
                     f"{db_path!r}. Agents run in the project directory, so it "
-                    f"would open a different database. Set an absolute "
-                    f"--db-path in the MCP config."
+                    f"would open or create a different database there. Every "
+                    f"dispatch is refused until this is fixed. Fix: edit "
+                    f"{path} and make the --db-path argument of {name!r} an "
+                    f"absolute path, e.g. \"--db-path\", \"{suggestion}\" "
+                    f"(check that this is the real TheForge database)."
                 )
 
 
@@ -863,7 +1035,7 @@ def build_cli_command(
     )
     claude_bin = shutil.which("claude") or "claude"
     # sandbox-11: checked before any tempfile exists, so a refusal leaks none.
-    _check_mcp_servers(MCP_CONFIG)
+    _check_mcp_servers(MCP_CONFIG, (project_dir,))
 
     # Write system prompt to a temp file to avoid Windows command-line length
     # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
@@ -889,6 +1061,12 @@ def build_cli_command(
             "--no-session-persistence",
             "--append-system-prompt-file", prompt_file.name,
             "--mcp-config", str(MCP_CONFIG),
+            # IR-01: the CLI runs in the agent-writable project directory, so
+            # load user settings only (a project .claude/settings.json could
+            # set disableAllHooks and switch off the Bash gate; CLAUDE.md
+            # would plant instructions) and only EQUIPA's MCP servers (no
+            # project .mcp.json). See equipa/cli_isolation.py.
+            *CLAUDE_CLI_ISOLATION_ARGS,
             "--add-dir", str(project_dir),
             "--permission-mode", "bypassPermissions",
         ]
@@ -1383,9 +1561,17 @@ async def _spawn_agent_process(
     cwd = project_dir or _cmd_option(cmd, "--add-dir")
     if cwd is not None and not os.path.isdir(cwd):
         raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
+    if cmd and is_claude_cli(cmd[0]):
+        # IR-01 backstop for every caller (reflexion, manager, custom argv):
+        # whatever built the argv, project-scope settings, CLAUDE.md and
+        # .mcp.json in the cwd are never loaded.
+        try:
+            cmd = isolate_claude_argv(cmd)
+        except ValueError as exc:
+            raise AgentDispatchRefused(str(exc)) from exc
     mcp_config = _cmd_option(cmd, "--mcp-config")
     if mcp_config:
-        _check_mcp_servers(mcp_config)
+        _check_mcp_servers(mcp_config, (cwd,))
     # P2A-05: the scrubbed env below is pointless if the agent can read ours
     # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
     # failure refuses the dispatch instead of starting an agent anyway.
@@ -1668,6 +1854,11 @@ async def run_agent(
         if stderr_text:
             result["errors"].append(f"stderr: {stderr_text}")
 
+        # The CLI's own error message (an is_error result). With stderr it is
+        # all the retry classifiers below may read: the JSON stdout also holds
+        # the agent's text and token counts ("cache_read_input_tokens": 5029
+        # contains "502"), neither of which is an API error (F1).
+        api_error_text = ""
         if not stdout_text:
             result["errors"].append("No output from agent")
             last_error = "No output from agent"
@@ -1681,18 +1872,19 @@ async def run_agent(
                 # Check for error subtypes
                 subtype = data.get("subtype", "")
                 if subtype == "error_max_turns":
-                    # Agent ran out of turns but may have done useful work.
-                    # gate-07: the run did NOT finish, so a caller whose
-                    # output must be complete (the security reviewer) reads
-                    # ``hit_max_turns`` and treats the run as failed.
-                    result["success"] = True
+                    # The run was cut off, not finished (F8, as the streaming
+                    # path reports it): not a success, and ``hit_max_turns``
+                    # tells a caller that wants the partial work (the dev
+                    # loop) or needs complete output (a reviewer, gate-07).
+                    result["success"] = False
                     result["hit_max_turns"] = True
-                    result["errors"].append("Agent hit max turns limit")
+                    result["errors"].append(_MAX_TURNS_ERROR)
                 elif data.get("is_error"):
                     result["success"] = False
                     error_msg = data.get('result', 'unknown')
                     result["errors"].append(f"Agent error: {error_msg}")
                     last_error = error_msg
+                    api_error_text = str(error_msg)
                 else:
                     result["success"] = True
 
@@ -1706,9 +1898,13 @@ async def run_agent(
         # If successful, return immediately
         if result["success"]:
             return result
+        # A run cut off by its turn budget is never relaunched (F1/F8): a
+        # fresh agent with a full budget on a dirty worktree is not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, api_error_text)
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -1716,13 +1912,13 @@ async def run_agent(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, api_error_text):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, api_error_text)
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:
@@ -2710,6 +2906,10 @@ async def run_agent_with_retries(
         if is_overloaded_result(result):
             print("  Not retrying: model overloaded (529) through every retry")
             return result, attempt
+        # Out of turns is not a transient failure: never relaunch (F1).
+        if result.get("hit_max_turns"):
+            print("  Not retrying: agent hit its max turns")
+            return result, attempt
 
         # Check if output is valid
         is_valid, reason = validate_output(result)
@@ -2793,11 +2993,17 @@ async def run_agent_streaming_with_retry(
         # If successful, return immediately
         if result.get("success"):
             return result
+        # A run cut off by its turn budget is never relaunched (F1, indep
+        # review of 3122): the dev loop's continuation owns what happens
+        # next, and a fresh agent with a full budget on a dirty worktree is
+        # not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
-        # Extract error info
-        stderr_text = " ".join(result.get("errors", []))
-        stdout_text = result.get("result_text", "")
-        last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+        # Extract error info. Only structured error fields are classified,
+        # never the agent's RESULT text (F1).
+        stderr_text = _structured_error_text(result)
+        last_error = (stderr_text or result.get("result_text", ""))[:200]
 
         # Non-retryable: analysis paralysis kills must fail fast, not retry.
         # Retrying after a paralysis kill restarts the exact same pattern
@@ -2814,7 +3020,7 @@ async def run_agent_streaming_with_retry(
                 return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, "")
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -2822,13 +3028,13 @@ async def run_agent_streaming_with_retry(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, ""):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, "")
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:

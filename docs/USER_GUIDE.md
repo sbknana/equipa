@@ -140,7 +140,7 @@ MCP server configuration passed to each agent.
     "mcpServers": {
         "theforge": {
             "type": "stdio",
-            "command": "uvx",
+            "command": "/path/to/uvx",
             "args": [
                 "mcp-server-sqlite",
                 "--db-path",
@@ -150,6 +150,10 @@ MCP server configuration passed to each agent.
     }
 }
 ```
+
+The command and `--db-path` must be absolute paths; agents run in the project
+directory, and a relative entry refuses every dispatch (see "MCP server
+config" in `docs/ORCHESTRATOR.md` for the accepted launch forms).
 
 ---
 

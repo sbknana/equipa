@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
 from equipa.config import (
     APPROVED_MODEL_UPGRADES_KEY,
     get_configured_model,
@@ -2204,6 +2205,8 @@ def dispatch_ghost_scout(prompt: str) -> str | None:
         "--model", get_configured_model(),
         "--max-turns", str(GHOST_SCOUT_MAX_TURNS),
         "--no-session-persistence",
+        # IR-01: no project-scope settings, CLAUDE.md or .mcp.json.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
     try:
@@ -2698,6 +2701,8 @@ def call_claude_for_proposals(prompt, cfg):
         "--model", model,
         "--max-turns", "2",
         "--no-session-persistence",
+        # IR-01: no project-scope settings, CLAUDE.md or .mcp.json.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
     try:

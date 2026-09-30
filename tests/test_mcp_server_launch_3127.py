@@ -155,6 +155,10 @@ REFUSED = {
     "bunx": {"command": "/opt/fake/bin/bunx", "args": ["srv"]},
     "bun reads bunfig.toml": {"command": "/opt/fake/bin/bun",
                               "args": ["/abs/srv.ts"]},
+    # Accepted until task 3134: IR-03 requires -I and refuses PYTHONPATH.
+    "-P -m with PYTHONPATH": {"command": PY, "args": ["-P", "-m", "x"],
+                              "cwd": "/abs/checkout",
+                              "env": {"PYTHONPATH": "/abs/checkout"}},
 }
 
 
@@ -168,9 +172,6 @@ def test_cwd_relative_server_is_refused(tmp_path, server):
 ACCEPTED = {
     "-I -m with absolute cwd": {"command": PY, "args": ["-I", "-m", "x"],
                                 "cwd": "/abs/checkout"},
-    "-P -m with PYTHONPATH": {"command": PY, "args": ["-P", "-m", "x"],
-                              "cwd": "/abs/checkout",
-                              "env": {"PYTHONPATH": "/abs/checkout"}},
     "clustered -IBm": {"command": PY, "args": ["-IBm", "x"],
                        "cwd": "/abs/checkout"},
     "absolute script": {"command": PY,
@@ -240,20 +241,32 @@ def _resolve_module_origin(module: str, cwd: str | None,
 def test_example_isolated_form_loads_the_checkout_from_a_planted_project(
         planted_project):
     """The CLI ignores the per-server cwd and starts the server in the
-    project; the example's -P plus absolute PYTHONPATH must still load the
-    trusted checkout's module, not the plant."""
+    project; the example's -I plus absolute script must still load the
+    trusted checkout's equipa package, not the plant, even with a planted
+    PYTHONPATH (task 3134 moved the example from -P + PYTHONPATH to -I)."""
     example = json.loads((REPO_ROOT / "mcp_config.example.json").read_text(
         encoding="utf-8"))["mcpServers"]["equipa"]
-    flags = tuple(arg for arg in example["args"][:example["args"].index("-m")])
-    assert flags == ("-P",)
+    assert example["args"][0] == "-I"
+    script = example["args"][1].replace("/path/to/equipa-checkout",
+                                        str(REPO_ROOT))
+    assert script == str(REPO_ROOT / "equipa" / "mcp_server.py")
+    (planted_project / "equipa" / "config.py").write_text(PLANTED_SERVER,
+                                                          encoding="utf-8")
 
-    planted = _resolve_module_origin("equipa.mcp_server", str(planted_project),
+    # The hazard is real: resolved from the project, the plant is found.
+    planted = _resolve_module_origin("equipa.config", str(planted_project),
                                      env={"PYTHONPATH": str(REPO_ROOT)})
-    assert planted == str(planted_project / "equipa" / "mcp_server.py")
-    isolated = _resolve_module_origin("equipa.mcp_server", str(planted_project),
-                                      flags=flags,
-                                      env={"PYTHONPATH": str(REPO_ROOT)})
-    assert isolated == str(REPO_ROOT / "equipa" / "mcp_server.py")
+    assert planted == str(planted_project / "equipa" / "config.py")
+
+    initialize = json.dumps({"jsonrpc": "2.0", "id": 1,
+                             "method": "initialize", "params": {}}) + "\n"
+    completed = subprocess.run(
+        [sys.executable, "-I", script], cwd=planted_project, input=initialize,
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(planted_project),
+             "EQUIPA_MCP_TOKEN": FAKE_TOKEN})
+    assert '"serverInfo"' in completed.stdout, completed.stderr
+    assert not (planted_project / "planted_ran.txt").exists()
 
 
 def test_mcp_dispatch_child_resolves_equipa_cli_from_the_trusted_checkout(

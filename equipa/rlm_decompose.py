@@ -23,6 +23,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
 from equipa.config import get_configured_model
 # The claude -p calls below embed project files in their prompt, so they get
 # the allowlisted agent env like every other agent CLI (P2A-07).
@@ -267,6 +268,9 @@ def _run_sub_query(
         "--model", model,
         "--max-turns", str(MAX_SUB_QUERY_TURNS),
         "--no-session-persistence",
+        # IR-01: cwd is the agent-writable project; ignore its .claude/
+        # settings, CLAUDE.md and .mcp.json (see equipa/cli_isolation.py).
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
     try:
@@ -599,6 +603,8 @@ def _call_outer_agent(
         "--model", model,
         "--max-turns", "1",
         "--no-session-persistence",
+        # IR-01: same as sub_query; the cwd is the project directory.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
     try:
