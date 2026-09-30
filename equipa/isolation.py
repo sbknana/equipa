@@ -44,6 +44,7 @@ import copy
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -122,6 +123,11 @@ _UNIT_NAME_RE = re.compile(
     rf"^{re.escape(UNIT_PREFIX)}(\d+)-(\d+)-([0-9a-f]+)\.scope$")
 # Characters that end a sudoers command token or need escaping there.
 _SUDOERS_UNSAFE = frozenset(' \t\n,:=\\"#!*?[]()')
+# The orchestrator writes review artifacts here (loops.ARTIFACTS_DIR_NAME);
+# always protected on import, whatever carry_ignored_paths says.
+ARTIFACTS_DIR = ".equipa-artifacts"
+_SYMLINK_MODE = b"120000"
+_MAX_CHANGED_SYMLINKS = 1000
 
 
 class AgentIsolationError(RuntimeError):
@@ -869,14 +875,86 @@ def copy_untrusted_file(source: str, destination: Path, max_bytes: int) -> None:
                 out.write(chunk)
 
 
+def _tree_symlinks(worktree_path: str, treeish: str) -> dict[str, str]:
+    """{path: blob id} of every symbolic link in ``treeish``."""
+    result = git_run(["ls-tree", "-r", "-z", "--full-tree", treeish],
+                     cwd=worktree_path, timeout=_BUNDLE_TIMEOUT_SECONDS,
+                     text=False)
+    if result.returncode != 0:
+        raise AgentIsolationError(
+            f"git ls-tree failed in {worktree_path}: "
+            f"{result.stderr.decode('utf-8', 'replace').strip()[-500:]}")
+    links: dict[str, str] = {}
+    for record in result.stdout.split(b"\0"):
+        meta, _tab, path = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if len(fields) == 3 and fields[0] == _SYMLINK_MODE:
+            links[path.decode("utf-8", "surrogateescape")] = fields[2].decode()
+    return links
+
+
+def _link_escapes(path: str, target: str) -> bool:
+    """True for an absolute target or one that leaves the working tree."""
+    if target.startswith("/"):
+        return True
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+    return resolved == ".." or resolved.startswith("../")
+
+
+def check_imported_links(worktree: WorktreeInfo, state: str,
+                         carry_paths: Sequence[str]) -> None:
+    """Refuse agent state whose symbolic links would redirect the
+    orchestrator's own writes (review ISO-04).
+
+    ``read-tree -u --reset`` replaces the orchestrator's ignored
+    ``.equipa-artifacts/`` with whatever the agent recorded there, and the
+    orchestrator later writes review files into it as its own user. So no
+    link may sit at, above or below a carried path. Anywhere else, a link
+    the agent added or changed may not be absolute or point out of the
+    tree; links already in the dispatch base are the project's own.
+    """
+    protected = [path.strip("/") for path in
+                 dict.fromkeys((ARTIFACTS_DIR, *carry_paths))]
+    state_links = _tree_symlinks(worktree.path, state)
+    base_links = _tree_symlinks(worktree.path, worktree.base_sha)
+    changed: list[tuple[str, str]] = []
+    for path, blob in state_links.items():
+        for carried in protected:
+            if (path == carried or carried.startswith(path + "/")
+                    or path.startswith(carried + "/")):
+                raise AgentIsolationError(
+                    f"the agent's export makes {path} a symbolic link; the "
+                    f"orchestrator writes into {carried}, so this is refused")
+        if base_links.get(path) != blob:
+            changed.append((path, blob))
+    if len(changed) > _MAX_CHANGED_SYMLINKS:
+        raise AgentIsolationError(
+            f"the agent's export adds or changes {len(changed)} symbolic "
+            f"links (limit {_MAX_CHANGED_SYMLINKS})")
+    for path, blob in changed:
+        result = git_run(["cat-file", "blob", blob], cwd=worktree.path,
+                         text=False)
+        if result.returncode != 0:
+            raise AgentIsolationError(f"cannot read the link {path} in the "
+                                      f"agent's export")
+        target = result.stdout.decode("utf-8", "surrogateescape")
+        if _link_escapes(path, target):
+            raise AgentIsolationError(
+                f"the agent's export adds a symbolic link {path} -> {target} "
+                f"that points outside the worktree")
+
+
 def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
-                        max_bytes: int) -> str:
+                        max_bytes: int,
+                        carry_paths: Sequence[str] = ()) -> str:
     """Bring the agent's exported work into the task worktree.
 
     Only the task branch moves, and only from the dispatch base
     (compare-and-swap). The working tree is then set to the exported state
     and the index to the new branch tip, so the agent's uncommitted and
-    carried files look exactly as the agent left them. Returns the new tip.
+    carried files look exactly as the agent left them. Symbolic links that
+    would redirect the orchestrator's writes refuse the import first
+    (:func:`check_imported_links`). Returns the new tip.
     """
     private_dir = Path(tempfile.mkdtemp(prefix="equipa-isolation-import-"))
     import_ref = f"refs/equipa/isolation-import/{unit}"
@@ -900,6 +978,7 @@ def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
                 raise AgentIsolationError("the exported state commit has an "
                                           "unexpected shape")
             state, tip = commits[0], commits[1]
+            check_imported_links(worktree, state, carry_paths)
             _git(["update-ref", "-m", "equipa isolation: import agent work",
                   worktree.branch_ref, tip, worktree.base_sha], worktree.path)
             _git(["read-tree", "-u", "--reset", state], worktree.path)
@@ -1474,7 +1553,8 @@ class IsolatedAgent:
         self.imported = True
         try:
             tip = import_agent_export(self.worktree, self.unit, self.export_path,
-                                      self.settings.max_export_bytes)
+                                      self.settings.max_export_bytes,
+                                      self.settings.carry_ignored_paths)
         except AgentIsolationError as exc:
             logger.error(
                 "[Isolation] the work of agent %s was NOT imported into %s: "

@@ -638,3 +638,102 @@ def test_verify_script_checks_the_per_unit_home(tmp_path: Path) -> None:
     assert any(line.startswith("FAIL agent can write its passwd HOME")
                for line in lines)
     assert "FAIL GIT_CONFIG_GLOBAL '' is not the unit's own file" in lines
+
+
+# --- ISO-04: imported state cannot redirect the orchestrator's writes --------------------
+
+
+def _export_clone(repo: dict[str, Path], tmp_path: Path, prepare) -> tuple:
+    """Build a clone, let ``prepare(clone)`` change it, export it, and
+    return what the import needs."""
+    settings = _settings(tmp_path)
+    info, handoff, session = _session_for(repo, tmp_path, settings)
+    prepare(session.repo_dir)
+    session.export()
+    session.discard()
+    return info, handoff, settings
+
+
+def _import(info, handoff, settings) -> str:
+    # The artifacts directory is protected whatever the carry paths are.
+    return isolation.import_agent_export(
+        info, UNIT, handoff.export_path, settings.max_export_bytes)
+
+
+def test_import_refuses_a_link_above_a_configured_carry_path(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    def plant(clone: Path) -> None:
+        (clone / "notes").symlink_to(str(tmp_path))
+
+    info, handoff, settings = _export_clone(repo, tmp_path, plant)
+    with pytest.raises(isolation.AgentIsolationError, match="writes into notes/x"):
+        isolation.import_agent_export(info, UNIT, handoff.export_path,
+                                      settings.max_export_bytes, ["notes/x"])
+
+
+@pytest.mark.parametrize("link, target", [
+    (".equipa-artifacts", "OUTSIDE"),
+    (".equipa-artifacts/SECURITY-REVIEW-1.md", "OUTSIDE/review.md"),
+])
+def test_import_refuses_links_at_or_below_the_artifacts_dir(
+        repo: dict[str, Path], tmp_path: Path, link: str, target: str) -> None:
+    outside = tmp_path / "operator-notes"
+    outside.mkdir()
+    worktree = repo["worktree"]
+    (worktree / ".equipa-artifacts").mkdir()
+    (worktree / ".equipa-artifacts" / "PLAN-1.md").write_text("orchestrator\n")
+    base = _git("rev-parse", "HEAD", cwd=worktree)
+
+    def plant(clone: Path) -> None:
+        shutil.rmtree(clone / ".equipa-artifacts", ignore_errors=True)
+        path = clone / link
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target.replace("OUTSIDE", str(outside)))
+
+    exported = _export_clone(repo, tmp_path, plant)
+    with pytest.raises(isolation.AgentIsolationError, match="symbolic link"):
+        _import(*exported)
+    artifacts = worktree / ".equipa-artifacts"
+    assert artifacts.is_dir() and not artifacts.is_symlink()
+    assert (artifacts / "PLAN-1.md").read_text() == "orchestrator\n"
+    assert _git("rev-parse", "forge-task-1", cwd=repo["main"]) == base
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("target", ["/etc", "../../outside", "a/../../.."])
+def test_import_refuses_new_links_out_of_the_tree(
+        repo: dict[str, Path], tmp_path: Path, target: str) -> None:
+    def plant(clone: Path) -> None:
+        (clone / "sub").mkdir()
+        (clone / "sub" / "link").symlink_to(target)
+
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="outside the worktree"):
+        _import(*_export_clone(repo, tmp_path, plant))
+
+
+def test_import_accepts_in_tree_links_and_links_from_the_base(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    worktree = repo["worktree"]
+    (worktree / "system-python").symlink_to("/usr/bin/python3")
+    _git("add", "system-python", cwd=worktree)
+    _git("commit", "-q", "-m", "project's own absolute link", cwd=worktree)
+
+    def plant(clone: Path) -> None:
+        (clone / "docs").mkdir()
+        (clone / "docs" / "latest").symlink_to("../README")
+        (clone / ".equipa-artifacts").mkdir()
+        (clone / ".equipa-artifacts" / "SECURITY-REVIEW-1.md").write_text("ok\n")
+
+    _import(*_export_clone(repo, tmp_path, plant))
+    assert os.readlink(worktree / "docs" / "latest") == "../README"
+    assert os.readlink(worktree / "system-python") == "/usr/bin/python3"
+    assert (worktree / ".equipa-artifacts" / "SECURITY-REVIEW-1.md").is_file()
+
+
+def test_link_escape_detection() -> None:
+    assert isolation._link_escapes("a/b", "/abs")
+    assert isolation._link_escapes("a/b", "../../x")
+    assert isolation._link_escapes("top", "..")
+    assert not isolation._link_escapes("a/b", "../x")
+    assert not isolation._link_escapes("a/b", "c/./d")
