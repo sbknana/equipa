@@ -176,15 +176,29 @@ ACCEPTED = {
                        "cwd": "/abs/checkout"},
     "absolute script": {"command": PY,
                         "args": ["-I", "/abs/checkout/equipa/mcp_server.py"]},
-    "uvx package": {"command": "/opt/fake/bin/uvx",
+    # {installed} is an installed fake: since task 3138 (RR-02) a command
+    # that does not exist is refused.
+    "uvx package": {"command": "{installed}/uvx",
                     "args": ["mcp-server-sqlite", "--db-path", "/abs/t.db"]},
     "node absolute script": {"command": "/usr/bin/node",
                              "args": ["/abs/dist/index.js", "--port", "8080"]},
 }
 
 
+def _installed(tmp_path: Path, name: str) -> Path:
+    """An executable file named ``name`` outside every project directory."""
+    exe = tmp_path / "installed" / name
+    exe.parent.mkdir(exist_ok=True)
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
 def test_absolute_isolated_server_is_accepted(tmp_path, server):
+    installed = _installed(tmp_path, "uvx").parent
+    server = {**server,
+              "command": server["command"].format(installed=installed)}
     config = _write_config(tmp_path, {"srv": {"type": "stdio", **server}})
     agent_runner._check_mcp_servers(config)
 
@@ -195,8 +209,27 @@ def test_remote_server_is_not_checked_as_a_process(tmp_path):
     agent_runner._check_mcp_servers(config)
 
 
-def test_shipped_example_config_passes_the_check():
-    agent_runner._check_mcp_servers(REPO_ROOT / "mcp_config.example.json")
+def test_shipped_example_config_passes_the_check(tmp_path):
+    """Every server shape the example ships passes, once each placeholder
+    command (``/path/to/uvx``) names an installed program: since task 3138
+    (RR-02) a command that does not exist is refused."""
+    example = json.loads((REPO_ROOT / "mcp_config.example.json").read_text(
+        encoding="utf-8"))
+    for server in example["mcpServers"].values():
+        command = server.get("command", "")
+        if command.startswith("/path/to/"):
+            server["command"] = str(_installed(tmp_path,
+                                               Path(command).name))
+    config = tmp_path / "mcp_config.example.json"
+    config.write_text(json.dumps(example), encoding="utf-8")
+    agent_runner._check_mcp_servers(config)
+
+
+def test_shipped_example_placeholder_command_is_refused_until_installed():
+    """The unfilled example is refused, naming the placeholder."""
+    with pytest.raises(agent_runner.AgentDispatchRefused,
+                       match="/path/to/uvx.*does not exist"):
+        agent_runner._check_mcp_servers(REPO_ROOT / "mcp_config.example.json")
 
 
 def test_shipped_example_equipa_server_is_isolated():

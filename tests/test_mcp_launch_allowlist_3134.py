@@ -50,7 +50,7 @@ def layout(tmp_path: Path) -> dict[str, Path]:
     trusted = tmp_path / "opt" / "srv"
     (trusted / "bin").mkdir(parents=True)
     for exe in (project / "bin" / "server", project / ".venv" / "bin" / "python3",
-                trusted / "bin" / "mcp-server"):
+                trusted / "bin" / "mcp-server", trusted / "bin" / "uvx"):
         exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
     (trusted / "notexec").write_text("data", encoding="utf-8")
@@ -195,8 +195,11 @@ ACCEPTED = {
     "node absolute script": {"command": NODE, "args": ["/abs/s.js", "--port", "1"]},
     "node heap limit": {"command": NODE,
                         "args": ["--max-old-space-size=4096", "/abs/s.js"]},
-    "uvx package": {"command": "/opt/fake/bin/uvx",
+    # An installed uvx: since task 3138 (RR-02) a missing command is refused.
+    "uvx package": {"command": "{trusted}/bin/uvx",
                     "args": ["mcp-server-sqlite", "--db-path", "/abs/t.db"]},
+    # The operator lists it under mcp_trusted_executables (task 3138, RR-02:
+    # any other program is refused).
     "own executable": {"command": "{trusted}/bin/mcp-server",
                        "args": ["--stdio"], "env": {"LOG_LEVEL": "info"}},
     "python unbuffered env": {"command": PY, "args": ["-I", "/abs/s.py"],
@@ -205,7 +208,10 @@ ACCEPTED = {
 
 
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
-def test_allowlisted_launch_is_accepted(layout, server):
+def test_allowlisted_launch_is_accepted(layout, server, monkeypatch):
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config", {
+        agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: [
+            str(layout["trusted"] / "bin" / "mcp-server")]})
     _check(layout, _fill(server, layout))
 
 

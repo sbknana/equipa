@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import filecmp
+import functools
 import hashlib
 import json
 import logging
@@ -177,6 +179,7 @@ from equipa.cli_isolation import (
 )
 from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
+    get_active_dispatch_config,
     get_configured_model,
     get_persistent_retry_max_attempts,
     is_feature_enabled,
@@ -767,7 +770,29 @@ _MCP_REFUSED_LAUNCHERS = frozenset({
     "wish", "rscript", "julia", "osascript", "dotnet", "mono", "erl",
     "elixir", "iex", "mix", "gradle", "mvn", "sbt", "scala", "kotlin",
     "groovy", "swift",
+    # RR-02: more programs that run the program named in their arguments
+    # (setarch x86_64 python3 -m srv), and script interpreters (awk -f).
+    "setarch", "linux", "prlimit", "setpriv", "systemd-run", "sg", "newgrp",
+    "pkexec", "runcon", "capsh", "xvfb-run", "fakeroot", "fakechroot",
+    "eatmydata", "numactl", "catchsegv", "unbuffer", "expect", "faketime",
+    "torsocks", "proxychains", "chpst", "daemonize", "start-stop-daemon",
+    "cpulimit", "dbus-launch", "dbus-run-session", "screen", "tmux", "ssh",
+    "parallel", "entr", "find", "awk", "gawk", "mawk", "nawk", "sed",
+    "rbash", "ash", "yash", "posh", "lksh", "oksh", "loksh", "pdksh",
+    "elvish", "nu", "xonsh",
 })
+# Shells, named anywhere in the refused set above or in /etc/shells. A
+# renamed copy or hard link of one is found by comparing the binary itself
+# (_is_shell_binary).
+_ETC_SHELLS = Path("/etc/shells")
+_STANDARD_SHELL_PATHS = ("/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh",
+                         "/bin/ksh", "/usr/bin/zsh", "/usr/bin/fish",
+                         "/bin/busybox")
+# dispatch_config.json key: absolute paths of MCP server executables the
+# operator trusts, beyond python -I, node and uvx (RR-02).
+MCP_TRUSTED_EXECUTABLES_KEY = "mcp_trusted_executables"
+# uvx options that install local code: --with-editable always does.
+_UVX_REFUSED_OPTIONS = frozenset({"--with-editable"})
 # Server env variables that make an interpreter or the dynamic loader run
 # extra code (IR-03).
 _MCP_REFUSED_ENV = frozenset({
@@ -804,17 +829,97 @@ def _launcher_stem(command: str) -> str:
     return re.sub(r"[0-9.]*(?:-(?:dbg|debug))?$", "", name) or name
 
 
+@functools.lru_cache(maxsize=1)
+def _known_shell_binaries() -> tuple[str, ...]:
+    """Resolved paths of the shells installed here (/etc/shells + standard)."""
+    candidates = set(_STANDARD_SHELL_PATHS)
+    try:
+        for line in _ETC_SHELLS.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("/"):
+                candidates.add(line)
+    except OSError:
+        pass  # no /etc/shells: the standard paths still apply
+    return tuple(sorted({os.path.realpath(path) for path in candidates
+                         if os.path.isfile(path)}))
+
+
+def _is_shell_binary(path: str) -> bool:
+    """True when ``path`` is a shell: named like an installed shell, or the
+    same file as one, or a byte-identical copy (a renamed dash)."""
+    names = {os.path.basename(shell) for shell in _known_shell_binaries()}
+    if {os.path.basename(path), os.path.basename(os.path.realpath(path))} & names:
+        return True
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    for shell in _known_shell_binaries():
+        try:
+            if os.path.samefile(path, shell) or (
+                    os.path.getsize(shell) == size
+                    and filecmp.cmp(path, shell, shallow=False)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _is_dynamic_loader(path: str) -> bool:
+    """ld.so / ld-linux-x86-64.so.2 / ld-musl-*.so.1: runs its argument."""
+    return any(re.fullmatch(r"ld[\w.-]*\.so(?:\.\d+)*", os.path.basename(name))
+               for name in (path, os.path.realpath(path)))
+
+
 def _launcher_kind(command: str) -> str:
-    """"python", "node", "refused" or "executable", judged on the name as
-    written AND the resolved target (a symlink named srv -> python3)."""
+    """"refused", "python", "node", "uvx" or "executable", judged on the name
+    as written AND the resolved target (a symlink named srv -> python3), and
+    for shells on the binary itself (a renamed copy of dash is a shell)."""
     stems = {_launcher_stem(command), _launcher_stem(os.path.realpath(command))}
+    if (stems & _MCP_REFUSED_LAUNCHERS or _is_dynamic_loader(command)
+            or _is_shell_binary(command)):
+        return "refused"
     if stems & {"python", "pypy"}:
         return "python"
     if stems & {"node", "nodejs"}:
         return "node"
-    if stems & _MCP_REFUSED_LAUNCHERS:
-        return "refused"
+    if "uvx" in stems:
+        return "uvx"
     return "executable"
+
+
+def _trusted_mcp_executables() -> set[str]:
+    """Resolved paths listed under mcp_trusted_executables (RR-02).
+
+    An unreadable config or a malformed entry trusts nothing more.
+    """
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("cannot read %s from the dispatch config: %s",
+                       MCP_TRUSTED_EXECUTABLES_KEY, exc)
+        return set()
+    entries = config.get(MCP_TRUSTED_EXECUTABLES_KEY, [])
+    if not isinstance(entries, list):
+        logger.warning("%s must be a list of absolute paths; ignored",
+                       MCP_TRUSTED_EXECUTABLES_KEY)
+        return set()
+    return {os.path.realpath(entry) for entry in entries
+            if isinstance(entry, str) and os.path.isabs(entry)}
+
+
+def _arg_values(arg: str) -> list[str]:
+    """``arg``, plus the value of an ``--opt=value`` argument, so a path
+    hidden behind ``=`` is checked like a plain one (RR-02)."""
+    if arg.startswith("-") and "=" in arg:
+        return [arg, arg.split("=", 1)[1]]
+    return [arg]
+
+
+def _is_db_path_value(args: list[str], index: int) -> bool:
+    """The data file of --db-path, which _check_mcp_db_path owns."""
+    return (args[index].startswith("--db-path=")
+            or (index > 0 and args[index - 1] == "--db-path"))
 
 
 def _python_invocation(
@@ -918,22 +1023,41 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path,
     if kind == "refused":
         raise refuse(
             f"is started through {os.path.basename(command)!r}, a wrapper, "
-            f"shell, runtime or package runner that resolves code the check "
-            f"cannot verify",
+            f"shell, loader, runtime or package runner that resolves code "
+            f"the check cannot verify",
             "Run the server's own executable, an absolute python -I with an "
             "absolute script, or an absolute node with an absolute script.")
+    # RR-02: a command that does not exist yet is whatever is put there
+    # later; none of the checks below could look at it.
+    if not os.path.exists(command):
+        raise refuse(f"has the command {command!r}, which does not exist",
+                     "Install the server first and point at its executable.")
+    if not (os.path.isfile(command) and os.access(command, os.X_OK)):
+        raise refuse(f"has the command {command!r}, which is not an "
+                     f"executable file", "Point it at the server executable.")
     if kind == "python":
         _check_python_launch(args, cwd, refuse, refuse_inside_project)
     elif kind == "node":
         _check_node_launch(args, refuse, refuse_inside_project)
-    elif os.path.lexists(command) and not (
-            os.path.isfile(command) and os.access(command, os.X_OK)):
-        raise refuse(f"has the command {command!r}, which is not an "
-                     f"executable file", "Point it at the server executable.")
-    for arg in args:
-        if _looks_like_relative_path(arg):
-            raise refuse(f"has the relative path argument {arg!r}",
-                         "Use an absolute path.")
+    elif kind == "uvx":
+        _check_uvx_launch(args, refuse, refuse_inside_project)
+    elif os.path.realpath(command) not in _trusted_mcp_executables():
+        # RR-02: a true allowlist. Any other program may run the program in
+        # its arguments (setarch, prlimit, ld.so, awk -f ...), and a list of
+        # such programs is never complete.
+        raise refuse(
+            f"runs {command!r}, which is not an allowlisted MCP server "
+            f"executable",
+            f"Run it as an absolute python -I or node script, through uvx, "
+            f"or add its absolute path to \"{MCP_TRUSTED_EXECUTABLES_KEY}\" "
+            f"in dispatch_config.json if it is the server's own program.")
+    for index, arg in enumerate(args):
+        for value in _arg_values(arg):
+            if _looks_like_relative_path(value):
+                raise refuse(f"has the relative path argument {arg!r}",
+                             "Use an absolute path.")
+            if os.path.isabs(value) and not _is_db_path_value(args, index):
+                refuse_inside_project("argument", value)
 
 
 def _check_python_launch(args: list[str], cwd: str | None, refuse: Any,
@@ -994,6 +1118,75 @@ def _check_node_launch(args: list[str], refuse: Any,
         raise refuse(f"runs the relative node script {script!r}",
                      "Use an absolute script path.")
     refuse_inside_project("script", script)
+
+
+# uvx options whose value is a local file or directory (RR-02).
+_UVX_PATH_OPTIONS = frozenset({
+    "--directory", "--project", "--config-file", "--env-file",
+    "--with-requirements", "--constraints", "--overrides",
+    "--build-constraints", "--find-links", "--cache-dir", "--python", "-p",
+})
+# uvx options whose value is a package: a name, or a local path or file: URL.
+_UVX_PACKAGE_OPTIONS = frozenset({"--from", "--with"})
+
+
+def _is_path_like(value: str) -> bool:
+    return (value in (".", "..") or value.startswith(("/", "./", "../", "~"))
+            or "/" in value)
+
+
+def _local_package_paths(spec: str) -> list[str]:
+    """Local paths a uvx package spec installs from: ``.``, ``./srv``,
+    ``/abs/dir``, ``srv @ ./dir``, ``file:///abs/dir``, ``x.whl``.
+
+    A package name (``mcp-server-sqlite==0.6``) or a remote URL gives none.
+    """
+    paths = [match.group(1) for match in
+             re.finditer(r"file:(?://(?:localhost)?)?([^\s#?]+)", spec)]
+    for part in spec.split("@"):
+        part = part.strip()
+        if part and "://" not in part and not part.startswith("file:") and (
+                _is_path_like(part)
+                or part.endswith((".whl", ".tar.gz", ".zip"))):
+            paths.append(part)
+    return paths
+
+
+def _check_uvx_launch(args: list[str], refuse: Any,
+                      refuse_inside_project: Any) -> None:
+    """uvx installs a package and runs it (RR-02).
+
+    Refused: ``--with-editable`` (it always installs a local directory), and
+    ``--from`` / ``--with`` / path options naming a relative path, which
+    resolves in the agent-writable project directory, or a path inside a
+    project. Every argument is scanned, the tool's own too: the tool name
+    cannot be told from an option value without uvx's option table.
+    """
+    for index, arg in enumerate(args):
+        option, has_value, attached = arg.partition("=")
+        if not option.startswith("-"):
+            continue
+        if option in _UVX_REFUSED_OPTIONS:
+            raise refuse(f"passes uvx {option}, which installs a local "
+                         f"directory an agent can write",
+                         "Install the server from a package index, or from "
+                         "an absolute path outside every project directory.")
+        value = attached if has_value else (
+            args[index + 1] if index + 1 < len(args) else "")
+        if option in _UVX_PACKAGE_OPTIONS:
+            paths = _local_package_paths(value)
+        elif option in _UVX_PATH_OPTIONS:
+            paths = [value] if _is_path_like(value) else []
+        else:
+            continue
+        for path in paths:
+            expanded = os.path.expanduser(path)
+            if not os.path.isabs(expanded):
+                raise refuse(f"passes uvx {option} {value!r}, a path relative "
+                             f"to the project directory",
+                             "Use a package from an index, or an absolute "
+                             "path outside every project directory.")
+            refuse_inside_project(f"uvx {option} path", expanded)
 
 
 def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
