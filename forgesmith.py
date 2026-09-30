@@ -362,10 +362,18 @@ def extract_lessons(runs, cfg):
         if info["count"] < 2:
             continue
 
-        # Check if lesson already exists
+        # Reject mode: a signature that matches an injection pattern yields
+        # no lesson at all (the sanitizer logs the reason).
+        safe_sig = sanitize_error_signature(sig)
+        if not safe_sig:
+            continue
+
+        # Check if lesson already exists. Signatures are stored sanitized
+        # (< and > escaped); older rows may hold the raw form, so match both.
         existing = conn.execute(
-            "SELECT id, times_seen FROM lessons_learned WHERE error_signature = ?",
-            (sig,)
+            "SELECT id, times_seen FROM lessons_learned "
+            "WHERE error_signature IN (?, ?)",
+            (safe_sig, sig)
         ).fetchone()
 
         if existing:
@@ -382,7 +390,6 @@ def extract_lessons(runs, cfg):
             if lesson and validate_lesson_structure(lesson):
                 # Sanitize the lesson content before storage
                 lesson = sanitize_lesson_content(lesson)
-                safe_sig = sanitize_error_signature(sig)
                 cursor = conn.execute(
                     """INSERT INTO lessons_learned
                        (role, error_type, error_signature, lesson, times_seen)
