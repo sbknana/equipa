@@ -235,3 +235,99 @@ def test_scaled_budget_lets_the_same_run_finish(tmp_path):
     set_active_dispatch_config({"early_term_read_budget_scale": 2})
     result = _run(tmp_path, _reads(20))
     assert not result.get("early_terminated"), result.get("early_term_reason")
+
+
+# --- review follow-ups: fail-closed paths the first version did not pin -----
+
+def test_flagged_command_with_no_tool_result_kills(tmp_path, settings):
+    path, _ = settings
+    result = _run(tmp_path, [_assistant_bash("t1", FLAGGED_CMD), FINAL],
+                  ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert "no tool_result" in result["early_term_reason"]
+
+
+def test_executed_verdict_stops_reading_the_stream(tmp_path, settings):
+    """After an EXECUTED verdict nothing later in the stream is processed."""
+    path, _ = settings
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", "ran"),
+        _assistant_read("r1", "/tmp/later.py"),
+        _result("r1", "later"),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert result["num_turns"] == 1
+
+
+def test_exit_code_shaped_forgery_kills(tmp_path, settings):
+    """What a command that RAN and printed the refusal text really looks like."""
+    path, hook_command = settings
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", "Exit code 1\n" + _refusal(hook_command), is_error=True),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert "EXECUTED" in result["early_term_reason"]
+
+
+def test_hook_at_another_path_is_not_trusted(tmp_path):
+    copy = tmp_path / PRETOOLUSE_HOOK_SCRIPT.name
+    copy.write_text(PRETOOLUSE_HOOK_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    payload = _pretooluse_settings_payload(copy, sys.executable)
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _pretooluse_hook_command(["claude", "--settings", str(path)]) is None
+    hook_command = payload["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", _refusal(hook_command), is_error=True),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+
+
+def test_gate_failing_its_canary_means_kill_on_sight(tmp_path, settings, monkeypatch):
+    path, hook_command = settings
+    monkeypatch.setattr(agent_runner, "_gate_canary_ok", lambda cmd: False)
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", _refusal(hook_command), is_error=True),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert "EXECUTED" not in result["early_term_reason"]  # killed on sight
+    assert result["num_turns"] == 1
+
+
+def test_real_gate_passes_its_canary(settings):
+    _, hook_command = settings
+    assert agent_runner._gate_canary_ok(hook_command)
+    assert not agent_runner._gate_canary_ok("/bin/true")
+
+
+def test_gate_changed_mid_run_fails_closed(tmp_path, settings, monkeypatch):
+    path, hook_command = settings
+    prints = iter(["aaa", "bbb"])
+    monkeypatch.setattr(agent_runner, "_gate_fingerprint", lambda: next(prints, "zzz"))
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", _refusal(hook_command), is_error=True),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert "changed during the run" in result["early_term_reason"]
+
+
+def test_slow_check_means_kill_on_sight(tmp_path, settings, monkeypatch):
+    path, hook_command = settings
+    monkeypatch.setattr(agent_runner, "_SLOW_CHECK_SECONDS", -1.0)
+    result = _run(tmp_path, [
+        _assistant_bash("t1", FLAGGED_CMD),
+        _result("t1", _refusal(hook_command), is_error=True),
+        FINAL,
+    ], ["--settings", str(path)])
+    assert result.get("early_terminated")
+    assert result["num_turns"] == 1
