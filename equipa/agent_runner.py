@@ -641,6 +641,12 @@ def _check_mcp_servers(mcp_config: str | os.PathLike[str]) -> None:
 
 # Interpreters whose first non-option argument is a script path.
 _MCP_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# JavaScript package runners and package managers. Started in the project
+# they resolve code from it: npx runs <cwd>/node_modules/.bin/<name> when the
+# project provides one, and .npmrc, .yarnrc.yml (yarnPath) and bunfig.toml
+# (preload) in the cwd are read as configuration.
+_MCP_PACKAGE_RUNNERS = frozenset({"npx", "pnpx", "bunx", "npm", "pnpm",
+                                  "yarn", "bun"})
 # Python options that take a value (from ``python --help``).
 _PYTHON_VALUE_OPTIONS = frozenset("cmWX")
 _PYTHON_LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs"})
@@ -731,6 +737,14 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
     if basename == "env":
         raise refuse("is started through env(1), which resolves its target "
                      "through PATH", 'Use an absolute command and the "env" key.')
+    runner = basename.lower().removesuffix(".exe").removesuffix(".cmd")
+    if runner in _MCP_PACKAGE_RUNNERS:
+        raise refuse(
+            f"is started through the package runner {basename!r}, which "
+            f"resolves the package and its configuration in the project "
+            f"first (node_modules/.bin, .npmrc, .yarnrc.yml, bunfig.toml)",
+            "Install the server outside the project and run its entry script "
+            "by absolute path with an absolute node.")
     if _is_python_command(command):
         _check_python_launch(server, args, cwd, refuse)
     elif basename in _MCP_SHELLS:

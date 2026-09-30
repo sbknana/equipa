@@ -144,6 +144,17 @@ REFUSED = {
     "dot-slash argument": {"command": "/opt/fake/bin/uvx",
                            "args": ["--from", "./pkg", "srv"]},
     "non-string args": {"command": PY, "args": ["-I", 3]},
+    # npx started in the project runs <project>/node_modules/.bin/<name>
+    # when the project provides it (probed with a planted local package).
+    "npx scoped package": {"command": "/usr/bin/npx",
+                           "args": ["-y", "@scope/server-files", "/abs/dir"]},
+    "npm exec": {"command": "/usr/bin/npm",
+                 "args": ["exec", "--yes", "server-files"]},
+    "pnpm dlx": {"command": "/opt/fake/bin/pnpm", "args": ["dlx", "srv"]},
+    "yarn dlx": {"command": "/opt/fake/bin/yarn", "args": ["dlx", "srv"]},
+    "bunx": {"command": "/opt/fake/bin/bunx", "args": ["srv"]},
+    "bun reads bunfig.toml": {"command": "/opt/fake/bin/bun",
+                              "args": ["/abs/srv.ts"]},
 }
 
 
@@ -166,8 +177,6 @@ ACCEPTED = {
                         "args": ["-I", "/abs/checkout/equipa/mcp_server.py"]},
     "uvx package": {"command": "/opt/fake/bin/uvx",
                     "args": ["mcp-server-sqlite", "--db-path", "/abs/t.db"]},
-    "npx scoped package": {"command": "/usr/bin/npx",
-                           "args": ["-y", "@scope/server-files", "/abs/dir"]},
     "node absolute script": {"command": "/usr/bin/node",
                              "args": ["/abs/dist/index.js", "--port", "8080"]},
 }
