@@ -54,6 +54,7 @@
         "gepa_ab_testing": false,
         "security_review": true,
         "bash_security_pretooluse": false,
+        "agent_isolation": false,
         "security_review_block_on_missing_artifact": true,
         "quality_scoring": true,
         "anti_compaction_state": true,
