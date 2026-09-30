@@ -507,6 +507,36 @@ class TestClaims:
     def test_doc_states_the_principle_and_limits(self, fact: str):
         assert fact in WORKAROUNDS_DOC.read_text(encoding="utf-8")
 
+    @pytest.mark.parametrize(
+        ("command", "expected_safe"),
+        [
+            ("grep -n '$(' f", True),
+            ('echo "\\$(x) is literal"', True),
+            ("awk '{print $(NF)}' f", True),
+            ("cd tests && pytest -q > out.txt", True),
+            ("cd /tmp/w && echo x > out.txt", True),
+            ('echo "$((1 + 2))"', True),
+            ("(( i++ ))", True),
+            # Known limit: run-time text is eval-equivalent and passes.
+            ("read v < f; (( v ))", True),
+            ("cd /etc; echo x > f", False),
+            ("cd ~ && echo x > f", False),
+            ('cd "$D" && echo x > f', False),
+            ("echo $\\\n(cmd)", False),
+            ("echo \"${X:-'$(cmd)'}\"", False),
+            ("echo $'$(cmd)'", False),
+            ("let 'a[$(cmd)]'", False),
+            ("echo \"$(( '$(cmd)' ))\"", False),
+            ("(( x == 'a' ))", False),
+        ],
+    )
+    def test_documented_examples_match_the_checker(self, command: str, expected_safe: bool):
+        doc = WORKAROUNDS_DOC.read_text(encoding="utf-8")
+        shown = command.replace("\\\n", "")
+        if "\\\n" not in command:
+            assert shown in doc, f"example not in the doc: {command!r}"
+        assert check_bash_command(command).safe is expected_safe, command
+
     def test_module_docstring_states_the_principle(self):
         doc = bash_security.__doc__ or ""
         assert "fail closed" in doc.lower()

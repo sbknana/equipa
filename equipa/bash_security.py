@@ -6,9 +6,18 @@ classifies a shell command as safe/unsafe with about two dozen checks
 whitespace, redirect targets, etc.). It is a pure classifier — it never
 runs anything itself.
 
-Quoting is read ONCE by a shared tokenizer (``_scan_shell``) that follows
-bash's parser; every quote-sensitive check reads its classification, and a
-command it cannot parse cleanly is refused (check 25) instead of guessed at.
+Quoting is read ONCE by a shared tokenizer (``_scan_shell``) and every
+quote-sensitive check reads its classification. The tokenizer is a model of
+the bash constructs it lists, not bash, and it has disagreed with bash
+before (IND3128-01/02), so the checker is built to fail closed:
+backslash-newline continuations are joined first, as bash does; a command
+the tokenizer cannot parse to a clean end is refused (check 25); and
+substitution-looking text (``$(``, ``$[``, a backtick, ``<(``, ``>(``)
+counts as live unless it is proven inert - a top-level single-quoted word,
+a ``\\$`` or ``\\``` directly inside a top-level double-quoted string, or a
+quoted heredoc body, and none of those when the command also evaluates text
+as arithmetic, which expands an array subscript again (check 26). Known
+limits are listed in docs/BASHSECURITY-WORKAROUNDS.md.
 
 What it is NOT: a permission policy or a sandbox. It looks for
 parser-confusion and substitution tricks; plainly destructive commands
@@ -133,11 +142,12 @@ MAX_COMMAND_BYTES = 16384
 # models. Words that bash reads as complete - ``$'\''`` and
 # ``"$(echo '"')"`` - left those models "inside a quote", so a substitution
 # or redirect after them was invisible to checks 8 and 10. _scan_shell
-# classifies every character ONCE, following bash's parser (quoting restarts
-# inside $(...) even within double quotes, $'...' has backslash escapes,
-# comments and heredoc bodies are not code), and the helpers below read that
-# one classification. A command it cannot parse to a clean end state is
-# refused (check 25) rather than guessed at.
+# classifies every character ONCE, modelling bash's parser for the constructs
+# it knows (quoting restarts inside $(...) even within double quotes, $'...'
+# has backslash escapes, comments and heredoc bodies are not code), and the
+# helpers below read that one classification. The model is not bash (task
+# 3133 found two more disagreements), so what it cannot parse is refused
+# (check 25) and what it cannot prove inert is treated as live (check 26).
 
 # Per-character kinds: the low four bits of a _ShellScan.kinds entry.
 _K_CODE = 1        # shell syntax: blanks and operators act here
@@ -786,13 +796,18 @@ class _ShellScanner:
 
 @functools.lru_cache(maxsize=64)
 def _scan_shell(command: str) -> _ShellScan:
-    """Classify every character of *command* the way bash parses it.
+    """Classify every character of *command* with the tokenizer's bash model.
 
     Returns per-character kinds (``_K_*`` with ``_F_*`` flag bits), the
-    heredocs and substitutions found, and ``error`` - a reason string when
-    the command does not reach a clean end state (an unterminated quote or
-    substitution, or a construct this tokenizer does not model). Every
-    quote-sensitive helper in this module reads this one classification.
+    heredocs and substitutions found, the backslash-newlines bash would
+    delete, and ``error`` - a reason string when the command does not reach
+    a clean end state (an unterminated quote or substitution, or a construct
+    this tokenizer does not model). Every quote-sensitive helper in this
+    module reads this one classification. The model is tested against bash
+    (tests/test_bash_tokenizer_3128.py) but is not bash: callers must fail
+    closed where it cannot prove text inert (_substitution_lookalikes).
+    Line continuations are NOT joined here; check_bash_command joins them
+    first (_join_line_continuations).
     """
     return _ShellScanner(command).run()
 
