@@ -1120,12 +1120,16 @@ def _check_node_launch(args: list[str], refuse: Any,
     refuse_inside_project("script", script)
 
 
-# uvx options whose value is a local file or directory (RR-02).
+# uvx options whose value is a local file or directory (RR-02); a bare name
+# there (req.txt) is relative to the project directory too.
 _UVX_PATH_OPTIONS = frozenset({
     "--directory", "--project", "--config-file", "--env-file",
     "--with-requirements", "--constraints", "--overrides",
-    "--build-constraints", "--find-links", "--cache-dir", "--python", "-p",
+    "--build-constraints", "--find-links", "--cache-dir",
 })
+# uvx options whose value is a path only when it looks like one (--python
+# 3.12 is a version).
+_UVX_MAYBE_PATH_OPTIONS = frozenset({"--python", "-p"})
 # uvx options whose value is a package: a name, or a local path or file: URL.
 _UVX_PACKAGE_OPTIONS = frozenset({"--from", "--with"})
 
@@ -1176,6 +1180,8 @@ def _check_uvx_launch(args: list[str], refuse: Any,
         if option in _UVX_PACKAGE_OPTIONS:
             paths = _local_package_paths(value)
         elif option in _UVX_PATH_OPTIONS:
+            paths = [] if "://" in value else [value]
+        elif option in _UVX_MAYBE_PATH_OPTIONS:
             paths = [value] if _is_path_like(value) else []
         else:
             continue
