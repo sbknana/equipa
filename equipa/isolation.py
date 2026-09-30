@@ -322,18 +322,40 @@ def isolation_enabled(dispatch_config: Mapping[str, Any] | None = None) -> bool:
     return is_feature_enabled(dispatch_config, FEATURE_FLAG)  # type: ignore[arg-type]
 
 
-def unisolated_spawn_refusal(purpose: str) -> str | None:
+def unisolated_spawn_refusal(
+        purpose: str,
+        remedy: str = "turn off rlm_decompose or agent_isolation") -> str | None:
     """Why ``purpose`` must not start the CLI itself, or None.
 
-    Helpers that run ``claude`` directly (RLM decomposition) would run it as
-    the orchestrator's user, outside the agent cgroup (review CT-04). With
-    isolation on they refuse instead.
+    Helpers that run ``claude`` directly (RLM decomposition, the ForgeSmith
+    GHOST scout, OPRO and SIMBA) would run it as the orchestrator's user,
+    outside the agent cgroup, on text agents wrote (reviews CT-04, ISO-06).
+    With isolation on they refuse instead.
     """
     if not isolation_enabled():
         return None
     return (f"{purpose} refused: agent_isolation is on and this path would "
             f"start the Claude CLI as the orchestrator's user outside the "
-            f"agent sandbox; turn off rlm_decompose or agent_isolation")
+            f"agent sandbox; {remedy}")
+
+
+def worktree_execution_refusal(action: str) -> str | None:
+    """Why the orchestrator must not run ``action`` in a project directory,
+    or None when agent_isolation is off.
+
+    With isolation on, the task worktree holds work imported from an
+    isolated agent. Install and build commands execute that content
+    (package.json scripts, build backends, MSBuild targets, a tracked
+    ``node_modules/.bin/tsc``), so running them as the orchestrator would run
+    agent-authored code with the orchestrator's user and sudo, outside the
+    sandbox (review ISO-01). They are refused rather than run in a scope: the
+    agent's clone has no gitignored dependency trees, so an isolated build
+    check would report every such project as broken.
+    """
+    if not isolation_enabled():
+        return None
+    return (f"{action} refused: agent_isolation is on and it would execute "
+            f"agent-written project files as the orchestrator's user")
 
 
 # --- Commands the operator installs and the orchestrator runs -------------------
