@@ -185,7 +185,7 @@ from equipa.constants import (
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
-from equipa.env_loader import build_agent_env, protect_orchestrator_process
+from equipa.env_loader import active_agent_env, protect_orchestrator_process
 from equipa.redact import redact_secrets, redact_tool_input, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
@@ -802,14 +802,7 @@ def _agent_subprocess_env() -> dict[str, str]:
     The passthrough list comes from the active dispatch config. If that
     cannot be loaded, no names are added: fewer variables, never more.
     """
-    try:
-        from equipa.config import get_active_dispatch_config
-        dispatch_config = get_active_dispatch_config()
-    except (ImportError, OSError, ValueError, TypeError, AttributeError):
-        logger.warning("dispatch config unavailable; agent env passthrough "
-                       "disabled for this run", exc_info=True)
-        dispatch_config = None
-    return build_agent_env(dispatch_config)
+    return active_agent_env()
 
 
 @contextlib.contextmanager

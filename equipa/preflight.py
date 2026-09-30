@@ -24,6 +24,10 @@ from equipa.constants import (
     PREFLIGHT_SKIP_KEYWORDS,
     PREFLIGHT_TIMEOUT,
 )
+# Install and build commands run project code (package.json scripts, setup.py
+# and build backends, MSBuild targets), often written by an agent in this very
+# dispatch, so they get the allowlisted agent env, never ours (P2A-06).
+from equipa.env_loader import active_agent_env
 from equipa.output import log
 
 # Mirrors equipa.agent_runner.OVERLOADED_OUTCOME; this module imports
@@ -57,7 +61,7 @@ async def _run_install_cmd(
     """Run an install command, log result. Returns True on success."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=cwd,
+            *cmd, cwd=cwd, env=active_agent_env(),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
@@ -158,7 +162,7 @@ async def preflight_build_check(
     log(f"  [Preflight] Detected {language} project. Running build check: {' '.join(build_cmd)}", output)
     try:
         proc = await asyncio.create_subprocess_exec(
-            *build_cmd, cwd=str(Path(project_dir)),
+            *build_cmd, cwd=str(Path(project_dir)), env=active_agent_env(),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:

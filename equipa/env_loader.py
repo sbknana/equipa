@@ -268,6 +268,25 @@ def build_agent_env(
     return env
 
 
+def active_agent_env() -> dict[str, str]:
+    """:func:`build_agent_env` for the active dispatch config.
+
+    For every orchestrator-side process that runs agent- or project-
+    controlled code: agent CLIs, and the preflight install and build
+    commands that execute project scripts (P2A-06). If the dispatch config
+    cannot be loaded, no passthrough names are added: fewer variables,
+    never more.
+    """
+    try:
+        from equipa.config import get_active_dispatch_config
+        dispatch_config = get_active_dispatch_config()
+    except (ImportError, OSError, ValueError, TypeError, AttributeError):
+        logger.warning("dispatch config unavailable; agent env passthrough "
+                       "disabled for this run", exc_info=True)
+        dispatch_config = None
+    return build_agent_env(dispatch_config)
+
+
 def _is_valid_env_key(key: str) -> bool:
     """Return True if *key* is a valid shell environment variable name."""
     if not key:
