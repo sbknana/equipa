@@ -159,7 +159,9 @@ class MergeSignalShield:
         tb: TracebackType | None,
     ) -> None:
         for signum, previous in self._previous.items():
-            signal.signal(signum, previous)
+            # None means the previous handler was not installed from Python;
+            # the closest restorable equivalent is the default action.
+            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
         self._previous.clear()
         if self.received is None:
             return

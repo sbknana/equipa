@@ -28,6 +28,7 @@ from equipa.db import get_db_connection, update_task_status
 from equipa.git_ops import _is_git_repo
 from equipa.loops import run_dev_test_loop
 from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
+from equipa.merge_safety import report_leftover_dispatch_state, shutdown_requested
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
@@ -283,7 +284,6 @@ async def run_manager_loop(
     if _is_git_repo(project_dir):
         # Imported here: equipa.dispatch imports this module.
         from equipa.dispatch import run_task_in_isolation
-        from equipa.merge_safety import report_leftover_dispatch_state
 
         await report_leftover_dispatch_state(project_dir)
         try:
@@ -300,6 +300,10 @@ async def run_manager_loop(
         return False
 
     for round_num in range(1, max_rounds + 1):
+        if goal_guard is not None and shutdown_requested() is not None:
+            # dispatch-06: a signal deferred during a merge stops the goal.
+            log("\n  [Manager] Shutdown requested during a merge. Stopping the goal.", output)
+            return "interrupted", round_num, all_completed, all_blocked, total_cost, total_duration
         log(f"\n{'#' * 60}", output)
         log(f"  MANAGER ROUND {round_num}/{max_rounds}", output)
         log(f"{'#' * 60}", output)
@@ -357,6 +361,13 @@ async def run_manager_loop(
                     task, project_dir, project_context, args,
                     execute=execute_in_worktree, guard=goal_guard, output=output,
                 )
+                if isolated.outcome == "shutdown_requested":
+                    # Never started: the task keeps its status.
+                    log(f"\n  [Manager] {isolated.reason}. Stopping the goal.", output)
+                    return (
+                        "interrupted", round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
                 result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
                 total_duration += result.get("duration", 0)
                 if result.get("cost"):

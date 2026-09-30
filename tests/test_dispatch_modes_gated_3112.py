@@ -570,6 +570,55 @@ def test_sigterm_during_merge_is_deferred_and_the_merge_aborted(
     assert "shutting down" in guard.outcomes[3308].reason
 
 
+def test_sigterm_during_a_merge_stops_further_tasks_after_finishing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-run, two tasks: SIGTERM lands while task 1 merges. Task 1's merge
+    completes and is recorded; task 2 is never started and keeps its status."""
+    repo = _init_repo(tmp_path / "repo")
+    tasks = {3320: _task(3320), 3321: _task(3321)}
+    probe = GateProbe(repo, 0)
+    probe.install(monkeypatch)
+    _patch_auto_run(monkeypatch, repo, tasks[3320], probe)
+    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: dict(tasks[task_id]))
+
+    async def fake_dev_test_loop(task, project_dir, project_context, args, output=None):
+        probe.agent_dirs.append(project_dir)
+        _commit_files(Path(project_dir), {f"src/t{task['id']}.py": "x = 1\n"}, "work")
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    monkeypatch.setattr(dispatch_mod, "run_dev_test_loop", fake_dev_test_loop)
+    real_merge = dispatch_mod._merge_task_branch
+
+    async def merge_then_sigterm(*args, **kwargs):
+        merged = await real_merge(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return merged
+
+    monkeypatch.setattr(dispatch_mod, "_merge_task_branch", merge_then_sigterm)
+    summary = {"project_id": 9001, "codename": "gatedproj", "total_todo": 2,
+               "tasks": [{"id": 3320, "title": "a"}, {"id": 3321, "title": "b"}]}
+    args = SimpleNamespace(model="m", max_turns=10, max_tasks_per_project=None,
+                           security_review=True)
+
+    def killed(signum, frame):
+        raise _KilledBySignal(f"signal {signum} was not deferred during the merge")
+
+    previous = signal.signal(signal.SIGTERM, killed)
+    try:
+        asyncio.run(dispatch_mod.run_project_tasks(
+            summary, {"features": {"autoresearch": False}}, args,
+        ))
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    worktree_1 = str(repo / ".forge-worktrees" / "task-3320")
+    assert probe.agent_dirs == [worktree_1], "task 2 started after the shutdown request"
+    [(task_id, outcome, merged_sha)] = probe.statuses
+    assert (task_id, outcome) == (3320, "tests_passed")
+    assert merged_sha and _is_ancestor(repo, merged_sha, _master(repo))
+
+
 def test_dirty_main_checkout_is_refused_not_stashed(tmp_path: Path) -> None:
     repo = _repo_with_task_branch(tmp_path, 3309, {"docs/b.md": "# b\n"})
     baseline = _master(repo)

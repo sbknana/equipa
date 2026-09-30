@@ -1214,6 +1214,10 @@ async def run_project_tasks(
                 task, project_dir, project_context, task_args,
                 execute=execute_in_worktree, guard=project_guard, output=output,
             )
+            if isolated.outcome == "shutdown_requested":
+                # Never started: the task and the rest of the queue stay todo.
+                log(f"  [{codename}] {isolated.reason}; not starting further tasks.", output)
+                break
             result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
             merged_sha = isolated.merged_sha
             task = loop_totals.get("task", task)
@@ -3083,6 +3087,17 @@ async def run_task_in_isolation(
     """
     task_id = task["id"]
     task_branch = f"forge-task-{task_id}"
+    shutdown_signal = shutdown_requested()
+    if shutdown_signal is not None:
+        # dispatch-06: a signal was deferred during an earlier merge; no new
+        # agent is started on the way out.
+        reason = (
+            f"orchestrator shutting down ({signal.Signals(shutdown_signal).name})"
+        )
+        log(f"[Task #{task_id}] NOT started: {reason}", output)
+        return IsolatedTaskRun(
+            "shutdown_requested", _empty_run_result(), 0, reason=reason,
+        )
     if guard is None:
         try:
             guard = await DefaultBranchGuard.snapshot(project_dir)

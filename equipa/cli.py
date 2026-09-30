@@ -2093,6 +2093,11 @@ async def _run_task_isolated(task, project_dir, project_context, args) -> None:
     isolated: IsolatedTaskRun = await run_task_in_isolation(
         task, project_dir, project_context, args, execute=execute,
     )
+    if isolated.outcome == "shutdown_requested":
+        # Never started: the task keeps its status (dispatch-06).
+        print(f"\nTask #{task['id']} NOT started: {isolated.reason}")
+        exit_if_shutdown_requested()
+        return
     if isolated.agent_outcome is None:
         update_task_status(task["id"], isolated.outcome)
         print(f"\nTask #{task['id']} NOT run: {isolated.reason}")
