@@ -61,6 +61,16 @@ from equipa.git_ops import (
     git_run_async,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
+from equipa.merge_integrity import (
+    DefaultBranchGuard,
+    MergeAttempt,
+    MergeIntegrityError,
+    MergeOutcome,
+    find_repo_execution_hazards,
+    is_ancestor,
+    resolve_commit,
+    reviewed_commit_refusal,
+)
 from equipa.loops import (
     _count_findings_in_review_file,
     ensure_artifacts_dir,
@@ -90,9 +100,11 @@ from equipa.security_gate import (
     decide_merge_gate,
     format_counts,
     get_changed_files_for_branch,
+    get_reviewer_run,
     is_doc_only_diff,
     record_reviewer_skipped_doc_only,
     reviewer_run_failure,
+    unrecorded_reviewer_runs_permitted,
     verify_reviewer_provenance,
 )
 from equipa.single_agent_guard import (
@@ -752,8 +764,8 @@ async def run_dev_test_loop_with_autoresearch(
     helper is the canonical retry entry point - both call sites use it.
 
     ``task_branch`` is set when ``project_dir`` is the task's isolation
-    worktree. Before every attempt the worktree must still be on that
-    branch; otherwise the task is aborted with outcome
+    worktree. Before and after every attempt (task #3111) the worktree must
+    still be on that branch; otherwise the task is aborted with outcome
     ``worktree_branch_mismatch`` instead of letting the agent commit
     elsewhere. The HEAD seen before the first attempt is the base the
     worktree is reset to between attempts. A failed reset aborts the task
@@ -825,6 +837,22 @@ async def run_dev_test_loop_with_autoresearch(
         loop_total_duration += result.get("duration", 0)
         if result.get("cost"):
             loop_total_cost += result["cost"]
+
+        # Task #3111 (3107 review R1): assert the branch AFTER every attempt
+        # too. An agent that checks out another branch (the default branch)
+        # during its final, successful attempt would otherwise have its
+        # commits there treated as the task's result.
+        if task_branch is not None:
+            try:
+                await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(
+                    task_id, "worktree-branch-mismatch",
+                    f"after attempt {retry_count + 1} ({outcome}): {exc}",
+                    output,
+                )
+                outcome = "worktree_branch_mismatch"
+                break
 
         # Success - break out of retry loop
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
@@ -1839,8 +1867,25 @@ async def _merge_task_branch(
     branch_name: str,
     *,
     expect_artifact: bool = True,
+    merge_sha: str | None = None,
+    worktree_dir: str | None = None,
+    merge_record: MergeAttempt | None = None,
 ) -> bool:
     """Merge a single task branch into the main repo's current branch.
+
+    Task #3111 (gate-01): the merge target is a commit SHA, never the branch
+    name. ``merge_sha`` is the commit the gate approved (the reviewed SHA);
+    when omitted, the branch tip is resolved ONCE and that SHA is merged, so
+    a commit landing on the branch mid-merge cannot ride along. When
+    ``merge_record`` is given it is filled in with what actually landed
+    (``merged_sha`` — the pinned commit or its rebased copy — plus the
+    default-branch SHA before and after, and a failure ``reason``).
+
+    dispatch-08: the conflict fallback rebases the pinned commit onto the
+    default branch INSIDE the task worktree (``worktree_dir``), then
+    fast-forwards the default branch from the main checkout with
+    ``--ff-only``. Success requires the default branch to have actually moved
+    to the rebased SHA. Without a worktree there is no fallback.
 
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
     All failures are logged to stdout — the function NEVER swallows errors
@@ -1951,6 +1996,7 @@ async def _merge_task_branch(
             event="defensive-invariant-passed",
             counts=counts,
         )
+    record = merge_record if merge_record is not None else MergeAttempt()
     try:
         # Task #2493: always merge INTO the repo's DEFAULT branch, never the
         # branch HEAD happens to sit on. In single-task (--task) mode the main
@@ -1972,6 +2018,7 @@ async def _merge_task_branch(
                 f"target: {exc}"
             )
             print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = f"no trusted merge target: {exc}"
             return False
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
@@ -1989,6 +2036,9 @@ async def _merge_task_branch(
                     f"{checkout_res.stderr[:200]}"
                 )
                 print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = (
+                    f"could not check out default branch '{default_branch}'"
+                )
                 return False
             current_branch = default_branch
         print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
@@ -1997,6 +2047,7 @@ async def _merge_task_branch(
             ["rev-parse", "HEAD"], project_dir, timeout=10,
         )
         pre_head = pre_head_res.stdout.strip()
+        record.pre_head = pre_head
 
         # Task #2488: distinguish "branch missing" from "no commits ahead".
         # Previously a missing branch produced empty `log HEAD..<branch>`
@@ -2018,7 +2069,16 @@ async def _merge_task_branch(
                 f"Agent commits may have landed on an unexpected branch. "
                 f"Do NOT treat as 'no commits ahead' — investigate."
             )
+            record.reason = f"branch '{branch_name}' does not exist"
             return False
+        # gate-01 (task #3111): from here on the merge names a commit, never
+        # the branch, so the branch moving mid-merge changes nothing.
+        target_sha = merge_sha or branch_check.stdout.strip()
+        print(
+            f"  [Isolation] Task #{task_id}: merging commit {target_sha[:12]} "
+            f"({'gate-approved' if merge_sha else 'pinned tip of'} "
+            f"'{branch_name}')"
+        )
 
         # Task #2493: count commits-ahead against the DEFAULT branch, not
         # HEAD. HEAD is now always the default branch here (checked out
@@ -2027,7 +2087,7 @@ async def _merge_task_branch(
         # at entry. Mirrors the <default>..<branch> rev-list used elsewhere
         # in this module.
         ahead = await git_run_async(
-            ["log", "--oneline", f"{default_branch}..{branch_name}"],
+            ["log", "--oneline", f"{default_branch}..{target_sha}"],
             project_dir, timeout=15,
         )
         if not ahead.stdout.strip():
@@ -2035,6 +2095,7 @@ async def _merge_task_branch(
                 f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
                 f"NO commits ahead of '{default_branch}' — skipping merge"
             )
+            record.reason = f"no commits ahead of '{default_branch}'"
             return False
 
         commits_ahead = len(ahead.stdout.strip().split("\n"))
@@ -2050,7 +2111,10 @@ async def _merge_task_branch(
 
         try:
             merge_result = await git_run_async(
-                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
+                ["merge", "--no-edit", "-m",
+                 f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})",
+                 target_sha],
+                project_dir, timeout=60,
             )
             post_head_res = await git_run_async(
                 ["rev-parse", "HEAD"], project_dir, timeout=10,
@@ -2062,47 +2126,116 @@ async def _merge_task_branch(
                     f"  [Isolation] Merged task #{task_id} into main "
                     f"({pre_head[:8]} -> {post_head[:8]})"
                 )
+                record.merged_sha = target_sha
+                record.post_head = post_head
                 return True
             if merge_result.returncode == 0 and post_head == pre_head:
                 print(
                     f"  [Isolation] WARNING: Merge returned 0 for task "
                     f"#{task_id} but HEAD unchanged ({pre_head[:8]})"
                 )
-                print(f"  [Isolation] Merge stdout: {merge_result.stdout[:200]}")
+                print(
+                    f"  [Isolation] Merge output: "
+                    f"{_git_output(merge_result)}"
+                )
+                record.reason = "merge returned 0 but the default branch did not move"
                 return False
 
-            # Conflict path: try rebase-then-merge.
+            # dispatch-17: git reports conflicts on stdout, so log both.
+            merge_output = _git_output(merge_result)
+            print(
+                f"  [Isolation] Merge of task #{task_id} failed "
+                f"(rc={merge_result.returncode}): {merge_output}"
+            )
             await git_run_async(
                 ["merge", "--abort"], project_dir, timeout=15,
             )
+
+            # dispatch-08: rebase the pinned commit onto the default branch in
+            # the task's OWN worktree, then fast-forward the default branch
+            # from the main checkout. The old in-place `rebase HEAD <branch>`
+            # checked the task branch out here and then merged it into itself
+            # ("Already up to date", rc 0), reporting a merge that never
+            # happened.
+            if not worktree_dir:
+                print(
+                    f"  [Isolation] Merge FAILED for task #{task_id}: "
+                    f"{merge_output} (no task worktree to rebase in)"
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = f"merge conflict: {merge_output}"
+                return False
+            wt_branch = await git_run_async(
+                ["branch", "--show-current"], worktree_dir, timeout=10,
+            )
+            wt_head = await git_run_async(
+                ["rev-parse", "HEAD"], worktree_dir, timeout=10,
+            )
+            if (
+                wt_branch.stdout.strip() != branch_name
+                or wt_head.stdout.strip() != target_sha
+            ):
+                print(
+                    f"  [Isolation] Merge FAILED for task #{task_id}: "
+                    f"{merge_output}; worktree {worktree_dir} is on "
+                    f"'{wt_branch.stdout.strip() or 'DETACHED'}' at "
+                    f"{wt_head.stdout.strip()[:12] or 'unknown'}, not "
+                    f"'{branch_name}' at {target_sha[:12]} — not rebasing"
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = (
+                    f"merge conflict; worktree not at the approved commit: "
+                    f"{merge_output}"
+                )
+                return False
             rebase_result = await git_run_async(
-                ["rebase", "HEAD", branch_name], project_dir, timeout=60,
+                ["rebase", pre_head], worktree_dir, timeout=60,
             )
             if rebase_result.returncode != 0:
                 await git_run_async(
-                    ["rebase", "--abort"], project_dir, timeout=15,
+                    ["rebase", "--abort"], worktree_dir, timeout=15,
                 )
                 print(
                     f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_result.stderr[:200]}"
+                    f"{merge_output}; rebase onto {pre_head[:8]} also failed: "
+                    f"{_git_output(rebase_result)}"
                 )
                 print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = f"merge and rebase conflict: {merge_output}"
                 return False
-
-            merge2 = await git_run_async(
-                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
+            rebased = await git_run_async(
+                ["rev-parse", "HEAD"], worktree_dir, timeout=10,
             )
-            if merge2.returncode == 0:
-                print(f"  [Isolation] Merged task #{task_id} (after rebase)")
+            rebased_sha = rebased.stdout.strip()
+            fast_forward = await git_run_async(
+                ["merge", "--ff-only", rebased_sha], project_dir, timeout=60,
+            )
+            ff_head_res = await git_run_async(
+                ["rev-parse", "HEAD"], project_dir, timeout=10,
+            )
+            ff_head = ff_head_res.stdout.strip()
+            if (
+                fast_forward.returncode == 0
+                and rebased_sha
+                and ff_head == rebased_sha
+                and ff_head != pre_head
+            ):
+                print(
+                    f"  [Isolation] Merged task #{task_id} after rebase "
+                    f"({pre_head[:8]} -> {ff_head[:8]}, rebased from "
+                    f"{target_sha[:8]})"
+                )
+                record.merged_sha = rebased_sha
+                record.post_head = ff_head
                 return True
-            await git_run_async(
-                ["merge", "--abort"], project_dir, timeout=15,
-            )
             print(
-                f"  [Isolation] Merge FAILED for task #{task_id} "
-                f"(conflict after rebase)"
+                f"  [Isolation] Merge FAILED for task #{task_id}: "
+                f"fast-forward to rebased {rebased_sha[:8] or 'unknown'} did "
+                f"not move '{default_branch}' ({pre_head[:8]} -> "
+                f"{ff_head[:8]}): {_git_output(fast_forward)}"
             )
-            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED (rebased)")
+            record.reason = "fast-forward after rebase did not move the default branch"
             return False
         finally:
             if had_stash:
@@ -2114,7 +2247,23 @@ async def _merge_task_branch(
         # because we did not add it to the merged set.
         print(f"  [Isolation] Merge error for task #{task_id}: {e}")
         print(f"  [Isolation] Branch '{branch_name}' PRESERVED (merge errored)")
+        record.reason = f"merge errored: {e}"
         return False
+
+
+def _git_output(result: subprocess.CompletedProcess, limit: int = 400) -> str:
+    """stdout and stderr of a git call on one line, for failure logs.
+
+    dispatch-17: ``git merge`` writes conflict details to stdout and leaves
+    stderr empty, so logging stderr alone printed an empty reason.
+    """
+    parts = [
+        f"{label}: {' '.join(text.split())}"
+        for label, text in (("stdout", result.stdout), ("stderr", result.stderr))
+        if text and text.strip()
+    ]
+    combined = " | ".join(parts) or "(no output)"
+    return combined[:limit]
 
 
 async def _stash_uncommitted_in_worktree(
@@ -2311,8 +2460,31 @@ async def _gated_merge_task(
     project_context: dict | None = None,
     security_review_enabled: bool = True,
     block_on_missing: bool = True,
+    guard: DefaultBranchGuard | None = None,
+    worktree_dir: str | None = None,
 ) -> str:
     """Unified, gated merge entry point used by BOTH dispatch modes.
+
+    Task #3111 — merge integrity, in this order:
+
+      1. fail closed on repository hazards (``refs/replace/*``, local config
+         defining filter / merge / diff drivers, ``core.worktree`` or a
+         conditional include) BEFORE any gate evaluation;
+      2. ``guard`` (the run's :class:`DefaultBranchGuard`, snapshotted before
+         dispatch) must still see the default branch at its expected SHA;
+      3. the task branch is pinned to ONE commit; the gate diffs that commit,
+         and for a reviewed (code) diff it must equal the reviewer's recorded
+         ``reviewed_sha`` — otherwise ``blocked`` ("branch moved after
+         review"). The merge then names that SHA, never the branch;
+      4. after the merge the guard checks the new tip is exactly this merge
+         and advances its expected-SHA chain; any other movement trips the
+         guard and every later merge in the run is refused.
+
+    The per-task result (status, reason, merged SHA) is stored in
+    ``guard.outcomes[task_id]`` so callers can write the task status only
+    after the merge. Without a ``guard`` one is snapshotted here, which still
+    covers the window around this merge. ``worktree_dir`` enables the
+    dispatch-08 rebase fallback.
 
     Task #2451: single-task ``--dev-test`` (``cli.run_mode_task``) and
     parallel ``--tasks`` (``run_parallel_tasks``) both funnel through this
@@ -2358,9 +2530,17 @@ async def _gated_merge_task(
       * ``"blocked"``  — gate fired; branch left intact, no merge attempted.
       * ``"merged"``   — branch merged into master, HEAD advanced.
       * ``"merge_failed"`` — gate passed but ``_merge_task_branch`` returned
-        False (conflict, no commits ahead, etc.). Branch preserved.
+        False (conflict, etc.). Branch preserved.
+      * ``"noop"`` — the approved commit is already on the default branch
+        (the task produced no commits); nothing to merge (task #3111).
     """
     project_dir = os.fspath(repo)
+    run_guard = guard
+
+    def finish(status: str, reason: str, merged_sha: str | None = None) -> str:
+        if run_guard is not None:
+            run_guard.outcomes[task_id] = MergeOutcome(status, reason, merged_sha)
+        return status
 
     # An outcome already demoted to ``security_review_blocked`` upstream is
     # honoured as blocked (the gate fired) — this is strictly stricter and
@@ -2374,7 +2554,7 @@ async def _gated_merge_task(
             task_id=task_id,
             event="merge-skipped",
         )
-        return "blocked"
+        return finish("blocked", "security review blocked the merge")
 
     if outcome not in ("tests_passed", "no_tests"):
         _gate_audit_log(
@@ -2383,7 +2563,50 @@ async def _gated_merge_task(
             task_id=task_id,
             event="merge-skipped",
         )
-        return "skipped"
+        return finish("skipped", f"outcome {outcome} is not merge-eligible")
+
+    # Task #3111: repository state the hardened git helper cannot neutralise
+    # blocks before ANY gate evaluation — the reviewer agent's git honours
+    # replace refs, and driver config runs programs during the merge. The
+    # task worktree is scanned too: the rebase fallback runs git there, and
+    # its own config.worktree is invisible from the main checkout.
+    hazards: list[str] = []
+    for scan_dir in (project_dir, worktree_dir):
+        if scan_dir is None:
+            continue
+        for hazard in await find_repo_execution_hazards(scan_dir):
+            if hazard not in hazards:
+                hazards.append(hazard)
+    if hazards:
+        detail = "; ".join(hazards)
+        print(
+            f"  [Merge-Integrity] Task #{task_id}: refusing to gate or merge "
+            f"— {detail}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=repo-hazard-blocked detail={detail}",
+            task_id=task_id,
+            event="repo-hazard-blocked",
+        )
+        return finish("blocked", f"repository hazard: {detail}")
+
+    if guard is None:
+        try:
+            guard = await DefaultBranchGuard.snapshot(project_dir)
+        except MergeIntegrityError as exc:
+            _gate_audit_log(
+                f"task={task_id} event=merge-skipped "
+                f"reason=default-branch-unpinned detail={exc}",
+                task_id=task_id,
+                event="merge-skipped",
+            )
+            return finish("blocked", f"default branch could not be pinned: {exc}")
+    if not await guard.verify(f"pre-gate task={task_id}", task_id=task_id):
+        return finish("blocked", guard.alert or "default branch moved")
+
+    # gate-01: pin the branch to ONE commit. The gate diffs that commit and
+    # the merge names it, so the branch moving afterwards changes nothing.
+    branch_sha = await resolve_commit(project_dir, f"refs/heads/{branch}")
 
     # === Single GateDecision, computed from ground truth (task #2706) ===
     # Diff the task BRANCH ref (not HEAD) so the file list is identical in
@@ -2391,7 +2614,7 @@ async def _gated_merge_task(
     # (main checkout on the default branch, work on a shared branch ref).
     # base_ref omitted -> auto-detect default branch (#2479).
     changed_files = await get_changed_files_for_branch(
-        project_dir, head_ref=branch,
+        project_dir, head_ref=branch_sha or branch,
     )
     decision: GateDecision = decide_merge_gate(
         changed_files,
@@ -2418,14 +2641,59 @@ async def _gated_merge_task(
             event="merge-skipped",
             counts=decision.counts,
         )
-        return "blocked"
+        return finish("blocked", f"security gate: {decision.reason}")
 
+    merge_sha = branch_sha
+    if decision.expect_artifact:
+        # A reviewed (code) diff merges exactly the commit the reviewer read.
+        review_record = get_reviewer_run(task_id)
+        if review_record is not None:
+            refusal = reviewed_commit_refusal(review_record, branch_sha)
+        elif unrecorded_reviewer_runs_permitted():
+            refusal = None  # hermetic tests only: no reviewer ran in-process
+        else:
+            refusal = "no reviewer run recorded"
+        if refusal is not None:
+            print(
+                f"  [Merge-Integrity] Task #{task_id}: refusing to merge "
+                f"'{branch}' — {refusal}"
+            )
+            _gate_audit_log(
+                f"task={task_id} event=reviewed-sha-refused branch={branch} "
+                f"branch_sha={branch_sha or 'MISSING'} reason={refusal}",
+                task_id=task_id,
+                event="reviewed-sha-refused",
+            )
+            return finish("blocked", refusal)
+        if review_record is not None:
+            merge_sha = review_record.reviewed_sha
+
+    if merge_sha is not None and await is_ancestor(
+        project_dir, merge_sha, guard.expected_sha,
+    ):
+        _gate_audit_log(
+            f"task={task_id} event=merge-noop branch={branch} "
+            f"sha={merge_sha} default={guard.default_branch}@"
+            f"{guard.expected_sha[:12]}",
+            task_id=task_id,
+            event="merge-noop",
+        )
+        print(
+            f"  [Isolation] Task #{task_id}: {merge_sha[:12]} is already on "
+            f"'{guard.default_branch}' — nothing to merge"
+        )
+        return finish("noop", "approved commit already on the default branch", merge_sha)
+
+    if not await guard.verify(f"pre-merge task={task_id}", task_id=task_id):
+        return finish("blocked", guard.alert or "default branch moved")
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
-        f"doc_only={decision.doc_only}",
+        f"sha={merge_sha or 'MISSING'} doc_only={decision.doc_only} "
+        f"default={guard.default_branch}@{guard.expected_sha[:12]}",
         task_id=task_id,
         event="merge-attempt",
     )
+    attempt = MergeAttempt()
     try:
         # expect_artifact is DERIVED from the ground-truth decision, never a
         # caller flag. Doc-only diffs (re-derived from the real diff) skip
@@ -2433,6 +2701,9 @@ async def _gated_merge_task(
         merged = await _merge_task_branch(
             project_dir, task_id, branch,
             expect_artifact=decision.expect_artifact,
+            merge_sha=merge_sha,
+            worktree_dir=worktree_dir,
+            merge_record=attempt,
         )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
@@ -2440,20 +2711,98 @@ async def _gated_merge_task(
             task_id=task_id,
             event="defensive-invariant-blocked",
         )
-        return "blocked"
+        return finish("blocked", f"defensive invariant: {exc}")
     if merged:
+        landed_sha = attempt.merged_sha or merge_sha
+        if landed_sha is None or not await guard.record_merge(task_id, landed_sha):
+            return finish(
+                "blocked",
+                guard.alert or "merged commit could not be verified on the "
+                "default branch",
+            )
         _gate_audit_log(
-            f"task={task_id} event=merge-succeeded branch={branch}",
+            f"task={task_id} event=merge-succeeded branch={branch} "
+            f"merged_sha={landed_sha} "
+            f"default_after={guard.expected_sha}",
             task_id=task_id,
             event="merge-succeeded",
         )
-        return "merged"
+        return finish("merged", "merged", landed_sha)
+    if not await guard.verify(f"after-failed-merge task={task_id}", task_id=task_id):
+        return finish("blocked", guard.alert or "default branch moved")
+    reason = attempt.reason or "merge failed"
     _gate_audit_log(
-        f"task={task_id} event=merge-failed branch={branch}",
+        f"task={task_id} event=merge-failed branch={branch} reason={reason}",
         task_id=task_id,
         event="merge-failed",
     )
-    return "merge_failed"
+    return finish("merge_failed", reason)
+
+
+def outcome_after_merge(
+    agent_outcome: str,
+    merge_outcome: MergeOutcome | None,
+    guard: DefaultBranchGuard | None,
+    guard_error: str | None = None,
+) -> tuple[str, str | None, str]:
+    """``(outcome, merged_sha, reason)`` to record once the merge has run.
+
+    dispatch-05 (task #3111): a merge-eligible task is ``done`` only when its
+    approved commit is verifiably on the default branch (``merged``, or
+    ``noop`` when it was already there) and the default branch moved only
+    through the orchestrator's merges. Every other result maps to a
+    non-success outcome, which ``update_task_status`` records as ``blocked``.
+    """
+    if guard is None:
+        return (
+            "merge_integrity_failed", None,
+            guard_error or "default branch was not pinned before dispatch",
+        )
+    if guard.tripped:
+        return "merge_integrity_failed", None, guard.alert or "default branch moved"
+    if merge_outcome is None:
+        return "merge_failed", None, "no merge result was recorded"
+    if merge_outcome.done:
+        return agent_outcome, merge_outcome.merged_sha, merge_outcome.status
+    status_outcomes = {
+        "blocked": "merge_blocked",
+        "merge_failed": "merge_failed",
+        "skipped": "merge_skipped",
+    }
+    return (
+        status_outcomes.get(merge_outcome.status, "merge_failed"),
+        None,
+        merge_outcome.reason or merge_outcome.status,
+    )
+
+
+def _write_status_after_merge(
+    run_result: dict,
+    guard: DefaultBranchGuard | None,
+    guard_error: str | None,
+) -> None:
+    """Write the deferred task status once the gated merge has run."""
+    task_id = run_result["task"]["id"]
+    merge_outcome = guard.outcomes.get(task_id) if guard is not None else None
+    final_outcome, merged_sha, reason = outcome_after_merge(
+        run_result["outcome"], merge_outcome, guard, guard_error,
+    )
+    single_line_reason = " ".join(reason.split())
+    print(
+        f"  [Task #{task_id}] Final status after merge: {final_outcome} "
+        f"({single_line_reason}"
+        + (f"; merged_sha={merged_sha[:12]}" if merged_sha else "")
+        + ")"
+    )
+    _gate_audit_log(
+        f"task={task_id} event=task-status-after-merge outcome={final_outcome} "
+        f"merged_sha={merged_sha or 'none'} reason={single_line_reason}",
+        task_id=task_id,
+        event="task-status-after-merge",
+    )
+    update_task_status(task_id, final_outcome, merged_sha=merged_sha)
+    run_result["final_outcome"] = final_outcome
+    run_result["merged_sha"] = merged_sha
 
 
 def _refuse_task_without_worktree(
@@ -2596,6 +2945,24 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
     use_worktrees = _is_git_repo(project_dir)
+    # dispatch-03 / gate-12 (task #3111): pin the default branch BEFORE any
+    # agent runs. From here on only the orchestrator's own merges may move
+    # it; anything else trips the guard and nothing further is merged.
+    merge_guard: DefaultBranchGuard | None = None
+    merge_guard_error: str | None = None
+    if use_worktrees:
+        try:
+            merge_guard = await DefaultBranchGuard.snapshot(project_dir)
+            print(
+                f"  [Merge-Integrity] '{merge_guard.default_branch}' pinned at "
+                f"{merge_guard.baseline_sha[:12]} before dispatch"
+            )
+        except MergeIntegrityError as exc:
+            merge_guard_error = f"default branch could not be pinned: {exc}"
+            print(
+                f"  [Merge-Integrity] ERROR: {merge_guard_error} — no task in "
+                f"this run will be merged"
+            )
     # Worktree creation issues 2-3 git commands per task. The helper is
     # natively async (uses git_run_async) so the event loop is not
     # blocked while subprocesses run.
@@ -2858,7 +3225,27 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                         )
                     outcome = "security_review_blocked"
 
-            update_task_status(task["id"], outcome, output=output)
+            if merge_guard is not None:
+                # dispatch-03: catch an agent that moved the default branch
+                # (checkout + commit, update-ref, merge) as soon as it ends.
+                await merge_guard.verify(
+                    f"after-agent task={task['id']}", task_id=task["id"],
+                )
+            needs_merge = (
+                task["id"] in worktree_dirs
+                and outcome in ("tests_passed", "no_tests")
+                and not review_blocks_merge
+            )
+            if needs_merge:
+                # dispatch-05: "done" is written only after the merge (see
+                # _write_status_after_merge); until then the task stays as is.
+                log(
+                    f"[Task #{task['id']}] Status deferred until the gated "
+                    f"merge ({outcome})",
+                    output,
+                )
+            else:
+                update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
             if flow_id is not None:
                 try:
@@ -2892,11 +3279,6 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
 
             # Mark for post-gather sequential merge (avoid parallel merge conflicts)
             merge_ok = False
-            needs_merge = (
-                task["id"] in worktree_dirs
-                and outcome in ("tests_passed", "no_tests")
-                and not review_blocks_merge
-            )
 
             return {
                 "task": task,
@@ -2993,6 +3375,10 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             task_id = r["task"]["id"]
             if task_id not in worktree_dirs:
                 continue
+            if merge_guard is None:
+                # The default branch was never pinned, so a merge could not
+                # be checked against it: nothing is merged this run.
+                continue
             branch_name = f"forge-task-{task_id}"
             try:
                 # Task #2706: the unified gate now computes its own single
@@ -3012,6 +3398,8 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     project_context=project_context,
                     security_review_enabled=_gate_security_review_enabled,
                     block_on_missing=_gate_block_on_missing,
+                    guard=merge_guard,
+                    worktree_dir=worktree_dirs[task_id],
                 )
             except SecurityGateBypassError as exc:
                 # Phase K (F-04): narrow from `except Exception` so genuine
@@ -3027,10 +3415,27 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     task_id=task_id,
                     event="defensive-invariant-blocked",
                 )
+                merge_guard.outcomes[task_id] = MergeOutcome(
+                    "blocked", f"defensive invariant: {exc}",
+                )
                 continue
             if merge_status == "merged":
                 r["merge_ok"] = True
                 merged_tasks_seq.add(task_id)
+
+    # dispatch-03: the default branch must still be where the orchestrator's
+    # own merges left it. Checked BEFORE any status is written, so a late
+    # movement (a reset that dropped a merge, say) leaves every task blocked.
+    if merge_guard is not None:
+        await merge_guard.verify("end-of-run")
+        if merge_guard.tripped:
+            # Keep every task branch: the default branch may no longer hold
+            # the commits merged from them.
+            merged_tasks_seq.clear()
+    for r in results:
+        if isinstance(r, Exception) or not r.get("needs_merge"):
+            continue
+        _write_status_after_merge(r, merge_guard, merge_guard_error)
 
     # Clean up worktrees — only delete branches that were successfully merged.
     # Helper is natively async; per-task `git worktree remove` and

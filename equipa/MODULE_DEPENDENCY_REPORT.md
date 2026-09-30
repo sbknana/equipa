@@ -4,11 +4,11 @@
 > Regenerate with `python scripts/gen_module_report.py`. The `docs-drift-check`
 > CI job fails if this file is stale (see `scripts/check_docs_drift.py`).
 
-**Modules analyzed:** 52 (equipa/ package, recursive)
+**Modules analyzed:** 53 (equipa/ package, recursive)
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **34,516 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **53 Python modules** totaling **35,461 lines** of code across **11 dependency layers** (L0–L10). 29 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -33,7 +33,7 @@ The `equipa/` package contains **52 Python modules** totaling **34,516 lines** o
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
 | `config.py` | 394 | L1 | `constants.py` | — | 20 |
-| `db.py` | 768 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
+| `db.py` | 798 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
 | `hooks/__init__.py` | 427 | L1 | `hooks/dispatcher.py` | — | 17 |
 | `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
 | `parsing.py` | 908 | L1 | `constants.py` | `tool_result_storage.py` | 20 |
@@ -57,17 +57,18 @@ The `equipa/` package contains **52 Python modules** totaling **34,516 lines** o
 | `mcp_server.py` | 956 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `prompts.py` | 799 | L3 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 151 | L3 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
-| `security_gate.py` | 930 | L3 | `git_ops.py` | `db.py` | 37 |
+| `security_gate.py` | 944 | L3 | `git_ops.py` | `db.py` | 37 |
 | `agent_runner.py` | 2280 | L4 | `abort_controller.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 23 |
+| `merge_integrity.py` | 395 | L4 | `git_ops.py`, `security_gate.py` | — | 13 |
 | `preflight.py` | 343 | L5 | `agent_runner.py`, `constants.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
-| `loops.py` | 3104 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
+| `loops.py` | 3119 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
 | `manager.py` | 328 | L7 | `agent_runner.py`, `constants.py`, `db.py`, `loops.py`, `output.py`, `prompts.py`, `roles.py`, `tasks.py` | — | 5 |
-| `dispatch.py` | 3041 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 16 |
-| `cli.py` | 2122 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
+| `dispatch.py` | 3446 | L8 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `merge_integrity.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 17 |
+| `cli.py` | 2208 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `merge_integrity.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
 | `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 34,516 lines | 650 public exports
+**Total:** 35,461 lines | 664 public exports
 
 ## Modules by Layer
 
@@ -77,7 +78,7 @@ Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf m
 - **L1**: `checkpoints.py`, `config.py`, `db.py`, `hooks/__init__.py`, `output.py`, `parsing.py`, `role_resolver.py`, `routing.py`, `security.py`
 - **L2**: `config_versions.py`, `embeddings.py`, `flows.py`, `git_ops.py`, `graph.py`, `initiative_runner.py`, `lessons.py`, `messages.py`, `monitoring.py`, `rlm_decompose.py`, `roles.py`, `sessions.py`, `tasks.py`, `templates.py`
 - **L3**: `mcp_server.py`, `prompts.py`, `reflexion.py`, `security_gate.py`
-- **L4**: `agent_runner.py`
+- **L4**: `agent_runner.py`, `merge_integrity.py`
 - **L5**: `preflight.py`
 - **L6**: `loops.py`
 - **L7**: `manager.py`
@@ -134,12 +135,12 @@ How many other `equipa` modules each module imports.
 | `bash_security.py` | 0 | 0 | **0** |
 | `checkpoints.py` | 1 | 0 | **1** |
 | `classifier.py` | 0 | 0 | **0** |
-| `cli.py` | 24 | 5 | **29** |
+| `cli.py` | 25 | 5 | **30** |
 | `config.py` | 1 | 0 | **1** |
 | `config_versions.py` | 2 | 0 | **2** |
 | `constants.py` | 0 | 0 | **0** |
 | `db.py` | 1 | 4 | **5** |
-| `dispatch.py` | 18 | 4 | **22** |
+| `dispatch.py` | 19 | 4 | **23** |
 | `embeddings.py` | 2 | 2 | **4** |
 | `env_loader.py` | 0 | 0 | **0** |
 | `flows.py` | 2 | 1 | **3** |
@@ -155,10 +156,11 @@ How many other `equipa` modules each module imports.
 | `initiative_runner.py` | 2 | 3 | **5** |
 | `integration_test.py` | 0 | 1 | **1** |
 | `lessons.py` | 4 | 4 | **8** |
-| `loops.py` | 18 | 1 | **19** |
+| `loops.py` | 19 | 1 | **20** |
 | `manager.py` | 8 | 0 | **8** |
 | `mcp_health.py` | 0 | 0 | **0** |
 | `mcp_server.py` | 3 | 0 | **3** |
+| `merge_integrity.py` | 2 | 0 | **2** |
 | `messages.py` | 1 | 1 | **2** |
 | `monitoring.py` | 2 | 1 | **3** |
 | `output.py` | 1 | 1 | **2** |

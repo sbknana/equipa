@@ -24,6 +24,7 @@ parallel-mode dispatch path:
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -209,6 +210,29 @@ def test_artifact_count_ignores_severity_words_in_prose(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+class _FakeMergeGuard:
+    """Stand-in for ``DefaultBranchGuard``: this harness has no git repo.
+
+    Task #3111's real guard, pinned SHAs and repo-hazard checks are exercised
+    against real repositories in ``tests/test_merge_integrity_3111.py``; here
+    they are stubbed so these tests keep covering the review gate only.
+    """
+
+    default_branch = "main"
+    baseline_sha = expected_sha = "0" * 40
+    alert = None
+    tripped = False
+
+    def __init__(self) -> None:
+        self.outcomes: dict = {}
+
+    async def verify(self, stage, *, task_id=None) -> bool:
+        return True
+
+    async def record_merge(self, task_id, merged_sha) -> bool:
+        return True
+
+
 def _patch_parallel_mode(
     tmp_project: Path,
     *,
@@ -276,7 +300,7 @@ def _patch_parallel_mode(
         patch("equipa.dispatch.resolve_project_dir",
               return_value=str(tmp_project)),
         patch("equipa.dispatch.fetch_project_context", return_value={}),
-        patch("equipa.dispatch._is_git_repo", return_value=True),
+        _pretend_git_repo(),
         patch(
             "equipa.dispatch.run_dev_test_loop_with_autoresearch",
             side_effect=fake_dev_test,
@@ -311,6 +335,31 @@ def _patch_parallel_mode(
         ),
     ]
     return patches, merge_calls
+
+
+@contextlib.contextmanager
+def _pretend_git_repo():
+    """Treat the skeleton project as a git repo, merge-integrity included.
+
+    Task #3111: the gate now pins SHAs, checks repo hazards and a
+    default-branch guard. The skeleton project has no git repo, so those are
+    stubbed alongside ``_is_git_repo``.
+    """
+    with patch("equipa.dispatch._is_git_repo", return_value=True), \
+            patch(
+                "equipa.dispatch.DefaultBranchGuard.snapshot",
+                new=AsyncMock(side_effect=lambda *_a, **_k: _FakeMergeGuard()),
+            ), \
+            patch(
+                "equipa.dispatch.find_repo_execution_hazards",
+                new=AsyncMock(return_value=[]),
+            ), \
+            patch(
+                "equipa.dispatch.resolve_commit",
+                new=AsyncMock(return_value="a" * 40),
+            ), \
+            patch("equipa.dispatch.is_ancestor", new=AsyncMock(return_value=False)):
+        yield
 
 
 @pytest.mark.asyncio

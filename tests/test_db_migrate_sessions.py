@@ -95,8 +95,8 @@ def _index_names(conn: sqlite3.Connection) -> set[str]:
 
 
 def test_current_version_is_eleven():
-    """Latest schema is v11 (Paperclip B1)."""
-    assert CURRENT_VERSION == 11
+    """The schema is at least v11 (Paperclip B1); v12 added tasks.merged_sha."""
+    assert CURRENT_VERSION >= 11
 
 
 def test_migration_registry_has_slot_eleven():
@@ -356,11 +356,11 @@ def test_full_run_migrations_from_v10_head_to_v11(tmp_path):
     success, from_ver, to_ver = run_migrations(str(db_path), silent=True)
     assert success is True
     assert from_ver == 10
-    assert to_ver == 11
+    assert to_ver == CURRENT_VERSION
 
     conn = sqlite3.connect(str(db_path))
     try:
-        assert get_db_version(conn) == 11
+        assert get_db_version(conn) == CURRENT_VERSION
         assert "agent_sessions" in _table_names(conn)
     finally:
         conn.close()

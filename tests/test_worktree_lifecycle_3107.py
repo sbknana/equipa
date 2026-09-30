@@ -175,7 +175,7 @@ def _run_parallel(
             patch.object(dispatch_mod, "get_db_connection", lambda write=False: db), \
             patch.object(
                 dispatch_mod, "update_task_status",
-                side_effect=lambda task_id, outcome, output=None:
+                side_effect=lambda task_id, outcome, output=None, merged_sha=None:
                     status_updates.append((task_id, outcome)),
             ), \
             patch.object(dispatch_mod, "record_agent_run", MagicMock()), \
@@ -223,7 +223,9 @@ def test_stale_branch_task_is_refused_and_default_branch_untouched(repo: Path) -
     assert _sha(repo, "master") == master_before, "agent work reached master"
     assert _sha(repo, "forge-task-5") == stale_sha, "stale branch was not preserved"
     assert (5, "worktree_refused") in status_updates
-    assert (6, "tests_passed") in status_updates
+    # Task #3111 (dispatch-05): the mocked gate merged nothing, so task 6 is
+    # left blocked rather than done.
+    assert (6, "merge_failed") in status_updates
 
 
 def test_unregistered_leftover_directory_refuses_task(repo: Path) -> None:
@@ -287,7 +289,9 @@ def test_worktree_left_off_its_branch_blocks_the_task(repo: Path) -> None:
     assert len(agent.calls) == 1, "a retry ran after the worktree left its branch"
     assert _sha(repo, "master") == master_before
     assert "agent work 8 attempt 1" in _git(repo, "log", "--format=%s", "forge-task-8")
-    assert status_updates == [(8, "attempt_cleanup_failed")]
+    # Task #3111: the branch is now asserted right after the attempt, before
+    # the cleanup runs, so the abort names the mismatch itself.
+    assert status_updates == [(8, "worktree_branch_mismatch")]
 
 
 def test_attempt_refused_when_worktree_is_not_on_task_branch(repo: Path) -> None:

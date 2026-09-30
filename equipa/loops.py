@@ -73,6 +73,7 @@ from equipa.monitoring import (
 )
 from equipa.output import log
 from equipa.git_ops import git_run_async
+from equipa.merge_integrity import resolve_commit, snapshot_reviewed_tree
 from equipa.security_gate import (
     REVIEWER_STATUS_FAILED,
     REVIEWER_STATUS_RUNNING,
@@ -472,6 +473,10 @@ async def run_security_review(
     pre_artifact = fingerprint_artifact(
         find_review_artifact(project_dir, "SECURITY-REVIEW", task_id),
     )
+    # gate-01 (task #3111): pin the commit the reviewer is about to read. The
+    # merge uses this SHA, and refuses if the branch has moved on since.
+    reviewed_tree = await snapshot_reviewed_tree(project_dir)
+    log(f"  Reviewing {reviewed_tree.describe()}", output)
     run_started = time.monotonic()
     run_started_wall = time.time()
     # SR41-04 (task #3063): the audit line names which reviewer ran — a run
@@ -497,6 +502,10 @@ async def run_security_review(
             timeouts=tuple(attempt_timeouts),
             run_id=run_id,
             model=sec_model,
+            reviewed_sha=reviewed_tree.sha,
+            reviewed_branch=reviewed_tree.branch,
+            reviewed_tree_clean=reviewed_tree.clean,
+            reviewed_tree_detail=reviewed_tree.detail,
         ))
         security_task["description"] = (
             f"{review_instructions}{_reviewer_nonce_instructions(nonce)}"
@@ -532,6 +541,7 @@ async def run_security_review(
         sec_timeout = retry_timeout
 
     review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
+    reviewed_sha_end = await resolve_commit(project_dir, "HEAD")
     run_record = ReviewerRunRecord(
         task_id=task_id,
         nonce=nonce,
@@ -552,6 +562,11 @@ async def run_security_review(
         run_id=run_id,
         model=sec_model,
         prompt_sha256=prompt_sha256,
+        reviewed_sha=reviewed_tree.sha,
+        reviewed_sha_end=reviewed_sha_end,
+        reviewed_branch=reviewed_tree.branch,
+        reviewed_tree_clean=reviewed_tree.clean,
+        reviewed_tree_detail=reviewed_tree.detail,
     )
     record_reviewer_run(run_record)
     audit_reviewer_run(run_record)

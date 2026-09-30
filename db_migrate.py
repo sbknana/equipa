@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 11
+CURRENT_VERSION = 12
 
 
 # ============================================================
@@ -844,6 +844,23 @@ def migrate_v10_to_v11(conn):
     conn.commit()
 
 
+def migrate_v11_to_v12(conn):
+    """Add ``tasks.merged_sha`` (v11 -> v12, task #3111 / dispatch-05).
+
+    A merge-eligible task is marked ``done`` only after the orchestrator's
+    gated merge; ``merged_sha`` is the task commit that merge put on the
+    default branch, so ``done`` can be checked with
+    ``git merge-base --is-ancestor <merged_sha> <default-branch>``. NULL for
+    tasks that were not merged. Idempotent: an existing column is kept.
+    """
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN merged_sha TEXT DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -857,6 +874,7 @@ MIGRATIONS = {
     9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
     10: ("Paperclip config version tables (v9 -> v10)", migrate_v9_to_v10),
     11: ("Paperclip agent_sessions table (v10 -> v11)", migrate_v10_to_v11),
+    12: ("tasks.merged_sha for verifiable done (v11 -> v12)", migrate_v11_to_v12),
 }
 
 

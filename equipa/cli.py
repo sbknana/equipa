@@ -38,6 +38,12 @@ from equipa.agent_runner import (
 )
 from equipa.checkpoints import load_checkpoint
 from equipa.db import log_gate_audit, record_agent_run, update_task_status
+from equipa.git_ops import _is_git_repo
+from equipa.merge_integrity import (
+    DefaultBranchGuard,
+    MergeIntegrityError,
+    MergeOutcome,
+)
 from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
@@ -48,6 +54,7 @@ from equipa.dispatch import (
     is_feature_enabled,
     load_dispatch_config,
     load_goals_file,
+    outcome_after_merge,
     parse_task_ids,
     run_auto_dispatch,
     run_parallel_goals,
@@ -302,9 +309,10 @@ async def _post_task_telemetry(
     cycle_number: int | None = None,
     output: list[str] | None = None,
     dispatch_config: dict | None = None,
+    merged_sha: str | None = None,
 ) -> None:
     """Run all post-task telemetry: DB update, recording, scoring, reflexion, MemRL."""
-    update_task_status(task["id"], outcome, output=output)
+    update_task_status(task["id"], outcome, output=output, merged_sha=merged_sha)
     record_agent_run(task, result, outcome, role=role, model=model,
                      max_turns=max_turns, cycle_number=cycle_number)
     if outcome in ("tests_passed", "no_tests"):
@@ -326,8 +334,12 @@ async def _gated_post_merge(
     task_id: int | None = None,
     security_review_enabled: bool = True,
     block_on_missing: bool = True,
+    guard: DefaultBranchGuard | None = None,
 ) -> str:
     """Unified post-loop gated merge for single-task ``--dev-test`` mode.
+
+    ``guard`` is the run's default-branch guard, snapshotted before the
+    dev-test loop (task #3111); the gate records its per-task result on it.
 
     Task #2451 Phase B: this is a thin adapter that delegates to
     :func:`equipa.dispatch._gated_merge_task` — both single-task and parallel
@@ -361,7 +373,28 @@ async def _gated_post_merge(
         task_id=task_id,
         security_review_enabled=security_review_enabled,
         block_on_missing=block_on_missing,
+        guard=guard,
     )
+
+
+async def _snapshot_merge_guard(project_dir: str) -> DefaultBranchGuard | None:
+    """Pin the default branch before the dev-test loop (dispatch-03).
+
+    ``None`` when the project is not a git repo or its default branch cannot
+    be pinned; the gated merge then refuses to mark the task done.
+    """
+    if not _is_git_repo(project_dir):
+        return None
+    try:
+        guard = await DefaultBranchGuard.snapshot(project_dir)
+    except MergeIntegrityError as exc:
+        print(f"  [Merge-Integrity] ERROR: {exc} — this task will not be merged")
+        return None
+    print(
+        f"  [Merge-Integrity] '{guard.default_branch}' pinned at "
+        f"{guard.baseline_sha[:12]} before dispatch"
+    )
+    return guard
 
 
 # --- Template subcommand (PLAN-1067 §3.C3) ---
@@ -1529,11 +1562,17 @@ async def _run_dev_test_mode(task, project_dir, project_context, args):
 
 
 async def _run_security_review_and_gate(
-    task, project_dir, project_context, args, outcome,
+    task, project_dir, project_context, args, outcome, *, guard=None,
 ):
     """Optional security review followed by the Bug #2450 unified gated
     post-merge. May demote ``outcome`` to ``security_review_blocked``.
-    Returns the (possibly updated) ``outcome``."""
+    Returns the (possibly updated) ``outcome``.
+
+    Task #3111 (dispatch-05): in a git project a merge-eligible outcome
+    survives only if the gated merge verifiably put the task on the default
+    branch and ``guard`` saw no foreign movement; otherwise it is demoted
+    (``merge_blocked`` / ``merge_failed`` / ``merge_integrity_failed``) so
+    the task is recorded as blocked, never done."""
     # Optional security review after successful dev-test. Must run
     # BEFORE _post_task_telemetry so that CRITICAL/HIGH findings can
     # demote the outcome to ``security_review_blocked`` and prevent
@@ -1676,6 +1715,7 @@ async def _run_security_review_and_gate(
     # the git-merge that were previously decoupled (task 2449 proof:
     # outcome=security_review_blocked but commits on master, branch gone).
     if args.dev_test:
+        merge_eligible = outcome in ("tests_passed", "no_tests")
         merge_branch = f"forge-task-{task['id']}"
         # Task #2706: no per-task trust signal is forwarded — the unified
         # gate re-derives doc-only-ness from the real diff and re-reads the
@@ -1692,6 +1732,7 @@ async def _run_security_review_and_gate(
                 getattr(args, "dispatch_config", None) or {},
                 "security_review_block_on_missing_artifact",
             ),
+            guard=guard,
         )
         if merge_result == "merged":
             print(
@@ -1708,10 +1749,47 @@ async def _run_security_review_and_gate(
                 f"  [Task #{task['id']}] MERGE: skipped — security gate "
                 f"blocked merge of {merge_branch}."
             )
+        if merge_eligible and _is_git_repo(project_dir):
+            if guard is not None:
+                await guard.verify("end-of-run", task_id=task["id"])
+            merge_outcome = (
+                guard.outcomes.get(task["id"]) if guard is not None else None
+            )
+            final_outcome, _merged_sha, reason = outcome_after_merge(
+                outcome, merge_outcome, guard,
+            )
+            if final_outcome != outcome:
+                single_line_reason = " ".join(reason.split())
+                print(
+                    f"  [Task #{task['id']}] STATUS: {final_outcome} — "
+                    f"{single_line_reason}; task left blocked, not done."
+                )
+                log_gate_audit(
+                    f"task={task['id']} event=task-status-after-merge "
+                    f"outcome={final_outcome} merged_sha=none "
+                    f"reason={single_line_reason}",
+                    task["id"],
+                    event="task-status-after-merge",
+                )
+            outcome = final_outcome
     return outcome
 
 
-async def _record_task_telemetry(task, result, outcome, cycles, args):
+def _merged_sha_for(
+    guard: DefaultBranchGuard | None, task_id: int, outcome: str,
+) -> str | None:
+    """The merged SHA to store with a ``done`` outcome, else None."""
+    if guard is None or outcome not in ("tests_passed", "no_tests"):
+        return None
+    merge_outcome: MergeOutcome | None = guard.outcomes.get(task_id)
+    if merge_outcome is None or not merge_outcome.done:
+        return None
+    return merge_outcome.merged_sha
+
+
+async def _record_task_telemetry(
+    task, result, outcome, cycles, args, *, merged_sha=None,
+):
     """Post-task telemetry for the dev+test path: DB update / ForgeSmith
     recording, TheForge status verification, and the loop summary. Runs
     after the security gate so a blocked outcome is what gets persisted."""
@@ -1732,7 +1810,8 @@ async def _record_task_telemetry(task, result, outcome, cycles, args):
         model=telemetry_model,
         max_turns=get_role_turns(task_role, args, task=task),
         cycle_number=cycles,
-        dispatch_config=getattr(args, "dispatch_config", None))
+        dispatch_config=getattr(args, "dispatch_config", None),
+        merged_sha=merged_sha)
 
     # Verify the task status in TheForge
     verified, verify_msg = verify_task_updated(task["id"])
@@ -1890,13 +1969,20 @@ async def run_mode_task(args: argparse.Namespace) -> None:
     # --- Execute ---
 
     if args.dev_test:
+        # dispatch-03 (task #3111): pin the default branch before any agent
+        # runs; only the gated merge below may move it.
+        merge_guard = await _snapshot_merge_guard(project_dir)
         result, cycles, outcome = await _run_dev_test_mode(
             task, project_dir, project_context, args,
         )
         outcome = await _run_security_review_and_gate(
             task, project_dir, project_context, args, outcome,
+            guard=merge_guard,
         )
-        await _record_task_telemetry(task, result, outcome, cycles, args)
+        await _record_task_telemetry(
+            task, result, outcome, cycles, args,
+            merged_sha=_merged_sha_for(merge_guard, task["id"], outcome),
+        )
     else:
         await _run_single_agent_mode(
             task, project_dir, project_context, args,
