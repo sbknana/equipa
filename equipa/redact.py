@@ -31,6 +31,19 @@ REDACTED = "[REDACTED]"
 # inside the preview but ends after it is still recognised whole.
 _PREVIEW_LOOKAHEAD = 1024
 
+# Hard cap on the text one redact_secrets call scans (IR-05). Previews and
+# log lines are far shorter; only a caller passing a whole tool input or
+# output reaches it, and gets the redacted head plus this marker.
+MAX_REDACT_INPUT = 64 * 1024
+TRUNCATED_MARKER = " [TRUNCATED]"
+# Replaces the rest of a tool input whose strings would cost more regex work
+# than _WALK_WORK_FACTOR x the preview budget (IR-05). Only a pathological
+# input (thousands of credential-shaped strings that each redact down to a
+# few characters) gets here; the preview then ends early instead of showing
+# anything unredacted.
+WORK_LIMIT_MARKER = "[REDACTION WORK LIMIT]"
+_WALK_WORK_FACTOR = 4
+
 # A variable value after ``NAME=``: a double-quoted string (raw ``"`` or the
 # JSON-escaped ``\"``; the closing quote may be missing when the text was
 # truncated), a single-quoted string, or a bare word.
@@ -50,12 +63,19 @@ _FLAG_VALUE = (
 )
 
 # Names that hold credentials by convention: anything containing SECRET,
-# PASSWORD or PASSWD (PGPASSWORD, DB_PASSWORD, CLIENT_SECRET_ID, ...), and
-# anything ending in _TOKEN or _KEY (GITHUB_TOKEN, ANTHROPIC_API_KEY, ...).
-# Upper-case only: environment variables are upper-case, and matching
-# lower-case identifiers would mangle ordinary code such as ``sort_key=len``.
+# PASSWORD or PASSWD (PGPASSWORD, DB_PASSWORD, CLIENT_SECRET_ID, ...), PASS
+# as a whole ``_``-separated word (PASS, DB_PASS, SMTP_PASS_1; not BYPASS or
+# COMPASS), and anything ending in _TOKEN or _KEY (GITHUB_TOKEN,
+# ANTHROPIC_API_KEY, ...). Upper-case only: environment variables are
+# upper-case, and matching lower-case identifiers would mangle ordinary code
+# such as ``sort_key=len``.
+#
+# Linear (IR-05): the keyword is found by a lookahead that scans the name run
+# once, then the run is consumed once. The earlier ``X*KEYWORD X*`` shape
+# backtracked quadratically on a run holding many keywords (``PWD_PWD_...``).
 _SECRET_NAME = (
-    r"(?:[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD)[A-Z0-9_]*"
+    r"(?:(?=[A-Z0-9_]*?(?:SECRET|PASSWORD|PASSWD|(?<![A-Z0-9])PASS(?![A-Z0-9])))"
+    r"[A-Z0-9_]+"
     r"|[A-Z0-9_]*_(?:TOKEN|KEY)|TOKEN)"
 )
 
@@ -68,10 +88,25 @@ _NAME_START = r"(?:(?<![A-Za-z0-9_])|(?<=\\[nrt]))"
 # password/passwd/pwd (libpq ``password=``, YAML, JSON, db_password),
 # secrets, API and access keys, private keys, and names ENDING in token
 # (``access_token``, but not ``max_tokens``). Bare ``key`` is not included,
-# so ``sort(key=len)`` is left alone.
+# so ``sort(key=len)`` is left alone. Linear like _SECRET_NAME: a lookahead
+# finds the keyword, then the run is consumed once (IR-05).
 _SECRET_KEY = (
-    r"(?i:[a-z0-9_.-]*(?:(?:password|passwd|pwd|secret|api[-_]?key"
-    r"|access[-_]?key|private[-_]?key)[a-z0-9_.-]*|token))"
+    r"(?i:(?=[a-z0-9_.-]*?(?:password|passwd|pwd|secret|api[-_]?key"
+    r"|access[-_]?key|private[-_]?key))[a-z0-9_.-]+|[a-z0-9_.-]*token)"
+)
+
+# How far a command-scoped flag pattern (``mysql ... -p``) looks from the
+# command word to the flag. Bounded so a text repeating the command word
+# cannot make the search quadratic (IR-05).
+_FLAG_REACH = r"[^\n;&|]{0,1024}?"
+
+# A .pgpass line (``host:port:database:user:password``, IR-06): the port
+# field is a number or ``*``. The password may hold ``\:`` escapes.
+_PGPASS_START = r"(?:(?<![^\s'\"=>])|(?<=\\[nrt]))"
+_PGPASS_LINE = re.compile(
+    rf"{_PGPASS_START}((?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9_.*-]+):(?:\d{{1,5}}|\*)"
+    r":[^:\s'\"]+:[^:\s'\"]+:)"
+    r"(?!\[REDACTED\])((?:\\[^\"\s]|[^\s'\"\\])+)"
 )
 # Start of such a key: one start per run of name characters, which keeps the
 # match linear on long runs; a JSON escape counts as a separator (P2A-08).
@@ -120,6 +155,12 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-" + REDACTED),
     # AWS access key ids.
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
+    # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-...).
+    (re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}"), REDACTED),
+    # Google API keys.
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), REDACTED),
+    # GitLab personal / project / group access tokens.
+    (re.compile(r"\bglpat-[0-9A-Za-z_-]{16,}"), REDACTED),
     # JWTs (header.payload.signature, base64url; the header starts "eyJ").
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
      REDACTED),
@@ -135,19 +176,53 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # alone). Scoped to the mysql/mariadb clients: -p means something else to
     # most tools.
     (re.compile(
-        r"((?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))\b[^\n;&|]*?\s-p)"
+        rf"((?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))\b{_FLAG_REACH}\s-p)"
         rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
      r"\1" + REDACTED),
     # sshpass -p <value> / -p<value>. Scoped to sshpass: ssh -p is a port.
     (re.compile(
-        r"(\bsshpass\b[^\n;&|]*?\s-p\s*)"
+        rf"(\bsshpass\b{_FLAG_REACH}\s-p\s*)"
         rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
      r"\1" + REDACTED),
-    # curl -u user:password / --user user:password (no colon: curl prompts).
+    # Password flags scoped to the command that means it (IR-06): docker /
+    # podman / nerdctl login -p, az ... -p, sqlcmd -P, redis-cli -a / --pass.
+    # Elsewhere these letters mean ports, paths or "all".
     (re.compile(
-        r"(\bcurl\b[^\n;&|]*?\s(?:-u\s*|--user(?:=|\s+))"
+        rf"(\b(?:docker|podman|nerdctl)\b{_FLAG_REACH}\blogin\b{_FLAG_REACH}"
+        r"\s-p(?:\s+|=))"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    (re.compile(
+        rf"(\baz\s+[a-z]{_FLAG_REACH}\s-p(?:\s+|=))"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    (re.compile(
+        rf"((?i:\bsqlcmd)\b{_FLAG_REACH}\s-P\s*)"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    (re.compile(
+        rf"(\bredis-cli\b{_FLAG_REACH}\s(?:-a|--pass)\s+)"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    # htpasswd -b [other flags] file user PASSWORD: the password is the last
+    # word of the command (IR-06).
+    (re.compile(
+        rf"(\bhtpasswd\b{_FLAG_REACH}\s-[A-Za-z]*b[A-Za-z]*\s{_FLAG_REACH}\s)"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"
+        r"(?=[ \t]*(?:[\n;&|)`\"\\]|$))"),
+     r"\1" + REDACTED),
+    # curl -u / --user and -U / --proxy-user user:password (no colon: curl
+    # prompts).
+    (re.compile(
+        rf"(\bcurl\b{_FLAG_REACH}\s"
+        r"(?:-u\s*|--user(?:=|\s+)|-U\s*|--proxy-user(?:=|\s+))"
         r"(?:\\?[\"'])?[^\s:'\"\\]*:)"
         r"(?!\[REDACTED\])([^\s'\"\\;&|]+)"),
+     r"\1" + REDACTED),
+    # .pgpass lines: host:port:database:user:password.
+    (_PGPASS_LINE, r"\1" + REDACTED),
+    # Cookie / Set-Cookie header values, to the end of the header (IR-06).
+    (re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)(?!\[REDACTED\])[^\r\n'\"\\]+"),
      r"\1" + REDACTED),
     # key = value / key: value / "key": "value" of credential-named keys in
     # any case and format: libpq DSNs, YAML, JSON, headers (X-Api-Key: ...).
@@ -175,11 +250,22 @@ def redact_secrets(text: str) -> str:
     ``scheme://user:password@`` URLs (passwords containing ``/`` or ``@``
     too); ``Authorization``/``Bearer`` headers; ``sk-...`` API keys, GitHub
     ``ghp_``/``gho_``/``github_pat_`` tokens, AWS ``AKIA`` key ids, JWTs and
-    PEM private-key bodies. Idempotent. Non-string input is returned
-    unchanged so a malformed tool payload never breaks logging.
+    PEM private-key bodies; also Slack ``xox?-``, Google ``AIza`` and GitLab
+    ``glpat-`` tokens, ``PASS=``/``*_PASS=``, ``docker login -p``,
+    ``htpasswd -b``, ``az -p``, ``sqlcmd -P``, ``redis-cli -a``, curl
+    ``--proxy-user``, ``.pgpass`` lines and ``Cookie``/``Set-Cookie``
+    headers. Idempotent. Non-string input is returned unchanged so a
+    malformed tool payload never breaks logging.
+
+    Text longer than ``MAX_REDACT_INPUT`` is cut to that length (ending in
+    ``TRUNCATED_MARKER``) before any pattern runs, so no caller can hand the
+    patterns an unbounded amount of work (IR-05). Nothing past the cut is
+    returned, so nothing unredacted leaks.
     """
     if not isinstance(text, str) or not text:
         return text
+    if len(text) > MAX_REDACT_INPUT:
+        text = text[:MAX_REDACT_INPUT - len(TRUNCATED_MARKER)] + TRUNCATED_MARKER
     for pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
     return text
@@ -203,17 +289,69 @@ def redacted_preview(text: str, limit: int) -> str:
 _MAX_STRUCTURE_DEPTH = 32
 
 
-def _redact_values(value: Any, budget: int, depth: int = 0) -> Any:
-    """Copy of ``value`` with every string redacted (and cut to ``budget``)."""
+class _WalkBudget:
+    """What is left while redacting one tool input (IR-05).
+
+    ``output`` counts down the rendered characters still inside the preview
+    budget. Each string is counted at its redacted length plus its quotes,
+    a lower bound of what ``json.dumps`` renders (escapes only add), so the
+    walk never stops before the rendering has really passed the budget.
+    ``work`` counts down the characters the patterns may still scan.
+    """
+
+    __slots__ = ("output", "work")
+
+    def __init__(self, output: int) -> None:
+        self.output = output
+        self.work = output * _WALK_WORK_FACTOR
+
+    @property
+    def spent(self) -> bool:
+        return self.output <= 0
+
+
+def _redact_text(text: str, budget: _WalkBudget) -> str:
+    """One string of a tool input, cut and redacted within ``budget``."""
+    piece = text[: max(budget.output, 0) + _PREVIEW_LOOKAHEAD]
+    if len(piece) > budget.work:
+        # Out of regex work before the preview filled: end the walk here.
+        budget.work = budget.output = 0
+        return WORK_LIMIT_MARKER
+    budget.work -= len(piece)
+    redacted = redact_secrets(piece)
+    budget.output -= len(redacted) + 2
+    return redacted
+
+
+def _redact_values(value: Any, budget: _WalkBudget, depth: int = 0) -> Any:
+    """Copy of ``value``, strings redacted, in ``json.dumps`` order.
+
+    Items after the point where the rendering passes the budget are left
+    out: they cannot reach the preview, and skipping them keeps the work
+    proportional to the preview, not to the input (IR-05). The rendering of
+    the copy is identical to the full rendering up to that point.
+    """
     if isinstance(value, str):
-        return redact_secrets(value[:budget])
+        return _redact_text(value, budget)
     if depth >= _MAX_STRUCTURE_DEPTH:
-        return redact_secrets(str(value)[:budget])
+        return _redact_text(str(value), budget)
     if isinstance(value, dict):
-        return {key: _redact_values(item, budget, depth + 1)
-                for key, item in value.items()}
+        copied: dict[Any, Any] = {}
+        for key, item in value.items():
+            if budget.spent:
+                break
+            budget.output -= len(str(key)) + 4  # "key": (lower bound)
+            copied[key] = _redact_values(item, budget, depth + 1)
+        return copied
     if isinstance(value, (list, tuple)):
-        return [_redact_values(item, budget, depth + 1) for item in value]
+        items: list[Any] = []
+        for item in value:
+            if budget.spent:
+                break
+            budget.output -= 1  # separator (lower bound)
+            items.append(_redact_values(item, budget, depth + 1))
+        return items
+    budget.output -= 1  # a number, true/false or null: at least one character
     return value
 
 
@@ -231,11 +369,13 @@ def redacted_json_preview(value: Any, limit: int) -> str:
     ``json.dumps`` a line break is the two characters ``\\n``, so an
     assignment at the start of a later line would no longer look like one.
     The rendering is then redacted again, which catches credentials that are
-    only recognisable with their key (``{"api_key": "..."}``). Strings are
-    cut to ``limit`` plus the lookahead first; nothing past that can appear
-    in the preview.
+    only recognisable with their key (``{"api_key": "..."}``). The walk stops
+    once the rendering passes ``limit`` plus the lookahead, and each string
+    is cut to what is left plus the lookahead; nothing past that can appear
+    in the preview. Total work is bounded by the preview size, not by the
+    input (IR-05).
     """
-    budget = limit + _PREVIEW_LOOKAHEAD
+    budget = _WalkBudget(limit + _PREVIEW_LOOKAHEAD)
     return redacted_preview(_render(_redact_values(value, budget)), limit)
 
 
