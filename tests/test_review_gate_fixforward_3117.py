@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Fix-forward of task 3117 after its independent review.
+
+1. Three finding SHAPES the listed candidate rules missed must fail closed
+   behind a zero footer: a list item that starts with a severity, a
+   Severity field in a nested list item, a table cell with a Severity field.
+2. Prose mentions of a severity stay allowed (tasks 2315 / 3038 design).
+3. Only status-position "Draft / WIP / Preliminary / Initial scan" blocks;
+   ordinary prose that starts with those words does not.
+
+Copyright 2026 Forgeborn
+"""
+
+from pathlib import Path
+
+import pytest
+
+from equipa import loops
+from equipa.security_gate import review_complete_line, reviewer_nonce_line
+
+NONCE = "0123456789abcdef0123456789abcdef"
+ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
+
+
+def review(summary: str, body: list[str], footer: str, low_heading: bool) -> str:
+    lines = [reviewer_nonce_line(NONCE), "# Security Review", "",
+             "## Summary", summary, ""]
+    if low_heading:
+        lines += ["### [E1] LOW - verbose error message", "Details.", ""]
+    lines += body + ["", "## Files Reviewed", "- app.py", "- tests/test_app.py",
+                     "", "## Methodology", "Read the diff, ran semgrep.", "",
+                     "## Counts", footer, review_complete_line(NONCE)]
+    return "\n".join(lines) + "\n"
+
+
+def verdict(text: str) -> str:
+    return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text).verdict
+
+
+# --- 1. finding shapes that used to merge behind a zero footer ---------------
+
+@pytest.mark.parametrize("body", [
+    ["## Notes", "- HIGH: SQL injection in the search endpoint"],
+    ["## Notes", "1. **Critical** - remote code execution in upload"],
+    ["## Findings", "- S1 token leak", "    - **Severity:** HIGH"],
+    ["## Findings", "- S1 token leak", "        * Severity: CRITICAL"],
+    ["| ID | Detail | Where |", "|---|---|---|", "| S1 | Severity: HIGH | app.py:12 |"],
+])
+def test_finding_shapes_behind_zero_footer_fail_closed(body):
+    text = review("No findings.", body, ZERO, low_heading=False)
+    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
+
+
+def test_leading_high_next_to_a_counted_low_fails_closed():
+    text = review("1 finding.", ["## Notes", "- HIGH: auth bypass on /admin"],
+                  ONE_LOW, low_heading=True)
+    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
+
+
+# --- 2. prose mentions and near-misses still merge ----------------------------
+
+@pytest.mark.parametrize("line", [
+    "Rated S1 MEDIUM, not HIGH: it needs a local foothold.",
+    "E1 was rated LOW rather than HIGH because the path is admin-only.",
+    "No HIGH or CRITICAL issues were found.",
+    "semgrep: 0 CRITICAL/HIGH results across the diff.",
+    "- High confidence in the fix; the caller validates input.",
+    "- Low-level parsing is unchanged.",
+    "    indented prose that mentions HIGH in passing",
+])
+def test_prose_mentions_still_merge(line):
+    text = review("1 finding.", ["## Notes", line], ONE_LOW, low_heading=True)
+    assert verdict(text) == loops.REVIEW_VERDICT_OK, line
+
+
+# --- 3. unfinished-summary markers only in status position -------------------
+
+@pytest.mark.parametrize("summary", [
+    "Initial review of the 7 changed files found one LOW issue.",
+    "WIP branch contains a refactor of the cache layer; 1 finding.",
+    "Preliminary checks passed, then a full pass found 1 finding.",
+    "The PR is awaiting review by the owner; 1 finding.",
+    "Drafted fixes are out of scope; 1 finding.",
+])
+def test_honest_summaries_are_not_unfinished(summary):
+    text = review(summary, [], ONE_LOW, low_heading=True)
+    assert verdict(text) == loops.REVIEW_VERDICT_OK, summary
+
+
+@pytest.mark.parametrize("summary", [
+    "Draft",
+    "WIP: still reading dispatch.py",
+    "Preliminary - more to come",
+    "Initial automated scan only; manual review pending",
+    "IN PROGRESS - initial skeleton",
+    "**Draft**",
+    "Initial scan only",
+])
+def test_status_markers_still_block(summary):
+    text = review(summary, [], ONE_LOW, low_heading=True)
+    assert verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary

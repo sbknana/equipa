@@ -439,9 +439,11 @@ async def run_security_review(
         f"`### [TAG-NN] SEVERITY — title`, using `#` headings only (no "
         f"`===`/`---` underlined or HTML headings). Do NOT put the words "
         f"CRITICAL, HIGH, MEDIUM, LOW or INFO (in any case) in any other "
-        f"heading, bold lead-in, table cell, `Severity:` field or "
+        f"heading, bold lead-in, table cell, `Severity:` field (at any "
+        f"list depth), list item that starts with a severity, or "
         f"parenthesis of a list item: each of those is counted as a "
-        f"finding. A finding heading still counts even when it is marked "
+        f"finding. Mentioning a severity in ordinary prose is fine. "
+        f"A finding heading still counts even when it is marked "
         f"fixed or resolved, so refer to already-fixed upstream findings "
         f"by their ID only, without a severity word. "
         f"The review MUST end with a footer formatted EXACTLY as:\n"
@@ -870,13 +872,21 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # gate-07: "Draft", "WIP", "Preliminary" and "Initial automated scan only"
 # opened Summaries of unfinished reviews that parsed ``ok``. ``(?![\w-])``
 # keeps "Drafted" and "Draft-mode endpoint lacks auth" finished.
+# Fix-forward of 3117: DRAFT / WIP / PRELIMINARY / "Initial scan" count only
+# as a STATUS, i.e. followed by end of line, ":", a dash, a bracket or "only".
+# "WIP branch contains...", "Initial review of 7 files found..." and
+# "Preliminary checks passed" are ordinary prose in finished reviews. The
+# completion sentinel is the real proof a review finished; these markers are
+# a second line of defence and must not block honest reviews.
+_STATUS_END = r"(?=[ \t]*(?:$|[:—–(\[]|-(?!\w)|only\b))"
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
     r"^[ \t*_\[(:—–-]*(?:"
     r"(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b"
-    r"|(?:DRAFT|WIP|PRELIMINARY)(?![\w-])"
-    r"|INITIAL[ \t]+(?:AUTOMATED[ \t]+)?(?:SCAN|PASS|REVIEW)(?![\w-])"
+    r"|(?:DRAFT|WIP|PRELIMINARY)[ \t*_\])]*" + _STATUS_END +
+    r"|INITIAL[ \t]+(?:AUTOMATED[ \t]+)?(?:SCAN|PASS|REVIEW)[ \t*_\])]*"
+    + _STATUS_END +
     r")",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 # gate-07: a Summary that says the review itself is still to be done, in any
 # position ("Initial automated scan only; manual review pending").
@@ -884,7 +894,7 @@ _PENDING_REVIEW_RE = re.compile(
     r"(?<![A-Za-z])(?:"
     r"review[ \t]+(?:is[ \t]+)?(?:still[ \t]+)?(?:pending|in[ \t]+progress"
     r"|incomplete|not[ \t]+(?:yet[ \t]+)?(?:complete|completed|finished|done))"
-    r"|(?:pending|awaiting)[ \t]+(?:manual[ \t]+|full[ \t]+)?review"
+    r"|(?:pending|awaiting)[ \t]+(?:manual|full)[ \t]+review"
     r")(?![A-Za-z])",
     re.IGNORECASE,
 )
@@ -1015,8 +1025,12 @@ _ANY_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.MULTILINE)
 # is not a field: the word after "Severity" must itself be a severity.
 # Every whitespace run is bounded: two adjacent unbounded ``[ \t]*`` made a
 # "Severity" line padded with 20000 spaces take seconds (quadratic).
+# Fix-forward of 3117: a Severity field in a NESTED list item ("    - **Severity:**
+# HIGH") is still a list item, not indented code, so it may be indented up to
+# 12 columns when it carries a bullet. A bare line still allows only 0-3.
 _SEVERITY_FIELD_RE = re.compile(
-    r"^[ \t]{0,3}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
+    r"^(?:[ \t]{0,3}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
+    r"|[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})"
     r"[*_]{0,3}[ \t]{0,8}severity(?:[ \t]{1,8}(?:rating|level))?"
     r"[ \t]{0,8}[*_]{0,3}(?:[ \t]{0,8}[:=—–-]|[ \t])"
     r"[^A-Za-z0-9\n]{0,8}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
@@ -1030,6 +1044,22 @@ _LIST_ITEM_SEVERITY_RE = re.compile(
     r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_]{0,2}[ \t]{0,8}"
     r"[)\],;:]",
     re.MULTILINE | re.IGNORECASE,
+)
+# Fix-forward of 3117: a list item that OPENS with a severity followed by a
+# colon or dash is a finding: "- HIGH: SQL injection", "2. **Critical** - RCE".
+# "- High confidence in the fix" is not (no colon or dash after the severity).
+# A line _FINDING_CANDIDATE_RE already counts (some bold lead-ins) is skipped
+# in _extra_candidate_severities so one finding is never counted twice.
+_LIST_ITEM_LEADING_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}[*_\[(]{0,3}[ \t]{0,4}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_\])]{0,3}[ \t]{0,4}"
+    r"(?::|—|–|-(?!\w))",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Fix-forward of 3117: a table cell holding a Severity field ("Severity: HIGH").
+_TABLE_SEVERITY_FIELD_CELL_RE = re.compile(
+    r"severity[ \t]*[:=][ \t]*[*_]{0,2}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
+    re.IGNORECASE,
 )
 # A table cell that IS a severity (fullmatch): "HIGH", "**High**",
 # "🔴 HIGH", "High-severity", "HIGH (CVSS 7.5)". A description cell that
@@ -1290,7 +1320,8 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
             continue
         severity_cells: dict[int, str] = {}
         for column, cell in enumerate(cells):
-            match = _TABLE_SEVERITY_CELL_RE.fullmatch(cell)
+            match = (_TABLE_SEVERITY_CELL_RE.fullmatch(cell)
+                     or _TABLE_SEVERITY_FIELD_CELL_RE.search(cell))
             if match is not None:
                 severity_cells[column] = match.group(1).upper()
         if not severity_cells:
@@ -1322,6 +1353,11 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
         for regex in (_SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE)
         for match in regex.finditer(visible_text)
     ]
+    for match in _LIST_ITEM_LEADING_SEVERITY_RE.finditer(visible_text):
+        line_start = visible_text.rfind("\n", 0, match.start()) + 1
+        if _FINDING_CANDIDATE_RE.match(visible_text, line_start):
+            continue  # already counted as a bold lead-in candidate
+        severities.append(match.group(1).upper())
     severities.extend(_table_candidate_severities(visible_text))
     return severities
 

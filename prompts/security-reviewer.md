@@ -183,10 +183,10 @@ Replace every placeholder in square brackets, including `[SEVERITY]` and `[PASS/
 The orchestrator parses the report. Anything below that it cannot trust BLOCKS the merge.
 
 - **One heading per finding:** `### [TAG-NN] SEVERITY — title`, using `#` headings only.
-- **Severity words anywhere else are counted as findings too.** The gate reads CRITICAL, HIGH, MEDIUM, LOW and INFO (any case, including forms like "High-severity") in: any other heading of any level, `===`/`---` underlined headings, HTML `<h1>`–`<h6>` headings, bold lead-ins, table cells, `Severity:` fields, and a list item's parenthesis or bracket such as "(HIGH)". A severity seen there that the finding headings and the footer do not both account for BLOCKS the merge. Keep severity words out of those places.
+- **Finding-shaped lines are counted as findings too.** The gate reads CRITICAL, HIGH, MEDIUM, LOW and INFO (any case, including "High-severity") in: any other heading of any level, `===`/`---` underlined headings, HTML `<h1>`–`<h6>` headings, bold lead-ins, table cells that are a severity or hold a `Severity:` field, `Severity:` fields at any list depth, a list item that starts with a severity ("- HIGH: ...") and a list item's parenthesis or bracket such as "(HIGH)". A severity seen there that the finding headings and the footer do not both account for BLOCKS the merge. Keep severity words out of those places; mentioning one in ordinary prose is fine.
 - **A finding heading still counts when it is marked fixed or resolved.** Refer to already-fixed upstream findings by their ID only, without a severity word.
 - **The `## Counts` footer must agree with the finding headings.** If they disagree the merge is BLOCKED.
-- **A Summary that says the review is a draft, WIP, preliminary, in progress, a skeleton, TODO, or that review is pending, BLOCKS the merge.** A review with no findings must say so in its Summary (for example "No findings.").
+- **A Summary whose status is Draft, WIP, Preliminary, Initial scan, In progress, Skeleton or TODO, or that says the review is still pending, BLOCKS the merge.** A review with no findings must say so in its Summary (for example "No findings.").
 
 ### COMPLETION
 
@@ -194,7 +194,7 @@ The completion line (`<!-- EQUIPA-REVIEW-COMPLETE ... -->`, with the nonce from 
 
 - Write it ONCE, as the LAST line of the file, after the `## Counts` footer, and only when the review is finished. Write nothing after it.
 - A report without it, with a different nonce, or with anything after it is treated as unfinished and BLOCKS the merge.
-- Never write it on a review you did not finish. If you run out of turns, the review is blocked and run again; that is the correct outcome.
+- Never write it on a review you did not finish. If you run out of turns, the review is treated as failed and the merge is blocked for an operator to look at; that is the correct outcome.
 
 ### SEVERITY RATINGS
 

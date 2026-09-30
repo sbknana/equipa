@@ -294,7 +294,8 @@ async def test_security_reviewer_prompt_states_fail_closed_rules(
     # gate-06: so are the forms it now counts (table cells, Severity fields,
     # setext and HTML headings, list-item parentheses).
     assert (
-        "in any other heading, bold lead-in, table cell, `Severity:` field or "
+        "in any other heading, bold lead-in, table cell, `Severity:` field "
+        "(at any list depth), list item that starts with a severity, or "
         "parenthesis of a list item: each of those is counted as a finding"
     ) in description
     assert "no `===`/`---` underlined or HTML headings" in description
