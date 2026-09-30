@@ -13,7 +13,7 @@ from typing import Any
 
 from equipa.config import get_configured_model
 from equipa.db import db_conn
-from equipa.lessons import record_agent_episode
+from equipa.lessons import record_agent_episode, sanitize_episode_text
 from equipa.output import log
 from equipa.parsing import parse_reflection
 
@@ -107,6 +107,13 @@ async def run_reflexion_agent(
                 reflection_text = parsed["result"].strip()
         except (json.JSONDecodeError, KeyError):
             pass  # not JSON, use raw text
+
+        # The reflection agent read the task's output tail, so its text is
+        # agent-authored: reject-mode sanitize before storage (sandbox-10).
+        reflection_text = sanitize_episode_text(reflection_text, "reflection")
+        if not reflection_text:
+            log("  [Reflexion] Reflection rejected by sanitizer, discarding.", output)
+            return
 
         # Update the most recent episode for this task (subquery for portability)
         with db_conn(write=True) as conn:
