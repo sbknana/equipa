@@ -169,6 +169,11 @@ class AgentResult(_AgentResultRequired, total=False):
 
 from equipa import agent_launcher
 from equipa.abort_controller import AbortController, create_child_abort_controller
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    is_claude_cli,
+    isolate_claude_argv,
+)
 from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
     get_configured_model,
@@ -889,6 +894,12 @@ def build_cli_command(
             "--no-session-persistence",
             "--append-system-prompt-file", prompt_file.name,
             "--mcp-config", str(MCP_CONFIG),
+            # IR-01: the CLI runs in the agent-writable project directory, so
+            # load user settings only (a project .claude/settings.json could
+            # set disableAllHooks and switch off the Bash gate; CLAUDE.md
+            # would plant instructions) and only EQUIPA's MCP servers (no
+            # project .mcp.json). See equipa/cli_isolation.py.
+            *CLAUDE_CLI_ISOLATION_ARGS,
             "--add-dir", str(project_dir),
             "--permission-mode", "bypassPermissions",
         ]
@@ -1383,6 +1394,14 @@ async def _spawn_agent_process(
     cwd = project_dir or _cmd_option(cmd, "--add-dir")
     if cwd is not None and not os.path.isdir(cwd):
         raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
+    if cmd and is_claude_cli(cmd[0]):
+        # IR-01 backstop for every caller (reflexion, manager, custom argv):
+        # whatever built the argv, project-scope settings, CLAUDE.md and
+        # .mcp.json in the cwd are never loaded.
+        try:
+            cmd = isolate_claude_argv(cmd)
+        except ValueError as exc:
+            raise AgentDispatchRefused(str(exc)) from exc
     mcp_config = _cmd_option(cmd, "--mcp-config")
     if mcp_config:
         _check_mcp_servers(mcp_config)
