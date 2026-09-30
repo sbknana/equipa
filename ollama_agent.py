@@ -20,6 +20,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Model-chosen commands get the same allowlisted environment as every other
+# agent subprocess, never the orchestrator's (IR-07, task 3134).
+from equipa.env_loader import active_agent_env
+
 # --- Config ---
 
 DEFAULT_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -316,7 +320,8 @@ def exec_grep(project_dir, args):
             "grep", "-rn", pattern, str(target)
         ]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, cwd=str(project)
+            cmd, capture_output=True, text=True, timeout=30, cwd=str(project),
+            env=active_agent_env(),
         )
         output = result.stdout
         if len(output) > MAX_OUTPUT_SIZE:
@@ -342,7 +347,8 @@ def exec_bash(project_dir, args, allow_write=False):
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            timeout=120, cwd=project_dir,
+            timeout=120, cwd=str(Path(project_dir).resolve()),
+            env=active_agent_env(),
         )
         output = result.stdout
         if result.stderr:
