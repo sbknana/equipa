@@ -33,6 +33,26 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# R3136-06: the prompt mutation starts the Claude CLI on text built from
+# agent_runs.error_summary, as the orchestrator's user. With agent_isolation
+# on it refuses, like the ForgeSmith GHOST/OPRO and SIMBA spawns (ISO-06).
+# Run as a script, equipa sits next to (or one level above) this file; if it
+# still cannot be imported, the flag cannot be read and the call is refused.
+for _root in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
+    if (_root / "equipa" / "__init__.py").is_file() and str(_root) not in sys.path:
+        sys.path.append(str(_root))
+try:
+    from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+    from equipa.isolation import unisolated_spawn_refusal
+except ImportError:
+    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
+                                 "--strict-mcp-config")
+
+    def unisolated_spawn_refusal(purpose, remedy=""):
+        """Standalone fallback: agent_isolation cannot be checked; refuse."""
+        return (f"{purpose} refused: equipa is not importable, so "
+                f"agent_isolation cannot be checked")
+
 
 def is_on_claudinator() -> bool:
     """Detect if we're running on the primary server (EQUIPA_BASE exists)."""
@@ -354,6 +374,13 @@ Rules:
 
 Output the raw prompt text only."""
 
+    refusal = unisolated_spawn_refusal(
+        "autoresearch prompt mutation",
+        "run the autoresearch loop with agent_isolation off")
+    if refusal:
+        print(f"  ERROR: {refusal}")
+        return ""
+
     print(f"  Calling Claude CLI (opus, subscription)...", flush=True)
 
     # Write meta_prompt to a temp file to avoid shell quoting issues
@@ -366,10 +393,15 @@ Output the raw prompt text only."""
 
     try:
         if is_on_claudinator():
-            result = subprocess.run(
-                ["bash", "-c", f'claude --print --model opus < "{tmp_path}"'],
-                capture_output=True, text=True, timeout=300
-            )
+            # The argv runs directly (no shell) with the prompt on stdin, and
+            # never loads project settings or MCP servers (IR-01).
+            with open(tmp_path, encoding="utf-8") as prompt_input:
+                result = subprocess.run(
+                    ["claude", "--print", "--model", "opus",
+                     *CLAUDE_CLI_ISOLATION_ARGS],
+                    stdin=prompt_input, capture_output=True, text=True,
+                    timeout=300,
+                )
         else:
             # Running on Windows — SCP the prompt file, then SSH to run claude
             remote_tmp = f"/tmp/autoresearch_prompt_{role}.txt"

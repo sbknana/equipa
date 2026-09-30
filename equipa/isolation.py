@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import collections
 import contextlib
 import copy
 import json
@@ -54,7 +55,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,11 @@ _SUDOERS_UNSAFE = frozenset(' \t\n,:=\\"#!*?[]()')
 ARTIFACTS_DIR = ".equipa-artifacts"
 _SYMLINK_MODE = b"120000"
 _MAX_CHANGED_SYMLINKS = 1000
+# Symbolic links followed while resolving one imported link (MAXSYMLINKS).
+_MAX_LINK_HOPS = 40
+# How the commits of an export (state, parents) are named in refusals.
+_EXPORT_COMMIT_NAMES = ("", " (committed task-branch tip)",
+                        " (the clone's HEAD commit)")
 
 
 class AgentIsolationError(RuntimeError):
@@ -902,16 +908,55 @@ def _tree_symlinks(worktree_path: str, treeish: str) -> dict[str, str]:
     return links
 
 
-def _link_escapes(path: str, target: str) -> bool:
-    """True for an absolute target or one that leaves the working tree."""
+def _link_escapes(path: str, target: str,
+                  link_target: Callable[[str], str | None] | None = None) -> bool:
+    """True for an absolute target or one that leaves the working tree.
+
+    ``link_target(p)`` returns the target of the tree's own link at ``p``
+    (None when ``p`` is no link). Each such component is followed, as the
+    kernel would, so ``a/..`` through a link ``a`` resolves where the link
+    points rather than lexically (review R3136-05). Too many hops count as
+    an escape. Without ``link_target`` the walk is purely lexical.
+    """
     if target.startswith("/"):
         return True
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
-    return resolved == ".." or resolved.startswith("../")
+    directory = [part for part in posixpath.dirname(path).split("/") if part]
+    pending = collections.deque(target.split("/"))
+    hops = 0
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not directory:
+                return True
+            directory.pop()
+            continue
+        inner = (None if link_target is None
+                 else link_target("/".join((*directory, part))))
+        if inner is None:
+            directory.append(part)
+            continue
+        hops += 1
+        if hops > _MAX_LINK_HOPS or inner.startswith("/"):
+            return True
+        # The inner target is relative to the link's directory, which is
+        # ``directory`` itself.
+        pending.extendleft(reversed(inner.split("/")))
+    return False
+
+
+def _read_link_target(worktree_path: str, path: str, blob: str) -> str:
+    result = git_run(["cat-file", "blob", blob], cwd=worktree_path, text=False)
+    if result.returncode != 0:
+        raise AgentIsolationError(f"cannot read the link {path} in the "
+                                  f"agent's export")
+    return result.stdout.decode("utf-8", "surrogateescape")
 
 
 def check_imported_links(worktree: WorktreeInfo, state: str,
-                         carry_paths: Sequence[str]) -> None:
+                         carry_paths: Sequence[str], *,
+                         where: str = "") -> None:
     """Refuse agent state whose symbolic links would redirect the
     orchestrator's own writes (review ISO-04).
 
@@ -919,38 +964,46 @@ def check_imported_links(worktree: WorktreeInfo, state: str,
     ``.equipa-artifacts/`` with whatever the agent recorded there, and the
     orchestrator later writes review files into it as its own user. So no
     link may sit at, above or below a carried path. Anywhere else, a link
-    the agent added or changed may not be absolute or point out of the
-    tree; links already in the dispatch base are the project's own.
+    the agent added or changed may not be absolute or resolve out of the
+    tree, following the tree's other links (R3136-05); links already in
+    the dispatch base are the project's own. ``state`` is any commit of the
+    export; ``where`` names it in the refusal.
     """
     protected = [path.strip("/") for path in
                  dict.fromkeys((ARTIFACTS_DIR, *carry_paths))]
     state_links = _tree_symlinks(worktree.path, state)
     base_links = _tree_symlinks(worktree.path, worktree.base_sha)
-    changed: list[tuple[str, str]] = []
+    changed: list[str] = []
     for path, blob in state_links.items():
         for carried in protected:
             if (path == carried or carried.startswith(path + "/")
                     or path.startswith(carried + "/")):
                 raise AgentIsolationError(
-                    f"the agent's export makes {path} a symbolic link; the "
-                    f"orchestrator writes into {carried}, so this is refused")
+                    f"the agent's export{where} makes {path} a symbolic link; "
+                    f"the orchestrator writes into {carried}, so this is "
+                    f"refused")
         if base_links.get(path) != blob:
-            changed.append((path, blob))
+            changed.append(path)
     if len(changed) > _MAX_CHANGED_SYMLINKS:
         raise AgentIsolationError(
-            f"the agent's export adds or changes {len(changed)} symbolic "
-            f"links (limit {_MAX_CHANGED_SYMLINKS})")
-    for path, blob in changed:
-        result = git_run(["cat-file", "blob", blob], cwd=worktree.path,
-                         text=False)
-        if result.returncode != 0:
-            raise AgentIsolationError(f"cannot read the link {path} in the "
-                                      f"agent's export")
-        target = result.stdout.decode("utf-8", "surrogateescape")
-        if _link_escapes(path, target):
+            f"the agent's export{where} adds or changes {len(changed)} "
+            f"symbolic links (limit {_MAX_CHANGED_SYMLINKS})")
+    targets: dict[str, str] = {}
+
+    def link_target(path: str) -> str | None:
+        blob = state_links.get(path)
+        if blob is None:
+            return None
+        if path not in targets:
+            targets[path] = _read_link_target(worktree.path, path, blob)
+        return targets[path]
+
+    for path in changed:
+        target = link_target(path) or ""
+        if _link_escapes(path, target, link_target):
             raise AgentIsolationError(
-                f"the agent's export adds a symbolic link {path} -> {target} "
-                f"that points outside the worktree")
+                f"the agent's export{where} adds a symbolic link {path} -> "
+                f"{target} that points outside the worktree")
 
 
 def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
@@ -987,7 +1040,13 @@ def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
                 raise AgentIsolationError("the exported state commit has an "
                                           "unexpected shape")
             state, tip = commits[0], commits[1]
-            check_imported_links(worktree, state, carry_paths)
+            # The state tree lands in the worktree, but the tip becomes the
+            # task branch and a second parent is the clone's HEAD. An agent
+            # can commit a link and then drop it from its working tree, so
+            # every one is checked (review R3136-02).
+            for commit, where in zip(commits, _EXPORT_COMMIT_NAMES):
+                check_imported_links(worktree, commit, carry_paths,
+                                     where=where)
             _git(["update-ref", "-m", "equipa isolation: import agent work",
                   worktree.branch_ref, tip, worktree.base_sha], worktree.path)
             _git(["read-tree", "-u", "--reset", state], worktree.path)
