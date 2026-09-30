@@ -131,6 +131,50 @@ def test_core_worktree_does_not_move_the_gate_or_the_merge_to_another_repo(
     assert "core.worktree" in capsys.readouterr().out
 
 
+def _reviewer_probe_repo(root: Path, branch_file: str, text: str) -> Path:
+    """One repository of the reviewer's end-to-end probe, default branch ``main``."""
+    root.mkdir(parents=True)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "test@forgeborn.dev")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "commit.gpgsign", "false")
+    _commit_files(root, {"README.md": "base\n"}, "base")
+    _git(root, "checkout", "-q", "-b", TASK_BRANCH)
+    _commit_files(root, {branch_file: text}, "change")
+    _git(root, "checkout", "-q", "main")
+    return root
+
+
+def test_reviewer_probe_core_worktree_merge_lands_nowhere(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """The independent reviewer's IND-02 probe, verbatim in shape.
+
+    On the pre-fix main this returned ``merged``: the gate diffed the other
+    repository's doc-only branch and merged it into THAT repository's
+    ``main``, while this project's code stayed unreviewed on its branch.
+    """
+    other = _reviewer_probe_repo(tmp_path / "other", "README.md", "docs only\n")
+    real = _reviewer_probe_repo(tmp_path / "real", "evil.py", PAYLOAD)
+    real_main = _git(real, "rev-parse", "refs/heads/main")
+    other_main = _git(other, "rev-parse", "refs/heads/main")
+    _git(real, "config", "core.worktree", str(other))
+
+    status = _run(dispatch_mod._gated_merge_task(
+        repo=str(real), branch=TASK_BRANCH, outcome="tests_passed",
+        task_id=TASK_ID,
+    ))
+
+    assert status == "blocked"
+    assert _git(other, "rev-parse", "refs/heads/main") == other_main, (
+        "the other repository's main moved"
+    )
+    assert _git(real, "rev-parse", "refs/heads/main") == real_main
+    out = capsys.readouterr().out
+    assert "event=merge-succeeded" not in out
+    assert "core.worktree" in out
+
+
 def test_containment_blocks_a_redirected_root_even_without_the_hazard_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
