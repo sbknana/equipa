@@ -75,25 +75,32 @@ def cpu_checker(tmp_path):
 
 
 async def _with_heartbeat(coro):
-    """Run ``coro`` while measuring the longest event-loop stall."""
+    """Run ``coro`` while measuring the longest event-loop stall.
+
+    The heartbeat is ticking BEFORE ``coro`` starts: a check that grabs the
+    GIL as soon as it is submitted would otherwise freeze the loop before
+    the heartbeat took its first timestamp, and the stall would go unseen.
+    """
     done = asyncio.Event()
     gaps: list[float] = []
+    ticking = asyncio.Event()
 
     async def beat() -> None:
         last = time.monotonic()
         while not done.is_set():
+            ticking.set()
             await asyncio.sleep(0.02)
             now = time.monotonic()
             gaps.append(now - last)
             last = now
 
-    async def run():
-        try:
-            return await coro
-        finally:
-            done.set()
-
-    result, _ = await asyncio.gather(run(), beat())
+    beater = asyncio.create_task(beat())
+    await ticking.wait()
+    try:
+        result = await coro
+    finally:
+        done.set()
+        await beater
     return result, max(gaps)
 
 
