@@ -1144,6 +1144,200 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
     return _SAFE
 
 
+# Opener of the canonical ``$(cat <<'DELIM'`` substitution, matched at a
+# ``$(`` position. Only quoted or backslash-escaped delimiters qualify (they
+# make the body literal text), and the body must start on the next line.
+_CAT_HEREDOC_SUBSTITUTION_OPENER_RE = re.compile(
+    r"\$\(\s*cat[ \t]+<<(?P<dash>-?)[ \t]*"
+    r"(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"
+    r'|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)"'
+    r"|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*))"
+    r"[ \t]*\n"
+)
+_CLOSE_PAREN_RE = re.compile(r"\s*\)")
+
+
+def _benign_cat_heredoc_substitution_end(command: str, start: int) -> int | None:
+    """Return the index just past ``$(cat <<'DELIM' ... DELIM)`` at *start*.
+
+    Returns None when no such substitution starts at *start*. The terminator
+    is found the way bash finds it: the FIRST line that is exactly
+    ``DELIM`` (leading tabs allowed for ``<<-``). The substitution must close
+    right after that line. A lenient or last-match terminator would let text
+    after bash's real terminator - which bash executes inside the
+    substitution - be skipped as "heredoc body".
+    """
+    opener = _CAT_HEREDOC_SUBSTITUTION_OPENER_RE.match(command, start)
+    if opener is None:
+        return None
+    delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
+    leading_tabs = r"\t*" if opener.group("dash") else ""
+    terminator = re.compile(
+        rf"^{leading_tabs}{re.escape(delim)}$", re.MULTILINE
+    ).search(command, opener.end())
+    if terminator is None:
+        return None
+    close = _CLOSE_PAREN_RE.match(command, terminator.end())
+    return close.end() if close else None
+
+
+def _double_quoted_substitutions(command: str) -> list[tuple[str, str]]:
+    """Find the command substitutions bash runs from inside double quotes.
+
+    ``_extract_unquoted`` drops double-quoted text entirely, so check 8 never
+    saw ``echo "$(curl ... | sh)"`` although bash executes it (sandbox-01).
+    This scanner follows the real nesting - quoting starts afresh inside
+    ``$(...)`` - and returns ``(kind, inner)`` for every outermost
+    substitution opened while a double-quoted string is open, at any depth
+    (``X=$(echo "$(id)")`` included). ``kind`` is ``"$("`` or ``"`"``.
+
+    Single-quoted and ANSI-C (``$'...'``) text is inert and skipped. A
+    canonical ``$(cat <<'EOF' ... EOF)`` is skipped as literal text. An
+    unterminated substitution yields the rest of the command as its inner,
+    so a malformed command is judged rather than ignored. Linear time.
+    """
+    found: list[tuple[str, str]] = []
+    # Frame: [kind, content_start, recorded, paren_depth]; kind is
+    # "top", "dq" (inside "...") or "cmd" (inside $(...)).
+    stack: list[list] = [["top", 0, False, 0]]
+    open_double_quotes = 0
+    recording = False  # an outer recorded $( is open; nested ones are its inner
+    length = len(command)
+    i = 0
+    while i < length:
+        ch = command[i]
+        frame = stack[-1]
+        nxt = command[i + 1] if i + 1 < length else ""
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "$" and nxt == "(":
+            end = _benign_cat_heredoc_substitution_end(command, i)
+            if end is not None:
+                i = end
+                continue
+            record = open_double_quotes > 0 and not recording
+            recording = recording or record
+            stack.append(["cmd", i + 2, record, 0])
+            i += 2
+            continue
+        if ch == "`":
+            close = i + 1
+            while close < length and command[close] != "`":
+                close += 2 if command[close] == "\\" else 1
+            if open_double_quotes > 0 and not recording:
+                found.append(("`", command[i + 1:close]))
+            i = close + 1
+            continue
+        if frame[0] == "dq":
+            if ch == '"':
+                stack.pop()
+                open_double_quotes -= 1
+            i += 1
+            continue
+        # Code context: top level or inside $(...).
+        if ch == "'":
+            close = command.find("'", i + 1)
+            i = length if close < 0 else close + 1
+            continue
+        if ch == "$" and nxt == "'":
+            close = i + 2
+            while close < length and command[close] != "'":
+                close += 2 if command[close] == "\\" else 1
+            i = close + 1
+            continue
+        if ch == '"':
+            stack.append(["dq", i + 1, False, 0])
+            open_double_quotes += 1
+            i += 1
+            continue
+        if frame[0] == "cmd":
+            if ch == "(":
+                frame[3] += 1
+            elif ch == ")":
+                if frame[3] > 0:
+                    frame[3] -= 1
+                else:
+                    stack.pop()
+                    if frame[2]:
+                        found.append(("$(", command[frame[1]:i]))
+                        recording = False
+        i += 1
+    for frame in stack:
+        if frame[0] == "cmd" and frame[2]:
+            found.append(("$(", command[frame[1]:]))
+    return found
+
+
+# ``${NAME}``, ``${#NAME}``, ``${NAME[0]}``, ``${1}``: plain parameter reads
+# with no operator, so they cannot run anything. Normalised to ``$NAME``
+# before the safe-substitution check so ``"$(dirname "${BASH_SOURCE[0]}")"``
+# is judged on its command, not on the brace form of a variable.
+_SIMPLE_PARAMETER_EXPANSION_RE = re.compile(
+    r"\$\{#?([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(?:\[[A-Za-z0-9_@*]+\])?\}"
+)
+
+
+def _is_arithmetic_inner(inner: str) -> bool:
+    """True if a ``$(`` inner is ``(...)`` whose first paren closes last.
+
+    That is arithmetic expansion ``$((...))``. ``$( (cmd) )`` (a subshell,
+    which runs commands) has a space or text around its parens and fails.
+    """
+    if len(inner) < 2 or inner[0] != "(" or inner[-1] != ")":
+        return False
+    depth = 0
+    last = len(inner) - 1
+    for index, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and index != last:
+                return False
+    return depth == 0
+
+
+def _check_double_quoted_substitution(command: str) -> BashSecurityResult:
+    """Check 8, double-quoted form: ``"$(...)"`` and ``"`...`"`` (sandbox-01).
+
+    Bash runs command substitution inside double quotes exactly as it does
+    unquoted, so the verdict is the unquoted one: backticks always block, and
+    a ``$(...)`` passes only when its inner text passes
+    ``_is_safe_substitution_inner`` AND the full pipeline (which catches, for
+    example, a redirect to a sensitive path inside the substitution).
+    Arithmetic ``$((...))`` passes when it holds no substitution.
+    """
+    if '"' not in command or ("$(" not in command and "`" not in command):
+        return _SAFE
+    for kind, inner in _double_quoted_substitutions(command):
+        if kind == "`":
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                message="Command contains backticks (`) for command substitution inside double quotes",
+            )
+        if _is_arithmetic_inner(inner):
+            if "$(" in inner or "`" in inner:
+                return BashSecurityResult(
+                    safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                    message="Command contains command substitution inside $((...)) in double quotes",
+                )
+            continue
+        normalized = _SIMPLE_PARAMETER_EXPANSION_RE.sub(r"$\1", inner)
+        if not _is_safe_substitution_inner(normalized):
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                message="Command contains $() command substitution inside double quotes",
+            )
+        nested = check_bash_command(inner)
+        if not nested.safe:
+            return BashSecurityResult(
+                safe=False, check_id=nested.check_id,
+                message=f"$() inside double quotes: {nested.message}",
+            )
+    return _SAFE
+
+
 def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
     """Checks 9-10: Input and output redirection in unquoted content.
 
@@ -2435,6 +2629,10 @@ def check_bash_command(command: str) -> BashSecurityResult:
         _check_mid_word_hash(command),
         _check_brace_expansion(command, unquoted),
         _check_zsh_dangerous_commands(command),
+        # Last, so every verdict and check id the checks above already gave
+        # is unchanged; this only adds blocks for substitutions hidden inside
+        # double quotes (sandbox-01).
+        _check_double_quoted_substitution(command),
     ]
 
     for result in checks:
