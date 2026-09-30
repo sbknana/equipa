@@ -7,7 +7,7 @@
       "args": [
         "mcp-server-sqlite",
         "--db-path",
-        "theforge.db"
+        "/path/to/theforge.db"
       ]
     },
     "equipa": {
