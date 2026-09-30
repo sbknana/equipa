@@ -625,17 +625,35 @@ def test_git_child_environment_drops_repository_redirects(
     assert not set(redirects) & set(environ), sorted(set(redirects) & set(environ))
 
 
-def test_push_calls_get_github_credentials(
+def _environ_file(path: Path) -> dict[str, str]:
+    pairs = [item.partition("=") for item in path.read_text().split("\0") if item]
+    return {key: value for key, _, value in pairs}
+
+
+def test_only_push_calls_get_github_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A real ``git push`` whose receive-pack program records its env."""
     repo = _init_repo(tmp_path / "repo")
+    dump = tmp_path / "push-env"
+    receive_pack = tmp_path / "fake-receive-pack"
+    receive_pack.write_text(
+        f"#!/bin/sh\ncat /proc/$$/environ > {dump}\nexit 1\n", encoding="utf-8",
+    )
+    receive_pack.chmod(receive_pack.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("GH_TOKEN", SECRET_SENTINELS["GH_TOKEN"])
     monkeypatch.setenv("DATABASE_URL", SECRET_SENTINELS["DATABASE_URL"])
 
-    environ = _git_child_environ(repo, env=git_ops_mod.github_credential_env())
+    result = git_ops_mod.git_run(
+        ["push", f"--receive-pack={receive_pack}", str(tmp_path / "remote"), "master"],
+        repo,
+    )
 
-    assert environ.get("GH_TOKEN") == SECRET_SENTINELS["GH_TOKEN"]
-    assert "DATABASE_URL" not in environ
+    assert result.returncode != 0  # the fake receive-pack refuses
+    push_environ = _environ_file(dump)
+    assert push_environ.get("GH_TOKEN") == SECRET_SENTINELS["GH_TOKEN"]
+    assert "DATABASE_URL" not in push_environ
+    assert "GH_TOKEN" not in _git_child_environ(repo), "a non-push call got the token"
 
 
 def test_gh_gets_github_credentials_and_nothing_else(

@@ -688,12 +688,17 @@ def _operator_program_pins(env: Mapping[str, str]) -> tuple[str, ...]:
     )
 
 
-def _hardened_git_env(extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Process env, then the caller's ``extra_env``, then the hardening.
+def _hardened_git_env(
+    extra_env: Mapping[str, str] | None = None,
+    args: Sequence[str] = (),
+) -> dict[str, str]:
+    """Allowlisted env, push credentials for a push ``args``, the caller's
+    ``extra_env``, then the hardening.
 
     The hardening is applied last so no caller can switch it back off.
     """
     env = _get_repo_env()
+    env.update(_credential_env_for(args))
     if extra_env:
         env.update(extra_env)
     env.update(GIT_HARDENING_ENV)
@@ -763,16 +768,29 @@ GITHUB_CREDENTIAL_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+# git subcommands that talk to a remote and may need the credentials above.
+# EQUIPA only pushes; every other git call runs without them.
+_CREDENTIAL_SUBCOMMANDS = frozenset({"push"})
+
+
 def github_credential_env() -> dict[str, str]:
     """The GitHub credential / proxy variables set in the orchestrator's env.
 
-    Pass as ``env=`` to exactly the git calls that push to GitHub; gh calls
-    through :func:`_gh_run` get them automatically.
+    :func:`git_run` / :func:`git_run_async` add them to ``git push`` and
+    :func:`_gh_run` to every gh call; no other child receives them.
     """
     return {
         key: os.environ[key] for key in GITHUB_CREDENTIAL_ENV_KEYS
         if key in os.environ
     }
+
+
+def _credential_env_for(args: Sequence[str]) -> dict[str, str]:
+    """GitHub credentials when ``git <args>`` is a push, else nothing."""
+    subcommand = _git_subcommand_index(args)
+    if subcommand is not None and args[subcommand] in _CREDENTIAL_SUBCOMMANDS:
+        return github_credential_env()
+    return {}
 
 
 def _get_repo_env() -> dict[str, str]:
@@ -835,7 +853,7 @@ def git_run(
     ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
     """
-    run_env = _hardened_git_env(env)
+    run_env = _hardened_git_env(env, args)
     return _run_with_env(
         _hardened_git_argv(args, run_env), cwd, timeout, run_env, text=text,
     )
@@ -861,7 +879,7 @@ async def git_run_async(
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
-    run_env = _hardened_git_env(env)
+    run_env = _hardened_git_env(env, args)
     argv = _hardened_git_argv(args, run_env)
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -1566,7 +1584,6 @@ def setup_single_repo(
             default_branch = get_default_branch(p)
             pr = git_run(
                 ["push", "-u", "origin", default_branch], p, timeout=120,
-                env=github_credential_env(),
             )
             if pr.returncode != 0:
                 if default_branch == "main":
@@ -1576,7 +1593,6 @@ def setup_single_repo(
                     )
                 pr2 = git_run(
                     ["push", "-u", "origin", "main"], p, timeout=120,
-                    env=github_credential_env(),
                 )
                 if pr2.returncode != 0:
                     return False, (
