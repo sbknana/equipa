@@ -163,6 +163,8 @@ class _CommandScoped:
         command: regex source of the command word (``\\bsshpass``).
         flags: ``(pattern, replacement)`` pairs substituted in the rest of
             the command, in order.
+        hints: lower-case words, one of which every match contains (see
+            ``_PATTERNS``).
         after: an optional word that must follow the command first (the
             ``login`` of ``docker login``); flags are only looked for after it.
         first_only: substitute only the first match of each flag pattern.
@@ -170,10 +172,12 @@ class _CommandScoped:
 
     def __init__(self, command: str,
                  flags: tuple[tuple[re.Pattern[str], str], ...],
+                 hints: tuple[str, ...],
                  after: re.Pattern[str] | None = None,
                  first_only: bool = False) -> None:
         self.pattern = re.compile(rf"({command}\b)({_COMMAND_REST})")
         self.flags = flags
+        self.hints = hints
         self.after = after
         self.count = 1 if first_only else 0
 
@@ -208,19 +212,22 @@ _COMMAND_RULES: tuple[_CommandScoped, ...] = (
     # mysql -p<value>: attached, bare or quoted. A bare -p prompts and is
     # left alone.
     _CommandScoped(r"(?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))",
-                   (_flag(r"\s-p"),)),
+                   (_flag(r"\s-p"),), hints=("mysql", "mariadb")),
     # sshpass -p <value> / -p<value>. Scoped to sshpass: ssh -p is a port.
-    _CommandScoped(r"\bsshpass", (_flag(r"\s-p\s*"),)),
+    _CommandScoped(r"\bsshpass", (_flag(r"\s-p\s*"),), hints=("sshpass",)),
     _CommandScoped(r"\b(?:docker|podman|nerdctl)",
-                   (_flag(r"\s-p(?:\s+|=)"),),
+                   (_flag(r"\s-p(?:\s+|=)"),), hints=("login",),
                    after=re.compile(r"\blogin\b")),
     # az needs a subcommand word before the flag.
-    _CommandScoped(r"\baz(?=\s+[a-z])", (_flag(r"\s-p(?:\s+|=)"),)),
-    _CommandScoped(r"(?i:\bsqlcmd)", (_flag(r"\s-P\s*"),)),
-    _CommandScoped(r"\bredis-cli", (_flag(r"\s(?:-a|--pass)\s+"),)),
+    _CommandScoped(r"\baz(?=\s+[a-z])", (_flag(r"\s-p(?:\s+|=)"),),
+                   hints=("az",)),
+    _CommandScoped(r"(?i:\bsqlcmd)", (_flag(r"\s-P\s*"),), hints=("sqlcmd",)),
+    _CommandScoped(r"\bredis-cli", (_flag(r"\s(?:-a|--pass)\s+"),),
+                   hints=("redis-cli",)),
     # mongosh / mongo / mongodump ... -p <value>; a -p followed by another
     # option prompts.
-    _CommandScoped(r"\bmongo[a-z]*", (_flag(r"\s-p(?:\s+|=)(?![-\[])"),)),
+    _CommandScoped(r"\bmongo[a-z]*", (_flag(r"\s-p(?:\s+|=)(?![-\[])"),),
+                   hints=("mongo",)),
     # htpasswd -b [other flags] file user PASSWORD: the password is the first
     # word after the -b flag that ends the command. The value is matched
     # atomically (lookahead + backreference), so a failed end check never
@@ -230,6 +237,7 @@ _COMMAND_RULES: tuple[_CommandScoped, ...] = (
         ((re.compile(rf"(\s)(?!\[REDACTED\])(?=({_FLAG_VALUE}))\2"
                      r"(?=[ \t]*(?:[\n;&|)`\"\\]|$))"),
           r"\1" + REDACTED),),
+        hints=("htpasswd",),
         after=re.compile(r"\s-(?=[A-Za-z]*b)[A-Za-z]+(?=\s)"),
         first_only=True),
     # curl -u / --user and -U / --proxy-user user:password (no colon: curl
@@ -244,65 +252,82 @@ _COMMAND_RULES: tuple[_CommandScoped, ...] = (
               r"[^'\"\\\n]+"),
         _flag(r"\s(?:-b\s*|--cookie(?:=|\s+))[^\s=;'\"\\]+=",
               r"[^\s'\"\\;&|]+"),
-    )),
+    ), hints=("curl",)),
 )
 
+# Lower-case words the credential-key patterns need: the keywords of
+# _SECRET_NAME and _SECRET_KEY.
+_SECRET_NAME_HINTS = ("secret", "pass", "token", "_key", "_auth")
+_SECRET_KEY_HINTS = ("pass", "pwd", "secret", "key", "token")
 
-_PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
+
+def _fold_for_hints(text: str) -> str:
+    """``text`` folded so every character (?i) matches to an ASCII letter
+    becomes that letter: casefold() does this for all but the dotless i."""
+    return text.casefold().replace("\N{LATIN SMALL LETTER DOTLESS I}", "i")
+
+
+# (pattern, replacement, hints). Every match of a pattern contains one of its
+# lower-case hints, so a pattern whose hints are all missing from the folded
+# text (_fold_for_hints) is skipped: most text then costs a few substring
+# searches instead of a regex walk per pattern (RR-01).
+_PATTERNS: tuple[tuple[re.Pattern[str], Any, tuple[str, ...]], ...] = (
     # PEM private keys: header kept, body (to END, or to the end) replaced.
-    (_PEM_PRIVATE_KEY, _redact_pem),
+    (_PEM_PRIVATE_KEY, _redact_pem, ("-----begin ",)),
     # GitHub tokens: classic/OAuth/user/server/refresh and fine-grained PATs.
     (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})"),
-     REDACTED),
+     REDACTED, ("gh", "github_pat_")),
     # Anthropic / OpenAI style API keys (sk-..., sk-ant-..., sk-proj-...).
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-" + REDACTED),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-" + REDACTED, ("sk-",)),
     # AWS access key ids.
-    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED, ("akia", "asia")),
     # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-...) and Slack
     # app-level tokens (xapp-, RR-06).
-    (re.compile(r"\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]{10,}"), REDACTED),
+    (re.compile(r"\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]{10,}"), REDACTED,
+     ("xox", "xapp-")),
     # Hugging Face access tokens (RR-06).
-    (re.compile(r"\bhf_[A-Za-z0-9]{30,}"), REDACTED),
+    (re.compile(r"\bhf_[A-Za-z0-9]{30,}"), REDACTED, ("hf_",)),
     # Google API keys.
-    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), REDACTED),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), REDACTED, ("aiza",)),
     # GitLab personal / project / group access tokens.
-    (re.compile(r"\bglpat-[0-9A-Za-z_-]{16,}"), REDACTED),
+    (re.compile(r"\bglpat-[0-9A-Za-z_-]{16,}"), REDACTED, ("glpat-",)),
     # JWTs (header.payload.signature, base64url; the header starts "eyJ").
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-     REDACTED),
+     REDACTED, ("eyj",)),
     # Inline URL credentials: scheme://user:password@host, parsed.
-    (_URL_TOKEN, _redact_url_token),
+    (_URL_TOKEN, _redact_url_token, ("://",)),
     # NAME=value assignments of credential-named variables.
     (re.compile(rf"{_NAME_START}({_SECRET_NAME})=(?!\[REDACTED\])({_VALUE})"),
-     r"\1=" + REDACTED),
+     r"\1=" + REDACTED, _SECRET_NAME_HINTS),
     # --password VALUE / --api-key VALUE (the = form is covered below).
     (re.compile(rf"{_KEY_START}(--{_SECRET_KEY}\s+)(?![-\[])({_VALUE})"),
-     r"\1" + REDACTED),
+     r"\1" + REDACTED, _SECRET_KEY_HINTS),
     # Password flags scoped to their command (see _COMMAND_RULES).
-    *((rule.pattern, rule) for rule in _COMMAND_RULES),
+    *((rule.pattern, rule, rule.hints) for rule in _COMMAND_RULES),
     # openssl -pass / -passin / -passout pass:<value> (RR-06). The pass:
     # prefix names a literal password; env: and file: forms are left alone.
     (re.compile(r"(\s-pass(?:in|out)?\s+(?:\\?[\"'])?pass:)"
                 rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
-     r"\1" + REDACTED),
+     r"\1" + REDACTED, ("pass:",)),
     # .pgpass lines: host:port:database:user:password.
-    (_PGPASS_LINE, r"\1" + REDACTED),
+    (_PGPASS_LINE, r"\1" + REDACTED, (":",)),
     # Cookie / Set-Cookie header values, to the end of the header (IR-06).
     (re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)(?!\s|\[REDACTED\])[^\r\n'\"\\]+"),
-     r"\1" + REDACTED),
+     r"\1" + REDACTED, ("cookie",)),
     # key = value / key: value / "key": "value" of credential-named keys in
     # any case and format: libpq DSNs, YAML, JSON, headers (X-Api-Key: ...).
     (re.compile(
         rf"{_KEY_START}({_SECRET_KEY}(?:\\?[\"'])?\s*[:=]\s*)"
         rf"(?!\[REDACTED\])({_VALUE})"),
-     r"\1" + REDACTED),
+     r"\1" + REDACTED, _SECRET_KEY_HINTS),
     # Authorization headers, whatever the scheme word.
     (re.compile(
         r"(?i)\b(authorization\s*[:=]\s*(?:bearer\s+|basic\s+|token\s+)?)"
         r"[^\s'\"\\,}]+"),
-     r"\1" + REDACTED),
+     r"\1" + REDACTED, ("authorization",)),
     # A bare "Bearer <token>" outside an Authorization header.
-    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1" + REDACTED),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1" + REDACTED,
+     ("bearer",)),
 )
 
 
@@ -333,8 +358,12 @@ def redact_secrets(text: str) -> str:
         return text
     if len(text) > MAX_REDACT_INPUT:
         text = text[:MAX_REDACT_INPUT - len(TRUNCATED_MARKER)] + TRUNCATED_MARKER
-    for pattern, replacement in _PATTERNS:
-        text = pattern.sub(replacement, text)
+    # Redaction only replaces values with [REDACTED], so it never adds a hint
+    # a later pattern needs: one fold of the input serves every pattern.
+    folded = _fold_for_hints(text)
+    for pattern, replacement, hints in _PATTERNS:
+        if any(hint in folded for hint in hints):
+            text = pattern.sub(replacement, text)
     return text
 
 
