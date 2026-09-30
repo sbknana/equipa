@@ -197,6 +197,73 @@ async def commit_parents(repo: str | os.PathLike, sha: str) -> list[str] | None:
     return result.stdout.split()[1:]
 
 
+async def _range_patch_ids(
+    repo: str | os.PathLike, commit_range: str,
+) -> tuple[list[str], list[str]] | str:
+    """(commits, patch ids) of ``commit_range`` oldest first, or a problem.
+
+    ``--verbatim`` keeps whitespace in the patch id: in Python an indentation
+    change is a code change, and the default patch id would ignore it.
+    """
+    commits = await git_run_async(
+        ["rev-list", "--reverse", commit_range], repo, timeout=30,
+    )
+    if commits.returncode != 0:
+        return f"rev-list {commit_range} failed: {commits.stderr.strip()[:200]}"
+    log = await git_run_async(
+        ["log", "--reverse", "-p", "--no-color", "--no-merges", commit_range],
+        repo, timeout=60,
+    )
+    if log.returncode != 0:
+        return f"log {commit_range} failed: {log.stderr.strip()[:200]}"
+    patch_ids = await git_run_async(
+        ["patch-id", "--verbatim"], repo, timeout=60,
+        input=log.stdout.encode("utf-8"),
+    )
+    if patch_ids.returncode != 0:
+        return f"patch-id {commit_range} failed: {patch_ids.stderr.strip()[:200]}"
+    return (
+        commits.stdout.split(),
+        [line.split()[0] for line in patch_ids.stdout.splitlines() if line.strip()],
+    )
+
+
+async def rebased_range_problem(
+    repo: str | os.PathLike, onto: str, approved_sha: str, rebased_sha: str,
+) -> str | None:
+    """Why ``onto..rebased_sha`` is not exactly the approved commits, or None.
+
+    Task #3116 (MI-03): the rebase fallback re-reads HEAD of the agent's
+    worktree, which another process can move right after the rebase. Before
+    anything is fast-forwarded, the rebased range must sit on ``onto``, hold
+    no merge commit, have exactly as many commits as ``onto..approved_sha``
+    and carry the same patches in the same order.
+    """
+    if not rebased_sha:
+        return "rebased HEAD did not resolve"
+    if not await is_ancestor(repo, onto, rebased_sha):
+        return f"rebased {_short(rebased_sha)} does not descend from {_short(onto)}"
+    merges = await git_run_async(
+        ["rev-list", "--merges", f"{onto}..{rebased_sha}"], repo, timeout=30,
+    )
+    if merges.returncode != 0 or merges.stdout.strip():
+        return f"rebased range {_short(onto)}..{_short(rebased_sha)} contains merges"
+    approved = await _range_patch_ids(repo, f"{onto}..{approved_sha}")
+    if isinstance(approved, str):
+        return approved
+    rebased = await _range_patch_ids(repo, f"{onto}..{rebased_sha}")
+    if isinstance(rebased, str):
+        return rebased
+    if not rebased[0] or len(rebased[0]) != len(approved[0]):
+        return (
+            f"rebased range has {len(rebased[0])} commit(s), the approved "
+            f"range {len(approved[0])}"
+        )
+    if rebased[1] != approved[1]:
+        return "rebased patches differ from the approved commits"
+    return None
+
+
 def _driver_hazard(key: str, value: str | None) -> str | None:
     """Label of the driver program ``key`` defines, None if harmless/allowed."""
     lowered = key.lower()

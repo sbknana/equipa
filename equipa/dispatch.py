@@ -68,6 +68,7 @@ from equipa.merge_integrity import (
     MergeOutcome,
     find_repo_execution_hazards,
     is_ancestor,
+    rebased_range_problem,
     resolve_commit,
     reviewed_commit_refusal,
 )
@@ -1836,7 +1837,9 @@ async def _retire_leftover_worktree(
             f"leftover {wt} is not a registered worktree; preserved, "
             f"resolve by hand"
         )
-    status = await git_run_async(["status", "--porcelain"], wt, timeout=15)
+    status = await git_run_async(
+        ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
+    )
     if status.returncode != 0:
         return (
             f"could not read the status of leftover worktree {wt}; "
@@ -1844,7 +1847,9 @@ async def _retire_leftover_worktree(
         )
     if status.stdout.strip():
         await _stash_uncommitted_in_worktree(wt, task_id, branch_name)
-        recheck = await git_run_async(["status", "--porcelain"], wt, timeout=15)
+        recheck = await git_run_async(
+            ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
+        )
         if recheck.returncode != 0 or recheck.stdout.strip():
             return (
                 f"leftover worktree {wt} has uncommitted work that could not "
@@ -2207,6 +2212,23 @@ async def _merge_task_branch(
                 ["rev-parse", "HEAD"], worktree_dir, timeout=10,
             )
             rebased_sha = rebased.stdout.strip()
+            # MI-03 (task #3116): the worktree HEAD is agent-writable, so the
+            # SHA read above is only merged once its range is verified to be
+            # exactly the approved commits; from here on only that SHA is used.
+            range_problem = await rebased_range_problem(
+                project_dir, pre_head, target_sha, rebased_sha,
+            )
+            if range_problem:
+                print(
+                    f"  [Isolation] Merge FAILED for task #{task_id}: "
+                    f"{merge_output}; rebased {rebased_sha[:12] or 'unknown'} "
+                    f"is not the approved commits: {range_problem}"
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED (rebased)")
+                record.reason = (
+                    f"rebased commits are not the approved commits: {range_problem}"
+                )
+                return False
             fast_forward = await git_run_async(
                 ["merge", "--ff-only", rebased_sha], project_dir, timeout=60,
             )
@@ -2286,7 +2308,7 @@ async def _stash_uncommitted_in_worktree(
         return
     try:
         status = await git_run_async(
-            ["status", "--porcelain"], wt_path, timeout=15,
+            ["status", "--porcelain", "--ignore-submodules=all"], wt_path, timeout=15,
         )
         if status.returncode != 0 or not status.stdout.strip():
             return

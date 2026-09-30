@@ -2954,7 +2954,8 @@ async def run_dev_test_loop(
                         # though the deliverable is on disk. See bug 2263.
                         try:
                             status_result = await git_run_async(
-                                ["status", "--porcelain"], project_dir, timeout=5,
+                                ["status", "--porcelain", "--ignore-submodules=all"],
+                                project_dir, timeout=5,
                             )
                             if status_result.returncode == 0:
                                 md_files = [

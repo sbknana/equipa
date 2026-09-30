@@ -464,6 +464,9 @@ _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
     ("gpg.openpgp.program", "gpg"),
     ("gpg.x509.program", "gpgsm"),
     ("gpg.ssh.program", "ssh-keygen"),
+    # Task #3116 (MI-05): checkout / merge / stash never recurse into a
+    # submodule, where that submodule's own config could name a driver.
+    ("submodule.recurse", "false"),
 )
 
 GIT_HARDENING_ARGS: tuple[str, ...] = (
