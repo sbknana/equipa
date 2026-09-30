@@ -129,6 +129,37 @@ python scripts/gen_module_report.py --check     # exit 1 if it is stale
 The Docs Drift Check CI job runs the generator into a buffer and fails if the
 committed report differs by a single byte. Do not edit the file by hand.
 
+### Generated files in the gated merge
+
+Every task branch regenerates the report, so in a parallel `--tasks` batch the
+second and later branches always conflict in it. Generated files are therefore
+declared, with their generator, in one place:
+`equipa.generated_files.GENERATED_FILES`. When the orchestrator's gated merge
+conflicts **only** in declared files, it regenerates them from the merged tree,
+stages them, completes the merge commit and logs
+`GATE-AUDIT ... event=generated-files-regenerated files=<paths>`. Any other
+conflicting path keeps the ordinary behaviour (abort, `merge_failed`, branch
+preserved), and a project without the declared file or generator is unaffected.
+
+The generator is code from the merged tree, which agents can write, so:
+
+- it runs only if its blob is identical on the pinned default branch, on the
+  task branch and in the merged tree. A branch that changed the generator ends
+  `merge_failed` with "the task branch changed the generator"; it is never run;
+- it runs as `python -I` in a private `git archive` export of the merged tree
+  (never in the main checkout or the orchestrator's process), with the scrubbed
+  agent environment minus the Claude CLI credential, and a timeout that kills
+  its whole process group. It must print the file's new content to stdout; a
+  failure, empty output or timeout ends `merge_failed` with a clean checkout;
+- the recorded `merged_sha` is the resolution commit. The merge-integrity
+  check (task #3116) accepts it only when its tree equals
+  `git merge-tree --write-tree <default> <approved>` everywhere except the
+  regenerated paths, which must be exactly that merge's conflicted paths and
+  regular files. A resolution touching any other path trips the guard.
+
+To declare another generated file, add a `GeneratedFile(path, generator, args)`
+entry; the generator must accept a repository root and print to stdout.
+
 ## 8. Skill manifest integrity
 
 Role prompts and skill files are integrity-protected. `skill_manifest.json`

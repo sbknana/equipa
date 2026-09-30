@@ -54,6 +54,17 @@ All notable changes to EQUIPA are documented here.
     schema v12); a single-task run whose pre-dispatch pin failed is not
     merged.
 
+- **Generated-file merge conflicts** (task #3131) — a gated merge that
+  conflicts only in declared generated files
+  (`equipa.generated_files.GENERATED_FILES`, initially
+  `equipa/MODULE_DEPENDENCY_REPORT.md` from `scripts/gen_module_report.py`)
+  is completed by regenerating them from the merged tree instead of ending
+  `merge_failed`. The generator runs only when the task branch left it
+  unchanged, isolated from the orchestrator and with a timeout; the recorded
+  merged SHA is the resolution commit, and the merge-integrity check accepts
+  it only if it differs from `git merge-tree`'s merge in the regenerated
+  files alone. Any other conflict behaves as before. See CONTRIBUTING.md §7.
+
 ## [3.1.0] - 2026-03-05
 
 ### Added
