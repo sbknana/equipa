@@ -157,15 +157,22 @@ into a task branch only, never into the default branch.
 A helper agent without a project directory (reflexion) runs in an empty
 private directory. Nothing is cloned or exported for it.
 
-Before `read-tree` touches the worktree, the orchestrator lists the state
-tree and refuses the import (review ISO-04) when:
+Before `read-tree` touches the worktree, the orchestrator lists the tree of
+every commit of the export (the state commit, the committed task-branch tip
+that becomes the task branch and, when present, the clone's HEAD) and
+refuses the import (reviews ISO-04, R3136-02) when:
 
 * a symbolic link sits at, above or below `.equipa-artifacts` or any
   `carry_ignored_paths` entry. `read-tree -u --reset` would otherwise replace
   the orchestrator's own ignored artifacts directory with the agent's link,
-  and the orchestrator later writes review files into it as its own user;
-* a link the agent added or changed is absolute or points out of the tree.
-  Links already in the dispatch base are the project's own and are kept.
+  and the orchestrator later writes review files into it as its own user.
+  A link that is only committed would reach later checkouts of the branch
+  (and of the default branch after a merge) instead;
+* a link the agent added or changed is absolute or resolves out of the
+  tree. The target is resolved the way the kernel would, following the
+  tree's other links (`a/..` through a link `a` goes where `a` points), with
+  at most 40 hops (review R3136-05). Links already in the dispatch base are
+  the project's own and are kept.
 
 The task branch has not moved at that point, so a refused import leaves the
 worktree exactly at the dispatch base.
@@ -202,6 +209,42 @@ Therefore:
 The CLI still passes `--setting-sources user --strict-mcp-config` (task
 3134); with the per-unit `CLAUDE_CONFIG_DIR` the user scope is empty.
 
+### Reviewers run alone (until there is a UID pool)
+
+A per-unit HOME does not help against a unit running *at the same time*:
+every unit has the same UID, so a developer agent of task A could read the
+handed-over prompt (with the provenance and completion nonces) of a security
+reviewer running for task B, and write into that reviewer's clone, which is
+exported into task B's worktree (review R3136-03, GP2-02). Until the agents
+get separate UIDs, reviewer units never overlap any other isolated unit:
+
+* `security-reviewer` and `code-reviewer` units (`EXCLUSIVE_ROLES`) wait
+  until every running isolated unit has ended, and until no agent scope of
+  the orchestrator user is populated (a unit that survived `cgroup.kill`, or
+  one started by an orchestrator without the lock; a scope whose
+  orchestrator is gone is killed by the sweep instead of waited for);
+* while a reviewer waits or runs, every new unit waits (writer preference,
+  so a steady stream of developers cannot starve the review), and so does a
+  second reviewer;
+* ordinary units run side by side as before.
+
+It is a reader-writer lock over two `flock` files in the orchestrator's
+private runtime directory (`$XDG_RUNTIME_DIR`), so it covers every dispatch
+mode and every orchestrator process of the same user, not only one event
+loop. The unit's slot is taken before the handoff is built and given back
+when the agent handle is released, after its cgroup was emptied and its
+export imported; a refused setup gives it back at once. The role comes from
+`build_cli_command(role=...)`, which both reviewer call sites use. Waiting
+is logged (`[Isolation] ... waits for ...`, repeated every 5 minutes, and
+`... runs alone`); a wait longer than `unit_wait_timeout_sec` (default 6 h)
+refuses the dispatch. The cost is throughput: in a parallel wave, a review
+holds back the other tasks' next units while it runs.
+
+**Long-term fix:** a pool of agent users, one UID per unit, or at least a
+reviewer UID that no developer, tester or debugger unit ever shares. The
+reviewer's handed-over files and clone would then be closed to every other
+unit by ordinary file permissions, and the lock above could go.
+
 ### The orchestrator never executes agent output
 
 With the flag on, the orchestrator does not run project files as its own
@@ -222,10 +265,31 @@ as broken and start paid auto-fix runs that cannot succeed. Behaviour change:
 with isolation on there is no pre-dispatch build check. The agents still
 build and test inside their own sandbox.
 
-`rlm_decompose`, the ForgeSmith GHOST scout and OPRO, and SIMBA start
-`claude -p` themselves, outside any launcher, on text derived from agent
-output. With the flag on they refuse (CT-04, ISO-06); SIMBA run standalone
-without an importable `equipa` refuses as well.
+`rlm_decompose`, the ForgeSmith GHOST scout and OPRO, SIMBA and the
+autoresearch prompt mutation start `claude` themselves, outside any
+launcher, on text derived from agent output. With the flag on they refuse
+(CT-04, ISO-06, R3136-06); SIMBA and autoresearch run standalone without an
+importable `equipa` refuse as well. Autoresearch no longer goes through
+`bash -c`: the argv runs directly with the prompt on stdin and the
+`--setting-sources user --strict-mcp-config` pair.
+
+The Ollama provider (`provider` or `provider_<role>` set to `ollama`, or
+`--provider ollama`) runs the model's tool calls, `bash_write` included,
+in the orchestrator's own process; it never reaches the isolated launcher.
+With the flag on it is refused (review R3136-01): `dispatch_agent` returns a
+blocked result (`RESULT: blocked`, `Ollama agent refused: agent_isolation is
+on ...`) before `run_ollama_agent` is imported, and `run_ollama_agent`
+refuses by itself as well, which covers its `__main__` demo. Use the Claude
+provider for every role while isolation is on; routing Ollama's tools
+through the launcher is future work.
+
+Source fences keep this true (`tests/test_agent_isolation_3140.py`): every
+`run_ollama_agent` call and every process spawn in a function that names
+the Claude CLI (argv literal or a `claude ...` shell string) must sit behind
+an `if` on the refusal that returns or raises first, and every `shell=True`,
+`create_subprocess_shell`, `os.system`, `exec` or `eval` site must be in a
+short, reasoned allowlist (operator hooks, the RLM REPL behind its refused
+outer call, the Ollama tools behind their refused loop).
 
 ### TheForge: read-only view without `api_keys`
 
@@ -249,7 +313,8 @@ through the RESULT block.
 ### Fail closed
 
 With the flag on, `_spawn_agent_process` hands every agent to
-`isolation.spawn_isolated_agent`. It never falls back to the same-UID
+`isolation.spawn_isolated_agent` (the Ollama provider, which never reaches
+it, is refused before it runs anything). It never falls back to the same-UID
 launcher. Each of the following refuses the dispatch
 (`AgentDispatchRefused: agent isolation: ...`):
 
@@ -270,7 +335,10 @@ launcher. Each of the following refuses the dispatch
   or `cgroup.kill` is missing or not writable;
 * the launcher's own checks fail. It refuses when it runs as root, as the
   orchestrator's UID, as the wrong user or in a privileged group; when the
-  agent user can write its passwd HOME; when it runs outside the expected
+  agent user can write its passwd HOME; when the agent user lingers
+  (`/var/lib/systemd/linger/<agent>`) or `crontab -l` / `at -l` do not
+  report a permission denial (review R3136-04: a scheduled job or a user
+  manager runs outside the scope and outlives the unit); when it runs outside the expected
   cgroup or with other limits; when it can read a `deny_read` path, where
   entering a directory (search permission) counts as reading it (the
   TheForge DB and its -wal/-shm both beside a symlink and beside its real
@@ -282,7 +350,13 @@ launcher. Each of the following refuses the dispatch
   parent, the main `.git` and checkout, the view and its directory); when it
   cannot run a hook or MCP program; or when it cannot become non-dumpable or
   a child subreaper;
-* no ready line within `setup_timeout_sec`.
+* no ready line within `setup_timeout_sec`;
+* a reviewer unit (or a unit held back by one) waited longer than
+  `unit_wait_timeout_sec`, or the unit lock in the runtime directory cannot
+  be opened.
+
+The Ollama provider is refused with a blocked result rather than an
+`AgentDispatchRefused` (see above).
 
 The feature flag is in `FAIL_CLOSED_FEATURE_FLAGS`. An invalid value
 (`"yes"`) or an unreadable dispatch config turns it **on**, which refuses
@@ -308,7 +382,7 @@ Security review of task 3135 (fix-forward task 3136):
 | Finding | Status (flag on) | Test |
 |---|---|---|
 | ISO-01 HIGH: preflight build checks and auto-install run agent-written project files as the orchestrator | FIXED: refused (installs skipped, build check reported as skipped, auto-fix not dispatched); flag off unchanged | `test_preflight_runs_no_project_code_with_isolation_on` (every spawn primitive recorded, 6 project types), `test_every_preflight_spawn_is_preceded_by_the_isolation_refusal` (source fence), `test_preflight_unchanged_with_isolation_off`, `test_preflight_refuses_when_the_config_is_unreadable` |
-| ISO-02 HIGH: one shared agent HOME lets a developer persist into and forge the later review | FIXED for sequential units: per-unit empty HOME, `CLAUDE_CONFIG_DIR`, XDG dirs and `GIT_CONFIG_GLOBAL`, removed with the unit (also on a failed export); launcher git uses `GIT_CONFIG_GLOBAL=/dev/null`; the passwd HOME must be read-only to the agent. NOT FIXED for concurrent units (same UID; needs a UID pool) | `test_consecutive_units_get_disjoint_empty_homes`, `test_launcher_git_ignores_global_config_the_agent_planted`, `test_failed_export_still_removes_the_unit_home`, `test_launcher_refuses_an_agent_writable_passwd_home`, `test_isolated_agent_end_to_end`, verify script |
+| ISO-02 HIGH: one shared agent HOME lets a developer persist into and forge the later review | FIXED for sequential units: per-unit empty HOME, `CLAUDE_CONFIG_DIR`, XDG dirs and `GIT_CONFIG_GLOBAL`, removed with the unit (also on a failed export); launcher git uses `GIT_CONFIG_GLOBAL=/dev/null`; the passwd HOME must be read-only to the agent. NOT FIXED for concurrent units (same UID; needs a UID pool); since task 3140 reviewer units never run concurrently with another unit (R3136-03) | `test_consecutive_units_get_disjoint_empty_homes`, `test_launcher_git_ignores_global_config_the_agent_planted`, `test_failed_export_still_removes_the_unit_home`, `test_launcher_refuses_an_agent_writable_passwd_home`, `test_isolated_agent_end_to_end`, verify script |
 | ISO-03 HIGH: `api_keys` readable through TheForge backup copies; symlinked DB hides the real -wal/-shm | FIXED: the DB's real directory, the real -wal/-shm and every `db_backup_dirs` entry are in `deny_read`, and an enterable directory counts as readable; the verify script checks the directories, probes every copy the orchestrator finds by name, searches for readable copies as the agent, and checks directory and copy modes from outside | `test_deny_read_covers_db_directory_real_side_files_and_backups`, `test_launcher_refuses_an_enterable_deny_read_directory`, `test_database_copies_are_found_beside_the_db_and_in_backup_dirs`, `test_probe_command_names_every_directory_and_copy`, `test_outer_checks_fail_on_open_directories_and_copies`, `test_verify_script_fails_on_readable_db_directory_and_copies`, `test_verify_script_passes_a_closed_db_directory` |
 | ISO-04 MEDIUM: imported state turns `.equipa-artifacts` into a symlink the orchestrator writes through | FIXED: the import refuses links at, above or below the artifacts dir and carry paths, and new or changed links that are absolute or leave the tree | `test_import_refuses_links_at_or_below_the_artifacts_dir`, `test_import_refuses_a_link_above_a_configured_carry_path`, `test_import_refuses_new_links_out_of_the_tree`, `test_import_accepts_in_tree_links_and_links_from_the_base` |
 | ISO-05 MEDIUM: deny_read is a blocklist; other world-readable credentials stay readable | FIXED as far as a blocklist can be: the runbook requires project checkouts closed to others, and the verify script FAILS when the agent can read a secret-shaped file below `secret_scan_roots` or any `--repo` (an empty list fails verification). NOT FIXED: an allowlist model (mount namespace, `ProtectHome=`/`TemporaryFileSystem=` for the scope) | `test_verify_script_fails_on_readable_project_secrets`, `test_outer_checks_fail_on_open_directories_and_copies` |
@@ -321,16 +395,32 @@ Security review of task 3135 (fix-forward task 3136):
 | ISO-12 INFO: the view is a blocklist copy of the whole database | NOT FIXED (information exposure, no credentials) | none |
 | ISO-13 LOW: bundle fetches skip fsck on git < 2.46 | NOT FIXED: `read-tree -u` still refuses `.git`/`..` paths; see residual risks | none |
 
+Security review of task 3136 (fix-forward task 3140). All tests are in
+`tests/test_agent_isolation_3140.py`:
+
+| Finding | Status (flag on) | Test |
+|---|---|---|
+| R3136-01 HIGH: the Ollama provider runs model-chosen shell commands as the orchestrator user | FIXED: refused with a blocked result in `dispatch_agent` (provider, `provider_<role>`, `--provider`) and again inside `run_ollama_agent`; flag off unchanged. Routing Ollama's tools through the launcher is future work | `test_ollama_provider_is_refused_with_isolation_on` (3 ways to select it), `test_ollama_provider_unchanged_with_isolation_off`, `test_run_ollama_agent_itself_refuses_with_isolation_on`, `test_run_ollama_agent_unchanged_with_isolation_off`, fences `test_every_run_ollama_agent_call_is_gated_by_the_refusal`, `test_run_ollama_agent_refuses_before_its_tool_loop`, `test_every_command_executing_entry_point_is_known`, `test_ollama_tool_execution_is_only_reached_through_run_ollama_agent` |
+| R3136-02 MEDIUM: the link check ignores the committed tip that becomes the task branch | FIXED: the state commit, the tip and the clone's HEAD are each checked with the same rules | `test_import_refuses_a_committed_link_the_working_tree_dropped`, `test_import_refuses_a_committed_escaping_link`, `test_import_refuses_a_link_in_the_clones_detached_head`, `test_import_accepts_a_committed_in_tree_link` |
+| R3136-03 MEDIUM: concurrent units share one UID under parallel dispatch | MITIGATED until a UID pool exists: reviewer units run alone (host-wide reader-writer lock, logged; see "Reviewers run alone"). Long-term fix: per-unit or per-role UIDs | `test_reviewer_waits_for_running_units_and_blocks_new_ones`, `test_reviewers_do_not_overlap_each_other`, `test_reviewer_waits_for_live_agent_scopes`, `test_units_in_another_process_are_waited_for`, `test_wait_past_the_timeout_refuses_and_holds_nothing`, `test_spawn_holds_the_slot_until_the_agent_is_released`, `test_failed_setup_gives_the_slot_back`, `test_build_cli_command_marks_the_role_for_the_isolated_spawn`, `test_reviewer_spawn_sites_build_their_command_with_the_role` |
+| R3136-04 LOW: cron/at denial is only a runbook line | FIXED: the launcher refuses when the agent lingers or `crontab -l`/`at -l` are not denied; the verify script checks the same | `test_launcher_refuses_an_agent_that_may_use_cron`, `test_launcher_refuses_an_agent_that_may_use_at`, `test_launcher_refuses_a_lingering_agent_user`, `test_launcher_accepts_denied_cron_and_at`, `test_verify_script_fails_when_the_agent_may_schedule_jobs`, `test_verify_script_passes_denied_cron_and_at` |
+| R3136-05 LOW: the out-of-tree link test is lexical | FIXED: links are resolved through the tree's other links, 40 hops at most | `test_link_escape_follows_links_of_the_tree`, `test_import_refuses_a_link_pair_that_resolves_outside`, `test_import_accepts_a_link_pair_that_stays_inside` |
+| R3136-06 LOW: autoresearch starts `claude --print` through `bash -c` | FIXED: refused with the flag on (and when `equipa` cannot be imported); direct argv with stdin and the isolation args | `test_autoresearch_mutation_refuses_with_isolation_on`, `test_autoresearch_mutation_runs_the_cli_without_a_shell`, `test_every_direct_claude_spawn_is_gated_by_the_refusal` |
+| R3136-07 INFO: the fences prove the refusal exists, not that it gates the spawn | FIXED: the new fences require an `if` on the refusal that returns or raises before the spawn, in an enclosing block | `test_gate_detection_needs_an_exit_before_the_spawn`, `test_every_preflight_spawn_is_gated_by_the_refusal`, `test_every_direct_claude_spawn_is_gated_by_the_refusal`, `test_claude_fence_sees_a_shell_string_spawn` |
+| R3136-08 INFO: the database-copy search covers only the configured directories | FIXED: SQLite files below `secret_scan_roots` and `--repo` whose schema holds an excluded table are probed by name as the agent, and a world-readable one fails the outer check | `test_credential_databases_below_project_roots_are_found`, `test_probe_command_probes_credential_copies_as_the_agent`, `test_outer_checks_fail_on_a_world_readable_credential_copy` |
+
 ## Residual risks and limitations
 
 * **All agents share one agent UID.** Sequential units no longer share
-  anything (per-unit HOME, ISO-02), but *concurrent* agents (parallel
-  dispatch) can read, write and signal each other's processes and unit
-  directories (not the orchestrator's). A developer running at the same
-  time as a security reviewer could therefore still read the reviewer's
-  system prompt and nonces or plant files in its HOME (GP2-02 for parallel
-  dispatch). Closing that needs a pool of agent users, with the reviewer on
-  its own UID (future work).
+  anything (per-unit HOME, ISO-02), and reviewer units never overlap another
+  unit (R3136-03). Other *concurrent* agents (developers, testers and
+  debuggers of a parallel wave) can still read, write and signal each
+  other's processes and unit directories (not the orchestrator's), so one
+  task's developer can tamper with another task's developer or tester
+  clone while both run; that work still passes that task's own review.
+  Closing it needs a pool of agent users with one UID per unit (future
+  work), which would also let reviewers run in parallel again.
+* The Ollama provider cannot be used with the flag on (R3136-01).
 * The file-access boundary is a blocklist (`deny_read` plus the verify
   script's scans), not an allowlist: world-readable files outside the
   checked locations stay readable to the agent. The runbook closes project
@@ -388,6 +478,11 @@ loginctl disable-linger equipa-agent      # no user manager: it could start unit
 echo equipa-agent >> /etc/cron.deny       # no cron/at persistence
 echo equipa-agent >> /etc/at.deny
 ```
+
+The launcher refuses to start an agent while the agent user lingers or may
+use `crontab` or `at` (if they are installed), and the verify script checks
+the same. If `/etc/cron.allow` or `/etc/at.allow` exists, it takes
+precedence: leave the agent user out of it instead.
 
 No global git configuration is needed, and none is read: the launcher
 copies `user.name`/`user.email` from the task worktree into each clone and
@@ -533,7 +628,9 @@ Other keys, with defaults: `launcher` (this checkout's
 `carry_ignored_paths` (`[".equipa-artifacts"]`), `db_backup_dirs` (`[]`:
 directories with TheForge backups, closed to the agent like the database's
 own directory), `secret_scan_roots` (`[]`: project roots the verify script
-scans; it fails while this is empty). Unknown keys are refused.
+scans; it fails while this is empty), `unit_wait_timeout_sec` (21600: how
+long a reviewer may wait for the running units, or any unit for a reviewer,
+before the dispatch is refused). Unknown keys are refused.
 
 ### 8. Verify on the real host
 
@@ -558,9 +655,13 @@ launcher; is in its own `equipa-agent-*.scope` with `pids.max` and
 signal the orchestrator; the view is read-only and has no `api_keys`; no
 credential except the OAuth token is in its environment; its HOME,
 `CLAUDE_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` are the unit's own and it cannot
-write its passwd HOME. From outside, as the orchestrator, it also fails when
+write its passwd HOME; it cannot use `crontab` or `at` and does not linger;
+it cannot read any SQLite file below the project roots whose schema holds an
+excluded table (found by the orchestrator, probed by name). From outside, as
+the orchestrator, it also fails when
 the database or backup directories are open to others or to a group of the
-agent user, when any copy in them is world-readable, and when
+agent user, when any copy in them, or any such file below
+`secret_scan_roots`, is world-readable, and when
 `secret_scan_roots` is empty. Exit status 0 means
 everything passed. 1 means a check failed. 2 means isolation could not be
 established (the message says which refusal).
@@ -568,7 +669,7 @@ established (the message says which refusal).
 ### 9. Operating it
 
 * Logs: `[Isolation]` lines show the unit, cgroup and import result of each
-  agent.
+  agent, and when a unit waits for a reviewer or a reviewer runs alone.
 * Running agents: `systemctl --user list-units 'equipa-agent-*'` (as `<orch>`).
   Kill one: `echo 1 > /sys/fs/cgroup/<ControlGroup of the unit>/cgroup.kill`.
 * If an import fails, the ERROR line names the export bundle in the
