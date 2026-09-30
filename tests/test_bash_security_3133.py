@@ -182,6 +182,18 @@ class TestLiteralApostrophes:
 
     @pytest.mark.parametrize(
         "command",
+        ["cat <<EOF\n${v:-'$(id)'}\nEOF", "cat <<EOF\n${v:-x${w:+'`id`'}}\nEOF"],
+    )
+    def test_unquoted_heredoc_body_default_word_is_scanned_as_text(self, command: str):
+        """An unquoted heredoc body expands like double quotes (bash ran
+        `${v:-'$(m)'}` there), so the substitution must be recorded."""
+        scan = bash_security._scan_shell(command)
+        assert scan.error is None
+        assert len(scan.substitutions) == 1
+        assert not check_bash_command(command).safe
+
+    @pytest.mark.parametrize(
+        "command",
         [
             'echo "$((1 + 2))"',
             "(( count++ ))",
@@ -231,6 +243,40 @@ class TestArithmeticSubscripts:
     def test_quoted_subscript_in_evaluating_command_blocks(self, command: str):
         result = check_bash_command(command)
         assert not result.safe, f"bypass allowed: {command!r}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            f"let $'a[\\x24({SENTINEL})]'",
+            f"let $'a[\\044({SENTINEL})]'",
+            f"let $'a[\\u24({SENTINEL})]'",
+            f"let $'a[\\U00000024({SENTINEL})]'",
+            f"let $'a[\\x60{SENTINEL}\\x60]'",
+            f"x=$'a[\\x24({SENTINEL})]'; (( x ))",
+        ],
+    )
+    def test_ansi_c_escapes_that_spell_a_substitution_block(self, command: str):
+        """Check 4 happens to refuse these today; check 26 must too, on its
+        own, because bash decodes the escapes before let evaluates them."""
+        assert not check_bash_command(command).safe
+        result = bash_security._check_substitution_lookalikes(command)
+        assert result.check_id == CheckID.SUBSTITUTION_LOOKALIKE, result
+        assert "escapes spell" in result.message
+
+    @pytest.mark.parametrize(
+        ("body", "decoded"),
+        [
+            ("a\\x24(b", "a$(b"), ("\\044(", "$("), ("\\44(", "$("),
+            ("\\u0024(", "$("), ("\\U00000024[", "$["), ("\\x60", "`"),
+            ("\\t\\n\\\\\\'", "\t\n\\'"), ("\\q", "\\q"), ("\\cA", "\x01"),
+            ("\\x", "\\x"), ("\\UFFFFFFFF", "�"),
+        ],
+    )
+    def test_decode_ansi_c(self, body: str, decoded: str):
+        assert bash_security._decode_ansi_c(body) == decoded
+
+    def test_ansi_c_text_without_evaluation_is_left_to_the_other_checks(self):
+        assert bash_security._substitution_lookalikes("echo $'\\x24(id)'") == []
 
     @pytest.mark.parametrize(
         "command",
@@ -366,6 +412,38 @@ class TestRedirectAfterDirectoryChange:
     def test_message_names_the_real_target(self):
         result = check_bash_command("cd /etc; echo x > zz-fake")
         assert "/etc/zz-fake" in result.message
+
+
+# ---------------------------------------------------------------------------
+# The new passes stay linear at the length cap (sandbox-07)
+# ---------------------------------------------------------------------------
+
+CAP = bash_security.MAX_COMMAND_BYTES
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo " + "$\\\n(" * ((CAP - 5) // 4),                    # continuations
+        "echo " + "'$\\\n(' " * ((CAP - 5) // 7),                 # unjoined ones
+        "cat <<'A'\n`x`\nA\n" * (CAP // 17),                      # bodies x look-alikes
+        "echo " + "'`' " * ((CAP - 5) // 4),                      # quoted look-alikes
+        "cd /tmp/a; " * (CAP // 12) + "echo x > f",               # directory changes
+        "cd a; echo x > f; " * (CAP // 19),
+        "echo \"" + "\\$(" * ((CAP - 7) // 3) + "\"",              # escaped in "..."
+        "echo \"${x:-" + "'$(" * ((CAP - 20) // 3) + "}\"",        # literal apostrophes
+    ],
+    ids=["dollar-continuations", "sq-continuations", "heredoc-bodies",
+         "sq-lookalikes", "cd-chain", "cd-redirect-chain", "dq-escapes",
+         "brace-apostrophes"],
+)
+def test_new_passes_are_fast_at_the_cap(command: str):
+    import time
+
+    assert len(command.encode()) <= CAP
+    start = time.perf_counter()
+    check_bash_command(command + " ")  # bypass any cached scan
+    assert time.perf_counter() - start < 1.0
 
 
 # ---------------------------------------------------------------------------

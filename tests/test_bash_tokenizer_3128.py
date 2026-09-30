@@ -630,6 +630,7 @@ SUBSTITUTION_STATEMENTS = [
     f"printf -v 'a[{OPENER}$({MARKER})]' q",      # runs
     f"xa='a[{OPENER}$({MARKER})]'; [[ xa -eq 1 ]]",  # runs
     f": '{OPENER}$({MARKER})'",                   # inert
+    f"let {OPENER}$'a[\\x24({MARKER})]'",         # runs: escapes decoded
 ]
 SUBSTITUTION_HEREDOCS = [
     f"p <<'EOF'\n{OPENER}$({MARKER})\nEOF",       # inert: quoted body
@@ -637,6 +638,8 @@ SUBSTITUTION_HEREDOCS = [
     f"p <<E\\\nOF\n{OPENER}$({MARKER})\nEOF",     # runs: EOF is unquoted
     f"p <<EOF\n{OPENER}$\\\n({MARKER})\nEOF",     # runs
     f"p <<\"EOF\"\nq {OPENER}`{MARKER}`\nEOF",    # inert
+    f"p <<EOF\n${{v:-'{OPENER}$({MARKER})'}}\nEOF",   # runs: ' is literal
+    f"p <<EOF\n${{w#'{OPENER}$({MARKER})'}}\nEOF",    # inert: pattern quotes
 ]
 
 SUBSTITUTION_PRELUDE = (

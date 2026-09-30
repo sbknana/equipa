@@ -56,6 +56,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 import posixpath
@@ -685,13 +686,17 @@ class _ShellScanner:
         apostrophes as ordinary characters, so a ``$(...)`` between two of
         them runs; the pattern operators (``#``, ``%``, ``/``) treat them as
         quotes. They are read as ordinary characters for every operator:
-        a ``$(...)`` there is then always seen, which fails closed.
+        a ``$(...)`` there is then always seen, which fails closed. An
+        unquoted heredoc body expands like double quotes, so the same holds
+        for every ``${...}`` scanned while a body is open (self.limits).
         """
         command = self.command
         ch = command[index]
         flags = frame.flags
         nxt = command[index + 1] if index + 1 < self.limit() else ""
-        literal_apostrophe = frame.kind == "brace" and bool(flags & _F_HIDDEN)
+        literal_apostrophe = frame.kind == "brace" and (
+            bool(flags & _F_HIDDEN) or bool(self.limits)
+        )
         if ch == "\\":
             self.note_continuation(index)
             self.mark(index, min(index + 2, self.limit()), _K_PARAM, flags)
@@ -881,6 +886,10 @@ _LOOKALIKE_CONTEXTS = {
     _K_SQ: "a single-quoted word inside a substitution or expansion",
     _K_DQ: "double quotes",
     _K_ANSI: "a $'...' string",
+    _K_ANSI_DELIM: (
+        "a $'...' string whose escapes spell a substitution, in a command "
+        "that evaluates arithmetic or array subscripts"
+    ),
     _K_COMMENT: "a comment",
     _K_HEREDOC: "a heredoc body or terminator bash expands",
     _K_PARAM: "a ${...} or $[...] expansion",
@@ -914,31 +923,106 @@ def _substitution_lookalikes(command: str) -> list[_Lookalike]:
     in a substitution - is treated as executing the sequence.
     """
     matches = list(_SUBSTITUTION_LOOKALIKE_RE.finditer(command))
-    if not matches:
+    if not matches and "$'" not in command:
         return []
     scan = _scan_shell(command)
     evaluates_text = bool(
         _EVALUATES_TEXT_RE.search(re.sub(r"[\\'\"]", "", command))
     )
+    # Heredoc bodies never overlap and are recorded in order, so a bisect
+    # finds the only body that can hold a position (linear overall).
     quoted_bodies = [
         (heredoc.body_start, heredoc.terminator_start)
         for heredoc in scan.heredocs if heredoc.quoted
     ]
+    body_starts = [body for body, _end in quoted_bodies]
     escaped = frozenset(scan.escaped_in_double_quotes)
     lookalikes = []
     for match in matches:
         start = match.start()
         kind = scan.kinds[start]
+        slot = bisect.bisect_right(body_starts, start) - 1
         quoted_context = (
             kind == _K_SQ  # no flag bit: top level, outside every construct
             or start in escaped
-            or any(body <= start < end for body, end in quoted_bodies)
+            or (slot >= 0 and start < quoted_bodies[slot][1])
         )
         lookalikes.append(_Lookalike(
             start, match.group(0), kind, quoted_context,
             quoted_context and not evaluates_text,
         ))
+    if evaluates_text:
+        # `let $'a[\x24(cmd)]'` runs cmd: the escapes spell the look-alike
+        # only after bash decodes them, so decode before searching.
+        lookalikes.extend(_ansi_c_spelled_lookalikes(command, scan.kinds))
+        lookalikes.sort(key=lambda item: item.start)
     return lookalikes
+
+
+_ANSI_C_ESCAPES = {
+    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+_ANSI_C_HEX_DIGITS = {"x": 2, "u": 4, "U": 8}
+
+
+def _decode_ansi_c(body: str) -> str:
+    """Decode the text between ``$'`` and ``'`` the way bash expands it."""
+    decoded: list[str] = []
+    index = 0
+    length = len(body)
+    while index < length:
+        ch = body[index]
+        if ch != "\\" or index + 1 >= length:
+            decoded.append(ch)
+            index += 1
+            continue
+        code = body[index + 1]
+        if code in _ANSI_C_ESCAPES:
+            decoded.append(_ANSI_C_ESCAPES[code])
+            index += 2
+            continue
+        if code in "01234567":
+            digits = re.match(r"[0-7]{1,3}", body[index + 1:index + 4]).group(0)
+            decoded.append(chr(int(digits, 8) & 0xFF))
+            index += 1 + len(digits)
+            continue
+        width = _ANSI_C_HEX_DIGITS.get(code)
+        if width is not None:
+            digits = re.match(
+                rf"[0-9A-Fa-f]{{1,{width}}}", body[index + 2:index + 2 + width]
+            )
+            if digits is not None:
+                value = int(digits.group(0), 16)
+                decoded.append(chr(value) if value <= 0x10FFFF else "�")
+                index += 2 + len(digits.group(0))
+                continue
+        if code == "c" and index + 2 < length:
+            decoded.append(chr(ord(body[index + 2]) & 0x1F))
+            index += 3
+            continue
+        decoded.append(body[index:index + 2])  # unknown escape: kept as is
+        index += 2
+    return "".join(decoded)
+
+
+def _ansi_c_spelled_lookalikes(command: str, kinds: bytes) -> list[_Lookalike]:
+    """Look-alikes that a ``$'...'`` string's escapes spell (IND3128-03)."""
+    found: list[_Lookalike] = []
+    index = command.find("$'")
+    while index >= 0:
+        kind = kinds[index]
+        if kind & _KIND_MASK == _K_ANSI_DELIM:
+            end = index + 2
+            while end < len(command) and kinds[end] & _KIND_MASK == _K_ANSI:
+                end += 1
+            decoded = _decode_ansi_c(command[index + 2:end])
+            if _SUBSTITUTION_LOOKALIKE_RE.search(decoded):
+                found.append(_Lookalike(index, "$'", kind, False, False))
+            index = command.find("$'", end)
+            continue
+        index = command.find("$'", index + 1)
+    return found
 
 
 def _check_substitution_lookalikes(command: str) -> BashSecurityResult:
