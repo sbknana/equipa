@@ -432,6 +432,25 @@ async def test_caller_env_is_merged_and_hardening_cannot_be_unset(
     assert diff.stdout.split() == ["evil.py"]
 
 
+@pytest.mark.asyncio
+async def test_caller_env_cannot_replace_the_hardening_value(plain_repo: Path) -> None:
+    """The env git receives carries the hardening value, not the caller's.
+
+    git 2.43 disables replace refs when GIT_NO_REPLACE_OBJECTS is merely
+    present, so a caller's "0" is harmless today. A git that parses the value
+    as a boolean would not be, so pin what git actually receives.
+    """
+    print_env = ["-c", "alias.probe-env=!printenv GIT_NO_REPLACE_OBJECTS", "probe-env"]
+    caller_env = {"GIT_NO_REPLACE_OBJECTS": "0"}
+
+    sync_result = git_run(print_env, plain_repo, timeout=10, env=caller_env)
+    async_result = await git_run_async(print_env, plain_repo, timeout=10, env=caller_env)
+
+    for result in (sync_result, async_result):
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "1"
+
+
 def test_completed_process_args_show_the_hardened_command(plain_repo: Path) -> None:
     result = git_run(["status", "--porcelain"], plain_repo, timeout=10)
     assert result.args[0] == "git"
