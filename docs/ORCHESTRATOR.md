@@ -164,8 +164,19 @@ absolute `cwd`, absolute `PYTHONPATH` entries and an absolute `--db-path`.
 `python -m` (or `-c`) additionally needs `-I` or `-P` and an absolute `cwd`,
 because Python would otherwise put the project directory first on `sys.path`
 and run an agent-planted module holding the server's token. `env` wrappers and
-inline `sh -c` commands are refused because they cannot be verified. See
-`mcp_config.example.json` for the accepted form.
+inline `sh -c` commands are refused because they cannot be verified. JavaScript
+package runners and managers (`npx`, `pnpx`, `bunx`, `npm`, `pnpm`, `yarn`,
+`bun`) are refused too: started in the project, `npx <name>` runs the project's
+own `node_modules/.bin/<name>`, and `.npmrc`, `.yarnrc.yml` and `bunfig.toml`
+are read from it. Install such a server outside the project and point an
+absolute `node` at its entry script. See `mcp_config.example.json` for the
+accepted form.
+
+The Claude CLI currently ignores a per-server `cwd` and starts every stdio
+server in its own working directory, the project. For `python -m` servers the
+isolation therefore comes from `-P` (or `-I`) with absolute `PYTHONPATH`
+entries, not from `cwd`. The `equipa` MCP server starts its dispatch child
+(`python -m equipa.cli`) from its own checkout for the same reason.
 
 ## Agent isolation: what is and is not covered
 
@@ -187,7 +198,10 @@ in depth for that shared UID:
 - Tool inputs are redacted before they are persisted to `agent_actions`.
 
 None of this stops a same-UID process from reading files the orchestrator's
-user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`). **The
+user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`). Nor does it
+cover short-lived orchestrator helpers that exec with the full environment
+(git, docker): after exec they are dumpable again, so their
+`/proc/<pid>/environ` is readable while they run. **The
 complete fix is running agents under a separate Unix user** without access to
 those files. That is planned for a later wave.
 
