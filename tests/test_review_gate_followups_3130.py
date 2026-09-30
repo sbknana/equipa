@@ -30,6 +30,8 @@ ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
 ONE_HIGH = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 ONE_MEDIUM = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 1 | LOW: 0 | INFO: 0"
+# Spelled by name so a reader can tell it from a Latin H.
+ETA = "\N{GREEK CAPITAL LETTER ETA}"
 
 
 def review(summary: str, body: list[str], footer: str, low_heading: bool,
@@ -224,12 +226,14 @@ def test_range_prose_cell_merges(row):
 # --- F4 / R3122-04: lookalike letters, entities and comments ---------------------
 
 @pytest.mark.parametrize("line", [
-    "ΗIGH: SQL injection in login",          # Greek capital Eta
-    "НIGH: SQL injection in login",          # Cyrillic capital En
-    "HІGH: SQL injection in login",          # Cyrillic Byelorussian I
-    "HIԌH: SQL injection in login",          # Cyrillic Komi Sje
-    "- SQL injection in login - ΗΙGH",  # Greek Eta and Iota
-    "| S1 | SQLi | НІGH |",
+    f"{ETA}IGH: SQL injection in login",
+    "\N{CYRILLIC CAPITAL LETTER EN}IGH: SQL injection in login",
+    "H\N{CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I}GH: SQL injection",
+    "HI\N{CYRILLIC CAPITAL LETTER KOMI SJE}H: SQL injection in login",
+    f"- SQL injection in login - {ETA}\N{GREEK CAPITAL LETTER IOTA}GH",
+    "| S1 | SQLi | \N{CHEROKEE LETTER MI}IGH |",
+    f"{ETA}igh: SQL injection in login",  # Title case, lookalike capital
+    "\N{LISU LETTER XA}IGH: SQL injection in login",
 ])
 def test_confusable_letters_fail_closed(line):
     assert_blocks_behind_zero_footer(["## Findings", "", line])
@@ -237,7 +241,7 @@ def test_confusable_letters_fail_closed(line):
 
 def test_confusable_heading_is_a_strict_finding_heading():
     analysis = analyze(review(
-        "1 finding.", ["## Findings", "", "### [S1] ΗIGH — SQL injection"],
+        "1 finding.", ["## Findings", "", f"### [S1] {ETA}IGH — SQL injection"],
         ONE_HIGH, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.header_counts["HIGH"] == 1
@@ -313,6 +317,7 @@ def test_comment_around_a_draft_summary_is_still_incomplete(opener):
     ["AT&amp;T and R&amp;D endpoints were reviewed; &lt;none&gt; flagged."],
     ["<!-- reviewer note: nothing else to add -->"],
     ["Coverage is high<!-- measured with pytest-cov -->."],
+    # Greek and Cyrillic prose: folding lookalikes must not invent a severity.
     ["Η προστασία "
      "είναι εντάξει."],
     ["Ничего не "
@@ -350,6 +355,30 @@ def test_comment_markers_quoted_in_code_open_no_comment():
 ])
 def test_wrapped_prose_line_opening_with_an_id_merges(body):
     assert_prose_merges(["## Notes", ""] + body)
+
+
+@pytest.mark.parametrize("line", [
+    "HI&#8203;GH: SQL injection",       # zero-width space renders as nothing
+    "HI&shy;GH: SQL injection",         # soft hyphen renders as nothing
+    "&#xFF28;IGH: SQL injection",       # fullwidth H
+    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;HIGH: SQL injection",
+])
+def test_invisible_fullwidth_and_blank_references_fail_closed(line):
+    assert_blocks_behind_zero_footer(["## Findings", "", line])
+
+
+@pytest.mark.parametrize("body", [
+    # Blocked before task 3130 by the text as written; the rendered view
+    # alone would read a zero tally. The stricter view must win.
+    ["HIGH: &#48; SQL injection in login"],
+    ["## [S1] 0      HIGH — SQL injection"],
+    # Blocked before as a bare line; now a list item, still blocked.
+    ["<ul><li>HIGH</li></ul>"],
+    ["<ul><li>\N{LARGE RED CIRCLE} HIGH</li></ul>"],
+    ["<ol><li>S1: HIGH</li></ol>"],
+])
+def test_rendered_view_never_loosens_an_earlier_block(body):
+    assert_blocks_behind_zero_footer(["## Findings", ""] + body)
 
 
 def test_terse_review_with_comment_lines_is_not_near_empty():
@@ -459,7 +488,7 @@ ADVERSARIAL_BODIES = {
     "named-entity-flood": ["&amp;" * (REVIEW_BYTES // 5)],
     "li-flood": ["<li>" * (REVIEW_BYTES // 4)],
     "br-flood": ["x<br>" * (REVIEW_BYTES // 5)],
-    "confusable-flood": ["Η" * (REVIEW_BYTES // 2)],
+    "confusable-flood": [ETA * (REVIEW_BYTES // 2)],
     "blank-runs": ["Severity:" + " \t" * (REVIEW_BYTES // 2) + "x"],
     "severity-is-runs": ["severity " + "is " * (REVIEW_BYTES // 3)],
     "priority-lines": _padded_lines("Priority:" + " " * 7 + "*" * 3 + " maybe"),

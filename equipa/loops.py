@@ -1252,11 +1252,15 @@ _LIST_ITEM_TRAILING_SEVERITY_RE = re.compile(
     r"(?:[ -]severity)?[*_\])]{0,3}[ \t.]{0,4}$",
     re.MULTILINE | re.IGNORECASE,
 )
-# Task 3130: a list item that is ONLY an UPPER-case severity ("- HIGH"), which
-# is also what "<li>HIGH</li>" becomes once HTML list items keep their bullet.
+# Task 3130: a list item that is ONLY an UPPER-case severity, optionally after
+# an emoji or a finding ID ("- HIGH", "- 🔴 HIGH", "- [S1] HIGH"). It is also
+# what "<li>HIGH</li>" becomes once HTML list items keep their bullet, so it
+# takes the prefixes _BARE_LEADING_SEVERITY_RE took from that line before.
 _LIST_ITEM_LONE_SEVERITY_RE = re.compile(
-    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}[*_\[(]{0,3}"
-    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}"
+    r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?"
+    r"(?:[\[(`]?[A-Za-z]{1,4}-?\d{1,3}[\])`]?[ \t]{0,2}[:—–-]?[ \t]{1,4})?"
+    r"[*_\[(]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
     r"[*_\])]{0,3}[ \t.]{0,4}$",
     re.MULTILINE | re.IGNORECASE,
 )
@@ -1816,15 +1820,19 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
     return [severity for _line, severity in found]
 
 
-# Task 3130 (R3122-01, R3122-04): the parser reads the review the way a
-# Markdown renderer shows it. "&#72;IGH", "HI<!-- x -->GH" and a Greek-Eta
-# "ΗIGH" all render as HIGH, and a Severity cell padded with 12 spaces
-# renders as "Severity: HIGH"; each was invisible to every rule.
+# Task 3130 (R3122-01, R3122-04): the review as a Markdown renderer shows it.
+# "&#72;IGH", "HI<!-- x -->GH" and HIGH spelled with a Greek capital Eta
+# (U+0397) all render as HIGH, and a Severity cell padded with 12 spaces
+# renders as "Severity: HIGH"; each was invisible to every rule. _analyze_review_file parses this rendered view
+# AND the text as written, and the stricter result wins, so the rewrite can
+# only add blocks ("HIGH: &#48; SQLi" is a tally once decoded, but still
+# blocks as written, as it did before).
 #
-# The provenance and completion comments the gate itself asks for. Stripping
-# them hides nothing, so they alone never trigger the second pass.
+# The provenance and completion comments the gate itself asks for. A review
+# whose rendered view differs from its text only by these (nearly every one)
+# is parsed once.
 _EQUIPA_MARKER_COMMENT_RE = re.compile(
-    r"[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}[ \t]*",
+    r"<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}[ \t]*-->",
 )
 # CommonMark character references: the semicolon is required.
 _CHARACTER_REFERENCE_RE = re.compile(
@@ -1836,7 +1844,7 @@ _CHARACTER_REFERENCE_RE = re.compile(
 # is literal backticks around a finding, not a code span that hides it. Such
 # references become U+FFFD, which no rule treats as structure.
 _SAFE_REFERENCE_PUNCTUATION = frozenset(":;,.!?-—–/'\"()&")
-_UNSAFE_REFERENCE_CHAR = "�"
+_UNSAFE_REFERENCE_CHAR = "\N{REPLACEMENT CHARACTER}"
 # Decoded blanks are marked first, so the ones that would open a line (and
 # turn "&nbsp;&nbsp;&nbsp;&nbsp;HIGH: SQLi" into indented code) are dropped.
 _REFERENCE_BLANK = "\x00"
@@ -1844,43 +1852,44 @@ _LEADING_REFERENCE_BLANKS_RE = re.compile(r"^[ \t\x00]+", re.MULTILINE)
 # A run of two or more blanks inside a line renders as one space. Leading
 # indentation is kept: it decides what is a list item or indented code.
 _INTERIOR_BLANK_RUN_RE = re.compile(r"(?<=[^ \t\n])[ \t]{2,}")
-# Letters from other scripts that look like the Latin letters of the five
-# severity words, UPPER and Title case. A subset of Unicode confusables.txt;
-# NFKC (normalize_review_text) already folds fullwidth and mathematical
-# letters but leaves these alone.
+# Code points from other scripts that look like the Latin letters of the five
+# severity words, UPPER and Title case: Greek, Cyrillic, Cherokee, Lisu and
+# Latin small capitals. A subset of Unicode confusables.txt; NFKC
+# (normalize_review_text) already folds fullwidth and mathematical letters
+# but leaves these alone.
 _CONFUSABLES_BY_LETTER = {
-    "A": "ΑАᎪꓮ",
-    "C": "ϹСᏟꓚ",
-    "D": "Ꭰꓓ",
-    "E": "ΕЕᎬꓰ",
-    "F": "Ϝꓝ",
-    "G": "ԌᏀꓖɢ",
-    "H": "ΗНᎻꓧʜ",
-    "I": "ΙІӀꓲǀɪ",
-    "L": "Ꮮꓡ",
-    "M": "ΜМᎷꓟ",
-    "N": "Νꓠ",
-    "O": "ΟОꓳ",
-    "R": "ᎡᏒꓣ",
-    "T": "ΤТᎢꓔ",
-    "U": "ꓴ",
-    "W": "ԜᎳꓪ",
-    "a": "аɑ",
-    "c": "сϲ",
-    "d": "ԁ",
-    "e": "е",
-    "g": "ɡ",
-    "h": "һ",
-    "i": "іıι",
-    "l": "ӏ",
-    "o": "οо",
-    "w": "ԝ",
+    "A": (0x0391, 0x0410, 0x13AA, 0xA4EE),
+    "C": (0x03F9, 0x0421, 0x13DF, 0xA4DA),
+    "D": (0x13A0, 0xA4D3),
+    "E": (0x0395, 0x0415, 0x13AC, 0xA4F0),
+    "F": (0x03DC, 0xA4DD),
+    "G": (0x050C, 0x13C0, 0xA4D6, 0x0262),
+    "H": (0x0397, 0x041D, 0x13BB, 0xA4E7, 0x029C),
+    "I": (0x0399, 0x0406, 0x04C0, 0xA4F2, 0x01C0, 0x026A),
+    "L": (0x13DE, 0xA4E1),
+    "M": (0x039C, 0x041C, 0x13B7, 0xA4DF),
+    "N": (0x039D, 0xA4E0),
+    "O": (0x039F, 0x041E, 0xA4F3),
+    "R": (0x13A1, 0x13D2, 0xA4E3),
+    "T": (0x03A4, 0x0422, 0x13A2, 0xA4D4),
+    "U": (0xA4F4,),
+    "W": (0x051C, 0x13B3, 0xA4EA),
+    "a": (0x0430, 0x0251),
+    "c": (0x0441, 0x03F2),
+    "d": (0x0501,),
+    "e": (0x0435,),
+    "g": (0x0261,),
+    "h": (0x04BB,),
+    "i": (0x0456, 0x0131, 0x03B9),
+    "l": (0x04CF,),
+    "o": (0x03BF, 0x043E),
+    "w": (0x051D,),
 }
-_CONFUSABLE_LETTERS = str.maketrans({
-    source: letter
-    for letter, sources in _CONFUSABLES_BY_LETTER.items()
-    for source in sources
-})
+_CONFUSABLE_LETTERS = {
+    code_point: letter
+    for letter, code_points in _CONFUSABLES_BY_LETTER.items()
+    for code_point in code_points
+}
 
 
 def _carry_line_breaks(segment: str, carried: int) -> tuple[str, int]:
@@ -1921,26 +1930,23 @@ def _mask_code(text: str) -> str:
     return "\n".join(masked)
 
 
-def _strip_html_comments(text: str) -> tuple[str, bool]:
+def _strip_html_comments(text: str) -> str:
     """Remove HTML comments the way a renderer hides them (task 3130).
 
-    Returns the text without comments, and whether any removed comment held
-    more than an EQUIPA provenance marker. A comment is removed with no
-    replacement, so the word it split is joined ("HI<!-- x -->GH" reads
-    HIGH); the line breaks it spanned are re-inserted at the end of the line
-    it closed on, so every later line keeps its number. "<!-->" and
-    "<!--->" are empty comments. Code is not HTML: a "<!--" quoted in a code
-    span opens nothing (a real review quoted one, and a "-->" in another span
-    30 lines later hid two finding headings). An unterminated comment is
-    left in place, so its text stays visible (fail closed). Linear: every
-    search starts where the previous one ended.
+    A comment is removed with no replacement, so the word it split is joined
+    ("HI<!-- x -->GH" reads HIGH); the line breaks it spanned are re-inserted
+    at the end of the line it closed on, so every later line keeps its
+    number. "<!-->" and "<!--->" are empty comments. Code is not HTML: a
+    "<!--" quoted in a code span opens nothing (a real review quoted one, and
+    a "-->" in another span 30 lines later hid two finding headings). An
+    unterminated comment is left in place, so its text stays visible. Linear:
+    every search starts where the previous one ended.
     """
     if "<!--" not in text:
-        return text, False
+        return text
     masked = _mask_code(text)
     pieces: list[str] = []
     carried_breaks = 0
-    hid_content = False
     position = 0
     while (start := masked.find("<!--", position)) != -1:
         if masked.startswith("<!-->", start):
@@ -1952,18 +1958,15 @@ def _strip_html_comments(text: str) -> tuple[str, bool]:
             if body_end == -1:
                 break
             end = body_end + 3
-        body = text[start + 4:body_end]
-        if body.strip() and not _EQUIPA_MARKER_COMMENT_RE.fullmatch(body):
-            hid_content = True
         segment, carried_breaks = _carry_line_breaks(
             text[position:start], carried_breaks,
         )
         pieces.append(segment)
-        carried_breaks += body.count("\n")
+        carried_breaks += text.count("\n", start, end)
         position = end
     rest, carried_breaks = _carry_line_breaks(text[position:], carried_breaks)
     pieces.append(rest + "\n" * carried_breaks)
-    return "".join(pieces), hid_content
+    return "".join(pieces)
 
 
 def _decode_character_reference(match: re.Match[str]) -> str:
@@ -1972,6 +1975,11 @@ def _decode_character_reference(match: re.Match[str]) -> str:
     decoded = html.unescape(reference)
     if decoded == reference:
         return reference  # unknown name: the renderer shows it literally
+    # Fullwidth letters fold to ASCII; a zero-width space or soft hyphen
+    # ("HI&#8203;GH") renders as nothing and must join the word.
+    decoded = normalize_review_text(decoded)
+    if not decoded:
+        return ""
     if all(char.isalnum() or char in _SAFE_REFERENCE_PUNCTUATION
            for char in decoded):
         return decoded
@@ -1982,12 +1990,13 @@ def _decode_character_reference(match: re.Match[str]) -> str:
 
 
 def _rendered_review_text(text: str) -> str:
-    """Decode references, fold lookalike letters and collapse blank runs.
+    """The review as a renderer shows it: comments removed, character
+    references decoded, lookalike letters folded, blank runs collapsed.
 
-    ``text`` is already normalised (normalize_review_text). Comments are
-    handled separately by :func:`_strip_html_comments`, before this runs, so
-    a decoded "&lt;!--" never opens a comment.
+    ``text`` is already normalised (normalize_review_text). Comments go
+    first, so a decoded "&lt;!--" never opens one.
     """
+    text = _strip_html_comments(text)
     if "&" in text:
         # A raw NUL renders as U+FFFD; it must not pass for a decoded blank.
         text = text.replace(_REFERENCE_BLANK, _UNSAFE_REFERENCE_CHAR)
@@ -2004,22 +2013,24 @@ def _rendered_review_text(text: str) -> str:
 
 
 def _stricter_analysis(
-    rendered: ReviewCountAnalysis, with_comments: ReviewCountAnalysis,
+    as_written: ReviewCountAnalysis, rendered: ReviewCountAnalysis,
 ) -> ReviewCountAnalysis:
     """Combine the two views of one review so neither can loosen the gate.
 
-    A view that does not trust the review wins. When both trust it, the
-    merge counts are the per-severity maximum.
+    A view that does not trust the review wins, the text as written first
+    (its verdict and detail are the ones earlier tasks produced). When both
+    trust it, the rendered view is returned with the per-severity maximum of
+    the two views' merge counts.
     """
+    if not as_written.trusted:
+        return as_written
     if not rendered.trusted:
         return rendered
-    if not with_comments.trusted:
-        return with_comments
+    written_counts = as_written.counts or {}
     rendered_counts = rendered.counts or {}
-    comment_counts = with_comments.counts or {}
     return replace(rendered, counts={
-        severity: max(rendered_counts.get(severity, 0),
-                      comment_counts.get(severity, 0))
+        severity: max(written_counts.get(severity, 0),
+                      rendered_counts.get(severity, 0))
         for severity in _REVIEW_SEVERITIES
     })
 
@@ -2085,21 +2096,19 @@ def _analyze_review_file(
 
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
-    # Task 3130: parse what the reader sees (comments removed, references
-    # decoded, lookalike letters folded, blank runs collapsed). Text inside a
-    # comment used to be parsed and could block; the reader never sees it,
-    # but dropping it must not loosen the gate. So a review whose comments
-    # hold anything but the EQUIPA markers is parsed a second time with its
-    # comments kept, and the stricter result wins.
-    rendered, hid_comment_content = _strip_html_comments(text)
-    analysis = _analyze_review_text(
-        _rendered_review_text(rendered), nonblank_lines,
+    # Task 3130: parse the text as written (what every earlier task parsed)
+    # and as rendered (comments removed, references decoded, lookalike
+    # letters folded, blank runs collapsed); the stricter result wins. The
+    # rendered view catches "&#72;IGH" and "HI<!-- -->GH"; the text as
+    # written keeps every block it produced before, including a finding
+    # inside a multi-line comment.
+    as_written = _analyze_review_text(text, nonblank_lines)
+    rendered = _rendered_review_text(text)
+    if rendered == _EQUIPA_MARKER_COMMENT_RE.sub("", text):
+        return as_written  # only the gate's own marker comments differ
+    return _stricter_analysis(
+        as_written, _analyze_review_text(rendered, nonblank_lines),
     )
-    if hid_comment_content:
-        analysis = _stricter_analysis(analysis, _analyze_review_text(
-            _rendered_review_text(text), nonblank_lines,
-        ))
-    return analysis
 
 
 def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
