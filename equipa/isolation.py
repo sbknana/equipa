@@ -989,8 +989,8 @@ def parse_handshake(line: bytes) -> tuple[str | None, str]:
 @dataclass
 class Handoff:
     header: dict[str, Any]
-    bundle_path: Path
-    export_path: str
+    bundle_path: Path | None
+    export_path: str | None
 
 
 def _existing(paths: Iterable[str | os.PathLike[str] | None]) -> list[str]:
@@ -1014,13 +1014,15 @@ def _deny_read_paths(settings: IsolationSettings,
 
 
 def _deny_write_paths(settings: IsolationSettings,
-                      worktree: WorktreeInfo) -> list[str]:
+                      worktree: WorktreeInfo | None) -> list[str]:
     view = settings.view_db_path
+    repository: list[str] = []
+    if worktree is not None:
+        repository = [worktree.path, os.path.dirname(worktree.path),
+                      worktree.git_dir, worktree.common_dir, worktree.main_root]
     return _existing([
         RUNTIME_ROOT, PACKAGE_DIR, settings.launcher, settings.python,
-        settings.claude_executable, settings.git_executable,
-        worktree.path, os.path.dirname(worktree.path), worktree.git_dir,
-        worktree.common_dir, worktree.main_root,
+        settings.claude_executable, settings.git_executable, *repository,
         view, os.path.dirname(view) if view else None,
         *settings.deny_write,
     ])
@@ -1035,12 +1037,13 @@ def _git_identity(path: str) -> dict[str, str]:
     return identity
 
 
-def build_handoff(cmd: Sequence[str], cwd: str, env: Mapping[str, str],
+def build_handoff(cmd: Sequence[str], cwd: str | None, env: Mapping[str, str],
                   settings: IsolationSettings, unit: str,
-                  worktree: WorktreeInfo, oauth_token: str,
+                  worktree: WorktreeInfo | None, oauth_token: str,
                   bundle_path: Path) -> Handoff:
     """Everything the launcher needs, except the scope path (known only
-    once the scope exists)."""
+    once the scope exists). Without a worktree (a helper agent with no
+    project directory) nothing is bundled or exported."""
     if not cmd:
         raise AgentIsolationError("empty agent command")
     argv = [settings.claude_executable, *cmd[1:]]
@@ -1075,7 +1078,7 @@ def build_handoff(cmd: Sequence[str], cwd: str, env: Mapping[str, str],
             index += 2
             continue
         if option == "--add-dir" and value is not None:
-            if os.path.realpath(value) != worktree.path:
+            if worktree is None or os.path.realpath(value) != worktree.path:
                 needs.read.add(value)
             index += 2
             continue
@@ -1084,17 +1087,26 @@ def build_handoff(cmd: Sequence[str], cwd: str, env: Mapping[str, str],
         refresh_view_db(Path(forge_source_db), Path(settings.view_db_path),
                         settings.exclude_tables)
         needs.read.add(settings.view_db_path)
-    handoff_ref = create_handoff_bundle(worktree, unit,
-                                        settings.carry_ignored_paths,
-                                        bundle_path)
-    export_path = os.path.join(settings.exchange_dir, f"{unit}.bundle")
+    workspace: dict[str, Any] | None = None
+    export_path: str | None = None
+    if worktree is not None:
+        export_path = os.path.join(settings.exchange_dir, f"{unit}.bundle")
+        workspace = {
+            "handoff_ref": create_handoff_bundle(
+                worktree, unit, settings.carry_ignored_paths, bundle_path),
+            "branch_ref": worktree.branch_ref,
+            "base_sha": worktree.base_sha,
+            "export_path": export_path,
+            "carry_paths": list(settings.carry_ignored_paths),
+        }
     header = {
         "unit": unit,
         "argv": argv,
         "executable": settings.claude_executable,
         "env": filter_agent_env(env, oauth_token),
         "files": files,
-        "workdir_sources": sorted({worktree.path, os.path.abspath(cwd)}),
+        "workdir_sources": (sorted({worktree.path, os.path.abspath(cwd)})
+                            if worktree is not None and cwd else []),
         "identity": {"user": settings.agent_user,
                      "orchestrator_uid": os.getuid(),
                      "privileged_groups": list(settings.privileged_groups)},
@@ -1108,15 +1120,13 @@ def build_handoff(cmd: Sequence[str], cwd: str, env: Mapping[str, str],
         "git": {"executable": settings.git_executable,
                 "hardening_args": list(GIT_HARDENING_ARGS),
                 "hardening_env": dict(GIT_HARDENING_ENV),
-                **_git_identity(worktree.path)},
-        "handoff_ref": handoff_ref,
-        "branch_ref": worktree.branch_ref,
-        "base_sha": worktree.base_sha,
-        "export": {"path": export_path,
-                   "carry_paths": list(settings.carry_ignored_paths)},
+                **(_git_identity(worktree.path) if worktree else {})},
+        "workspace": workspace,
         "grace": agent_launcher.DEFAULT_GRACE_SECONDS,
     }
-    return Handoff(header=header, bundle_path=bundle_path, export_path=export_path)
+    return Handoff(header=header,
+                   bundle_path=bundle_path if worktree is not None else None,
+                   export_path=export_path)
 
 
 def encode_handoff_preamble(header_bytes: bytes, bundle_size: int) -> bytes:
@@ -1142,8 +1152,8 @@ class IsolatedAgent:
     """
 
     def __init__(self, process: asyncio.subprocess.Process, unit: str,
-                 settings: IsolationSettings, worktree: WorktreeInfo,
-                 export_path: str) -> None:
+                 settings: IsolationSettings, worktree: WorktreeInfo | None,
+                 export_path: str | None) -> None:
         self.process = process
         self.pid = process.pid
         self.start_time = agent_launcher.proc_start_time(process.pid)
@@ -1197,10 +1207,13 @@ class IsolatedAgent:
     async def _send_handoff(self, handoff: Handoff) -> None:
         stdin = self.process.stdin
         header_bytes = json.dumps(handoff.header).encode("utf-8")
-        bundle_size = handoff.bundle_path.stat().st_size
+        bundle_size = (0 if handoff.bundle_path is None
+                       else handoff.bundle_path.stat().st_size)
         stdin.write(encode_handoff_preamble(header_bytes, bundle_size))
         stdin.write(header_bytes)
         await stdin.drain()
+        if handoff.bundle_path is None:
+            return
         with open(handoff.bundle_path, "rb") as bundle:
             while chunk := bundle.read(1 << 20):
                 stdin.write(chunk)
@@ -1330,7 +1343,8 @@ class IsolatedAgent:
         self.release()
 
     def _import_once(self) -> None:
-        if self.imported or not self.started:
+        if (self.imported or not self.started or self.worktree is None
+                or self.export_path is None):
             return
         self.imported = True
         try:
@@ -1395,13 +1409,12 @@ async def spawn_isolated_agent(
     if dispatch_config is None:
         dispatch_config = get_active_dispatch_config()
     settings = load_isolation_settings(dispatch_config)
-    if not cwd:
-        raise AgentIsolationError("agent_isolation needs a project directory")
     identity = resolve_agent_identity(settings)
     check_host(settings, identity)
     sweep_stale_scopes()
     oauth_token = resolve_oauth_token(settings)
-    worktree = await asyncio.to_thread(describe_worktree, cwd)
+    worktree = (await asyncio.to_thread(describe_worktree, cwd)
+                if cwd else None)
     unit = make_unit_name()
     temp_dir = Path(tempfile.mkdtemp(prefix="equipa-isolation-"))
     try:

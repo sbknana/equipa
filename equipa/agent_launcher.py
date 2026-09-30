@@ -702,27 +702,37 @@ class _IsolatedSession:
         self.git_env = {str(k): str(v) for k, v in git_env.items()}
         self.git_identity = {key: git[key] for key in ("user_name", "user_email")
                              if isinstance(git.get(key), str) and git[key]}
-        self.handoff_ref = _field(header, "handoff_ref", str)
-        self.branch_ref = _field(header, "branch_ref", str)
-        if not (_REF_RE.match(self.handoff_ref)
-                and self.branch_ref.startswith("refs/heads/")
-                and _REF_RE.match(self.branch_ref)):
-            raise IsolationRefused("invalid handoff ref names")
-        self.base_sha = _field(header, "base_sha", str)
-        if not _SHA_RE.match(self.base_sha):
-            raise IsolationRefused("invalid base commit id")
-        export = _field(header, "export", dict)
-        self.export_path = _field(export, "path", str)
-        self.carry_paths = _str_list(export, "carry_paths")
-        if not os.path.isabs(self.export_path) or any(
-                os.path.isabs(p) or ".." in Path(p).parts
-                for p in self.carry_paths):
-            raise IsolationRefused("invalid export paths")
+        # No workspace: a helper agent without a project directory (e.g.
+        # reflexion) runs in an empty private directory; nothing is cloned
+        # or exported.
+        self.has_workspace = header.get("workspace") is not None
+        self.handoff_ref = self.branch_ref = self.base_sha = ""
+        self.export_path = ""
+        self.carry_paths: list[str] = []
+        if self.has_workspace:
+            self._parse_workspace(_field(header, "workspace", dict))
         self.grace = float(_field(header, "grace", (int, float)))
         self.home = ""
         self.shell = "/bin/sh"
         self.state_dir: Path | None = None
         self.repo_dir: Path | None = None
+
+    def _parse_workspace(self, workspace: Mapping) -> None:
+        self.handoff_ref = _field(workspace, "handoff_ref", str)
+        self.branch_ref = _field(workspace, "branch_ref", str)
+        if not (_REF_RE.match(self.handoff_ref)
+                and self.branch_ref.startswith("refs/heads/")
+                and _REF_RE.match(self.branch_ref)):
+            raise IsolationRefused("invalid handoff ref names")
+        self.base_sha = _field(workspace, "base_sha", str)
+        if not _SHA_RE.match(self.base_sha):
+            raise IsolationRefused("invalid base commit id")
+        self.export_path = _field(workspace, "export_path", str)
+        self.carry_paths = _str_list(workspace, "carry_paths")
+        if not os.path.isabs(self.export_path) or any(
+                os.path.isabs(p) or ".." in Path(p).parts
+                for p in self.carry_paths):
+            raise IsolationRefused("invalid export paths")
 
     # -- checks ---------------------------------------------------------------
 
@@ -846,6 +856,11 @@ class _IsolatedSession:
         (self.state_dir / "files").mkdir(mode=0o700)
         (self.state_dir / "tmp").mkdir(mode=0o700)
         self.repo_dir = self.state_dir / "repo"
+        if not self.has_workspace:
+            if bundle_size:
+                raise IsolationRefused("a bundle was sent without a workspace")
+            self.repo_dir.mkdir(mode=0o700)
+            return
         bundle_path = self.state_dir / "handoff.bundle"
         out = os.open(bundle_path,
                       os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -881,6 +896,8 @@ class _IsolatedSession:
     def _substitute(self, text: str) -> str:
         """Point every mention of the orchestrator worktree at the clone."""
         sources = sorted(set(self.workdir_sources), key=len, reverse=True)
+        if not sources:
+            return text
         pattern = re.compile(
             "(?:" + "|".join(re.escape(source) for source in sources) + ")"
             r"(?![A-Za-z0-9._-])")
@@ -1013,7 +1030,8 @@ def _run_isolated() -> int:
     status = _supervise_cli(cli_pid, session.grace)
     terminate_descendants(os.getpid(), session.grace)
     try:
-        session.export()
+        if session.has_workspace:
+            session.export()
     except (IsolationRefused, OSError) as exc:
         _report(f"export failed; the agent's work is kept in "
                 f"{session.repo_dir}: {exc}")
