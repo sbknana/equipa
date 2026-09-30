@@ -1846,6 +1846,71 @@ def _brace_expansions(text: str) -> list[tuple[int, int, str]]:
 _BRACE_COMMA_MESSAGE = "Command contains brace expansion that could alter parsing"
 _BRACE_SEQUENCE_MESSAGE = "Command contains brace sequence expansion ({a..z})"
 
+# Commands whose ARGUMENTS may carry a brace list (`ls {a,b}`,
+# `cp f{,.bak}`): none of them runs an argument as a command or as code.
+_BRACE_EXPANSION_SAFE_BASES: frozenset[str] = frozenset([
+    "echo", "printf", "ls", "cat", "cp", "mv", "mkdir", "touch", "diff",
+    "wc", "head", "tail", "grep", "egrep", "fgrep", "rg", "stat", "du",
+    "file", "sort", "uniq",
+])
+# A brace word containing any of these could turn into something else after
+# quote removal or expansion (`"-"{a,b}` becomes `-a -b`).
+_BRACE_WORD_FORBIDDEN_CHARS = frozenset("'\"\\$`")
+_WORD_WHITESPACE = frozenset(" \t\n")
+
+
+def _brace_segment_problem(segment: str) -> str | None:
+    """Return a check-16 message if *segment* uses brace expansion unsafely.
+
+    Allowed (sandbox-13): a comma list such as ``{a,b}`` in an ARGUMENT of a
+    command from ``_BRACE_EXPANSION_SAFE_BASES``, provided that
+
+    * the command word itself holds no brace (``{rm,-rf,x}`` builds a
+      command),
+    * the word does not start with ``-`` and a list at the start of a word
+      has no element starting with ``-`` (``ls {-la,/}`` builds flags),
+    * the word holds no quote, backslash, ``$`` or backtick, and
+    * there is at most one list per word and no nesting, which keeps the
+      expansion linear in the command length (``{a,b}{a,b}...`` doubles
+      with every group).
+
+    Sequence expressions (``{1..99999999}``) stay blocked: their size is
+    unbounded. The scan runs on the quote-delimiter-preserving view, so
+    quoted commas do not count and quoted text shows up as a quote mark.
+    """
+    view = _extract_unquoted_keep_delimiters(segment)
+    expansions = _brace_expansions(view)
+    if not expansions:
+        return None
+    if any(kind == "sequence" for _, _, kind in expansions):
+        return _BRACE_SEQUENCE_MESSAGE
+    base = _get_base_command(view)
+    if "{" in base or base.rsplit("/", 1)[-1] not in _BRACE_EXPANSION_SAFE_BASES:
+        return _BRACE_COMMA_MESSAGE
+
+    previous_word_end = -1
+    for open_pos, close_pos, _ in expansions:
+        if open_pos < previous_word_end:
+            return _BRACE_COMMA_MESSAGE  # second or nested list in one word
+        word_start = open_pos
+        while word_start > 0 and view[word_start - 1] not in _WORD_WHITESPACE:
+            word_start -= 1
+        word_end = close_pos + 1
+        while word_end < len(view) and view[word_end] not in _WORD_WHITESPACE:
+            word_end += 1
+        word = view[word_start:word_end]
+        if word.startswith("-") or any(
+            ch in _BRACE_WORD_FORBIDDEN_CHARS for ch in word
+        ):
+            return _BRACE_COMMA_MESSAGE
+        if open_pos == word_start and any(
+            element.startswith("-")
+            for element in view[open_pos + 1:close_pos].split(",")
+        ):
+            return _BRACE_COMMA_MESSAGE
+        previous_word_end = word_end
+    return None
+
 
 def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
     """Check 16: Brace expansion ({a,b} or {1..5}) in unquoted content."""
@@ -1873,16 +1938,17 @@ def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
             message="Quoted brace character inside brace context (potential obfuscation)",
         )
 
-    if open_count == 0:
+    # Early out: expansions seen in the per-segment quote-preserving view
+    # are a subset of those in the unquoted view.
+    if open_count == 0 or not _brace_expansions(unquoted):
         return _SAFE
-    expansions = _brace_expansions(unquoted)
-    if not expansions:
-        return _SAFE
-    kind = expansions[0][2]
-    return BashSecurityResult(
-        safe=False, check_id=CheckID.BRACE_EXPANSION,
-        message=_BRACE_SEQUENCE_MESSAGE if kind == "sequence" else _BRACE_COMMA_MESSAGE,
-    )
+    for segment in _split_command_segments(command):
+        message = _brace_segment_problem(segment)
+        if message is not None:
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.BRACE_EXPANSION, message=message,
+            )
+    return _SAFE
 
 
 def _check_unicode_whitespace(command: str) -> BashSecurityResult:

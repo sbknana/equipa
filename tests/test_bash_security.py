@@ -377,9 +377,14 @@ class TestBraceExpansion:
     """Check ID 16: Brace expansion {a,b} and {1..5}."""
 
     def test_comma_brace(self) -> None:
-        result = check_bash_command("echo {a,b,c}")
-        assert not result.safe
-        assert result.check_id == CheckID.BRACE_EXPANSION
+        """Task 3121 (sandbox-13) allows ``echo {a,b,c}`` - an argument list
+        for a command that does not execute its arguments. Brace lists that
+        build a command word or flags still block."""
+        assert check_bash_command("echo {a,b,c}").safe
+        for command in ("{echo,hi}", "ls {-la,/}", "xargs {rm,x}"):
+            result = check_bash_command(command)
+            assert not result.safe, command
+            assert result.check_id == CheckID.BRACE_EXPANSION, command
 
     def test_range_brace(self) -> None:
         result = check_bash_command("echo {1..10}")
