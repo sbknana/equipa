@@ -180,9 +180,9 @@ def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
 
     Security flags in FAIL_CLOSED_FEATURE_FLAGS resolve to True when the
     dispatch config could not be read (load_dispatch_config marks it with
-    CONFIG_LOAD_ERROR_KEY), when "features" is not an object, or when their
-    value is invalid: a config problem must never switch a gate off
-    silently, so an ERROR is logged and the gate stays on.
+    CONFIG_LOAD_ERROR_KEY), when dispatch_config itself or "features" is not
+    an object, or when their value is invalid: a config problem must never
+    switch a gate off silently, so an ERROR is logged and the gate stays on.
 
     Returns True/False. Unknown features default to False.
     """
@@ -190,11 +190,14 @@ def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
     if dispatch_config is None:
         return default
     if not isinstance(dispatch_config, dict):
-        logger.warning(
-            "dispatch_config is %s, not a dict; feature %r uses default %s",
-            type(dispatch_config).__name__, feature_name, default,
+        # IND3128-05: the same fail-closed rule as every other malformed
+        # shape - a security gate stays ON, other flags use their default.
+        return _invalid_flag_fallback(
+            feature_name,
+            f"dispatch_config is {type(dispatch_config).__name__}, not a dict "
+            f"(feature {feature_name!r})",
+            default,
         )
-        return default
 
     load_error = dispatch_config.get(CONFIG_LOAD_ERROR_KEY)
     if load_error and feature_name in FAIL_CLOSED_FEATURE_FLAGS:
