@@ -171,6 +171,83 @@ def test_standalone_marker_comments_still_parse_once(monkeypatch):
     assert len(calls) == 1
 
 
+# --- N2: shapes a CommonMark renderer shows as text -------------------------------
+
+@pytest.mark.parametrize("body", [
+    # (a) backtick runs of different lengths do not pair.
+    ["SQL injection in login `` ` `` severity: HIGH `x`"],
+    ["`` ` `` HIGH: SQL injection in login `x`"],
+    # (b) a code span that closes on the next line.
+    ["SQL injection in login `x", "y` severity: HIGH `z`"],
+    ["See `x", "y` and then:", "HIGH: SQL injection `a` in `b`"],
+    # (c) a backtick in the info string: not a fence.
+    ["```x`y", "HIGH: SQL injection", "```"],
+    # A tab-indented "fence" is indented code, not a fence.
+    ["", "\t```", "", "HIGH: SQL injection", "```"],
+    # (d) a list item's paragraph indented 4 spaces after a blank line.
+    ["- Finding 1", "", "    HIGH: SQL injection"],
+    ["1. Finding 1", "", "    HIGH: SQL injection"],
+    ["- Findings", "  - Finding 1", "", "      HIGH: SQL injection"],
+    # (e) five and more nested blockquotes.
+    ["> > > > > HIGH: SQL injection"],
+    [">>>>>> - SQL injection (HIGH)"],
+    # (f) footnote definitions.
+    ["See the note.[^1]", "", "[^1]: HIGH: SQL injection"],
+    ["[^note]: - SQL injection in login - HIGH"],
+    ["[^rce]: CRITICAL - RCE in upload"],
+    # (g) combining marks, typed, as a reference, and precomposed.
+    ["H̲IGH: SQL injection"],
+    ["H&#818;IGH: SQL injection"],
+    ["H\N{LATIN CAPITAL LETTER I WITH ACUTE}GH: SQL injection"],
+    # Same family: an escaped backtick, a table cell, an HTML block.
+    ["SQL injection in login \\` severity: HIGH `x`"],
+    ["| ID | Severity | Note |", "|---|---|---|", "| S1 | `x | HIGH | y` |"],
+    ["<div>", "SQL injection ` severity: HIGH ` in login", "</div>"],
+])
+def test_markdown_the_renderer_shows_as_text_fails_closed(body):
+    severity = "CRITICAL" if any("CRITICAL" in line for line in body) else "HIGH"
+    assert_blocks_behind_zero_footer(body, severity)
+
+
+@pytest.mark.parametrize("body", [
+    ["Example: `HIGH: x` is the format."],
+    ["```markdown", "HIGH: example finding", "```"],
+    ["````", "HIGH: example finding", "```", "still code", "````"],
+    ["~~~", "HIGH: example finding", "~~~"],
+    ["- Example:", "", "  ```", "  HIGH: example finding", "  ```"],
+    ["- Example output:", "", "      HIGH: example finding"],
+    ["Example output:", "", "        log.info('HIGH:   ' + message)"],
+    ["- Finding context", "", "    The endpoint is internal."],
+    ["- - Coverage of the parser is high."],
+    ["> > > > > The fix is sound."],
+    ["See the advisory.[^1]", "", "[^1]: Upstream advisory, fixed in 2.1."],
+    ["Café menu parsing is unchanged."],
+    ["A `<!--` quoted in code opens nothing.", "Plain prose.",
+     "A `-->` quoted in code closes nothing."],
+])
+def test_markdown_the_renderer_hides_or_shows_as_prose_merges(body):
+    assert_prose_merges(body)
+
+
+def test_rendered_view_counts_a_nested_finding_once():
+    analysis = analyze(review("No findings.", ["- 1. HIGH: SQL injection"],
+                              ZERO, low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert analysis.detail.endswith("HIGH=1"), analysis.detail
+
+
+def test_honest_review_of_the_new_shapes_merges():
+    """A review that writes these shapes and counts them in its footer is
+    trusted, with the counts it states."""
+    body = ["### [S1] HIGH \N{EM DASH} SQL injection in login", "Details.", "",
+            "- Finding 1", "", "    HIGH: SQL injection in login",
+            "", "[^1]: HIGH: SQL injection in login"]
+    footer = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+    analysis = analyze(review("1 finding.", body, footer, low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.counts["HIGH"] == 1
+
+
 # --- N3: line-break floods --------------------------------------------------------
 
 REVIEW_BYTES = 200 * 1024
@@ -187,6 +264,54 @@ def test_200kb_of_line_breaks_parses_in_half_a_second(line_break):
     elapsed = time.perf_counter() - started
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
+
+
+def _padded_lines(line: str) -> list[str]:
+    return [line] * (REVIEW_BYTES // (len(line) + 1) + 1)
+
+
+# Adversarial bodies for every pass and rule task 3137 added. Each is parsed
+# as written and as rendered, so each must stay well inside the budget.
+ADVERSARIAL_BODIES = {
+    "backtick-lines": _padded_lines("`"),
+    "backtick-pairs": ["` " * (REVIEW_BYTES // 2)],
+    "backtick-run-lengths": [" ".join("`" * length for length in range(1, 640))],
+    "unclosed-double-runs": ["`` x " * (REVIEW_BYTES // 5)],
+    "escaped-backticks": ["\\`" * (REVIEW_BYTES // 2)],
+    "backslash-runs": ["\\" * REVIEW_BYTES + "`"],
+    "fence-with-backtick-info": _padded_lines("```x`y"),
+    "fence-pairs": _padded_lines("```"),
+    "unclosed-tilde-fences": _padded_lines("~~~ x"),
+    "comment-lines": _padded_lines("<!--"),
+    "midline-comment-openers": _padded_lines("x <!-- y"),
+    "comment-in-code": _padded_lines("`<!--` x `-->`"),
+    "nested-markers": ["- " * (REVIEW_BYTES // 2) + "HIGH: x"],
+    "nested-marker-lines": _padded_lines("- 1. > - x"),
+    "deep-blockquotes": [">" * REVIEW_BYTES + " HIGH: x"],
+    "list-continuations": ["- a", ""] + _padded_lines("    b"),
+    "list-items-and-paragraphs": _padded_lines("- a\n\n    b"),
+    "deep-list-nesting": ["  " * depth + "- x" for depth in range(300)] * 3,
+    "footnote-lines": _padded_lines("[^1]: x"),
+    "table-code-cells": ["| a | b |", "|---|---|"]
+    + _padded_lines("| `x | y` | \\| z |"),
+    "html-block-lines": ["<div>"] + _padded_lines("`x` HIGHx"),
+    "combining-marks": ["H̲" * (REVIEW_BYTES // 3)],
+    "accented-letters": ["\N{LATIN CAPITAL LETTER I WITH ACUTE}" * (REVIEW_BYTES // 2)],
+    "severity-clause-runs": [", severity " * (REVIEW_BYTES // 11)],
+    "title-lead-in-lines": _padded_lines("HIGH HIGH HIGH HIGH Hx"),
+    "marker-comment-splits": ["HI<!-- EQUIPA-X -->" * (REVIEW_BYTES // 19)],
+}
+
+
+@pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
+def test_200kb_adversarial_review_parses_under_one_second(name):
+    text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
+                  low_heading=False)
+    assert len(text.encode()) >= REVIEW_BYTES
+    started = time.perf_counter()
+    analyze(text)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
 
 
 @pytest.mark.parametrize("gap", [3, 40, 5000])

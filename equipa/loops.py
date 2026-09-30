@@ -18,6 +18,7 @@ import re
 import subprocess
 import time
 import unicodedata
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1511,12 +1512,13 @@ def _review_summary_text(text: str) -> str:
     collected: list[str] = []
     in_summary_section = False
     for line in text.splitlines():
-        heading = _SUMMARY_HEADING_RE.match(line)
+        # Both heading rules need a "#" first (task 3137: skip them otherwise).
+        heading = _SUMMARY_HEADING_RE.match(line) if line[:1] == "#" else None
         if heading is not None:
             in_summary_section = True
             collected.append(heading.group(1))
             continue
-        if _MARKDOWN_HEADING_RE.match(line):
+        if line[:1] == "#" and _MARKDOWN_HEADING_RE.match(line):
             in_summary_section = False
             continue
         if in_summary_section:
@@ -1535,6 +1537,8 @@ def _blank_code(text: str) -> str:
     the review's own structure. An unterminated fence blanks nothing after
     it, so a stray fence can never hide a footer or finding (fail closed).
     """
+    if "`" not in text and "~~~" not in text:
+        return text  # no fence and no inline code (task 3137: skip the loop)
     lines = text.split("\n")
     visible: list[str] = []
     fence: str | None = None
@@ -1545,8 +1549,10 @@ def _blank_code(text: str) -> str:
             if opener is not None:
                 fence, fence_start = opener.group(1)[0], index
                 visible.append("")
-            else:
+            elif "`" in line:
                 visible.append(_INLINE_CODE_RE.sub("", line))
+            else:
+                visible.append(line)
         else:
             if opener is not None and opener.group(1)[0] == fence:
                 fence = None
@@ -1762,6 +1768,30 @@ _TASK_3122_LINE_RULES = (
 )
 
 
+# Task 3137 (N3): a line that holds a severity word in any case. Every rule
+# _shape_candidates runs over lines (all but the table scan) is confined to
+# one line and captures a severity word, so a line without one matches none
+# of them. The rules scan only these lines, each mapped back to its number,
+# so a 200 KB review of ordinary lines costs them little, even parsed as
+# written and as rendered.
+_SEVERITY_WORD_LINE_RE = re.compile(
+    r"^[^\n]*?(?i:critical|high|medium|low|info)[^\n]*", re.MULTILINE,
+)
+
+
+def _severity_word_lines(text: str) -> tuple[str, list[int]]:
+    """The lines of ``text`` that hold a severity word, and their numbers."""
+    kept: list[str] = []
+    numbers: list[int] = []
+    line_number = counted_to = 0
+    for match in _SEVERITY_WORD_LINE_RE.finditer(text):
+        line_number += text.count("\n", counted_to, match.start())
+        counted_to = match.start()
+        kept.append(match.group(0))
+        numbers.append(line_number)
+    return "\n".join(kept), numbers
+
+
 def _line_number_finder(text: str) -> Callable[[int], int]:
     """Return a function mapping an offset in ``text`` to its 0-based line."""
     newline_offsets = [match.start() for match in _NEWLINE_RE.finditer(text)]
@@ -1778,8 +1808,18 @@ def _shape_candidates(
     nor _FINDING_CANDIDATE_RE (counted by the caller) saw it, so one finding
     is counted once and a mismatch detail still reads "HIGH=1". ``seen``
     receives every (line, severity) pair this scan or the candidate regex saw.
+
+    Task 3137 (N3): the line rules scan a copy of ``text`` without the lines
+    that hold no severity word (see _LINE_WITHOUT_SEVERITY_RE); the table
+    scan reads every row, since a tally header's counts sit on other rows.
     """
-    line_of = _line_number_finder(text)
+    table_found = _table_candidate_severities(text)
+    text, line_numbers = _severity_word_lines(text)
+    scan_line_of = _line_number_finder(text)
+
+    def line_of(offset: int) -> int:
+        return line_numbers[scan_line_of(offset)]
+
     found = [
         (line_of(match.start()), _matched_severity(match))
         for regex in (_SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE)
@@ -1790,7 +1830,7 @@ def _shape_candidates(
         if _FINDING_CANDIDATE_RE.match(text, line_start):
             continue  # already counted as a bold lead-in candidate
         found.append((line_of(match.start()), match.group(1).upper()))
-    found.extend(_table_candidate_severities(text))
+    found.extend(table_found)
     seen.update(found)
     seen.update(
         (line_of(match.start()), match.group(1).upper())
@@ -2014,71 +2054,394 @@ def _carry_line_breaks(segment: str, carried: int) -> tuple[str, int]:
     return segment[:newline] + "\n" * carried + segment[newline:], 0
 
 
-def _mask_code(text: str) -> str:
-    """``text`` with code blanked to spaces, keeping every offset.
+# --- Task 3137 (N2): block and inline structure of the rendered view ---------
+#
+# _blank_code and the line rules read Markdown more loosely than a CommonMark
+# renderer, and in these shapes the loose reading HID a finding the renderer
+# shows: "SQLi `` ` `` severity: HIGH `x`" (backtick runs of different
+# lengths do not pair), a code span that closes on the next line (that
+# line's own backticks were paired instead), "```x`y" (not a fence: its info
+# string holds a backtick), "- Finding 1" / "" / "    HIGH: SQLi" (a
+# paragraph of the list item, not indented code), "> > > > > HIGH:" (five
+# nested quotes) and "[^1]: HIGH:" (a footnote). The rendered view is rebuilt
+# the way a renderer reads it: block structure first, then code spans and
+# comments inside each block, left to right. Where this reading is unsure it
+# shows the text (fail closed). Only the rendered view is built this way; the
+# text as written keeps _blank_code and the stricter view wins, so none of
+# this can loosen the gate.
 
-    The same code as :func:`_blank_code` (fenced blocks, inline spans, and
-    nothing after an unterminated fence), but each masked character becomes
-    a space, so an offset found in the mask is an offset in ``text``.
+# A footnote definition's label: "[^1]: HIGH: SQLi" renders "HIGH: SQLi".
+_FOOTNOTE_DEFINITION_RE = re.compile(r"\[\^[^\]\s]{1,100}\]:[ \t]*")
+# What may start a block, read after a line's indentation. Any other line
+# continues an open paragraph, whatever its indentation.
+_BLOCK_START_RE = re.compile(
+    r"#{1,6}(?:[ \t]|$)|>|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|`{3,}|~{3,}|<",
+)
+_HEADING_START_RE = re.compile(r"#{1,6}(?:[ \t]|$)")
+# A fence opener after the indentation: three or more backticks whose info
+# string holds no backtick ("```x`y" is text), or three or more tildes.
+_FENCE_OPENER_RE = re.compile(r"(`{3,})[^`]*$|(~{3,})")
+# An HTML block that runs to the next blank line. A renderer passes its text
+# through as HTML, so a backtick in it is not code.
+_HTML_BLOCK_START_RE = re.compile(
+    r"</?(?:address|article|aside|blockquote|body|caption|center|col"
+    r"|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure"
+    r"|footer|form|h[1-6]|header|hr|html|iframe|legend|li|main|menu|nav|ol"
+    r"|p|pre|script|section|style|summary|table|tbody|td|textarea|tfoot|th"
+    r"|thead|tr|ul)(?:[ \t>]|/>|$)",
+    re.IGNORECASE,
+)
+_TABLE_DELIMITER_ROW_RE = re.compile(
+    r"[ \t]{0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*",
+)
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_INLINE_OPENER_RE = re.compile(r"`+|<!--")
+# A line the per-line _blank_code would take for a fence. In the rendered
+# text every real fence is already blanked, so what is left is text.
+_TILDE_FENCE_LINE_RE = re.compile(r"^([ \t]{0,3})(~{3,})", re.MULTILINE)
+# A backtick or fence character a renderer shows as text. Nothing pairs it.
+_LITERAL_CODE_MARK = _UNSAFE_REFERENCE_CHAR
+
+
+@dataclass
+class _RenderedBlocks:
+    """The block structure :func:`_rendered_blocks` found (task 3137)."""
+
+    lines: list[str]
+    # Opener line -> closer line of every fenced block that is closed.
+    fences: dict[int, int] = field(default_factory=dict)
+    # Lines that open a block: a code span never runs into one of them.
+    breaks: set[int] = field(default_factory=set)
+    table_rows: set[int] = field(default_factory=set)
+
+
+def _closes_fence(stripped: str, fence: str) -> bool:
+    """True when ``stripped`` (a line after its indentation) closes ``fence``."""
+    run = len(stripped) - len(stripped.lstrip(fence[0]))
+    return run >= len(fence) and not stripped[run:].strip(" \t")
+
+
+def _comment_end(text: str, start: int, limit: int) -> int:
+    """Offset just past the HTML comment that opens at ``start``, or -1.
+
+    "<!-->" and "<!--->" are empty comments; any other comment ends at the
+    first "-->" before ``limit``.
     """
-    lines = text.split("\n")
-    masked: list[str] = []
-    fence: str | None = None
-    fence_start = 0
+    if text.startswith("<!-->", start):
+        return start + 5
+    if text.startswith("<!--->", start):
+        return start + 6
+    close = text.find("-->", start + 4, limit)
+    return -1 if close == -1 else close + 3
+
+
+def _neutralize_backticks(line: str) -> str:
+    """``line`` with every backtick shown as text."""
+    return line.replace("`", _LITERAL_CODE_MARK)
+
+
+def _neutralize_fence(line: str) -> str:
+    """An unclosed fence opener (the line starts with its run) as text."""
+    run = len(line) - len(line.lstrip(line[:1]))
+    return _LITERAL_CODE_MARK * run + _neutralize_backticks(line[run:])
+
+
+def _rendered_blocks(text: str) -> _RenderedBlocks:
+    """Block structure of the review as a CommonMark renderer builds it.
+
+    Every line keeps its number. Nested container markers keep only the
+    innermost one (_innermost_container_line). A line inside a list item is
+    re-indented relative to the item's content column, so a paragraph that
+    continues the item after a blank line is text, not indented code. A
+    footnote definition loses its label. Backticks in indented code, in an
+    HTML block and on the line an HTML comment block closes on are text.
+    Closed fences, the lines that open blocks and table rows are recorded for
+    :func:`_render_code_and_comments`. A fence that never closes (or whose
+    list item ends first) hides nothing, as in _blank_code (fail closed): its
+    opener is shown as text. Paragraph continuation lines are left alone.
+    Linear: one pass, each list item is pushed and popped once, and a failed
+    search for "-->" is never repeated.
+    """
+    blocks = _RenderedBlocks(lines=text.split("\n"))
+    lines = blocks.lines
+    item_columns: list[int] = []  # content column of each open list item
+    fence = ""  # the run that opened the open fence
+    fence_start = fence_column = 0
+    in_paragraph = in_html_block = in_table = False
+    comment_end = 0  # offset where the open HTML comment block ends
+    no_comment_end_from = len(text) + 1  # no "-->" at or after this offset
+    next_line_start = 0
     for index, line in enumerate(lines):
-        opener = _CODE_FENCE_RE.match(line)
-        if fence is None and opener is None:
-            masked.append(_INLINE_CODE_RE.sub(
-                lambda span: " " * len(span.group(0)), line,
-            ))
-            continue
-        if fence is None:
-            fence, fence_start = opener.group(1)[0], index
-        elif opener is not None and opener.group(1)[0] == fence:
-            fence = None
-        masked.append(" " * len(line))
-    if fence is not None:
-        masked[fence_start:] = lines[fence_start:]
-    return "\n".join(masked)
-
-
-def _strip_html_comments(text: str) -> str:
-    """Remove HTML comments the way a renderer hides them (task 3130).
-
-    A comment is removed with no replacement, so the word it split is joined
-    ("HI<!-- x -->GH" reads HIGH); the line breaks it spanned are re-inserted
-    at the end of the line it closed on, so every later line keeps its
-    number. "<!-->" and "<!--->" are empty comments. Code is not HTML: a
-    "<!--" quoted in a code span opens nothing (a real review quoted one, and
-    a "-->" in another span 30 lines later hid two finding headings). An
-    unterminated comment is left in place, so its text stays visible. Linear:
-    every search starts where the previous one ended.
-    """
-    if "<!--" not in text:
-        return text
-    masked = _mask_code(text)
-    pieces: list[str] = []
-    carried_breaks = 0
-    position = 0
-    while (start := masked.find("<!--", position)) != -1:
-        if masked.startswith("<!-->", start):
-            body_end, end = start + 4, start + 5
-        elif masked.startswith("<!--->", start):
-            body_end, end = start + 4, start + 6
-        else:
-            body_end = masked.find("-->", start + 4)
-            if body_end == -1:
-                break
-            end = body_end + 3
-        segment, carried_breaks = _carry_line_breaks(
-            text[position:start], carried_breaks,
+        line_start, next_line_start = (
+            next_line_start, next_line_start + len(line) + 1,
         )
+        if line_start < comment_end:
+            continue  # inside an HTML comment block
+        stripped = line.lstrip(" \t")
+        if not stripped:
+            in_paragraph = in_html_block = in_table = False
+            continue
+        indent = len(line) - len(stripped)
+        if indent and "\t" in line[:indent]:
+            indent = len(line[:indent].expandtabs(4))
+        if fence:
+            if indent >= fence_column:
+                if (indent - fence_column <= 3
+                        and _closes_fence(stripped, fence)):
+                    blocks.fences[fence_start] = index
+                    fence = ""
+                continue
+            # The list item holding the fence ended before the fence closed.
+            lines[fence_start] = _neutralize_fence(lines[fence_start])
+            fence = ""
+        if in_html_block:
+            if "`" in line:
+                lines[index] = _neutralize_backticks(line)
+            continue
+        base = item_columns[-1] if item_columns else 0
+        opens_block = (
+            (in_paragraph or in_table) and indent - base <= 3
+            and _BLOCK_START_RE.match(stripped) is not None
+        )
+        if in_table and not opens_block:
+            blocks.table_rows.add(index)
+            blocks.breaks.add(index)
+            continue
+        in_table = False
+        if in_paragraph and not opens_block and not (
+            stripped[0] in "=-" and _SETEXT_UNDERLINE_RE.fullmatch(line)
+        ):
+            continue  # a continuation line of the paragraph above
+        blocks.breaks.add(index)
+        while item_columns and indent < item_columns[-1]:
+            item_columns.pop()
+        base = item_columns[-1] if item_columns else 0
+        relative = indent - base
+        in_paragraph = False
+        if relative >= 4:
+            if "`" in line:
+                lines[index] = _neutralize_backticks(line)  # indented code
+            continue
+        if stripped.startswith("<!--"):
+            opener = line_start + len(line) - len(stripped)
+            end = -1
+            if opener + 4 < no_comment_end_from:
+                end = _comment_end(text, opener, len(text))
+                if end == -1:
+                    no_comment_end_from = opener + 4
+            if end != -1:
+                comment_end = end
+                closing = index + text.count("\n", opener, end)
+                # The rest of the closing line is HTML, not Markdown.
+                lines[closing] = _neutralize_backticks(lines[closing])
+                blocks.breaks.add(closing + 1)
+                continue
+        if stripped[0] == "<" and _HTML_BLOCK_START_RE.match(stripped):
+            in_html_block = True
+            if "`" in line:
+                lines[index] = _neutralize_backticks(line)
+            continue
+        if (index + 1 < len(lines) and "|" in stripped
+                and not _CONTAINER_MARKER_RE.match(stripped)
+                and "|" in lines[index + 1]
+                and _TABLE_DELIMITER_ROW_RE.fullmatch(lines[index + 1])):
+            in_table = True
+            blocks.table_rows.add(index)
+            continue
+        content = stripped
+        footnote = None
+        if content.startswith("[^"):
+            footnote = _FOOTNOTE_DEFINITION_RE.match(content)
+            if footnote is not None:
+                content = content[footnote.end():]
+        position = markers = 0
+        quoted = False
+        while (marker := _CONTAINER_MARKER_RE.match(content, position)) is not None:
+            position = marker.end()
+            markers += 1
+            if marker.group(0).startswith(">"):
+                quoted = True
+            elif not quoted and footnote is None:
+                item_columns.append(base + relative + position)
+        rest = content[position:]
+        opener = (_FENCE_OPENER_RE.match(rest)
+                  if not quoted and rest[:1] in ("`", "~") else None)
+        if opener is not None:
+            fence = opener.group(1) or opener.group(2)
+            fence_start = index
+            fence_column = base + relative + position if position else base
+            lines[index] = rest
+            continue
+        in_paragraph = bool(rest.strip()) and not (
+            (rest[0] == "#" and _HEADING_START_RE.match(rest))
+            or (content[0] in "-*_=" and (
+                _THEMATIC_BREAK_RE.fullmatch(content)
+                or _SETEXT_UNDERLINE_RE.fullmatch(content)))
+        )
+        if base or footnote is not None:
+            lines[index] = " " * relative + (
+                _innermost_container_line(content) if markers > 1 else content
+            )
+        elif markers > 1:
+            lines[index] = _innermost_container_line(line)
+    if fence:
+        lines[fence_start] = _neutralize_fence(lines[fence_start])
+    return blocks
+
+
+def _is_escaped(text: str, offset: int, floor: int) -> bool:
+    """True when an odd run of backslashes ends at ``offset``."""
+    run_start = offset
+    while run_start > floor and text[run_start - 1] == "\\":
+        run_start -= 1
+    return (offset - run_start) % 2 == 1
+
+
+def _unescaped_pipes(text: str, start: int, end: int) -> list[int]:
+    """Offsets of the cell separators of the table row ``text[start:end]``."""
+    pipes: list[int] = []
+    at = text.find("|", start, end)
+    while at != -1:
+        if at == start or text[at - 1] != "\\":
+            pipes.append(at)
+        at = text.find("|", at + 1, end)
+    return pipes
+
+
+def _neutralize_tilde_fence(match: re.Match[str]) -> str:
+    return match.group(1) + _LITERAL_CODE_MARK * len(match.group(2))
+
+
+def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
+    """The review with code and HTML comments removed as a renderer hides them.
+
+    Closed fenced blocks are blanked. Everything else is read left to right
+    (tasks 3130 and 3137), and whichever construct opens first wins, so a
+    "<!--" inside code opens nothing (a real review quoted one, and a "-->"
+    in another span 30 lines later hid two finding headings) and a backtick
+    inside a comment opens nothing:
+
+    * a backtick run opens a code span that closes at the next run of the
+      SAME length inside its block (a paragraph, a heading, a table cell). The
+      span is removed, keeping its line breaks. A run with no closer, or
+      escaped by a backslash, is text;
+    * an HTML comment is removed with no replacement, so the word it split is
+      joined ("HI<!-- x -->GH" reads HIGH), and its line breaks are carried
+      to the end of the line it closed on, so every later line keeps its
+      number. A comment that opens a line may run across blank lines (an
+      HTML block); any other must close inside its run of non-blank lines.
+      "<!-->" and "<!--->" are empty. An unclosed comment stays, visible.
+
+    Every backtick left is shown as text, and so is a tilde fence line, so
+    _blank_code finds no code in the result. Linear: every backtick run is a
+    closer candidate once, and a failed "-->" search is never repeated.
+    """
+    lines = blocks.lines
+    for opener_line, closer_line in blocks.fences.items():
+        for index in range(opener_line, closer_line + 1):
+            lines[index] = " " * len(lines[index])
+    text = "\n".join(lines)
+    if "`" not in text and "<!--" not in text:
+        return _TILDE_FENCE_LINE_RE.sub(_neutralize_tilde_fence, text)
+
+    line_starts: list[int] = []
+    offset = 0
+    for line in lines:
+        line_starts.append(offset)
+        offset += len(line) + 1
+    # Per line: where its code-span block ends, and where its run of
+    # non-blank lines ends (the reach of a comment that opens mid-line).
+    span_limits = [0] * len(lines)
+    comment_limits = [0] * len(lines)
+    blank = [not line.strip() for line in lines] + [True]
+    span_end = run_end = 0
+    for index in range(len(lines) - 1, -1, -1):
+        if blank[index]:
+            continue
+        line_end = line_starts[index] + len(lines[index])
+        following = index + 1
+        if blank[following]:
+            span_end = run_end = line_end
+        elif following in blocks.breaks or index in blocks.table_rows:
+            span_end = line_end
+        span_limits[index] = span_end
+        comment_limits[index] = run_end
+
+    closers_by_length: dict[int, deque[int]] = {}
+    for run in _BACKTICK_RUN_RE.finditer(text):
+        closers_by_length.setdefault(run.end() - run.start(), deque()).append(
+            run.start(),
+        )
+    cell_pipes: dict[int, list[int]] = {}
+    pieces: list[str] = []
+    carried = 0
+    position = 0
+    failed_limit = failed_from = -1  # a "-->" search that found nothing
+
+    def emit(segment: str) -> None:
+        nonlocal carried
+        if carried:
+            segment, carried = _carry_line_breaks(segment, carried)
         pieces.append(segment)
-        carried_breaks += text.count("\n", start, end)
-        position = end
-    rest, carried_breaks = _carry_line_breaks(text[position:], carried_breaks)
-    pieces.append(rest + "\n" * carried_breaks)
-    return "".join(pieces)
+
+    while (token := _INLINE_OPENER_RE.search(text, position)) is not None:
+        start = token.start()
+        line = bisect.bisect_right(line_starts, start) - 1
+        line_start = line_starts[line]
+        if line in blocks.table_rows:
+            line_end = line_start + len(lines[line])
+            pipes = cell_pipes.setdefault(
+                line, _unescaped_pipes(text, line_start, line_end),
+            )
+            next_pipe = bisect.bisect_right(pipes, start)
+            span_limit = comment_limit = (
+                pipes[next_pipe] if next_pipe < len(pipes) else line_end
+            )
+        else:
+            span_limit, comment_limit = span_limits[line], comment_limits[line]
+        escaped = (start > line_start and text[start - 1] == "\\"
+                   and _is_escaped(text, start, line_start))
+        if token.group(0) == "<!--":
+            if not escaped and line not in blocks.table_rows and not (
+                text[line_start:start].strip(" \t")
+            ):
+                comment_limit = len(text)  # an HTML comment block
+            end = -1
+            if not escaped and not (
+                comment_limit == failed_limit and start + 4 >= failed_from
+            ):
+                end = _comment_end(text, start, comment_limit)
+                if end == -1:
+                    failed_limit, failed_from = comment_limit, start + 4
+            if end == -1:
+                emit(text[position:start + 4])
+                position = start + 4
+                continue
+            emit(text[position:start])
+            carried += text.count("\n", start, end)
+            position = end
+            continue
+        emit(text[position:start])
+        opener_start, opener_length = start, token.end() - start
+        if escaped:
+            emit(_LITERAL_CODE_MARK)  # "\`" is a backtick shown as text
+            opener_start, opener_length = start + 1, opener_length - 1
+        closer = -1
+        closers = closers_by_length.get(opener_length)
+        if opener_length and closers:
+            while closers and closers[0] <= start:
+                closers.popleft()
+            if closers and closers[0] < span_limit:
+                closer = closers.popleft()
+        if closer == -1:
+            emit(_LITERAL_CODE_MARK * opener_length)
+            position = token.end()
+            continue
+        emit("\n" * text.count("\n", opener_start, closer))
+        position = closer + opener_length
+    emit(text[position:])
+    pieces.append("\n" * carried)
+    return _TILDE_FENCE_LINE_RE.sub(_neutralize_tilde_fence, "".join(pieces))
 
 
 def _decode_character_reference(match: re.Match[str]) -> str:
@@ -2092,6 +2455,10 @@ def _decode_character_reference(match: re.Match[str]) -> str:
     decoded = normalize_review_text(decoded)
     if not decoded:
         return ""
+    # Task 3137 (N2): a combining mark ("H&#818;IGH") draws on the letter
+    # before it, so it joins the word like an invisible character.
+    if all(unicodedata.category(char) == "Mn" for char in decoded):
+        return ""
     if all(char.isalnum() or char in _SAFE_REFERENCE_PUNCTUATION
            for char in decoded):
         return decoded
@@ -2101,15 +2468,37 @@ def _decode_character_reference(match: re.Match[str]) -> str:
     return _UNSAFE_REFERENCE_CHAR
 
 
-def _rendered_review_text(text: str) -> str:
-    """The review as a renderer shows it: comments removed, character
-    references decoded, lookalike letters folded, "*" emphasis inside a word
-    removed, blank runs collapsed.
+# Task 3137 (N2): "H̲IGH" (H with a combining low line) and "HÍGH" render
+# as HIGH with a mark on a letter. Marks (Unicode category Mn) are dropped
+# after canonical decomposition, so the letters under them are read. Only
+# non-ASCII runs are touched.
+_NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f]+")
 
-    ``text`` is already normalised (normalize_review_text). Comments go
-    first, so a decoded "&lt;!--" never opens one.
+
+def _without_combining_marks(run: re.Match[str]) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFD", run.group(0))
+        if unicodedata.category(char) != "Mn"
+    )
+
+
+def _strip_combining_marks(text: str) -> str:
+    """``text`` without combining marks (task 3137, N2)."""
+    if text.isascii():
+        return text
+    return _NON_ASCII_RUN_RE.sub(_without_combining_marks, text)
+
+
+def _rendered_review_text(text: str) -> str:
+    """The review as a renderer shows it: block structure resolved, code and
+    comments removed, character references decoded, combining marks dropped,
+    lookalike letters folded, "*" emphasis inside a word removed, blank runs
+    collapsed.
+
+    ``text`` is already normalised (normalize_review_text). Code and comments
+    go first, so a decoded "&lt;!--" or "&#96;" never opens one.
     """
-    text = _strip_html_comments(text)
+    text = _render_code_and_comments(_rendered_blocks(text))
     if "&" in text:
         # A raw NUL renders as U+FFFD; it must not pass for a decoded blank.
         text = text.replace(_REFERENCE_BLANK, _UNSAFE_REFERENCE_CHAR)
@@ -2121,6 +2510,7 @@ def _rendered_review_text(text: str) -> str:
             text = text.replace(_REFERENCE_BLANK, " ")
         # A decoded reference may itself be fullwidth or invisible.
         text = normalize_review_text(text)
+    text = _strip_combining_marks(text)
     text = text.translate(_CONFUSABLE_LETTERS)
     text = _INTRAWORD_EMPHASIS_RE.sub("", text)
     return _INTERIOR_BLANK_RUN_RE.sub(" ", text)
