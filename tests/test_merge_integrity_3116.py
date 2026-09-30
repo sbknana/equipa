@@ -93,10 +93,6 @@ def _files_on(repo: Path, ref: str) -> set[str]:
     return set(_git(repo, "ls-tree", "-r", "--name-only", ref).splitlines())
 
 
-def _show(repo: Path, ref: str, path: str) -> str:
-    return _git(repo, "show", f"{ref}:{path}")
-
-
 def _add_task_worktree(repo: Path) -> Path:
     worktree = repo / ".forge-worktrees" / f"task-{TASK}"
     _git(repo, "worktree", "add", "-q", "-b", BRANCH, str(worktree), "main")
@@ -487,6 +483,27 @@ def test_serialize_git_config_round_trips_awkward_values(tmp_path):
     listed = _git(tmp_path, "config", "--file", str(path), "--list", "-z")
 
     assert parse_config_list_z(listed + "\0") == entries
+
+
+def test_cli_pins_the_global_config_before_any_mode_runs(isolated_home, monkeypatch):
+    """Every mode (not only the merge-capable ones) starts with the pin in
+    place, so orchestrator git never reads a global config an agent edited."""
+    (isolated_home / ".gitconfig").write_text("[user]\n\tname = Operator\n",
+                                              encoding="utf-8")
+    pins_seen = []
+
+    async def handler(_args):
+        pins_seen.append(global_git_config_pin())
+
+    monkeypatch.setattr(cli, "_select_mode_handler", lambda _args: handler)
+    monkeypatch.setattr(cli, "load_dispatch_config", lambda _path: {})
+    monkeypatch.setattr(cli, "set_active_dispatch_config", lambda _config: None)
+    monkeypatch.setattr("sys.argv", ["forge_orchestrator.py", "--task", "1", "--yes"])
+
+    asyncio.run(cli.async_main())
+
+    assert len(pins_seen) == 1 and pins_seen[0] is not None
+    assert pins_seen[0].entries == 1
 
 
 # --- MI-02: the merge commit's tree -------------------------------------------

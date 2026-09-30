@@ -38,7 +38,11 @@ from equipa.agent_runner import (
 )
 from equipa.checkpoints import load_checkpoint
 from equipa.db import log_gate_audit, record_agent_run, update_task_status
-from equipa.git_ops import _is_git_repo
+from equipa.git_ops import (
+    GlobalConfigPinError,
+    _is_git_repo,
+    pin_global_git_config,
+)
 from equipa.merge_integrity import (
     DefaultBranchGuard,
     MergeIntegrityError,
@@ -2109,6 +2113,19 @@ async def async_main() -> None:
                 "        ANTHROPIC_API_KEY=sk-ant-...\n"
                 "    - Or export it in /etc/environment for system-wide access."
             )
+
+    # MI-04 (task #3116): pin the global git config before any mode can
+    # dispatch an agent. Agents share the operator's UID and HOME, so every
+    # orchestrator git call in this process must read the config as it was
+    # before they ran. Not fatal here: the pre-dispatch merge guard retries
+    # the pin and refuses to merge if it still fails.
+    try:
+        pin_global_git_config()
+    except GlobalConfigPinError as exc:
+        print(
+            f"WARNING: the global git config could not be pinned ({exc}); "
+            f"gated merges will be refused unless the pin succeeds later."
+        )
 
     # Dispatch to the selected mode handler.
     handler = _select_mode_handler(args)
