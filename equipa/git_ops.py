@@ -9,13 +9,18 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import asyncio
+import atexit
+import hashlib
 import logging
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -471,9 +476,14 @@ GIT_HARDENING_ARGS: tuple[str, ...] = (
     ),
 )
 
-GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType(
-    {"GIT_NO_REPLACE_OBJECTS": "1"}
-)
+# GIT_CONFIG_NOSYSTEM / GIT_ATTR_NOSYSTEM (task #3116, MI-04): the system
+# config and attributes files are skipped; the global config is replaced by
+# the orchestrator's pre-dispatch snapshot (see pin_global_git_config).
+GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType({
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_ATTR_NOSYSTEM": "1",
+})
 
 # diff.external cannot be cleared with -c: git runs an empty value as a
 # command and every patch diff dies. Diff drivers are switched off per
@@ -515,6 +525,9 @@ def _hardened_git_env(extra_env: Mapping[str, str] | None = None) -> dict[str, s
     if extra_env:
         env.update(extra_env)
     env.update(GIT_HARDENING_ENV)
+    pin = _global_config_pin
+    if pin is not None:
+        env["GIT_CONFIG_GLOBAL"] = str(pin.path)
     return env
 
 
@@ -606,6 +619,7 @@ async def git_run_async(
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
     env: Mapping[str, str] | None = None,
+    input: bytes | None = None,
 ) -> subprocess.CompletedProcess:
     """Async equivalent of ``git_run`` — does NOT block the event loop.
 
@@ -614,7 +628,8 @@ async def git_run_async(
     without serialising the loop. Returns a ``subprocess.CompletedProcess``
     with the same ``returncode``, ``stdout``, and ``stderr`` shape as
     ``git_run`` so call sites can be migrated incrementally. Applies the
-    same hardening and ``env`` merging as ``git_run``.
+    same hardening and ``env`` merging as ``git_run``. ``input``, when
+    given, is written to git's stdin (e.g. for ``git patch-id``).
 
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
@@ -625,12 +640,13 @@ async def git_run_async(
         *argv,
         cwd=str(cwd),
         env=run_env,
+        stdin=asyncio.subprocess.PIPE if input is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
+            proc.communicate(input), timeout=timeout,
         )
     except asyncio.TimeoutError as e:
         try:
@@ -645,6 +661,253 @@ async def git_run_async(
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
     )
+
+
+# --- Pinned global git config (task #3116, MI-04) -----------------------------
+#
+# Agents run as the operator's UID with the operator's HOME, so the global git
+# config (~/.gitconfig, $XDG_CONFIG_HOME/git/config and every file they
+# include) is agent-writable. A filter or merge driver defined there runs
+# inside the orchestrator's own checkout, merge or status. Before dispatch the
+# orchestrator therefore copies the effective global config, includes
+# resolved, into a read-only file it created, and every hardened git call runs
+# with GIT_CONFIG_GLOBAL pointing at that copy: an agent's later edits to the
+# real files never reach the orchestrator. merge_integrity scans the copy for
+# driver programs outside an allowlist and checks its hash before a merge.
+#
+# The copy is taken once per process and kept for its lifetime. Conditional
+# includes (includeIf) are evaluated outside any repository when the copy is
+# taken, so their repository-dependent parts do not survive.
+
+# A pinned file, an attributes file or a config file is a few KiB. Anything
+# larger is not trusted rather than read unbounded.
+MAX_TRUSTED_FILE_BYTES = 1024 * 1024
+
+# Keys that pull in another file. ``--includes`` already inlines what they
+# include; keeping the key in the copy would re-read an agent-writable file.
+_INCLUDE_KEY_RE = re.compile(r"^(include|includeif\..+)\.path$")
+
+
+class GlobalConfigPinError(RuntimeError):
+    """The operator's global git config could not be pinned or verified."""
+
+
+@dataclass(frozen=True)
+class GlobalConfigPin:
+    """The orchestrator-owned copy of the operator's global git config."""
+
+    path: Path
+    sha256: str
+    entries: int
+
+
+_global_config_pin: GlobalConfigPin | None = None
+_global_config_pin_lock = threading.Lock()
+
+
+def read_regular_file_bounded(
+    path: str | os.PathLike, limit: int = MAX_TRUSTED_FILE_BYTES,
+) -> bytes:
+    """Bytes of the regular file at ``path``, read without following a FIFO.
+
+    Raises ``FileNotFoundError`` when absent and ``OSError`` when ``path`` is
+    not a regular file or is larger than ``limit`` (a FIFO or device planted
+    at the path must not hang or exhaust the orchestrator).
+    """
+    fd = os.open(
+        os.fspath(path),
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0),
+    )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{os.fspath(path)} is not a regular file")
+        if info.st_size > limit:
+            raise OSError(
+                f"{os.fspath(path)} is {info.st_size} bytes (limit {limit})"
+            )
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > limit:
+            raise OSError(f"{os.fspath(path)} grew past {limit} bytes while read")
+        return data
+    finally:
+        os.close(fd)
+
+
+def parse_config_list_z(raw: str) -> list[tuple[str, str | None]]:
+    """(key, value) pairs from ``git config --list -z`` output, in order.
+
+    A record without a newline is a bare boolean key (``[core] bare``) and
+    gets the value None.
+    """
+    entries: list[tuple[str, str | None]] = []
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        key, newline, value = record.partition("\n")
+        entries.append((key, value if newline else None))
+    return entries
+
+
+def _quote_config_value(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"')
+        .replace("\n", "\\n").replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def serialize_git_config(entries: Sequence[tuple[str, str | None]]) -> str:
+    """Render (key, value) pairs as a git config file, order preserved.
+
+    Every entry gets its own section header, so multi-valued keys keep their
+    order (a ``credential.helper`` reset depends on it) and subsections that
+    contain dots (``credential.https://example.com.helper``) round-trip.
+    """
+    lines: list[str] = []
+    for key, value in entries:
+        section, _, rest = key.partition(".")
+        subsection, _, name = rest.rpartition(".")
+        if not section or not name or "\n" in subsection:
+            raise GlobalConfigPinError(f"cannot serialise config key {key!r}")
+        if subsection:
+            quoted = subsection.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'[{section} "{quoted}"]')
+        else:
+            lines.append(f"[{section}]")
+        if value is None:
+            lines.append(f"\t{name}")
+        else:
+            lines.append(f"\t{name} = {_quote_config_value(value)}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _operator_global_config_files(env: Mapping[str, str]) -> list[Path]:
+    """The files ``git config --global`` reads for this environment."""
+    if env.get("GIT_CONFIG_GLOBAL"):
+        return [Path(env["GIT_CONFIG_GLOBAL"])]
+    home = Path(env.get("HOME") or Path.home())
+    xdg = env.get("XDG_CONFIG_HOME")
+    xdg_dir = Path(xdg) if xdg else home / ".config"
+    return [xdg_dir / "git" / "config", home / ".gitconfig"]
+
+
+def _read_operator_global_config() -> list[tuple[str, str | None]]:
+    """The operator's effective global config, includes resolved."""
+    env = _get_repo_env()
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    with tempfile.TemporaryDirectory(prefix="equipa-gitcfg-read-") as neutral:
+        # Outside any repository, so no includeIf can match this repo's state.
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(neutral).parent)
+        result = _run_with_env(
+            ["git", "config", "--global", "--list", "--includes", "-z"],
+            neutral, GIT_DEFAULT_TIMEOUT, env,
+        )
+    if result.returncode == 0:
+        return parse_config_list_z(result.stdout)
+    if not any(p.exists() for p in _operator_global_config_files(env)):
+        return []  # no global config at all: pin an empty file
+    raise GlobalConfigPinError(
+        f"could not read the global git config (rc={result.returncode}: "
+        f"{result.stderr.strip()[:200]})"
+    )
+
+
+def global_git_config_pin() -> GlobalConfigPin | None:
+    """The active pin, or None before :func:`pin_global_git_config` ran."""
+    return _global_config_pin
+
+
+def pin_global_git_config() -> GlobalConfigPin:
+    """Pin the operator's global git config for every later hardened git call.
+
+    Idempotent: the first call copies the config and every later call returns
+    the same pin. Call it before any agent runs (``DefaultBranchGuard``
+    does). Raises :class:`GlobalConfigPinError` when the config cannot be
+    read, written or read back identically.
+    """
+    global _global_config_pin
+    with _global_config_pin_lock:
+        if _global_config_pin is not None:
+            return _global_config_pin
+        entries = [
+            (key, value) for key, value in _read_operator_global_config()
+            if not _INCLUDE_KEY_RE.match(key)
+        ]
+        text = serialize_git_config(entries)
+        directory = Path(tempfile.mkdtemp(prefix="equipa-gitconfig-"))
+        path = directory / "global.gitconfig"
+        try:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+            os.chmod(path, 0o400)
+            data = read_regular_file_bounded(path)
+            env = _get_repo_env()
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            readback = _run_with_env(
+                ["git", "config", "--file", str(path), "--list", "-z"],
+                directory, GIT_DEFAULT_TIMEOUT, env,
+            )
+            if (
+                readback.returncode != 0
+                or parse_config_list_z(readback.stdout) != entries
+            ):
+                raise GlobalConfigPinError(
+                    f"pinned global git config does not read back as written "
+                    f"(rc={readback.returncode}: {readback.stderr.strip()[:200]})"
+                )
+        except (OSError, subprocess.SubprocessError, GlobalConfigPinError) as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            if isinstance(exc, GlobalConfigPinError):
+                raise
+            raise GlobalConfigPinError(
+                f"could not write the pinned global git config: {exc}"
+            ) from exc
+        pin = GlobalConfigPin(path, hashlib.sha256(data).hexdigest(), len(entries))
+        atexit.register(shutil.rmtree, directory, True)
+        _global_config_pin = pin
+        logger.info(
+            "Pinned global git config: %d entries at %s (sha256 %s)",
+            pin.entries, pin.path, pin.sha256[:16],
+        )
+        return pin
+
+
+def verify_global_git_config_pin() -> str | None:
+    """Why the pinned copy can no longer be trusted, or None while intact."""
+    pin = _global_config_pin
+    if pin is None:
+        return "the global git config was not pinned before dispatch"
+    try:
+        data = read_regular_file_bounded(pin.path)
+    except OSError as exc:
+        return f"pinned global git config {pin.path} is unreadable ({exc})"
+    if hashlib.sha256(data).hexdigest() != pin.sha256:
+        return f"pinned global git config {pin.path} changed after it was pinned"
+    return None
+
+
+def reset_global_git_config_pin() -> None:
+    """Forget the pin so the next :func:`pin_global_git_config` re-reads.
+
+    For tests that swap HOME; production pins once per process.
+    """
+    global _global_config_pin
+    with _global_config_pin_lock:
+        _global_config_pin = None
 
 
 def _gh_run(
