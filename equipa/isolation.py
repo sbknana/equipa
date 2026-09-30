@@ -459,6 +459,23 @@ def _runtime_dir() -> str:
     return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 
 
+# Parent of the per-user systemd runtime directories (logind creates
+# /run/user/<uid> for the user alone).
+_USER_RUNTIME_ROOT = "/run/user"
+
+
+def _unit_lock_dir() -> str:
+    """Directory of the unit locks: the orchestrator user's systemd runtime
+    directory, whatever ``XDG_RUNTIME_DIR`` says.
+
+    The variable is only inherited. An orchestrator process started with
+    another value (a stale tmux or ``sudo`` shell) would lock files no
+    other orchestrator process of the user sees, and its units would run
+    beside a reviewer (review R3136-03).
+    """
+    return os.path.join(_USER_RUNTIME_ROOT, str(os.getuid()))
+
+
 def launch_environment() -> dict[str, str]:
     """Environment for systemd-run and sudo: only what reaching the user
     manager needs. sudo resets it anyway; the agent's own environment
@@ -1398,8 +1415,9 @@ def encode_handoff_preamble(header_bytes: bytes, bundle_size: int) -> bytes:
 # nonces) and write into its clone. Until each unit (or at least each
 # reviewer) gets its own UID, reviewer units never overlap any other
 # isolated unit: a reader-writer lock over two flock files in the
-# orchestrator's private runtime directory, so it holds across every
-# dispatch mode and every orchestrator process of this user.
+# orchestrator user's private runtime directory (/run/user/<uid>, never
+# taken from XDG_RUNTIME_DIR), so it holds across every dispatch mode and
+# every orchestrator process of this user.
 #
 # * Any other unit takes the turnstile shared for an instant, then the units
 #   lock shared for its whole life.
@@ -1565,7 +1583,7 @@ async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
     """
     import fcntl
 
-    directory = lock_dir or _runtime_dir()
+    directory = lock_dir or _unit_lock_dir()
     _check_private_lock_dir(directory)
     handles = [_open_lock_file(directory, _TURNSTILE_LOCK_NAME)]
     try:

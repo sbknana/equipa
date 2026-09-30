@@ -228,10 +228,13 @@ get separate UIDs, reviewer units never overlap any other isolated unit:
   second reviewer;
 * ordinary units run side by side as before.
 
-It is a reader-writer lock over two `flock` files in the orchestrator's
-private runtime directory (`$XDG_RUNTIME_DIR`), so it covers every dispatch
-mode and every orchestrator process of the same user, not only one event
-loop. That directory must be the orchestrator user's own, not a link, and
+It is a reader-writer lock over two `flock` files in the orchestrator
+user's private runtime directory, so it covers every dispatch mode and
+every orchestrator process of the same user, not only one event loop. The
+directory is always `/run/user/<uid>`, never taken from `XDG_RUNTIME_DIR`:
+the variable is only inherited, and a process started with another value
+(a stale tmux or `sudo` shell) would lock files no other orchestrator
+process sees. That directory must be the orchestrator user's own, not a link, and
 writable by no one else, or the unit is refused: whoever can write it can
 unlink a lock file a running unit holds, and the next reviewer would lock a
 fresh file beside that unit. The unit's slot is taken before the handoff is built and given back

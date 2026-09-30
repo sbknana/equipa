@@ -759,6 +759,41 @@ def test_units_in_another_process_are_waited_for(slots) -> None:
         holder.wait()
 
 
+def test_unit_lock_ignores_another_xdg_runtime_dir(slots, tmp_path: Path,
+                                                   monkeypatch) -> None:
+    """Every orchestrator process of the user locks the same files. One
+    started with another XDG_RUNTIME_DIR (a stale tmux or sudo shell) must
+    still wait for the units the others run."""
+    user_runtime = tmp_path / "run-user" / str(os.getuid())
+    user_runtime.mkdir(parents=True, mode=0o700)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    monkeypatch.setattr(isolation, "_USER_RUNTIME_ROOT",
+                        str(tmp_path / "run-user"), raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(elsewhere))
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_SHARED,
+         str(user_runtime / isolation._UNITS_LOCK_NAME)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+
+        async def scenario() -> bool:
+            task = await _pending(isolation.acquire_unit_slot(
+                "security-reviewer 1", exclusive=True, timeout=5))
+            overlapped = task.done()
+            holder.stdin.close()
+            (await asyncio.wait_for(task, 5)).release()
+            return overlapped
+
+        assert asyncio.run(scenario()) is False, \
+            "the reviewer ran beside a unit of another orchestrator process"
+        assert not list(elsewhere.iterdir())
+    finally:
+        holder.kill()
+        holder.wait()
+
+
 def test_unit_lock_must_be_a_private_regular_file(slots, tmp_path: Path) -> None:
     (slots.lock_dir / isolation._TURNSTILE_LOCK_NAME).symlink_to(tmp_path / "x")
     with pytest.raises(isolation.AgentIsolationError, match="unit lock"):
@@ -818,6 +853,9 @@ def _fake_setup(tmp_path: Path, monkeypatch, lock_dir: Path) -> None:
     monkeypatch.setattr(isolation, "resolve_agent_identity", lambda s: None)
     monkeypatch.setattr(isolation, "check_host", lambda s, i: None)
     monkeypatch.setattr(isolation, "_runtime_dir", lambda: str(lock_dir))
+    # Never the real /run/user/<uid>: a live orchestrator locks there.
+    monkeypatch.setattr(isolation, "_unit_lock_dir", lambda: str(lock_dir),
+                        raising=False)
 
 
 async def _spawn_as(role: str | None):
