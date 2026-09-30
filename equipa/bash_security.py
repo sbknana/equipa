@@ -96,6 +96,14 @@ class CheckID:
     BACKSLASH_ESCAPED_OPERATORS = 21
     COMMENT_QUOTE_DESYNC = 22
     QUOTED_NEWLINE = 23
+    COMMAND_TOO_LONG = 24
+
+
+# Commands longer than this (UTF-8 bytes) are blocked outright (sandbox-07).
+# Every check below is linear, but a hook timeout is a NON-blocking error for
+# Claude Code, so a bounded input keeps the gate far inside its time budget.
+# Legitimate long inputs belong in a file (Write tool) the command reads.
+MAX_COMMAND_BYTES = 16384
 
 
 # ---------------------------------------------------------------------------
@@ -368,14 +376,19 @@ def _has_backslash_escaped_operator(command: str) -> bool:
     return False
 
 
-def _is_escaped_at(content: str, pos: int) -> bool:
-    """Return True if character at *pos* is preceded by an odd number of backslashes."""
-    count = 0
-    i = pos - 1
-    while i >= 0 and content[i] == "\\":
-        count += 1
-        i -= 1
-    return count % 2 == 1
+def _escaped_positions(content: str) -> list[bool]:
+    """Return a bitmap: ``result[i]`` is True when ``content[i]`` is preceded
+    by an odd number of backslashes.
+
+    One linear pass. It replaces a per-position backwards walk that made the
+    brace scan quadratic on long backslash or brace runs (sandbox-07).
+    """
+    escaped = [False] * len(content)
+    backslash_run = 0
+    for index, ch in enumerate(content):
+        escaped[index] = backslash_run % 2 == 1
+        backslash_run = backslash_run + 1 if ch == "\\" else 0
+    return escaped
 
 
 def _has_shell_level_char(command: str, chars: str) -> bool:
@@ -976,7 +989,11 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
         )
 
     # Empty quote pairs adjacent to quoted dash: """-f"
-    if re.search(r"""(?:""|''){1,}['\"]-""", command):
+    # One pair is enough: any run of pairs ending in a quoted dash contains
+    # a single pair followed by the quoted dash. The old ``{1,}`` quantifier
+    # was unanchored and backtracked quadratically on long quote runs
+    # (sandbox-07: 50k quotes took ~28 s).
+    if re.search(r"""(?:""|'')['\"]-""", command):
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains empty quote pair adjacent to quoted dash",
@@ -1376,15 +1393,55 @@ def _check_backslash_escaped_whitespace(command: str) -> BashSecurityResult:
     return _SAFE
 
 
+def _brace_expansions(text: str) -> list[tuple[int, int, str]]:
+    """Return ``(open_pos, close_pos, kind)`` for every brace expansion in *text*.
+
+    A brace expansion is a matched, unescaped ``{...}`` whose top level holds
+    a ``,`` (kind ``"comma"``: ``{a,b}``) or ``..`` (kind ``"sequence"``:
+    ``{1..5}``). Unmatched braces are ignored. Results are sorted by
+    ``open_pos``.
+
+    Single linear pass with a stack (sandbox-07): the previous version walked
+    forward from every ``{`` to find its partner and backwards over
+    backslashes at every position, so 40k ``{`` took minutes.
+    """
+    escaped = _escaped_positions(text)
+    open_stack: list[list] = []  # [open_pos, kind or None]
+    found: list[tuple[int, int, str]] = []
+    length = len(text)
+    for index, ch in enumerate(text):
+        if ch == "{" and not escaped[index]:
+            open_stack.append([index, None])
+        elif ch == "}" and not escaped[index]:
+            if open_stack:
+                open_pos, kind = open_stack.pop()
+                if kind is not None:
+                    found.append((open_pos, index, kind))
+        elif open_stack and open_stack[-1][1] is None:
+            # A separator belongs to the innermost open brace, i.e. the pair
+            # for which it sits at depth 0.
+            if ch == ",":
+                open_stack[-1][1] = "comma"
+            elif ch == "." and index + 1 < length and text[index + 1] == ".":
+                open_stack[-1][1] = "sequence"
+    found.sort()
+    return found
+
+
+_BRACE_COMMA_MESSAGE = "Command contains brace expansion that could alter parsing"
+_BRACE_SEQUENCE_MESSAGE = "Command contains brace sequence expansion ({a..z})"
+
+
 def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
     """Check 16: Brace expansion ({a,b} or {1..5}) in unquoted content."""
-    # Count unescaped braces
+    # Count unescaped braces (linear: escape state is precomputed).
+    escaped = _escaped_positions(unquoted)
     open_count = 0
     close_count = 0
-    for i, ch in enumerate(unquoted):
-        if ch == "{" and not _is_escaped_at(unquoted, i):
+    for index, ch in enumerate(unquoted):
+        if ch == "{" and not escaped[index]:
             open_count += 1
-        elif ch == "}" and not _is_escaped_at(unquoted, i):
+        elif ch == "}" and not escaped[index]:
             close_count += 1
 
     # Excess closing braces = quoted braces were stripped (attack primitive)
@@ -1401,49 +1458,16 @@ def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
             message="Quoted brace character inside brace context (potential obfuscation)",
         )
 
-    # Scan for {a,b} or {1..5} patterns in unquoted content
-    i = 0
-    while i < len(unquoted):
-        if unquoted[i] != "{" or _is_escaped_at(unquoted, i):
-            i += 1
-            continue
-        # Find matching close brace with nesting
-        depth = 1
-        close_pos = -1
-        j = i + 1
-        while j < len(unquoted):
-            if unquoted[j] == "{" and not _is_escaped_at(unquoted, j):
-                depth += 1
-            elif unquoted[j] == "}" and not _is_escaped_at(unquoted, j):
-                depth -= 1
-                if depth == 0:
-                    close_pos = j
-                    break
-            j += 1
-        if close_pos == -1:
-            i += 1
-            continue
-        # Check for comma or .. at outermost level
-        inner_depth = 0
-        for k in range(i + 1, close_pos):
-            ch = unquoted[k]
-            if ch == "{" and not _is_escaped_at(unquoted, k):
-                inner_depth += 1
-            elif ch == "}" and not _is_escaped_at(unquoted, k):
-                inner_depth -= 1
-            elif inner_depth == 0:
-                if ch == ",":
-                    return BashSecurityResult(
-                        safe=False, check_id=CheckID.BRACE_EXPANSION,
-                        message="Command contains brace expansion that could alter parsing",
-                    )
-                if ch == "." and k + 1 < close_pos and unquoted[k + 1] == ".":
-                    return BashSecurityResult(
-                        safe=False, check_id=CheckID.BRACE_EXPANSION,
-                        message="Command contains brace sequence expansion ({a..z})",
-                    )
-        i += 1
-    return _SAFE
+    if open_count == 0:
+        return _SAFE
+    expansions = _brace_expansions(unquoted)
+    if not expansions:
+        return _SAFE
+    kind = expansions[0][2]
+    return BashSecurityResult(
+        safe=False, check_id=CheckID.BRACE_EXPANSION,
+        message=_BRACE_SEQUENCE_MESSAGE if kind == "sequence" else _BRACE_COMMA_MESSAGE,
+    )
 
 
 def _check_unicode_whitespace(command: str) -> BashSecurityResult:
@@ -2358,6 +2382,24 @@ def check_bash_command(command: str) -> BashSecurityResult:
     """
     if not command or not command.strip():
         return _SAFE
+
+    # Length cap (sandbox-07): checked before any scan so an oversized
+    # command is refused in constant-ish time with an actionable reason.
+    command_bytes = len(command.encode("utf-8", errors="surrogatepass"))
+    if command_bytes > MAX_COMMAND_BYTES:
+        result = BashSecurityResult(
+            safe=False, check_id=CheckID.COMMAND_TOO_LONG,
+            message=(
+                f"Command is {command_bytes} bytes, over the "
+                f"{MAX_COMMAND_BYTES}-byte limit; write long content to a "
+                "file and run a short command that reads it"
+            ),
+        )
+        log.warning(
+            "Bash security check %d BLOCKED command: %s — %s",
+            result.check_id, command[:120], result.message,
+        )
+        return result
 
     # Canonical `git commit` fed by a quoted-delimiter heredoc: the body is
     # inert literal text piped to git's stdin, so strip it and validate only
