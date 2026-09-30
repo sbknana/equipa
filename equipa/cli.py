@@ -2087,7 +2087,12 @@ async def _run_task_isolated(task, project_dir, project_context, args) -> None:
             )
         run = await _execute_single_agent(task, worktree_dir, project_context, args)
         single_runs.append(run)
-        _preserve_task_artifacts(worktree_dir, project_dir, task["id"])
+        try:
+            _preserve_task_artifacts(worktree_dir, project_dir, task["id"])
+        except OSError as exc:
+            # Losing a report copy must not lose the run's gate and status.
+            print(f"  [Isolation] WARNING: could not preserve task artifacts "
+                  f"from {worktree_dir}: {exc}")
         return run.result, 1, run.outcome
 
     isolated: IsolatedTaskRun = await run_task_in_isolation(

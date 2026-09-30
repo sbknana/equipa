@@ -284,6 +284,43 @@ def test_task_dev_test_runs_in_worktree_and_merges_only_through_gate(
         assert captured["merged_sha"] and _is_ancestor(repo, captured["merged_sha"], _master(repo))
 
 
+@pytest.mark.parametrize("leave_uncommitted", [False, True], ids=["clean", "uncommitted"])
+def test_task_dev_test_without_commits_merges_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leave_uncommitted: bool,
+) -> None:
+    """No commits: nothing is reviewed or merged. A clean run is done at the
+    fork point and leaves no stale branch behind; uncommitted work blocks the
+    task and is kept (stashed) on its branch."""
+    repo = _init_repo(tmp_path / "repo")
+    task = _task(3322)
+    probe = GateProbe(repo, 1)
+    probe.install(monkeypatch)
+    captured = _patch_cli_task_basics(monkeypatch, repo, task, probe)
+
+    async def idle_dev_test_loop(task, project_dir, project_context, args, output=None):
+        probe.agent_dirs.append(project_dir)
+        if leave_uncommitted:
+            (Path(project_dir) / "notes.txt").write_text("never committed\n")
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    monkeypatch.setattr(cli_mod, "run_dev_test_loop", idle_dev_test_loop)
+
+    asyncio.run(cli_mod.run_mode_task(_cli_args(task=3322)))
+
+    probe.assert_ran_isolated(3322)
+    assert probe.review_dirs == [], "a reviewer was run on an empty branch"
+    assert _master(repo) == probe.baseline
+    assert not (repo / ".forge-worktrees" / "task-3322").exists()
+    if leave_uncommitted:
+        assert captured["outcome"] == "merge_failed"
+        assert _branch_sha(repo, "forge-task-3322") is not None
+        assert "equipa-early-term task-3322" in _git(repo, "stash", "list")
+    else:
+        assert captured["outcome"] == "tests_passed"
+        assert captured["merged_sha"] == probe.baseline
+        assert _branch_sha(repo, "forge-task-3322") is None, "stale branch left behind"
+
+
 def test_task_dev_test_refuses_stale_branch_and_exits_non_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3180,10 +3180,12 @@ async def run_task_in_isolation(
                     output,
                 )
         else:
-            outcome, _ = await review_task_branch(
-                task, worktree_dir, project_dir, project_context, args,
-                outcome, output=output,
-            )
+            if not guard.tripped:
+                # A tripped guard blocks the merge anyway; no reviewer is paid for.
+                outcome, _ = await review_task_branch(
+                    task, worktree_dir, project_dir, project_context, args,
+                    outcome, output=output,
+                )
             try:
                 await _gated_merge_task(
                     repo=project_dir,
@@ -3232,12 +3234,21 @@ async def run_task_in_isolation(
                 event="task-status-after-merge",
             )
             outcome = final_outcome
+        # The branch goes only when nothing on it can be lost: it was merged,
+        # or its tip is already on the default branch and the worktree holds
+        # no uncommitted work. Otherwise it stays (a re-dispatch is refused
+        # until the operator resolves it). A tripped guard keeps everything.
         merge_status = guard.outcomes.get(task_id)
         if not guard.tripped:
             if merge_status is not None and merge_status.status == "merged":
                 delete_branch = True
-            elif nothing_to_merge and await _worktree_dirty_reason(worktree_dir) is None:
-                delete_branch = True
+            else:
+                tip = await resolve_commit(project_dir, f"refs/heads/{task_branch}")
+                delete_branch = (
+                    tip is not None
+                    and await is_ancestor(project_dir, tip, guard.expected_sha)
+                    and await _worktree_dirty_reason(worktree_dir) is None
+                )
         return IsolatedTaskRun(
             outcome, result, cycles, merged_sha=merged_sha,
             agent_outcome=agent_outcome, reason=reason,
