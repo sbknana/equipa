@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from equipa import loops
+from equipa import agent_runner, loops
 from equipa import security_gate as sg
 from equipa.dispatch import _security_review_blocks_merge
 from equipa.security_gate import (
@@ -412,6 +414,42 @@ def review_writer(root, newline="\n", extra=None):
             result.update(extra)
         return result
     return behave
+
+
+FAKE_CLI_PRINTING_RESULT = (
+    "import os, sys\n"
+    "sys.stdout.write(open(os.environ['FAKE_RESULT'], encoding='utf-8').read())\n"
+)
+
+
+@pytest.mark.parametrize(
+    "subtype, expect_max_turns",
+    [("error_max_turns", True), ("success", False)],
+)
+def test_run_agent_flags_a_run_that_hit_max_turns(
+    tmp_path, monkeypatch, subtype, expect_max_turns,
+):
+    """The CLI's ``error_max_turns`` result is reported as ``hit_max_turns``.
+
+    ``success`` stays True for callers that keep partial work; the security
+    reviewer reads the flag and treats the run as failed (gate-07).
+    """
+    result_file = tmp_path / "result.json"
+    result_file.write_text(json.dumps({
+        "type": "result", "subtype": subtype, "num_turns": 5,
+        "result": "partial report written",
+    }), encoding="utf-8")
+    fake_cli = tmp_path / "fake_claude.py"
+    fake_cli.write_text(FAKE_CLI_PRINTING_RESULT, encoding="utf-8")
+    monkeypatch.setenv("FAKE_RESULT", str(result_file))
+
+    result = asyncio.run(agent_runner.run_agent(
+        [sys.executable, str(fake_cli)], timeout=30, max_retries=0,
+    ))
+
+    assert result["success"] is True
+    assert bool(result.get("hit_max_turns")) is expect_max_turns
+    assert ("Agent hit max turns limit" in result["errors"]) is expect_max_turns
 
 
 def test_max_turns_reviewer_blocks_and_is_not_retried(tmp_path, fake_reviewer):
