@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -1537,6 +1538,9 @@ async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -
 
 # --- Parallel Tasks ---
 
+_TASK_ID_PART_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
 def parse_task_ids(task_str: str) -> list[int]:
     """Parse comma-separated IDs or ranges into a list of ints.
 
@@ -1546,21 +1550,39 @@ def parse_task_ids(task_str: str) -> list[int]:
 
     Each "start-end" range is bounded by MAX_TASK_RANGE to prevent memory
     exhaustion (e.g. "1-999999999" would otherwise materialise ~1B ints).
+
+    dispatch-15 (task #3112): duplicates are dropped (first occurrence
+    wins), so "5,5" or "4-6,5" never dispatches one task twice. Every part
+    must be a positive id or an ascending "start-end" range; anything else
+    ("-5", "7-3", "0", "abc", an empty part) raises ValueError naming the
+    offending part instead of a bare int() error.
     """
     ids: list[int] = []
-    for part in task_str.split(","):
-        part = part.strip()
-        if "-" in part:
-            start_str, end_str = part.split("-", 1)
-            start = int(start_str)
-            end = int(end_str)
-            if end - start > MAX_TASK_RANGE:
-                raise ValueError(
-                    f"task range too large: {part} (max {MAX_TASK_RANGE})"
-                )
-            ids.extend(range(start, end + 1))
-        else:
-            ids.append(int(part))
+    seen: set[int] = set()
+    for raw_part in task_str.split(","):
+        part = raw_part.strip()
+        match = _TASK_ID_PART_RE.match(part)
+        if match is None:
+            raise ValueError(
+                f"invalid task id {part!r}: expected a positive id or an "
+                f"ascending range like 109-114"
+            )
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) is not None else start
+        if start < 1:
+            raise ValueError(f"invalid task id {part!r}: ids start at 1")
+        if end < start:
+            raise ValueError(
+                f"invalid task range {part!r}: end is below start"
+            )
+        if end - start > MAX_TASK_RANGE:
+            raise ValueError(
+                f"task range too large: {part} (max {MAX_TASK_RANGE})"
+            )
+        for task_id in range(start, end + 1):
+            if task_id not in seen:
+                seen.add(task_id)
+                ids.append(task_id)
     return ids
 
 
