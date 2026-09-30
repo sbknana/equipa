@@ -30,6 +30,30 @@ All notable changes to EQUIPA are documented here.
   regression test (`tests/test_review_artifact_paths.py`, 18 cases)
   asserts the contract end-to-end and guards against future drift.
 
+- **Merge integrity** (tasks #3111, #3116) — the gated merge names the
+  reviewed commit, never the branch, and the default branch is pinned
+  before dispatch; any other movement raises an ALERT and stops merging.
+  Operator-visible effects:
+  - The security reviewer now works in an orchestrator-made, read-only
+    checkout of the reviewed commit in a temp directory (only
+    `.equipa-artifacts/` is writable); its artifact is copied back to the
+    task worktree. Index entries with skip-worktree or assume-unchanged
+    set make the review unclean, so the task is not merged.
+  - Orchestrator git ignores the system git config and system attributes
+    (`GIT_CONFIG_NOSYSTEM=1`, `GIT_ATTR_NOSYSTEM=1`) and reads a copy of
+    the global config taken when the orchestrator starts
+    (`GIT_CONFIG_GLOBAL`). Edits to `~/.gitconfig` made while it runs are
+    not seen until the next start; `includeIf` sections of the global
+    config are not carried over.
+  - Filter, merge and diff driver programs in any config scope (including
+    submodule configs) block the merge, except git-lfs's standard
+    programs (`merge_integrity.DRIVER_CONFIG_ALLOWLIST`). So does
+    `.git/info/attributes` or the global attributes file selecting a
+    driver other than `lfs` or git's built-in ones.
+  - A task is `done` only after its merge landed (`tasks.merged_sha`,
+    schema v12); a single-task run whose pre-dispatch pin failed is not
+    merged.
+
 ## [3.1.0] - 2026-03-05
 
 ### Added
