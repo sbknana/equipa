@@ -268,7 +268,8 @@ def test_cleanup_never_resets_default_branch_checked_out_in_worktree(
     assert "agent work 22 attempt 1" in _git(
         repo, "log", "--format=%s", "forge-task-22",
     ), "the failed attempt's commit was not preserved on its branch"
-    assert status_updates == [(22, "attempt_cleanup_failed")]
+    # Task #3111: caught by the post-attempt branch assertion, before cleanup.
+    assert status_updates == [(22, "worktree_branch_mismatch")]
 
 
 def test_cleanup_with_unreachable_base_fails_loud_before_status_reset(

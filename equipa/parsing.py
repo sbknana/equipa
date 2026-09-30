@@ -16,6 +16,7 @@ import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+from equipa.git_ops import pinned_git_env
 
 # --- Token Budget Constants ---
 # Anthropic recommendation: ~4 chars/token for Claude
@@ -801,6 +802,7 @@ def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str
         result = subprocess.run(
             ["git", "diff", "--name-only", "HEAD"],
             cwd=project_dir, capture_output=True, text=True, timeout=10,
+            env=pinned_git_env(),
         )
         if result.returncode != 0:
             return claimed_files  # Can't verify, trust the claim
@@ -809,6 +811,7 @@ def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str
         staged = subprocess.run(
             ["git", "diff", "--name-only", "--cached"],
             cwd=project_dir, capture_output=True, text=True, timeout=10,
+            env=pinned_git_env(),
         )
         if staged.returncode == 0:
             actual_files.update(staged.stdout.strip().splitlines())

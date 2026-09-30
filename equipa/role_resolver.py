@@ -286,7 +286,11 @@ def is_reserved_role(role: str) -> bool:
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
     """Run a hardened read-only git command in ``root``; None if git failed to run."""
-    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
+    # Late import: git_ops imports this module. pinned_git_env adds the
+    # hardening variables and the pinned global config (task #3116, MI-04).
+    from equipa.git_ops import pinned_git_env
+
+    env = dict(pinned_git_env(), GIT_TERMINAL_PROMPT="0")
     try:
         return subprocess.run(
             ["git", "-C", str(root), *_GIT_SAFE_CONFIG, *args],

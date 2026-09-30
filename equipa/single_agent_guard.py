@@ -43,6 +43,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from equipa.git_ops import pinned_git_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -152,6 +154,7 @@ def _git_diff_files(repo_path: Path) -> list[str]:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    env=pinned_git_env(),
                     check=False,
                 )
                 if out.returncode == 0 and out.stdout.strip():
@@ -165,6 +168,7 @@ def _git_diff_files(repo_path: Path) -> list[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
             check=False,
         )
         if out.returncode != 0:

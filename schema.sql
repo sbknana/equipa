@@ -43,6 +43,8 @@ CREATE TABLE tasks (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     task_type TEXT DEFAULT 'feature',
     role TEXT,
+    -- Task commit the gated merge put on the default branch (dispatch-05).
+    merged_sha TEXT,
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
@@ -656,6 +658,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_expires
 -- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v11. Migrations handle upgrades from older versions.
-PRAGMA user_version = 11;
+-- Marks fresh installs as v12. Migrations handle upgrades from older versions.
+PRAGMA user_version = 12;
 
