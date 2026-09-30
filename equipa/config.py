@@ -52,6 +52,7 @@ CONFIG_LOAD_ERROR_KEY = "_config_load_error"
 # config is fail-open (EQUIPA review 2026-09-29, sandbox-06).
 FAIL_CLOSED_FEATURE_FLAGS: frozenset[str] = frozenset({
     "bash_security_pretooluse",
+    "agent_isolation",
 })
 
 
@@ -72,6 +73,13 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # the command has executed, so it is not a substitute. An invalid value
     # for this flag forces it ON (FAIL_CLOSED_FEATURE_FLAGS). See task 2703.
     "bash_security_pretooluse": False,
+    # When True, every agent CLI runs as the separate unprivileged user in
+    # dispatch_config["agent_isolation"], in its own cgroup and its own git
+    # clone, with a read-only TheForge view without api_keys (equipa.isolation,
+    # docs/AGENT_ISOLATION.md). DEFAULT FALSE: it needs host setup first. If
+    # it is on and isolation cannot be established the dispatch is refused;
+    # an invalid value or unreadable config forces it ON (fail-closed).
+    "agent_isolation": False,
     # When True (default), a missing SECURITY-REVIEW-NNNN.md artifact after
     # the security-review agent runs is treated as a gate-blocking failure
     # (fail-closed). Set to False only if your workflow accepts the

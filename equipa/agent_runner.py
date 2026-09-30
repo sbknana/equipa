@@ -168,7 +168,7 @@ class AgentResult(_AgentResultRequired, total=False):
     # _run_started_at_utc.
     started_at: str
 
-from equipa import agent_launcher
+from equipa import agent_launcher, isolation
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.cli_isolation import (
     CLAUDE_CLI_ISOLATION_ARGS,
@@ -1583,6 +1583,15 @@ async def _spawn_agent_process(
         )
     kwargs["env"] = _agent_subprocess_env()
     kwargs["cwd"] = cwd
+
+    if isolation.isolation_enabled():
+        # Task 3135: separate agent UID, per-agent cgroup and clone; refused,
+        # never downgraded, when isolation cannot be established.
+        try:
+            return await isolation.spawn_isolated_agent(
+                cmd, cwd, kwargs["env"], limit=kwargs.get("limit"))
+        except isolation.AgentIsolationError as exc:
+            raise AgentDispatchRefused(f"agent isolation: {exc}") from exc
 
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
