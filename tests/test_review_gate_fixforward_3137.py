@@ -203,6 +203,9 @@ def test_standalone_marker_comments_still_parse_once(monkeypatch):
     ["SQL injection in login \\` severity: HIGH `x`"],
     ["| ID | Severity | Note |", "|---|---|---|", "| S1 | `x | HIGH | y` |"],
     ["<div>", "SQL injection ` severity: HIGH ` in login", "</div>"],
+    # A backtick inside an inline tag or autolink opens no code span.
+    ['See <a href="x`y">the report</a> - severity: HIGH `z'],
+    ["See <https://example.test/a`b> - severity: HIGH `c"],
 ])
 def test_markdown_the_renderer_shows_as_text_fails_closed(body):
     severity = "CRITICAL" if any("CRITICAL" in line for line in body) else "HIGH"
@@ -334,6 +337,9 @@ ADVERSARIAL_BODIES = {
     "severity-clause-runs": [", severity " * (REVIEW_BYTES // 11)],
     "title-lead-in-lines": _padded_lines("HIGH HIGH HIGH HIGH Hx"),
     "marker-comment-splits": ["HI<!-- EQUIPA-X -->" * (REVIEW_BYTES // 19)],
+    "inline-tags-with-backticks": ["<a title='`'> `x` " * (REVIEW_BYTES // 18)],
+    "unclosed-tag-openers": ["<a`" * (REVIEW_BYTES // 3)],
+    "long-unclosed-tags": _padded_lines("<a " + "`" * 600),
 }
 
 

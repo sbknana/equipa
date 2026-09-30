@@ -2095,7 +2095,12 @@ _TABLE_DELIMITER_ROW_RE = re.compile(
     r"[ \t]{0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*",
 )
 _BACKTICK_RUN_RE = re.compile(r"`+")
-_INLINE_OPENER_RE = re.compile(r"`+|<!--")
+# Inline constructs that open where they start: a backtick run, an HTML
+# comment, and an inline HTML tag or autolink ("<a href='x`y'>", "<https://
+# x`y>"), which a renderer reads before any code span that starts inside it.
+# The tag form is looser than CommonMark's, so it can only keep a backtick
+# from opening code (more text shown, fail closed).
+_INLINE_OPENER_RE = re.compile(r"`+|<!--|<[A-Za-z/?!][^<>\n]{0,500}>")
 # A line the per-line _blank_code would take for a fence. In the rendered
 # text every real fence is already blanked, so what is left is text.
 _TILDE_FENCE_LINE_RE = re.compile(r"^([ \t]{0,3})(~{3,})", re.MULTILINE)
@@ -2319,7 +2324,7 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
     (tasks 3130 and 3137), and whichever construct opens first wins, so a
     "<!--" inside code opens nothing (a real review quoted one, and a "-->"
     in another span 30 lines later hid two finding headings) and a backtick
-    inside a comment opens nothing:
+    inside a comment, an inline HTML tag or an autolink opens nothing:
 
     * a backtick run opens a code span that closes at the next run of the
       SAME length inside its block (a paragraph, a heading, a table cell). The
@@ -2401,6 +2406,12 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
             span_limit, comment_limit = span_limits[line], comment_limits[line]
         escaped = (start > line_start and text[start - 1] == "\\"
                    and _is_escaped(text, start, line_start))
+        if token.group(0)[0] == "<" and token.group(0) != "<!--":
+            # An inline tag or autolink is kept as written; a backtick
+            # inside it opens nothing.
+            emit(text[position:token.end()])
+            position = token.end()
+            continue
         if token.group(0) == "<!--":
             if not escaped and line not in blocks.table_rows and not (
                 text[line_start:start].strip(" \t")
@@ -2513,7 +2524,8 @@ def _rendered_review_text(text: str) -> str:
     text = _strip_combining_marks(text)
     text = text.translate(_CONFUSABLE_LETTERS)
     text = _INTRAWORD_EMPHASIS_RE.sub("", text)
-    return _INTERIOR_BLANK_RUN_RE.sub(" ", text)
+    # Removed code and comments can leave long runs of blank lines (task 3137).
+    return _fold_blank_line_runs(_INTERIOR_BLANK_RUN_RE.sub(" ", text))
 
 
 def _stricter_analysis(
