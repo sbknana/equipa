@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import random
 import re
 import string
 import sys
@@ -70,6 +71,8 @@ REVIEW_UNITS = (
     '"', "'", '\\"', "\\n", '" ', "' ", '\\" ', "a:5432:b:c:", "5432:",
     "-----BEGIN PRIVATE KEY-----", "Bearer x", "cookie: ", "eyJa.a",
     "x://a:b@", "hf_", "xapp-", "REDISCLI_AUTH=", "A_AUTH",
+    # The JWT pattern's start per "-eyJ" (task 3138 family search).
+    "-eyJ", "eyJ-", "-eyJa.",
 )
 COMMAND_UNITS = tuple(
     f"{command} {flag} " for command in COMMAND_WORDS for flag in FLAGS
@@ -79,6 +82,10 @@ COMMAND_UNITS = tuple(
 PAIR_ALPHABET = " -p:=\"'\\\nb_/;"
 PAIR_UNITS = tuple("".join(pair)
                    for pair in itertools.product(PAIR_ALPHABET, repeat=2))
+# Separators put before and after each of a pattern's own words: "-eyJ" x N
+# gave the JWT pattern a word-boundary start per repeat, each scanning to the
+# end of the run (1.7 s on 64 KB), and no word or pair list above had it.
+SEPARATORS = " \t-_.:=\"'\\\n/@;"
 
 PATTERN_INDEXES = range(len(redact._PATTERNS))
 
@@ -116,6 +123,8 @@ def _derived_units(index: int) -> list[str]:
     units += [f"{first} {second} "
               for first, second in itertools.permutations(tokens[:10], 2)]
     units.append(" ".join(tokens) + " ")
+    units += [unit for token in tokens for separator in SEPARATORS
+              for unit in (separator + token, token + separator)]
     return units
 
 
@@ -238,6 +247,39 @@ def test_four_mb_tool_input_of_each_patterns_words_is_fast(index):
 ])
 def test_four_mb_tool_input_of_the_review_shapes_is_fast(unit):
     _assert_four_mb_is_fast(unit)
+
+
+# --- The JWT pattern: linear, and the same matches as before ------------------
+
+# The JWT pattern before task 3138: a start at every "-eyJ" of a run.
+JWT_BEFORE_3138 = re.compile(
+    r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+@pytest.mark.parametrize("text, kept", [
+    ("token-eyJhbGciOi.eyJzdWIiOi.FAKEjwt3138", "token-"),
+    ("x eyJ-eyJa.b.FAKEjwt3138 y", "x "),
+    ("-eyJ-eyJ.x.FAKEjwt3138", "-"),
+    ("a.eyJa.b.FAKEjwt3138.eyJc.d.FAKEjwt3138", "a."),
+    ('{"jwt": "eyJa.eyJb.FAKEjwt3138"}', '{"jwt": "'),
+])
+def test_jwt_is_redacted_and_the_text_before_it_kept(text, kept):
+    redacted = redact_secrets(text)
+    assert "FAKEjwt3138" not in redacted
+    assert redacted.startswith(kept + REDACTED)
+    assert redacted == JWT_BEFORE_3138.sub(REDACTED, text)
+
+
+def test_jwt_pattern_matches_the_old_one_on_random_text():
+    """Same result as the pre-3138 pattern on 20 000 seeded random texts
+    built from the characters around the JWT boundary cases."""
+    pieces = ["eyJ", "e", "y", "J", "-", "_", ".", "a", "9", " ",
+              "\N{LATIN SMALL LETTER E WITH ACUTE}", "=", "eyJa", ".b", "\n"]
+    rng = random.Random(3138)
+    for _ in range(20_000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        assert (redact._JWT.sub(r"\1" + REDACTED, text)
+                == JWT_BEFORE_3138.sub(REDACTED, text)), repr(text)
 
 
 # --- The hint skip never hides a match ------------------------------------------

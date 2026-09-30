@@ -125,6 +125,19 @@ _URL_PARTS = re.compile(
     re.DOTALL,
 )
 
+# A JWT (header.payload.signature), tried once per run of base64url
+# characters, at the run's first ``eyJ`` word; group 1 is the text of the
+# run before it. Linear (RR-01): the plain ``\beyJ[A-Za-z0-9_-]+\.`` had a
+# start at every ``-eyJ`` of a run and rescanned the run to its end from
+# each one (1.7 s on 64 KB). A later ``eyJ`` of the same run reaches the
+# same dots, so it matches exactly when the first does; the lookahead plus
+# backreference commits to the first one like an atomic group (which the
+# ``re`` of Python 3.10 lacks), so the engine never tries the others.
+_JWT = re.compile(
+    r"(?<![A-Za-z0-9_-])(?=([A-Za-z0-9_-]*?)\beyJ)\1"
+    r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+
 _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----(?!\[REDACTED\])"
     r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*)",
@@ -292,8 +305,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any, tuple[str, ...]], ...] = (
     # GitLab personal / project / group access tokens.
     (re.compile(r"\bglpat-[0-9A-Za-z_-]{16,}"), REDACTED, ("glpat-",)),
     # JWTs (header.payload.signature, base64url; the header starts "eyJ").
-    (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-     REDACTED, ("eyj",)),
+    (_JWT, r"\1" + REDACTED, ("eyj",)),
     # Inline URL credentials: scheme://user:password@host, parsed.
     (_URL_TOKEN, _redact_url_token, ("://",)),
     # NAME=value assignments of credential-named variables.
