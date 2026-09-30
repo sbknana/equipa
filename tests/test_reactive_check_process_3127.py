@@ -173,9 +173,15 @@ def test_real_checker_runs_in_the_worker():
     checker = ReactiveBashChecker()
     try:
         assert checker.check_blocking("ls -la", 10.0).safe is True
-        flagged = checker.check_blocking("ls -la <(echo hi)", 10.0)
+        command = "ls -la <(echo hi)"
+        flagged = checker.check_blocking(command, 10.0)
         assert flagged.safe is False
-        assert flagged.check_id == 8
+        # Same verdict as the in-process checker (whatever its check ids are
+        # at the time: bash_security.py is maintained separately).
+        from equipa.bash_security import check_bash_command
+        expected = check_bash_command(command)
+        assert (flagged.safe, flagged.check_id, flagged.message) == (
+            expected.safe, expected.check_id, expected.message)
         assert checker.worker_pid() != os.getpid()
     finally:
         checker.close()
