@@ -878,13 +878,16 @@ _REVIEW_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # "Preliminary checks passed" are ordinary prose in finished reviews. The
 # completion sentinel is the real proof a review finished; these markers are
 # a second line of defence and must not block honest reviews.
-_STATUS_END = r"(?=[ \t]*(?:$|[:—–(\[]|-(?!\w)|only\b))"
+_STATUS_END = r"(?=[ \t]*(?:$|[:—–(\[.;,]|-(?!\w)|only\b))"
 _INCOMPLETE_REVIEW_MARKER_RE = re.compile(
-    r"^[ \t*_\[(:—–-]*(?:"
+    r"^[ \t*_\[(:—–-]*"
+    r"(?:status[ \t]*[*_]{0,2}[ \t]*[:=—–-][ \t]*[*_]{0,2}[ \t]*)?(?:"
     r"(?:(?:WORK[ \t_-]*)?IN[ \t_-]*PROGRESS|skeleton|TODO)\b"
-    r"|(?:DRAFT|WIP|PRELIMINARY)[ \t*_\])]*" + _STATUS_END +
+    r"|(?:DRAFT|WIP|PRELIMINARY)"
+    r"(?:[ \t]+(?:review|findings?|pass|scan))?[ \t*_\])]*" + _STATUS_END +
     r"|INITIAL[ \t]+(?:AUTOMATED[ \t]+)?(?:SCAN|PASS|REVIEW)[ \t*_\])]*"
     + _STATUS_END +
+    r"|(?:PENDING|AWAITING)[ \t]+(?:(?:manual|full)[ \t]+)?REVIEW\b"
     r")",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -1051,14 +1054,19 @@ _LIST_ITEM_SEVERITY_RE = re.compile(
 # A line _FINDING_CANDIDATE_RE already counts (some bold lead-ins) is skipped
 # in _extra_candidate_severities so one finding is never counted twice.
 _LIST_ITEM_LEADING_SEVERITY_RE = re.compile(
-    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}[*_\[(]{0,3}[ \t]{0,4}"
-    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_\])]{0,3}[ \t]{0,4}"
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}"
+    r"(?:\[[ xX]\][ \t]{1,4})?"
+    r"(?:[^\w\s*_\[(`]{1,4}[ \t]{0,2})?"
+    r"(?:[\[(`]?[A-Za-z]{1,4}-?\d{1,3}[\])`]?[ \t]{0,2}[:—–-]?[ \t]{1,4})?"
+    r"[*_\[(]{0,3}[ \t]{0,4}"
+    r"(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))(?:[ -]severity)?[*_\])]{0,3}[ \t]{0,4}"
     r"(?::|—|–|-(?!\w))",
     re.MULTILINE | re.IGNORECASE,
 )
 # Fix-forward of 3117: a table cell holding a Severity field ("Severity: HIGH").
 _TABLE_SEVERITY_FIELD_CELL_RE = re.compile(
-    r"severity[ \t]*[:=][ \t]*[*_]{0,2}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
+    r"severity[*_]{0,3}[ \t]*[:=][*_]{0,3}[ \t]*[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
     re.IGNORECASE,
 )
 # A table cell that IS a severity (fullmatch): "HIGH", "**High**",

@@ -100,3 +100,48 @@ def test_honest_summaries_are_not_unfinished(summary):
 def test_status_markers_still_block(summary):
     text = review(summary, [], ONE_LOW, low_heading=True)
     assert verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary
+
+
+
+# --- re-review follow-up: shapes the first fix-forward still missed ---------
+
+@pytest.mark.parametrize("body", [
+    ["| ID | Detail | Where |", "|---|---|---|", "| S1 | SQLi | **Severity:** HIGH |"],
+    ["| S1 | SQLi | **Severity**: HIGH |"],
+    ["## Findings", "- S1 HIGH: SQL injection"],
+    ["## Findings", "- S1: HIGH - SQL injection"],
+    ["## Findings", "- (S1) HIGH: SQL injection"],
+    ["## Findings", "- \U0001f534 HIGH: SQL injection"],
+    ["## Findings", "- \u26a0\ufe0f HIGH: SQL injection"],
+    ["## Findings", "- [x] HIGH: SQL injection"],
+    ["## Findings", "- [ ] HIGH - SQL injection"],
+    ["## Findings", "> - HIGH: SQL injection"],
+])
+def test_rereview_shapes_fail_closed(body):
+    text = review("No findings.", body, ZERO, low_heading=False)
+    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+
+
+@pytest.mark.parametrize("line", [
+    "- Info: semgrep 1.176.0",
+    "- Low: coverage of tests/ is thin",
+    "1. Info: consider pinning deps",
+])
+def test_note_bullets_do_not_block(line):
+    text = review("No findings.", ["## Notes", line], ZERO, low_heading=False)
+    assert verdict(text) == loops.REVIEW_VERDICT_OK, line
+
+
+@pytest.mark.parametrize("summary", [
+    "Draft.",
+    "WIP.",
+    "Pending review.",
+    "Awaiting review.",
+    "Status: Draft",
+    "**Status:** WIP",
+    "Draft review; 1 finding.",
+    "Preliminary findings: 1 LOW.",
+])
+def test_punctuated_status_markers_block(summary):
+    text = review(summary, [], ONE_LOW, low_heading=True)
+    assert verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary
