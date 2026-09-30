@@ -14,6 +14,12 @@
 # and, inside, checks as the agent user that it:
 #   * is not root and cannot sudo;
 #   * cannot read the TheForge database or the orchestrator's HOME secrets;
+#   * can neither list nor enter the TheForge database directory or any
+#     backup directory, and cannot read any database copy in them (every
+#     copy the orchestrator finds is probed by name, and the agent searches
+#     for readable ones itself);
+#   * cannot read secret-shaped files (.env, keys, credentials) below the
+#     configured project roots (agent_isolation.secret_scan_roots, --repo);
 #   * cannot write any repository .git, the EQUIPA runtime or the launcher;
 #   * runs in its own equipa-agent-*.scope cgroup with pids.max and
 #     memory.max set, and cannot leave that cgroup or raise its limits;
@@ -32,9 +38,13 @@ set -u
 inside() {
     local orchestrator_pid="" orchestrator_home="" database="" runtime=""
     local launcher="" pids_expected="" view_db="" mcp_config=""
-    local -a git_dirs=() excluded_tables=()
+    local -a git_dirs=() excluded_tables=() deny_dirs=() db_copies=()
+    local -a secret_roots=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --deny-dir) deny_dirs+=("$2"); shift 2 ;;
+            --db-copy) db_copies+=("$2"); shift 2 ;;
+            --secret-root) secret_roots+=("$2"); shift 2 ;;
             --orchestrator-pid) orchestrator_pid="$2"; shift 2 ;;
             --orchestrator-home) orchestrator_home="$2"; shift 2 ;;
             --db) database="$2"; shift 2 ;;
@@ -80,11 +90,47 @@ inside() {
             pass "agent cannot read $path"
         fi
     done
+    # The directories, not only the files: a backup copy beside the live
+    # database (theforge_backup_<date>.db) holds the same api_keys table.
+    local directory readable
+    for directory in "${deny_dirs[@]}"; do
+        if [ -r "$directory" ] || [ -x "$directory" ]; then
+            fail "agent can list or enter the TheForge database/backup directory $directory"
+        else
+            pass "agent can neither list nor enter $directory"
+        fi
+        readable="$(find "$directory" -xdev -type f \( -name '*.db' -o -name '*.db[-._]*' -o -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.sqlite[-._]*' -o -name '*.sqlite3[-._]*' \) -readable -print 2>/dev/null | head -n 5 | tr '\n' ' ')"
+        if [ -n "$readable" ]; then
+            fail "agent can read database copies under $directory: $readable"
+        fi
+    done
+    local copies_readable=0
+    for path in "${db_copies[@]}"; do
+        if head -c 1 -- "$path" >/dev/null 2>&1; then
+            fail "agent can read the database copy $path"
+            copies_readable=$((copies_readable + 1))
+        fi
+    done
+    if [ "${#db_copies[@]}" -gt 0 ] && [ "$copies_readable" -eq 0 ]; then
+        pass "agent cannot read any of the ${#db_copies[@]} database files and copies"
+    fi
+    local root secrets
+    for root in "${secret_roots[@]}"; do
+        secrets="$(find "$root" -xdev -maxdepth 6 \( -name node_modules -o -name .git -o -name .venv -o -name venv \) -prune -o -type f \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o -name 'id_ecdsa*' -o -name '*.p12' -o -name '*.pfx' -o -name 'credentials*.json' -o -name '.netrc' -o -name '.pgpass' -o -name '.git-credentials' \) ! -name '*.example' ! -name '*.sample' ! -name '*.template' ! -name '*.pub' -readable -print 2>/dev/null | head -n 10 | tr '\n' ' ')"
+        if [ -n "$secrets" ]; then
+            fail "agent can read secret files under $root: $secrets"
+        else
+            pass "agent can read no secret files under $root"
+        fi
+    done
     if [ -n "$orchestrator_home" ]; then
         if ls -- "$orchestrator_home" >/dev/null 2>&1; then
             fail "agent can list the orchestrator HOME $orchestrator_home"
         else
             pass "agent cannot list the orchestrator HOME"
+        fi
+        if [ -x "$orchestrator_home" ]; then
+            fail "agent can enter the orchestrator HOME $orchestrator_home (0711 exposes every file at a known name)"
         fi
         for path in .claude .claude.json .config .ssh .gitconfig .git-credentials .netrc .pgpass; do
             if head -c 1 -- "$orchestrator_home/$path" >/dev/null 2>&1 \
@@ -197,6 +243,27 @@ inside() {
     if [ "${HOME:-}" = "$orchestrator_home" ]; then
         fail "agent HOME is the orchestrator's HOME"
     fi
+
+    # --- per-unit HOME: nothing one agent leaves reaches the next ------------
+    local passwd_home
+    passwd_home="$(getent passwd "$user" | cut -d: -f6)"
+    if [ -n "$passwd_home" ] && [ -w "$passwd_home" ]; then
+        fail "agent can write its passwd HOME $passwd_home (files planted there reach later agents)"
+    else
+        pass "agent cannot write its passwd HOME ${passwd_home:-(none)}"
+    fi
+    case "${HOME:-}" in
+        */.equipa-agent/equipa-agent-*/home) pass "agent HOME is its own unit's $HOME" ;;
+        *) fail "agent HOME '${HOME:-}' is not a per-unit HOME" ;;
+    esac
+    case "${CLAUDE_CONFIG_DIR:-}" in
+        "$HOME"/*) pass "CLAUDE_CONFIG_DIR is inside the unit HOME" ;;
+        *) fail "CLAUDE_CONFIG_DIR '${CLAUDE_CONFIG_DIR:-}' is not inside the unit HOME" ;;
+    esac
+    case "${GIT_CONFIG_GLOBAL:-}" in
+        */.equipa-agent/equipa-agent-*/gitconfig) pass "GIT_CONFIG_GLOBAL is the unit's own file" ;;
+        *) fail "GIT_CONFIG_GLOBAL '${GIT_CONFIG_GLOBAL:-}' is not the unit's own file" ;;
+    esac
 
     if [ "$failures" -eq 0 ]; then echo "RESULT: PASS"; else
         echo "RESULT: FAIL ($failures failed)"; fi

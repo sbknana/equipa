@@ -411,3 +411,230 @@ def test_launcher_git_ignores_global_config_the_agent_planted(
                                   settings.max_export_bytes)
     review = repo["worktree"] / ".equipa-artifacts" / "SECURITY-REVIEW-1.md"
     assert review.read_text() == "clean\n"
+
+
+# --- ISO-03: the DB directory, the real -wal/-shm and every backup ----------------------
+
+
+@pytest.fixture
+def forge_layout(tmp_path: Path, monkeypatch) -> dict[str, Path]:
+    """The host layout from the review: THEFORGE_DB is a symlink in the
+    runtime to the live DB in its own directory, with world-readable
+    backups beside it and in a separate backup directory."""
+    forge = tmp_path / "TheForge"
+    forge.mkdir()
+    live = forge / "theforge.db"
+    for name in ("theforge.db", "theforge.db-wal", "theforge.db-shm",
+                 "theforge_backup_2026-09-30.db",
+                 "theforge.db.pre-consolidation-backup", "notes.txt",
+                 "schema.dbml"):
+        (forge / name).write_text("x")
+    backups = tmp_path / "backups"
+    (backups / "daily").mkdir(parents=True)
+    (backups / "daily" / "theforge_qiao_backup_1.db").write_text("x")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    link = runtime / "theforge.db"
+    link.symlink_to(live)
+    monkeypatch.setattr(isolation, "THEFORGE_DB", link)
+    return {"forge": forge, "live": live, "link": link, "backups": backups,
+            "runtime": runtime}
+
+
+def test_deny_read_covers_db_directory_real_side_files_and_backups(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    settings = _settings(tmp_path, db_backup_dirs=[str(forge_layout["backups"])])
+    denied = isolation._deny_read_paths(settings, None)
+    forge = forge_layout["forge"]
+    for expected in (forge, forge / "theforge.db", forge / "theforge.db-wal",
+                     forge / "theforge.db-shm", forge_layout["backups"]):
+        assert str(expected) in denied, expected
+
+
+def test_deny_read_covers_the_forge_mcp_source_database(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "forge.db").write_text("x")
+    denied = isolation._deny_read_paths(_settings(tmp_path),
+                                        str(other / "forge.db"))
+    assert str(other) in denied and str(other / "forge.db") in denied
+
+
+def test_launcher_refuses_an_enterable_deny_read_directory(tmp_path: Path) -> None:
+    """Search permission without read permission (mode 0711 for others)
+    still opens every file at a known name inside."""
+    directory = tmp_path / "TheForge"
+    directory.mkdir()
+    (directory / "theforge_backup.db").write_text("api_keys")
+    directory.chmod(0o100)  # enter, but not list, for this (owner) user
+    try:
+        session = agent_launcher._IsolatedSession(
+            _header(_unit(5), deny_read=[str(directory)]))
+        with pytest.raises(agent_launcher.IsolationRefused, match="can enter"):
+            session._verify_denied_access()
+        directory.chmod(0o000)
+        session._verify_denied_access()  # neither list nor enter: passes
+    finally:
+        directory.chmod(0o755)
+
+
+def test_database_copies_are_found_beside_the_db_and_in_backup_dirs(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    settings = _settings(tmp_path, db_backup_dirs=[str(forge_layout["backups"])])
+    directories = isolation.database_directories(settings)
+    assert directories == [str(forge_layout["forge"]),
+                           str(forge_layout["backups"])]
+    copies, truncated = isolation.find_database_copies(directories)
+    names = sorted(Path(path).name for path in copies)
+    assert names == ["theforge.db", "theforge.db-shm", "theforge.db-wal",
+                     "theforge.db.pre-consolidation-backup",
+                     "theforge_backup_2026-09-30.db",
+                     "theforge_qiao_backup_1.db"]
+    assert not truncated
+    assert isolation.find_database_copies(directories, limit=2)[1] is True
+
+
+def test_handoff_refuses_a_required_path_inside_the_db_directory(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    """A DB kept in the runtime would make the launcher unreachable once
+    its directory is closed; say so instead of a confusing launcher refusal."""
+    settings = _settings(tmp_path)
+    isolation.check_database_directory_conflicts(
+        settings, isolation.database_directories(settings), [])
+    with pytest.raises(isolation.AgentIsolationError, match="directory of its own"):
+        isolation.check_database_directory_conflicts(
+            settings, [str(Path(settings.launcher).parent.parent)], [])
+    with pytest.raises(isolation.AgentIsolationError, match="must not enter"):
+        isolation.check_database_directory_conflicts(
+            settings, [str(forge_layout["forge"])],
+            [str(forge_layout["forge"] / "mcp_server.py")])
+
+
+def test_probe_command_names_every_directory_and_copy(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    settings = _settings(tmp_path, db_backup_dirs=[str(forge_layout["backups"])],
+                         secret_scan_roots=[str(tmp_path / "projects")])
+    command = isolation.build_probe_command(
+        "probe", settings, [str(tmp_path / "repo")], str(tmp_path))
+
+    def values(option: str) -> list[str]:
+        return [command[i + 1] for i, arg in enumerate(command) if arg == option]
+
+    assert values("--deny-dir") == [str(forge_layout["forge"]),
+                                    str(forge_layout["backups"])]
+    copies = values("--db-copy")
+    for expected in (forge_layout["link"], forge_layout["live"],
+                     forge_layout["forge"] / "theforge.db-wal",
+                     forge_layout["forge"] / "theforge_backup_2026-09-30.db",
+                     forge_layout["backups"] / "daily" / "theforge_qiao_backup_1.db"):
+        assert str(expected) in copies, expected
+    assert values("--secret-root") == [str(tmp_path / "projects"),
+                                       str(tmp_path / "repo")]
+    text = (REPO_ROOT / "scripts" / "verify_agent_isolation.sh").read_text()
+    for option in ("--deny-dir", "--db-copy", "--secret-root"):
+        assert f"{option})" in text
+
+
+def test_outer_checks_fail_on_open_directories_and_copies(
+        tmp_path: Path, forge_layout: dict[str, Path], monkeypatch) -> None:
+    monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+    forge = forge_layout["forge"]
+    forge.chmod(0o755)
+    (forge / "theforge_backup_2026-09-30.db").chmod(0o644)
+    settings = _settings(tmp_path, db_backup_dirs=[str(forge_layout["backups"])])
+    failures = "\n".join(isolation._outer_checks(settings))
+    assert f"{forge} can be listed or entered by other users" in failures
+    assert "theforge_backup_2026-09-30.db is world-readable" in failures
+    assert "secret_scan_roots is empty" in failures
+    forge.chmod(0o700)
+    forge_layout["backups"].chmod(0o700)
+    for path in forge.iterdir():
+        path.chmod(0o600)
+    for path in forge_layout["backups"].rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    settings = _settings(tmp_path, db_backup_dirs=[str(forge_layout["backups"])],
+                         secret_scan_roots=[str(tmp_path)])
+    assert isolation._outer_checks(settings) == []
+
+
+VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_agent_isolation.sh"
+
+
+def _run_inside(tmp_path: Path, *args: str) -> list[str]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    sudo = fake_bin / "sudo"
+    sudo.write_text("#!/bin/sh\nexit 1\n")
+    sudo.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    result = subprocess.run([str(VERIFY_SCRIPT), "--inside", *args],
+                            capture_output=True, text=True, env=env,
+                            timeout=120, check=False)
+    return result.stdout.splitlines()
+
+
+def test_verify_script_fails_on_readable_db_directory_and_copies(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    """Run as the current user, who can read everything: every ISO-03
+    check must report FAIL (the script is what the operator runs)."""
+    forge = forge_layout["forge"]
+    backup = forge / "theforge_backup_2026-09-30.db"
+    lines = _run_inside(tmp_path, "--deny-dir", str(forge),
+                        "--db-copy", str(backup))
+    assert (f"FAIL agent can list or enter the TheForge database/backup "
+            f"directory {forge}") in lines
+    assert any(line.startswith(f"FAIL agent can read database copies under "
+                               f"{forge}") and "theforge_backup" in line
+               for line in lines)
+    assert f"FAIL agent can read the database copy {backup}" in lines
+    assert lines[-1].startswith("RESULT: FAIL")
+
+
+def test_verify_script_passes_a_closed_db_directory(
+        tmp_path: Path, forge_layout: dict[str, Path]) -> None:
+    forge = forge_layout["forge"]
+    backup = forge / "theforge_backup_2026-09-30.db"
+    forge.chmod(0o000)
+    try:
+        lines = _run_inside(tmp_path, "--deny-dir", str(forge),
+                            "--db-copy", str(backup))
+    finally:
+        forge.chmod(0o755)
+    assert f"PASS agent can neither list nor enter {forge}" in lines
+    assert "PASS agent cannot read any of the 1 database files and copies" in lines
+    assert not [line for line in lines if "database" in line
+                and line.startswith("FAIL")]
+
+
+# --- ISO-05: secret files below the project roots ---------------------------------------
+
+
+def test_verify_script_fails_on_readable_project_secrets(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    (projects / "shop" / "node_modules" / "x").mkdir(parents=True)
+    (projects / "shop" / ".env").write_text("STRIPE_KEY=sk_live_x\n")
+    (projects / "shop" / ".env.example").write_text("STRIPE_KEY=\n")
+    (projects / "shop" / "node_modules" / "x" / "test.pem").write_text("x")
+    (projects / "clean").mkdir()
+    (projects / "clean" / ".env.sample").write_text("")
+    lines = _run_inside(tmp_path, "--secret-root", str(projects),
+                        "--secret-root", str(projects / "clean"))
+    failed = [line for line in lines
+              if line.startswith(f"FAIL agent can read secret files under "
+                                 f"{projects}:")]
+    assert len(failed) == 1
+    assert str(projects / "shop" / ".env") in failed[0]
+    assert ".env.example" not in failed[0] and "node_modules" not in failed[0]
+    assert f"PASS agent can read no secret files under {projects / 'clean'}" \
+        in lines
+
+
+def test_verify_script_checks_the_per_unit_home(tmp_path: Path) -> None:
+    """ISO-02 on the host: the probe sees a per-unit HOME, config dir and
+    git config; as a normal user with a normal HOME it must FAIL."""
+    lines = _run_inside(tmp_path)
+    assert f"FAIL agent HOME '{tmp_path}' is not a per-unit HOME" in lines
+    assert any(line.startswith("FAIL agent can write its passwd HOME")
+               for line in lines)
+    assert "FAIL GIT_CONFIG_GLOBAL '' is not the unit's own file" in lines

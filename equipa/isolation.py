@@ -158,6 +158,8 @@ class IsolationSettings:
     privileged_groups: tuple[str, ...]
     oauth_token_file: str | None
     carry_ignored_paths: tuple[str, ...]
+    db_backup_dirs: tuple[str, ...] = ()
+    secret_scan_roots: tuple[str, ...] = ()
 
 
 _DEFAULTS: dict[str, Any] = {
@@ -184,6 +186,13 @@ _DEFAULTS: dict[str, Any] = {
     "privileged_groups": list(DEFAULT_PRIVILEGED_GROUPS),
     "oauth_token_file": None,
     "carry_ignored_paths": [".equipa-artifacts"],
+    # Directories holding TheForge backups or other copies of the database.
+    # Like the live database's own directory, the agent may neither list
+    # nor enter them (review ISO-03).
+    "db_backup_dirs": [],
+    # Directories holding project checkouts; the verify script fails if the
+    # agent user can read a secret-shaped file below them (review ISO-05).
+    "secret_scan_roots": [],
 }
 
 
@@ -278,6 +287,11 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
     deny_write = _str_tuple(raw, "deny_write") if raw.get("deny_write") else ()
     if not all(os.path.isabs(item) for item in (*deny_read, *deny_write)):
         raise _setting_error("deny_read/deny_write", "must hold absolute paths")
+    path_lists = {key: (_str_tuple(raw, key) if raw.get(key) else ())
+                  for key in ("db_backup_dirs", "secret_scan_roots")}
+    for key, paths in path_lists.items():
+        if not all(os.path.isabs(item) for item in paths):
+            raise _setting_error(key, "must hold absolute paths")
     return IsolationSettings(
         agent_user=agent_user,
         python=_abs_path(raw, "python", sudoers=True),
@@ -304,6 +318,10 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
         privileged_groups=_str_tuple(raw, "privileged_groups"),
         oauth_token_file=_abs_path(raw, "oauth_token_file", optional=True),
         carry_ignored_paths=carry,
+        db_backup_dirs=tuple(os.path.normpath(p)
+                             for p in path_lists["db_backup_dirs"]),
+        secret_scan_roots=tuple(os.path.normpath(p)
+                                for p in path_lists["secret_scan_roots"]),
     )
 
 
@@ -1021,19 +1039,77 @@ def _existing(paths: Iterable[str | os.PathLike[str] | None]) -> list[str]:
                    if path and os.path.lexists(os.fspath(path))})
 
 
+def database_file_paths(database: str | os.PathLike[str] | None) -> list[str]:
+    """The database and its SQLite side files, both as named and resolved.
+
+    THEFORGE_DB is often a symlink, and SQLite keeps -wal/-shm next to the
+    link's TARGET, so the side files beside the link may not exist while the
+    real ones do (review ISO-03).
+    """
+    if not database:
+        return []
+    named = os.path.abspath(os.fspath(database))
+    paths: list[str] = []
+    for base in dict.fromkeys((named, os.path.realpath(named))):
+        paths += [base, f"{base}-wal", f"{base}-shm", f"{base}-journal"]
+    return paths
+
+
+def database_directories(settings: IsolationSettings,
+                         forge_source_db: str | None = None) -> list[str]:
+    """Directories the agent may neither list nor enter: the resolved
+    directory of every TheForge database and ``db_backup_dirs``.
+
+    Protecting the directory, not the file, covers every backup and copy
+    kept beside the database (``theforge_backup_*.db`` held api_keys while
+    only the live file was checked; review ISO-03).
+    """
+    directories = [os.path.dirname(os.path.realpath(os.fspath(database)))
+                   for database in (THEFORGE_DB, forge_source_db) if database]
+    directories += [os.path.realpath(path) for path in settings.db_backup_dirs]
+    return list(dict.fromkeys(directories))
+
+
 def _deny_read_paths(settings: IsolationSettings,
                      forge_source_db: str | None) -> list[str]:
+    """Paths the launcher refuses to run with if the agent can read them;
+    for a directory, entering it counts as reading (see the launcher)."""
     import pwd
 
     home = pwd.getpwuid(os.getuid()).pw_dir
-    databases = [str(THEFORGE_DB), forge_source_db]
     candidates: list[str | None] = [MCP_CONFIG.as_posix(), home]
-    for database in databases:
-        if database:
-            candidates += [database, f"{database}-wal", f"{database}-shm"]
+    for database in (str(THEFORGE_DB), forge_source_db):
+        candidates += database_file_paths(database)
+    candidates += database_directories(settings, forge_source_db)
     candidates += [os.path.join(home, name) for name in ORCHESTRATOR_HOME_SECRETS]
     candidates += settings.deny_read
     return _existing(candidates)
+
+
+def _is_within(path: str, directory: str) -> bool:
+    real_path, real_directory = os.path.realpath(path), os.path.realpath(directory)
+    return (real_path == real_directory
+            or real_path.startswith(real_directory.rstrip(os.sep) + os.sep))
+
+
+def check_database_directory_conflicts(settings: IsolationSettings,
+                                       directories: Sequence[str],
+                                       required: Iterable[str]) -> None:
+    """Refuse when something the agent must reach lies inside a directory it
+    must not enter. The launcher would refuse too, but with a less direct
+    reason; this names the fix."""
+    needed = [settings.launcher, settings.python, settings.claude_executable,
+              settings.git_executable, settings.exchange_dir,
+              *([settings.view_db_path] if settings.view_db_path else []),
+              *required]
+    for directory in directories:
+        for path in needed:
+            if _is_within(path, directory):
+                raise AgentIsolationError(
+                    f"{path} is inside {directory}, a TheForge database or "
+                    f"backup directory the agent must not enter; keep the "
+                    f"database in a directory of its own "
+                    f"(docs/AGENT_ISOLATION.md step 3)")
 
 
 def _deny_write_paths(settings: IsolationSettings,
@@ -1106,6 +1182,9 @@ def build_handoff(cmd: Sequence[str], cwd: str | None, env: Mapping[str, str],
             index += 2
             continue
         index += 1
+    check_database_directory_conflicts(
+        settings, database_directories(settings, forge_source_db),
+        [*needs.execute, *needs.read])
     if forge_source_db is not None:
         refresh_view_db(Path(forge_source_db), Path(settings.view_db_path),
                         settings.exclude_tables)
@@ -1500,6 +1579,87 @@ async def spawn_isolated_agent(
 # --- Operator verification (scripts/verify_agent_isolation.sh) --------------------
 
 
+# Database files and copies: x.db, x.db-wal, x.db.pre-consolidation-backup,
+# theforge_backup_<date>.db, x.sqlite3 ...
+_DATABASE_COPY_RE = re.compile(r"\.(?:db|sqlite3?)(?:$|[-._])", re.IGNORECASE)
+_MAX_DATABASE_COPIES = 5000
+
+
+def find_database_copies(directories: Iterable[str],
+                         limit: int = _MAX_DATABASE_COPIES
+                         ) -> tuple[list[str], bool]:
+    """Every database-looking file below ``directories``, as the
+    orchestrator sees them; returns (paths, truncated at ``limit``)."""
+    found: set[str] = set()
+    for directory in directories:
+        for root, _dirs, files in os.walk(directory, followlinks=False):
+            for name in files:
+                if _DATABASE_COPY_RE.search(name):
+                    found.add(os.path.join(root, name))
+                    if len(found) >= limit:
+                        return sorted(found), True
+    return sorted(found), False
+
+
+def forge_source_database(settings: IsolationSettings) -> str | None:
+    """The --db-path of the forge MCP server in mcp_config.json, or None."""
+    try:
+        config = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
+        args = config["mcpServers"][settings.forge_mcp_server]["args"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(args, list):
+        return None
+    for index, arg in enumerate(args):
+        if arg == "--db-path" and index + 1 < len(args):
+            return str(args[index + 1])
+        if isinstance(arg, str) and arg.startswith("--db-path="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _agent_in_group(settings: IsolationSettings, gid: int) -> bool:
+    import grp
+    import pwd
+
+    try:
+        entry = pwd.getpwnam(settings.agent_user)
+        members = grp.getgrgid(gid).gr_mem
+    except KeyError:
+        return False
+    return entry.pw_gid == gid or settings.agent_user in members
+
+
+def _database_directory_failures(settings: IsolationSettings,
+                                 directories: Sequence[str]) -> list[str]:
+    """Mode checks, as the orchestrator, on the database and backup
+    directories and on every copy below them (review ISO-03)."""
+    failures: list[str] = []
+    for directory in directories:
+        try:
+            info = os.stat(directory)
+        except OSError as exc:
+            failures.append(f"TheForge database/backup directory {directory} "
+                            f"cannot be checked: {exc}")
+            continue
+        if info.st_mode & (stat.S_IROTH | stat.S_IXOTH):
+            failures.append(f"{directory} can be listed or entered by other "
+                            f"users, the agent included (chmod o-rwx)")
+        if (info.st_mode & (stat.S_IRGRP | stat.S_IXGRP)
+                and _agent_in_group(settings, info.st_gid)):
+            failures.append(f"{directory} is open to a group the agent user "
+                            f"is in (chmod g-rwx or change its group)")
+    copies, truncated = find_database_copies(directories)
+    for copy in copies:
+        with contextlib.suppress(OSError):
+            if os.stat(copy).st_mode & stat.S_IROTH:
+                failures.append(f"{copy} is world-readable (chmod 0600)")
+    if truncated:
+        failures.append(f"more than {_MAX_DATABASE_COPIES} database copies "
+                        f"under {list(directories)}; clean up before verifying")
+    return failures
+
+
 def _outer_checks(settings: IsolationSettings) -> list[str]:
     """Checks made as the orchestrator user; returns failure messages."""
     import pwd
@@ -1515,6 +1675,12 @@ def _outer_checks(settings: IsolationSettings) -> list[str]:
     database = Path(THEFORGE_DB)
     if database.exists() and database.stat().st_mode & stat.S_IROTH:
         failures.append(f"{database} is world-readable (chmod o-r)")
+    failures += _database_directory_failures(
+        settings, database_directories(settings, forge_source_database(settings)))
+    if not settings.secret_scan_roots:
+        failures.append(f"{CONFIG_KEY}.secret_scan_roots is empty; list the "
+                        f"directories that hold project checkouts so the "
+                        f"agent's access to their secrets is checked")
     return failures
 
 
@@ -1552,6 +1718,21 @@ def build_probe_command(probe: str, settings: IsolationSettings,
             command += ["--exclude-table", table]
     if MCP_CONFIG.is_file():
         command += ["--mcp-config", str(MCP_CONFIG)]
+    # ISO-03: the directories themselves, and every copy the orchestrator
+    # can see in them, are probed as the agent.
+    source_db = forge_source_database(settings)
+    directories = database_directories(settings, source_db)
+    for directory in directories:
+        command += ["--deny-dir", directory]
+    copies, _truncated = find_database_copies(directories)
+    side_files = [path for path in (*database_file_paths(THEFORGE_DB),
+                                    *database_file_paths(source_db))
+                  if os.path.lexists(path)]
+    for path in dict.fromkeys([*side_files, *copies]):
+        command += ["--db-copy", path]
+    # ISO-05: secret-shaped files readable below the project roots.
+    for root in dict.fromkeys([*settings.secret_scan_roots, *repos]):
+        command += ["--secret-root", root]
     return command
 
 

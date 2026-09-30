@@ -655,6 +655,11 @@ def _can_open_for_reading(path: str) -> bool:
     return True
 
 
+def _can_enter_directory(path: str) -> bool:
+    """True if ``path`` is a directory this process may search (X_OK)."""
+    return os.path.isdir(path) and os.access(path, os.X_OK)
+
+
 def _remove_tree(path: Path) -> None:
     """rmtree that also removes entries the agent made read-only."""
     def make_writable_and_retry(function, target, _exc_info) -> None:
@@ -814,6 +819,11 @@ class _IsolatedSession:
         for path in self.deny_read:
             if _can_open_for_reading(path):
                 raise IsolationRefused(f"the agent user can read {path}")
+            # Search permission alone opens every world-readable file at a
+            # known name inside: backups beside the TheForge DB, dot-files
+            # in a 0711 HOME (reviews ISO-03, ISO-07).
+            if _can_enter_directory(path):
+                raise IsolationRefused(f"the agent user can enter {path}")
         for path in self.deny_write:
             if os.access(path, os.W_OK):
                 raise IsolationRefused(f"the agent user can write {path}")

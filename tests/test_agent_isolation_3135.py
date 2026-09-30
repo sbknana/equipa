@@ -1069,7 +1069,9 @@ def _verification_config(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "exchange").mkdir(exist_ok=True)
     monkeypatch.setattr(isolation, "get_active_dispatch_config", lambda: {
         "features": {"agent_isolation": True},
-        "agent_isolation": {"exchange_dir": str(tmp_path / "exchange")}})
+        "agent_isolation": {"exchange_dir": str(tmp_path / "exchange"),
+                            # Required since task 3136 (ISO-05).
+                            "secret_scan_roots": [str(tmp_path)]}})
     monkeypatch.setattr(isolation, "THEFORGE_DB", tmp_path / "missing.db")
 
 
