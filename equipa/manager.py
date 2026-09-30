@@ -8,10 +8,13 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from typing import Any
 
 from equipa.agent_runner import (
     OVERLOADED_OUTCOME,
+    _run_started_at_utc,
     build_cli_command,
     is_overloaded_result,
     run_agent,
@@ -21,12 +24,15 @@ from equipa.constants import (
     MAX_FOLLOWUP_TASKS,
     MAX_TASKS_PER_PLAN,
 )
-from equipa.db import update_task_status
+from equipa.db import get_db_connection, update_task_status
 from equipa.loops import run_dev_test_loop
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
+from equipa.single_agent_guard import TasksCreatedDb, validate_tasks_created_claim
 from equipa.tasks import _get_task_status, fetch_tasks_by_ids
+
+logger = logging.getLogger(__name__)
 
 
 def parse_planner_output(result_text: str) -> list[int]:
@@ -97,6 +103,36 @@ def parse_evaluator_output(result_text: str) -> dict[str, Any]:
     return parsed
 
 
+def _reject_planner_claim(
+    task_ids: list[int],
+    project_id: int,
+    run_started_at: str | None,
+) -> str | None:
+    """Why the planner's ``TASKS_CREATED`` ids must not run, or None if valid.
+
+    dispatch-16 (task #3112): goal mode used to execute whatever ids the
+    planner printed, so a hallucinated line naming another project's tasks
+    ran them in this project's directory and flipped their status. The exact
+    ids the manager would execute are checked with
+    ``validate_tasks_created_claim``: each must exist, belong to
+    ``project_id`` and have been created during this planner run. A failed
+    lookup rejects the claim (fail closed).
+    """
+    claim_text = "TASKS_CREATED: " + ",".join(str(task_id) for task_id in task_ids)
+    try:
+        with TasksCreatedDb(get_db_connection()) as db:
+            verdict = validate_tasks_created_claim(
+                stdout=claim_text,
+                run_started_at=run_started_at,
+                expected_project_id=project_id,
+                db=db,
+            )
+    except (sqlite3.Error, OSError) as exc:
+        logger.exception("[Planner] TASKS_CREATED validation could not read TheForge")
+        return f"could not verify the claimed ids against TheForge: {exc}"
+    return None if verdict.is_valid else verdict.reason
+
+
 async def run_planner_agent(
     goal: str,
     project_id: int,
@@ -121,6 +157,7 @@ async def run_planner_agent(
         prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
     ) as cmd:
         log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        run_started_at = _run_started_at_utc()
         result = await run_agent(cmd)
 
     if is_overloaded_result(result):
@@ -137,6 +174,13 @@ async def run_planner_agent(
         log(f"  [Planner] Created {len(task_ids)} tasks (max {MAX_TASKS_PER_PLAN}). "
             f"Using first {MAX_TASKS_PER_PLAN}.", output)
         task_ids = task_ids[:MAX_TASKS_PER_PLAN]
+
+    if task_ids:
+        rejection = _reject_planner_claim(task_ids, project_id, run_started_at)
+        if rejection:
+            log(f"  [Planner] REJECTED TASKS_CREATED claim {task_ids}: {rejection}. "
+                f"No task from this plan is executed.", output)
+            return result, []
 
     if task_ids:
         log(f"  [Planner] Created {len(task_ids)} tasks: {task_ids}", output)

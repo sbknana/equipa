@@ -483,6 +483,46 @@ def _parse_iso_timestamp(value: Any) -> datetime | None:
     return None
 
 
+class TasksCreatedDb:
+    """Adapter exposing ``fetch_tasks_by_ids`` over a sqlite3 connection.
+
+    Used by :func:`validate_tasks_created_claim` so this module does not
+    need to know about EQUIPA's db helpers. Closes the connection on exit.
+    Shared by the single-agent CLI path and the goal-mode planner
+    (task #3112, dispatch-16).
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def fetch_tasks_by_ids(self, ids: Iterable[Any]) -> list[dict[str, Any]]:
+        ids = [int(i) for i in ids if i is not None]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"SELECT id, project_id, created_at FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        )
+        return [
+            {"id": r[0], "project_id": r[1], "created_at": r[2]}
+            for r in cur.fetchall()
+        ]
+
+    def close(self) -> None:
+        # QS-01 leak family: the wrapped sqlite3 connection must be closed.
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover — defensive
+            logger.debug("closing the TASKS_CREATED db connection failed", exc_info=True)
+
+    def __enter__(self) -> "TasksCreatedDb":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+
 def validate_tasks_created_claim(
     *,
     stdout: str,
@@ -574,6 +614,7 @@ def validate_tasks_created_claim(
 
 __all__ = [
     "SingleAgentOutcome",
+    "TasksCreatedDb",
     "TasksCreatedValidation",
     "evaluate_single_agent_outcome",
     "validate_tasks_created_claim",

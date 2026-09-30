@@ -100,6 +100,7 @@ from equipa.roles import _discover_roles, get_role_model, get_role_turns
 from equipa.routing import CircuitOpenError
 from equipa.routing import record_model_outcome
 from equipa.security import write_skill_manifest
+from equipa.single_agent_guard import TasksCreatedDb
 from equipa.security_gate import (
     get_changed_files_for_branch,
     is_doc_only_diff,
@@ -263,43 +264,9 @@ def _handle_add_project(name: str, project_dir: str) -> None:
 
 
 # --- TASKS_CREATED validator DB adapter (task #2371) ---
-
-class _TasksCreatedDb:
-    """Adapter exposing ``fetch_tasks_by_ids`` over a sqlite3 connection.
-
-    Used by ``validate_tasks_created_claim`` so the guard module does
-    not need to know about EQUIPA's specific db helpers.
-    """
-
-    def __init__(self, conn) -> None:
-        self._conn = conn
-
-    def fetch_tasks_by_ids(self, ids):
-        ids = [int(i) for i in ids if i is not None]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        cur = self._conn.execute(
-            f"SELECT id, project_id, created_at FROM tasks WHERE id IN ({placeholders})",
-            ids,
-        )
-        return [
-            {"id": r[0], "project_id": r[1], "created_at": r[2]}
-            for r in cur.fetchall()
-        ]
-
-    def close(self) -> None:
-        # QS-01 leak family: the wrapped sqlite3 connection must be closed.
-        try:
-            self._conn.close()
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-    def __enter__(self) -> "_TasksCreatedDb":
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        self.close()
+# Moved to equipa.single_agent_guard (task #3112) so goal mode can share it;
+# the old private name stays importable from here.
+_TasksCreatedDb = TasksCreatedDb
 
 
 # --- Post-Task Telemetry ---
