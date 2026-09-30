@@ -1016,10 +1016,20 @@ def _extract_dollar_paren_inners(text: str) -> list[str]:
     substitution, but the surrounding caller has already stripped quoted
     content.
     """
+    return _extract_paren_inners(text, "$")
+
+
+def _extract_paren_inners(text: str, sigil: str) -> list[str]:
+    """Return the inner text of every top-level ``<sigil>(...)`` construct.
+
+    *sigil* is ``"$"`` for command substitution or ``"<"`` for process
+    substitution. Same naive nesting-aware scan as
+    ``_extract_dollar_paren_inners``.
+    """
     inners: list[str] = []
     i = 0
     while i < len(text) - 1:
-        if text[i] == "$" and text[i + 1] == "(":
+        if text[i] == sigil and text[i + 1] == "(":
             depth = 1
             j = i + 2
             start = j
@@ -1134,6 +1144,17 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
             scrubbed = unquoted
     else:
         scrubbed = unquoted
+
+    # <(...) process substitution (sandbox-13): `diff <(sort a) <(sort b)`
+    # only reads the output of the inner commands, so it gets the same
+    # read-only allowlist as $(...). >(...) feeds data INTO a command and
+    # stays blocked unconditionally.
+    if "<(" in scrubbed:
+        process_inners = _extract_paren_inners(scrubbed, "<")
+        if process_inners and all(
+            _is_safe_substitution_inner(inner) for inner in process_inners
+        ):
+            scrubbed = re.sub(r"<\([^()]*\)", "", scrubbed)
 
     for pattern, desc in _COMMAND_SUBSTITUTION_PATTERNS:
         if pattern.search(scrubbed):
