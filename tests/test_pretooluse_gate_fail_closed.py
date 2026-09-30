@@ -309,6 +309,9 @@ def test_valid_config_can_still_turn_the_gate_off(tmp_path: Path):
         ("0", False),
         (" TRUE ", True),
         ("False", False),
+        # JSON integers 0/1 (BS3121-02): main treated 1 as ON.
+        (1, True),
+        (0, False),
     ],
 )
 def test_flag_coercion_accepts_documented_values(value: object, expected: bool):
@@ -317,26 +320,63 @@ def test_flag_coercion_accepts_documented_values(value: object, expected: bool):
     # And in the other direction for a default-ON flag.
     config = {"features": {"security_review": value}}
     assert is_feature_enabled(config, "security_review") is expected
+    # And for an ordinary default-OFF flag.
+    config = {"features": {"hooks": value}}
+    assert is_feature_enabled(config, "hooks") is expected
 
 
-@pytest.mark.parametrize(
-    "value", ["yes", "no", "off", "on", "", "enabled", 1, 0, 2, None, [], {}, 1.0]
-)
-def test_flag_coercion_rejects_other_values_with_warning(
+INVALID_FLAG_VALUES = [
+    "yes", "no", "off", "on", "", "enabled", 2, -1, None, [], {}, 1.0, 0.0,
+]
+
+
+@pytest.mark.parametrize("value", INVALID_FLAG_VALUES)
+def test_invalid_value_uses_default_for_ordinary_flags(
     value: object, caplog: pytest.LogCaptureFixture
 ):
     with caplog.at_level(logging.WARNING, logger="equipa.config"):
         # Default OFF flag: the string "false" used to be truthy -> ON.
-        off_default = is_feature_enabled(
-            {"features": {"bash_security_pretooluse": value}},
-            "bash_security_pretooluse",
-        )
+        off_default = is_feature_enabled({"features": {"hooks": value}}, "hooks")
         on_default = is_feature_enabled(
             {"features": {"security_review": value}}, "security_review"
         )
-    assert off_default is DEFAULT_FEATURE_FLAGS["bash_security_pretooluse"]
+    assert off_default is DEFAULT_FEATURE_FLAGS["hooks"]
     assert on_default is DEFAULT_FEATURE_FLAGS["security_review"]
     assert sum("invalid value" in r.getMessage() for r in caplog.records) == 2
+
+
+@pytest.mark.parametrize("value", INVALID_FLAG_VALUES)
+def test_invalid_value_forces_security_gate_on(
+    value: object, caplog: pytest.LogCaptureFixture
+):
+    """BS3121-02: an unrecognised value for a FAIL_CLOSED flag is treated like
+    a load error - ERROR logged, gate ON - never like "use the default OFF"."""
+    with caplog.at_level(logging.WARNING, logger="equipa.config"):
+        enabled = is_feature_enabled(
+            {"features": {"bash_security_pretooluse": value}},
+            "bash_security_pretooluse",
+        )
+    assert enabled is True
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(
+        "fail-closed" in r.getMessage() and "bash_security_pretooluse" in r.getMessage()
+        for r in errors
+    ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize("value", [1, "yes", "on", "ON", " Yes "])
+def test_operator_spellings_of_on_keep_the_gate_on(value: object):
+    """The review's probe: 1, "yes" and "on" used to turn the gate OFF."""
+    config = {"features": {"bash_security_pretooluse": value}}
+    assert is_feature_enabled(config, "bash_security_pretooluse") is True
+
+
+def test_bool_is_not_mistaken_for_an_integer():
+    """True/False are ints in Python; they keep their JSON-boolean meaning."""
+    assert is_feature_enabled({"features": {"hooks": True}}, "hooks") is True
+    assert is_feature_enabled(
+        {"features": {"bash_security_pretooluse": False}}, "bash_security_pretooluse"
+    ) is False
 
 
 def test_features_not_a_dict_uses_defaults(caplog: pytest.LogCaptureFixture):
@@ -344,3 +384,19 @@ def test_features_not_a_dict_uses_defaults(caplog: pytest.LogCaptureFixture):
         assert is_feature_enabled({"features": ["hooks"]}, "hooks") is False
         assert is_feature_enabled({"features": "x"}, "security_review") is True
     assert any("not a dict" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("features", [None, "x", ["bash_security_pretooluse"], 1])
+def test_features_not_a_dict_forces_security_gate_on(
+    features: object, caplog: pytest.LogCaptureFixture
+):
+    """BS3121-02: ``"features": null`` must not switch the gate off."""
+    with caplog.at_level(logging.WARNING, logger="equipa.config"):
+        enabled = is_feature_enabled(
+            {"features": features}, "bash_security_pretooluse"
+        )
+    assert enabled is True
+    assert any(
+        r.levelno >= logging.ERROR and "fail-closed" in r.getMessage()
+        for r in caplog.records
+    )

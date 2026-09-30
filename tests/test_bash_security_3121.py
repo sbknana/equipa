@@ -303,6 +303,15 @@ class TestRedirectTargets:
         result = check_bash_command(command)
         assert result.safe, f"false positive on {command!r}: {result.message}"
 
+    def test_redirect_scan_does_not_start_inside_a_quote(self):
+        """``$'\\''`` is one complete word; the redirect after it is real."""
+        assert bash_security._shell_redirects("echo $'\\'' >> /etc/x") == [
+            ("out", "/etc/x", False)
+        ]
+        assert bash_security._shell_redirects(
+            "echo \"$(echo '\"')\" >> /etc/x"
+        ) == [("out", "/etc/x", False)]
+
     def test_word_reader_joins_quoted_parts(self):
         literal, dynamic, _ = bash_security._read_shell_word(
             '/tmp/x"/../"\'..\'/y z', 0
@@ -311,6 +320,93 @@ class TestRedirectTargets:
 
     def test_fd_duplication_is_not_a_file_target(self):
         assert bash_security._shell_redirects("cmd 2>&1 >&2 <&0 >&-") == []
+
+
+# ---------------------------------------------------------------------------
+# BS3121-01 (task 3128): quote forms that desynced the old quote model
+# ---------------------------------------------------------------------------
+
+# Each word is complete and harmless in bash, and each ends in a state the
+# old per-check quote scanners misread as "inside a quote", hiding every
+# later substitution and redirect from checks 8 and 10.
+DESYNC_WORDS = {
+    "ansi-c-apostrophe": "$'\\''",
+    "nested-dq-quote": "\"$(echo '\"')\"",
+}
+
+
+def _desync_variants(command: str) -> list[str]:
+    """The desync word chained before *command*, and (for a plain first
+    word) inserted as the first argument, the reviewer's probe shape."""
+    variants = [
+        f"echo {word} && {command}" for word in DESYNC_WORDS.values()
+    ]
+    first, _, rest = command.partition(" ")
+    if rest and first.isidentifier():
+        variants += [f"{first} {word} {rest}" for word in DESYNC_WORDS.values()]
+    return variants
+
+
+SANDBOX_01_AND_08_CASES = DOUBLE_QUOTED_SUBSTITUTION_BYPASSES + TRAVERSAL_REDIRECTS
+
+DESYNC_BYPASSES = sorted({
+    variant
+    for command in SANDBOX_01_AND_08_CASES
+    for variant in _desync_variants(command)
+} | {
+    # SECURITY-REVIEW-3121 probes, verbatim apart from the sentinel paths.
+    "echo $'\\'' $(touch /tmp/zz-sentinel)",
+    "echo $'\\'' `touch /tmp/zz-sentinel`",
+    "echo $'\\'' >> /etc/zz-fake",
+    "echo $'\\'' >> ~/zz-fake",
+    "echo $'\\'' >> /tmp/../var/tmp/zz-sentinel",
+    "echo $'\\'' >> /tmp/zz-scratch/b/../out.txt",
+    "echo \"$(echo '\"')\" $(touch /tmp/zz-sentinel)",
+    "echo \"$(echo '\"')\" `touch /tmp/zz-sentinel`",
+    "echo \"$(echo '\"')\" >> /etc/zz-fake",
+    "echo \"$(echo '\"')\" >> /tmp/../var/tmp/zz-sentinel",
+    # The same desync inside a double-quoted substitution's inner command,
+    # which the read-only allowlist splits into segments.
+    "echo \"$(grep $'\\'' f; touch /tmp/zz-sentinel)\"",
+    # A quoted heredoc that bash never sees (the << is inside $'...'):
+    # its "body" is live code, and the inert-heredoc strip must not hide it.
+    "cat $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF\n#'",
+    "cat $'\\' <<'EOF'\n'; echo x >> /tmp/../etc/zz-fake #\nEOF\n#'",
+})
+
+
+class TestQuoteDesyncBypasses:
+
+    @pytest.mark.parametrize("word", sorted(DESYNC_WORDS.values()))
+    def test_desync_word_alone_is_allowed(self, word: str):
+        """Control: the prefix itself passes, so each block below comes from
+        the payload after it, not from the prefix."""
+        result = check_bash_command(f"echo {word}")
+        assert result.safe, result
+
+    @pytest.mark.parametrize("command", DESYNC_BYPASSES)
+    def test_payload_after_desync_word_blocks(self, command: str):
+        result = check_bash_command(command)
+        assert not result.safe, f"bypass allowed: {command!r}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo 'unterminated",
+            "echo \"unterminated",
+            "echo $'unterminated\\'",
+            "echo \"$(echo x\"",
+            "echo $(echo x",
+            "echo `id",
+            "echo ${HOME",
+            "echo \"$(echo ')\"",
+        ],
+    )
+    def test_unterminated_quote_or_substitution_fails_closed(self, command: str):
+        result = check_bash_command(command)
+        assert not result.safe
+        assert result.check_id == CheckID.UNPARSEABLE_QUOTING, result
+        assert "could not be parsed" in result.message
 
 
 # ---------------------------------------------------------------------------
