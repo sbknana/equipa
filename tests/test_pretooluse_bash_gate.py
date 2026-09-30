@@ -133,13 +133,16 @@ def test_hook_allows_empty_command():
 
 
 @pytest.mark.parametrize("stdin_text", ["", "   ", "not json at all", "[1, 2, 3]"])
-def test_hook_fails_open_on_bad_stdin(stdin_text: str):
-    """Unparseable / non-dict stdin must fail OPEN (exit 0), never brick the agent.
+def test_hook_fails_closed_on_bad_stdin(stdin_text: str):
+    """Unparseable / non-dict stdin must fail CLOSED (exit 2) with a reason.
 
-    The reactive stream check in agent_runner remains as defense-in-depth, so a
-    hook infrastructure error must not block every command.
+    EQUIPA review 2026-09-29 sandbox-06: the old fail-open contract relied on
+    the reactive stream check, which does not run for every role. A payload
+    the gate cannot read is a command it cannot judge, so it is blocked.
     """
-    assert _run_hook(stdin_text).returncode == 0
+    result = _run_hook(stdin_text)
+    assert result.returncode == 2, (result.returncode, result.stderr)
+    assert "fails closed" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +171,12 @@ def test_extract_bash_command_variants():
     assert mod._extract_bash_command(
         {"tool_name": "Bash", "tool_input": {"command": "   "}}
     ) is None
-    assert mod._extract_bash_command({"tool_name": "Bash"}) is None
-    assert mod._extract_bash_command({}) is None
+    # A Bash call without a judgeable command, or a payload without a tool
+    # name, is unparseable: the gate raises so main() can fail closed.
+    with pytest.raises(mod.PayloadError):
+        mod._extract_bash_command({"tool_name": "Bash"})
+    with pytest.raises(mod.PayloadError):
+        mod._extract_bash_command({})
 
 
 def test_load_check_bash_command_resolves_isolated_checker():

@@ -2,181 +2,156 @@
 
 > **Read this BEFORE making any bash command from inside an EQUIPA dispatch on this repo.**
 >
-> EQUIPA's bash security validator (`equipa/bash_security.py` — yes, the same code you may be modifying) runs every shell command the agent emits. Several common shell idioms trip false positives. These patterns will get you killed mid-task — with up to 25 autoresearch retries failing on the same shape.
->
-> The most painful case observed: **task 2320** (the very fix for one of these false positives) exhausted all 25 retries because every retry tried to test the fix using `gh pr create --body "$(cat <<EOF ...)"` — which tripped check 19 (heredoc inside command substitution). Don't be that task. Read this doc.
+> EQUIPA's bash security classifier (`equipa/bash_security.py` — yes, the same code you may be modifying) judges the shell commands agents emit. Several common shell idioms still trip false positives, and a blocked command can end your run. This page lists what is blocked, what passes, and the shapes to use instead.
 
-## The trap that took 2320 down
+## What the checker does — and what it does not
 
-When you're working on `equipa/bash_security.py` itself, **the checks you're modifying are running against your own bash commands in real time**. You cannot test a check-23 fix by invoking `gh pr create --body "$(cat <<EOF ... EOF)"` — that pattern also fires check 19, and you'll burn every retry attempting variations of the same shape.
+The classifier is enforced in two places, with different guarantees:
 
-**Rule of thumb when modifying `bash_security.py`:** test via pytest unit tests against `check_bash_command()` DIRECTLY in `tests/test_bash_security.py`. NEVER invoke `gh pr create`, `git commit -m "$(cat <<...)"`, or `python3 -c "..."` with embedded multi-line content to "exercise" the check. The checks fire on YOUR bash, not on YOUR test inputs.
+- **Pre-execution gate** (`hooks/pretooluse_bash_gate.py`, feature flag `features.bash_security_pretooluse`, default OFF in code). When the flag is on, `build_cli_command` wires a Claude Code PreToolUse hook into the agent CLI through a generated `--settings` file. Exception, still open (SECURITY-REVIEW-3121 BS3121-04, in `agent_runner.py`): if the hook script is missing or the settings file cannot be written, the agent is started without the gate and only a WARNING is logged. The hook runs the classifier *before* the Bash tool executes and refuses an unsafe command (exit 2, reason on stderr), so the command never runs. The gate **fails closed**: if the payload cannot be parsed, the checker cannot be loaded (import or syntax error), the checker raises, or it returns something unusable, the command is blocked with a `pretooluse_bash_gate: ... fails closed` reason. The flag is forced ON, with an ERROR logged, when `dispatch_config.json` exists but cannot be read or parsed, when its `features` value is not an object, or when the flag's value is not one of `true`/`false`, `0`/`1` or the strings `"true"`/`"false"`/`"1"`/`"0"` (so `"yes"`, `"on"` or `null` keep the gate on rather than turning it off).
+- **Reactive stream check** (`equipa/agent_runner.py`). For roles that run with streaming output, the orchestrator also runs the classifier on each Bash call it sees in the stream. The CLI has already executed the call by then, so this detects and terminates; it does not prevent. Roles that run without streaming (the early-term-exempt ones, such as planner, evaluator, the reviewers and researcher) are **not** checked this way.
+
+What it is **not**:
+
+- **Not every command is checked.** With the flag off, only streaming roles get the (after-the-fact) reactive check.
+- **Not a permission policy.** The classifier detects parser-confusion and substitution tricks. Plainly destructive or powerful commands pass: `rm -rf build/`, `bash scripts/x.sh`, `git push --force`, and writing any file through the Write/Edit tools.
+- **Not a sandbox.** A task worktree is a separate git checkout, not an isolation boundary. Agents run as the same user as the orchestrator, and the redirect checks below are textual: a symlink that points elsewhere (even one created earlier in the same command) is not detected, and neither is a writer that is not a redirect, such as `tee -a`.
+
+How it reads a command: one tokenizer (`_scan_shell` in `equipa/bash_security.py`) classifies every character the way bash parses it: `'...'`, `"..."`, `$'...'` with its backslash escapes, `$"..."`, quoting that starts afresh inside `$(...)` (even within double quotes), backticks, `${...}`, `#` comments and heredoc bodies. Every check that cares about quoting reads that one classification, and a separate test compares it with bash on a generated corpus. A command it cannot parse to a clean end is **refused** (check 25) rather than guessed at: an unterminated quote or substitution, a `case` statement inside `$(...)`, a `((` that is not an arithmetic command (write `( (`), a heredoc delimiter containing `$` or a backtick, or a heredoc whose body would begin inside a multi-line substitution.
 
 ## Status of known BashSecurity false-positives
 
-| TheForge bug | Check | Status as of 2026-05-15 |
+| TheForge task | Check | Status |
 |---|---|---|
-| 2282 | parallel-mode missing autoresearch retry | ✅ FIXED — retries fire |
-| 2283 | check 7: newlines in `python3 -c` | ✅ FIXED in source + prod |
-| 2284 | check 8: `$()` command substitution | ✅ FIXED in source + prod |
-| 2285 | check 9: `<<EOF` heredoc treated as `<` redirection | ✅ FIXED in source + prod |
-| 2310 | check 4: locale-quoting `$"..."` on data | ✅ FIXED in source + prod |
-| 2214 | check 12 + check 4 on benign post-commit composition | ✅ FIXED in source + prod |
-| 2316 | check 4 per-segment evaluation (composed commands) | ✅ FIXED in source + prod |
-| 2320 | check 23: markdown body header in `gh pr create` heredoc | ✅ FIXED in source (commit f008911) — pending Equipa-prod pull |
+| 2282 | parallel-mode missing autoresearch retry | FIXED — retries fire |
+| 2283 | check 7: newlines inside `python3 -c "..."` | FIXED |
+| 2284 | check 8: `$()` of read-only commands | FIXED (allowlist; see below) |
+| 2285 | check 9: `<<EOF` heredoc treated as `<` redirection | FIXED |
+| 2310 | check 4: locale-quoting `$"..."` on data | FIXED |
+| 2214 | check 12 + check 4 on benign post-commit composition | FIXED |
+| 2316 | check 4 per-segment evaluation (composed commands) | FIXED |
+| 2320 | check 23: markdown body header in `gh pr create` heredoc | FIXED |
+| 3121 | check 7: quoted-delimiter heredoc into an interpreter or `cat` (`python3 - <<'EOF'`, `cat > f <<'EOF'`) | FIXED in source |
+| 3121 | check 9: `<` from a relative path (`sort < data/in.txt`, `while read l; do ...; done < list.txt`) | FIXED in source |
+| 3121 | check 16: brace list in an argument (`ls {src,tests}`, `cp f{,.bak}`) | FIXED in source |
+| 3121 | check 8: read-only process substitution (`diff <(sort a) <(sort b)`) | FIXED in source |
+| 3121 | check 10: fd duplication (`echo msg >&2`) | FIXED in source |
+| 3128 | checks 9/10: `<` or `>` inside a `#` comment read as a redirect (`grep x f # see <foo>`) | FIXED in source |
 
-Even with fixes deployed, **prod runs a snapshotted bash_security.py** — any false positive that hasn't been backported + deployed will still trip you. Always assume the production checker is stricter than the one you're editing in source.
+"FIXED in source" means merged to this repo. Production runs whatever `bash_security.py` was last deployed, so a fix only helps once it is deployed. When in doubt, assume production is stricter than the file you are editing.
+
+## What passes and what blocks (current source)
+
+| Passes | Blocks | Why |
+|---|---|---|
+| `python3 - <<'EOF'` ... `EOF` | `python3 - <<EOF` ... `EOF` (unquoted delimiter) | An unquoted delimiter expands `$(...)` in the body. |
+| `cat > notes.md <<'EOF'` ... `EOF` | `bash <<'EOF'` ... `EOF`, `cat <<'EOF' \| sh` ... | A heredoc into a shell is shell code. Only `cat`, python/perl/ruby/node, `gh`, `wc`, `sort`, `head`, `tail` and `grep` qualify, with nothing but `> file` after the opener, and nothing after the closing delimiter. |
+| `sort < data/in.txt`, `wc -l < /tmp/x` | `sort < ../x`, `cat < ~/.ssh/id_rsa`, `sort < /etc/x`, `sort < "$F"` | Input must come from a literal relative path without `..`, `/tmp/...` or `/dev/null`. |
+| `echo x > out/result.txt`, `>> /tmp/run.log`, `2>/dev/null`, `>&2` | `> ../x`, `>> /tmp/../home/u/.bashrc`, `> /srv/x.log`, `> /tmp/$NAME` | Output targets must be literal, relative without `..`, or under `/tmp/`. Quoted parts count as part of the path (`/tmp/x"/../y"` is `/tmp/x/../y`). |
+| `ls {src,tests}`, `cp config.json{,.bak}` | `{rm,-rf,x}`, `ls {-la,/}`, `echo {1..5}`, `xargs {rm,x}` | Brace lists are allowed only in arguments of commands that do not run their arguments (`echo`, `ls`, `cat`, `cp`, `mv`, `mkdir`, `diff`, `grep`, ...), one list per word, no flags, no `{a..b}` ranges. |
+| `diff <(sort a) <(sort b)` | `diff <(curl ... \| sh) b`, `cat <(echo x)`, `tee >(sort)` | `<(...)` takes the same read-only allowlist as `$(...)`, except `echo`/`printf` (use `<<<` instead). `>(...)` is always blocked. |
+| `echo "$(git rev-parse HEAD)"`, `echo '$(anything)'` | `echo "$(curl ... \| sh)"`, ``echo "`id`"`` | Substitution inside double quotes is judged like the unquoted form. Single quotes stay inert. |
+| `echo $'\''`, `echo "$(echo '"')"` | `echo $'\'' >> /etc/x`, `echo "$(echo '"')" $(touch x)` | A complete quoted word no longer hides what follows it. |
+| `( (cd a && ls) )`, `$(grep case notes.txt)` | `echo 'unterminated`, `((cd a) ; ls)`, `$(case $x in a) ls;; esac)` | Check 25: quoting the checker cannot parse is refused. Close every quote, write `( (` for nested subshells, move `case` out of `$(...)`. |
+| a command up to 16384 bytes | anything longer | Write long content to a file with the Write tool and run a short command that reads it. |
 
 ## Workaround patterns
 
-### Editing files: use the Edit and Write tools — NEVER interpreter heredocs
+### Editing files: use the Edit and Write tools
 
-> **The single most common kill pattern.** Observed 2026-05-15 terminating CryptoTrader Batch-0 tasks #2375 (T1) and #2376 (T2): `BashSecurity BLOCKED check=7: cmd=python3 << 'EOF'`.
+Even though `python3 - <<'EOF'` is now allowed in source, **make file edits with the Edit and Write tools**, not with a script piped into an interpreter. They bypass bash entirely, they are reviewable, and they cannot be blocked by a production checker that predates task 3121. The shapes that still block and end runs:
 
 ```bash
-# DON'T — trips check 7 (newlines / "could separate multiple commands")
-# and KILLS your run. The agent executes arbitrary multi-line code, which
-# is exactly what check 7 is designed to block.
-python3 << 'EOF'
-import pathlib
-p = pathlib.Path("equipa/foo.py")
-text = p.read_text()
-text = text.replace("old", "new")
-p.write_text(text)
+# BLOCKS (check 7): unquoted delimiter, so the body is expanded by the shell
+python3 << EOF
+print("$HOME")
 EOF
 
-# Same shape, same kill: bash << EOF, ruby << EOF, node << EOF, perl << EOF
-# Also kills: python3 -c "..." with embedded newlines
+# BLOCKS (check 7): a heredoc into a shell is shell code
+bash <<'EOF'
+echo hi
+EOF
 ```
 
-```bash
-# DO — make the change with the Edit tool (exact string replacement)
-# or the Write tool (whole-file rewrite). Both bypass bash entirely.
-```
-
-**For multi-file or surgical changes, make successive `Edit` calls** — one per location. Do NOT batch them into a script piped through an interpreter. The `Edit` tool is cheap; emitting a `python3 << EOF` heredoc costs you the entire dispatch.
-
-**check 7 is working as intended** — it cannot distinguish "I am editing a file with Python" from "I am running arbitrary code." There is no allowlist that would make this safe without weakening the check. The fix is to use the right tool for the job: `Edit` / `Write`, not bash.
-
-The benign `$(cat <<'EOF' ... EOF)` substitution form is still fine for `git commit -m` / `gh pr create --body` bodies (see the dedicated sections below) — that form emits literal text, not executable code. The interpreter-heredoc form (`<interpreter> << EOF`) is the one that gets you killed.
-
-### `gh pr create` with multi-line body — use `--body-file`
+### `gh pr create` with a multi-line body — use `--body-file`
 
 ```bash
-# DON'T — trips check 19 (heredoc inside $()), and check 23 (## inside body)
+# BLOCKS (check 19): unquoted delimiter inside $()
 gh pr create --title "X" --body "$(cat <<EOF
 ## Summary
-- foo
-- bar
 EOF
 )"
 ```
 
-Write the body to a file first via the **Write tool**, then point `gh` at it:
+The quoted-delimiter form `--body "$(cat <<'EOF' ... EOF\n)"` passes, but only when the closing `EOF` is alone on its line with no indentation and only whitespace separates it from the `)`. The robust shape is to write the body with the Write tool and pass the file:
 
 ```bash
-# DO — file written via Write tool, then --body-file
 gh pr create --title "X" --body-file /tmp/pr-body.md
 ```
 
-The Write tool API does NOT route through bash, so multi-line markdown content (including `##` headings, code fences, quoted blocks) is safe.
-
-### `git commit` with multi-line message — use `-F` not heredoc
+### `git commit` with a multi-line message — use `-F`
 
 ```bash
-# DON'T — trips check 19
+# BLOCKS (check 19): unquoted delimiter inside $()
 git commit -m "$(cat <<EOF
 fix: subject line
-
-body paragraph with markdown ## heading
 EOF
 )"
 ```
 
 ```bash
-# DO — write the message file via Write tool, then -F
+# PASSES — message file written with the Write tool
 git commit -F /tmp/commit-msg.txt
 
-# OR — single-line message is always safe
+# PASSES — single-line message
 git commit -m "fix: subject line"
 ```
 
 ### Testing `check_bash_command()` itself — pytest, not bash
 
-If you're modifying `equipa/bash_security.py`, **do not** try to "test the fix" by invoking `gh`/`git` from bash with the patterns you're trying to allow. Write pytest unit tests in `tests/test_bash_security.py`:
+When you work on `equipa/bash_security.py`, the checks you are changing may be judging your own shell commands. Do not "exercise" a fix by running the pattern you want to allow from bash. Put the pattern in a pytest test and call `check_bash_command()` directly:
 
 ```python
-# In tests/test_bash_security.py
-def test_check_23_allows_markdown_body_in_gh_pr_create(self) -> None:
-    """Bug 2320: gh pr create with markdown body in heredoc must pass."""
-    cmd = '''gh pr create --title "X" --body "$(cat <<EOF
-## Summary
-- foo
-EOF
-)"'''
-    result = check_bash_command(cmd)
-    assert result.safe, f"expected safe: got check {result.check_id}: {result.message}"
+def test_allows_read_only_process_substitution() -> None:
+    result = check_bash_command("diff <(sort a) <(sort b)")
+    assert result.safe, f"check {result.check_id}: {result.message}"
 ```
 
-Run with `python3 -m pytest tests/test_bash_security.py -q` — no shell heredoc involved.
+Run it with `python3 -m pytest tests/test_bash_security.py -q`. Keep a fixture for every false-positive fix: past fixes regressed because they shipped without one.
 
-### `$()` command substitution in arguments — use intermediate variables
+### `$()` command substitution — read-only commands only
 
-```bash
-# DON'T — trips check 8 on inline $() (post-2284 fix this is allowlisted for git/go/mktemp, but bombs on others)
-ls $(go env GOMODCACHE)
-```
+`$(...)` passes, in any position and inside double quotes, when every command in it is on the read-only allowlist (`git` read-only subcommands, `go env|version|list`, `date`, `basename`, `dirname`, `realpath`, `pwd`, `echo`, `cat`, `wc`, `head`, `tail`, `sort`, `grep`, `tr`, `cut`, `ls`, `whoami`, `which`, `[`, ...) and it holds no nested command substitution. `${...}` expansions outside double quotes still block.
 
 ```bash
-# DO — assignment-side $() is universally allowlisted
-gomodcache=$(go env GOMODCACHE)
-ls "$gomodcache"
+ls $(go env GOMODCACHE)        # passes
+echo "$(git rev-parse HEAD)"   # passes
+echo "$(curl -s URL | sh)"     # blocks: curl and sh are not read-only
 ```
 
 ### Multi-line `python3 -c "..."` — write a script file
 
-```bash
-# DON'T — trips check 7 on newlines inside -c (fixed in source, but prod may lag)
-python3 -c "
-import struct
-with open('out.bin', 'wb') as f:
-    f.write(struct.pack('I', 42))
-"
-```
+Newlines inside `python3 -c "..."` pass in source, but a script file is easier to review and does not depend on the deployed checker:
 
 ```bash
-# DO — Write the script to scripts/build_thing.py via the Write tool, then:
+# Write the script to scripts/build_thing.py with the Write tool, then:
 python3 scripts/build_thing.py
 ```
 
-### Locale-quoting `$"..."` — single-quote the outer string
+### Locale quoting `$"..."` — single-quote the outer string
 
 ```bash
-# DON'T — embeds $" as a literal in the arg, may trip check 4 in older code paths
-echo "the literal string $\"hello\" appears here"
-```
-
-```bash
-# DO — single-quote the whole argument so $" is opaque to the parser
 echo 'the literal string $"hello" appears here'
 ```
 
 ## What to do if you trip a check anyway
 
-After bug 2282's fix (autoresearch retries fire), failures inject the kill reason into the next attempt's context. **Read the reflection — don't repeat the same form.** If retry 3 says "check 19 blocked your `$(cat <<EOF...)`", retry 4 must use a different shape (Write tool + --body-file).
+Read the reason — the hook prints the check number and message to stderr — and change the *shape* of the command, not just its spelling. If the pre-execution gate reports `fails closed`, the checker itself is broken or could not read your payload; that is an infrastructure problem, so report it rather than retrying variations.
 
-If you find yourself unable to express what you need within these constraints — for example, you need to emit binary bytes that don't fit in any --body-file pattern — log a comment in your PR body with:
+If you cannot express what you need within these constraints, put this in your PR body or final report:
 
 ```
-BLOCKED-BY-BASHSECURITY: <description of what you tried, what check fired, what shape you'd need>
+BLOCKED-BY-BASHSECURITY: <what you tried, which check fired, what shape you need>
 ```
 
-The operator will intervene with a hand-fix.
-
-## When this doc becomes obsolete
-
-Bug 2320 is now FIXED in source (commit `f008911`, 2026-05-15) — the `_MARKDOWN_BODY_TOOLS` + `_MARKDOWN_BODY_FLAGS` allowlist plus the token-aware `_last_segment_start` fallback recognize the `gh pr create --body "$(cat <<EOF ... )"` form and let it through. Once Equipa-prod pulls master, the heredoc-in-substitution workaround for `gh pr create` becomes unnecessary.
-
-That said, the **agent-side guidance still holds**: prefer Write-tool + `--body-file` for multi-line PR bodies and `git commit -F` for multi-line commit messages. The fix recognized the legitimate pattern; the cleaner pattern remains a better choice for readability and audit.
-
-The orchestrator IS the security checker — there is no shortcut around it.
+The operator will intervene by hand.

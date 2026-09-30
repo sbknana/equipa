@@ -1,29 +1,40 @@
-"""EQUIPA bash_security — dangerous-bash-command detector (23 exploit patterns).
+"""EQUIPA bash_security — shell-command obfuscation detector.
 
 Ported from Claude Code's bashSecurity.ts. :func:`check_bash_command`
-classifies a shell command as safe/unsafe against 23 exploit patterns
-(command substitution, IFS injection, heredoc smuggling, unicode homoglyphs,
-etc.). It is a pure classifier — it never runs anything itself.
+classifies a shell command as safe/unsafe with about two dozen checks
+(command substitution, IFS injection, heredoc smuggling, unicode
+whitespace, redirect targets, etc.). It is a pure classifier — it never
+runs anything itself.
+
+Quoting is read ONCE by a shared tokenizer (``_scan_shell``) that follows
+bash's parser; every quote-sensitive check reads its classification, and a
+command it cannot parse cleanly is refused (check 25) instead of guessed at.
+
+What it is NOT: a permission policy or a sandbox. It looks for
+parser-confusion and substitution tricks; plainly destructive commands
+(``rm -rf build/``, ``bash script.sh``, ``git push --force``) pass. Redirect
+targets are judged textually (no symlink resolution), and commands longer
+than ``MAX_COMMAND_BYTES`` are refused outright.
 
 Where the classification is enforced depends on the call site, and the two
-enforcement modes have very different guarantees. Do NOT overclaim the first:
+enforcement modes have very different guarantees. Do NOT overclaim either:
 
-* **Reactive (always on, the default).** The streaming loop in
+* **Reactive (streaming roles only).** The streaming loop in
   ``equipa.agent_runner`` inspects each Bash tool call in the Claude CLI's
   stream-JSON output and, on an unsafe verdict, terminates the agent run.
-  Crucially the CLI has ALREADY executed the tool call by the time the
-  observer sees it — this is post-hoc *detect-and-terminate*, NOT prevention.
-  It stops the agent from continuing, and it stops repeat offenses, but it
-  cannot un-run the command that tripped it.
+  The CLI has ALREADY executed the tool call by the time the observer sees
+  it — this is post-hoc *detect-and-terminate*, NOT prevention. Roles that
+  run without streaming (the early-term-exempt ones, e.g. planner,
+  evaluator, reviewers, researcher) are never checked this way.
 
-* **Pre-execution (opt-in, feature flag ``bash_security_pretooluse``,
-  DEFAULT OFF).** When enabled, ``agent_runner`` wires
+* **Pre-execution (feature flag ``bash_security_pretooluse``, default OFF
+  in code).** When enabled, ``agent_runner`` wires
   ``hooks/pretooluse_bash_gate.py`` into the spawned CLI as a Claude Code
   PreToolUse hook (via a generated ``--settings`` file). The hook calls this
   module BEFORE the Bash tool runs and blocks an unsafe command (exit 2) so
-  it never executes. This is the only mode that delivers true
-  *before-subprocess* prevention. The reactive check stays on underneath it
-  as defense-in-depth.
+  it never executes; it fails closed (exit 2) when it cannot load or run
+  this module. This is the only mode that prevents execution; it applies to
+  every agent whose CLI ``build_cli_command`` builds, streaming or not.
 
 Pure Python stdlib — NO pip dependencies. Uses ``re`` for regex patterns.
 
@@ -36,6 +47,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import shlex
@@ -96,92 +108,693 @@ class CheckID:
     BACKSLASH_ESCAPED_OPERATORS = 21
     COMMENT_QUOTE_DESYNC = 22
     QUOTED_NEWLINE = 23
+    COMMAND_TOO_LONG = 24
+    UNPARSEABLE_QUOTING = 25
+
+
+# Commands longer than this (UTF-8 bytes) are blocked outright (sandbox-07).
+# Every check below is linear, but a hook timeout is a NON-blocking error for
+# Claude Code, so a bounded input keeps the gate far inside its time budget.
+# Legitimate long inputs belong in a file (Write tool) the command reads.
+MAX_COMMAND_BYTES = 16384
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_unquoted(command: str) -> str:
-    """Strip single- and double-quoted content, returning only unquoted text.
+# ---------------------------------------------------------------------------
+# Shared shell tokenizer (task 3128, SECURITY-REVIEW-3121 BS3121-01)
+# ---------------------------------------------------------------------------
+#
+# The checks used to walk the raw string with about a dozen private quote
+# models. Words that bash reads as complete - ``$'\''`` and
+# ``"$(echo '"')"`` - left those models "inside a quote", so a substitution
+# or redirect after them was invisible to checks 8 and 10. _scan_shell
+# classifies every character ONCE, following bash's parser (quoting restarts
+# inside $(...) even within double quotes, $'...' has backslash escapes,
+# comments and heredoc bodies are not code), and the helpers below read that
+# one classification. A command it cannot parse to a clean end state is
+# refused (check 25) rather than guessed at.
 
-    Respects bash quoting rules:
-    - Backslash escapes the next character (outside single quotes).
-    - Single quotes cannot be escaped inside single quotes.
-    - Double quotes do not affect single-quote toggling and vice-versa.
+# Per-character kinds: the low four bits of a _ShellScan.kinds entry.
+_K_CODE = 1        # shell syntax: blanks and operators act here
+_K_ESCAPE = 2      # a backslash escaping the next character (code context)
+_K_ESCAPED = 3     # the character after that backslash
+_K_SQ_DELIM = 4    # ' opening or closing '...'
+_K_SQ = 5          # text inside '...'
+_K_DQ_DELIM = 6    # " opening or closing "...", and the $ of $"..."
+_K_DQ = 7          # literal text inside "..." (its backslashes included)
+_K_ANSI_DELIM = 8  # the $' opening and the ' closing $'...'
+_K_ANSI = 9        # text inside $'...'
+_K_COMMENT = 10    # a # comment, up to (not including) its newline
+_K_HEREDOC = 11    # heredoc body and terminator line
+_K_PARAM = 12      # text inside ${...} or $[...]
+_KIND_MASK = 0x0F
+# Flag bits.
+_F_NESTED = 0x10   # inside a substitution, ${...}, $[...], "..." or heredoc body
+_F_HIDDEN = 0x20   # enclosed by double quotes at some outer level
+
+# Kinds that make up the "unquoted view" (_extract_unquoted).
+_UNQUOTED_VIEW_KINDS = frozenset(
+    {_K_CODE, _K_ESCAPE, _K_ESCAPED, _K_COMMENT, _K_HEREDOC, _K_PARAM}
+)
+_QUOTE_DELIMITER_KINDS = frozenset({_K_SQ_DELIM, _K_DQ_DELIM, _K_ANSI_DELIM})
+
+# A code character after which the next character starts a new token
+# (bash's metacharacters plus newline). Only there does # open a comment.
+_TOKEN_BREAK_CHARS = frozenset(" \t\n;&|<>()")
+# Reserved words after which bash still expects a command, so a following
+# `case` or `((` is a keyword, not an argument.
+_COMMAND_PREFIX_WORDS = frozenset(
+    {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time",
+     "for", "select"}
+)
+_BARE_WORD_RE = re.compile(r"[^\s;&|<>()'\"\\`$]+")
+_SCAN_METACHARS = " \t\n;&|<>()"
+
+
+@dataclass(frozen=True)
+class _Heredoc:
+    """A ``<<`` heredoc as bash reads it.
+
+    ``terminator_start``/``terminator_end`` delimit the terminator line's
+    text (its newline excluded); both equal ``len(command)`` when the body
+    runs to the end of the input.
     """
-    result: list[str] = []
-    in_single = False
-    in_double = False
-    escaped = False
+    operator: int
+    quoted: bool
+    body_start: int
+    terminator_start: int
+    terminator_end: int
+    top_level: bool
 
-    for ch in command:
-        if escaped:
-            escaped = False
-            if not in_single and not in_double:
-                result.append(ch)
-            continue
 
-        if ch == "\\" and not in_single:
-            escaped = True
-            if not in_single and not in_double:
-                result.append(ch)
-            continue
+@dataclass(frozen=True)
+class _Substitution:
+    """A ``$(...)`` (arithmetic included) or backtick substitution."""
+    kind: str               # "$(" or "`"
+    start: int              # index of the $ or the opening backtick
+    inner_start: int
+    inner_end: int          # len(command) when unterminated
+    in_double_quotes: bool  # a double-quoted string encloses it
 
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            continue
 
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            continue
+@dataclass(frozen=True)
+class _ShellScan:
+    kinds: bytes
+    error: str | None
+    heredocs: tuple[_Heredoc, ...]
+    substitutions: tuple[_Substitution, ...]
 
-        if not in_single and not in_double:
-            result.append(ch)
 
-    return "".join(result)
+class _Frame:
+    """One open construct on the tokenizer's stack.
+
+    kind: "top", "cmd" ($(...)), "arith" ($((...))), "dparen" (the (( ))
+    command), "dq" ("..."), "brace" (${...}), "bracket" ($[...]) or "hdoc"
+    (body of an unquoted-delimiter heredoc).
+    """
+    __slots__ = (
+        "kind", "flags", "depth", "word_start", "command_position",
+        "substitution", "pending_heredocs",
+    )
+
+    def __init__(self, kind: str, flags: int, substitution: int = -1) -> None:
+        self.kind = kind
+        self.flags = flags          # flag bits for characters inside
+        self.depth = 0              # unmatched ( or [ inside the frame
+        self.word_start = True      # next character starts a token
+        self.command_position = True
+        self.substitution = substitution  # index into _ShellScanner.substitutions
+        self.pending_heredocs: list[tuple[int, str, bool, bool, bool]] = []
+
+
+class _ShellScanner:
+    """Single pass over a command; see _scan_shell. Linear time."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self.length = len(command)
+        self.kinds = bytearray(self.length)
+        self.error: str | None = None
+        self.error_at = self.length
+        self.heredocs: list[_Heredoc] = []
+        self.substitutions: list[list] = []
+        self.stack: list[_Frame] = [_Frame("top", 0)]
+        # End indexes of the unquoted heredoc bodies being scanned.
+        self.limits: list[int] = []
+        # Per open hdoc frame: (terminator_start, terminator_end, resume_at).
+        self.heredoc_ends: list[tuple[int, int, int]] = []
+        # Heredoc specs still waiting for their body after the current line.
+        self.body_queue: list[tuple[int, str, bool, bool, bool]] = []
+
+    # -- helpers -----------------------------------------------------------
+
+    def fail(self, reason: str, index: int) -> int:
+        if self.error is None:
+            self.error = reason
+            self.error_at = index
+        return self.length
+
+    def mark(self, start: int, end: int, kind: int, flags: int) -> None:
+        if end > start:
+            self.kinds[start:end] = bytes((kind | flags,)) * (end - start)
+
+    def limit(self) -> int:
+        return self.limits[-1] if self.limits else self.length
+
+    def push(self, kind: str, parent: _Frame, substitution: int = -1) -> _Frame:
+        flags = parent.flags | _F_NESTED
+        if kind == "dq":
+            flags |= _F_HIDDEN
+        frame = _Frame(kind, flags, substitution)
+        self.stack.append(frame)
+        return frame
+
+    def record_substitution(self, kind: str, start: int, inner: int, flags: int) -> int:
+        self.substitutions.append(
+            [kind, start, inner, self.length, bool(flags & _F_HIDDEN)]
+        )
+        return len(self.substitutions) - 1
+
+    # -- shared constructs -------------------------------------------------
+
+    def single_quote(self, index: int, flags: int) -> int:
+        close = self.command.find("'", index + 1, self.limit())
+        if close < 0:
+            return self.fail("unterminated single quote", index)
+        self.mark(index, index + 1, _K_SQ_DELIM, flags)
+        self.mark(index + 1, close, _K_SQ, flags)
+        self.mark(close, close + 1, _K_SQ_DELIM, flags)
+        return close + 1
+
+    def ansi_c_quote(self, index: int, flags: int) -> int:
+        """``$'...'``: a backslash escapes any character, ``\\'`` included."""
+        limit = self.limit()
+        close = index + 2
+        while close < limit and self.command[close] != "'":
+            close += 2 if self.command[close] == "\\" else 1
+        if close >= limit:
+            return self.fail("unterminated $'...' quote", index)
+        self.mark(index, index + 2, _K_ANSI_DELIM, flags)
+        self.mark(index + 2, close, _K_ANSI, flags)
+        self.mark(close, close + 1, _K_ANSI_DELIM, flags)
+        return close + 1
+
+    def backtick(self, index: int, flags: int) -> int:
+        """`...`: bash ends it at the next unescaped backtick, quotes or not."""
+        limit = self.limit()
+        close = index + 1
+        while close < limit and self.command[close] != "`":
+            close += 2 if self.command[close] == "\\" else 1
+        if close >= limit:
+            self.record_substitution("`", index, index + 1, flags)
+            return self.fail("unterminated backtick substitution", index)
+        self.substitutions.append(
+            ["`", index, index + 1, close, bool(flags & _F_HIDDEN)]
+        )
+        self.mark(index, index + 1, _K_CODE, flags)
+        inner_flags = flags | _F_NESTED
+        position = index + 1
+        while position < close:
+            if self.command[position] == "\\" and position + 1 < close:
+                self.mark(position, position + 1, _K_ESCAPE, inner_flags)
+                self.mark(position + 1, position + 2, _K_ESCAPED, inner_flags)
+                position += 2
+                continue
+            self.mark(position, position + 1, _K_CODE, inner_flags)
+            position += 1
+        self.mark(close, close + 1, _K_CODE, flags)
+        return close + 1
+
+    def dollar(self, index: int, frame: _Frame) -> int | None:
+        """Open ``$(``, ``$((``, ``${`` or ``$[`` at *index*; None if none."""
+        command = self.command
+        nxt = command[index + 1] if index + 1 < self.limit() else ""
+        if nxt == "(":
+            arith = index + 2 < self.limit() and command[index + 2] == "("
+            sub = self.record_substitution("$(", index, index + 2, frame.flags)
+            self.mark(index, index + 2, _K_CODE, frame.flags)
+            self.push("arith" if arith else "cmd", frame, sub)
+            return index + 2
+        if nxt in ("{", "["):
+            self.mark(index, index + 2, _K_CODE, frame.flags)
+            self.push("brace" if nxt == "{" else "bracket", frame)
+            return index + 2
+        return None
+
+    def close_frame(self, index: int, width: int = 1) -> int:
+        frame = self.stack.pop()
+        parent = self.stack[-1]
+        if frame.pending_heredocs:
+            return self.fail("heredoc has no body before its substitution closes", index)
+        if frame.substitution >= 0:
+            self.substitutions[frame.substitution][3] = index
+        kind = _K_DQ_DELIM if frame.kind == "dq" else _K_CODE
+        self.mark(index, index + width, kind, parent.flags)
+        # (( )) is a whole token; any other construct is part of a word.
+        parent.word_start = frame.kind == "dparen"
+        parent.command_position = False
+        return index + width
+
+    # -- heredocs ----------------------------------------------------------
+
+    def heredoc_operator(self, index: int, frame: _Frame) -> int:
+        """``<<`` / ``<<-`` and its delimiter word (never expanded)."""
+        command = self.command
+        limit = self.limit()
+        position = index + 2
+        strip_tabs = position < limit and command[position] == "-"
+        if strip_tabs:
+            position += 1
+        self.mark(index, position, _K_CODE, frame.flags)
+        while position < limit and command[position] in " \t":
+            self.mark(position, position + 1, _K_CODE, frame.flags)
+            position += 1
+        literal: list[str] = []
+        quoted = False
+        word_start = position
+        while position < limit and command[position] not in _SCAN_METACHARS:
+            ch = command[position]
+            if ch in "$`" or (ch == "#" and position == word_start):
+                return self.fail("heredoc delimiter is not a plain word", position)
+            if ch == "\\":
+                quoted = True
+                self.mark(position, position + 1, _K_ESCAPE, frame.flags)
+                if position + 1 < limit:
+                    self.mark(position + 1, position + 2, _K_ESCAPED, frame.flags)
+                    if command[position + 1] != "\n":
+                        literal.append(command[position + 1])
+                position += 2
+                continue
+            if ch == "'":
+                quoted = True
+                close = command.find("'", position + 1, limit)
+                if close < 0:
+                    return self.fail("unterminated single quote", position)
+                literal.append(command[position + 1:close])
+                self.mark(position, position + 1, _K_SQ_DELIM, frame.flags)
+                self.mark(position + 1, close, _K_SQ, frame.flags)
+                self.mark(close, close + 1, _K_SQ_DELIM, frame.flags)
+                position = close + 1
+                continue
+            if ch == '"':
+                quoted = True
+                close = position + 1
+                while close < limit and command[close] != '"':
+                    if command[close] in "$`":
+                        return self.fail("heredoc delimiter is not a plain word", close)
+                    if command[close] == "\\" and close + 1 < limit:
+                        if command[close + 1] in '"\\':
+                            literal.append(command[close + 1])
+                        elif command[close + 1] != "\n":
+                            literal.append(command[close:close + 2])
+                        close += 2
+                        continue
+                    literal.append(command[close])
+                    close += 1
+                if close >= limit:
+                    return self.fail("unterminated double quote", position)
+                self.mark(position, position + 1, _K_DQ_DELIM, frame.flags)
+                self.mark(position + 1, close, _K_DQ, frame.flags | _F_NESTED)
+                self.mark(close, close + 1, _K_DQ_DELIM, frame.flags)
+                position = close + 1
+                continue
+            literal.append(ch)
+            self.mark(position, position + 1, _K_CODE, frame.flags)
+            position += 1
+        if position == word_start:
+            return self.fail("heredoc operator without a delimiter word", index)
+        top_level = len(self.stack) == 1
+        frame.pending_heredocs.append(
+            (index, "".join(literal), quoted, strip_tabs, top_level)
+        )
+        frame.word_start = False
+        frame.command_position = False
+        return position
+
+    def find_terminator(
+        self, start: int, delimiter: str, quoted: bool, strip_tabs: bool
+    ) -> tuple[int, int, int]:
+        """Return (terminator_start, terminator_end, resume_at) for a body at
+        *start*. An unquoted body joins a line ending in an odd backslash run
+        to the next one before comparing, as bash does."""
+        command = self.command
+        limit = self.limit()
+        line_start = start
+        while line_start < limit:
+            logical: list[str] = []
+            position = line_start
+            while True:
+                newline = command.find("\n", position, limit)
+                end = limit if newline < 0 else newline
+                text = command[position:end]
+                if strip_tabs:
+                    text = text.lstrip("\t")
+                if not quoted and newline >= 0:
+                    run = len(text) - len(text.rstrip("\\"))
+                    if run % 2 == 1:
+                        logical.append(text[:-1])
+                        position = newline + 1
+                        continue
+                logical.append(text)
+                break
+            if "".join(logical) == delimiter:
+                return line_start, end, (end + 1 if newline >= 0 else end)
+            if newline < 0:
+                break
+            line_start = newline + 1
+        return limit, limit, limit
+
+    def start_heredoc_bodies(self, index: int) -> int:
+        """Read queued heredoc bodies starting at *index*; return resume point."""
+        while self.body_queue and self.error is None:
+            operator, delimiter, quoted, strip_tabs, top_level = self.body_queue.pop(0)
+            flags = self.stack[-1].flags
+            term_start, term_end, resume = self.find_terminator(
+                index, delimiter, quoted, strip_tabs
+            )
+            self.heredocs.append(
+                _Heredoc(operator, quoted, index, term_start, term_end, top_level)
+            )
+            if quoted:
+                self.mark(index, resume, _K_HEREDOC, flags | _F_NESTED)
+                index = resume
+                continue
+            self.push("hdoc", self.stack[-1])
+            self.limits.append(term_start)
+            self.heredoc_ends.append((term_start, term_end, resume))
+            return index
+        return index
+
+    def finish_heredoc_body(self) -> int:
+        self.stack.pop()
+        self.limits.pop()
+        term_start, _term_end, resume = self.heredoc_ends.pop()
+        self.mark(term_start, resume, _K_HEREDOC, self.stack[-1].flags | _F_NESTED)
+        return self.start_heredoc_bodies(resume)
+
+    # -- per-context steps -------------------------------------------------
+
+    def step_code(self, index: int, frame: _Frame) -> int:
+        command = self.command
+        ch = command[index]
+        flags = frame.flags
+        limit = self.limit()
+        nxt = command[index + 1] if index + 1 < limit else ""
+        in_arith = frame.kind in ("arith", "dparen")
+
+        if ch == "\\":
+            self.mark(index, index + 1, _K_ESCAPE, flags)
+            if nxt:
+                self.mark(index + 1, index + 2, _K_ESCAPED, flags)
+                if nxt != "\n":  # \<newline> is removed: token state unchanged
+                    frame.word_start = False
+                    frame.command_position = False
+            return index + 2
+        if ch == "'":
+            frame.word_start = frame.command_position = False
+            return self.single_quote(index, flags)
+        if ch == "$":
+            if nxt == "'":
+                frame.word_start = frame.command_position = False
+                return self.ansi_c_quote(index, flags)
+            if nxt == '"':
+                frame.word_start = frame.command_position = False
+                self.mark(index, index + 2, _K_DQ_DELIM, flags)
+                self.push("dq", frame)
+                return index + 2
+            opened = self.dollar(index, frame)
+            if opened is not None:
+                frame.word_start = frame.command_position = False
+                return opened
+        if ch == '"':
+            frame.word_start = frame.command_position = False
+            self.mark(index, index + 1, _K_DQ_DELIM, flags)
+            self.push("dq", frame)
+            return index + 1
+        if ch == "`":
+            frame.word_start = frame.command_position = False
+            return self.backtick(index, flags)
+
+        if not in_arith and frame.word_start:
+            if ch == "#":
+                newline = command.find("\n", index, limit)
+                end = limit if newline < 0 else newline
+                self.mark(index, end, _K_COMMENT, flags)
+                return end
+            if frame.command_position:
+                if ch == "(" and nxt == "(":
+                    self.mark(index, index + 2, _K_CODE, flags)
+                    self.push("dparen", frame)
+                    return index + 2
+                word = _BARE_WORD_RE.match(command, index, limit)
+                if word is not None:
+                    end = word.end()
+                    # A reserved word only when the whole word is bare.
+                    whole = end >= limit or command[end] in _SCAN_METACHARS
+                    text = word.group(0) if whole else ""
+                    if text == "case" and frame.kind == "cmd":
+                        # Its pattern `)`s would close the $( early.
+                        return self.fail(
+                            "case statement inside $(...) is not supported", index
+                        )
+                    self.mark(index, end, _K_CODE, flags)
+                    frame.word_start = False
+                    frame.command_position = text in _COMMAND_PREFIX_WORDS
+                    return end
+
+        if ch == "\n" and not in_arith:
+            self.mark(index, index + 1, _K_CODE, flags)
+            frame.word_start = frame.command_position = True
+            if any(f.pending_heredocs for f in self.stack[:-1]):
+                return self.fail(
+                    "heredoc body would start inside a multi-line substitution",
+                    index,
+                )
+            if frame.pending_heredocs:
+                if self.limits:
+                    return self.fail("heredoc inside a heredoc body", index)
+                self.body_queue = frame.pending_heredocs
+                frame.pending_heredocs = []
+                return self.start_heredoc_bodies(index + 1)
+            return index + 1
+        if ch == "<" and nxt == "<" and not in_arith:
+            if command.startswith("<<<", index):
+                self.mark(index, index + 3, _K_CODE, flags)
+                frame.word_start = frame.command_position = True
+                return index + 3
+            if self.limits:
+                return self.fail("heredoc inside a heredoc body", index)
+            return self.heredoc_operator(index, frame)
+
+        if frame.kind != "top":
+            if ch == "(":
+                frame.depth += 1
+            elif ch == ")":
+                if frame.depth > 0:
+                    frame.depth -= 1
+                elif frame.kind == "dparen":
+                    if nxt != ")":
+                        return self.fail(
+                            "'((' that is not an arithmetic command; write '( ('",
+                            index,
+                        )
+                    return self.close_frame(index, 2)
+                else:
+                    return self.close_frame(index)
+        self.mark(index, index + 1, _K_CODE, flags)
+        if ch in _TOKEN_BREAK_CHARS:
+            frame.word_start = True
+            if ch not in " \t<>":
+                frame.command_position = ch != ")"
+        else:
+            frame.word_start = frame.command_position = False
+        return index + 1
+
+    def step_double_quoted(self, index: int, frame: _Frame) -> int:
+        command = self.command
+        ch = command[index]
+        if ch == "\\":
+            end = min(index + 2, self.limit())
+            self.mark(index, end, _K_DQ, frame.flags)
+            return index + 2
+        if ch == '"':
+            return self.close_frame(index)
+        if ch == "`":
+            return self.backtick(index, frame.flags)
+        if ch == "$":
+            opened = self.dollar(index, frame)
+            if opened is not None:
+                return opened
+        self.mark(index, index + 1, _K_DQ, frame.flags)
+        return index + 1
+
+    def step_group(self, index: int, frame: _Frame) -> int:
+        """Inside ${...} or $[...]: quotes pair up, substitutions nest."""
+        command = self.command
+        ch = command[index]
+        flags = frame.flags
+        nxt = command[index + 1] if index + 1 < self.limit() else ""
+        if ch == "\\":
+            self.mark(index, min(index + 2, self.limit()), _K_PARAM, flags)
+            return index + 2
+        if ch == "'":
+            return self.single_quote(index, flags)
+        if ch == '"':
+            self.mark(index, index + 1, _K_DQ_DELIM, flags)
+            self.push("dq", frame)
+            return index + 1
+        if ch == "`":
+            return self.backtick(index, flags)
+        if ch == "$":
+            if nxt == "'":
+                return self.ansi_c_quote(index, flags)
+            opened = self.dollar(index, frame)
+            if opened is not None:
+                return opened
+        if frame.kind == "brace" and ch == "}":
+            return self.close_frame(index)
+        if frame.kind == "bracket":
+            if ch == "[":
+                frame.depth += 1
+            elif ch == "]":
+                if frame.depth == 0:
+                    return self.close_frame(index)
+                frame.depth -= 1
+        self.mark(index, index + 1, _K_PARAM, flags)
+        return index + 1
+
+    def step_heredoc_body(self, index: int, frame: _Frame) -> int:
+        """Unquoted-delimiter body: text, but $(...), `...` and ${...} run."""
+        command = self.command
+        ch = command[index]
+        if ch == "\\":
+            self.mark(index, min(index + 2, self.limit()), _K_HEREDOC, frame.flags)
+            return index + 2
+        if ch == "`":
+            return self.backtick(index, frame.flags)
+        if ch == "$":
+            opened = self.dollar(index, frame)
+            if opened is not None:
+                return opened
+        self.mark(index, index + 1, _K_HEREDOC, frame.flags)
+        return index + 1
+
+    # -- driver ------------------------------------------------------------
+
+    _UNTERMINATED = {
+        "cmd": "unterminated $(...) substitution",
+        "arith": "unterminated $((...)) expansion",
+        "dparen": "unterminated (( )) command",
+        "dq": "unterminated double quote",
+        "brace": "unterminated ${...} expansion",
+        "bracket": "unterminated $[...] expansion",
+    }
+
+    def run(self) -> _ShellScan:
+        index = 0
+        while self.error is None:
+            frame = self.stack[-1]
+            if index >= self.limit():
+                if frame.kind == "hdoc":
+                    index = self.finish_heredoc_body()
+                    continue
+                if self.limits:
+                    self.fail(
+                        f"{self._UNTERMINATED[frame.kind]} inside a heredoc body",
+                        index,
+                    )
+                break
+            if frame.kind in ("top", "cmd", "arith", "dparen"):
+                index = self.step_code(index, frame)
+            elif frame.kind == "dq":
+                index = self.step_double_quoted(index, frame)
+            elif frame.kind == "hdoc":
+                index = self.step_heredoc_body(index, frame)
+            else:
+                index = self.step_group(index, frame)
+        if self.error is None and len(self.stack) > 1:
+            self.fail(self._UNTERMINATED[self.stack[-1].kind], self.length)
+        if self.error is not None:
+            # Unparseable: expose the rest as plain top-level code, which the
+            # most checks see. Open substitutions keep inner_end == length.
+            self.mark(self.error_at, self.length, _K_CODE, 0)
+        return _ShellScan(
+            kinds=bytes(self.kinds),
+            error=self.error,
+            heredocs=tuple(self.heredocs),
+            substitutions=tuple(_Substitution(*record) for record in self.substitutions),
+        )
+
+
+@functools.lru_cache(maxsize=64)
+def _scan_shell(command: str) -> _ShellScan:
+    """Classify every character of *command* the way bash parses it.
+
+    Returns per-character kinds (``_K_*`` with ``_F_*`` flag bits), the
+    heredocs and substitutions found, and ``error`` - a reason string when
+    the command does not reach a clean end state (an unterminated quote or
+    substitution, or a construct this tokenizer does not model). Every
+    quote-sensitive helper in this module reads this one classification.
+    """
+    return _ShellScanner(command).run()
+
+
+def _extract_unquoted(command: str) -> str:
+    """Return the text bash treats as unquoted at the top quoting level.
+
+    Quoted text (``'...'``, ``"..."``, ``$'...'``, ``$"..."``) and the
+    delimiters are removed, and so is everything inside double quotes,
+    including a ``$(...)`` there (check 8's double-quoted form judges
+    those). Code inside an unquoted ``$(...)`` is kept with its own quoted
+    text removed. Comments and heredoc bodies are kept verbatim.
+    """
+    kinds = _scan_shell(command).kinds
+    return "".join(
+        ch for ch, kind in zip(command, kinds)
+        if not kind & _F_HIDDEN and kind & _KIND_MASK in _UNQUOTED_VIEW_KINDS
+    )
 
 
 def _extract_unquoted_keep_delimiters(command: str) -> str:
-    """Strip quoted *content* but preserve quote delimiter characters.
+    """Like ``_extract_unquoted`` but keeps quote delimiter characters.
 
-    Like ``_extract_unquoted`` but keeps ``'`` and ``"`` in the output.
-    This is needed by ``_check_mid_word_hash`` to detect quote-adjacent
-    ``#`` patterns like ``'x'#`` where full stripping would hide the
-    adjacency.
+    Needed by ``_check_mid_word_hash`` to detect quote-adjacent ``#``
+    patterns like ``'x'#`` where full stripping would hide the adjacency.
     """
-    result: list[str] = []
-    in_single = False
-    in_double = False
-    escaped = False
+    kinds = _scan_shell(command).kinds
+    return "".join(
+        ch for ch, kind in zip(command, kinds)
+        if not kind & _F_HIDDEN and (
+            kind & _KIND_MASK in _UNQUOTED_VIEW_KINDS
+            or kind & _KIND_MASK in _QUOTE_DELIMITER_KINDS
+        )
+    )
 
-    for ch in command:
-        if escaped:
-            escaped = False
-            if not in_single and not in_double:
-                result.append(ch)
+
+def _code_char_positions(
+    command: str, chars: str, *, include_double_quoted: bool = False
+) -> list[int]:
+    """Indexes where a character in *chars* is live shell syntax.
+
+    Live means code context - not quoted, escaped, commented or heredoc
+    text. Code inside a double-quoted ``"$(...)"`` counts only when
+    *include_double_quoted* is set.
+    """
+    kinds = _scan_shell(command).kinds
+    positions = []
+    for index, ch in enumerate(command):
+        if ch not in chars:
             continue
-
-        if ch == "\\" and not in_single:
-            escaped = True
-            if not in_single and not in_double:
-                result.append(ch)
+        kind = kinds[index]
+        if kind & _KIND_MASK != _K_CODE:
             continue
-
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            result.append(ch)  # Keep the delimiter
+        if kind & _F_HIDDEN and not include_double_quoted:
             continue
-
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            result.append(ch)  # Keep the delimiter
-            continue
-
-        if not in_single and not in_double:
-            result.append(ch)
-
-    return "".join(result)
+        positions.append(index)
+    return positions
 
 
 def _get_base_command(command: str) -> str:
@@ -204,178 +817,79 @@ def _split_command_segments(command: str) -> list[str]:
 
     Used by Check 4 (locale quoting) to evaluate the safe-base allowlist
     per chained segment rather than only on the head command. See bug 2316.
+
+    The boundaries come from the shared tokenizer (_scan_shell), so an
+    escaped separator (SR-2722 S4: ``find . -exec id \\;``), a separator in
+    a comment or heredoc body, and one after a ``$'\\''`` word are all
+    judged the way bash judges them. A single ``&`` separates too (bash's
+    background operator, attack-equivalent to ``;``: SECURITY-REVIEW-2316
+    S1).
     """
+    kinds = _scan_shell(command).kinds
     segments: list[str] = []
-    buf: list[str] = []
-    in_single = False
-    in_double = False
-    paren_depth = 0  # $(...) depth, tracked outside single quotes
-    in_backtick = False
-    i = 0
-    n = len(command)
-
-    def flush() -> None:
-        seg = "".join(buf).strip()
-        if seg:
-            segments.append(seg)
-        buf.clear()
-
-    while i < n:
-        ch = command[i]
-        nxt = command[i + 1] if i + 1 < n else ""
-
-        if in_single:
-            buf.append(ch)
-            if ch == "'":
-                in_single = False
-            i += 1
+    start = 0
+    index = 0
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        # Top frame only: no flag bits (not in a substitution or quotes).
+        if ch in ";&|" and kinds[index] == _K_CODE:
+            segment = command[start:index].strip()
+            if segment:
+                segments.append(segment)
+            doubled = (
+                ch in "&|" and index + 1 < length
+                and command[index + 1] == ch and kinds[index + 1] == _K_CODE
+            )
+            index += 2 if doubled else 1
+            start = index
             continue
-
-        if in_backtick:
-            buf.append(ch)
-            if ch == "`":
-                in_backtick = False
-            i += 1
-            continue
-
-        # `$(` opens a substitution in both unquoted and double-quoted contexts.
-        if ch == "$" and nxt == "(":
-            paren_depth += 1
-            buf.append(ch)
-            buf.append(nxt)
-            i += 2
-            continue
-        if paren_depth > 0:
-            if ch == "(":
-                paren_depth += 1
-            elif ch == ")":
-                paren_depth -= 1
-            buf.append(ch)
-            i += 1
-            continue
-
-        if in_double:
-            if ch == '"':
-                in_double = False
-            buf.append(ch)
-            i += 1
-            continue
-
-        # Outside quotes / substitutions.
-        # SR-2722 S4: a backslash escapes the next character at the shell
-        # level, so an escaped separator (e.g. a backslash-semicolon in
-        # ``find . -exec id \;``) is literal data, not a segment boundary.
-        # Consume both chars together so the operator scan below never sees
-        # the escaped separator. Mirrors _has_shell_level_char's escape flag.
-        if ch == "\\":
-            buf.append(ch)
-            if nxt:
-                buf.append(nxt)
-                i += 2
-            else:
-                i += 1
-            continue
-        if ch == "'":
-            in_single = True
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == '"':
-            in_double = True
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == "`":
-            in_backtick = True
-            buf.append(ch)
-            i += 1
-            continue
-
-        # Top-level operators end the current segment.
-        if ch == ";":
-            flush()
-            i += 1
-            continue
-        if ch == "&" and nxt == "&":
-            flush()
-            i += 2
-            continue
-        if ch == "&":
-            # Single `&` is bash's background-process separator (cmd1 & cmd2).
-            # Attack-equivalent to `;` for per-segment check-4 purposes — see
-            # SECURITY-REVIEW-2316.md finding S1. Must come AFTER the `&&`
-            # check so the two-char operator is detected first.
-            flush()
-            i += 1
-            continue
-        if ch == "|" and nxt == "|":
-            flush()
-            i += 2
-            continue
-        if ch == "|":
-            flush()
-            i += 1
-            continue
-
-        buf.append(ch)
-        i += 1
-
-    flush()
+        index += 1
+    segment = command[start:].strip()
+    if segment:
+        segments.append(segment)
     return segments
+
+
+def _has_shell_escaped_char(command: str, chars: str) -> bool:
+    """True if a character in *chars* is backslash-escaped in code context.
+
+    Outside every quote (double-quoted ``"$(...)"`` code included in
+    "inside quotes", as before). Escapes are located by _scan_shell, so a
+    preceding ``$'\\''`` word cannot hide them.
+    """
+    kinds = _scan_shell(command).kinds
+    for index, ch in enumerate(command):
+        if ch in chars:
+            kind = kinds[index]
+            if kind & _KIND_MASK == _K_ESCAPED and not kind & _F_HIDDEN:
+                return True
+    return False
 
 
 def _has_backslash_escaped_whitespace(command: str) -> bool:
     """Detect backslash-space or backslash-tab outside quotes."""
-    in_single = False
-    in_double = False
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if ch == "\\" and not in_single:
-            if not in_double and i + 1 < len(command):
-                nxt = command[i + 1]
-                if nxt in (" ", "\t"):
-                    return True
-            i += 2
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-        elif ch == "'" and not in_double:
-            in_single = not in_single
-        i += 1
-    return False
+    return _has_shell_escaped_char(command, " \t")
 
 
 def _has_backslash_escaped_operator(command: str) -> bool:
     r"""Detect ``\;``, ``\|``, ``\&``, ``\<``, ``\>`` outside quotes."""
-    operators = frozenset(";|&<>")
-    in_single = False
-    in_double = False
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if ch == "\\" and not in_single:
-            if not in_double and i + 1 < len(command):
-                if command[i + 1] in operators:
-                    return True
-            i += 2
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        i += 1
-    return False
+    return _has_shell_escaped_char(command, ";|&<>")
 
 
-def _is_escaped_at(content: str, pos: int) -> bool:
-    """Return True if character at *pos* is preceded by an odd number of backslashes."""
-    count = 0
-    i = pos - 1
-    while i >= 0 and content[i] == "\\":
-        count += 1
-        i -= 1
-    return count % 2 == 1
+def _escaped_positions(content: str) -> list[bool]:
+    """Return a bitmap: ``result[i]`` is True when ``content[i]`` is preceded
+    by an odd number of backslashes.
+
+    One linear pass. It replaces a per-position backwards walk that made the
+    brace scan quadratic on long backslash or brace runs (sandbox-07).
+    """
+    escaped = [False] * len(content)
+    backslash_run = 0
+    for index, ch in enumerate(content):
+        escaped[index] = backslash_run % 2 == 1
+        backslash_run = backslash_run + 1 if ch == "\\" else 0
+    return escaped
 
 
 def _has_shell_level_char(command: str, chars: str) -> bool:
@@ -386,35 +900,10 @@ def _has_shell_level_char(command: str, chars: str) -> bool:
     real shell operator rather than literal data. This is the shared
     quote-aware pre-pass used to stop operators embedded inside quoted string
     literals (``grep -rn "SATS->ECHO"``, ``echo "a|b"``) from tripping the
-    pattern-scanning checks (task 2652).
+    pattern-scanning checks (task 2652). Comments and heredoc bodies are
+    not shell level either; the classification is _scan_shell's.
     """
-    in_single = False
-    in_double = False
-    escaped = False
-    for ch in command:
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\" and not in_single:
-            escaped = True
-            continue
-        if in_single:
-            if ch == "'":
-                in_single = False
-            continue
-        if in_double:
-            if ch == '"':
-                in_double = False
-            continue
-        if ch == "'":
-            in_single = True
-            continue
-        if ch == '"':
-            in_double = True
-            continue
-        if ch in chars:
-            return True
-    return False
+    return bool(_code_char_positions(command, chars))
 
 
 def _scan_shell_level_dollar_quotes(command: str) -> set[str]:
@@ -434,53 +923,20 @@ def _scan_shell_level_dollar_quotes(command: str) -> set[str]:
     regardless of the surrounding quote context and produced check-4 false
     positives (task 2652). ``\$'...'`` (an escaped dollar) is correctly NOT
     reported, matching bash semantics where ``\$`` is a literal ``$``.
+    Positions come from _scan_shell, so a ``$'...'`` holding ``\\'`` no
+    longer hides the constructs after it.
     """
+    scan_kinds = _scan_shell(command).kinds
     kinds: set[str] = set()
-    in_single = False
-    in_double = False
-    escaped = False
-    n = len(command)
-    i = 0
-    while i < n:
-        ch = command[i]
-        if escaped:
-            escaped = False
-            i += 1
-            continue
-        if ch == "\\" and not in_single:
-            escaped = True
-            i += 1
-            continue
-        if in_single:
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if in_double:
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        # Unquoted, unescaped shell-level context.
-        if ch == "$" and i + 1 < n:
-            nxt = command[i + 1]
-            if nxt == "'":
+    index = command.find("$")
+    while index >= 0:
+        kind = scan_kinds[index]
+        if not kind & _F_HIDDEN:
+            if kind & _KIND_MASK == _K_ANSI_DELIM:
                 kinds.add("ansi-c")
-                # Enter the ANSI-C single-quoted region so its body (which may
-                # contain " or $) does not perturb detection of later tokens.
-                in_single = True
-                i += 2
-                continue
-            if nxt == '"':
+            elif kind & _KIND_MASK == _K_DQ_DELIM:
                 kinds.add("locale")
-                in_double = True
-                i += 2
-                continue
-        if ch == "'":
-            in_single = True
-        elif ch == '"':
-            in_double = True
-        i += 1
+        index = command.find("$", index + 1)
     return kinds
 
 
@@ -976,7 +1432,11 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
         )
 
     # Empty quote pairs adjacent to quoted dash: """-f"
-    if re.search(r"""(?:""|''){1,}['\"]-""", command):
+    # One pair is enough: any run of pairs ending in a quoted dash contains
+    # a single pair followed by the quoted dash. The old ``{1,}`` quantifier
+    # was unanchored and backtracked quadratically on long quote runs
+    # (sandbox-07: 50k quotes took ~28 s).
+    if re.search(r"""(?:""|'')['\"]-""", command):
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains empty quote pair adjacent to quoted dash",
@@ -999,10 +1459,20 @@ def _extract_dollar_paren_inners(text: str) -> list[str]:
     substitution, but the surrounding caller has already stripped quoted
     content.
     """
+    return _extract_paren_inners(text, "$")
+
+
+def _extract_paren_inners(text: str, sigil: str) -> list[str]:
+    """Return the inner text of every top-level ``<sigil>(...)`` construct.
+
+    *sigil* is ``"$"`` for command substitution or ``"<"`` for process
+    substitution. Same naive nesting-aware scan as
+    ``_extract_dollar_paren_inners``.
+    """
     inners: list[str] = []
     i = 0
     while i < len(text) - 1:
-        if text[i] == "$" and text[i + 1] == "(":
+        if text[i] == sigil and text[i + 1] == "(":
             depth = 1
             j = i + 2
             start = j
@@ -1082,6 +1552,24 @@ def _is_safe_substitution_inner(inner: str) -> bool:
     return True
 
 
+# Constant-text emitters are NOT allowed inside <(...): a here-string
+# (`cmd <<< "text"`) covers that use, and `ls -la <(echo ...)` is the
+# command agent_runner's gate canary (_CANARY_COMMAND) and its guard-rail
+# tests rely on the gate refusing. Changing this set means changing that
+# canary first.
+_PROCESS_SUBSTITUTION_EXCLUDED_BASES: frozenset[str] = frozenset({"echo", "printf"})
+
+
+def _is_safe_process_substitution_inner(inner: str) -> bool:
+    """True if ``<(inner)`` only reads data through read-only commands."""
+    if not _is_safe_substitution_inner(inner):
+        return False
+    return all(
+        _get_base_command(segment) not in _PROCESS_SUBSTITUTION_EXCLUDED_BASES
+        for segment in _split_command_segments(inner.strip())
+    )
+
+
 def _check_command_substitution(unquoted: str) -> BashSecurityResult:
     """Check 8: Backticks and command substitution patterns.
 
@@ -1118,6 +1606,18 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
     else:
         scrubbed = unquoted
 
+    # <(...) process substitution (sandbox-13): `diff <(sort a) <(sort b)`
+    # only reads the output of the inner commands, so it gets the same
+    # read-only allowlist as $(...) (minus constant-text emitters, see
+    # _is_safe_process_substitution_inner). >(...) feeds data INTO a command
+    # and stays blocked unconditionally.
+    if "<(" in scrubbed:
+        process_inners = _extract_paren_inners(scrubbed, "<")
+        if process_inners and all(
+            _is_safe_process_substitution_inner(inner) for inner in process_inners
+        ):
+            scrubbed = re.sub(r"<\([^()]*\)", "", scrubbed)
+
     for pattern, desc in _COMMAND_SUBSTITUTION_PATTERNS:
         if pattern.search(scrubbed):
             return BashSecurityResult(
@@ -1125,6 +1625,306 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
                 message=f"Command contains {desc}",
             )
     return _SAFE
+
+
+# Opener of the canonical ``$(cat <<'DELIM'`` substitution, matched at a
+# ``$(`` position. Only quoted or backslash-escaped delimiters qualify (they
+# make the body literal text), and the body must start on the next line.
+_CAT_HEREDOC_SUBSTITUTION_OPENER_RE = re.compile(
+    r"\$\(\s*cat[ \t]+<<(?P<dash>-?)[ \t]*"
+    r"(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"
+    r'|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)"'
+    r"|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*))"
+    r"[ \t]*\n"
+)
+_CLOSE_PAREN_RE = re.compile(r"\s*\)")
+
+
+def _benign_cat_heredoc_substitution_end(command: str, start: int) -> int | None:
+    """Return the index just past ``$(cat <<'DELIM' ... DELIM)`` at *start*.
+
+    Returns None when no such substitution starts at *start*. The terminator
+    is found the way bash finds it: the FIRST line that is exactly
+    ``DELIM`` (leading tabs allowed for ``<<-``). The substitution must close
+    right after that line. A lenient or last-match terminator would let text
+    after bash's real terminator - which bash executes inside the
+    substitution - be skipped as "heredoc body".
+    """
+    opener = _CAT_HEREDOC_SUBSTITUTION_OPENER_RE.match(command, start)
+    if opener is None:
+        return None
+    delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
+    leading_tabs = r"\t*" if opener.group("dash") else ""
+    terminator = re.compile(
+        rf"^{leading_tabs}{re.escape(delim)}$", re.MULTILINE
+    ).search(command, opener.end())
+    if terminator is None:
+        return None
+    close = _CLOSE_PAREN_RE.match(command, terminator.end())
+    return close.end() if close else None
+
+
+def _double_quoted_substitutions(command: str) -> list[tuple[str, str]]:
+    """Find the command substitutions bash runs from inside double quotes.
+
+    ``_extract_unquoted`` drops double-quoted text entirely, so check 8 never
+    saw ``echo "$(curl ... | sh)"`` although bash executes it (sandbox-01).
+    This scanner follows the real nesting - quoting starts afresh inside
+    ``$(...)`` - and returns ``(kind, inner)`` for every outermost
+    substitution opened while a double-quoted string is open, at any depth
+    (``X=$(echo "$(id)")`` included). ``kind`` is ``"$("`` or ``"`"``.
+
+    Single-quoted and ANSI-C (``$'...'``) text is inert and skipped. A
+    canonical ``$(cat <<'EOF' ... EOF)`` is skipped as literal text when
+    the tokenizer agrees where it ends. An unterminated substitution yields
+    the rest of the command as its inner, so a malformed command is judged
+    rather than ignored. The substitutions are _scan_shell's, which also
+    models comments and heredoc bodies inside them.
+    """
+    found: list[tuple[str, str]] = []
+    covered_until = -1  # end of the last reported one; nested ones are its inner
+    for sub in _scan_shell(command).substitutions:
+        if sub.start < covered_until:
+            continue
+        if sub.kind == "$(":
+            canonical_end = _benign_cat_heredoc_substitution_end(command, sub.start)
+            if canonical_end is not None and canonical_end == sub.inner_end + 1:
+                covered_until = canonical_end
+                continue
+        if not sub.in_double_quotes:
+            continue
+        found.append((sub.kind, command[sub.inner_start:sub.inner_end]))
+        covered_until = sub.inner_end
+    return found
+
+
+# ``${NAME}``, ``${#NAME}``, ``${NAME[0]}``, ``${1}``: plain parameter reads
+# with no operator, so they cannot run anything. Normalised to ``$NAME``
+# before the safe-substitution check so ``"$(dirname "${BASH_SOURCE[0]}")"``
+# is judged on its command, not on the brace form of a variable.
+_SIMPLE_PARAMETER_EXPANSION_RE = re.compile(
+    r"\$\{#?([A-Za-z_][A-Za-z0-9_]*|[0-9]+)(?:\[[A-Za-z0-9_@*]+\])?\}"
+)
+
+
+def _is_arithmetic_inner(inner: str) -> bool:
+    """True if a ``$(`` inner is ``(...)`` whose first paren closes last.
+
+    That is arithmetic expansion ``$((...))``. ``$( (cmd) )`` (a subshell,
+    which runs commands) has a space or text around its parens and fails.
+    """
+    if len(inner) < 2 or inner[0] != "(" or inner[-1] != ")":
+        return False
+    depth = 0
+    last = len(inner) - 1
+    for index, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and index != last:
+                return False
+    return depth == 0
+
+
+def _check_double_quoted_substitution(command: str) -> BashSecurityResult:
+    """Check 8, double-quoted form: ``"$(...)"`` and ``"`...`"`` (sandbox-01).
+
+    Bash runs command substitution inside double quotes exactly as it does
+    unquoted, so the verdict is the unquoted one: backticks always block, and
+    a ``$(...)`` passes only when its inner text passes
+    ``_is_safe_substitution_inner`` AND the full pipeline (which catches, for
+    example, a redirect to a sensitive path inside the substitution).
+    Arithmetic ``$((...))`` passes when it holds no substitution.
+    """
+    if '"' not in command or ("$(" not in command and "`" not in command):
+        return _SAFE
+    for kind, inner in _double_quoted_substitutions(command):
+        if kind == "`":
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                message="Command contains backticks (`) for command substitution inside double quotes",
+            )
+        if _is_arithmetic_inner(inner):
+            if "$(" in inner or "`" in inner:
+                return BashSecurityResult(
+                    safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                    message="Command contains command substitution inside $((...)) in double quotes",
+                )
+            continue
+        normalized = _SIMPLE_PARAMETER_EXPANSION_RE.sub(r"$\1", inner)
+        if not _is_safe_substitution_inner(normalized):
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.COMMAND_SUBSTITUTION,
+                message="Command contains $() command substitution inside double quotes",
+            )
+        nested = check_bash_command(inner)
+        if not nested.safe:
+            return BashSecurityResult(
+                safe=False, check_id=nested.check_id,
+                message=f"$() inside double quotes: {nested.message}",
+            )
+    return _SAFE
+
+
+_WORD_BREAK_CHARS = frozenset(" \t\n;&|<>()")
+# Characters that make a redirect target unknowable before run time.
+_DYNAMIC_WORD_CHARS = frozenset("$`*?[")
+# Absolute redirect targets allowed besides /tmp/...
+_ALLOWED_DEVICE_TARGETS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+
+
+def _read_shell_word(command: str, start: int) -> tuple[str, bool, int]:
+    """Read the shell word starting at *start*.
+
+    Returns ``(literal, dynamic, end)``. Unquoted, single-quoted and
+    double-quoted parts are joined the way bash joins them into one word, so
+    ``/tmp/x"/../../y"`` reads as ``/tmp/x/../../y``. ``dynamic`` is True
+    when the real value is only known at run time - a ``$`` or backtick
+    expansion, an unquoted glob character (``.*`` matches ``..``), or an
+    unterminated quote.
+    """
+    parts: list[str] = []
+    dynamic = False
+    length = len(command)
+    index = start
+    while index < length:
+        ch = command[index]
+        if ch in _WORD_BREAK_CHARS:
+            break
+        if ch == "\\":
+            # \<newline> is a line continuation: both characters vanish, so
+            # `/tmp/.\<newline>./x` is `/tmp/../x` to bash.
+            if index + 1 < length and command[index + 1] != "\n":
+                parts.append(command[index + 1])
+            index += 2
+            continue
+        if ch == "'":
+            close = command.find("'", index + 1)
+            if close < 0:
+                return "".join(parts), True, length
+            parts.append(command[index + 1:close])
+            index = close + 1
+            continue
+        if ch == '"':
+            inner = index + 1
+            while inner < length and command[inner] != '"':
+                if command[inner] == "\\" and inner + 1 < length:
+                    escaped = command[inner + 1]
+                    if escaped in '$`"\\':
+                        parts.append(escaped)
+                    elif escaped != "\n":  # \<newline> vanishes here too
+                        parts.append(command[inner:inner + 2])
+                    inner += 2
+                    continue
+                if command[inner] in "$`":
+                    dynamic = True
+                parts.append(command[inner])
+                inner += 1
+            if inner >= length:
+                return "".join(parts), True, length
+            index = inner + 1
+            continue
+        if ch in _DYNAMIC_WORD_CHARS:
+            dynamic = True
+        parts.append(ch)
+        index += 1
+    return "".join(parts), dynamic, index
+
+
+def _shell_redirects(command: str) -> list[tuple[str, str, bool]]:
+    """Return ``(direction, target, dynamic)`` for each file redirection.
+
+    *direction* is ``"in"`` (``<``, ``<&file``) or ``"out"`` (``>``, ``>>``,
+    ``>|``, ``<>``, ``&>``, ``&>>``, ``>&file``). Only shell-level operators
+    count: quoted text is skipped, and so are heredoc/here-string operators,
+    ``<(``/``>(`` process substitutions (check 8 judges those) and fd
+    duplications such as ``2>&1`` or ``>&-``. Code inside ``$(...)`` is
+    scanned, double-quoted ``"$(...)"`` included, because bash performs
+    those redirections too. Which characters are operators is decided by
+    the shared tokenizer (_scan_shell), not by a private quote model
+    (BS3121-01: ``echo $'\\'' >> /etc/x`` used to hide the redirect).
+    """
+    redirects: list[tuple[str, str, bool]] = []
+    length = len(command)
+    operator_positions = _code_char_positions(
+        command, "<>&", include_double_quoted=True
+    )
+    skip_until = 0
+    for index in operator_positions:
+        if index < skip_until:
+            continue  # second character of an operator already handled
+        ch = command[index]
+        is_dup = False
+        if ch == "&" and command.startswith("&>", index):
+            direction = "out"
+            op_end = index + (3 if command.startswith("&>>", index) else 2)
+        elif ch == "<":
+            if command.startswith("<<<", index):
+                skip_until = index + 3
+                continue
+            if command.startswith("<<", index):
+                skip_until = index + (3 if command.startswith("<<-", index) else 2)
+                continue
+            if command.startswith("<(", index):
+                skip_until = index + 2
+                continue
+            if command.startswith("<>", index):
+                direction, op_end = "out", index + 2
+            elif command.startswith("<&", index):
+                direction, op_end, is_dup = "in", index + 2, True
+            else:
+                direction, op_end = "in", index + 1
+        elif ch == ">":
+            if command.startswith(">(", index):
+                skip_until = index + 2
+                continue
+            if command.startswith(">>", index) or command.startswith(">|", index):
+                direction, op_end = "out", index + 2
+            elif command.startswith(">&", index):
+                direction, op_end, is_dup = "out", index + 2, True
+            else:
+                direction, op_end = "out", index + 1
+        else:
+            continue  # a lone & (background / separator)
+
+        skip_until = op_end
+        word_start = op_end
+        while word_start < length and command[word_start] in " \t":
+            word_start += 1
+        target, dynamic, _word_end = _read_shell_word(command, word_start)
+        if is_dup and not dynamic and (target.isdigit() or target == "-"):
+            continue  # 2>&1, >&2, <&0, >&- : fd duplication, not a file
+        redirects.append((direction, target, dynamic))
+    return redirects
+
+
+def _redirect_target_problem(direction: str, target: str, dynamic: bool) -> str | None:
+    """Explain why a redirect target is refused, or return None if allowed.
+
+    Allowed: a literal relative path with no ``..`` component (it stays in the
+    working directory), a literal ``/tmp/...`` path with no ``..`` component,
+    and ``/dev/null``/``/dev/stdout``/``/dev/stderr``. The check is textual:
+    a symlink inside the tree that points elsewhere is NOT detected.
+    """
+    if dynamic:
+        return (
+            "target is only known at run time (variable, substitution, glob "
+            "or unterminated quote); use a literal path"
+        )
+    if not target:
+        return "target is missing or empty"
+    if target.startswith("~"):
+        return "target is in a home directory"
+    if ".." in target.split("/"):
+        return "target contains a '..' path component"
+    if target.startswith("/"):
+        if target in _ALLOWED_DEVICE_TARGETS:
+            return None
+        if target.startswith("/tmp/") and target.strip("/") != "tmp":
+            return None
+        return "target is an absolute path outside /tmp"
+    return None
 
 
 def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
@@ -1162,8 +1962,10 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
     real redirect — so the check short-circuits to safe. This makes check-9/10
     provably immune to operators embedded inside quoted strings while leaving
     every genuine redirect (which is always unquoted) fully validated.
+    Redirections inside a double-quoted ``"$(...)"`` are real too, so they
+    count here and are validated word by word below.
     """
-    if not _has_shell_level_char(command, "<>"):
+    if not _code_char_positions(command, "<>", include_double_quoted=True):
         return _SAFE
 
     # Hard denylist applied to the ORIGINAL unquoted string before any
@@ -1183,6 +1985,27 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
             message="Command redirects output to a sensitive system path",
         )
 
+    # Word-level target validation (sandbox-08, sandbox-13). The target is
+    # read the way bash reads it - quoted parts joined - so neither
+    # `>> /tmp/../home/u/.bashrc` nor `> /tmp/x"/../../home/u/.bashrc"` can
+    # hide a traversal from the textual allowlist below. Input redirection
+    # from a literal relative path (`sort < data/in.txt`) is allowed: it
+    # reads nothing the process could not read anyway, while absolute, home
+    # and `..` sources stay blocked.
+    for direction, target, dynamic in _shell_redirects(command):
+        problem = _redirect_target_problem(direction, target, dynamic)
+        if problem is None:
+            continue
+        if direction == "in":
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.INPUT_REDIRECTION,
+                message=f"Command contains input redirection (<) whose {problem}",
+            )
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.OUTPUT_REDIRECTION,
+            message=f"Command contains output redirection (>) whose {problem}",
+        )
+
     # Strip safe stderr/stdout redirection patterns before the literal-char check
     safe_patterns = [
         # Heredoc / here-string operators MUST be stripped BEFORE bare-< check.
@@ -1190,9 +2013,25 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
         # so the third < is not misread as a heredoc body word boundary.
         r"<<<",                            # <<<word here-string operator
         r"<<-?\s*\\?['\"]?[\w-]+['\"]?",   # <<EOF, <<-EOF, <<'EOF', <<\EOF
+        # A heredoc operator whose quoted delimiter was removed by
+        # _extract_unquoted (`cat <<'EOF' > f` -> `cat << > f`).
+        r"<<-?",
+        # <(...) process substitution: check 8 already judged its inner.
+        r"<\(",
+        # Input from a literal relative, /tmp or /dev/null path: every
+        # target was validated word by word above (no `..`, no ~, no
+        # absolute path outside /tmp, nothing dynamic).
+        r"<\s*/dev/null",
+        r"<\s*/tmp/[\w./-]+",
+        r"<\s*\./[\w./-]+",
+        r"<\s*[A-Za-z0-9_][\w./-]*",
         r"2\s*>\s*&\s*1",                  # 2>&1
+        # fd duplication/close (>&2, 1>&2, <&0, >&-): no file is opened;
+        # _shell_redirects above skips exactly these forms too.
+        r"[0-9]*[<>]&(?:[0-9]+|-)",
         r"2\s*>\s*/dev/null",              # 2>/dev/null
         r">\s*/dev/null",                  # >/dev/null
+        r">>?\s*/dev/std(?:out|err)\b",    # >/dev/stderr
         r"2\s*>>\s*[\w./-]+\.log",         # 2>>somefile.log
         r">>\s*[\w./-]+\.log",             # >>somefile.log (dev append)
         # > or >> targeting /tmp/...
@@ -1266,10 +2105,13 @@ def _check_newlines(command: str, unquoted: str) -> BashSecurityResult:
     separators and must not trigger this check (the false-positive that
     blocked agents writing multi-line script bodies through ``-c``/``-e``).
 
-    Walks the command character-by-character tracking quote state, so the
-    decision is made on real shell semantics rather than on the
-    ``_extract_unquoted`` helper's stripped output (which can desync when
-    quote nesting interacts with backslash escapes).
+    The quote state comes from the shared tokenizer (_scan_shell), so the
+    decision is made on real shell semantics: a newline in any quoted
+    token, a ``\\<NL>`` continuation or a heredoc body line is not a
+    separator, while the newline ending a heredoc opener line is. Newlines
+    inside a double-quoted ``"$(...)"`` are judged when check 8 runs that
+    substitution's inner command through the full pipeline. (Comment
+    smuggling via ``\\n#`` in quotes is check 23's job.)
 
     Carriage-return handling is preserved: ``\\r`` outside double quotes
     is blocked because it can cause parser differentials between
@@ -1278,70 +2120,41 @@ def _check_newlines(command: str, unquoted: str) -> BashSecurityResult:
     if "\n" not in command and "\r" not in command:
         return _SAFE
 
-    in_single = False
-    in_double = False
-    escaped = False
-    quote_open_idx = -1
-
+    kinds = _scan_shell(command).kinds
     for i, ch in enumerate(command):
-        if escaped:
-            escaped = False
+        if ch not in "\n\r":
             continue
-        if ch == "\\" and not in_single:
-            escaped = True
-            continue
-        if ch == "'" and not in_double:
-            if not in_single:
-                quote_open_idx = i
-            in_single = not in_single
-            continue
-        if ch == '"' and not in_single:
-            if not in_double:
-                quote_open_idx = i
-            in_double = not in_double
-            continue
-
-        if ch == "\n":
-            if in_single or in_double:
-                # Inside a quoted token — by shell semantics, NOT a
-                # command separator. Defense-in-depth: explicitly recognize
-                # the script-interpreter -c/-e case so the intent is
-                # documented and any future tightening here cannot
-                # accidentally re-introduce the false-positive.
-                if _is_inside_quoted_arg_value(command, quote_open_idx):
-                    continue
-                # Other quoted contexts: still part of the quoted token
-                # at the shell level, so the newline is not a separator.
-                # (Comment-smuggling via ``\n#`` is handled separately by
-                # check 23 / ``_check_quoted_newline_comment``.)
+        kind = kinds[i]
+        if ch == "\r":
+            if kind & _KIND_MASK == _K_DQ or kind & _F_HIDDEN:
                 continue
-
-            # Unquoted newline — true shell-token boundary. Block only when
-            # followed by non-whitespace (i.e., a subsequent command on the
-            # next line), allowing ``\<NL>`` POSIX line continuations.
-            rest = command[i + 1:]
-            if not rest.lstrip():
-                continue
-            j = i - 1
-            while j >= 0 and command[j] in " \t":
-                j -= 1
-            is_continuation = (
-                j >= 0
-                and command[j] == "\\"
-                and (j == 0 or command[j - 1] in (" ", "\t"))
-            )
-            if is_continuation:
-                continue
-            return BashSecurityResult(
-                safe=False, check_id=CheckID.NEWLINES,
-                message="Command contains newlines that could separate multiple commands",
-            )
-
-        if ch == "\r" and not in_double:
             return BashSecurityResult(
                 safe=False, check_id=CheckID.NEWLINES,
                 message="Command contains carriage return which can cause parser differentials",
             )
+        if kind & _KIND_MASK != _K_CODE or kind & _F_HIDDEN:
+            continue  # quoted, escaped, heredoc text, or inside "$(...)"
+        # Unquoted newline — true shell-token boundary. Block only when
+        # followed by non-whitespace (i.e., a subsequent command on the
+        # next line). A real ``\<NL>`` continuation never gets here (the
+        # tokenizer marks that newline escaped); the backslash-then-blanks
+        # allowance below is kept from the previous scanner.
+        if not command[i + 1:].lstrip():
+            continue
+        j = i - 1
+        while j >= 0 and command[j] in " \t":
+            j -= 1
+        is_continuation = (
+            j >= 0
+            and command[j] == "\\"
+            and (j == 0 or command[j - 1] in (" ", "\t"))
+        )
+        if is_continuation:
+            continue
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.NEWLINES,
+            message="Command contains newlines that could separate multiple commands",
+        )
 
     return _SAFE
 
@@ -1376,15 +2189,120 @@ def _check_backslash_escaped_whitespace(command: str) -> BashSecurityResult:
     return _SAFE
 
 
+def _brace_expansions(text: str) -> list[tuple[int, int, str]]:
+    """Return ``(open_pos, close_pos, kind)`` for every brace expansion in *text*.
+
+    A brace expansion is a matched, unescaped ``{...}`` whose top level holds
+    a ``,`` (kind ``"comma"``: ``{a,b}``) or ``..`` (kind ``"sequence"``:
+    ``{1..5}``). Unmatched braces are ignored. Results are sorted by
+    ``open_pos``.
+
+    Single linear pass with a stack (sandbox-07): the previous version walked
+    forward from every ``{`` to find its partner and backwards over
+    backslashes at every position, so 40k ``{`` took minutes.
+    """
+    escaped = _escaped_positions(text)
+    open_stack: list[list] = []  # [open_pos, kind or None]
+    found: list[tuple[int, int, str]] = []
+    length = len(text)
+    for index, ch in enumerate(text):
+        if ch == "{" and not escaped[index]:
+            open_stack.append([index, None])
+        elif ch == "}" and not escaped[index]:
+            if open_stack:
+                open_pos, kind = open_stack.pop()
+                if kind is not None:
+                    found.append((open_pos, index, kind))
+        elif open_stack and open_stack[-1][1] is None:
+            # A separator belongs to the innermost open brace, i.e. the pair
+            # for which it sits at depth 0.
+            if ch == ",":
+                open_stack[-1][1] = "comma"
+            elif ch == "." and index + 1 < length and text[index + 1] == ".":
+                open_stack[-1][1] = "sequence"
+    found.sort()
+    return found
+
+
+_BRACE_COMMA_MESSAGE = "Command contains brace expansion that could alter parsing"
+_BRACE_SEQUENCE_MESSAGE = "Command contains brace sequence expansion ({a..z})"
+
+# Commands whose ARGUMENTS may carry a brace list (`ls {a,b}`,
+# `cp f{,.bak}`): none of them runs an argument as a command or as code.
+_BRACE_EXPANSION_SAFE_BASES: frozenset[str] = frozenset([
+    "echo", "printf", "ls", "cat", "cp", "mv", "mkdir", "touch", "diff",
+    "wc", "head", "tail", "grep", "egrep", "fgrep", "rg", "stat", "du",
+    "file", "sort", "uniq",
+])
+# A brace word containing any of these could turn into something else after
+# quote removal or expansion (`"-"{a,b}` becomes `-a -b`).
+_BRACE_WORD_FORBIDDEN_CHARS = frozenset("'\"\\$`")
+_WORD_WHITESPACE = frozenset(" \t\n")
+
+
+def _brace_segment_problem(segment: str) -> str | None:
+    """Return a check-16 message if *segment* uses brace expansion unsafely.
+
+    Allowed (sandbox-13): a comma list such as ``{a,b}`` in an ARGUMENT of a
+    command from ``_BRACE_EXPANSION_SAFE_BASES``, provided that
+
+    * the command word itself holds no brace (``{rm,-rf,x}`` builds a
+      command),
+    * the word does not start with ``-`` and a list at the start of a word
+      has no element starting with ``-`` (``ls {-la,/}`` builds flags),
+    * the word holds no quote, backslash, ``$`` or backtick, and
+    * there is at most one list per word and no nesting, which keeps the
+      expansion linear in the command length (``{a,b}{a,b}...`` doubles
+      with every group).
+
+    Sequence expressions (``{1..99999999}``) stay blocked: their size is
+    unbounded. The scan runs on the quote-delimiter-preserving view, so
+    quoted commas do not count and quoted text shows up as a quote mark.
+    """
+    view = _extract_unquoted_keep_delimiters(segment)
+    expansions = _brace_expansions(view)
+    if not expansions:
+        return None
+    if any(kind == "sequence" for _, _, kind in expansions):
+        return _BRACE_SEQUENCE_MESSAGE
+    base = _get_base_command(view)
+    if "{" in base or base.rsplit("/", 1)[-1] not in _BRACE_EXPANSION_SAFE_BASES:
+        return _BRACE_COMMA_MESSAGE
+
+    previous_word_end = -1
+    for open_pos, close_pos, _ in expansions:
+        if open_pos < previous_word_end:
+            return _BRACE_COMMA_MESSAGE  # second or nested list in one word
+        word_start = open_pos
+        while word_start > 0 and view[word_start - 1] not in _WORD_WHITESPACE:
+            word_start -= 1
+        word_end = close_pos + 1
+        while word_end < len(view) and view[word_end] not in _WORD_WHITESPACE:
+            word_end += 1
+        word = view[word_start:word_end]
+        if word.startswith("-") or any(
+            ch in _BRACE_WORD_FORBIDDEN_CHARS for ch in word
+        ):
+            return _BRACE_COMMA_MESSAGE
+        if open_pos == word_start and any(
+            element.startswith("-")
+            for element in view[open_pos + 1:close_pos].split(",")
+        ):
+            return _BRACE_COMMA_MESSAGE
+        previous_word_end = word_end
+    return None
+
+
 def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
     """Check 16: Brace expansion ({a,b} or {1..5}) in unquoted content."""
-    # Count unescaped braces
+    # Count unescaped braces (linear: escape state is precomputed).
+    escaped = _escaped_positions(unquoted)
     open_count = 0
     close_count = 0
-    for i, ch in enumerate(unquoted):
-        if ch == "{" and not _is_escaped_at(unquoted, i):
+    for index, ch in enumerate(unquoted):
+        if ch == "{" and not escaped[index]:
             open_count += 1
-        elif ch == "}" and not _is_escaped_at(unquoted, i):
+        elif ch == "}" and not escaped[index]:
             close_count += 1
 
     # Excess closing braces = quoted braces were stripped (attack primitive)
@@ -1401,48 +2319,16 @@ def _check_brace_expansion(command: str, unquoted: str) -> BashSecurityResult:
             message="Quoted brace character inside brace context (potential obfuscation)",
         )
 
-    # Scan for {a,b} or {1..5} patterns in unquoted content
-    i = 0
-    while i < len(unquoted):
-        if unquoted[i] != "{" or _is_escaped_at(unquoted, i):
-            i += 1
-            continue
-        # Find matching close brace with nesting
-        depth = 1
-        close_pos = -1
-        j = i + 1
-        while j < len(unquoted):
-            if unquoted[j] == "{" and not _is_escaped_at(unquoted, j):
-                depth += 1
-            elif unquoted[j] == "}" and not _is_escaped_at(unquoted, j):
-                depth -= 1
-                if depth == 0:
-                    close_pos = j
-                    break
-            j += 1
-        if close_pos == -1:
-            i += 1
-            continue
-        # Check for comma or .. at outermost level
-        inner_depth = 0
-        for k in range(i + 1, close_pos):
-            ch = unquoted[k]
-            if ch == "{" and not _is_escaped_at(unquoted, k):
-                inner_depth += 1
-            elif ch == "}" and not _is_escaped_at(unquoted, k):
-                inner_depth -= 1
-            elif inner_depth == 0:
-                if ch == ",":
-                    return BashSecurityResult(
-                        safe=False, check_id=CheckID.BRACE_EXPANSION,
-                        message="Command contains brace expansion that could alter parsing",
-                    )
-                if ch == "." and k + 1 < close_pos and unquoted[k + 1] == ".":
-                    return BashSecurityResult(
-                        safe=False, check_id=CheckID.BRACE_EXPANSION,
-                        message="Command contains brace sequence expansion ({a..z})",
-                    )
-        i += 1
+    # Early out: expansions seen in the per-segment quote-preserving view
+    # are a subset of those in the unquoted view.
+    if open_count == 0 or not _brace_expansions(unquoted):
+        return _SAFE
+    for segment in _split_command_segments(command):
+        message = _brace_segment_problem(segment)
+        if message is not None:
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.BRACE_EXPANSION, message=message,
+            )
     return _SAFE
 
 
@@ -1553,54 +2439,6 @@ _SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
     r"(?:python|python2|python3|py|perl|ruby|node|nodejs)"
     r"\s+-(?:c|e)\s*$"
 )
-
-
-# Broader allowlist used by check 7 (newlines): any interpreter or DB CLI
-# whose ``-c``/``-e``/``-x``/``--command`` argument is a multi-statement
-# script body where embedded newlines are legitimate (consumed by the
-# interpreter, not the shell). This includes shell interpreters
-# (``bash``/``sh``/``zsh``) — unlike the comment-smuggling check, a bare
-# newline inside ``bash -c "..."`` is NOT a shell-token boundary at the
-# outer shell level (the whole quoted body is ONE token to ``bash``).
-# The ``\n#`` smuggling primitive is still caught for shells by check 23
-# via ``_is_inside_safe_interpreter_arg`` (which intentionally excludes
-# the shells), so this looser list does not weaken that defense.
-#
-# The optional path prefix ``(?:[^\s]*/)?`` mirrors the same fix applied
-# to ``_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE`` — virtualenv forms like
-# ``./venv/bin/python3 -c`` must also pass the newline check (bug 2603).
-_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
-    r"(?:^|[\s;&|`(])"
-    r"(?:[^\s]*/)?(?:python|python2|python3|py|perl|ruby|node|nodejs|"
-    r"bash|sh|zsh|ksh|dash|fish|"
-    r"psql|mysql|mariadb|sqlite|sqlite3|"
-    r"awk|gawk|sed|"
-    r"php|lua|tclsh|R|Rscript)"
-    r"\s+-(?:c|e|x|-command)\s*$"
-)
-
-
-def _is_inside_quoted_arg_value(command: str, quote_open_idx: int) -> bool:
-    """Return True if the quote at ``quote_open_idx`` opens the body of a
-    script-interpreter or DB-CLI ``-c``/``-e`` argument where embedded
-    newlines are legitimate (``python3 -c``, ``bash -c``, ``psql -c``,
-    ``perl -e``, ``awk -e``, etc.).
-
-    Used by check 7 (``_check_newlines``) to ensure it only fires when the
-    newline is at a true shell-token boundary, not when it is inside a
-    quoted-string argument value being passed to a known interpreter. The
-    shell sees the whole quoted argument as one token, so newlines inside
-    are consumed by the interpreter — they cannot separate shell commands.
-
-    Mirrors ``_is_inside_safe_interpreter_arg`` (used by check 23) but
-    includes shell and DB CLIs because a newline alone is not the
-    comment-smuggling primitive — that primitive (``\\n#``) is what
-    check 23 catches with the narrower allowlist.
-    """
-    if quote_open_idx <= 0:
-        return False
-    prefix = command[:quote_open_idx]
-    return bool(_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE.search(prefix))
 
 
 def _is_inside_safe_interpreter_arg(command: str, quote_open_idx: int) -> bool:
@@ -2337,10 +3175,213 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
     if suffix.strip():
         return None
 
+    # The opener regex does not know quoting: bash must agree that this `<<`
+    # opens a top-level quoted heredoc whose body is exactly what we strip.
+    body_start = opener.end() + body_nl + 1
+    terminator_start = opener.end() + body_nl + close.start() + 1
+    if not _tokenizer_confirms_quoted_heredoc(
+        command, opener.start(), body_start, terminator_start
+    ):
+        return None
+
     # Canonical benign shape: nothing executable trails the opener, and the
     # body + closing delimiter are inert. Return the pure git command line for
     # normal re-validation of the git arguments themselves.
     return prefix.rstrip()
+
+
+def _tokenizer_confirms_quoted_heredoc(
+    command: str, operator: int, body_start: int, terminator_start: int
+) -> bool:
+    """True when bash reads a top-level quoted heredoc exactly there.
+
+    The heredoc strippers find their opener with their own scans. Before
+    text is removed from the checked command, the shared tokenizer must
+    agree - on the whole command - that the ``<<`` at *operator* is live
+    syntax, that its delimiter is quoted (so the body is inert) and that
+    the body spans *body_start* to *terminator_start*. Otherwise the
+    "body" may be code: ``cat $'\\' <<'EOF'`` puts the ``<<`` inside an
+    ANSI-C string, and the following lines run.
+    """
+    scan = _scan_shell(command)
+    if scan.error is not None:
+        return False
+    return any(
+        heredoc.operator == operator
+        and heredoc.quoted
+        and heredoc.top_level
+        and heredoc.body_start == body_start
+        and heredoc.terminator_start == terminator_start
+        and heredoc.terminator_start < len(command)
+        for heredoc in scan.heredocs
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quoted-delimiter heredoc into a non-shell consumer (task 3121, sandbox-13)
+# ---------------------------------------------------------------------------
+
+# Commands whose heredoc body is data or a program in their OWN language
+# (``python3 - <<'EOF'``), never shell code. Shells, eval/source, xargs and
+# writers other than ``cat`` are deliberately absent: a heredoc into
+# sh/bash IS shell code and keeps full scrutiny (check 7 blocks it).
+_INERT_HEREDOC_CONSUMERS: frozenset[str] = frozenset([
+    "cat", "python", "py", "perl", "ruby", "node", "nodejs",
+    "gh", "wc", "sort", "head", "tail", "grep",
+])
+
+_HEREDOC_OPENER_RE = re.compile(
+    r"<<(?P<dash>-?)[ \t]*"
+    r"(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"
+    r'|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)"'
+    r"|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+# All that may follow the opener on its line: plain output redirections to
+# literal words. Their targets are validated by check 10 afterwards.
+_HEREDOC_OPENER_LINE_REST_RE = re.compile(
+    r"(?:[ \t]*[0-9]?>>?[ \t]*[\w./-]+)*[ \t]*"
+)
+_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-s", "-k", "--signal", "--kill-after"})
+
+
+def _heredoc_consumer(segment: str) -> str:
+    """Return the normalised command name that receives a heredoc.
+
+    Strips a path (``.venv/bin/python3``), folds ``python3.12`` to
+    ``python`` and looks through a leading ``timeout [opts] DURATION``.
+    Returns ``""`` when the command word cannot be determined.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return ""
+    index = 0
+    if tokens and tokens[0] == "timeout":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            if tokens[index] in _TIMEOUT_OPTIONS_WITH_VALUE:
+                index += 1
+            index += 1
+        index += 1  # the duration
+    if index >= len(tokens):
+        return ""
+    name = tokens[index].rsplit("/", 1)[-1]
+    if re.fullmatch(r"python[0-9.]*", name):
+        return "python"
+    return name
+
+
+def _strip_inert_heredoc_body(command: str) -> str | None:
+    """Remove the body of an inert quoted-delimiter heredoc; None if not one.
+
+    Recognises ``<consumer> ... <<'DELIM' [> file]`` on the first line,
+    followed by a literal body and a ``DELIM`` line, where the consumer is in
+    ``_INERT_HEREDOC_CONSUMERS``. A quoted (or backslash-escaped) delimiter
+    stops the shell from expanding anything in the body, so the body cannot
+    run shell code or redirect files; for these consumers it is data or
+    their own-language program - the same thing ``python3 -c '...'`` passes
+    as an argument. Checks 7/9/22/23 used to fire on ordinary body text
+    (newlines, ``<``, ``#``), which left ``python3 - <<'EOF'`` with no
+    permitted form.
+
+    Returns the command with ONLY the body and terminator line removed.
+    The opener line is returned for normal checking, and anything after the
+    terminator is kept (on its own line, so check 7 still blocks it).
+    Returns None - the command is checked unchanged - when the delimiter is
+    unquoted (the body is expanded), the consumer is a shell or unknown,
+    the first line holds more than one heredoc, a substitution, an open
+    quote or anything but redirections after the opener, or the terminator
+    is missing.
+    """
+    first_newline = command.find("\n")
+    if first_newline < 0 or "<<" not in command[:first_newline]:
+        return None
+    line = command[:first_newline]
+
+    # Shell-level scan of the opener line.
+    opener_positions: list[int] = []
+    in_single = in_double = False
+    index = 0
+    while index < len(line):
+        ch = line[index]
+        if ch == "\\" and not in_single:
+            index += 2
+            continue
+        if in_single:
+            in_single = ch != "'"
+        elif in_double:
+            if ch in "$`":
+                return None
+            in_double = ch != '"'
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "`" or line.startswith("$(", index) or line.startswith(
+            "<(", index
+        ) or line.startswith(">(", index):
+            return None
+        elif line.startswith("<<<", index):
+            index += 3
+            continue
+        elif line.startswith("<<", index):
+            opener_positions.append(index)
+            index += 2
+            continue
+        index += 1
+    if in_single or in_double or len(opener_positions) != 1:
+        return None
+
+    opener_pos = opener_positions[0]
+    opener = _HEREDOC_OPENER_RE.match(line, opener_pos)
+    if opener is None or opener.group("bare"):
+        return None
+    following = line[opener.end():opener.end() + 1]
+    if following and (following.isalnum() or following in "_'\"\\"):
+        return None  # <<'E'OF style: the real delimiter differs from ours
+    if not _HEREDOC_OPENER_LINE_REST_RE.fullmatch(line[opener.end():]):
+        return None
+
+    prefix = line[:opener_pos]
+    consumer = _heredoc_consumer(prefix[_last_segment_start(prefix):])
+    if consumer not in _INERT_HEREDOC_CONSUMERS:
+        return None
+
+    delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
+    leading_tabs = r"\t*" if opener.group("dash") else ""
+    terminator = re.compile(
+        rf"^{leading_tabs}{re.escape(delim)}$", re.MULTILINE
+    ).search(command, first_newline + 1)
+    if terminator is None:
+        return None
+    if not _tokenizer_confirms_quoted_heredoc(
+        command, opener_pos, first_newline + 1, terminator.start()
+    ):
+        return None
+    after = command[terminator.end():]
+    return line + after if after.strip() else line
+
+
+def _check_quote_structure(command: str) -> BashSecurityResult:
+    """Check 25: the shared tokenizer must reach a clean end state.
+
+    An unterminated quote, substitution or ``${...}``, or a construct the
+    tokenizer does not model (see _scan_shell), means the checker cannot
+    tell quoted text from code. Guessing is how ``$'\\''`` hid payloads
+    (BS3121-01), so the command is refused with the reason instead.
+    """
+    error = _scan_shell(command).error
+    if error is None:
+        return _SAFE
+    return BashSecurityResult(
+        safe=False, check_id=CheckID.UNPARSEABLE_QUOTING,
+        message=(
+            f"Command quoting could not be parsed ({error}); the checker "
+            "cannot tell quoted text from code. Close every quote and "
+            "substitution, or put the text in a file"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2359,11 +3400,33 @@ def check_bash_command(command: str) -> BashSecurityResult:
     if not command or not command.strip():
         return _SAFE
 
+    # Length cap (sandbox-07): checked before any scan so an oversized
+    # command is refused in constant-ish time with an actionable reason.
+    command_bytes = len(command.encode("utf-8", errors="surrogatepass"))
+    if command_bytes > MAX_COMMAND_BYTES:
+        result = BashSecurityResult(
+            safe=False, check_id=CheckID.COMMAND_TOO_LONG,
+            message=(
+                f"Command is {command_bytes} bytes, over the "
+                f"{MAX_COMMAND_BYTES}-byte limit; write long content to a "
+                "file and run a short command that reads it"
+            ),
+        )
+        log.warning(
+            "Bash security check %d BLOCKED command: %s — %s",
+            result.check_id, command[:120], result.message,
+        )
+        return result
+
     # Canonical `git commit` fed by a quoted-delimiter heredoc: the body is
     # inert literal text piped to git's stdin, so strip it and validate only
     # the real git command line. Prevents checks 7/9/10/21/23 from
     # false-positiving on ordinary prose in the commit body (task 2468).
     sanitized = _benign_git_heredoc_sanitized(command)
+    if sanitized is None:
+        # Same idea for `python3 - <<'EOF'`, `cat > f <<'EOF'` and other
+        # non-shell consumers of a quoted-delimiter heredoc (sandbox-13).
+        sanitized = _strip_inert_heredoc_body(command)
     if sanitized is not None:
         command = sanitized
 
@@ -2372,6 +3435,10 @@ def check_bash_command(command: str) -> BashSecurityResult:
 
     # Run each check in priority order. First failure wins.
     checks: list[BashSecurityResult] = [
+        # First: every check below reads the tokenizer's view of quoting,
+        # which is meaningless for a command bash would not parse the same
+        # way (BS3121-01, fail closed).
+        _check_quote_structure(command),
         _check_control_characters(command),
         _check_unicode_whitespace(command),
         _check_incomplete_commands(command),
@@ -2393,6 +3460,10 @@ def check_bash_command(command: str) -> BashSecurityResult:
         _check_mid_word_hash(command),
         _check_brace_expansion(command, unquoted),
         _check_zsh_dangerous_commands(command),
+        # Last, so every verdict and check id the checks above already gave
+        # is unchanged; this only adds blocks for substitutions hidden inside
+        # double quotes (sandbox-01).
+        _check_double_quoted_substitution(command),
     ]
 
     for result in checks:
