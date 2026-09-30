@@ -334,9 +334,23 @@ def test_slow_launcher_backstop_kills_setsid_descendants(fake_claude,
     assert not _alive(fake_claude.watcher())
 
 
-def test_orchestrator_sigkill_kills_agent_tree(fake_claude, tmp_path):
-    """PT-02: PR_SET_PDEATHSIG makes the launcher clean up after a dead
-    orchestrator (SIGKILL runs no Python cleanup at all)."""
+@pytest.mark.parametrize("orchestrator_signal", [
+    pytest.param(signal.SIGKILL, id="SIGKILL"),
+    pytest.param(signal.SIGTERM, id="SIGTERM"),
+    pytest.param(signal.SIGHUP, id="SIGHUP"),
+    pytest.param(signal.SIGINT, id="SIGINT"),
+])
+def test_orchestrator_death_kills_agent_tree(fake_claude, tmp_path,
+                                             orchestrator_signal):
+    """PT-02: agents die with their orchestrator however it is stopped.
+
+    SIGKILL, and SIGTERM or SIGHUP with their default dispositions, end the
+    orchestrator without running any Python cleanup: PR_SET_PDEATHSIG makes
+    the launcher clean up by itself. SIGINT goes through asyncio.run's
+    KeyboardInterrupt path, which cancels the run while the loop shuts down.
+    Agents lead their own sessions, so none of these signals reaches them
+    directly.
+    """
     fake_claude.mode("hang", stubborn=True)
     script = tmp_path / "orchestrator.py"
     script.write_text(ORCHESTRATOR_SOURCE)
@@ -350,12 +364,16 @@ def test_orchestrator_sigkill_kills_agent_tree(fake_claude, tmp_path):
                            20), "the fake agent never started"
         watcher, stubborn = fake_claude.watcher(), fake_claude.stubborn()
         assert _alive(watcher) and _alive(stubborn)
+        orchestrator.send_signal(orchestrator_signal)
+        orchestrator.wait(timeout=20)
     finally:
-        orchestrator.kill()
-        orchestrator.wait(timeout=10)
+        if orchestrator.poll() is None:
+            orchestrator.kill()
+            orchestrator.wait(timeout=10)
 
     assert _wait_until(lambda: not _alive(watcher) and not _alive(stubborn),
-                       15), "the agent tree outlived its SIGKILLed orchestrator"
+                       15), (
+        f"the agent tree outlived its orchestrator ({orchestrator_signal!r})")
 
 
 def test_interpreter_exit_with_a_pending_run_kills_agent_tree(fake_claude,
