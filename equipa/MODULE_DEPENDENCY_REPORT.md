@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **55 Python modules** totaling **38,757 lines** of code across **13 dependency layers** (L0–L12). 30 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **55 Python modules** totaling **38,924 lines** of code across **13 dependency layers** (L0–L12). 30 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -56,11 +56,11 @@ The `equipa/` package contains **55 Python modules** totaling **38,757 lines** o
 | `parsing.py` | 903 | L3 | `constants.py`, `git_ops.py` | `tool_result_storage.py` | 20 |
 | `security_gate.py` | 1076 | L3 | `git_ops.py` | `db.py` | 42 |
 | `single_agent_guard.py` | 610 | L3 | `git_ops.py` | `role_resolver.py` | 6 |
-| `lessons.py` | 635 | L4 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 10 |
+| `lessons.py` | 723 | L4 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 13 |
 | `merge_integrity.py` | 930 | L4 | `git_ops.py`, `security_gate.py` | — | 22 |
 | `rlm_decompose.py` | 739 | L4 | `config.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
-| `prompts.py` | 799 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
-| `reflexion.py` | 151 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
+| `prompts.py` | 871 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
+| `reflexion.py` | 158 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 2730 | L6 | `abort_controller.py`, `agent_launcher.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 25 |
 | `preflight.py` | 343 | L7 | `agent_runner.py`, `constants.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 3533 | L8 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
@@ -70,7 +70,7 @@ The `equipa/` package contains **55 Python modules** totaling **38,757 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 38,757 lines | 728 public exports
+**Total:** 38,924 lines | 731 public exports
 
 ## Modules by Layer
 
