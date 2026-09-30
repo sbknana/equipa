@@ -1130,16 +1130,15 @@ def _run_git(repo_path: str, args: list[str]) -> str:
     """
     import subprocess
 
-    from equipa.git_ops import pinned_git_env
+    # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
+    from equipa.git_ops import git_run
 
-    completed = subprocess.run(
-        ["git", "-C", repo_path, *args],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-        env=pinned_git_env(),
-    )
+    completed = git_run(list(args), repo_path, timeout=30)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, completed.args,
+            output=completed.stdout, stderr=completed.stderr,
+        )
     return completed.stdout.strip()
 
 
@@ -1277,7 +1276,7 @@ async def _default_dispatch_wave(
     A task whose terminal status is ``done`` (or which produced a passing
     outcome) counts as succeeded; anything else halts the initiative.
     """
-    from equipa.dispatch import run_parallel_tasks
+    from equipa.dispatch import DispatchRefused, run_parallel_tasks
     from equipa.db import get_db_connection
 
     repo_path = _resolve_repo_path(getattr(args, "repo_path", None), [], None)
@@ -1324,7 +1323,18 @@ async def _default_dispatch_wave(
     finally:
         conn_hw.close()
 
-    await run_parallel_tasks(list(task_ids), args)
+    try:
+        await run_parallel_tasks(list(task_ids), args)
+    except DispatchRefused as exc:
+        # Task #3112: the wave was refused before any agent ran (a missing
+        # id, mixed projects, a bad concurrency cap). Its tasks keep their
+        # status, so the read-back below judges the wave failed and the
+        # initiative halts with a recorded reason instead of the process
+        # exiting mid-run.
+        logger.error(
+            "[Initiative] wave %s refused before dispatch: %s",
+            list(task_ids), exc.message,
+        )
 
     # S2: independently verify per-task branch isolation BEFORE trusting the
     # dispatch results. A violation downgrades the task so the runner halts.

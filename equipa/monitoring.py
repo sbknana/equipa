@@ -29,7 +29,7 @@ from equipa.constants import (
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
 )
-from equipa.git_ops import pinned_git_env
+from equipa.git_ops import git_run
 from equipa.hooks import fire as fire_hook_sync
 
 # --- Compaction Detection Constants ---
@@ -273,26 +273,15 @@ def _check_git_changes(project_dir: str | None) -> bool:
         return False
 
     try:
-        # Check for unstaged changes
-        diff_result = subprocess.run(
-            ["git", "diff", "--stat"],
-            cwd=project_dir_str,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
-        )
+        # Check for unstaged changes. Task #3112: every git call here goes
+        # through the hardened git_run (no hooks, fsmonitor or drivers run).
+        diff_result = git_run(["diff", "--stat"], project_dir_str, timeout=10)
         if diff_result.returncode == 0 and diff_result.stdout.strip():
             return True
 
         # Check for staged/untracked files
-        status_result = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=project_dir_str,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
+        status_result = git_run(
+            ["status", "--short", "--ignore-submodules=all"], project_dir_str, timeout=10,
         )
         if status_result.returncode == 0 and status_result.stdout.strip():
             return True
@@ -309,14 +298,7 @@ def get_starting_sha(project_dir: str | None) -> str | None:
     if not project_dir:
         return None
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
-        )
+        result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
@@ -336,14 +318,7 @@ def has_session_commits(
     if not project_dir or not starting_sha:
         return False
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
-        )
+        result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
         if result.returncode == 0 and result.stdout.strip():
             current_sha = result.stdout.strip()
             if current_sha != starting_sha:
@@ -375,23 +350,13 @@ def has_branch_commits(project_dir: str | None) -> bool:
     try:
         # Try to find merge-base with common default branches
         for base_ref in ("origin/main", "origin/master", "main", "master"):
-            merge_base = subprocess.run(
-                ["git", "merge-base", base_ref, "HEAD"],
-                cwd=project_dir_str,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                env=pinned_git_env(),
+            merge_base = git_run(
+                ["merge-base", base_ref, "HEAD"], project_dir_str, timeout=10,
             )
             if merge_base.returncode == 0 and merge_base.stdout.strip():
                 base_sha = merge_base.stdout.strip()
-                log_result = subprocess.run(
-                    ["git", "log", "--oneline", f"{base_sha}..HEAD"],
-                    cwd=project_dir_str,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    env=pinned_git_env(),
+                log_result = git_run(
+                    ["log", "--oneline", f"{base_sha}..HEAD"], project_dir_str, timeout=10,
                 )
                 if log_result.returncode == 0:
                     commits = [
@@ -400,13 +365,8 @@ def has_branch_commits(project_dir: str | None) -> bool:
                     return len(commits) > 0
 
         # Fallback: check git diff --stat HEAD~5..HEAD for any file changes
-        diff_result = subprocess.run(
-            ["git", "diff", "--stat", "HEAD~5..HEAD"],
-            cwd=project_dir_str,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
+        diff_result = git_run(
+            ["diff", "--stat", "HEAD~5..HEAD"], project_dir_str, timeout=10,
         )
         if diff_result.returncode == 0 and diff_result.stdout.strip():
             return True

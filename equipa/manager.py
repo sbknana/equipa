@@ -8,10 +8,13 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from typing import Any
 
 from equipa.agent_runner import (
     OVERLOADED_OUTCOME,
+    _run_started_at_utc,
     build_cli_command,
     is_overloaded_result,
     run_agent,
@@ -21,12 +24,18 @@ from equipa.constants import (
     MAX_FOLLOWUP_TASKS,
     MAX_TASKS_PER_PLAN,
 )
-from equipa.db import update_task_status
+from equipa.db import get_db_connection, update_task_status
+from equipa.git_ops import _is_git_repo
 from equipa.loops import run_dev_test_loop
+from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
+from equipa.merge_safety import report_leftover_dispatch_state, shutdown_requested
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
+from equipa.single_agent_guard import TasksCreatedDb, validate_tasks_created_claim
 from equipa.tasks import _get_task_status, fetch_tasks_by_ids
+
+logger = logging.getLogger(__name__)
 
 
 def parse_planner_output(result_text: str) -> list[int]:
@@ -97,6 +106,36 @@ def parse_evaluator_output(result_text: str) -> dict[str, Any]:
     return parsed
 
 
+def _reject_planner_claim(
+    task_ids: list[int],
+    project_id: int,
+    run_started_at: str | None,
+) -> str | None:
+    """Why the planner's ``TASKS_CREATED`` ids must not run, or None if valid.
+
+    dispatch-16 (task #3112): goal mode used to execute whatever ids the
+    planner printed, so a hallucinated line naming another project's tasks
+    ran them in this project's directory and flipped their status. The exact
+    ids the manager would execute are checked with
+    ``validate_tasks_created_claim``: each must exist, belong to
+    ``project_id`` and have been created during this planner run. A failed
+    lookup rejects the claim (fail closed).
+    """
+    claim_text = "TASKS_CREATED: " + ",".join(str(task_id) for task_id in task_ids)
+    try:
+        with TasksCreatedDb(get_db_connection()) as db:
+            verdict = validate_tasks_created_claim(
+                stdout=claim_text,
+                run_started_at=run_started_at,
+                expected_project_id=project_id,
+                db=db,
+            )
+    except (sqlite3.Error, OSError) as exc:
+        logger.exception("[Planner] TASKS_CREATED validation could not read TheForge")
+        return f"could not verify the claimed ids against TheForge: {exc}"
+    return None if verdict.is_valid else verdict.reason
+
+
 async def run_planner_agent(
     goal: str,
     project_id: int,
@@ -121,6 +160,7 @@ async def run_planner_agent(
         prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
     ) as cmd:
         log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        run_started_at = _run_started_at_utc()
         result = await run_agent(cmd)
 
     if is_overloaded_result(result):
@@ -137,6 +177,13 @@ async def run_planner_agent(
         log(f"  [Planner] Created {len(task_ids)} tasks (max {MAX_TASKS_PER_PLAN}). "
             f"Using first {MAX_TASKS_PER_PLAN}.", output)
         task_ids = task_ids[:MAX_TASKS_PER_PLAN]
+
+    if task_ids:
+        rejection = _reject_planner_claim(task_ids, project_id, run_started_at)
+        if rejection:
+            log(f"  [Planner] REJECTED TASKS_CREATED claim {task_ids}: {rejection}. "
+                f"No task from this plan is executed.", output)
+            return result, []
 
     if task_ids:
         log(f"  [Planner] Created {len(task_ids)} tasks: {task_ids}", output)
@@ -227,7 +274,36 @@ async def run_manager_loop(
     total_cost = 0.0
     total_duration = 0.0
 
+    # dispatch-07 (task #3112): in a git project each task runs in its own
+    # worktree and reaches the default branch only through the gated merge
+    # (equipa.dispatch.run_task_in_isolation). The planner and evaluator
+    # still run in the project checkout, so the goal's guard is verified
+    # after each of them: if either moved the default branch, the goal stops
+    # and nothing further is merged.
+    goal_guard: DefaultBranchGuard | None = None
+    if _is_git_repo(project_dir):
+        # Imported here: equipa.dispatch imports this module.
+        from equipa.dispatch import run_task_in_isolation
+
+        await report_leftover_dispatch_state(project_dir)
+        try:
+            goal_guard = await DefaultBranchGuard.snapshot(project_dir)
+        except MergeIntegrityError as exc:
+            log(f"\n  [Manager] Default branch could not be pinned ({exc}). "
+                f"Not running the goal.", output)
+            return "merge_integrity_failed", 0, all_completed, all_blocked, total_cost, total_duration
+
+    async def default_branch_untouched(stage: str) -> bool:
+        if goal_guard is None or await goal_guard.verify(stage):
+            return True
+        log(f"\n  [Manager] {goal_guard.alert}. Aborting the goal.", output)
+        return False
+
     for round_num in range(1, max_rounds + 1):
+        if goal_guard is not None and shutdown_requested() is not None:
+            # dispatch-06: a signal deferred during a merge stops the goal.
+            log("\n  [Manager] Shutdown requested during a merge. Stopping the goal.", output)
+            return "interrupted", round_num, all_completed, all_blocked, total_cost, total_duration
         log(f"\n{'#' * 60}", output)
         log(f"  MANAGER ROUND {round_num}/{max_rounds}", output)
         log(f"{'#' * 60}", output)
@@ -240,6 +316,12 @@ async def run_manager_loop(
         total_duration += planner_result.get("duration", 0)
         if planner_result.get("cost"):
             total_cost += planner_result["cost"]
+
+        if not await default_branch_untouched(f"after-planner round={round_num}"):
+            return (
+                "merge_integrity_failed", round_num, all_completed, all_blocked,
+                total_cost, total_duration,
+            )
 
         if not task_ids:
             log(f"\n  [Manager] Planner failed to create tasks. Aborting.", output)
@@ -267,14 +349,43 @@ async def run_manager_loop(
                 round_completed.append(task)
                 continue
 
-            result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, args, output=output,
-            )
-            total_duration += result.get("duration", 0)
-            if result.get("cost"):
-                total_cost += result["cost"]
+            if goal_guard is not None:
+                async def execute_in_worktree(
+                    worktree_dir: str, _task_branch: str, task: dict = task,
+                ) -> tuple[dict[str, Any], int, str]:
+                    return await run_dev_test_loop(
+                        task, worktree_dir, project_context, args, output=output,
+                    )
 
-            update_task_status(task["id"], outcome, output=output)
+                isolated = await run_task_in_isolation(
+                    task, project_dir, project_context, args,
+                    execute=execute_in_worktree, guard=goal_guard, output=output,
+                )
+                if isolated.outcome == "shutdown_requested":
+                    # Never started: the task keeps its status.
+                    log(f"\n  [Manager] {isolated.reason}. Stopping the goal.", output)
+                    return (
+                        "interrupted", round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
+                result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
+                total_duration += result.get("duration", 0)
+                if result.get("cost"):
+                    total_cost += result["cost"]
+                # The outcome already reflects the gated merge (dispatch-05).
+                update_task_status(
+                    task["id"], outcome, output=output, merged_sha=isolated.merged_sha,
+                )
+            else:
+                # Not a git repo: there are no branches to protect.
+                result, cycles, outcome = await run_dev_test_loop(
+                    task, project_dir, project_context, args, output=output,
+                )
+                total_duration += result.get("duration", 0)
+                if result.get("cost"):
+                    total_cost += result["cost"]
+
+                update_task_status(task["id"], outcome, output=output)
 
             if outcome in ("tests_passed", "no_tests"):
                 round_completed.append(task)
@@ -297,6 +408,12 @@ async def run_manager_loop(
         total_duration += eval_result.get("duration", 0)
         if eval_result.get("cost"):
             total_cost += eval_result["cost"]
+
+        if not await default_branch_untouched(f"after-evaluator round={round_num}"):
+            return (
+                "merge_integrity_failed", round_num, all_completed, all_blocked,
+                total_cost, total_duration,
+            )
 
         if eval_parsed["goal_status"] == "complete":
             log(f"\n  [Manager] Goal COMPLETE!", output)

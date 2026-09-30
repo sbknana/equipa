@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 
 import equipa.cli as cli_mod
+import equipa.dispatch as dispatch_mod
 
 
 # ---------------------------------------------------------------------------
@@ -53,16 +54,20 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "commit", "-m", "seed"], cwd=path, check=True, capture_output=True)
 
 
-def _make_feature_branch(path: Path, branch: str, files: dict[str, str]) -> None:
-    """Create a feature branch with the given files committed."""
-    subprocess.run(["git", "checkout", "-b", branch], cwd=path, check=True, capture_output=True)
+def _commit_files(path: Path, files: dict[str, str], message: str) -> None:
+    """Commit ``files`` on whatever branch ``path`` has checked out.
+
+    Task #3112 (dispatch-04): ``run_mode_task`` now creates the
+    ``forge-task-<id>`` worktree itself, so the fake Dev+Test loop commits
+    the agent's work inside the directory it is handed — exactly where a
+    real agent works. A pre-existing branch would be refused as stale.
+    """
     for rel, content in files.items():
         fp = path / rel
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
     subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", f"feat: {branch}"], cwd=path, check=True, capture_output=True)
-    subprocess.run(["git", "checkout", "master"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
 
 
 def _master_sha(path: Path) -> str:
@@ -107,6 +112,7 @@ def _drive_run_mode_task(
     review_crash: bool,
     doc_only: bool,
     monkeypatch: pytest.MonkeyPatch,
+    files: dict[str, str],
 ) -> dict[str, Any]:
     """Drive ``equipa.cli.run_mode_task`` with controlled monkeypatches.
 
@@ -141,19 +147,23 @@ def _drive_run_mode_task(
     monkeypatch.setattr(cli_mod, "verify_task_updated", lambda _id: (True, "ok"))
     monkeypatch.setattr(cli_mod, "print_dev_test_summary", lambda *a, **kw: None)
 
+    captured["dev_dirs"] = []
+
     async def fake_dev_test_loop(task, project_dir, project_context, args, output=None):
+        captured["dev_dirs"].append(project_dir)
+        _commit_files(Path(project_dir), files, f"feat: task {task['id']}")
         return ({"tests_passed": 1}, 1, "tests_passed")
 
     monkeypatch.setattr(cli_mod, "run_dev_test_loop", fake_dev_test_loop)
 
-    async def fake_changed_files(project_dir, base_ref="master"):
-        if doc_only:
-            return ["docs/notes.md", "README.md"]
-        return ["src/foo.py"]
-
-    monkeypatch.setattr(cli_mod, "get_changed_files_for_branch", fake_changed_files)
-
-    async def fake_security_review(task, project_dir, project_context, args):
+    # The review now runs in equipa.dispatch.review_task_branch (shared by
+    # every isolated mode), against the REAL diff of the task branch —
+    # doc-only-ness is derived from the files the fake agent committed.
+    async def fake_security_review(
+        task, project_dir, project_context, args, output=None,
+        stable_project_dir=None,
+    ):
+        captured["review_dirs"] = (project_dir, stable_project_dir)
         if review_crash:
             raise RuntimeError("simulated reviewer crash")
         body_lines = ["# Security Review\n", "## Findings\n"]
@@ -165,7 +175,7 @@ def _drive_run_mode_task(
             body_lines.append("### [M1] MEDIUM — cosmetic\n\nDetails...\n")
         (repo / f"SECURITY-REVIEW-{task['id']}.md").write_text("".join(body_lines), encoding="utf-8")
 
-    monkeypatch.setattr(cli_mod, "run_security_review", fake_security_review)
+    monkeypatch.setattr(dispatch_mod, "run_security_review", fake_security_review)
 
     async def fake_telemetry(task, result, outcome, *a, **kw):
         captured["outcome"] = outcome
@@ -199,12 +209,12 @@ class TestSingleTaskDevtestSecurityGateIntegration:
         ``security_review_blocked`` (so the branch is left unmerged for
         operator review per cli.py:1146-1158)."""
         _init_repo(tmp_path)
-        _make_feature_branch(tmp_path, "forge-task-99", {"src/foo.py": "def f(): return 1\n"})
         master_before = _master_sha(tmp_path)
 
         captured = _drive_run_mode_task(
             repo=tmp_path, task_id=99, review_high=1, review_critical=0,
             review_crash=False, doc_only=False, monkeypatch=monkeypatch,
+            files={"src/foo.py": "def f(): return 1\n"},
         )
 
         assert captured["outcome"] == "security_review_blocked", (
@@ -219,11 +229,11 @@ class TestSingleTaskDevtestSecurityGateIntegration:
     ) -> None:
         """CRITICAL findings must demote outcome identically to HIGH."""
         _init_repo(tmp_path)
-        _make_feature_branch(tmp_path, "forge-task-100", {"src/bar.py": "def g(): return 2\n"})
 
         captured = _drive_run_mode_task(
             repo=tmp_path, task_id=100, review_high=0, review_critical=1,
             review_crash=False, doc_only=False, monkeypatch=monkeypatch,
+            files={"src/bar.py": "def g(): return 2\n"},
         )
 
         assert captured["outcome"] == "security_review_blocked"
@@ -234,16 +244,24 @@ class TestSingleTaskDevtestSecurityGateIntegration:
     ) -> None:
         """A clean review (0 CRITICAL, 0 HIGH) must NOT demote the outcome."""
         _init_repo(tmp_path)
-        _make_feature_branch(tmp_path, "forge-task-101", {"src/baz.py": "def h(): return 3\n"})
 
         captured = _drive_run_mode_task(
             repo=tmp_path, task_id=101, review_high=0, review_critical=0,
             review_crash=False, doc_only=False, monkeypatch=monkeypatch,
+            files={"src/baz.py": "def h(): return 3\n"},
         )
 
         assert captured["outcome"] == "tests_passed", (
             "clean review must not block — outcome should remain tests_passed"
         )
+        # Task #3112: the agent worked in the forge-task worktree, the
+        # reviewer read that worktree, and the work reached master through
+        # the gated merge (the merged branch and its worktree are removed).
+        worktree = tmp_path / ".forge-worktrees" / "task-101"
+        assert captured["dev_dirs"] == [str(worktree)]
+        assert captured["review_dirs"] == (str(worktree), str(tmp_path))
+        assert (tmp_path / "src" / "baz.py").read_text() == "def h(): return 3\n"
+        assert not worktree.exists()
 
     def test_reviewer_crash_fails_closed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -256,11 +274,11 @@ class TestSingleTaskDevtestSecurityGateIntegration:
         artifact from a prior run.
         """
         _init_repo(tmp_path)
-        _make_feature_branch(tmp_path, "forge-task-102", {"src/qux.py": "def i(): return 4\n"})
 
         captured = _drive_run_mode_task(
             repo=tmp_path, task_id=102, review_high=0, review_critical=0,
             review_crash=True, doc_only=False, monkeypatch=monkeypatch,
+            files={"src/qux.py": "def i(): return 4\n"},
         )
 
         assert captured["outcome"] == "security_review_blocked"
@@ -277,11 +295,11 @@ class TestSingleTaskDevtestSecurityGateIntegration:
         helper.
         """
         _init_repo(tmp_path)
-        _make_feature_branch(tmp_path, "forge-task-103", {"docs/x.md": "# notes\n"})
 
         captured = _drive_run_mode_task(
             repo=tmp_path, task_id=103, review_high=99, review_critical=99,
             review_crash=False, doc_only=True, monkeypatch=monkeypatch,
+            files={"docs/x.md": "# notes\n"},
         )
 
         # Even with simulated review_high=99, the doc-only short-circuit

@@ -16,7 +16,7 @@ import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
-from equipa.git_ops import pinned_git_env
+from equipa.git_ops import git_run
 
 # --- Token Budget Constants ---
 # Anthropic recommendation: ~4 chars/token for Claude
@@ -795,24 +795,16 @@ def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str
     Returns only files that actually changed according to git.
     Prevents agents from faking progress by claiming changes they didn't make.
     """
-    import subprocess
     if not claimed_files or not project_dir:
         return claimed_files
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            cwd=project_dir, capture_output=True, text=True, timeout=10,
-            env=pinned_git_env(),
-        )
+        # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
+        result = git_run(["diff", "--name-only", "HEAD"], project_dir, timeout=10)
         if result.returncode != 0:
             return claimed_files  # Can't verify, trust the claim
         actual_files = set(result.stdout.strip().splitlines())
         # Also check staged files
-        staged = subprocess.run(
-            ["git", "diff", "--name-only", "--cached"],
-            cwd=project_dir, capture_output=True, text=True, timeout=10,
-            env=pinned_git_env(),
-        )
+        staged = git_run(["diff", "--name-only", "--cached"], project_dir, timeout=10)
         if staged.returncode == 0:
             actual_files.update(staged.stdout.strip().splitlines())
         if not actual_files:

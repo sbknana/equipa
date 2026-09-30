@@ -285,17 +285,19 @@ def is_reserved_role(role: str) -> bool:
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
-    """Run a hardened read-only git command in ``root``; None if git failed to run."""
-    # Late import: git_ops imports this module. pinned_git_env adds the
-    # hardening variables and the pinned global config (task #3116, MI-04).
-    from equipa.git_ops import pinned_git_env
+    """Run a hardened read-only git command in ``root``; None if git failed to run.
 
-    env = dict(pinned_git_env(), GIT_TERMINAL_PROMPT="0")
+    Output is bytes (``cat-file blob`` must be read verbatim).
+    """
+    # Late import: git_ops imports this module. git_run applies the same
+    # argv and env hardening as every other orchestrator git call (task
+    # #3112), including the pinned global config (task #3116, MI-04).
+    from equipa.git_ops import git_run
+
     try:
-        return subprocess.run(
-            ["git", "-C", str(root), *_GIT_SAFE_CONFIG, *args],
-            capture_output=True, timeout=_GIT_TIMEOUT_SECONDS, env=env,
-            check=False,
+        return git_run(
+            list(args), root, timeout=_GIT_TIMEOUT_SECONDS,
+            env={"GIT_TERMINAL_PROMPT": "0"}, text=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("role overlay: git %s failed in %s: %s", args[0], root, exc)

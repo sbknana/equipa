@@ -43,7 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from equipa.git_ops import pinned_git_env
+from equipa.git_ops import git_run
 
 logger = logging.getLogger(__name__)
 
@@ -146,30 +146,19 @@ def _git_diff_files(repo_path: Path) -> list[str]:
     """
     try:
         # Prefer the diff against the merge-base of master/main if one exists.
+        # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
         for base in ("master", "main", "HEAD~1"):
             try:
-                out = subprocess.run(
-                    ["git", "diff", "--name-only", f"{base}...HEAD"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    env=pinned_git_env(),
-                    check=False,
+                out = git_run(
+                    ["diff", "--name-only", f"{base}...HEAD"], repo_path, timeout=10,
                 )
                 if out.returncode == 0 and out.stdout.strip():
                     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
             except (subprocess.SubprocessError, OSError):
                 continue
         # Fallback: untracked + modified working-tree files.
-        out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
-            check=False,
+        out = git_run(
+            ["status", "--porcelain", "--ignore-submodules=all"], repo_path, timeout=10,
         )
         if out.returncode != 0:
             return []
@@ -483,6 +472,46 @@ def _parse_iso_timestamp(value: Any) -> datetime | None:
     return None
 
 
+class TasksCreatedDb:
+    """Adapter exposing ``fetch_tasks_by_ids`` over a sqlite3 connection.
+
+    Used by :func:`validate_tasks_created_claim` so this module does not
+    need to know about EQUIPA's db helpers. Closes the connection on exit.
+    Shared by the single-agent CLI path and the goal-mode planner
+    (task #3112, dispatch-16).
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def fetch_tasks_by_ids(self, ids: Iterable[Any]) -> list[dict[str, Any]]:
+        ids = [int(i) for i in ids if i is not None]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"SELECT id, project_id, created_at FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        )
+        return [
+            {"id": r[0], "project_id": r[1], "created_at": r[2]}
+            for r in cur.fetchall()
+        ]
+
+    def close(self) -> None:
+        # QS-01 leak family: the wrapped sqlite3 connection must be closed.
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover — defensive
+            logger.debug("closing the TASKS_CREATED db connection failed", exc_info=True)
+
+    def __enter__(self) -> "TasksCreatedDb":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+
 def validate_tasks_created_claim(
     *,
     stdout: str,
@@ -574,6 +603,7 @@ def validate_tasks_created_claim(
 
 __all__ = [
     "SingleAgentOutcome",
+    "TasksCreatedDb",
     "TasksCreatedValidation",
     "evaluate_single_agent_outcome",
     "validate_tasks_created_claim",

@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/license-Apache%202.0-orange" alt="Apache 2.0">
-  <img src="https://img.shields.io/badge/tests-3287-success" alt="3287 Tests">
+  <img src="https://img.shields.io/badge/tests-3371-success" alt="3371 Tests">
 </p>
 
 ---
@@ -98,14 +98,29 @@ claude mcp add equipa python3 /path/to/equipa/equipa/mcp_server.py
 | World Builder | Game world and lore construction |
 
 ### Git Worktree Isolation
-Parallel tasks (`--tasks N,M,...`) each get their own `git worktree` rooted at
-`<repo>/.forge-worktrees/task-<id>` on a fresh `forge-task-<id>` branch.
-Working-tree changes are filesystem-isolated — one task cannot see or break
-another. Successful work merges back to the default branch automatically; the
-worktree is torn down on completion. Single-task `--dev-test` mode does NOT
-spawn a separate worktree — it commits on a `forge-task-<id>` branch in the
-main checkout, so concurrent single-task dispatches against the same repo are
-not supported.
+In a git project, every mode that runs agents — `--task` (with or without
+`--dev-test`), `--project`, `--tasks N,M,...`, `--auto-run`, `--goal` and
+`--parallel-goals` — gives each task its own `git worktree` rooted at
+`<repo>/.forge-worktrees/task-<id>` on a fresh `forge-task-<id>` branch. No
+agent works in the main checkout, and no mode commits to the default branch
+directly: work reaches it only through the gated merge (security review, then
+`_gated_merge_task`), and a task is recorded `done` only once its commit is
+verifiably on the default branch. The worktree is torn down afterwards; the
+branch is deleted when merged (or empty) and kept otherwise. A project that is
+not a git repository runs in place — there are no branches to protect.
+
+- The merge refuses a main checkout with uncommitted tracked changes rather
+  than stashing the operator's work.
+- SIGTERM/SIGINT arriving during a merge are deferred: the merge finishes or
+  is aborted (no `MERGE_HEAD` is left), later merges in the run are refused,
+  and the process then exits with `128 + signal`.
+- At startup each dispatch lists leftovers of earlier runs — entries under
+  `.forge-worktrees/`, `forge-task-*` branches, `MERGE_HEAD`, EQUIPA-tagged
+  stashes. They are reported, never deleted.
+- A task whose `forge-task-<id>` branch or worktree is left over is refused
+  (left blocked; `--task` exits with status 2) until it is resolved by hand.
+- In goal mode the planner and evaluator still run in the project checkout;
+  if either moves the default branch the goal stops and nothing more merges.
 
 Defensive invariants (task #2488, hardened in #2490):
 - Worktree creation refuses to reuse an existing `forge-task-<id>` branch
@@ -118,7 +133,8 @@ Defensive invariants (task #2488, hardened in #2490):
 - Conflict-handling policy (unified across `git_ops.create_task_worktree`
   and `dispatch._create_isolation_worktrees`): on a branch-name conflict
   the default behaviour is to **raise** `WorktreeBranchConflictError` and
-  route the task to the shared-dir fallback. Unmerged commit SHAs ahead
+  refuse the task — it never falls back to the shared main checkout
+  (task #3107). Unmerged commit SHAs ahead
   of the default branch are logged before raising so the operator can
   recover via `git reflog`. The legacy "delete-and-retry" behaviour is
   only available when the caller passes `force=True` explicitly — never
