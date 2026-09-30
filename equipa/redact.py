@@ -222,7 +222,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # .pgpass lines: host:port:database:user:password.
     (_PGPASS_LINE, r"\1" + REDACTED),
     # Cookie / Set-Cookie header values, to the end of the header (IR-06).
-    (re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)(?!\[REDACTED\])[^\r\n'\"\\]+"),
+    (re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)(?!\s|\[REDACTED\])[^\r\n'\"\\]+"),
      r"\1" + REDACTED),
     # key = value / key: value / "key": "value" of credential-named keys in
     # any case and format: libpq DSNs, YAML, JSON, headers (X-Api-Key: ...).
