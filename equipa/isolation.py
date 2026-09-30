@@ -41,6 +41,7 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import contextvars
 import copy
 import json
 import logging
@@ -55,7 +56,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -172,6 +173,7 @@ class IsolationSettings:
     carry_ignored_paths: tuple[str, ...]
     db_backup_dirs: tuple[str, ...] = ()
     secret_scan_roots: tuple[str, ...] = ()
+    unit_wait_timeout_sec: float = 21600.0
 
 
 _DEFAULTS: dict[str, Any] = {
@@ -205,6 +207,10 @@ _DEFAULTS: dict[str, Any] = {
     # Directories holding project checkouts; the verify script fails if the
     # agent user can read a secret-shaped file below them (review ISO-05).
     "secret_scan_roots": [],
+    # How long a unit may wait for its turn: a reviewer until no other
+    # isolated agent runs, any other unit while a reviewer runs or waits
+    # (review R3136-03). Past it the dispatch is refused.
+    "unit_wait_timeout_sec": 21600,
 }
 
 
@@ -334,6 +340,8 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
                              for p in path_lists["db_backup_dirs"]),
         secret_scan_roots=tuple(os.path.normpath(p)
                                 for p in path_lists["secret_scan_roots"]),
+        unit_wait_timeout_sec=float(_int_in_range(
+            raw, "unit_wait_timeout_sec", 60, 7 * 86400)),
     )
 
 
@@ -1383,6 +1391,190 @@ def encode_handoff_preamble(header_bytes: bytes, bundle_size: int) -> bytes:
             f"{len(header_bytes)} {bundle_size}\n").encode("ascii")
 
 
+# --- Reviewers run alone (review R3136-03) ------------------------------------------
+#
+# Every isolated unit runs as the same agent UID, so a unit running beside a
+# security reviewer can read the reviewer's handed-over prompt (with its
+# nonces) and write into its clone. Until each unit (or at least each
+# reviewer) gets its own UID, reviewer units never overlap any other
+# isolated unit: a reader-writer lock over two flock files in the
+# orchestrator's private runtime directory, so it holds across every
+# dispatch mode and every orchestrator process of this user.
+#
+# * Any other unit takes the turnstile shared for an instant, then the units
+#   lock shared for its whole life.
+# * A reviewer takes the turnstile exclusively (no new unit may start) and
+#   then the units lock exclusively (every running unit has ended), and
+#   keeps both until it ends. It also waits until no agent scope of this
+#   user is populated, which covers a unit that survived cgroup.kill and
+#   units of an orchestrator that predates the lock.
+
+# Roles whose units run alone.
+EXCLUSIVE_ROLES = frozenset({"security-reviewer", "code-reviewer"})
+_UNIT_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "equipa_isolation_unit_role", default=None)
+_TURNSTILE_LOCK_NAME = "equipa-isolation-turnstile.lock"
+_UNITS_LOCK_NAME = "equipa-isolation-units.lock"
+_SLOT_POLL_SECONDS = 0.25
+_SLOT_LOG_EVERY_SECONDS = 300.0
+
+
+@contextlib.contextmanager
+def unit_role(role: str | None) -> Iterator[None]:
+    """Mark the agents spawned inside this block as ``role``'s units.
+
+    ``agent_runner.build_cli_command`` sets it around the ``with`` block
+    that runs the command, so :func:`spawn_isolated_agent` knows a reviewer
+    from any other unit without a change to every call site.
+    """
+    token = _UNIT_ROLE.set(role)
+    try:
+        yield
+    finally:
+        _UNIT_ROLE.reset(token)
+
+
+def current_unit_role() -> str | None:
+    return _UNIT_ROLE.get()
+
+
+class UnitSlot:
+    """A unit's place among the running isolated units; released (the lock
+    files closed) when the unit has ended. Idempotent."""
+
+    def __init__(self, label: str, exclusive: bool, handles: list[int]) -> None:
+        self.label = label
+        self.exclusive = exclusive
+        self._handles = handles
+
+    @property
+    def held(self) -> bool:
+        return bool(self._handles)
+
+    def release(self) -> None:
+        # Closing, not LOCK_UN: a forked child sharing the descriptors must
+        # not drop the parent's lock, and closing the last one releases it.
+        handles, self._handles = self._handles, []
+        for handle in handles:
+            with contextlib.suppress(OSError):
+                os.close(handle)
+        if handles and self.exclusive:
+            logger.info("[Isolation] %s has ended; other isolated agents may "
+                        "start again", self.label)
+
+
+def _open_lock_file(directory: str, name: str) -> int:
+    path = os.path.join(directory, name)
+    try:
+        handle = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise AgentIsolationError(
+            f"cannot open the unit lock {path}: {exc}") from exc
+    info = os.fstat(handle)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        os.close(handle)
+        raise AgentIsolationError(
+            f"the unit lock {path} is not a regular file of this user")
+    return handle
+
+
+def live_agent_scopes(app_slice: Path | None = None) -> list[str]:
+    """Names of this user's populated agent scopes, whoever started them."""
+    slice_dir = user_app_slice() if app_slice is None else app_slice
+    try:
+        entries = list(os.scandir(slice_dir))
+    except OSError:
+        return []
+    live = []
+    for entry in entries:
+        if (_UNIT_NAME_RE.match(entry.name)
+                and entry.is_dir(follow_symlinks=False)
+                and cgroup_populated(
+                    "/" + str(Path(entry.path).relative_to(CGROUP_ROOT)))):
+            live.append(entry.name)
+    return live
+
+
+class _SlotWait:
+    """Deadline and progress logging while a unit waits for its turn."""
+
+    def __init__(self, label: str, reason: str, timeout: float) -> None:
+        self.label = label
+        self.reason = reason
+        self.timeout = timeout
+        self.started = time.monotonic()
+        self.logged_at: float | None = None
+
+    async def pause(self, what: str) -> None:
+        now = time.monotonic()
+        if now - self.started >= self.timeout:
+            raise AgentIsolationError(
+                f"{self.label} waited {self.timeout:.0f}s for {what} "
+                f"(unit_wait_timeout_sec); refused")
+        if self.logged_at is None or now - self.logged_at >= _SLOT_LOG_EVERY_SECONDS:
+            self.logged_at = now
+            logger.warning("[Isolation] %s waits for %s: %s (%.0fs so far)",
+                           self.label, what, self.reason, now - self.started)
+        await asyncio.sleep(_SLOT_POLL_SECONDS)
+
+
+async def _flock_when_free(handle: int, operation: int, wait: _SlotWait,
+                           what: str) -> None:
+    import fcntl  # Linux-only, like the rest of the isolated spawn
+
+    while True:
+        try:
+            fcntl.flock(handle, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            raise AgentIsolationError(f"cannot lock the unit lock: {exc}") from exc
+        await wait.pause(what)
+
+
+async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
+                            lock_dir: str | None = None,
+                            app_slice: Path | None = None) -> UnitSlot:
+    """Wait for this unit's turn (see the section comment) and hold it.
+
+    Raises AgentIsolationError when the lock cannot be used or the wait
+    exceeds ``timeout``; nothing is held then.
+    """
+    import fcntl
+
+    directory = lock_dir or _runtime_dir()
+    handles = [_open_lock_file(directory, _TURNSTILE_LOCK_NAME)]
+    try:
+        handles.append(_open_lock_file(directory, _UNITS_LOCK_NAME))
+        turnstile, units = handles
+        if exclusive:
+            wait = _SlotWait(label, "a reviewer runs alone while every agent "
+                             "shares one UID (review R3136-03)", timeout)
+            await _flock_when_free(turnstile, fcntl.LOCK_EX, wait,
+                                   "the reviewer before it")
+            await _flock_when_free(units, fcntl.LOCK_EX, wait,
+                                   "the running isolated agents to end")
+            while scopes := live_agent_scopes(app_slice):
+                await wait.pause(f"agent scopes {', '.join(sorted(scopes))}")
+            logger.warning("[Isolation] %s runs alone: new isolated agents "
+                           "wait until it ends (shared agent UID, review "
+                           "R3136-03)", label)
+            return UnitSlot(label, True, handles)
+        wait = _SlotWait(label, "a reviewer runs or waits to run alone "
+                         "(review R3136-03)", timeout)
+        await _flock_when_free(turnstile, fcntl.LOCK_SH, wait, "a reviewer")
+        await _flock_when_free(units, fcntl.LOCK_SH, wait, "a reviewer")
+        os.close(handles.pop(0))  # the turnstile is only passed through
+        return UnitSlot(label, False, handles)
+    except BaseException:
+        for handle in handles:
+            with contextlib.suppress(OSError):
+                os.close(handle)
+        raise
+
+
 # --- The running agent -------------------------------------------------------------
 
 
@@ -1402,8 +1594,10 @@ class IsolatedAgent:
 
     def __init__(self, process: asyncio.subprocess.Process, unit: str,
                  settings: IsolationSettings, worktree: WorktreeInfo | None,
-                 export_path: str | None) -> None:
+                 export_path: str | None, slot: UnitSlot | None = None) -> None:
         self.process = process
+        # Held until release(): the unit's cgroup has been emptied by then.
+        self.slot = slot
         self.pid = process.pid
         self.start_time = agent_launcher.proc_start_time(process.pid)
         self.unit = unit
@@ -1643,6 +1837,8 @@ class IsolatedAgent:
         if self.leftover_killer is not None and not self.leftover_killer.done():
             with contextlib.suppress(RuntimeError):  # loop already closed
                 self.leftover_killer.cancel()
+        if self.slot is not None:
+            self.slot.release()
 
 
 def _terminate_live_isolated_agents_at_exit() -> None:
@@ -1674,7 +1870,11 @@ async def spawn_isolated_agent(
     """Start the agent CLI isolated (see the module docstring).
 
     Returns the process whose stdout/stderr carry the CLI's output (the
-    launcher's status line is already consumed) and its handle.
+    launcher's status line is already consumed) and its handle. A reviewer
+    unit (:data:`EXCLUSIVE_ROLES`, see :func:`unit_role`) first waits until
+    no other isolated unit runs, and any unit waits while a reviewer runs or
+    waits (:func:`acquire_unit_slot`); the handle holds that slot until it
+    is released.
 
     Raises:
         AgentIsolationError: isolation could not be established or verified;
@@ -1687,11 +1887,28 @@ async def spawn_isolated_agent(
     settings = load_isolation_settings(dispatch_config)
     identity = resolve_agent_identity(settings)
     check_host(settings, identity)
+    unit = make_unit_name()
+    role = current_unit_role()
+    slot = await acquire_unit_slot(
+        f"{role or 'agent'} unit {unit}", exclusive=role in EXCLUSIVE_ROLES,
+        timeout=settings.unit_wait_timeout_sec)
+    try:
+        return await _spawn_in_slot(cmd, cwd, env, settings, unit, slot, limit)
+    except BaseException:
+        slot.release()
+        raise
+
+
+async def _spawn_in_slot(cmd: Sequence[str], cwd: str | None,
+                         env: Mapping[str, str], settings: IsolationSettings,
+                         unit: str, slot: UnitSlot, limit: int | None,
+                         ) -> tuple[asyncio.subprocess.Process, IsolatedAgent]:
+    """spawn_isolated_agent once the unit may run; the agent handle owns
+    ``slot`` from its creation."""
     sweep_stale_scopes()
     oauth_token = resolve_oauth_token(settings)
     worktree = (await asyncio.to_thread(describe_worktree, cwd)
                 if cwd else None)
-    unit = make_unit_name()
     temp_dir = Path(tempfile.mkdtemp(prefix="equipa-isolation-"))
     try:
         handoff = await asyncio.to_thread(
@@ -1708,7 +1925,7 @@ async def spawn_isolated_agent(
         except OSError as exc:
             raise AgentIsolationError(f"cannot run systemd-run: {exc}") from exc
         agent = IsolatedAgent(process, unit, settings, worktree,
-                              handoff.export_path)
+                              handoff.export_path, slot)
         _track(agent)
         try:
             await agent.establish(handoff)

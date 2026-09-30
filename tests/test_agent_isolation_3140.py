@@ -610,3 +610,255 @@ def test_import_accepts_a_link_pair_that_stays_inside(
 
     _import(*_export_clone(repo, tmp_path, plant))
     assert (worktree / "sub" / "b").read_text() == "base\n"
+
+
+# --- R3136-03: reviewer units never overlap another isolated unit ----------------------
+
+
+@pytest.fixture
+def slots(tmp_path: Path, monkeypatch):
+    """acquire_unit_slot on a private lock directory, fast polling, and no
+    live agent scopes unless a test adds some."""
+    lock_dir = tmp_path / "run"
+    lock_dir.mkdir(mode=0o700)
+    scopes: list[str] = []
+    monkeypatch.setattr(isolation, "_SLOT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(isolation, "live_agent_scopes",
+                        lambda app_slice=None: list(scopes))
+
+    def acquire(label: str, exclusive: bool, timeout: float = 5.0):
+        return isolation.acquire_unit_slot(label, exclusive=exclusive,
+                                           timeout=timeout,
+                                           lock_dir=str(lock_dir))
+
+    acquire.scopes = scopes
+    acquire.lock_dir = lock_dir
+    return acquire
+
+
+async def _pending(awaitable, seconds: float = 0.2):
+    """Start ``awaitable`` and give it ``seconds`` to finish; return its task."""
+    task = asyncio.ensure_future(awaitable)
+    await asyncio.sleep(seconds)
+    return task
+
+
+def test_ordinary_units_run_side_by_side(slots) -> None:
+    async def scenario():
+        first = await slots("developer 1", False)
+        second = await asyncio.wait_for(slots("tester 2", False), 1)
+        assert first.held and second.held
+        first.release()
+        second.release()
+
+    asyncio.run(scenario())
+
+
+def test_reviewer_waits_for_running_units_and_blocks_new_ones(
+        slots, caplog) -> None:
+    caplog.set_level("INFO", logger="equipa.isolation")
+    order: list[str] = []
+
+    async def scenario():
+        developer = await slots("developer unit A", False)
+        reviewer_task = await _pending(slots("security-reviewer unit R", True))
+        assert not reviewer_task.done()           # waits for the developer
+        late_task = await _pending(slots("developer unit B", False))
+        assert not late_task.done()               # held back by the waiting reviewer
+        order.append("developer A ends")
+        developer.release()
+        reviewer = await asyncio.wait_for(reviewer_task, 2)
+        order.append("reviewer runs")
+        await asyncio.sleep(0.2)
+        assert not late_task.done()               # still held back while it runs
+        reviewer.release()
+        late = await asyncio.wait_for(late_task, 2)
+        order.append("developer B runs")
+        late.release()
+
+    asyncio.run(scenario())
+    assert order == ["developer A ends", "reviewer runs", "developer B runs"]
+    text = caplog.text
+    assert "security-reviewer unit R waits for the running isolated agents" in text
+    assert "security-reviewer unit R runs alone" in text
+    assert "developer unit B waits for a reviewer" in text
+    assert "security-reviewer unit R has ended" in text
+
+
+def test_reviewers_do_not_overlap_each_other(slots) -> None:
+    async def scenario():
+        first = await slots("code-reviewer 1", True)
+        second_task = await _pending(slots("security-reviewer 2", True))
+        assert not second_task.done()
+        first.release()
+        (await asyncio.wait_for(second_task, 2)).release()
+
+    asyncio.run(scenario())
+
+
+def test_reviewer_waits_for_live_agent_scopes(slots) -> None:
+    """A unit that survived cgroup.kill, or one of an orchestrator without
+    the lock, still counts as running."""
+    slots.scopes.append("equipa-agent-9-9-00.scope")
+
+    async def scenario():
+        task = await _pending(slots("security-reviewer 1", True))
+        assert not task.done()
+        slots.scopes.clear()
+        (await asyncio.wait_for(task, 2)).release()
+
+    asyncio.run(scenario())
+
+
+def test_wait_past_the_timeout_refuses_and_holds_nothing(slots) -> None:
+    async def scenario():
+        developer = await slots("developer 1", False)
+        with pytest.raises(isolation.AgentIsolationError,
+                           match="unit_wait_timeout_sec"):
+            await slots("security-reviewer 2", True, timeout=0.2)
+        developer.release()
+        # The refused reviewer left neither lock behind.
+        (await asyncio.wait_for(slots("code-reviewer 3", True), 1)).release()
+
+    asyncio.run(scenario())
+
+
+_HOLD_SHARED = (
+    "import fcntl, os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_SH)\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def test_units_in_another_process_are_waited_for(slots) -> None:
+    """The lock is per user, not per event loop: a unit held by another
+    orchestrator process delays a reviewer here."""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_SHARED,
+         str(slots.lock_dir / isolation._UNITS_LOCK_NAME)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+
+        async def scenario():
+            task = await _pending(slots("security-reviewer 1", True))
+            assert not task.done()
+            holder.stdin.close()
+            (await asyncio.wait_for(task, 5)).release()
+
+        asyncio.run(scenario())
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_unit_lock_must_be_a_private_regular_file(slots, tmp_path: Path) -> None:
+    (slots.lock_dir / isolation._TURNSTILE_LOCK_NAME).symlink_to(tmp_path / "x")
+    with pytest.raises(isolation.AgentIsolationError, match="unit lock"):
+        asyncio.run(slots("developer 1", False))
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.stdin = None
+        self.returncode = 0
+
+
+def _fake_setup(tmp_path: Path, monkeypatch, lock_dir: Path) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation, "load_isolation_settings",
+                        lambda config: settings)
+    monkeypatch.setattr(isolation, "resolve_agent_identity", lambda s: None)
+    monkeypatch.setattr(isolation, "check_host", lambda s, i: None)
+    monkeypatch.setattr(isolation, "_runtime_dir", lambda: str(lock_dir))
+
+
+async def _spawn_as(role: str | None):
+    with isolation.unit_role(role):
+        return await isolation.spawn_isolated_agent(["claude"], None, {}, {})
+
+
+def test_spawn_holds_the_slot_until_the_agent_is_released(
+        tmp_path: Path, monkeypatch, slots) -> None:
+    """spawn_isolated_agent (setup faked) takes the unit's slot by role and
+    the agent handle gives it back on release."""
+    _fake_setup(tmp_path, monkeypatch, slots.lock_dir)
+    started: list[str] = []
+
+    async def fake_spawn(cmd, cwd, env, settings, unit, slot, limit):
+        started.append(isolation.current_unit_role() or "agent")
+        agent = isolation.IsolatedAgent(_FakeProcess(), unit, settings, None,
+                                        None, slot)
+        return agent.process, agent
+
+    monkeypatch.setattr(isolation, "_spawn_in_slot", fake_spawn)
+
+    async def scenario():
+        _process, developer = await _spawn_as("developer")
+        reviewer_task = await _pending(_spawn_as("security-reviewer"))
+        assert started == ["developer"] and not reviewer_task.done()
+        developer.release()
+        _process, reviewer = await asyncio.wait_for(reviewer_task, 2)
+        assert started == ["developer", "security-reviewer"]
+        tester_task = await _pending(_spawn_as("tester"))
+        assert not tester_task.done()
+        reviewer.release()
+        _process, tester = await asyncio.wait_for(tester_task, 2)
+        tester.release()
+        assert started == ["developer", "security-reviewer", "tester"]
+
+    asyncio.run(scenario())
+
+
+def test_failed_setup_gives_the_slot_back(tmp_path: Path, monkeypatch,
+                                          slots) -> None:
+    _fake_setup(tmp_path, monkeypatch, slots.lock_dir)
+
+    async def broken(*args):
+        raise isolation.AgentIsolationError("setup failed")
+
+    monkeypatch.setattr(isolation, "_spawn_in_slot", broken)
+
+    async def scenario():
+        with pytest.raises(isolation.AgentIsolationError, match="setup failed"):
+            await _spawn_as("developer")
+        (await asyncio.wait_for(slots("security-reviewer 1", True), 1)).release()
+
+    asyncio.run(scenario())
+
+
+def test_build_cli_command_marks_the_role_for_the_isolated_spawn(
+        tmp_path: Path) -> None:
+    from equipa import agent_runner
+
+    assert isolation.current_unit_role() is None
+    with agent_runner.build_cli_command("prompt", str(tmp_path), 5, "opus",
+                                        role="security-reviewer",
+                                        dispatch_config={"x": 1}):
+        assert isolation.current_unit_role() == "security-reviewer"
+    assert isolation.current_unit_role() is None
+
+
+def test_reviewer_spawn_sites_build_their_command_with_the_role() -> None:
+    """loops.py runs both reviewers through build_cli_command with their
+    role, which is what makes their units exclusive."""
+    tree = ast.parse((REPO_ROOT / "equipa" / "loops.py").read_text(encoding="utf-8"))
+    roles = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _callee(node) == "build_cli_command":
+            roles.update(keyword.value.value for keyword in node.keywords
+                         if keyword.arg == "role"
+                         and isinstance(keyword.value, ast.Constant))
+    assert isolation.EXCLUSIVE_ROLES <= roles
+
+
+def test_unit_wait_timeout_setting(tmp_path: Path) -> None:
+    assert _settings(tmp_path).unit_wait_timeout_sec == 21600.0
+    assert _settings(tmp_path, unit_wait_timeout_sec=600).unit_wait_timeout_sec == 600.0
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="unit_wait_timeout_sec"):
+        _settings(tmp_path, unit_wait_timeout_sec=1)

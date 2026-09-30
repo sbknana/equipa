@@ -1135,7 +1135,9 @@ def build_cli_command(
         if skills_dir and skills_dir.exists():
             cmd.extend(["--add-dir", str(skills_dir)])
 
-        yield cmd
+        # R3136-03: with agent_isolation on, reviewer units run alone.
+        with isolation.unit_role(role):
+            yield cmd
     finally:
         # Idempotent: missing_ok=True means a second cleanup (or one after a
         # partial setup failure) does not raise.
