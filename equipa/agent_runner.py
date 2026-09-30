@@ -176,6 +176,7 @@ from equipa.cli_isolation import (
     CLAUDE_CLI_ISOLATION_ARGS,
     is_claude_cli,
     isolate_claude_argv,
+    mcp_config_values,
 )
 from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
@@ -704,11 +705,48 @@ def _check_mcp_servers(
     if not path.is_file():
         return
     try:
-        servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
-    except (OSError, ValueError, AttributeError) as exc:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
         raise AgentDispatchRefused(
             f"cannot read MCP config {path} to verify its servers: {exc}"
         ) from exc
+    _check_mcp_config_data(config, path, project_dirs)
+
+
+def _check_mcp_config_value(value: str, cwd: str | None) -> None:
+    """Check one ``--mcp-config`` value: a file, or inline JSON (RR-05).
+
+    A relative file would be read from the CLI's cwd, the agent-writable
+    project directory, so it is refused. Inline JSON (the manager passes
+    ``{"mcpServers": {}}``) is checked like a file.
+    """
+    if value.lstrip().startswith("{"):
+        try:
+            config = json.loads(value)
+        except ValueError as exc:
+            raise AgentDispatchRefused(
+                f"inline --mcp-config is not valid JSON: {exc}") from exc
+        _check_mcp_config_data(config, "inline --mcp-config", (cwd,))
+        return
+    if not os.path.isabs(value):
+        raise AgentDispatchRefused(
+            f"--mcp-config {value!r} is a relative path, which the CLI reads "
+            f"from the project directory {cwd!r} that agents can write. Use "
+            f"an absolute path.")
+    _check_mcp_servers(value, (cwd,))
+
+
+def _check_mcp_config_data(
+    config: Any, source: Path | str,
+    project_dirs: Iterable[str | os.PathLike[str] | None],
+) -> None:
+    """Every server of one parsed MCP config (see _check_mcp_servers)."""
+    path = source
+    if not isinstance(config, dict):
+        raise AgentDispatchRefused(
+            f"cannot read MCP config {path} to verify its servers: it is not "
+            f"a JSON object")
+    servers = config.get("mcpServers", {})
     if not isinstance(servers, dict):
         raise AgentDispatchRefused(
             f"MCP config {path}: \"mcpServers\" must be a JSON object")
@@ -1195,6 +1233,9 @@ def _check_uvx_launch(args: list[str], refuse: Any,
             refuse_inside_project(f"uvx {option} path", expanded)
 
 
+_DB_PATH_PLACEHOLDER = "/absolute/path/to/theforge.db"
+
+
 def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
     """Refuse a relative ``--db-path`` (sandbox-11), saying how to fix it."""
     args = server.get("args")
@@ -1207,21 +1248,26 @@ def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
             else:
                 continue
             if not isinstance(db_path, str) or not os.path.isabs(db_path):
-                # IR-02: name the file and the exact edit. The suggestion is
-                # where the relative path resolved before agents ran in the
-                # project directory (the orchestrator's cwd).
-                suggestion = (
-                    os.path.abspath(os.path.expanduser(db_path))
-                    if isinstance(db_path, str) and db_path
-                    else "/absolute/path/to/theforge.db")
+                # IR-02: name the file and the exact edit. RR-04: suggest no
+                # path. Resolving the relative value from the orchestrator's
+                # cwd named a stale copy of the database on a real host, and
+                # an operator who pasted it would silently point every agent
+                # at it. Say where the live database is configured instead.
                 raise AgentDispatchRefused(
                     f"MCP server {name!r} in {path} has a relative --db-path "
                     f"{db_path!r}. Agents run in the project directory, so it "
                     f"would open or create a different database there. Every "
                     f"dispatch is refused until this is fixed. Fix: edit "
-                    f"{path} and make the --db-path argument of {name!r} an "
-                    f"absolute path, e.g. \"--db-path\", \"{suggestion}\" "
-                    f"(check that this is the real TheForge database)."
+                    f"{path} and set the --db-path argument of {name!r} to the "
+                    f"absolute path of the live TheForge database: "
+                    f"\"--db-path\", \"{_DB_PATH_PLACEHOLDER}\". EQUIPA does "
+                    f"not guess it (a copy found from the current directory "
+                    f"can be stale). Use the database the orchestrator itself "
+                    f"opens, equipa.constants.THEFORGE_DB: the \"theforge_db\" "
+                    f"entry of forge_config.json next to forge_orchestrator.py, "
+                    f"else the THEFORGE_DB environment variable, else "
+                    f"theforge.db beside the equipa package. Resolve symlinks "
+                    f"(realpath) so both name the same file."
                 )
 
 
@@ -1812,9 +1858,9 @@ async def _spawn_agent_process(
             cmd = isolate_claude_argv(cmd)
         except ValueError as exc:
             raise AgentDispatchRefused(str(exc)) from exc
-    mcp_config = _cmd_option(cmd, "--mcp-config")
-    if mcp_config:
-        _check_mcp_servers(mcp_config, (cwd,))
+    # RR-05: every --mcp-config value, both spellings, files and inline JSON.
+    for mcp_config in mcp_config_values(cmd):
+        _check_mcp_config_value(mcp_config, cwd)
     # P2A-05: the scrubbed env below is pointless if the agent can read ours
     # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
     # failure refuses the dispatch instead of starting an agent anyway.

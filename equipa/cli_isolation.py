@@ -45,24 +45,63 @@ def is_claude_cli(executable: str) -> bool:
     return name in ("claude", "claude.exe", "claude.cmd")
 
 
+MCP_CONFIG_FLAG = "--mcp-config"
+END_OF_OPTIONS = "--"
+
+
+def _option_args(cmd: Sequence[str]) -> list[str]:
+    """``cmd`` up to its first ``--``: after it every argument is prompt
+    text to the CLI, never an option (RR-05)."""
+    args = list(cmd)
+    if END_OF_OPTIONS in args:
+        return args[:args.index(END_OF_OPTIONS)]
+    return args
+
+
 def _setting_sources_values(cmd: Sequence[str]) -> list[str]:
-    """Every value given to ``--setting-sources`` (both spellings)."""
+    """Every value given to ``--setting-sources`` (both spellings) as an
+    option, i.e. before ``--``."""
+    options = _option_args(cmd)
     values: list[str] = []
-    for index, arg in enumerate(cmd):
+    for index, arg in enumerate(options):
         if arg == SETTING_SOURCES_FLAG:
-            values.append(cmd[index + 1] if index + 1 < len(cmd) else "")
+            values.append(options[index + 1] if index + 1 < len(options) else "")
         elif arg.startswith(SETTING_SOURCES_FLAG + "="):
             values.append(arg.split("=", 1)[1])
+    return values
+
+
+def mcp_config_values(cmd: Sequence[str]) -> list[str]:
+    """Every value the CLI reads as an MCP config (RR-05).
+
+    ``--mcp-config`` is variadic: it takes every following argument up to
+    the next option, each a file or inline JSON. ``--mcp-config=<value>``
+    takes that one value. Arguments after ``--`` are prompt text.
+    """
+    options = _option_args(cmd)
+    values: list[str] = []
+    index = 0
+    while index < len(options):
+        arg = options[index]
+        index += 1
+        if arg.startswith(MCP_CONFIG_FLAG + "="):
+            values.append(arg.split("=", 1)[1])
+        elif arg == MCP_CONFIG_FLAG:
+            while index < len(options) and not options[index].startswith("-"):
+                values.append(options[index])
+                index += 1
     return values
 
 
 def isolate_claude_argv(cmd: Sequence[str]) -> list[str]:
     """``cmd`` with project-scope settings, CLAUDE.md and .mcp.json disabled.
 
-    Appends ``--setting-sources user`` and ``--strict-mcp-config`` when they
-    are missing; an argv that already has them is returned unchanged (as a
-    new list). The caller's own ``--mcp-config`` is kept: with the strict
-    flag it is the only MCP configuration the CLI reads.
+    Adds ``--setting-sources user`` and ``--strict-mcp-config`` when they
+    are missing as options: at the end, or just before a ``--``, after which
+    they would be prompt text (RR-05). An argv that already has them is
+    returned unchanged (as a new list). The caller's own ``--mcp-config`` is
+    kept: with the strict flag it is the only MCP configuration the CLI
+    reads.
 
     Raises:
         ValueError: ``cmd`` already asks for a setting source other than
@@ -78,16 +117,20 @@ def isolate_claude_argv(cmd: Sequence[str]) -> list[str]:
             f"runs may load only {ALLOWED_SETTING_SOURCES!r} because project "
             f"settings in the agent-writable cwd can disable the Bash gate"
         )
+    missing: list[str] = []
     if not sources:
-        isolated.extend([SETTING_SOURCES_FLAG, ALLOWED_SETTING_SOURCES])
-    if STRICT_MCP_FLAG not in isolated:
-        isolated.append(STRICT_MCP_FLAG)
+        missing.extend([SETTING_SOURCES_FLAG, ALLOWED_SETTING_SOURCES])
+    if STRICT_MCP_FLAG not in _option_args(isolated):
+        missing.append(STRICT_MCP_FLAG)
+    end_of_options = len(_option_args(isolated))
+    isolated[end_of_options:end_of_options] = missing
     return isolated
 
 
 def has_claude_cli_isolation(cmd: Sequence[str]) -> bool:
-    """True when ``cmd`` loads user settings only and strict MCP config."""
+    """True when ``cmd`` loads user settings only and strict MCP config, as
+    options (before any ``--``)."""
     sources = _setting_sources_values(cmd)
     return (bool(sources)
             and all(value == ALLOWED_SETTING_SOURCES for value in sources)
-            and STRICT_MCP_FLAG in cmd)
+            and STRICT_MCP_FLAG in _option_args(cmd))

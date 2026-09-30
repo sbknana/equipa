@@ -280,10 +280,16 @@ def test_streaming_project_dir_argument_sets_cwd(agent):
 
 
 def _mcp_config(tmp_path: Path, db_args: list[str]) -> Path:
+    # Absolute command: relative commands are refused since 3127 (P2A-02),
+    # and missing ones since 3138 (RR-02), so an installed fake uvx. It sits
+    # beside tmp_path, which some tests use as the project directory.
+    uvx = tmp_path.parent / f"{tmp_path.name}-installed" / "uvx"
+    uvx.parent.mkdir(exist_ok=True)
+    uvx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    uvx.chmod(0o755)
     path = tmp_path / "mcp_config.json"
     path.write_text(json.dumps({"mcpServers": {
-        # Absolute command: relative commands are refused since 3127 (P2A-02).
-        "theforge": {"type": "stdio", "command": "/opt/fake/bin/uvx",
+        "theforge": {"type": "stdio", "command": str(uvx),
                      "args": ["mcp-server-sqlite", *db_args]},
     }}), encoding="utf-8")
     return path

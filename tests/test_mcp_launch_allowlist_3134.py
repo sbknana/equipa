@@ -264,8 +264,14 @@ def test_relative_db_path_error_names_the_file_and_the_fix(
     assert message.count(config) >= 2  # where it is, and what to edit
     assert "relative --db-path" in message
     assert "absolute path" in message and "Fix:" in message
-    expected = suggestion or os.path.abspath("theforge.db")
-    assert f'"--db-path", "{expected}"' in message
+    # Task 3138 RR-04 replaced the suggestion: a path resolved from the
+    # orchestrator's cwd (or home) named a stale database copy, so the
+    # message now shows a placeholder and says where the live DB is set.
+    assert "absolute path of the live TheForge database" in message
+    guessed = suggestion or os.path.abspath("theforge.db")
+    if guessed != "/absolute/path/to/theforge.db":
+        assert guessed not in message
+    assert '"--db-path", "/absolute/path/to/theforge.db"' in message
 
 
 FAKE_CLI = '''import os
