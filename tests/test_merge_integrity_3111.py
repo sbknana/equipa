@@ -160,16 +160,23 @@ def _clean_review(nonce: str) -> str:
 @pytest.fixture
 def run_clean_review(monkeypatch):
     """``run(task_id, worktree, stable, during_review=None)`` runs the real
-    reviewer pipeline; the fake reviewer writes an honest clean review and
-    may call ``during_review()`` to simulate a concurrent writer."""
-    state = SimpleNamespace(task_id=None, worktree=None, during_review=None)
+    reviewer pipeline; the fake reviewer writes an honest clean review in the
+    directory it was told to work in (``state.review_dir``, the review
+    checkout since #3116) and may call ``during_review()`` to simulate a
+    concurrent writer. ``state.seen`` records what the reviewer read."""
+    state = SimpleNamespace(
+        task_id=None, worktree=None, during_review=None, review_dir=None,
+        seen={},
+    )
 
     async def fake_run_agent(_cmd, timeout=None):
         record = get_reviewer_run(state.task_id)
-        path = (
-            Path(state.worktree) / ARTIFACTS_DIR_NAME
-            / f"SECURITY-REVIEW-{state.task_id}.md"
-        )
+        review_dir = Path(state.review_dir)
+        state.seen = {
+            p.relative_to(review_dir).as_posix(): p.read_text(encoding="utf-8")
+            for p in review_dir.rglob("*.py")
+        }
+        path = review_dir / ARTIFACTS_DIR_NAME / f"SECURITY-REVIEW-{state.task_id}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_clean_review(record.nonce), encoding="utf-8")
         if state.during_review is not None:
@@ -177,7 +184,8 @@ def run_clean_review(monkeypatch):
         return {"success": True, "result_text": "done", "errors": []}
 
     @contextlib.contextmanager
-    def fake_cli(*_args, **_kwargs):
+    def fake_cli(_prompt, review_dir, *_args, **_kwargs):
+        state.review_dir = review_dir
         yield ["claude"]
 
     async def no_diff(_project_dir):
@@ -204,6 +212,7 @@ def run_clean_review(monkeypatch):
             output=[], stable_project_dir=str(stable),
         ))
 
+    run.state = state
     return run
 
 
