@@ -424,6 +424,26 @@ def test_failing_generator_leaves_the_checkout_clean(tmp_path, source, expected)
     assert (repo / REPORT).read_text(encoding="utf-8") == "report from main\n"
 
 
+def test_unexpected_resolver_error_still_aborts_the_merge(tmp_path, monkeypatch):
+    """The resolver runs while the main checkout is mid-merge: an exception
+    nobody anticipated must end merge_failed with the merge aborted, not
+    unwind the gate and leave MERGE_HEAD behind."""
+    repo = _repo_with_generator(tmp_path, "print('fresh report')\n")
+    worktree, branch_sha, main_sha = _diverge_by_hand(repo)
+
+    def explode() -> dict[str, str]:
+        raise RuntimeError("agent env unavailable")
+
+    monkeypatch.setattr("equipa.generated_files.build_agent_env", explode)
+
+    status, guard = _gate(repo, worktree)
+
+    assert status == "merge_failed"
+    assert "RuntimeError: agent env unavailable" in guard.outcomes[TASK].reason
+    _assert_failed_cleanly(repo, guard, main_sha, branch_sha)
+    assert (repo / REPORT).read_text(encoding="utf-8") == "report from main\n"
+
+
 # --- generator environment ----------------------------------------------------
 
 

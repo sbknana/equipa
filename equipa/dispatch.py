@@ -2544,6 +2544,16 @@ async def _resolve_generated_conflict(
         resolution = ConflictResolution(
             True, (), None, f"generated-file resolution errored: {exc}",
         )
+    except Exception as exc:
+        # The main checkout is mid-merge here. Any unexpected error must
+        # still reach the caller's ``merge --abort``, never unwind past it.
+        logger.exception(
+            "[Generated-Files] resolution of task #%s errored mid-merge", task_id,
+        )
+        resolution = ConflictResolution(
+            True, (), None,
+            f"generated-file resolution errored: {type(exc).__name__}: {exc}",
+        )
     if not resolution.applicable:
         return resolution
     files = ",".join(resolution.paths) or "unknown"
