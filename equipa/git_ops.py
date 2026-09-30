@@ -903,6 +903,17 @@ def verify_global_git_config_pin() -> str | None:
     return None
 
 
+def pinned_git_env() -> dict[str, str]:
+    """Environment for a git call that cannot go through :func:`git_run`.
+
+    The process environment plus the hardening variables and, once pinned,
+    ``GIT_CONFIG_GLOBAL`` pointing at the pre-dispatch copy — so a direct
+    ``subprocess.run(["git", ...])`` in the orchestrator reads the same
+    config as the hardened helper does (task #3116, MI-04).
+    """
+    return _hardened_git_env()
+
+
 def reset_global_git_config_pin() -> None:
     """Forget the pin so the next :func:`pin_global_git_config` re-reads.
 

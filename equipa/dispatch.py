@@ -59,6 +59,7 @@ from equipa.git_ops import (
     get_default_branch,
     get_trusted_default_branch,
     git_run_async,
+    pinned_git_env,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_integrity import (
@@ -686,6 +687,7 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
             check=False,
             capture_output=True,
             text=True,
+            env=pinned_git_env(),
         )
         # Only commit if there are staged changes for the plan file.
         diff = subprocess.run(
@@ -693,6 +695,7 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
             cwd=project_dir,
             check=False,
             capture_output=True,
+            env=pinned_git_env(),
         )
         if diff.returncode == 0:
             return  # nothing to commit
@@ -706,6 +709,7 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
             check=False,
             capture_output=True,
             text=True,
+            env=pinned_git_env(),
         )
     except Exception:
         import logging
