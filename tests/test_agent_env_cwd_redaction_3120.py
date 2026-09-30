@@ -498,16 +498,28 @@ async def _with_heartbeat(coro) -> tuple[dict, float]:
     return result, max(gaps)
 
 
+# The reactive check runs in a worker process since task 3127 (P2A-01), so a
+# slow checker is injected as a checker FILE the worker loads.
+SLOW_CHECKER = '''import time
+from dataclasses import dataclass
+@dataclass(frozen=True)
+class Result:
+    safe: bool
+    check_id: int = 0
+    message: str = ""
+def check(command):
+    time.sleep(2.0)
+    return Result(safe=True)
+'''
+
+
 def test_slow_reactive_check_times_out_as_a_block_without_freezing(
-        agent, monkeypatch):
+        agent, monkeypatch, tmp_path):
     bin_dir, fake, project = agent
-    real_check = agent_runner.check_bash_command
-
-    def slow_check(command):
-        time.sleep(2.0)
-        return real_check(command)
-
-    monkeypatch.setattr(agent_runner, "check_bash_command", slow_check)
+    checker_file = tmp_path / "slow_checker.py"
+    checker_file.write_text(SLOW_CHECKER, encoding="utf-8")
+    checker = agent_runner.ReactiveBashChecker(checker_file, "check")
+    monkeypatch.setattr(agent_runner, "_REACTIVE_CHECKER", checker)
     monkeypatch.setattr(agent_runner, "_SLOW_CHECK_SECONDS", 0.3)
     _write_stream(bin_dir, [_assistant_bash("t1", "ls -la"), FINAL])
     output: list[str] = []

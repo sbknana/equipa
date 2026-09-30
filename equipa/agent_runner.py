@@ -169,7 +169,7 @@ class AgentResult(_AgentResultRequired, total=False):
 
 from equipa import agent_launcher
 from equipa.abort_controller import AbortController, create_child_abort_controller
-from equipa.bash_security import check_bash_command
+from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
     get_configured_model,
     get_persistent_retry_max_attempts,
@@ -576,24 +576,23 @@ def _gate_canary_ok(hook_command: str, cwd: str | None = None) -> bool:
     return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
 
 
-async def _reactive_bash_check(bash_cmd: str) -> Any | None:
-    """``check_bash_command`` off the event loop; None when it timed out.
+# One persistent checker process per orchestrator (P2A-01). Tests replace it
+# with a ReactiveBashChecker that loads a fake checker file.
+_REACTIVE_CHECKER = ReactiveBashChecker()
 
-    Runs in a worker thread with a ``_SLOW_CHECK_SECONDS`` deadline, so a
-    pathological command cannot freeze the event loop that monitors every
-    parallel agent (sandbox-07 iii). Past the deadline the hook (same check,
-    same input) may itself have timed out and let the command run, so the
-    caller treats None as a block. A timed-out worker thread cannot be
-    interrupted and finishes on its own; the caller stops the agent, so no
-    further checks queue up behind it.
+
+async def _reactive_bash_check(bash_cmd: str) -> Any | None:
+    """``check_bash_command`` in a separate process; None when it failed.
+
+    The check is regex-bound and ``re`` holds the GIL, so a worker thread
+    would still freeze the event loop that monitors every parallel agent
+    (sandbox-07 iii, P2A-01). It runs in a persistent worker process with a
+    ``_SLOW_CHECK_SECONDS`` deadline instead; a missed deadline kills and
+    recycles the worker. Past the deadline the hook (same check, same input)
+    may itself have timed out and let the command run, so the caller treats
+    None (timeout, crash or malformed verdict) as a block.
     """
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(check_bash_command, bash_cmd),
-            timeout=_SLOW_CHECK_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        return None
+    return await _REACTIVE_CHECKER.check(bash_cmd, _SLOW_CHECK_SECONDS)
 
 
 class AgentDispatchRefused(RuntimeError):
