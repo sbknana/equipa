@@ -103,7 +103,7 @@ HANDOFF_FILE_OPTIONS: Mapping[str, str] = {
 # orchestrator's values point into its own HOME and runtime directory.
 _AGENT_SIDE_ENV = frozenset({
     "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "PWD",
-    "OLDPWD", "MAIL", "CLAUDE_CONFIG_DIR",
+    "OLDPWD", "MAIL", "CLAUDE_CONFIG_DIR", "GIT_CONFIG_GLOBAL",
 })
 _PAGE_SIZE = 4096
 _HANDOFF_FILE_MAX_BYTES = 32 * 1024 * 1024
