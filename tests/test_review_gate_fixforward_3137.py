@@ -248,6 +248,40 @@ def test_honest_review_of_the_new_shapes_merges():
     assert analysis.counts["HIGH"] == 1
 
 
+# --- prompt: the format rule claims only what the gate counts --------------------
+
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "security-reviewer.md"
+
+
+def _prompt_format_rule() -> str:
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    start = text.index("**Finding-shaped lines are counted as findings too.**")
+    return text[start:text.index("\n", start)]
+
+
+def test_prompt_names_the_places_task_3137_counts():
+    rule = _prompt_format_rule()
+    for place in ("..., severity HIGH in auth.py", "HIGH SQL injection in ...",
+                  "- 1. HIGH: ...", "> > > > > HIGH: ...",
+                  "a list item's later paragraphs", "[^1]: HIGH: ...",
+                  "<li>1. HIGH: ...</li>", "combining marks"):
+        assert place in rule, place
+
+
+def test_prompt_no_longer_claims_what_the_gate_does_not_count():
+    rule = _prompt_format_rule()
+    # Only the folded lookalikes count (not Coptic or every Cyrillic letter),
+    # only one-line HTML counts, only these separators end a list item, and a
+    # line opening with a severity needs a separator or a capitalised title.
+    assert "lookalike letters from another script" not in rule
+    assert "the Greek, Cyrillic, Cherokee or Lisu lookalike letters" in rule
+    assert "written in HTML (" not in rule
+    assert "one-line HTML" in rule
+    assert "a list item that ends with one after a dash, colon or comma" in rule
+    assert "starts with a severity (" not in rule
+    assert "starts with a severity and a separator" in rule
+
+
 # --- N3: line-break floods --------------------------------------------------------
 
 REVIEW_BYTES = 200 * 1024
