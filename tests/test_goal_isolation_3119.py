@@ -354,7 +354,13 @@ def test_nested_project_untracked_by_the_enclosing_repo_is_refused(
     task = _task(3342)
     probe = GateProbe(outer, 0)
     probe.install(monkeypatch)
-    _patch_auto_run(monkeypatch, task, probe, _committing_loop(probe))
+
+    async def records_where_it_ran(task, project_dir, project_context, args,
+                                   output=None, **_):
+        probe.agent_dirs.append(project_dir)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    _patch_auto_run(monkeypatch, task, probe, records_where_it_ran)
     project_dirs["scratchproj"] = str(project)
 
     result = _run_project("scratchproj", 3342)
