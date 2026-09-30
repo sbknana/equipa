@@ -140,12 +140,19 @@ class MergeAttempt:
 
     ``merged_sha`` is the task commit now on the default branch: the approved
     commit itself, or its rebased copy when the rebase fallback was used.
+
+    ``regenerated_paths`` (task #3131) is set when the merge conflicted only
+    in declared generated files and was completed by regenerating them.
+    ``merged_sha`` is then still the approved commit (the merge's second
+    parent) and ``post_head`` the resolution commit, which is what the gate
+    records as merged: the regenerated content is part of what landed.
     """
 
     merged_sha: str | None = None
     pre_head: str | None = None
     post_head: str | None = None
     reason: str = ""
+    regenerated_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -275,6 +282,99 @@ async def rebased_range_problem(
         )
     if rebased[1] != approved[1]:
         return "rebased patches differ from the approved commits"
+    return None
+
+
+@dataclass(frozen=True)
+class MergedTree:
+    """``git merge-tree --write-tree`` result: the tree and its conflicted paths.
+
+    With conflicts, ``tree`` holds the conflicted files with markers and every
+    other path exactly as ``git merge`` resolves it.
+    """
+
+    tree: str
+    conflicted: frozenset[str]
+
+
+async def merged_tree(
+    repo: str | os.PathLike, ours: str, theirs: str,
+) -> MergedTree | None:
+    """Merge ``ours`` and ``theirs`` from the object store alone, or None.
+
+    Independent of the ref store and of any checkout an agent can touch
+    (git >= 2.38). None when git fails or its output is inconsistent.
+    """
+    result = await git_run_async(
+        ["merge-tree", "--write-tree", "--no-messages", "--name-only", "-z",
+         ours, theirs],
+        repo, timeout=60,
+    )
+    if result.returncode not in (0, 1):
+        logger.error(
+            "[Merge-Integrity] merge-tree of %s and %s failed rc=%s: %s",
+            _short(ours), _short(theirs), result.returncode,
+            (result.stderr or result.stdout).strip()[:200],
+        )
+        return None
+    fields = result.stdout.split("\0")
+    tree = fields[0].strip()
+    conflicted = frozenset(name for name in fields[1:] if name)
+    if not tree or (result.returncode == 1) != bool(conflicted):
+        return None
+    return MergedTree(tree, conflicted)
+
+
+async def changed_paths(
+    repo: str | os.PathLike, tree_a: str, tree_b: str,
+) -> set[str] | None:
+    """Paths whose entry differs between two trees, or None if git fails.
+
+    Plumbing ``diff-tree`` with renames off and submodules never ignored,
+    so no agent-written diff config can fold or hide a path.
+    """
+    result = await git_run_async(
+        ["diff-tree", "-r", "-z", "--name-only", "--no-renames",
+         "--ignore-submodules=none", tree_a, tree_b],
+        repo, timeout=60,
+    )
+    if result.returncode != 0:
+        return None
+    return {name for name in result.stdout.split("\0") if name}
+
+
+async def regenerated_resolution_problem(
+    repo: str | os.PathLike,
+    merged: MergedTree,
+    resolved_tree: str,
+    regenerated: frozenset[str],
+) -> str | None:
+    """Why ``resolved_tree`` is not ``merged`` with only ``regenerated`` redone.
+
+    Task #3131: a merge that conflicted only in declared generated files is
+    completed by regenerating them. The resolution may differ from the
+    ``git merge-tree`` result in exactly those paths — every one of them a
+    conflicted path and a regular file afterwards — and nowhere else.
+    """
+    if not regenerated or merged.conflicted != regenerated:
+        return (
+            f"conflicted paths {sorted(merged.conflicted)} are not the "
+            f"regenerated paths {sorted(regenerated)}"
+        )
+    differing = await changed_paths(repo, merged.tree, resolved_tree)
+    if differing is None:
+        return f"diff-tree {_short(merged.tree)} {_short(resolved_tree)} failed"
+    extra = differing - regenerated
+    if extra:
+        return f"the resolution also changes {sorted(extra)[:10]}"
+    for path in sorted(regenerated):
+        entry = await git_run_async(
+            ["ls-tree", "-z", "--full-tree", resolved_tree, "--", path],
+            repo, timeout=_GIT_TIMEOUT,
+        )
+        mode_and_type = entry.stdout.split(" ", 2)[:2]
+        if entry.returncode != 0 or mode_and_type != ["100644", "blob"]:
+            return f"regenerated {path} is not a regular file in the resolution"
     return None
 
 
@@ -892,7 +992,12 @@ class DefaultBranchGuard:
         return False
 
     async def record_merge(
-        self, task_id: int, merged_sha: str, *, post_head: str | None,
+        self,
+        task_id: int,
+        merged_sha: str,
+        *,
+        post_head: str | None,
+        regenerated_paths: tuple[str, ...] = (),
     ) -> bool:
         """Advance the chain after the orchestrator merged ``merged_sha``.
 
@@ -906,6 +1011,13 @@ class DefaultBranchGuard:
           ``git merge-tree --write-tree expected merged_sha`` computes — a
           forged commit with the right parents and a backdoored tree fails.
 
+        ``regenerated_paths`` (task #3131) names the generated files the
+        orchestrator regenerated to complete a conflicted merge. The only
+        permitted difference from the ``merge-tree`` result is then those
+        paths — which must be exactly its conflicted paths and regular files
+        — see :func:`regenerated_resolution_problem`. A fast-forward never
+        carries regenerated files.
+
         Anything else means another writer moved the branch around the
         merge, and trips the guard.
         """
@@ -913,57 +1025,85 @@ class DefaultBranchGuard:
             return False
         current = await self.current_sha()
         previous = self.expected_sha
+        regenerated = frozenset(regenerated_paths)
         legitimate = False
         if current is not None and current != previous and current == post_head:
             if current == merged_sha:
-                legitimate = await is_ancestor(self.project_dir, previous, current)
+                legitimate = not regenerated and await is_ancestor(
+                    self.project_dir, previous, current,
+                )
             else:
                 parents = await commit_parents(self.project_dir, current)
                 legitimate = (
                     parents == [previous, merged_sha]
-                    and await self._tree_is_merge_of(current, previous, merged_sha)
+                    and await self._tree_is_merge_of(
+                        current, previous, merged_sha, regenerated,
+                    )
                 )
         if not legitimate:
             self.trip(f"post-merge task={task_id}", current, task_id=task_id)
             return False
         self.expected_sha = current
         self.merges.append((task_id, previous, current))
+        regenerated_note = (
+            f" regenerated={','.join(sorted(regenerated))}" if regenerated else ""
+        )
         _gate_audit_log(
             f"task={task_id} event=default-branch-advanced "
             f"branch={self.default_branch} before={_short(previous)} "
-            f"after={_short(current)} merged_sha={_short(merged_sha)}",
+            f"after={_short(current)} merged_sha={_short(merged_sha)}"
+            f"{regenerated_note}",
             task_id=task_id,
             event="default-branch-advanced",
         )
         return True
 
-    async def _tree_is_merge_of(self, commit: str, ours: str, theirs: str) -> bool:
-        """True when ``commit``'s tree is the clean merge of ``ours`` and ``theirs``.
+    async def _tree_is_merge_of(
+        self,
+        commit: str,
+        ours: str,
+        theirs: str,
+        regenerated: frozenset[str] = frozenset(),
+    ) -> bool:
+        """True when ``commit``'s tree is the merge of ``ours`` and ``theirs``.
 
         ``git merge-tree --write-tree`` (git >= 2.38) recomputes the merge
         from the object store alone, independent of the ref store and of any
-        checkout an agent can touch. A conflicted or failed recomputation is
-        not a match: the orchestrator's merge would not have succeeded.
+        checkout an agent can touch. Without ``regenerated`` the merge must be
+        clean and the trees identical: a conflicted or failed recomputation is
+        not a match, the orchestrator's merge would not have succeeded. With
+        ``regenerated`` (task #3131) the merge must conflict in exactly those
+        paths and ``commit`` may differ from the recomputed tree only there.
         """
-        expected = await git_run_async(
-            ["merge-tree", "--write-tree", "--no-messages", ours, theirs],
-            self.project_dir, timeout=60,
-        )
+        merged = await merged_tree(self.project_dir, ours, theirs)
         actual = await resolve_tree(self.project_dir, commit)
-        expected_tree = expected.stdout.split("\n", 1)[0].strip()
-        if expected.returncode != 0 or not expected_tree or actual is None:
+        if merged is None or actual is None:
+            return False
+        if regenerated:
+            problem = await regenerated_resolution_problem(
+                self.project_dir, merged, actual, regenerated,
+            )
+            if problem:
+                logger.error(
+                    "[Merge-Integrity] merge commit %s is not the merge of %s "
+                    "and %s with only %s regenerated: %s",
+                    _short(commit), _short(ours), _short(theirs),
+                    sorted(regenerated), problem,
+                )
+                return False
+            return True
+        if merged.conflicted:
             logger.error(
-                "[Merge-Integrity] merge-tree of %s and %s failed rc=%s: %s",
-                _short(ours), _short(theirs), expected.returncode,
-                (expected.stderr or expected.stdout).strip()[:200],
+                "[Merge-Integrity] merge-tree of %s and %s conflicts in %s",
+                _short(ours), _short(theirs), sorted(merged.conflicted)[:10],
             )
             return False
-        if actual != expected_tree:
+        if actual != merged.tree:
             logger.error(
                 "[Merge-Integrity] merge commit %s has tree %s, but merging %s "
                 "and %s gives %s",
                 _short(commit), _short(actual), _short(ours), _short(theirs),
-                _short(expected_tree),
+                _short(merged.tree),
             )
             return False
         return True
