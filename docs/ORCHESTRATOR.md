@@ -158,25 +158,54 @@ python forge_orchestrator.py --help
 ### MCP server config
 
 Agents run in the project directory, and the MCP servers the agent CLI starts
-inherit that directory. Every dispatch is therefore refused unless each stdio
-server in the MCP config uses an absolute `command`, absolute script paths, an
-absolute `cwd`, absolute `PYTHONPATH` entries and an absolute `--db-path`.
-`python -m` (or `-c`) additionally needs `-I` or `-P` and an absolute `cwd`,
-because Python would otherwise put the project directory first on `sys.path`
-and run an agent-planted module holding the server's token. `env` wrappers and
-inline `sh -c` commands are refused because they cannot be verified. JavaScript
-package runners and managers (`npx`, `pnpx`, `bunx`, `npm`, `pnpm`, `yarn`,
-`bun`) are refused too: started in the project, `npx <name>` runs the project's
-own `node_modules/.bin/<name>`, and `.npmrc`, `.yarnrc.yml` and `bunfig.toml`
-are read from it. Install such a server outside the project and point an
-absolute `node` at its entry script. See `mcp_config.example.json` for the
-accepted form.
+inherit that directory. Anything a launcher resolves from its working
+directory is therefore agent-writable, so every dispatch is refused unless
+each stdio server in the MCP config matches one of these shapes (an
+allowlist; task 3134, IR-03):
+
+- an absolute `python` with `-I` running an absolute script, or `-I -m` with
+  an absolute `cwd` outside every project directory;
+- an absolute `node` running an absolute script, with no preload, loader or
+  eval option (`-r`, `--require`, `--import`, `--loader`, `-e`, `-p`, ...);
+- the server's own absolute executable file (such as `uvx`), outside every
+  project directory.
+
+Wrappers (`timeout`, `nice`, `env`, `stdbuf`, `setsid`, `busybox`, ...),
+shells, other runtimes and package or task runners (`uv`, `poetry`, `pipx`,
+`npx`, `deno`, `go`, `make`, ...) are refused, because each loads code the
+check cannot follow: `timeout python3 -m x` or `uv run` still runs a module or
+`.venv` planted in the project, and `node -r <name>` loads the project's
+`node_modules`. A server `env` may not set `NODE_OPTIONS`, `PYTHONPATH`,
+`PYTHONSTARTUP`, `LD_*` or similar code-loading variables, and a server entry
+that is not a JSON object is refused. See `mcp_config.example.json` for the
+accepted forms.
+
+`--db-path` must be absolute too. **Deploy check:** an MCP config written
+before this rule (for example `"--db-path", "theforge.db"`) makes every
+dispatch refuse with an error that names the config file and the absolute path
+to use; edit the file before deploying.
 
 The Claude CLI currently ignores a per-server `cwd` and starts every stdio
-server in its own working directory, the project. For `python -m` servers the
-isolation therefore comes from `-P` (or `-I`) with absolute `PYTHONPATH`
-entries, not from `cwd`. The `equipa` MCP server starts its dispatch child
-(`python -m equipa.cli`) from its own checkout for the same reason.
+server in its own working directory, the project. That is why python needs
+`-I` (the project directory never reaches `sys.path`) and why the example runs
+`equipa/mcp_server.py` as an absolute script instead of `-m`. The `equipa` MCP
+server starts its dispatch child (`python -m equipa.cli`) from its own
+checkout for the same reason.
+
+### Project-scope Claude configuration is ignored
+
+Every Claude CLI run EQUIPA starts (agents, reviewers, reflexion, the RLM
+`claude -p` calls, forgesmith) passes `--setting-sources user` and
+`--strict-mcp-config` (`equipa/cli_isolation.py`, IR-01). The CLI runs in the
+agent-writable project directory, and by default it loads project-scope
+configuration from there: one `{"disableAllHooks": true}` in
+`.claude/settings.json` switched off the PreToolUse Bash gate for every later
+run in that project, an `env` block reached the agent's tools, `CLAUDE.md` was
+read as standing instructions for later tester and reviewer runs, and
+`.mcp.json` could add servers. With the two flags the CLI reads user settings,
+the `--settings` file EQUIPA passes and only the servers in EQUIPA's own
+`--mcp-config`. A project `CLAUDE.md` is therefore no longer seen by agents;
+put anything agents must know into the task or role prompt.
 
 ## Agent isolation: what is and is not covered
 
@@ -198,7 +227,9 @@ in depth for that shared UID:
 - Tool inputs are redacted before they are persisted to `agent_actions`.
 
 None of this stops a same-UID process from reading files the orchestrator's
-user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`). Nor does it
+user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`), or from
+writing `~/.claude/settings.json`, which every EQUIPA CLI run still loads as
+its user scope (so it too could switch hooks off). Nor does it
 cover short-lived orchestrator helpers that exec with the full environment
 (git, docker): after exec they are dumpable again, so their
 `/proc/<pid>/environ` is readable while they run. **The
