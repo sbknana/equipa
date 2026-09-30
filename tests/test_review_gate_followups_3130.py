@@ -182,6 +182,38 @@ def test_verb_and_priority_prose_merges(line):
     assert_prose_merges(["## Notes", "", line])
 
 
+@pytest.mark.parametrize("line", [
+    "Rating: HIGH",
+    "- **Rating:** HIGH",
+    "Finding: SQLi, rated HIGH",
+    "Finding S1 is rated HIGH.",
+    "Token reuse, rated HIGH severity, in session.py",
+    "SQL injection in login. Risk: HIGH.",
+    "Token leak in request logs; Impact: HIGH",
+    "- SQLi \N{EM DASH} HIGH \N{EM DASH} auth.py",
+    "- SQLi - HIGH - login handler",
+    "- **H**IGH: SQL injection",
+    "HI*G*H: SQL injection",
+])
+def test_rated_rating_mid_line_alias_dashes_and_split_emphasis_fail_closed(
+        line):
+    assert_blocks_behind_zero_footer(["## Findings", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "Rating: 4 of 5 for clarity.",
+    "- Rating: high confidence in the fix.",
+    "Findings rated HIGH or above block the merge.",
+    "The fix is rated high by the team.",
+    "The endpoint is internal. Risk: low.",
+    "Tokens are signed. Impact: High-value sessions stay safe.",
+    "The formula is a*b*c for the cache size.",
+    "Use - dashes - freely in prose.",
+])
+def test_rated_rating_mid_line_alias_dash_and_emphasis_prose_merges(line):
+    assert_prose_merges(["## Notes", "", line])
+
+
 @pytest.mark.parametrize("cell, higher", [
     ("HIGH/MEDIUM", "HIGH"),
     ("MEDIUM/HIGH", "HIGH"),
@@ -457,7 +489,8 @@ def test_prompt_keeps_every_other_format_obligation():
         assert obligation in text, obligation
     rule = _prompt_format_rule()
     for place in ("`<li>`", "`<td>`", "`Sev:`", "`Risk:`", "`Impact:`",
-                  "`Priority:`", "(HIGH)", "High risk", "Critical impact"):
+                  "`Priority:`", "`Rating:`", "(HIGH)", "High risk",
+                  "Critical impact", "HIGH/MEDIUM", "[HIGH] ..."):
         assert place in rule, place
 
 
@@ -497,6 +530,10 @@ ADVERSARIAL_BODIES = {
     "id-tag-runs": _padded_lines("[S2] HIGH1 [S2] HIGH1 [S2] HIGH1"),
     "double-dash-runs": ["- x" + " --" * (REVIEW_BYTES // 3)],
     "title-case-lines": _padded_lines("High High High High High"),
+    "rated-runs": ["rated " * (REVIEW_BYTES // 6)],
+    "sentence-alias-runs": [". Risk:" * (REVIEW_BYTES // 7)],
+    "dash-severity-runs": [" \N{EM DASH} HIGH" * (REVIEW_BYTES // 7)],
+    "intraword-star-runs": ["a*" * (REVIEW_BYTES // 2)],
     # The 3122 bodies, which must now also stay under 1 s.
     "trailing-separators": ["- x" + " - a" * (REVIEW_BYTES // 4)],
     "space-runs": ["- a" + " " * REVIEW_BYTES + "- HIGH x"],

@@ -1294,7 +1294,7 @@ _ALIAS_SEVERITY_VALUE = (
     r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
     r"|(CRITICAL|HIGH|MEDIUM)(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w))))"
 )
-_SEVERITY_ALIAS_LABEL = r"(?:sev|risk|impact|priority)"
+_SEVERITY_ALIAS_LABEL = r"(?:sev|risk|impact|priority|rating)"
 _SEVERITY_ALIAS_FIELD_RE = re.compile(
     r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
     r"[*_]{0,3}[ \t]{0,8}" + _SEVERITY_ALIAS_LABEL
@@ -1302,6 +1302,31 @@ _SEVERITY_ALIAS_FIELD_RE = re.compile(
     r"[*_]{0,3}[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
     + _ALIAS_SEVERITY_VALUE,
     re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130: the same field opening a sentence in the middle of a line, with a
+# colon: "SQL injection in login. Risk: HIGH." "The endpoint is internal.
+# Risk: low." stays prose.
+_SEVERITY_ALIAS_AFTER_SENTENCE_RE = re.compile(
+    r"(?<=[.;!?])[ \t]{1,4}[*_]{0,3}" + _SEVERITY_ALIAS_LABEL
+    + r"(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}[ \t]{0,4}[:=]"
+    r"[*_]{0,3}[ \t]{0,8}[*_]{0,3}" + _ALIAS_SEVERITY_VALUE,
+    re.IGNORECASE,
+)
+# Task 3130: "rated" and a severity that ends the clause or is followed by
+# "severity": "Finding S1 is rated HIGH.", "SQLi, rated HIGH", "rated HIGH
+# severity". "Findings rated HIGH or above block the merge" is prose.
+_RATED_SEVERITY_RE = re.compile(
+    r"(?<![A-Za-z_-])rated[ \t]{1,4}(?:as[ \t]{1,4})?[*_]{0,3}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium))[*_]{0,3}"
+    r"(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w))|[ \t]{1,4}severity(?![A-Za-z]))",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130: an UPPER-case severity set off by dashes in the middle of a line:
+# "- SQLi — HIGH — auth.py", "SQLi - HIGH - login handler".
+_DASH_DELIMITED_SEVERITY_RE = re.compile(
+    r"(?<=[ \t])(?:[—–]|-{1,2})[ \t]{1,4}[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)[*_]{0,3}[ \t]{1,4}(?:[—–]|-{1,2})"
+    r"(?=[ \t])",
 )
 # A line that is not a list item and OPENS with an UPPER-case severity and a
 # separator, optionally after a blockquote marker, an emoji or a finding ID:
@@ -1705,6 +1730,8 @@ _TASK_3122_LINE_RULES = (
     _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
     _BARE_LEADING_SEVERITY_RE, _BRACKETED_LEADING_SEVERITY_RE,
     _ID_TAGGED_SEVERITY_RE, _LIST_ITEM_LONE_SEVERITY_RE,
+    _SEVERITY_ALIAS_AFTER_SENTENCE_RE, _RATED_SEVERITY_RE,
+    _DASH_DELIMITED_SEVERITY_RE,
 )
 
 
@@ -1852,6 +1879,9 @@ _LEADING_REFERENCE_BLANKS_RE = re.compile(r"^[ \t\x00]+", re.MULTILINE)
 # A run of two or more blanks inside a line renders as one space. Leading
 # indentation is kept: it decides what is a list item or indented code.
 _INTERIOR_BLANK_RUN_RE = re.compile(r"(?<=[^ \t\n])[ \t]{2,}")
+# "*" emphasis inside a word ("**H**IGH", "HI*G*H") renders as one word.
+# "_" does not emphasise inside a word in CommonMark, so it is left alone.
+_INTRAWORD_EMPHASIS_RE = re.compile(r"(?<=[A-Za-z])\*{1,3}(?=[A-Za-z])")
 # Code points from other scripts that look like the Latin letters of the five
 # severity words, UPPER and Title case: Greek, Cyrillic, Cherokee, Lisu and
 # Latin small capitals. A subset of Unicode confusables.txt; NFKC
@@ -1991,7 +2021,8 @@ def _decode_character_reference(match: re.Match[str]) -> str:
 
 def _rendered_review_text(text: str) -> str:
     """The review as a renderer shows it: comments removed, character
-    references decoded, lookalike letters folded, blank runs collapsed.
+    references decoded, lookalike letters folded, "*" emphasis inside a word
+    removed, blank runs collapsed.
 
     ``text`` is already normalised (normalize_review_text). Comments go
     first, so a decoded "&lt;!--" never opens one.
@@ -2009,6 +2040,7 @@ def _rendered_review_text(text: str) -> str:
         # A decoded reference may itself be fullwidth or invisible.
         text = normalize_review_text(text)
     text = text.translate(_CONFUSABLE_LETTERS)
+    text = _INTRAWORD_EMPHASIS_RE.sub("", text)
     return _INTERIOR_BLANK_RUN_RE.sub(" ", text)
 
 
