@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -2054,6 +2055,17 @@ def _read_shell_word(command: str, start: int) -> tuple[str, bool, int]:
 def _shell_redirects(command: str) -> list[tuple[str, str, bool]]:
     """Return ``(direction, target, dynamic)`` for each file redirection.
 
+    See _shell_redirect_records, which also returns each operator's index.
+    """
+    return [
+        (direction, target, dynamic)
+        for _index, direction, target, dynamic in _shell_redirect_records(command)
+    ]
+
+
+def _shell_redirect_records(command: str) -> list[tuple[int, str, str, bool]]:
+    """Return ``(index, direction, target, dynamic)`` per file redirection.
+
     *direction* is ``"in"`` (``<``, ``<&file``) or ``"out"`` (``>``, ``>>``,
     ``>|``, ``<>``, ``&>``, ``&>>``, ``>&file``). Only shell-level operators
     count: quoted text is skipped, and so are heredoc/here-string operators,
@@ -2064,7 +2076,7 @@ def _shell_redirects(command: str) -> list[tuple[str, str, bool]]:
     the shared tokenizer (_scan_shell), not by a private quote model
     (BS3121-01: ``echo $'\\'' >> /etc/x`` used to hide the redirect).
     """
-    redirects: list[tuple[str, str, bool]] = []
+    redirects: list[tuple[int, str, str, bool]] = []
     length = len(command)
     operator_positions = _code_char_positions(
         command, "<>&", include_double_quoted=True
@@ -2114,17 +2126,129 @@ def _shell_redirects(command: str) -> list[tuple[str, str, bool]]:
         target, dynamic, _word_end = _read_shell_word(command, word_start)
         if is_dup and not dynamic and (target.isdigit() or target == "-"):
             continue  # 2>&1, >&2, <&0, >&- : fd duplication, not a file
-        redirects.append((direction, target, dynamic))
+        redirects.append((index, direction, target, dynamic))
     return redirects
+
+
+_DIRECTORY_CHANGE_WORDS = frozenset({"cd", "pushd", "popd"})
+_DIRECTORY_CHANGE_RE = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])")
+# Kinds a shell word can start with.
+_WORD_START_KINDS = frozenset(
+    {_K_CODE, _K_ESCAPE, _K_SQ_DELIM, _K_DQ_DELIM, _K_ANSI_DELIM}
+)
+# The directory the command started in (the agent's working tree).
+_START_DIRECTORY = ""
+
+
+def _directory_after_change(
+    command: str, word_end: int, word: str, current: str | None, cdpath: bool
+) -> str | None:
+    """Directory after the cd/pushd/popd word ending at *word_end*.
+
+    Returns _START_DIRECTORY when the command provably stays inside the
+    directory it started in (a literal relative path without ``..``), an
+    absolute path after a literal ``cd /abs``, and None when the directory
+    cannot be known: no argument (home), ``-``, ``~``, ``+N``, a variable,
+    a ``..`` component, ``popd``, or a relative path while CDPATH is set.
+    """
+    if word == "popd" or current is None:
+        return None
+    length = len(command)
+    index = word_end
+    while True:
+        while index < length and command[index] in " \t":
+            index += 1
+        if index >= length or command[index] in _TOKEN_BREAK_CHARS:
+            return None  # no argument: $HOME for cd, a swap for pushd
+        argument, dynamic, index = _read_shell_word(command, index)
+        if not dynamic and argument.startswith("-") and argument != "-":
+            continue  # an option (-P, -L, --)
+        break
+    if dynamic or not argument or argument == "-" or argument[0] in "~+":
+        return None
+    if ".." in argument.split("/"):
+        return None
+    if argument.startswith("/"):
+        return posixpath.normpath(argument)
+    if cdpath:
+        return None
+    if current == _START_DIRECTORY:
+        return _START_DIRECTORY
+    return posixpath.normpath(posixpath.join(current, argument))
+
+
+def _directory_changes(command: str) -> list[tuple[int, str | None]]:
+    """``(index, directory)`` for every directory change, in order.
+
+    IND3128-04: ``cd /etc; echo x > f`` writes /etc/f, so a relative
+    redirect target is only relative to the working tree while nothing has
+    changed directory. Every word that reads as cd, pushd or popd counts,
+    wherever it is (a subshell or ``$(...)`` included - over-counting only
+    refuses more). *directory* is as _directory_after_change returns it.
+    When the command mentions one of those words in a form this scan does
+    not resolve as a word (spliced from a variable, inside a string), a
+    change to an unknown directory at index 0 is reported instead.
+    """
+    stripped = re.sub(r"[\\'\"]", "", command)
+    mentioned = len(_DIRECTORY_CHANGE_RE.findall(stripped))
+    if not mentioned:
+        return []
+    kinds = _scan_shell(command).kinds
+    cdpath = "CDPATH" in stripped
+    changes: list[tuple[int, str | None]] = []
+    current: str | None = _START_DIRECTORY
+    for start, ch in enumerate(command):
+        if ch in _TOKEN_BREAK_CHARS or kinds[start] & _KIND_MASK not in _WORD_START_KINDS:
+            continue
+        if start > 0 and not (
+            command[start - 1] in _TOKEN_BREAK_CHARS
+            and kinds[start - 1] & _KIND_MASK == _K_CODE
+        ):
+            continue
+        word, dynamic, end = _read_shell_word(command, start)
+        if dynamic or word not in _DIRECTORY_CHANGE_WORDS:
+            continue
+        current = _directory_after_change(command, end, word, current, cdpath)
+        changes.append((start, current))
+    if len(changes) != mentioned:
+        return [(0, None)]
+    return changes
+
+
+def _effective_redirect_target(
+    target: str, index: int, changes: list[tuple[int, str | None]]
+) -> str | None:
+    """The path a literal *target* at *index* writes, after any cd before it.
+
+    Absolute and home targets are returned unchanged, and so is a relative
+    one while the command is still in its starting directory. After
+    ``cd /abs`` a relative target is joined to it and judged as absolute;
+    after a change to an unknown directory None is returned.
+    """
+    if not target or target.startswith(("/", "~")):
+        return target
+    directory = _START_DIRECTORY
+    for position, after in changes:
+        if position >= index:
+            break
+        directory = after
+    if directory is None:
+        return None
+    if directory == _START_DIRECTORY:
+        return target
+    return posixpath.join(directory, target)
 
 
 def _redirect_target_problem(direction: str, target: str, dynamic: bool) -> str | None:
     """Explain why a redirect target is refused, or return None if allowed.
 
-    Allowed: a literal relative path with no ``..`` component (it stays in the
-    working directory), a literal ``/tmp/...`` path with no ``..`` component,
-    and ``/dev/null``/``/dev/stdout``/``/dev/stderr``. The check is textual:
-    a symlink inside the tree that points elsewhere is NOT detected.
+    Allowed: a literal relative path with no ``..`` component, a literal
+    ``/tmp/...`` path with no ``..`` component, and
+    ``/dev/null``/``/dev/stdout``/``/dev/stderr``. A relative path is only
+    relative to the working tree while nothing changed directory first;
+    _check_redirections passes the joined path after a ``cd /abs``
+    (_effective_redirect_target). The check is textual: a symlink inside
+    the tree that points elsewhere is NOT detected.
     """
     if dynamic:
         return (
@@ -2210,9 +2334,22 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
     # hide a traversal from the textual allowlist below. Input redirection
     # from a literal relative path (`sort < data/in.txt`) is allowed: it
     # reads nothing the process could not read anyway, while absolute, home
-    # and `..` sources stay blocked.
-    for direction, target, dynamic in _shell_redirects(command):
-        problem = _redirect_target_problem(direction, target, dynamic)
+    # and `..` sources stay blocked. A relative target after a cd is judged
+    # where it really lands (IND3128-04: `cd /etc; echo x > f` is /etc/f).
+    changes = _directory_changes(command)
+    for index, direction, target, dynamic in _shell_redirect_records(command):
+        effective = target if dynamic else _effective_redirect_target(
+            target, index, changes
+        )
+        if effective is None:
+            problem = (
+                "target is relative, but an earlier cd/pushd/popd moved to a "
+                "directory the checker cannot know; use a /tmp/... path"
+            )
+        else:
+            problem = _redirect_target_problem(direction, effective, dynamic)
+            if problem is not None and effective != target:
+                problem += f" ({target!r} after the cd before it is {effective!r})"
         if problem is None:
             continue
         if direction == "in":
