@@ -103,7 +103,7 @@ def test_doc_only_is_rederived_from_real_file_list_not_a_flag():
     ``is_doc_only_diff`` on the real diff itself. A pure-doc file list must
     yield doc_only=True, a non-blocking merge, and NO artifact read.
     """
-    files = ["docs/guide.md", "README.rst", "notes.txt"]
+    files = ["docs/guide.md", "README.rst", "docs/notes.txt"]
     assert is_doc_only_diff(files) is True  # sanity: the input really is doc-only
     spy = _SpyArtifactReader((True, {"CRITICAL": 1}))
 

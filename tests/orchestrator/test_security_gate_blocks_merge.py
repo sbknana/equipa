@@ -306,7 +306,7 @@ def test_doc_only_diff_merges_without_artifact(tmp_path, monkeypatch):
     SECURITY-REVIEW-NNNN.md is written. Pre-#2706 the caller had to pass
     ``expect_artifact=False`` to tell the invariant not to demand one — a
     caller-trust hole. That parameter is now removed: the gate diffs the
-    real forge-task-9999 branch (docs.md only), calls the EXISTING
+    real forge-task-9999 branch (docs/guide.md only), calls the EXISTING
     ``is_doc_only_diff`` itself, derives doc_only=True, and merges without an
     artifact. No caller flag is involved.
     """
@@ -324,8 +324,10 @@ def test_doc_only_diff_merges_without_artifact(tmp_path, monkeypatch):
     master_head = _git(repo, "rev-parse", "HEAD")
 
     _git(repo, "checkout", "-q", "-b", "forge-task-9999")
-    (repo / "docs.md").write_text("# Docs\n\nProse only.\n")
-    _git(repo, "add", "docs.md")
+    # gate-04: prose under docs/ is doc-only; a root-level .md is not.
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.md").write_text("# Docs\n\nProse only.\n")
+    _git(repo, "add", "docs/guide.md")
     _git(repo, "commit", "-q", "-m", "docs: prose only")
     _git(repo, "checkout", "-q", "master")
 

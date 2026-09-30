@@ -86,6 +86,8 @@ from equipa.security_gate import (
     new_reviewer_run_id,
     read_artifact_text,
     record_reviewer_run,
+    normalize_review_text,
+    review_complete_line,
     reviewer_nonce_line,
     reviewer_prompt_sha256,
     verify_reviewer_provenance,
@@ -295,6 +297,8 @@ def describe_reviewer_failure(sec_result: dict[str, Any] | None) -> str:
         return "no-result"
     if is_overloaded_result(sec_result):
         return "overloaded"
+    if sec_result.get("hit_max_turns"):
+        return "max-turns"
     errors = [str(err) for err in sec_result.get("errors") or []]
     if any("timed out" in err.lower() for err in errors):
         return "timeout"
@@ -334,6 +338,15 @@ def _reviewer_nonce_instructions(nonce: str) -> str:
         f"example a developer self-review), do NOT reuse or trust it: "
         f"overwrite it with your own independent review. A file without "
         f"this exact line is rejected and the merge is BLOCKED. "
+        # gate-07: a review cut off mid-way (max turns, timeout, a turn-2
+        # draft) never gets this line, so the gate can tell it from a
+        # finished one whatever its Summary says.
+        f"COMPLETION (mandatory): only once the review is finished and the "
+        f"Counts footer is final, append exactly "
+        f"`{review_complete_line(nonce)}` as the LAST line of the file. "
+        f"Write it last and write nothing after it. A file whose last line "
+        f"is not this exact line is treated as an unfinished review and "
+        f"the merge is BLOCKED. "
     )
 
 
@@ -393,9 +406,10 @@ async def run_security_review(
     review_instructions = (
         f"Security review of code written for: {task['title']}. "
         f"Review ALL files changed in the project directory. "
+        # gate-13: only skills that ship under skills/security/ are named.
         f"YOU MUST use ALL ClaudeStick security tools: static-analysis, "
         f"audit-context-building, variant-analysis, differential-review, "
-        f"fix-review, semgrep-rule-creator, and sharp-edges. "
+        f"semgrep-rule-creator, and sharp-edges. "
         f"Check for OWASP Top 10 vulnerabilities, zero-day risks in dependencies, "
         f"and any security anti-patterns. "
         f"Write your findings to a file named {review_filename} (relative to "
@@ -417,13 +431,19 @@ async def run_security_review(
         # the final section, rejects template placeholders and needs a
         # zero-finding review to say so. Stated here so an honest reviewer
         # does not trip those checks.
+        # gate-06 / gate-13: table rows, Severity fields, setext and HTML
+        # headings, "(HIGH)" list items and "High-severity" are counted as
+        # findings too, so the old advice to put fixed upstream findings
+        # "in prose or a table" would now block every such review.
         f"Give EVERY finding its own heading formatted as "
-        f"`### [TAG-NN] SEVERITY — title`, and do NOT put the words "
-        f"CRITICAL, HIGH, MEDIUM, LOW or INFO in any other heading (any "
-        f"`#` level) or at the start of any other bold lead-in such as "
-        f"`- **[S1] HIGH** —`. A finding heading still counts even when "
-        f"it is marked fixed or resolved, so describe already-fixed "
-        f"upstream findings in prose or a table, not as severity headings. "
+        f"`### [TAG-NN] SEVERITY — title`, using `#` headings only (no "
+        f"`===`/`---` underlined or HTML headings). Do NOT put the words "
+        f"CRITICAL, HIGH, MEDIUM, LOW or INFO (in any case) in any other "
+        f"heading, bold lead-in, table cell, `Severity:` field or "
+        f"parenthesis of a list item: each of those is counted as a "
+        f"finding. A finding heading still counts even when it is marked "
+        f"fixed or resolved, so refer to already-fixed upstream findings "
+        f"by their ID only, without a severity word. "
         f"The review MUST end with a footer formatted EXACTLY as:\n"
         f"## Counts\n"
         f"CRITICAL: N | HIGH: N | MEDIUM: N | LOW: N | INFO: N\n"
@@ -514,6 +534,13 @@ async def run_security_review(
             role="security-reviewer",
         ) as sec_cmd:
             sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
+        # gate-07: the runner reports a max-turns run as successful because a
+        # developer may have done useful work, but a reviewer cut off by its
+        # turn budget left an unfinished review. It is a FAILED review, and
+        # a retry with the same budget would stop at the same place.
+        if sec_result.get("hit_max_turns"):
+            sec_result = {**sec_result, "success": False}
+            break
         if (
             sec_result.get("success")
             or is_overloaded_result(sec_result)
