@@ -222,11 +222,40 @@ class TestNewBypassShapes:
             "echo \"$(echo x # )\" $(touch /tmp/zz-sentinel)\n)\"",
             # (( that is really a subshell with a comment in it.
             "((echo a) #'\n) ; echo $(touch /tmp/zz-sentinel) #')",
+            # Checks 15 and 21 had their own quote model too.
+            "echo $'\\'' a\\ b",
+            "echo $'\\'' x \\> y",
+            "echo \"$(echo '\"')\" a\\ b",
         ],
     )
     def test_blocked(self, command: str):
         result = check_bash_command(command)
         assert not result.safe, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # bash: the << is inside $'...' and the "body" lines are code.
+            "cat $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF\n\\'",
+            "cat $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF\n#'",
+            # bash: the # starts a comment, so there is no heredoc at all.
+            "cat x #' <<' <<'EOF'\necho $(touch /tmp/zz-sentinel)\nEOF",
+        ],
+    )
+    def test_inert_heredoc_strip_needs_the_tokenizer_to_agree(self, command: str):
+        assert bash_security._strip_inert_heredoc_body(command) is None
+        assert not check_bash_command(command).safe
+
+    def test_git_heredoc_strip_needs_the_tokenizer_to_agree(self):
+        command = (
+            "git commit -F - $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF"
+        )
+        assert bash_security._benign_git_heredoc_sanitized(command) is None
+        assert not check_bash_command(command).safe
+        # The canonical shape still strips.
+        assert bash_security._benign_git_heredoc_sanitized(
+            "git commit -F - <<'EOF'\nfix: it's done; a < b\nEOF"
+        ) == "git commit -F -"
 
     @pytest.mark.parametrize(
         "command",

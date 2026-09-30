@@ -847,48 +847,30 @@ def _split_command_segments(command: str) -> list[str]:
     return segments
 
 
+def _has_shell_escaped_char(command: str, chars: str) -> bool:
+    """True if a character in *chars* is backslash-escaped in code context.
+
+    Outside every quote (double-quoted ``"$(...)"`` code included in
+    "inside quotes", as before). Escapes are located by _scan_shell, so a
+    preceding ``$'\\''`` word cannot hide them.
+    """
+    kinds = _scan_shell(command).kinds
+    for index, ch in enumerate(command):
+        if ch in chars:
+            kind = kinds[index]
+            if kind & _KIND_MASK == _K_ESCAPED and not kind & _F_HIDDEN:
+                return True
+    return False
+
+
 def _has_backslash_escaped_whitespace(command: str) -> bool:
     """Detect backslash-space or backslash-tab outside quotes."""
-    in_single = False
-    in_double = False
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if ch == "\\" and not in_single:
-            if not in_double and i + 1 < len(command):
-                nxt = command[i + 1]
-                if nxt in (" ", "\t"):
-                    return True
-            i += 2
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-        elif ch == "'" and not in_double:
-            in_single = not in_single
-        i += 1
-    return False
+    return _has_shell_escaped_char(command, " \t")
 
 
 def _has_backslash_escaped_operator(command: str) -> bool:
     r"""Detect ``\;``, ``\|``, ``\&``, ``\<``, ``\>`` outside quotes."""
-    operators = frozenset(";|&<>")
-    in_single = False
-    in_double = False
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if ch == "\\" and not in_single:
-            if not in_double and i + 1 < len(command):
-                if command[i + 1] in operators:
-                    return True
-            i += 2
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        i += 1
-    return False
+    return _has_shell_escaped_char(command, ";|&<>")
 
 
 def _escaped_positions(content: str) -> list[bool]:
