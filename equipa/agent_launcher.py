@@ -67,7 +67,6 @@ EXIT_ORPHANED = 128 + signal.SIGTERM
 EXIT_SPAWN_FAILED = 127
 
 
-
 def _existing_signals(*names: str) -> frozenset[int]:
     """The named signals this platform has. Windows lacks most POSIX ones,
     and ``equipa.agent_runner`` imports this module on every platform."""
