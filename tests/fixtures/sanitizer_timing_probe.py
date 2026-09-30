@@ -233,7 +233,7 @@ def main(argv: list[str]) -> int:
         from equipa.lessons import sanitize_episode_text
 
         def call() -> None:
-            sanitize_episode_text(text)
+            sanitize_episode_text(text, "reflection")
     else:
         raise SystemExit(f"unknown target {target!r}")
 
