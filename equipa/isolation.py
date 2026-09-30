@@ -1467,3 +1467,122 @@ async def spawn_isolated_agent(
     logger.info("[Isolation] agent %s runs as %s in %s", unit,
                 settings.agent_user, agent.cgroup)
     return process, agent
+
+
+# --- Operator verification (scripts/verify_agent_isolation.sh) --------------------
+
+
+def _outer_checks(settings: IsolationSettings) -> list[str]:
+    """Checks made as the orchestrator user; returns failure messages."""
+    import pwd
+
+    failures: list[str] = []
+    orchestrator_user = pwd.getpwuid(os.getuid()).pw_name
+    listed = _exit_status([settings.sudo, "-n", "-l", "-u", settings.agent_user,
+                             settings.python, "-I", settings.launcher,
+                             *agent_launcher.ISOLATED_ARGV])
+    if listed != 0:
+        failures.append("the sudoers rule is missing; install:\n"
+                        + sudoers_snippet(settings, orchestrator_user))
+    database = Path(THEFORGE_DB)
+    if database.exists() and database.stat().st_mode & stat.S_IROTH:
+        failures.append(f"{database} is world-readable (chmod o-r)")
+    return failures
+
+
+def _exit_status(argv: Sequence[str]) -> int:
+    """Exit status of a short, output-less command (outer checks only)."""
+    import subprocess
+
+    try:
+        return subprocess.run(list(argv), stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30,
+                              check=False).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 127
+
+
+def build_probe_command(probe: str, settings: IsolationSettings,
+                        repos: Sequence[str], orchestrator_home: str) -> list[str]:
+    """argv for ``verify_agent_isolation.sh --inside`` (argv[0] is replaced
+    by the probe path, as the CLI path is for a real agent)."""
+    command = ["claude", "--inside",
+               "--orchestrator-pid", str(os.getpid()),
+               "--orchestrator-home", orchestrator_home,
+               "--db", str(THEFORGE_DB),
+               "--runtime", str(RUNTIME_ROOT),
+               "--launcher", settings.launcher,
+               "--pids-max", str(settings.pids_max)]
+    for repo in [str(RUNTIME_ROOT), *repos]:
+        git_dir = os.path.join(repo, ".git")
+        if os.path.exists(git_dir):
+            command += ["--git-dir", git_dir]
+    if settings.view_db_path:
+        command += ["--view-db", settings.view_db_path]
+        for table in settings.exclude_tables:
+            command += ["--exclude-table", table]
+    if MCP_CONFIG.is_file():
+        command += ["--mcp-config", str(MCP_CONFIG)]
+    return command
+
+
+async def _run_probe(command: list[str], dispatch_config: Mapping[str, Any]
+                     ) -> str:
+    from equipa.env_loader import build_agent_env
+
+    process, agent = await spawn_isolated_agent(
+        command, None, build_agent_env(dispatch_config), dispatch_config)
+    try:
+        output = await asyncio.wait_for(process.stdout.read(), timeout=120)
+    finally:
+        await agent.terminate()
+    return output.decode("utf-8", "replace")
+
+
+def verification_main(argv: Sequence[str] | None = None) -> int:
+    """``python3 -m equipa.isolation --verify-probe <script>``: run the
+    operator's checks through the real isolated launch path. 0 = all pass."""
+    import argparse
+    import pwd
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m equipa.isolation",
+        description="Verify agent isolation (docs/AGENT_ISOLATION.md).")
+    parser.add_argument("--verify-probe", required=True,
+                        help="absolute path of scripts/verify_agent_isolation.sh")
+    parser.add_argument("--repo", action="append", default=[],
+                        help="project repository whose .git the agent must "
+                             "not write (repeatable)")
+    args = parser.parse_args(argv)
+    if os.geteuid() == 0:
+        print("FAIL run this as the orchestrator user, not root")
+        return 2
+    dispatch_config = copy.deepcopy(get_active_dispatch_config())
+    section = dict(dispatch_config.get(CONFIG_KEY) or {})
+    section["claude_executable"] = os.path.abspath(args.verify_probe)
+    dispatch_config[CONFIG_KEY] = section
+    try:
+        settings = load_isolation_settings(dispatch_config)
+    except AgentIsolationError as exc:
+        print(f"FAIL {exc}")
+        return 2
+    failures = _outer_checks(settings)
+    for failure in failures:
+        print(f"FAIL {failure}")
+    command = build_probe_command(args.verify_probe, settings, args.repo,
+                                  pwd.getpwuid(os.getuid()).pw_dir)
+    try:
+        output = asyncio.run(_run_probe(command, dispatch_config))
+    except AgentIsolationError as exc:
+        print(f"FAIL isolation could not be established: {exc}")
+        return 2
+    print(output, end="")
+    if failures or "RESULT: PASS" not in output.splitlines():
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    sys.exit(verification_main())
