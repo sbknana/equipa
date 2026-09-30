@@ -2682,6 +2682,77 @@ def _security_review_blocks_merge(
     return blocks, counts
 
 
+@dataclass(frozen=True)
+class _HazardScan:
+    """Hazards found and the resolved directories that were scanned."""
+
+    hazards: list[str]
+    directories: frozenset[Path]
+
+
+async def _collect_repo_hazards(
+    directories: list[str | None],
+    *,
+    already_scanned: frozenset[Path] = frozenset(),
+) -> _HazardScan:
+    """:func:`find_repo_execution_hazards` for each directory, deduplicated.
+
+    ``None`` entries and directories in ``already_scanned`` (compared
+    resolved) are skipped.
+    """
+    hazards: list[str] = []
+    scanned = set(already_scanned)
+    for directory in directories:
+        if directory is None:
+            continue
+        resolved = Path(directory).resolve()
+        if resolved in scanned:
+            continue
+        scanned.add(resolved)
+        for hazard in await find_repo_execution_hazards(directory):
+            if hazard not in hazards:
+                hazards.append(hazard)
+    return _HazardScan(hazards, frozenset(scanned))
+
+
+async def _git_common_dir(directory: str | os.PathLike) -> Path | None:
+    """Resolved git common dir of ``directory``, None when git cannot say."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--git-common-dir"], directory, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[git] no common dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    common = Path(printed)
+    if not common.is_absolute():
+        common = Path(directory) / common
+    return common.resolve()
+
+
+async def _common_dir_mismatch(
+    repo_root: str | os.PathLike, worktree_root: str | os.PathLike,
+) -> str | None:
+    """Why ``worktree_root`` is not a worktree of ``repo_root``'s repository."""
+    repo_common = await _git_common_dir(repo_root)
+    worktree_common = await _git_common_dir(worktree_root)
+    if repo_common is None or worktree_common is None:
+        return (
+            f"could not locate the git common dir of {repo_root} or "
+            f"{worktree_root}"
+        )
+    if repo_common != worktree_common:
+        return (
+            f"{repo_root} uses the repository at {repo_common} but its task "
+            f"worktree {worktree_root} uses {worktree_common} (a .git file or "
+            f"similar GIT_DIR redirect)"
+        )
+    return None
+
+
 async def _gated_merge_task(
     *,
     repo: str | os.PathLike,
@@ -2796,10 +2867,40 @@ async def _gated_merge_task(
         )
         return finish("skipped", f"outcome {outcome} is not merge-eligible")
 
+    def refuse_hazards(hazards: list[str]) -> str:
+        detail = "; ".join(hazards)
+        print(
+            f"  [Merge-Integrity] Task #{task_id}: refusing to gate or merge "
+            f"— {detail}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=repo-hazard-blocked detail={detail}",
+            task_id=task_id,
+            event="repo-hazard-blocked",
+        )
+        return finish("blocked", f"repository hazard: {detail}")
+
+    # Task #3111: repository state the hardened git helper cannot neutralise
+    # blocks before ANY gate evaluation — the reviewer agent's git honours
+    # replace refs, and driver config runs programs during the merge. The
+    # task worktree is scanned too: the rebase fallback runs git there, and
+    # its own config.worktree is invisible from the main checkout.
+    #
+    # IND-02 (task #3132): the scan runs on the OPERATOR's paths BEFORE any
+    # work-tree root is resolved. ``rev-parse --show-toplevel`` follows an
+    # agent-written ``core.worktree``; scanning the resolved root scanned
+    # whichever repository the agent named, and the gate and the merge then
+    # ran there while this project's task was recorded merged.
+    scanned = await _collect_repo_hazards([project_dir, worktree_dir])
+    if scanned.hazards:
+        return refuse_hazards(scanned.hazards)
+
     # R3119-01 (task #3126): every git call of the gate and the merge runs
     # at the work-tree ROOT. A project nested in a sub-directory of its
     # repository keeps ``project_dir`` only for its review artifact; from
     # the sub-directory, agent-written config could narrow the gate diff.
+    # git_toplevel_async names no root that does not contain the directory
+    # (IND-02, task #3132).
     repo_root = await git_toplevel_async(project_dir)
     worktree_root = (
         await git_toplevel_async(worktree_dir) if worktree_dir is not None else None
@@ -2816,30 +2917,21 @@ async def _gated_merge_task(
     git_dir = str(repo_root)
     git_worktree_dir = str(worktree_root) if worktree_root is not None else None
 
-    # Task #3111: repository state the hardened git helper cannot neutralise
-    # blocks before ANY gate evaluation — the reviewer agent's git honours
-    # replace refs, and driver config runs programs during the merge. The
-    # task worktree is scanned too: the rebase fallback runs git there, and
-    # its own config.worktree is invisible from the main checkout.
-    hazards: list[str] = []
-    for scan_dir in (git_dir, git_worktree_dir):
-        if scan_dir is None:
-            continue
-        for hazard in await find_repo_execution_hazards(scan_dir):
-            if hazard not in hazards:
-                hazards.append(hazard)
-    if hazards:
-        detail = "; ".join(hazards)
-        print(
-            f"  [Merge-Integrity] Task #{task_id}: refusing to gate or merge "
-            f"— {detail}"
-        )
-        _gate_audit_log(
-            f"task={task_id} event=repo-hazard-blocked detail={detail}",
-            task_id=task_id,
-            event="repo-hazard-blocked",
-        )
-        return finish("blocked", f"repository hazard: {detail}")
+    # IND-02 (task #3132): a ``.git`` file planted in a nested project's
+    # directory (a GIT_DIR-style redirect) makes that directory the root of
+    # ANOTHER repository. The orchestrator made the task worktree from the
+    # project's repository, so both must share one git common dir.
+    if worktree_root is not None:
+        mismatch = await _common_dir_mismatch(repo_root, worktree_root)
+        if mismatch:
+            return refuse_hazards([mismatch])
+
+    # Roots not scanned above (a nested project's) are scanned as well.
+    root_hazards = await _collect_repo_hazards(
+        [git_dir, git_worktree_dir], already_scanned=scanned.directories,
+    )
+    if root_hazards.hazards:
+        return refuse_hazards(root_hazards.hazards)
 
     if guard is None:
         try:
