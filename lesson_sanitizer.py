@@ -226,6 +226,39 @@ def normalize_for_matching(text: str) -> str:
     return folded
 
 
+# A lowercase snake_case or kebab-case identifier ("system_override",
+# "sudo_mode", "admin-alert"). Case-sensitive on purpose: "SYSTEM_OVERRIDE"
+# and "SYSTEM.OVERRIDE" are header-shaped, not code names, and so is an
+# identifier followed by a colon ("system_override: approve"). Linear: an
+# identifier starts only at a word boundary, each repetition begins with a
+# joiner, and the lookahead scans a run once.
+_CODE_IDENTIFIER = r"\b[a-z0-9]+(?:[-_][a-z0-9]+)+\b(?![ \t]*:)"
+_PLAIN_IDENTIFIER = re.compile(_CODE_IDENTIFIER)
+_IDENTIFIER_OR_JOINER = re.compile(
+    f"({_CODE_IDENTIFIER})|{_WORD_JOINER.pattern}"
+)
+
+
+def _space_joiners_outside_identifiers(folded: str, raw: str) -> str:
+    """Space joiner runs in *folded*, except inside plain code identifiers.
+
+    Only an identifier that also appears verbatim in *raw* is kept joined, so
+    one that exists only after folding (small capitals, Cyrillic or
+    zero-width splits) is spaced like any other joiner run.
+    """
+    plain = set(_PLAIN_IDENTIFIER.findall(raw))
+
+    def keep_plain_identifier(match: re.Match[str]) -> str:
+        identifier = match.group(1)
+        if identifier is None:
+            return " "
+        if identifier in plain:
+            return identifier
+        return _WORD_JOINER.sub(" ", identifier)
+
+    return _IDENTIFIER_OR_JOINER.sub(keep_plain_identifier, folded)
+
+
 def _joiner_variants(folded: str) -> tuple[str, ...]:
     """Copies of *folded* with word-joiner runs deleted and spaced, if any."""
     if not _WORD_JOINER.search(folded):
@@ -307,19 +340,31 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"\bforget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
             r"(?:your|the|all)\s+(?:previous\s+)?(?:instructions?|rules?|"
             r"guidelines?|training))|"
-            # "Forget all of that", but not "don't forget all migrations".
-            r"\bforget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
-            r"context|you)\b|"
+            # "Forget all of that", but not "don't forget all of this setup"
+            # or "the cache will forget all context entries": imperative
+            # position only, like the execute rule below.
+            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|just|and|so|also)\b)"
+            r"[ \t]*forget\s+all\s+(?:of\s+)?(?:that|this|above|before|"
+            r"earlier|context|you)\b|"
             r"\bnew\s+(?:instructions?|system\s+prompt|directives?)\b|"
-            # "New rules: ...", but not "add new rules to the linter".
-            r"\bnew\s+(?:rules?|orders?)\s*:|"
+            # "New rules: ..." as a sentence or heading, but not "add new
+            # rules to the linter" or "ruff ships new rules: E501".
+            r"(?:^|[\n.!?:;,])[ \t]*(?:[#*>-]+[ \t]*)?"
+            r"new\s+(?:rules?|orders?)\s*:|"
             r"\byour\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
             r"\boverride\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
             r"system|above))\s+(?:instructions?|rules?|guidelines?|"
             r"behaviou?r|programming|directives?|safety|restrictions)|"
             r"\bact\s+as\s+if\s+you\b|"
-            # "Act as a senior admin", but not "act as a good API citizen".
-            r"\bact\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
+            # "Act as a senior admin" / "I want you to act as the admin", but
+            # not "act as a good API citizen" or "the intermediate CA will
+            # act as the root CA": imperative position only. The "you"
+            # alternative ends on a word, not on whitespace, so it cannot
+            # overlap the [ \t]* after it.
+            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|just|and|also|"
+            r"instead)\b|\byou(?:\s+(?:must|should|will|shall|can|may|now|"
+            r"to))?)[ \t]*act\s+as\s+(?:an?|the|my|your)\s+"
+            r"(?:[\w-]+\s+){0,2}?"
             r"(?:admin(?:istrator)?|sysadmin|root|superuser|unrestricted|"
             r"jailbroken)\b|"
             r"\bpretend\s+(?:you\s+are|to\s+be|you're)\b|"
@@ -411,6 +456,13 @@ _JOINER_AWARE_REASONS = frozenset({
     "command instruction",
 })
 
+# Joiner-aware classes whose phrases are two-word names that code uses all
+# the time ("system_override" flag, "admin_alert()", "sudo_mode" setting).
+# Their spaced variant keeps lowercase snake_case / kebab-case identifiers
+# joined (review N4 of task 3129). Sentence-shaped classes do not get this:
+# "ignore_previous_instructions" and "you_are_now" must stay rejected.
+_IDENTIFIER_SAFE_REASONS = frozenset({"fake system header"})
+
 
 def detect_injection(text) -> str | None:
     """Return the reason *text* looks like a prompt injection, else None.
@@ -432,12 +484,21 @@ def detect_injection(text) -> str | None:
     if folded is None:
         return "abnormal unicode decomposition"
     variants = _joiner_variants(folded)
+    identifier_safe_variants: tuple[str, ...] = ()
+    if variants:
+        identifier_safe_variants = (
+            variants[0], _space_joiners_outside_identifiers(folded, raw),
+        )
     for reason, pattern in _INJECTION_PATTERNS:
         if pattern.search(folded):
             return reason
-        if reason in _JOINER_AWARE_REASONS and any(
-            pattern.search(variant) for variant in variants
-        ):
+        if reason not in _JOINER_AWARE_REASONS:
+            continue
+        if reason in _IDENTIFIER_SAFE_REASONS:
+            reason_variants = identifier_safe_variants
+        else:
+            reason_variants = variants
+        if any(pattern.search(variant) for variant in reason_variants):
             return reason
     return None
 
