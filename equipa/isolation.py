@@ -1463,6 +1463,27 @@ class UnitSlot:
                         "start again", self.label)
 
 
+def _check_private_lock_dir(directory: str) -> None:
+    """The unit locks hold only while nobody else can replace them.
+
+    Whoever may write their directory may unlink a lock file a running
+    unit holds; the next reviewer would then create and lock a fresh file
+    at once and run beside that unit. So the directory itself (no link)
+    must belong to this user and be writable by no one else.
+    """
+    try:
+        info = os.lstat(directory)
+    except OSError as exc:
+        raise AgentIsolationError(
+            f"cannot use the unit lock directory {directory}: {exc}") from exc
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        raise AgentIsolationError(
+            f"the unit lock directory {directory} must be a directory of this "
+            f"user that no one else can write to (mode "
+            f"{stat.filemode(info.st_mode)}, owner uid {info.st_uid})")
+
+
 def _open_lock_file(directory: str, name: str) -> int:
     path = os.path.join(directory, name)
     try:
@@ -1545,6 +1566,7 @@ async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
     import fcntl
 
     directory = lock_dir or _runtime_dir()
+    _check_private_lock_dir(directory)
     handles = [_open_lock_file(directory, _TURNSTILE_LOCK_NAME)]
     try:
         handles.append(_open_lock_file(directory, _UNITS_LOCK_NAME))

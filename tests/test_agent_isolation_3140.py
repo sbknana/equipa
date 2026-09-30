@@ -765,6 +765,44 @@ def test_unit_lock_must_be_a_private_regular_file(slots, tmp_path: Path) -> None
         asyncio.run(slots("developer 1", False))
 
 
+@pytest.mark.parametrize("mode", [0o777, 0o1777, 0o770, 0o720])
+def test_unit_lock_directory_must_be_private(slots, mode: int) -> None:
+    """Whoever may write the lock directory may unlink a held lock file."""
+    slots.lock_dir.chmod(mode)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="unit lock directory .* no one else can write"):
+        asyncio.run(slots("developer 1", False))
+
+
+def test_unit_lock_directory_may_not_be_a_link(slots, tmp_path: Path) -> None:
+    linked = tmp_path / "linked-run"
+    linked.symlink_to(slots.lock_dir)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="unit lock directory"):
+        asyncio.run(isolation.acquire_unit_slot(
+            "developer 1", exclusive=False, timeout=1, lock_dir=str(linked)))
+
+
+def test_a_replaced_lock_file_cannot_let_a_reviewer_overlap(slots) -> None:
+    """R3136-03 through the lock itself: in a lock directory others may
+    write, a running agent can unlink the units lock its own unit holds.
+    The reviewer would then lock a fresh file at once and run beside it."""
+    async def scenario():
+        developer = await slots("developer unit A", False)
+        slots.lock_dir.chmod(0o777)
+        (slots.lock_dir / isolation._UNITS_LOCK_NAME).unlink()
+        try:
+            with pytest.raises(isolation.AgentIsolationError,
+                               match="unit lock directory"):
+                reviewer = await slots("security-reviewer unit R", True,
+                                       timeout=0.5)
+                reviewer.release()
+        finally:
+            developer.release()
+
+    asyncio.run(scenario())
+
+
 class _FakeProcess:
     def __init__(self) -> None:
         self.pid = os.getpid()
