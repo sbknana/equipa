@@ -84,6 +84,7 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "gepa_ab_testing": False,
         "security_review": True,
         "bash_security_pretooluse": False,
+        "agent_isolation": False,
         "security_review_block_on_missing_artifact": True,
         "quality_scoring": True,
         "anti_compaction_state": True,
