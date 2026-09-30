@@ -1722,18 +1722,36 @@ async def _run_security_review_and_gate(
         # artifact itself. ``review_blocks_merge`` / ``review_skipped_doc_
         # only`` above still drive the DB-status outcome demotion and the
         # operator log lines, but they NO LONGER steer the merge decision.
-        merge_result = await _gated_post_merge(
-            repo=project_dir,
-            branch=merge_branch,
-            outcome=outcome,
-            task_id=task["id"],
-            security_review_enabled=is_security_review_enabled(args),
-            block_on_missing=is_feature_enabled(
-                getattr(args, "dispatch_config", None) or {},
-                "security_review_block_on_missing_artifact",
-            ),
-            guard=guard,
-        )
+        if guard is None and _is_git_repo(project_dir):
+            # MI-06 (task #3116): the default branch was not pinned before
+            # the agents ran, so a fresh snapshot now would adopt whatever
+            # they did as the baseline. Parallel mode merges nothing in this
+            # case; single-task mode now refuses the same way.
+            merge_result = "refused"
+            print(
+                f"  [Task #{task['id']}] MERGE: refused — the default branch "
+                f"was not pinned before dispatch; {merge_branch} left "
+                f"unmerged for operator review."
+            )
+            log_gate_audit(
+                f"task={task['id']} event=merge-refused branch={merge_branch} "
+                f"reason=default-branch-not-pinned-before-dispatch",
+                task["id"],
+                event="merge-refused",
+            )
+        else:
+            merge_result = await _gated_post_merge(
+                repo=project_dir,
+                branch=merge_branch,
+                outcome=outcome,
+                task_id=task["id"],
+                security_review_enabled=is_security_review_enabled(args),
+                block_on_missing=is_feature_enabled(
+                    getattr(args, "dispatch_config", None) or {},
+                    "security_review_block_on_missing_artifact",
+                ),
+                guard=guard,
+            )
         if merge_result == "merged":
             print(
                 f"  [Task #{task['id']}] MERGE: branch {merge_branch} "
