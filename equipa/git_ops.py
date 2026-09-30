@@ -307,17 +307,69 @@ def _git_identity_args() -> list[str]:
     return args
 
 
+class GitRepositoryUnreadableError(RuntimeError):
+    """A directory belongs to a git repository that git cannot read.
+
+    R3119-02 (task #3126): such a directory is neither "git" nor "not git".
+    A dispatch there is refused; it never runs ungated in the checkout.
+    """
+
+
+# git's answer for a directory outside every repository; read with LC_ALL=C.
+_NOT_A_REPOSITORY = "not a git repository"
+
+
+def _probe_work_tree(path: str | Path) -> tuple[Path | None, str]:
+    """``(work-tree root, "")``, or ``(None, why git named no root)``."""
+    try:
+        result = git_run(
+            ["rev-parse", "--show-toplevel"], path, timeout=10,
+            env={"LC_ALL": "C"},
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return None, f"git could not be run: {exc}"
+    toplevel = (result.stdout or "").strip()
+    if result.returncode == 0 and toplevel:
+        return Path(toplevel), ""
+    detail = (result.stderr or "").strip()[:300]
+    return None, detail or f"git rev-parse exited {result.returncode}"
+
+
+def _nearest_git_entry(path: Path) -> Path | None:
+    """The first ``.git`` entry at ``path`` or above it, None if there is none.
+
+    Both the path as given and its symlink-resolved form are walked: git
+    itself discovers the repository from the resolved working directory.
+    """
+    for start in dict.fromkeys((path.absolute(), path.resolve())):
+        for directory in (start, *start.parents):
+            entry = directory / ".git"
+            if os.path.lexists(entry):
+                return entry
+    return None
+
+
 def git_toplevel(path: str | Path) -> Path | None:
     """Root of the git work tree that contains ``path``, or None.
 
     None when ``path`` is not a directory inside a git work tree (a plain
     directory, a bare repository, a ``.git`` directory itself) or git
-    cannot be run there.
+    cannot be run there. Use :func:`_is_git_repo` to tell those apart.
     """
     if not Path(path).is_dir():
         return None
+    toplevel, problem = _probe_work_tree(path)
+    if toplevel is None:
+        logger.debug("[git] no work tree for %s: %s", path, problem)
+    return toplevel
+
+
+async def git_toplevel_async(path: str | Path) -> Path | None:
+    """:func:`git_toplevel` without blocking the event loop."""
+    if not Path(path).is_dir():
+        return None
     try:
-        result = git_run(["rev-parse", "--show-toplevel"], path, timeout=10)
+        result = await git_run_async(["rev-parse", "--show-toplevel"], path, timeout=10)
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning("[git] could not locate the work tree of %s: %s", path, exc)
         return None
@@ -335,8 +387,29 @@ def _is_git_repo(path: str | Path) -> bool:
     Checking for a ``.git`` entry treated it as "not git", so it got no
     worktree, no guard and no gate. ``git rev-parse --show-toplevel``
     answers for the enclosing repository as well.
+
+    R3119-02 (task #3126): fails closed. False only for a missing
+    directory, or when git positively answers "not a git repository" and
+    there is no ``.git`` at ``path`` or above it. Any other failure (a
+    corrupted config, a broken ``.git`` file, a timeout, no ``git``
+    binary) raises :class:`GitRepositoryUnreadableError`: an agent-broken
+    repository must not turn the next dispatch into an ungated one.
     """
-    return git_toplevel(path) is not None
+    directory = Path(path)
+    if not directory.is_dir():
+        return False
+    toplevel, problem = _probe_work_tree(directory)
+    if toplevel is not None:
+        return True
+    git_entry = _nearest_git_entry(directory)
+    if git_entry is None and _NOT_A_REPOSITORY in problem.lower():
+        return False
+    raise GitRepositoryUnreadableError(
+        f"{directory} cannot be read by git ({problem})"
+        + (f"; {git_entry} exists" if git_entry is not None else "")
+        + ". Refusing to treat it as a non-git project; repair the "
+        "repository before dispatching."
+    )
 
 
 def detect_project_language(project_dir: str | Path) -> dict:
@@ -496,12 +569,22 @@ _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
     ("submodule.recurse", "false"),
 )
 
+# R3119-01 (task #3126): run from a sub-directory (a project nested in
+# another repository), repo config ``diff.relative=true`` makes git diff /
+# log / show drop every path outside that directory, so code elsewhere in
+# the repository read as a doc-only change. Paths are always reported from
+# the work-tree root, whatever the repo config says.
+_GIT_PATH_SCOPE_PINS: tuple[tuple[str, str], ...] = (
+    ("diff.relative", "false"),
+    ("status.relativePaths", "false"),
+)
+
 GIT_HARDENING_ARGS: tuple[str, ...] = (
     "--no-pager",
     *_GIT_SAFE_CONFIG,
     *(
         flag
-        for key, value in _GIT_PROGRAM_CONFIG_PINS
+        for key, value in (*_GIT_PROGRAM_CONFIG_PINS, *_GIT_PATH_SCOPE_PINS)
         for flag in ("-c", f"{key}={value}")
     ),
 )
@@ -520,8 +603,11 @@ GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType({
 # subcommand instead. --no-ext-diff covers diff.external and
 # diff.<driver>.command; --no-textconv covers diff.<driver>.textconv, which
 # could also show the security reviewer a converted view that hides code.
+# --no-relative backs up the diff.relative pin (R3119-01, task #3126).
 _DIFF_DRIVER_SUBCOMMANDS = frozenset({"diff", "log", "show"})
-_DIFF_DRIVER_OFF_ARGS: tuple[str, ...] = ("--no-ext-diff", "--no-textconv")
+_DIFF_DRIVER_OFF_ARGS: tuple[str, ...] = (
+    "--no-ext-diff", "--no-textconv", "--no-relative",
+)
 
 # git global options whose value is the NEXT token (``-c k=v``, ``-C dir``).
 _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({
