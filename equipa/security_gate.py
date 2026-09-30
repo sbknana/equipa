@@ -989,10 +989,57 @@ def is_doc_only_diff(changed_files: list[str]) -> bool:
     (SR-2997 S3), and ``requirements*.txt`` / ``constraints*.txt`` /
     ``CMakeLists.txt`` / ``.gitattributes`` / ``.gitmodules``, which change
     what gets installed, built or checked out.
+
+    A submodule pointer (:class:`SubmodulePointerPath`, a gitlink in the
+    diff) is never doc-only whatever its name: it pulls in code the diff
+    does not show (IND-01, task #3132).
     """
     if not changed_files:
         return False
+    if any(isinstance(path, SubmodulePointerPath) for path in changed_files):
+        return False
     return all(is_doc_path(path) for path in changed_files)
+
+
+class SubmodulePointerPath(str):
+    """A changed path that is a submodule pointer (gitlink, mode 160000).
+
+    Returned by :func:`get_changed_files_for_branch`. It is an ordinary
+    ``str`` for every other purpose; :func:`is_doc_only_diff` refuses it.
+    """
+
+
+# git's file mode for a gitlink (a submodule pointer) in a tree.
+_GITLINK_MODE = "160000"
+
+
+def _parse_raw_diff_z(raw: str) -> list[str] | None:
+    """Changed paths from ``git diff --raw -z``, gitlinks marked.
+
+    Each record is ``:<old mode> <new mode> <old sha> <new sha> <status>``
+    followed by one path, or two for a rename / copy. None when the output
+    does not have that shape (callers then fail closed).
+    """
+    fields = raw.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    paths: list[str] = []
+    index = 0
+    while index < len(fields):
+        header = fields[index].split()
+        if len(header) != 5 or not header[0].startswith(":"):
+            return None
+        old_mode, new_mode, status = header[0][1:], header[1], header[4]
+        path_count = 2 if status[:1] in ("R", "C") else 1
+        record_paths = fields[index + 1:index + 1 + path_count]
+        if len(record_paths) != path_count:
+            return None
+        gitlink = _GITLINK_MODE in (old_mode, new_mode)
+        for path in record_paths:
+            if path.strip():
+                paths.append(SubmodulePointerPath(path) if gitlink else path)
+        index += 1 + path_count
+    return paths
 
 
 class SecurityGateBypassError(RuntimeError):
@@ -1011,7 +1058,7 @@ async def get_changed_files_for_branch(
 ) -> list[str]:
     """Return file paths changed on ``head_ref`` vs ``base_ref``.
 
-    Uses ``git diff --name-only base_ref...head_ref`` (three-dot syntax) so
+    Uses ``git diff --raw base_ref...head_ref`` (three-dot syntax) so
     the comparison is against the merge base, not the literal tip of
     ``base_ref`` — this matches what the eventual ``git merge`` will
     actually examine.
@@ -1041,6 +1088,14 @@ async def get_changed_files_for_branch(
     project nested in a sub-directory of its repository, and from there an
     agent-written ``diff.relative=true`` hid every change outside it. Paths
     are always relative to the work-tree root.
+
+    IND-01 / IND-02 (task #3132): ``--ignore-submodules=none`` overrides
+    every config that hides a submodule pointer bump (``diff.ignoreSubmodules``,
+    ``submodule.<name>.ignore`` in config or a committed ``.gitmodules``),
+    and ``--raw`` modes mark each gitlink as a :class:`SubmodulePointerPath`.
+    The work-tree root must contain ``project_dir``, so a ``core.worktree``
+    naming another checkout yields no list (fail closed), not that
+    checkout's diff.
     """
     repo_root = await git_toplevel_async(project_dir)
     if repo_root is None:
@@ -1067,8 +1122,8 @@ async def get_changed_files_for_branch(
         # must list the source path too, not only the destination (SR-2997
         # S4). -z: paths verbatim, never C-quoted (SR-2997 S6).
         result = await git_run_async(
-            ["diff", "--name-only", "--no-renames", "--no-relative", "-z",
-             f"{base_ref}...{head_ref}"],
+            ["diff", "--raw", "--no-abbrev", "--no-renames", "--no-relative",
+             "--ignore-submodules=none", "-z", f"{base_ref}...{head_ref}"],
             project_dir,
             timeout=10,
         )
@@ -1084,4 +1139,16 @@ async def get_changed_files_for_branch(
             base_ref, result.returncode, (result.stderr or "")[:200],
         )
         return []
-    return [path for path in (result.stdout or "").split("\0") if path.strip()]
+    changed = _parse_raw_diff_z(result.stdout or "")
+    if changed is None:
+        logger.warning(
+            "[security-gate] unexpected git diff --raw output vs %s", base_ref,
+        )
+        return []
+    gitlinks = [path for path in changed if isinstance(path, SubmodulePointerPath)]
+    if gitlinks:
+        logger.warning(
+            "[security-gate] submodule pointer change(s) %s: never doc-only, "
+            "review required", ", ".join(gitlinks[:5]),
+        )
+    return changed

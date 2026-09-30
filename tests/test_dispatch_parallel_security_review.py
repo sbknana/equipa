@@ -358,6 +358,11 @@ def _pretend_git_repo():
                 new=AsyncMock(side_effect=lambda project_dir: Path(project_dir)),
             ), \
             patch(
+                # Task #3132: the fake worktrees share the pretend repository.
+                "equipa.dispatch._common_dir_mismatch",
+                new=AsyncMock(return_value=None),
+            ), \
+            patch(
                 "equipa.dispatch.DefaultBranchGuard.snapshot",
                 new=AsyncMock(side_effect=lambda *_a, **_k: _FakeMergeGuard()),
             ), \

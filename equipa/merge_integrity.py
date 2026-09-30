@@ -48,6 +48,7 @@ from equipa.git_ops import (
     GlobalConfigPinError,
     get_trusted_default_branch,
     git_run_async,
+    git_toplevel_async,
     parse_config_list_z,
     pin_global_git_config,
     read_regular_file_bounded,
@@ -88,6 +89,11 @@ _REDIRECT_CONFIG_KEYS: tuple[tuple[re.Pattern[str], str], ...] = (
 # (an explicit false value is harmless). ``git config --list`` lowercases keys.
 _PATH_SCOPE_CONFIG_KEYS = frozenset({"diff.relative", "status.relativepaths"})
 _GIT_FALSE_VALUES = frozenset({"false", "no", "off", "0", ""})
+
+# IND-01 (task #3132): keys that hide a submodule pointer bump from
+# porcelain ``git diff``, so a gitlink change plus a README read as doc-only.
+# The gate diff overrides them, but any value other than "none" is refused.
+_SUBMODULE_IGNORE_KEY_RE = re.compile(r"^(diff\.ignoresubmodules|submodule\..+\.ignore)$")
 
 # Task #3116 (MI-04): driver programs allowed in any config scope, by exact
 # key AND value. An agent redefining filter.lfs.smudge to its own program is
@@ -304,6 +310,29 @@ def _path_scope_hazard(key: str, value: str | None) -> str | None:
     return "cwd-relative path output"
 
 
+def _submodule_ignore_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``key`` hides submodule changes from ``git diff``."""
+    if not _SUBMODULE_IGNORE_KEY_RE.match(key.lower()):
+        return None
+    if value is not None and value.strip().lower() == "none":
+        return None
+    return "submodule change hiding"
+
+
+def _bare_repository_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``core.bare`` is switched on (IND-02, task #3132).
+
+    ``git init`` writes ``core.bare = false`` into every repository, so only
+    a true value counts. A bare repository has no work tree: git would
+    answer for a different directory than the operator's project.
+    """
+    if key.lower() != "core.bare":
+        return None
+    if value is not None and value.strip().lower() in _GIT_FALSE_VALUES:
+        return None
+    return "work-tree redirect"
+
+
 def _parse_scoped_config_z(raw: str) -> list[tuple[str, str, str | None]] | None:
     """(scope, key, value) triples from ``config --list --show-scope -z``.
 
@@ -445,7 +474,9 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
       ``include``, that defines a filter, merge or diff driver program
       outside :data:`DRIVER_CONFIG_ALLOWLIST`, or sets ``core.worktree``,
       ``attr.tree`` or an ``includeIf``, or switches on ``diff.relative`` /
-      ``status.relativePaths`` (R3119-01, task #3126).
+      ``status.relativePaths`` (R3119-01, task #3126), ``core.bare``, or
+      sets ``diff.ignoreSubmodules`` / ``submodule.<name>.ignore`` to
+      anything but ``none`` (IND-02, IND-01, task #3132).
     * ``info/attributes`` or the global attributes file selecting a driver
       outside the built-in / git-lfs set.
     * submodule git dirs defining or selecting such a driver (MI-05).
@@ -491,7 +522,9 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
         label = (
             _driver_hazard(key, value)
             or _redirect_hazard(key)
+            or _bare_repository_hazard(key, value)
             or _path_scope_hazard(key, value)
+            or _submodule_ignore_hazard(key, value)
         )
         if label:
             hazards.append(f"{scope} config defines {label} '{key}'")
@@ -554,9 +587,11 @@ async def index_flag_problem(worktree_dir: str | os.PathLike) -> str | None:
 
     ``git ls-files`` lists only the directory it runs in, so it runs at the
     work-tree root: for a nested project the reviewer's ``worktree_dir`` is
-    a sub-directory (R3119-07, task #3126).
+    a sub-directory (R3119-07, task #3126). The root must contain
+    ``worktree_dir``: a ``core.worktree`` naming another checkout would
+    otherwise check that checkout's index (IND-02, task #3132).
     """
-    root = await _git_path(worktree_dir, "--show-toplevel")
+    root = await git_toplevel_async(worktree_dir)
     if root is None:
         return f"could not locate the work-tree root of {os.fspath(worktree_dir)}"
     result = await git_run_async(["ls-files", "-v", "-z"], root, timeout=30)
