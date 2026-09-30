@@ -295,7 +295,9 @@ the Claude CLI (argv literal or a `claude ...` shell string) must sit behind
 an `if` on the refusal that returns or raises first, and every `shell=True`,
 `create_subprocess_shell`, `os.system`, `exec` or `eval` site must be in a
 short, reasoned allowlist (operator hooks, the RLM REPL behind its refused
-outer call, the Ollama tools behind their refused loop).
+outer call, the Ollama tools behind their refused loop). Operator hooks run
+in the task worktree, so they carry their own condition (see residual
+risks).
 
 ### TheForge: read-only view without `api_keys`
 
@@ -408,7 +410,7 @@ Security review of task 3136 (fix-forward task 3140). All tests are in
 |---|---|---|
 | R3136-01 HIGH: the Ollama provider runs model-chosen shell commands as the orchestrator user | FIXED: refused with a blocked result in `dispatch_agent` (provider, `provider_<role>`, `--provider`) and again inside `run_ollama_agent`; flag off unchanged. Routing Ollama's tools through the launcher is future work | `test_ollama_provider_is_refused_with_isolation_on` (3 ways to select it), `test_ollama_provider_unchanged_with_isolation_off`, `test_run_ollama_agent_itself_refuses_with_isolation_on`, `test_run_ollama_agent_unchanged_with_isolation_off`, fences `test_every_run_ollama_agent_call_is_gated_by_the_refusal`, `test_run_ollama_agent_refuses_before_its_tool_loop`, `test_every_command_executing_entry_point_is_known`, `test_ollama_tool_execution_is_only_reached_through_run_ollama_agent` |
 | R3136-02 MEDIUM: the link check ignores the committed tip that becomes the task branch | FIXED: the state commit, the tip and the clone's HEAD are each checked with the same rules | `test_import_refuses_a_committed_link_the_working_tree_dropped`, `test_import_refuses_a_committed_escaping_link`, `test_import_refuses_a_link_in_the_clones_detached_head`, `test_import_accepts_a_committed_in_tree_link` |
-| R3136-03 MEDIUM: concurrent units share one UID under parallel dispatch | MITIGATED until a UID pool exists: reviewer units run alone (host-wide reader-writer lock, logged; see "Reviewers run alone"). Long-term fix: per-unit or per-role UIDs | `test_reviewer_waits_for_running_units_and_blocks_new_ones`, `test_reviewers_do_not_overlap_each_other`, `test_reviewer_waits_for_live_agent_scopes`, `test_units_in_another_process_are_waited_for`, `test_wait_past_the_timeout_refuses_and_holds_nothing`, `test_spawn_holds_the_slot_until_the_agent_is_released`, `test_failed_setup_gives_the_slot_back`, `test_a_replaced_lock_file_cannot_let_a_reviewer_overlap`, `test_unit_lock_directory_must_be_private`, `test_build_cli_command_marks_the_role_for_the_isolated_spawn`, `test_reviewer_spawn_sites_build_their_command_with_the_role` |
+| R3136-03 MEDIUM: concurrent units share one UID under parallel dispatch | MITIGATED until a UID pool exists: reviewer units run alone (host-wide reader-writer lock, logged; see "Reviewers run alone"). Long-term fix: per-unit or per-role UIDs | `test_reviewer_waits_for_running_units_and_blocks_new_ones`, `test_reviewers_do_not_overlap_each_other`, `test_reviewer_waits_for_live_agent_scopes`, `test_units_in_another_process_are_waited_for`, `test_unit_lock_ignores_another_xdg_runtime_dir`, `test_wait_past_the_timeout_refuses_and_holds_nothing`, `test_spawn_holds_the_slot_until_the_agent_is_released`, `test_failed_setup_gives_the_slot_back`, `test_a_replaced_lock_file_cannot_let_a_reviewer_overlap`, `test_unit_lock_directory_must_be_private`, `test_build_cli_command_marks_the_role_for_the_isolated_spawn`, `test_reviewer_spawn_sites_build_their_command_with_the_role` |
 | R3136-04 LOW: cron/at denial is only a runbook line | FIXED: the launcher refuses when the agent lingers or `crontab -l`/`at -l` are not denied; the verify script checks the same | `test_launcher_refuses_an_agent_that_may_use_cron`, `test_launcher_refuses_an_agent_that_may_use_at`, `test_launcher_refuses_a_lingering_agent_user`, `test_launcher_accepts_denied_cron_and_at`, `test_verify_script_fails_when_the_agent_may_schedule_jobs`, `test_verify_script_passes_denied_cron_and_at` |
 | R3136-05 LOW: the out-of-tree link test is lexical | FIXED: links are resolved through the tree's other links, 40 hops at most | `test_link_escape_follows_links_of_the_tree`, `test_import_refuses_a_link_pair_that_resolves_outside`, `test_import_accepts_a_link_pair_that_stays_inside` |
 | R3136-06 LOW: autoresearch starts `claude --print` through `bash -c` | FIXED: refused with the flag on (and when `equipa` cannot be imported); direct argv with stdin and the isolation args | `test_autoresearch_mutation_refuses_with_isolation_on`, `test_autoresearch_mutation_runs_the_cli_without_a_shell`, `test_every_direct_claude_spawn_is_gated_by_the_refusal` |
@@ -427,6 +429,14 @@ Security review of task 3136 (fix-forward task 3140). All tests are in
   Closing it needs a pool of agent users with one UID per unit (future
   work), which would also let reviewers run in parallel again.
 * The Ollama provider cannot be used with the flag on (R3136-01).
+* External lifecycle hooks (`equipa/hooks`) run their operator-configured
+  command through the shell, as the orchestrator user, with the task
+  worktree as the working directory; nothing refuses them with the flag on.
+  The command text is the operator's (task data travels in the
+  environment), but a command that names a project file (`./check.sh`,
+  `npm run ...`, `make`) runs whatever the imported agent work put there.
+  With the flag on, configure hooks only with absolute paths outside every
+  project. Refusing or isolating them is future work.
 * The file-access boundary is a blocklist (`deny_read` plus the verify
   script's scans), not an allowlist: world-readable files outside the
   checked locations stay readable to the agent. The runbook closes project
