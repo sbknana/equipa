@@ -1,29 +1,36 @@
-"""EQUIPA bash_security — dangerous-bash-command detector (23 exploit patterns).
+"""EQUIPA bash_security — shell-command obfuscation detector.
 
 Ported from Claude Code's bashSecurity.ts. :func:`check_bash_command`
-classifies a shell command as safe/unsafe against 23 exploit patterns
-(command substitution, IFS injection, heredoc smuggling, unicode homoglyphs,
-etc.). It is a pure classifier — it never runs anything itself.
+classifies a shell command as safe/unsafe with about two dozen checks
+(command substitution, IFS injection, heredoc smuggling, unicode
+whitespace, redirect targets, etc.). It is a pure classifier — it never
+runs anything itself.
+
+What it is NOT: a permission policy or a sandbox. It looks for
+parser-confusion and substitution tricks; plainly destructive commands
+(``rm -rf build/``, ``bash script.sh``, ``git push --force``) pass. Redirect
+targets are judged textually (no symlink resolution), and commands longer
+than ``MAX_COMMAND_BYTES`` are refused outright.
 
 Where the classification is enforced depends on the call site, and the two
-enforcement modes have very different guarantees. Do NOT overclaim the first:
+enforcement modes have very different guarantees. Do NOT overclaim either:
 
-* **Reactive (always on, the default).** The streaming loop in
+* **Reactive (streaming roles only).** The streaming loop in
   ``equipa.agent_runner`` inspects each Bash tool call in the Claude CLI's
   stream-JSON output and, on an unsafe verdict, terminates the agent run.
-  Crucially the CLI has ALREADY executed the tool call by the time the
-  observer sees it — this is post-hoc *detect-and-terminate*, NOT prevention.
-  It stops the agent from continuing, and it stops repeat offenses, but it
-  cannot un-run the command that tripped it.
+  The CLI has ALREADY executed the tool call by the time the observer sees
+  it — this is post-hoc *detect-and-terminate*, NOT prevention. Roles that
+  run without streaming (the early-term-exempt ones, e.g. planner,
+  evaluator, reviewers, researcher) are never checked this way.
 
-* **Pre-execution (opt-in, feature flag ``bash_security_pretooluse``,
-  DEFAULT OFF).** When enabled, ``agent_runner`` wires
+* **Pre-execution (feature flag ``bash_security_pretooluse``, default OFF
+  in code).** When enabled, ``agent_runner`` wires
   ``hooks/pretooluse_bash_gate.py`` into the spawned CLI as a Claude Code
   PreToolUse hook (via a generated ``--settings`` file). The hook calls this
   module BEFORE the Bash tool runs and blocks an unsafe command (exit 2) so
-  it never executes. This is the only mode that delivers true
-  *before-subprocess* prevention. The reactive check stays on underneath it
-  as defense-in-depth.
+  it never executes; it fails closed (exit 2) when it cannot load or run
+  this module. This is the only mode that prevents execution; it applies to
+  every agent whose CLI ``build_cli_command`` builds, streaming or not.
 
 Pure Python stdlib — NO pip dependencies. Uses ``re`` for regex patterns.
 
