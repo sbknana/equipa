@@ -442,11 +442,14 @@ def detect_injection(text) -> str | None:
     return None
 
 
-# "<" and ">" plus the fullwidth and small-form variants NFKD folds onto them.
+# "<" and ">" plus every code point whose NFKD decomposition contains one:
+# the fullwidth and small forms, and NOT LESS-THAN / NOT GREATER-THAN, which
+# decompose to "<" / ">" plus a combining solidus (review N7 of task 3129).
 _ANGLE_BRACKET_ESCAPES = str.maketrans({
     "<": "&lt;", ">": "&gt;",
     "＜": "&lt;", "＞": "&gt;",
     "﹤": "&lt;", "﹥": "&gt;",
+    "≮": "&lt;", "≯": "&gt;",
 })
 
 
