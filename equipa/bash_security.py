@@ -110,6 +110,7 @@ class CheckID:
     QUOTED_NEWLINE = 23
     COMMAND_TOO_LONG = 24
     UNPARSEABLE_QUOTING = 25
+    SUBSTITUTION_LOOKALIKE = 26
 
 
 # Commands longer than this (UTF-8 bytes) are blocked outright (sandbox-07).
@@ -206,6 +207,13 @@ class _ShellScan:
     error: str | None
     heredocs: tuple[_Heredoc, ...]
     substitutions: tuple[_Substitution, ...]
+    # Index of the backslash of every backslash-newline bash deletes before
+    # tokenizing (code, double quotes, ${...}, backticks, unquoted heredoc
+    # bodies - not single quotes, $'...', comments or quoted heredoc bodies).
+    continuations: tuple[int, ...] = ()
+    # Index of every backslash-escaped $ or backtick directly inside a
+    # top-level "...": literal text to bash (see _substitution_lookalikes).
+    escaped_in_double_quotes: tuple[int, ...] = ()
 
 
 class _Frame:
@@ -248,8 +256,19 @@ class _ShellScanner:
         self.heredoc_ends: list[tuple[int, int, int]] = []
         # Heredoc specs still waiting for their body after the current line.
         self.body_queue: list[tuple[int, str, bool, bool, bool]] = []
+        self.continuations: list[int] = []
+        self.escaped_in_double_quotes: list[int] = []
 
     # -- helpers -----------------------------------------------------------
+
+    def note_continuation(self, index: int) -> None:
+        """Record *index* if it is a backslash bash joins with a newline.
+
+        Called only where bash's lexer deletes backslash-newline (IND3128-01);
+        _join_line_continuations removes the recorded pairs and rescans.
+        """
+        if index + 1 < self.limit() and self.command[index + 1] == "\n":
+            self.continuations.append(index)
 
     def fail(self, reason: str, index: int) -> int:
         if self.error is None:
@@ -319,6 +338,7 @@ class _ShellScanner:
         position = index + 1
         while position < close:
             if self.command[position] == "\\" and position + 1 < close:
+                self.note_continuation(position)
                 self.mark(position, position + 1, _K_ESCAPE, inner_flags)
                 self.mark(position + 1, position + 2, _K_ESCAPED, inner_flags)
                 position += 2
@@ -380,6 +400,9 @@ class _ShellScanner:
             if ch in "$`" or (ch == "#" and position == word_start):
                 return self.fail("heredoc delimiter is not a plain word", position)
             if ch == "\\":
+                # `<<E\<newline>OF` is the UNQUOTED delimiter EOF to bash;
+                # the join pass removes the pair and rescans.
+                self.note_continuation(position)
                 quoted = True
                 self.mark(position, position + 1, _K_ESCAPE, frame.flags)
                 if position + 1 < limit:
@@ -506,6 +529,7 @@ class _ShellScanner:
         in_arith = frame.kind in ("arith", "dparen")
 
         if ch == "\\":
+            self.note_continuation(index)
             self.mark(index, index + 1, _K_ESCAPE, flags)
             if nxt:
                 self.mark(index + 1, index + 2, _K_ESCAPED, flags)
@@ -513,13 +537,18 @@ class _ShellScanner:
                     frame.word_start = False
                     frame.command_position = False
             return index + 2
-        if ch == "'":
+        if ch == "'" or (ch == "$" and nxt == "'"):
+            if in_arith:
+                # IND3128-02: (( )) and $(( )) expand like double quotes, so
+                # an apostrophe is an ordinary character there and a $(...)
+                # between two of them RUNS. Bash's parser still pairs them
+                # to find the closing )), so no single model is right.
+                return self.fail("single quote inside arithmetic", index)
             frame.word_start = frame.command_position = False
-            return self.single_quote(index, flags)
+            if ch == "'":
+                return self.single_quote(index, flags)
+            return self.ansi_c_quote(index, flags)
         if ch == "$":
-            if nxt == "'":
-                frame.word_start = frame.command_position = False
-                return self.ansi_c_quote(index, flags)
             if nxt == '"':
                 frame.word_start = frame.command_position = False
                 self.mark(index, index + 2, _K_DQ_DELIM, flags)
@@ -617,7 +646,11 @@ class _ShellScanner:
         command = self.command
         ch = command[index]
         if ch == "\\":
+            self.note_continuation(index)
             end = min(index + 2, self.limit())
+            # Stack [top, dq]: the string is not inside any other construct.
+            if end == index + 2 and command[index + 1] in "$`" and len(self.stack) == 2:
+                self.escaped_in_double_quotes.append(index + 1)
             self.mark(index, end, _K_DQ, frame.flags)
             return index + 2
         if ch == '"':
@@ -632,16 +665,36 @@ class _ShellScanner:
         return index + 1
 
     def step_group(self, index: int, frame: _Frame) -> int:
-        """Inside ${...} or $[...]: quotes pair up, substitutions nest."""
+        """Inside ${...} or $[...]: quotes pair up, substitutions nest.
+
+        Apostrophes are the exception (IND3128-02). ``$[...]`` is
+        arithmetic, where they are ordinary characters that bash's parser
+        still pairs, so they are refused. Inside double quotes, the word of
+        ``${x:-...}`` (and ``:+``, ``:=``, ``:?``) is expanded with
+        apostrophes as ordinary characters, so a ``$(...)`` between two of
+        them runs; the pattern operators (``#``, ``%``, ``/``) treat them as
+        quotes. They are read as ordinary characters for every operator:
+        a ``$(...)`` there is then always seen, which fails closed.
+        """
         command = self.command
         ch = command[index]
         flags = frame.flags
         nxt = command[index + 1] if index + 1 < self.limit() else ""
+        literal_apostrophe = frame.kind == "brace" and bool(flags & _F_HIDDEN)
         if ch == "\\":
+            self.note_continuation(index)
             self.mark(index, min(index + 2, self.limit()), _K_PARAM, flags)
             return index + 2
-        if ch == "'":
-            return self.single_quote(index, flags)
+        if ch == "'" or (ch == "$" and nxt == "'"):
+            if frame.kind == "bracket":
+                return self.fail("single quote inside $[...] arithmetic", index)
+            if not literal_apostrophe:
+                if ch == "'":
+                    return self.single_quote(index, flags)
+                return self.ansi_c_quote(index, flags)
+            if ch == "'":
+                self.mark(index, index + 1, _K_PARAM, flags)
+                return index + 1
         if ch == '"':
             self.mark(index, index + 1, _K_DQ_DELIM, flags)
             self.push("dq", frame)
@@ -649,8 +702,6 @@ class _ShellScanner:
         if ch == "`":
             return self.backtick(index, flags)
         if ch == "$":
-            if nxt == "'":
-                return self.ansi_c_quote(index, flags)
             opened = self.dollar(index, frame)
             if opened is not None:
                 return opened
@@ -671,6 +722,7 @@ class _ShellScanner:
         command = self.command
         ch = command[index]
         if ch == "\\":
+            self.note_continuation(index)
             self.mark(index, min(index + 2, self.limit()), _K_HEREDOC, frame.flags)
             return index + 2
         if ch == "`":
@@ -726,6 +778,8 @@ class _ShellScanner:
             error=self.error,
             heredocs=tuple(self.heredocs),
             substitutions=tuple(_Substitution(*record) for record in self.substitutions),
+            continuations=tuple(self.continuations),
+            escaped_in_double_quotes=tuple(self.escaped_in_double_quotes),
         )
 
 
@@ -740,6 +794,171 @@ def _scan_shell(command: str) -> _ShellScan:
     quote-sensitive helper in this module reads this one classification.
     """
     return _ShellScanner(command).run()
+
+
+# At most this many join-and-rescan passes (IND3128-01). A pass removes every
+# continuation the tokenizer sees; a later pass finds more only when a join
+# changed the quoting around another one, which takes deliberately nested
+# input. Past the cap the command is refused (check 25).
+_MAX_CONTINUATION_PASSES = 8
+
+
+@dataclass(frozen=True)
+class _JoinedCommand:
+    """A command with bash's backslash-newline deletions applied."""
+    text: str
+    origin: tuple[int, ...]  # origin[i] is the index in the original of text[i]
+    complete: bool           # False: continuations were left after the cap
+
+
+def _join_line_continuations(command: str) -> _JoinedCommand:
+    """Delete every backslash-newline pair bash deletes before tokenizing.
+
+    Bash removes them first (outside single quotes, ``$'...'``, comments and
+    quoted heredoc bodies), so ``$``, backslash-newline, ``(id)`` is the
+    command substitution ``$(id)`` and ``<<E``, backslash-newline, ``OF``
+    is the unquoted delimiter ``EOF`` (IND3128-01). Every check reads the
+    joined text. Removing a pair can change the quoting around a later
+    one, so the text is rescanned until none is left.
+    """
+    text = command
+    origin = list(range(len(command)))
+    for _ in range(_MAX_CONTINUATION_PASSES):
+        continuations = _scan_shell(text).continuations
+        if not continuations:
+            return _JoinedCommand(text, tuple(origin), True)
+        removed = set(continuations)
+        removed.update(index + 1 for index in continuations)
+        keep = [index for index in range(len(text)) if index not in removed]
+        text = "".join(text[index] for index in keep)
+        origin = [origin[index] for index in keep]
+    return _JoinedCommand(
+        text, tuple(origin), not _scan_shell(text).continuations
+    )
+
+
+# The start of something bash may run: ``$(``, ``$[``, a backtick, ``<(``
+# or ``>(``. Backslash-newlines between the two characters are allowed for
+# the contexts in which bash does not join them (they are judged like any
+# other text below); ``${`` counts only in that split form.
+_SUBSTITUTION_LOOKALIKE_RE = re.compile(
+    r"\$(?:\\\n)*[(\[]|\$(?:\\\n)+\{|`|[<>](?:\\\n)*\("
+)
+
+# Constructs that make bash evaluate text as arithmetic, where an array
+# subscript is expanded AGAIN - `let 'a[$(id)]'`, `x='a[$(id)]'; (( x ))`,
+# `[[ x -eq 1 ]]`, `test -v`, `printf -v`, `declare -i` all run id
+# (IND3128-03) - or re-parse a quoted compound assignment. Any `[` counts,
+# because a subscript can only come from one. Matched on the command with
+# quotes and backslashes deleted (`l'e't` is `let`); a spurious match only
+# means a quoted look-alike is no longer trusted.
+_EVALUATES_TEXT_RE = re.compile(
+    r"\(\(|\[|=\(|\$\{!"
+    r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|read|readarray"
+    r"|mapfile|unset|printf|test|getopts|wait)(?![\w.-])"
+)
+
+# Where a look-alike sits, for the refusal message.
+_LOOKALIKE_CONTEXTS = {
+    _K_ESCAPE: "a backslash escape",
+    _K_ESCAPED: "a backslash escape",
+    _K_SQ: "a single-quoted word inside a substitution or expansion",
+    _K_DQ: "double quotes",
+    _K_ANSI: "a $'...' string",
+    _K_COMMENT: "a comment",
+    _K_HEREDOC: "a heredoc body or terminator bash expands",
+    _K_PARAM: "a ${...} or $[...] expansion",
+}
+
+
+@dataclass(frozen=True)
+class _Lookalike:
+    """A substitution-looking sequence and whether it is proven inert."""
+    start: int
+    text: str
+    kind: int             # the _ShellScan.kinds byte at start
+    quoted_context: bool  # top-level single quote or quoted heredoc body
+    inert: bool           # quoted_context, and nothing evaluates text again
+
+
+def _substitution_lookalikes(command: str) -> list[_Lookalike]:
+    """Find every substitution-looking sequence in the raw *command*.
+
+    Fail closed (IND3128-01..03): a checker cannot model all of bash, so a
+    sequence counts as a live substitution unless the tokenizer PROVES it
+    inert. Only these contexts are proof: a single-quoted word at the top
+    level, a backslash-escaped ``$`` or backtick directly inside a
+    top-level double-quoted string (``"\\$(x)"``, required by sandbox-01
+    and covered by the differential test), and a quoted-delimiter heredoc
+    body. None of them is proof when the command also contains a construct
+    that evaluates text as arithmetic (see _EVALUATES_TEXT_RE), because
+    bash expands an array subscript inside such text again. Everything
+    else - other double-quoted text, ``$'...'``, comments, ``${...}``
+    operators, arithmetic, unquoted backslash escapes, single quotes nested
+    in a substitution - is treated as executing the sequence.
+    """
+    matches = list(_SUBSTITUTION_LOOKALIKE_RE.finditer(command))
+    if not matches:
+        return []
+    scan = _scan_shell(command)
+    evaluates_text = bool(
+        _EVALUATES_TEXT_RE.search(re.sub(r"[\\'\"]", "", command))
+    )
+    quoted_bodies = [
+        (heredoc.body_start, heredoc.terminator_start)
+        for heredoc in scan.heredocs if heredoc.quoted
+    ]
+    escaped = frozenset(scan.escaped_in_double_quotes)
+    lookalikes = []
+    for match in matches:
+        start = match.start()
+        kind = scan.kinds[start]
+        quoted_context = (
+            kind == _K_SQ  # no flag bit: top level, outside every construct
+            or start in escaped
+            or any(body <= start < end for body, end in quoted_bodies)
+        )
+        lookalikes.append(_Lookalike(
+            start, match.group(0), kind, quoted_context,
+            quoted_context and not evaluates_text,
+        ))
+    return lookalikes
+
+
+def _check_substitution_lookalikes(command: str) -> BashSecurityResult:
+    """Check 26: substitution-looking text must be judged or proven inert.
+
+    A look-alike in live code is a real substitution that check 8 (and its
+    double-quoted form) judges against the read-only allowlist. Any other
+    look-alike that _substitution_lookalikes cannot prove inert is refused:
+    that is where the tokenizer and bash have disagreed before (a line
+    continuation after ``$``, apostrophes inside ``$[...]`` or a
+    double-quoted ``${x:-...}``, a quoted array subscript fed to ``let``).
+    """
+    for lookalike in _substitution_lookalikes(command):
+        if lookalike.inert or lookalike.kind & _KIND_MASK == _K_CODE:
+            continue
+        if lookalike.quoted_context:
+            where = (
+                "quoted text in a command that also evaluates arithmetic or "
+                "array subscripts (let, ((, [[, [, test, printf -v, declare, "
+                "read, unset ...), which expands a subscript again"
+            )
+        else:
+            where = _LOOKALIKE_CONTEXTS.get(
+                lookalike.kind & _KIND_MASK, "a context the checker cannot prove inert"
+            )
+        shown = lookalike.text.replace("\\\n", "\\<newline>")
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.SUBSTITUTION_LOOKALIKE,
+            message=(
+                f"Command contains {shown!r} inside {where}; only a top-level "
+                "single-quoted word, a \\$ or \\` in a top-level double-quoted "
+                "string, or a quoted heredoc body is proven inert. "
+                "Single-quote it, or put the text in a file"
+            ),
+        )
+    return _SAFE
 
 
 def _extract_unquoted(command: str) -> str:
@@ -3418,6 +3637,25 @@ def check_bash_command(command: str) -> BashSecurityResult:
         )
         return result
 
+    # Bash deletes backslash-newline before it tokenizes, so every check
+    # reads the joined text: `$`, backslash-newline, `(id)` is `$(id)`
+    # (IND3128-01).
+    joined = _join_line_continuations(command)
+    if not joined.complete:
+        result = BashSecurityResult(
+            safe=False, check_id=CheckID.UNPARSEABLE_QUOTING,
+            message=(
+                "Command quoting could not be parsed (line continuations "
+                "change the quoting around each other); join the lines"
+            ),
+        )
+        log.warning(
+            "Bash security check %d BLOCKED command: %s — %s",
+            result.check_id, command[:120], result.message,
+        )
+        return result
+    command = joined.text
+
     # Canonical `git commit` fed by a quoted-delimiter heredoc: the body is
     # inert literal text piped to git's stdin, so strip it and validate only
     # the real git command line. Prevents checks 7/9/10/21/23 from
@@ -3464,6 +3702,9 @@ def check_bash_command(command: str) -> BashSecurityResult:
         # is unchanged; this only adds blocks for substitutions hidden inside
         # double quotes (sandbox-01).
         _check_double_quoted_substitution(command),
+        # Fail closed on substitution-looking text the checks above do not
+        # judge as a substitution and the tokenizer cannot prove inert.
+        _check_substitution_lookalikes(command),
     ]
 
     for result in checks:
