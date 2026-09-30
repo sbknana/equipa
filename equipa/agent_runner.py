@@ -9,6 +9,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import hashlib
 import json
@@ -16,8 +17,10 @@ import logging
 import math
 import os
 import random
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -164,6 +167,7 @@ class AgentResult(_AgentResultRequired, total=False):
     # _run_started_at_utc.
     started_at: str
 
+from equipa import agent_launcher
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
 from equipa.config import (
@@ -791,6 +795,426 @@ def _evaluate_paralysis_retry_read_gate(
     return None, must_write_next_turn
 
 
+# --- Agent process containment (gate-05) --------------------------------------
+#
+# On Linux every agent CLI runs under equipa/agent_launcher.py, a per-agent
+# supervisor that is a child subreaper. The real Claude CLI starts each
+# Bash-tool shell in a NEW session, so a ``nohup`` watcher an agent launches is
+# never in the CLI's process group; as a subreaper descendant it is still
+# found and killed by the launcher when the CLI exits. The launcher also
+# carries PR_SET_PDEATHSIG, so it cleans up by itself if the orchestrator dies.
+#
+# The launcher is started with start_new_session=True, so its process group
+# (pgid == launcher pid) is a second layer: if the launcher does not finish its
+# own cleanup in time, the orchestrator SIGKILLs that group.
+#
+# Everything here is Linux-only. Elsewhere the CLI is spawned directly and
+# killed by pid, exactly as before.
+
+# Seconds the launcher gives the CLI after a forwarded SIGTERM, and each
+# descendant between SIGTERM and SIGKILL.
+AGENT_TERMINATION_GRACE_SECONDS = 3.0
+# How long to wait for a signalled launcher to finish its own cleanup (CLI
+# grace + descendant grace + SIGKILL phase, plus slack) before the
+# orchestrator SIGKILLs the launcher's process group itself.
+_LAUNCHER_EXIT_TIMEOUT_SECONDS = (
+    2 * AGENT_TERMINATION_GRACE_SECONDS
+    + agent_launcher.KILL_PHASE_TIMEOUT_SECONDS
+    + 3.0
+)
+# Upper bound on waiting for the group to empty after the SIGKILL layer.
+_GROUP_KILL_TIMEOUT_SECONDS = 5.0
+_CONTAINMENT_POLL_SECONDS = 0.05
+
+# Agents spawned and not yet fully terminated. The atexit handler terminates
+# whatever is left synchronously, so an interrupted orchestrator cannot leave
+# an agent behind just because the event loop that would have escalated was
+# shut down first (PT-02).
+_LIVE_CONTAINED_AGENTS: set[_ContainedAgent] = set()
+_exit_handler_registered = False
+
+
+class AgentContainmentError(RuntimeError):
+    """The agent could not be verified as contained, so it was not run."""
+
+
+def _agent_containment_supported() -> bool:
+    """True where agents are spawned through the subreaper launcher.
+
+    Evaluated per spawn, not at import, so tests can force the fallback.
+    """
+    return (
+        agent_launcher.is_supported_platform()
+        and hasattr(os, "killpg")
+        and bool(sys.executable)
+        and agent_launcher.LAUNCHER_PATH.is_file()
+    )
+
+
+class _ContainedAgent:
+    """Handle on one launcher process and the process group it leads.
+
+    Signals are pinned to the launcher's identity (PT-04): the leader is only
+    signalled through a pidfd opened right after spawn, or after a /proc
+    start-time check where pidfds are unavailable, never by a raw pid that
+    may already have been reaped and recycled. The group is only signalled
+    while it is provably still this launcher's group.
+    """
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.process = process
+        # getattr: a spawn stand-in without a pid must fail closed in verify()
+        self.pid = getattr(process, "pid", None)
+        self.pidfd: int | None = None
+        self.start_time: int | None = None
+        self.closed = False
+        # A forked child inherits the registry and the exit handler; only the
+        # process that spawned the launcher may terminate it at exit.
+        self.owner_pid = os.getpid()
+
+    def verify(self) -> None:
+        """Pin the launcher's identity and check that it leads its own group.
+
+        Fails closed (PT-05): raises AgentContainmentError when the pid is not
+        a real process id, the process is already gone, or it is not the
+        leader of a group of its own. Group termination would otherwise miss
+        the agent, or hit the orchestrator's own group.
+        """
+        if not isinstance(self.pid, int) or self.pid <= 1:
+            raise AgentContainmentError(f"invalid agent pid {self.pid!r}")
+        if (hasattr(os, "pidfd_open")
+                and hasattr(signal, "pidfd_send_signal")):
+            try:
+                self.pidfd = os.pidfd_open(self.pid)
+            except ProcessLookupError as exc:
+                raise AgentContainmentError(
+                    f"agent launcher {self.pid} exited before it could be "
+                    "verified") from exc
+            except OSError:
+                self.pidfd = None  # no kernel support: start time guards it
+        self.start_time = agent_launcher.proc_start_time(self.pid)
+        try:
+            pgid = os.getpgid(self.pid)
+        except ProcessLookupError as exc:
+            raise AgentContainmentError(
+                f"agent launcher {self.pid} exited before it could be "
+                "verified") from exc
+        if (self.start_time is None or pgid != self.pid
+                or pgid == os.getpgrp()):
+            raise AgentContainmentError(
+                f"agent launcher {self.pid} is not the leader of its own "
+                f"process group (pgid {pgid})")
+
+    def leader_exited(self) -> bool:
+        """True once the launcher has exited (reaped or still a zombie)."""
+        if self.process.returncode is not None:
+            return True
+        if self.pidfd is not None:
+            # A pidfd polls readable as soon as its process exits. poll(),
+            # not select(): a long-running orchestrator can hold fds >= 1024.
+            poller = select.poll()
+            poller.register(self.pidfd, select.POLLIN)
+            try:
+                return bool(poller.poll(0))
+            except OSError:
+                pass  # fall through to the /proc check
+        stat = agent_launcher.read_proc_stat(self.pid)
+        return stat is None or stat[0] == "Z" or stat[3] != self.start_time
+
+    def signal_leader(self, sig: int) -> bool:
+        """Signal the launcher itself. False if it is gone or released."""
+        if self.closed:
+            return False
+        if self.pidfd is not None:
+            try:
+                signal.pidfd_send_signal(self.pidfd, sig)
+            except ProcessLookupError:
+                return False
+            except OSError as exc:
+                logger.warning("[ProcessTree] cannot signal agent launcher "
+                               "%d (signal %d): %s", self.pid, sig, exc)
+                return False
+            return True
+        if self.start_time is None or self.leader_exited():
+            return False
+        return agent_launcher.signal_process_identity(
+            self.pid, self.start_time, sig)
+
+    def request_termination(self) -> None:
+        """Ask the launcher to stop the agent. Never blocks.
+
+        The launcher forwards SIGTERM to the CLI, SIGKILLs it after the
+        grace period, then sweeps every descendant. That escalation runs in
+        the launcher process, so no asyncio task has to survive for it.
+        """
+        self.signal_leader(signal.SIGTERM)
+
+    def _group_is_ours(self) -> bool:
+        pgid = self.pid
+        if pgid <= 1 or pgid == os.getpgrp():
+            logger.error("[ProcessTree] refusing to signal process group %d",
+                         pgid)
+            return False
+        # Either the launcher still holds its pid (alive or a zombie), or
+        # nobody does, in which case any live member still pins the pgid and
+        # the kernel cannot hand that pid out again. A different start time
+        # means the group emptied and the pid was recycled: not ours.
+        leader_start = agent_launcher.proc_start_time(pgid)
+        return leader_start is None or leader_start == self.start_time
+
+    def _kill_leader_descendants(self) -> None:
+        """Last resort when the launcher did not finish its sweep in time.
+
+        While the launcher is alive it is the subreaper of every process the
+        agent started, including setsid'd ones outside its group, so they
+        are SIGKILLed here directly before the group SIGKILL takes the
+        launcher down and orphans them to init. Skipped once the launcher's
+        pid no longer belongs to it (exited and reaped, or recycled).
+        """
+        if agent_launcher.proc_start_time(self.pid) != self.start_time:
+            return
+        descendants = agent_launcher.list_descendants(self.pid)
+        if descendants:
+            logger.warning("[ProcessTree] SIGKILLing descendants %s of "
+                           "agent launcher %d", sorted(descendants), self.pid)
+        for pid, start_time in descendants.items():
+            agent_launcher.signal_process_identity(pid, start_time,
+                                                   signal.SIGKILL)
+
+    def _kill_group(self) -> bool:
+        """SIGKILL every live group member. True once the group is empty.
+
+        Members are signalled one by one, each pinned to the identity seen
+        in the /proc scan (PT-04), rather than with ``killpg``: by now the
+        launcher has usually been reaped, and a raw group signal would go to
+        whichever group holds the id at that instant. A member forked after
+        the scan is caught by the caller's next round; a SIGKILLed process
+        cannot fork again, so the rounds converge.
+        """
+        if not self._group_is_ours():
+            return True
+        members = agent_launcher.list_group_members(self.pid)
+        if not members:
+            return True
+        # The /proc scan above takes a while on a busy host. Re-check before
+        # signalling that the group id was not recycled while it ran.
+        if not self._group_is_ours():
+            return True
+        logger.warning("[ProcessTree] agent process group %d still has "
+                       "members %s; sending SIGKILL", self.pid, sorted(members))
+        for pid, start_time in members.items():
+            agent_launcher.signal_process_identity(pid, start_time,
+                                                   signal.SIGKILL)
+        return False
+
+    def terminate_sync(self) -> None:
+        """Blocking, bounded termination for contexts that cannot await:
+        cancellation, loop shutdown and interpreter exit (PT-02)."""
+        if self.closed:
+            return
+        try:
+            if not self.leader_exited():
+                self.request_termination()
+                deadline = time.monotonic() + _LAUNCHER_EXIT_TIMEOUT_SECONDS
+                while not self.leader_exited():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "[ProcessTree] agent launcher %d did not finish "
+                            "its cleanup in %.1fs", self.pid,
+                            _LAUNCHER_EXIT_TIMEOUT_SECONDS)
+                        self._kill_leader_descendants()
+                        break
+                    time.sleep(min(remaining, _CONTAINMENT_POLL_SECONDS))
+            deadline = time.monotonic() + _GROUP_KILL_TIMEOUT_SECONDS
+            while not self._kill_group():
+                if time.monotonic() >= deadline:
+                    logger.error("[ProcessTree] agent process group %d "
+                                 "survived SIGKILL", self.pid)
+                    break
+                time.sleep(_CONTAINMENT_POLL_SECONDS)
+        finally:
+            self.release()
+
+    async def terminate(self) -> None:
+        """Terminate the agent and reap the launcher. Idempotent.
+
+        After a normal exit the launcher has already swept the tree, so this
+        only confirms the group is empty. If the coroutine is cancelled
+        part-way, termination finishes synchronously before re-raising.
+        """
+        if self.closed:
+            return
+        try:
+            await self._terminate_async()
+        except BaseException:
+            self.terminate_sync()
+            raise
+        self.release()
+
+    async def _terminate_async(self) -> None:
+        if not self.leader_exited():
+            self.request_termination()
+        try:
+            await asyncio.wait_for(self.process.wait(),
+                                   timeout=_LAUNCHER_EXIT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("[ProcessTree] agent launcher %d did not finish "
+                           "its cleanup in %.1fs", self.pid,
+                           _LAUNCHER_EXIT_TIMEOUT_SECONDS)
+            self._kill_leader_descendants()
+        deadline = time.monotonic() + _GROUP_KILL_TIMEOUT_SECONDS
+        while not self._kill_group():
+            if time.monotonic() >= deadline:
+                logger.error("[ProcessTree] agent process group %d survived "
+                             "SIGKILL", self.pid)
+                break
+            await asyncio.sleep(_CONTAINMENT_POLL_SECONDS)
+        if self.process.returncode is None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.process.wait(),
+                                       timeout=_GROUP_KILL_TIMEOUT_SECONDS)
+
+    def release(self) -> None:
+        """Stop tracking this agent. Later signal requests are no-ops."""
+        if self.closed:
+            return
+        self.closed = True
+        _LIVE_CONTAINED_AGENTS.discard(self)
+        if self.pidfd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.pidfd)
+            self.pidfd = None
+
+
+def _terminate_live_agents_at_exit() -> None:
+    """atexit: synchronously terminate every agent that is still tracked.
+
+    All launchers are asked first, so their cleanups run in parallel. Agents
+    spawned by another process (this one is a fork of the orchestrator) are
+    not ours to stop: the fork only inherited the registry.
+    """
+    agents = [agent for agent in _LIVE_CONTAINED_AGENTS
+              if agent.owner_pid == os.getpid()]
+    for agent in agents:
+        agent.request_termination()
+    for agent in agents:
+        try:
+            agent.terminate_sync()
+        except Exception:  # noqa: BLE001 - every remaining agent must be tried
+            logger.exception("[ProcessTree] failed to terminate agent "
+                             "launcher %d at exit", agent.pid)
+
+
+def _track_live_agent(agent: _ContainedAgent) -> None:
+    global _exit_handler_registered
+    if not _exit_handler_registered:
+        atexit.register(_terminate_live_agents_at_exit)
+        _exit_handler_registered = True
+    _LIVE_CONTAINED_AGENTS.add(agent)
+
+
+async def _spawn_agent_process(
+    cmd: list[str], **kwargs: Any,
+) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
+    """Start the agent CLI with piped stdout/stderr, contained where possible.
+
+    Returns the process to read from and its containment handle (None on
+    platforms without the launcher). Raises FileNotFoundError when the
+    command is not on PATH, as a direct spawn would, and AgentContainmentError
+    when the launcher cannot be verified; the launcher is stopped first.
+    """
+    if not _agent_containment_supported():
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, **kwargs,
+        )
+        return process, None
+
+    executable = shutil.which(cmd[0])
+    if executable is None:
+        raise FileNotFoundError(f"command not found: {cmd[0]}")
+    launcher_cmd = [
+        sys.executable, "-I", str(agent_launcher.LAUNCHER_PATH),
+        "--parent-pid", str(os.getpid()),
+        "--grace", str(AGENT_TERMINATION_GRACE_SECONDS),
+        "--executable", os.path.abspath(executable),
+        "--", *cmd,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *launcher_cmd, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, start_new_session=True, **kwargs,
+    )
+    agent = _ContainedAgent(process)
+    try:
+        agent.verify()
+    except AgentContainmentError:
+        logger.exception("[ProcessTree] agent containment check failed")
+        # Only the launcher itself is signalled: its group is unverified.
+        agent.request_termination()
+        try:
+            await asyncio.wait_for(process.wait(),
+                                   timeout=_LAUNCHER_EXIT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            agent.signal_leader(signal.SIGKILL)
+        finally:
+            # Also when cancelled while waiting: the SIGTERMed launcher
+            # sweeps its own tree, and the pidfd must not leak.
+            agent.release()
+        raise
+    _track_live_agent(agent)
+    return process, agent
+
+
+def _request_agent_termination(
+    process: asyncio.subprocess.Process, agent: _ContainedAgent | None,
+) -> None:
+    """Non-blocking kill request, for abort handlers."""
+    if agent is not None:
+        agent.request_termination()
+    elif process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+
+async def _terminate_agent(
+    process: asyncio.subprocess.Process, agent: _ContainedAgent | None,
+) -> None:
+    """Terminate the agent on a timeout, early termination or normal exit.
+
+    Contained agents have their whole tree swept; without the launcher the
+    CLI is killed by pid if it is still running, as before.
+    """
+    if agent is not None:
+        await agent.terminate()
+    elif process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+
+def _terminate_agent_sync(
+    process: asyncio.subprocess.Process, agent: _ContainedAgent | None,
+) -> None:
+    """Blocking variant for cancellation and loop shutdown (PT-02)."""
+    if agent is not None:
+        agent.terminate_sync()
+    elif process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+
+def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:
+    return {
+        "success": False,
+        "result_text": "",
+        "num_turns": 0,
+        "duration": 0,
+        "cost": None,
+        "errors": [f"Agent not started: containment check failed: {exc}"],
+        "files_changed_set": [],
+    }
+
+
 async def run_agent(
     cmd: list[str],
     timeout: int | None = None,
@@ -865,21 +1289,18 @@ async def run_agent(
             }
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            process, contained = await _spawn_agent_process(cmd)
 
-            # Register abort handler to kill subprocess
-            def abort_handler() -> None:
-                if process.returncode is None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
+            # Register abort handler to stop the agent's whole process tree
+            def abort_handler(
+                process: asyncio.subprocess.Process = process,
+                contained: _ContainedAgent | None = contained,
+            ) -> None:
+                _request_agent_termination(process, contained)
 
-            child_controller.signal.add_event_listener("abort", abort_handler, once=True)
+            # Not once=True: its wrapper could not be removed again below.
+            # abort() fires at most once, so the handler still runs once.
+            child_controller.signal.add_event_listener("abort", abort_handler)
 
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -887,8 +1308,8 @@ async def run_agent(
                     timeout=effective_timeout,
                 )
             except asyncio.TimeoutError:
-                # Try to capture any partial output before killing
-                process.kill()
+                # Stop the whole tree, then capture any partial output
+                await _terminate_agent(process, contained)
                 try:
                     stdout_bytes, stderr_bytes = await asyncio.wait_for(
                         process.communicate(), timeout=5,
@@ -906,6 +1327,19 @@ async def run_agent(
                     "errors": [f"Process timed out after {effective_timeout} seconds"],
                     "files_changed_set": [],
                 }
+            except BaseException:
+                # Cancelled, or the loop is shutting down: stop the tree
+                # synchronously. An awaited or scheduled kill could itself be
+                # cancelled before it escalates (PT-02).
+                _terminate_agent_sync(process, contained)
+                raise
+            finally:
+                # A late parent abort must not signal a finished run (PT-04).
+                child_controller.signal.remove_event_listener("abort", abort_handler)
+
+            # The CLI exited on its own. The launcher has already swept what
+            # it left running; this confirms the group is empty (gate-05).
+            await _terminate_agent(process, contained)
 
         except FileNotFoundError:
             return {
@@ -917,6 +1351,8 @@ async def run_agent(
                 "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
                 "files_changed_set": [],
             }
+        except AgentContainmentError as exc:
+            return _containment_failure_result(exc)
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -1188,22 +1624,18 @@ async def _run_agent_streaming_impl(
         }
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        process, contained = await _spawn_agent_process(
+            cmd,
             limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
         )
 
-        # Register abort handler to kill subprocess
+        # Register abort handler to stop the agent's whole process tree
         def abort_handler() -> None:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+            _request_agent_termination(process, contained)
 
-        child_controller.signal.add_event_listener("abort", abort_handler, once=True)
+        # Not once=True: its wrapper could not be removed again below.
+        # abort() fires at most once, so the handler still runs once.
+        child_controller.signal.add_event_listener("abort", abort_handler)
 
     except FileNotFoundError:
         return {
@@ -1215,6 +1647,8 @@ async def _run_agent_streaming_impl(
             "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
             "files_changed_set": [],
         }
+    except AgentContainmentError as exc:
+        return _containment_failure_result(exc)
 
     try:
         # Read stdout line-by-line with overall timeout
@@ -1787,6 +2221,13 @@ async def _run_agent_streaming_impl(
         # orchestrator. Reason captured into early_term_reason for surfacing upstream.
         early_term_reason = f"Streaming monitor error: {e}"
         logger.exception("[Telemetry] streaming monitor caught unexpected error")
+    except BaseException:
+        # Cancelled, or the loop is shutting down: stop the tree
+        # synchronously. An awaited or scheduled kill could itself be
+        # cancelled before it escalates (PT-02).
+        child_controller.signal.remove_event_listener("abort", abort_handler)
+        _terminate_agent_sync(process, contained)
+        raise
 
     if pending_flagged and not early_term_reason:
         early_term_reason = (
@@ -1794,14 +2235,19 @@ async def _run_agent_streaming_impl(
             "ran is unknown; failing closed"
         )
 
-    # --- Kill process if still running ---
-    if process.returncode is None:
+    # A late parent abort must not signal a finished run (PT-04).
+    child_controller.signal.remove_event_listener("abort", abort_handler)
+
+    # --- Terminate the agent's whole process tree (gate-05) ---
+    # Runs on every exit path. After a normal exit the launcher has already
+    # swept whatever the agent left running; this confirms and releases.
+    was_running = process.returncode is None
+    if was_running:
         log(f"  [EarlyTerm] Killing agent process (reason: {early_term_reason})", output)
-        process.kill()
-        try:
+    await _terminate_agent(process, contained)
+    if was_running:
+        with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, OSError):
             await asyncio.wait_for(process.communicate(), timeout=5)
-        except (asyncio.TimeoutError, ProcessLookupError, OSError):
-            pass
 
     duration = time.time() - start_time
 

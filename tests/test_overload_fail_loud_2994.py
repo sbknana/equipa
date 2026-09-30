@@ -584,6 +584,10 @@ class TestPersistentRetryCeiling:
 
         monkeypatch.setattr(agent_runner.asyncio, "create_subprocess_exec",
                             fake_exec)
+        # The fake process has no real pid, so spawn the CLI directly instead
+        # of through the containment launcher (which would fail closed).
+        monkeypatch.setattr(agent_runner, "_agent_containment_supported",
+                            lambda: False)
         monkeypatch.setattr(agent_runner, "get_retry_delay", lambda *_a, **_k: 0.0)
 
         result = asyncio.run(agent_runner.run_agent(
