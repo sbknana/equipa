@@ -172,10 +172,36 @@ def test_severity_alias_field_fails_closed(line):
     "Risk: low, the endpoint is internal.",
     "- **Impact:** an attacker could read other tenants' rows.",
     "- **Impact:** High-value sessions could be hijacked.",
+    "- **Impact:** High if exploited, but not reachable",
     "Risk-free change to the logging format.",
 ])
 def test_severity_alias_prose_merges(line):
     assert_prose_merges(["## Notes", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "Risk: HIGH because the session token never expires",
+    "- **Impact:** CRITICAL if the admin token leaks",
+    "Impact: High.",
+    "| S1 | SQL injection | Impact: HIGH if chained |",
+])
+def test_upper_case_alias_counts_mid_sentence(line):
+    """Only a non-UPPER value has to end the clause to count."""
+    assert_blocks_behind_zero_footer(["## Findings", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "**Severity:** HIGH",
+    "**HIGH — nonce reuse in the session cipher**",
+    "- HIGH: SQL injection - Severity: HIGH",
+    "<p><b>Severity:</b> HIGH</p>",
+])
+def test_one_finding_is_counted_once_in_the_mismatch_detail(line):
+    """A line several rules see still reports one finding, not two."""
+    analysis = analyze(review("No findings.", ["## Findings", "", line], ZERO,
+                             low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert analysis.detail.endswith("HIGH=1"), analysis.detail
 
 
 # --- 6. table cells -------------------------------------------------------------

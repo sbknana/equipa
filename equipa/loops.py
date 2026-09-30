@@ -10,11 +10,13 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import os
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1264,14 +1266,20 @@ _SEVERITY_FIELD_ANYWHERE_RE = re.compile(
 )
 # Aliases of the Severity field: "Risk: High", "- **Impact:** CRITICAL",
 # "Sev: HIGH". The label must open the line or list item ("Overall risk:
-# LOW" rates the review) and be followed by a separator. "High-value"
-# after "Impact:" is prose, "High-severity" is not.
+# LOW" rates the review) and be followed by a separator. An UPPER-case
+# value always counts; any other case only when it ends the clause, so
+# "- **Impact:** High if exploited, but not reachable" (task #3038) and
+# "Impact: High-value sessions ..." stay prose.
+_ALIAS_SEVERITY_VALUE = (
+    r"(?:(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))"
+    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
+    r"|(CRITICAL|HIGH|MEDIUM)(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w))))"
+)
 _SEVERITY_ALIAS_FIELD_RE = re.compile(
     r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
     r"[*_]{0,3}[ \t]{0,8}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?"
     r"[*_]{0,3}[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
-    r"(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
-    r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))",
+    + _ALIAS_SEVERITY_VALUE,
     re.MULTILINE | re.IGNORECASE,
 )
 # A line that is not a list item and OPENS with an UPPER-case severity and a
@@ -1304,8 +1312,7 @@ _TABLE_LEADING_SEVERITY_CELL_RE = re.compile(
 )
 _TABLE_ALIAS_FIELD_CELL_RE = re.compile(
     r"[*_]{0,3}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}"
-    r"[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
-    r"(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))(?![A-Za-z_])",
+    r"[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}" + _ALIAS_SEVERITY_VALUE,
     re.IGNORECASE,
 )
 # Inline HTML a Markdown renderer shows as a finding: "<details><summary>
@@ -1541,8 +1548,8 @@ def _table_cells(line: str) -> list[str] | None:
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def _table_candidate_severities(visible_text: str) -> list[str]:
-    """Severities of table rows that report a finding (gate-06 / loop-11).
+def _table_candidate_severities(visible_text: str) -> list[tuple[int, str]]:
+    """(line number, severity) of table rows that report a finding (gate-06).
 
     A row with a severity cell (``| S1 | HIGH | SQL injection |``) is a
     finding. Rows that only TALLY are not, unless a count is non-zero:
@@ -1551,9 +1558,9 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
     whose cell is not a number counts, fail closed). A LOW/INFO "Overall
     risk" row is exempt, as the heading form is.
     """
-    severities: list[str] = []
+    severities: list[tuple[int, str]] = []
     severity_columns: dict[int, str] | None = None
-    for line in visible_text.split("\n"):
+    for line_number, line in enumerate(visible_text.split("\n")):
         cells = _table_cells(line)
         if cells is None:
             severity_columns = None
@@ -1566,9 +1573,9 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
                 count = _TABLE_COUNT_CELL_RE.fullmatch(cell)
                 if count is not None:
                     if int(count.group(1)) > 0:
-                        severities.append(severity)
+                        severities.append((line_number, severity))
                 elif _ALNUM_RE.search(cell):
-                    severities.append(severity)
+                    severities.append((line_number, severity))
             continue
         severity_cells: dict[int, str] = {}
         for column, cell in enumerate(cells):
@@ -1578,7 +1585,7 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
                      or _TABLE_SEVERITY_FIELD_CELL_RE.search(cell)
                      or _TABLE_ALIAS_FIELD_CELL_RE.match(cell))
             if match is not None:
-                severity_cells[column] = match.group(1).upper()
+                severity_cells[column] = _matched_severity(match)
         if not severity_cells:
             continue
         other_cells = [
@@ -1591,13 +1598,18 @@ def _table_candidate_severities(visible_text: str) -> list[str]:
         counts = [_TABLE_COUNT_CELL_RE.fullmatch(cell) for cell in other_cells]
         if other_cells and all(count is not None for count in counts):
             if any(int(count.group(1)) > 0 for count in counts):
-                severities.extend(severity_cells.values())
+                severities.extend(
+                    (line_number, severity)
+                    for severity in severity_cells.values()
+                )
             continue
         if any(_OVERALL_RISK_RE.search(cell) for cell in other_cells) and all(
             severity in ("LOW", "INFO") for severity in severity_cells.values()
         ):
             continue
-        severities.extend(severity_cells.values())
+        severities.extend(
+            (line_number, severity) for severity in severity_cells.values()
+        )
     return severities
 
 
@@ -1606,68 +1618,124 @@ def _matched_severity(match: re.Match[str]) -> str:
     return next(group for group in match.groups() if group).upper()
 
 
-def _shape_candidate_severities(visible_text: str) -> list[str]:
-    """Severities of Severity-field, list-item, bare-line and table findings."""
-    severities = [
-        _matched_severity(match)
-        for regex in (
-            _SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE,
-            _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
-            _BARE_LEADING_SEVERITY_RE,
-        )
-        for match in regex.finditer(visible_text)
+_NEWLINE_RE = re.compile("\n")
+
+# Rules added by task 3122. Unlike the older rules they report a severity
+# only on a line where no earlier rule saw it (see _shape_candidates).
+_TASK_3122_LINE_RULES = (
+    _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
+    _BARE_LEADING_SEVERITY_RE,
+)
+
+
+def _line_number_finder(text: str) -> Callable[[int], int]:
+    """Return a function mapping an offset in ``text`` to its 0-based line."""
+    newline_offsets = [match.start() for match in _NEWLINE_RE.finditer(text)]
+    return lambda offset: bisect.bisect_left(newline_offsets, offset)
+
+
+def _shape_candidates(
+    text: str, seen: set[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """(line number, severity) of field, list-item, bare-line and table findings.
+
+    The rules that predate task 3122 report every match, as before. A task
+    3122 rule reports a severity only on a line where neither an older rule
+    nor _FINDING_CANDIDATE_RE (counted by the caller) saw it, so one finding
+    is counted once and a mismatch detail still reads "HIGH=1". ``seen``
+    receives every (line, severity) pair this scan or the candidate regex saw.
+    """
+    line_of = _line_number_finder(text)
+    found = [
+        (line_of(match.start()), _matched_severity(match))
+        for regex in (_SEVERITY_FIELD_RE, _LIST_ITEM_SEVERITY_RE)
+        for match in regex.finditer(text)
     ]
-    for match in _LIST_ITEM_LEADING_SEVERITY_RE.finditer(visible_text):
-        line_start = visible_text.rfind("\n", 0, match.start()) + 1
-        if _FINDING_CANDIDATE_RE.match(visible_text, line_start):
+    for match in _LIST_ITEM_LEADING_SEVERITY_RE.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if _FINDING_CANDIDATE_RE.match(text, line_start):
             continue  # already counted as a bold lead-in candidate
-        severities.append(match.group(1).upper())
-    for match in _LIST_ITEM_TRAILING_SEVERITY_RE.finditer(visible_text):
+        found.append((line_of(match.start()), match.group(1).upper()))
+    found.extend(_table_candidate_severities(text))
+    seen.update(found)
+    seen.update(
+        (line_of(match.start()), match.group(1).upper())
+        for match in _FINDING_CANDIDATE_RE.finditer(text)
+    )
+
+    def report_once(offset: int, severity: str) -> None:
+        key = (line_of(offset), severity)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    for regex in _TASK_3122_LINE_RULES:
+        for match in regex.finditer(text):
+            report_once(match.start(), _matched_severity(match))
+    for match in _LIST_ITEM_TRAILING_SEVERITY_RE.finditer(text):
         severity = match.group(1)
         if severity in ("LOW", "INFO") and _OVERALL_RISK_RE.search(match.group(0)):
             continue  # "- Overall risk: LOW" rates the review, not a finding
-        severities.append(severity)
-    severities.extend(_table_candidate_severities(visible_text))
-    return severities
+        report_once(match.start(), severity)
+    return found
 
 
-def _html_as_markdown(html_lines: str) -> str:
+def _html_as_markdown(html_line: str) -> str:
     """Rewrite inline HTML as the Markdown a renderer would show (task 3122)."""
-    markdown = _HTML_BOLD_TAG_RE.sub("**", html_lines)
+    markdown = _HTML_BOLD_TAG_RE.sub("**", html_line)
     markdown = _HTML_CELL_OPEN_TAG_RE.sub("|", markdown)
     markdown = _HTML_BLOCK_TAG_RE.sub("\n", markdown)
     return _HTML_TAG_RE.sub(" ", markdown)
 
 
-def _html_candidate_severities(visible_text: str) -> list[str]:
-    """Severities of findings written in inline HTML (task 3122).
+def _html_candidates(
+    visible_text: str, seen: set[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """(line number, severity) of findings written in inline HTML (task 3122).
 
     Only lines that carry a tag are rewritten and rescanned, so the document
-    title exemption and every other rule see the text they saw before.
-    Heading lines are left to the heading rules, which already read through
-    inline tags.
+    title exemption and every other rule see the text they saw before. The
+    rewritten pieces keep the number of the line they came from, and a
+    severity ``seen`` already holds for that line is not reported again.
+    Heading lines are left to the heading rules, which read through tags.
     """
-    html_lines = "\n".join(
-        line for line in visible_text.split("\n") if "<" in line
-    )
-    if not _HTML_TAG_RE.search(html_lines):
+    source_lines: list[int] = []
+    pieces: list[str] = []
+    for line_number, line in enumerate(visible_text.split("\n")):
+        if "<" not in line or not _HTML_TAG_RE.search(line):
+            continue
+        if source_lines and source_lines[-1] != line_number - 1:
+            # A gap ends any table the previous tagged line was part of.
+            source_lines.append(line_number - 1)
+            pieces.append("")
+        for piece in _html_as_markdown(line).split("\n"):
+            source_lines.append(line_number)
+            pieces.append(piece)
+    if not pieces:
         return []
-    markdown = _html_as_markdown(html_lines)
-    severities = [
-        match.group(1).upper()
+    markdown = "\n".join(pieces)
+    line_of = _line_number_finder(markdown)
+    markdown_candidates = [
+        (line_of(match.start()), match.group(1).upper())
         for match in _FINDING_CANDIDATE_RE.finditer(markdown)
         if not _candidate_line(match).lstrip(" \t").startswith("#")
     ]
-    severities.extend(_shape_candidate_severities(markdown))
-    return severities
+    markdown_candidates += _shape_candidates(markdown, set())
+    found: list[tuple[int, str]] = []
+    for markdown_line, severity in markdown_candidates:
+        key = (source_lines[markdown_line], severity)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+    return found
 
 
 def _extra_candidate_severities(visible_text: str) -> list[str]:
     """Severities of findings in every non-heading shape, Markdown or HTML."""
-    return (
-        _shape_candidate_severities(visible_text)
-        + _html_candidate_severities(visible_text)
-    )
+    seen: set[tuple[int, str]] = set()
+    found = _shape_candidates(visible_text, seen)
+    found += _html_candidates(visible_text, seen)
+    return [severity for _line, severity in found]
 
 
 def _analyze_review_file(
