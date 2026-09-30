@@ -1008,11 +1008,16 @@ _ANY_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.MULTILINE)
 # never add to the merge counts; a severity they see that neither the footer
 # nor the strict headers count is a count mismatch (fail closed).
 #
-# A ``Severity:`` field, e.g. "**Severity:** HIGH" or "- Severity — High".
-# The heading it belongs to ("### Finding 1") may carry no severity at all.
+# A ``Severity:`` field, e.g. "**Severity:** HIGH", "- Severity — High" or
+# "**Severity** HIGH" (no separator at all). The heading it belongs to
+# ("### Finding 1") may carry no severity at all. "Severity ratings: ..."
+# is not a field: the word after "Severity" must itself be a severity.
+# Every whitespace run is bounded: two adjacent unbounded ``[ \t]*`` made a
+# "Severity" line padded with 20000 spaces take seconds (quadratic).
 _SEVERITY_FIELD_RE = re.compile(
-    r"^[ \t]{0,3}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?[*_]{0,3}"
-    r"[ \t]*severity(?:[ \t]+(?:rating|level))?[ \t]*[*_]{0,3}[ \t]*[:=—–-]"
+    r"^[ \t]{0,3}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
+    r"[*_]{0,3}[ \t]{0,8}severity(?:[ \t]{1,8}(?:rating|level))?"
+    r"[ \t]{0,8}[*_]{0,3}(?:[ \t]{0,8}[:=—–-]|[ \t])"
     r"[^A-Za-z0-9\n]{0,8}(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_])",
     re.MULTILINE | re.IGNORECASE,
 )
@@ -1020,8 +1025,8 @@ _SEVERITY_FIELD_RE = re.compile(
 # the line: "1. SQL injection in login (HIGH)", "- [High] token leak".
 # "(low risk)" is prose, so the severity must close the group.
 _LIST_ITEM_SEVERITY_RE = re.compile(
-    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t][^\n]*?[(\[][ \t]*[*_]{0,2}"
-    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_]{0,2}[ \t]*"
+    r"^[ \t]{0,12}(?:[-*+]|\d{1,3}[.)])[ \t][^\n]*?[(\[][ \t]{0,8}[*_]{0,2}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?:[ -]severity)?[*_]{0,2}[ \t]{0,8}"
     r"[)\],;:]",
     re.MULTILINE | re.IGNORECASE,
 )

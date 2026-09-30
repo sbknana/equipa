@@ -287,6 +287,9 @@ HIDDEN_HIGH_FORMS = {
     "severity-field-bold": "### Finding 2 - SQL injection\n**Severity:** HIGH",
     "severity-field-plain": "### Finding 2 - SQL injection\nSeverity: High",
     "severity-field-list": "- Severity: HIGH",
+    "severity-field-no-separator": "### Finding 2 - SQL injection\n"
+                                   "**Severity** HIGH",
+    "severity-level-field": "- Severity level = High",
     "setext-heading": "[S2] HIGH - SQL injection\n-------------------------",
     "setext-heading-equals": "[S2] HIGH - SQL injection\n=====",
     "html-heading": "<h3>[S2] HIGH - SQL injection</h3>",
@@ -342,6 +345,8 @@ BENIGN_SEVERITY_MENTIONS = {
     "description-cell": "| Area | Note |\n|---|---|\n| cache | High memory use |",
     "list-item-low-risk-prose": "- Rotating keys is (low risk) to defer.",
     "thematic-break": "Details.\n\n---",
+    "severity-ratings-prose": "Severity ratings follow CVSS: HIGH means 7.0+.",
+    "clean-summary-prose": "No CRITICAL or HIGH findings in this area.",
     "html-comment": "<!-- reviewer note: HIGH bar for evidence -->",
 }
 
@@ -358,6 +363,24 @@ def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention)
     write_recorded_review(tmp_path, task_id, text)
     blocks, counts = gate_result(tmp_path, task_id)
     assert blocks is False and counts and counts["LOW"] == 1, (blocks, counts)
+
+
+@pytest.mark.parametrize("line", [
+    "Severity" + " " * 50000 + "x",
+    "- Severity" + " " * 50000 + "level",
+    "- x (" + " " * 50000 + "HIGH" + " " * 50000 + "x",
+], ids=["severity-spaces", "severity-level-spaces", "list-paren-spaces"])
+def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
+    """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds."""
+    import time
+
+    text = review_body(footer=ONE_LOW_FOOTER).replace("Details.", line)
+    path = tmp_path / "SECURITY-REVIEW-94400.md"
+    path.write_text(text, encoding="utf-8")
+    start = time.perf_counter()
+    analysis = loops._analyze_review_file(path, text=text)
+    assert time.perf_counter() - start < 2.0
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 
 # --------------------------- gate-07 reviewer end to end (run_security_review)
