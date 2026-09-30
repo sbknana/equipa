@@ -23,8 +23,10 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 logger = logging.getLogger(__name__)
 
@@ -2892,6 +2894,37 @@ def _refuse_task_without_worktree(
     }
 
 
+# Exit status of a dispatch refused before any agent ran (dispatch-15): a
+# nohup log or wrapper script must be able to tell "refused" from "ran".
+EXIT_DISPATCH_REFUSED = 2
+
+
+def refuse_dispatch(message: str) -> NoReturn:
+    """Print ``ERROR: message`` and exit with :data:`EXIT_DISPATCH_REFUSED`."""
+    print(f"ERROR: {message}")
+    sys.exit(EXIT_DISPATCH_REFUSED)
+
+
+def resolve_max_concurrent(args) -> int:
+    """Concurrency cap for ``--tasks``: CLI flag, else dispatch config, else 4.
+
+    dispatch-10 (task #3112): ``max_concurrent`` from dispatch_config.json
+    used to be ignored here, so an operator who lowered it for a RAM-limited
+    host still got 4 agents at once. A cap below 1 (or not an integer) is
+    refused rather than silently replaced by the default.
+    """
+    cli_value = getattr(args, "max_concurrent", None)
+    if cli_value is not None:
+        value, source = cli_value, "--max-concurrent"
+    else:
+        config = getattr(args, "dispatch_config", None) or {}
+        value = config.get("max_concurrent", 4)
+        source = "dispatch config max_concurrent"
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        refuse_dispatch(f"{source} must be a positive integer, got {value!r}")
+    return value
+
+
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
@@ -2901,18 +2934,29 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     one task), a row in the ``flows`` table tracks the orchestration so
     the run survives a Claudinator restart and supports sticky cancel.
     """
+    # dispatch-15 (task #3112): de-duplicate, and refuse (exit non-zero)
+    # rather than silently running a subset when an id does not exist.
+    task_ids = list(dict.fromkeys(task_ids))
+    max_concurrent = resolve_max_concurrent(args)
     # Fetch all tasks
     tasks = fetch_tasks_by_ids(task_ids)
     if not tasks:
-        print("ERROR: No tasks found for given IDs.")
-        return
+        refuse_dispatch("No tasks found for given IDs.")
+    missing_ids = sorted(set(task_ids) - {t["id"] for t in tasks})
+    if missing_ids:
+        refuse_dispatch(
+            f"task id(s) not found in TheForge: "
+            f"{', '.join(str(i) for i in missing_ids)}. Nothing was run; "
+            f"fix the --tasks list and re-dispatch."
+        )
 
     # Verify all tasks are from the same project
     project_ids = set(t.get("project_id") for t in tasks)
     if len(project_ids) > 1:
-        print(f"ERROR: --tasks requires all tasks from the same project. "
-              f"Found project IDs: {project_ids}")
-        return
+        refuse_dispatch(
+            f"--tasks requires all tasks from the same project. "
+            f"Found project IDs: {project_ids}"
+        )
 
     project_id = tasks[0].get("project_id")
     project_dir = resolve_project_dir(tasks[0])
@@ -2922,23 +2966,19 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         # is empty, auto-clone the scaffold so dispatch can proceed.
         project_dir = _bootstrap_scaffold_if_needed(tasks[0], project_id)
     if not project_dir:
-        print("ERROR: Could not resolve project directory.")
-        return
+        refuse_dispatch("Could not resolve project directory.")
     try:
         from equipa.scaffold import ensure_scaffold, ScaffoldCloneError
         if ensure_scaffold(project_dir, project_id):
             print(f"Auto-cloned ForgeScaffold into {project_dir}")
     except ScaffoldCloneError as exc:
-        print(f"ERROR: Scaffold auto-clone failed: {exc}")
-        return
+        refuse_dispatch(f"Scaffold auto-clone failed: {exc}")
     except Exception as exc:  # pragma: no cover - defensive
         print(f"WARN: Scaffold auto-clone raised {exc!r}")
     if not Path(project_dir).exists():
-        print(f"ERROR: Project directory does not exist: {project_dir}")
-        return
+        refuse_dispatch(f"Project directory does not exist: {project_dir}")
 
     project_context = fetch_project_context(project_id)
-    max_concurrent = getattr(args, "max_concurrent", None) or 4
     semaphore = asyncio.Semaphore(max_concurrent)
 
     # --- Task Flow tracking (durable revisions + sticky cancel) ---

@@ -60,6 +60,7 @@ from equipa.dispatch import (
     load_goals_file,
     outcome_after_merge,
     parse_task_ids,
+    refuse_dispatch,
     run_auto_dispatch,
     run_parallel_goals,
     run_parallel_tasks,
@@ -1306,10 +1307,26 @@ async def run_mode_goal(args: argparse.Namespace) -> None:
 
 async def run_mode_tasks(args: argparse.Namespace) -> None:
     """Parallel tasks mode: run several task IDs concurrently."""
-    task_ids = parse_task_ids(args.tasks)
+    # dispatch-11 (task #3112): --tasks runs every task's Dev+Test loop with
+    # the role stored on the task (tasks.role). An explicit --role used to be
+    # dropped without a word; it is now refused so nothing is overridden
+    # silently.
+    if getattr(args, "role", None):
+        refuse_dispatch(
+            f"--tasks does not support --role ('{args.role}'): each task runs "
+            f"a Dev+Test loop with its own tasks.role. Set tasks.role in "
+            f"TheForge, or dispatch one task with --task <id> --role "
+            f"{args.role}."
+        )
+    if not getattr(args, "dev_test", False):
+        print("NOTE: --tasks always runs the Dev+Test loop (developer + tester) "
+              "for every task; --dev-test is implied.")
+    try:
+        task_ids = parse_task_ids(args.tasks)
+    except ValueError as exc:
+        refuse_dispatch(f"--tasks: {exc}")
     if not task_ids:
-        print("ERROR: Could not parse task IDs from --tasks argument.")
-        sys.exit(1)
+        refuse_dispatch("Could not parse task IDs from --tasks argument.")
 
     # Auto-snapshot tracked configs once at dispatch entry.
     tasks_for_snapshot = fetch_tasks_by_ids(task_ids)
