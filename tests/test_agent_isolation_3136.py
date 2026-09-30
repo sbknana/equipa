@@ -398,8 +398,9 @@ def test_launcher_git_ignores_global_config_the_agent_planted(
     forged = "[filter \"evil\"]\n\tclean = sed s/clean/FORGED/\n"
     with open(Path(session.home) / ".gitconfig", "a") as handle:
         handle.write(forged)
-    if session.unit_git_config is not None:
-        with open(session.unit_git_config, "a") as handle:
+    unit_git_config = getattr(session, "unit_git_config", None)
+    if unit_git_config is not None:
+        with open(unit_git_config, "a") as handle:
             handle.write(forged)
     (clone / ".gitattributes").write_text("*.md filter=evil\n")
     (clone / ".equipa-artifacts").mkdir()
