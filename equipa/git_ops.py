@@ -582,9 +582,9 @@ def detect_project_language(project_dir: str | Path) -> dict:
 # * passes ``--no-pager``, and ``--no-ext-diff --no-textconv`` to the
 #   diff-family subcommands.
 #
-# Programs named by the orchestrator's OWN environment (GIT_SSH_COMMAND,
-# GIT_EDITOR, GIT_ASKPASS, ...) still outrank these pins. That environment is
-# operator-controlled, not agent-writable.
+# Programs named by the orchestrator's OWN environment and kept by the IR-04
+# allowlist (GIT_SSH, GIT_SSH_COMMAND, GIT_ASKPASS, SSH_ASKPASS) still outrank
+# these pins. That environment is operator-controlled, not agent-writable.
 #
 # Residual, not neutralisable by a fixed argument list, because the driver
 # name is chosen by agent-writable .gitattributes / info/attributes:
@@ -750,6 +750,7 @@ _GIT_ENV_ALLOWLIST = frozenset({
     "GIT_TERMINAL_PROMPT", "GIT_CONFIG_GLOBAL",
     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
     # Windows: git for Windows and gh need these to start at all.
     "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
     "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
@@ -848,7 +849,7 @@ def git_run(
     the gate-02/gate-03 hardening: replace refs are ignored and no hook or
     program named in repo config can run (see ``GIT_HARDENING_ARGS``).
 
-    ``env`` holds extra variables layered over the process environment; the
+    ``env`` holds extra variables layered over the allowlisted environment; the
     hardening variables are applied last and cannot be overridden.
     ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
@@ -1148,7 +1149,7 @@ def verify_global_git_config_pin() -> str | None:
 def pinned_git_env() -> dict[str, str]:
     """Environment for a git call that cannot go through :func:`git_run`.
 
-    The process environment plus the hardening variables and, once pinned,
+    The allowlisted environment plus the hardening variables and, once pinned,
     ``GIT_CONFIG_GLOBAL`` pointing at the pre-dispatch copy — so a direct
     ``subprocess.run(["git", ...])`` in the orchestrator reads the same
     config as the hardened helper does (task #3116, MI-04).
