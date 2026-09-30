@@ -1150,7 +1150,38 @@ async def run_project_tasks(
         model=config.get("model", args.model),
         max_turns=config.get("max_turns", args.max_turns),
         dispatch_config=config,  # pass config so get_role_turns can read per-role limits
+        # dispatch-07 (task #3112): the isolated review honours the operator's
+        # --no-security-review choice; absent means the config decides.
+        security_review=getattr(args, "security_review", None),
     )
+
+    # dispatch-07 (task #3112): in a git project every task runs in its own
+    # worktree and reaches the default branch only through the gated merge.
+    # One guard per project: every orchestrator merge advances it, anything
+    # else trips it and the remaining tasks are refused.
+    project_guard: DefaultBranchGuard | None = None
+    use_isolation = _is_git_repo(project_dir)
+    if use_isolation:
+        await report_leftover_dispatch_state(project_dir)
+        try:
+            project_guard = await DefaultBranchGuard.snapshot(project_dir)
+        except MergeIntegrityError as exc:
+            log(
+                f"  [{codename}] ERROR: default branch could not be pinned "
+                f"({exc}); no task is dispatched in this project.",
+                output,
+            )
+            return {
+                "project_id": project_id,
+                "codename": codename,
+                "tasks_attempted": 0,
+                "tasks_completed": [],
+                "tasks_blocked": [],
+                "tasks_skipped": len(tasks),
+                "error": f"default branch could not be pinned: {exc}",
+                "total_cost": 0.0,
+                "total_duration": 0.0,
+            }
 
     for i, task_row in enumerate(tasks, 1):
         task_id = task_row["id"]
@@ -1178,16 +1209,45 @@ async def run_project_tasks(
         # Bug 2282: extracted into module-level helper so run_parallel_tasks
         # can reuse the same retry semantics. Both code paths now share one
         # canonical autoresearch wrapper.
-        result, cycles, outcome, _loop_cost, _loop_duration, task = (
-            await run_dev_test_loop_with_autoresearch(
-                task, project_dir, project_context, task_args, config, output=output,
+        merged_sha: str | None = None
+        if use_isolation:
+            loop_totals: dict = {}
+
+            async def execute_in_worktree(
+                worktree_dir: str, task_branch: str, task: dict = task,
+                loop_totals: dict = loop_totals,
+            ) -> tuple[dict, int, str]:
+                loop_result, loop_cycles, loop_outcome, cost, duration, refreshed = (
+                    await run_dev_test_loop_with_autoresearch(
+                        task, worktree_dir, project_context, task_args, config,
+                        output=output, task_branch=task_branch,
+                    )
+                )
+                loop_totals.update(cost=cost, duration=duration, task=refreshed)
+                return loop_result, loop_cycles, loop_outcome
+
+            isolated = await run_task_in_isolation(
+                task, project_dir, project_context, task_args,
+                execute=execute_in_worktree, guard=project_guard, output=output,
             )
-        )
+            result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
+            merged_sha = isolated.merged_sha
+            task = loop_totals.get("task", task)
+            _loop_cost = loop_totals.get("cost", 0.0)
+            _loop_duration = loop_totals.get("duration", 0.0)
+        else:
+            # Not a git repo: there are no branches to protect.
+            result, cycles, outcome, _loop_cost, _loop_duration, task = (
+                await run_dev_test_loop_with_autoresearch(
+                    task, project_dir, project_context, task_args, config, output=output,
+                )
+            )
         total_cost += _loop_cost
         total_duration += _loop_duration
 
-        # Orchestrator-side DB update (don't rely on agent)
-        update_task_status(task_id, outcome, output=output)
+        # Orchestrator-side DB update (don't rely on agent). In a git project
+        # the outcome already reflects the gated merge (dispatch-05).
+        update_task_status(task_id, outcome, output=output, merged_sha=merged_sha)
 
         # ForgeSmith telemetry
         task_role = task.get("role") or "developer"
@@ -1442,11 +1502,15 @@ async def run_single_goal(
     max_turns = goal_entry.get("max_turns", defaults["max_turns"])
     max_rounds = goal_entry.get("max_rounds", defaults["max_rounds"])
 
-    # Create a namespace that looks like args for the manager loop
+    # Create a namespace that looks like args for the manager loop. The
+    # dispatch config and --no-security-review carry through so the isolated
+    # review and gated merge follow the operator's policy (task #3112).
     goal_args = argparse.Namespace(
         model=model,
         max_turns=max_turns,
         max_rounds=max_rounds,
+        dispatch_config=getattr(args, "dispatch_config", None),
+        security_review=getattr(args, "security_review", None),
     )
 
     output: list[str] = []  # Buffer all output for this goal
@@ -3076,6 +3140,17 @@ async def run_task_in_isolation(
     try:
         base_sha = await resolve_commit(worktree_dir, "HEAD")
         result, cycles, agent_outcome = await execute(worktree_dir, task_branch)
+        # Task #3111 (3107 review R1): an agent that left its worktree on
+        # another branch must not have that branch's commits treated as the
+        # task's result.
+        try:
+            await _require_task_branch(worktree_dir, task_branch)
+        except AttemptCleanupError as exc:
+            _audit_task_abort(
+                task_id, "worktree-branch-mismatch",
+                f"after the run ({agent_outcome}): {exc}", output,
+            )
+            agent_outcome = "worktree_branch_mismatch"
         # dispatch-03: catch an agent that moved the default branch.
         await guard.verify(f"after-agent task={task_id}", task_id=task_id)
         branch_sha = await resolve_commit(project_dir, f"refs/heads/{task_branch}")

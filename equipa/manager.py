@@ -25,7 +25,9 @@ from equipa.constants import (
     MAX_TASKS_PER_PLAN,
 )
 from equipa.db import get_db_connection, update_task_status
+from equipa.git_ops import _is_git_repo
 from equipa.loops import run_dev_test_loop
+from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
@@ -271,6 +273,32 @@ async def run_manager_loop(
     total_cost = 0.0
     total_duration = 0.0
 
+    # dispatch-07 (task #3112): in a git project each task runs in its own
+    # worktree and reaches the default branch only through the gated merge
+    # (equipa.dispatch.run_task_in_isolation). The planner and evaluator
+    # still run in the project checkout, so the goal's guard is verified
+    # after each of them: if either moved the default branch, the goal stops
+    # and nothing further is merged.
+    goal_guard: DefaultBranchGuard | None = None
+    if _is_git_repo(project_dir):
+        # Imported here: equipa.dispatch imports this module.
+        from equipa.dispatch import run_task_in_isolation
+        from equipa.merge_safety import report_leftover_dispatch_state
+
+        await report_leftover_dispatch_state(project_dir)
+        try:
+            goal_guard = await DefaultBranchGuard.snapshot(project_dir)
+        except MergeIntegrityError as exc:
+            log(f"\n  [Manager] Default branch could not be pinned ({exc}). "
+                f"Not running the goal.", output)
+            return "merge_integrity_failed", 0, all_completed, all_blocked, total_cost, total_duration
+
+    async def default_branch_untouched(stage: str) -> bool:
+        if goal_guard is None or await goal_guard.verify(stage):
+            return True
+        log(f"\n  [Manager] {goal_guard.alert}. Aborting the goal.", output)
+        return False
+
     for round_num in range(1, max_rounds + 1):
         log(f"\n{'#' * 60}", output)
         log(f"  MANAGER ROUND {round_num}/{max_rounds}", output)
@@ -284,6 +312,12 @@ async def run_manager_loop(
         total_duration += planner_result.get("duration", 0)
         if planner_result.get("cost"):
             total_cost += planner_result["cost"]
+
+        if not await default_branch_untouched(f"after-planner round={round_num}"):
+            return (
+                "merge_integrity_failed", round_num, all_completed, all_blocked,
+                total_cost, total_duration,
+            )
 
         if not task_ids:
             log(f"\n  [Manager] Planner failed to create tasks. Aborting.", output)
@@ -311,14 +345,36 @@ async def run_manager_loop(
                 round_completed.append(task)
                 continue
 
-            result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, args, output=output,
-            )
-            total_duration += result.get("duration", 0)
-            if result.get("cost"):
-                total_cost += result["cost"]
+            if goal_guard is not None:
+                async def execute_in_worktree(
+                    worktree_dir: str, _task_branch: str, task: dict = task,
+                ) -> tuple[dict[str, Any], int, str]:
+                    return await run_dev_test_loop(
+                        task, worktree_dir, project_context, args, output=output,
+                    )
 
-            update_task_status(task["id"], outcome, output=output)
+                isolated = await run_task_in_isolation(
+                    task, project_dir, project_context, args,
+                    execute=execute_in_worktree, guard=goal_guard, output=output,
+                )
+                result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
+                total_duration += result.get("duration", 0)
+                if result.get("cost"):
+                    total_cost += result["cost"]
+                # The outcome already reflects the gated merge (dispatch-05).
+                update_task_status(
+                    task["id"], outcome, output=output, merged_sha=isolated.merged_sha,
+                )
+            else:
+                # Not a git repo: there are no branches to protect.
+                result, cycles, outcome = await run_dev_test_loop(
+                    task, project_dir, project_context, args, output=output,
+                )
+                total_duration += result.get("duration", 0)
+                if result.get("cost"):
+                    total_cost += result["cost"]
+
+                update_task_status(task["id"], outcome, output=output)
 
             if outcome in ("tests_passed", "no_tests"):
                 round_completed.append(task)
@@ -341,6 +397,12 @@ async def run_manager_loop(
         total_duration += eval_result.get("duration", 0)
         if eval_result.get("cost"):
             total_cost += eval_result["cost"]
+
+        if not await default_branch_untouched(f"after-evaluator round={round_num}"):
+            return (
+                "merge_integrity_failed", round_num, all_completed, all_blocked,
+                total_cost, total_duration,
+            )
 
         if eval_parsed["goal_status"] == "complete":
             log(f"\n  [Manager] Goal COMPLETE!", output)
