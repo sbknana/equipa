@@ -183,15 +183,18 @@ def test_dispatch_conflict_preserves_unmerged_branch(
     tmp_git_repo_with_conflict: Path,
 ) -> None:
     """The parallel-dispatch isolation helper must NOT force-delete a
-    pre-existing branch with unmerged commits.
+    pre-existing branch with unmerged commits, and must REFUSE the task.
 
-    Acceptance criterion 5 from task #2490:
+    Acceptance criterion 5 from task #2490, tightened by task #3107
+    (dispatch-01): routing the task to the shared main checkout is NOT a
+    safe fallback — the agent then commits straight onto the default
+    branch and the merge gate never sees it.
     - Setup: pre-create branch forge-task-9999 with one un-merged commit.
     - Dispatch mock task #9999.
+    - Assert: the task is refused with a "stale branch" reason and gets no
+      directory to run in.
     - Assert: branch forge-task-9999 STILL EXISTS with the un-merged
-      commit intact.
-    - Assert: dispatch raised WorktreeBranchConflictError OR routed to
-      shared-dir fallback (the new default).
+      commit intact, and the default branch did not move.
     """
     import asyncio
 
@@ -199,21 +202,26 @@ def test_dispatch_conflict_preserves_unmerged_branch(
 
     head_before = _git_rev_parse("forge-task-9999", tmp_git_repo_with_conflict)
     assert head_before is not None, "fixture must create forge-task-9999"
+    master_before = _git_rev_parse("master", tmp_git_repo_with_conflict)
 
     worktree_base = tmp_git_repo_with_conflict.parent / ".equipa-worktrees-9999"
+    refusals: dict[int, str] = {}
     result = asyncio.run(
         _create_isolation_worktrees(
             tasks=[{"id": 9999}],
             project_dir=str(tmp_git_repo_with_conflict),
             worktree_base=worktree_base,
+            refusals=refusals,
         )
     )
 
-    # Routed to shared-dir fallback (task not present in result map).
-    assert 9999 not in result, (
-        f"task #9999 should have been routed to shared-dir fallback, "
-        f"got worktree_dirs={result!r}"
-    )
+    # Refused: no worktree, and an explicit reason the caller turns into
+    # status=blocked. There is no shared-dir fallback any more.
+    assert 9999 not in result, f"task #9999 got a worktree: {result!r}"
+    assert refusals == {
+        9999: "stale branch forge-task-9999 exists; preserved, resolve by hand",
+    }
+    assert _git_rev_parse("master", tmp_git_repo_with_conflict) == master_before
 
     # Branch + unmerged commit intact.
     head_after = _git_rev_parse("forge-task-9999", tmp_git_repo_with_conflict)
