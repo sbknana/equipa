@@ -386,6 +386,30 @@ def test_features_not_a_dict_uses_defaults(caplog: pytest.LogCaptureFixture):
     assert any("not a dict" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("dispatch_config", [[], ["features"], "x", 1, 0.5, True])
+def test_dispatch_config_not_a_dict_forces_security_gate_on(
+    dispatch_config: object, caplog: pytest.LogCaptureFixture
+):
+    """IND3128-05: a non-object dispatch_config kept the gate at its default
+    (OFF) with only a WARNING; it must fail closed like every other shape."""
+    with caplog.at_level(logging.WARNING, logger="equipa.config"):
+        enabled = is_feature_enabled(dispatch_config, "bash_security_pretooluse")
+    assert enabled is True
+    assert any(
+        r.levelno >= logging.ERROR
+        and "fail-closed" in r.getMessage()
+        and "not a dict" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize("dispatch_config", [[], "x", 1])
+def test_dispatch_config_not_a_dict_keeps_ordinary_defaults(dispatch_config: object):
+    """Only security gates fail closed; other flags keep their default."""
+    assert is_feature_enabled(dispatch_config, "hooks") is False
+    assert is_feature_enabled(dispatch_config, "security_review") is True
+
+
 @pytest.mark.parametrize("features", [None, "x", ["bash_security_pretooluse"], 1])
 def test_features_not_a_dict_forces_security_gate_on(
     features: object, caplog: pytest.LogCaptureFixture

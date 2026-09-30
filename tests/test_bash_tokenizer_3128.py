@@ -279,12 +279,23 @@ SEED = 3128
 WORD_COMMANDS = 400
 HEREDOC_COMMANDS = 120
 
-# No glob, tilde, brace, $ or backtick characters unquoted: nothing is
-# expanded, so what bash prints is exactly its word splitting and quote
-# removal. The alphabet cannot spell a command either.
+# No glob, tilde, brace or backtick characters unquoted, and a $ only before
+# a character that makes it literal: nothing is expanded, so what bash
+# prints is exactly its word splitting and quote removal. The alphabet
+# cannot spell a command either.
 PLAIN = "qxzQXZ019_-./=:%+,@^"
 QUOTED_TEXT = PLAIN + " \t\"'#;|&<>()*?[]{}~!$`\\\n"
 ESCAPABLE = " '\"#;|&<>()$`\\*?[]{}~!q\n"
+# `$` followed by one of these is a literal `$` in bash, quoted or not.
+LITERAL_DOLLARS = ["$.", "$/", "$=", "$:", "$%", "$+", "$,", "$^"]
+
+
+def _require_bash() -> str:
+    """The differential tests are the tokenizer's ground truth: a host
+    without bash must fail them loudly, not skip them (BS3128-03)."""
+    if BASH is None:
+        pytest.fail("bash is required for the tokenizer differential tests")
+    return BASH
 
 
 def _single_quoted(rng: random.Random) -> str:
@@ -298,6 +309,8 @@ def _double_quoted_body(rng: random.Random) -> str:
         roll = rng.random()
         if roll < 0.25:
             parts.append("\\" + rng.choice('"\\$`q\n'))
+        elif roll < 0.33:
+            parts.append(rng.choice(LITERAL_DOLLARS))
         else:
             parts.append(rng.choice(QUOTED_TEXT.replace('"', "").replace("\\", "")
                                     .replace("$", "").replace("`", "")))
@@ -327,6 +340,8 @@ def _piece(rng: random.Random, first_in_word: bool) -> str:
         return f"$'{_ansi_c_body(rng)}'"
     if roll < 0.87:
         return f'$"{_double_quoted_body(rng)}"'
+    if roll < 0.93:
+        return rng.choice(LITERAL_DOLLARS)
     return "\\" + rng.choice(ESCAPABLE)
 
 
@@ -347,6 +362,8 @@ def _word_command(rng: random.Random) -> str:
         line += rng.choice([" ", "  ", "\t"]) + word
     if rng.random() < 0.3:
         comment = "".join(rng.choice(QUOTED_TEXT.replace("\n", "")) for _ in range(6))
+        if comment.endswith("\\"):
+            comment += "q"  # keep the no-trailing-backslash invariant below
         line += rng.choice([" #", "\t# ", ";#"]) + comment
     # Never end on a bare backslash: the script's newline would continue it.
     assert not line.endswith("\\") or line.endswith("\\\\"), line
@@ -501,8 +518,8 @@ PRELUDE = (
 )
 
 
-@pytest.mark.skipif(BASH is None, reason="bash is not installed")
 def test_tokenizer_agrees_with_bash_on_generated_commands(tmp_path: Path):
+    bash = _require_bash()
     rng = random.Random(SEED)
     cases: list[tuple[str, str, bool, bool]] = []
     for _ in range(WORD_COMMANDS):
@@ -519,7 +536,7 @@ def test_tokenizer_agrees_with_bash_on_generated_commands(tmp_path: Path):
     )
     start = time.perf_counter()
     proc = subprocess.run(
-        [BASH, "--norc", "--noprofile", str(script)],
+        [bash, "--norc", "--noprofile", str(script)],
         capture_output=True, timeout=20, cwd=tmp_path,
         # Nothing external can run even if a line were misparsed.
         env={"PATH": "/nonexistent", "LC_ALL": "C"},
@@ -544,9 +561,194 @@ def test_differential_corpus_exercises_the_tricky_forms():
     """Guard against a generator change that silently drops coverage."""
     rng = random.Random(SEED)
     corpus = "".join(_word_command(rng) for _ in range(WORD_COMMANDS))
-    for form in ("$'", "\\'", '$"', '\\"', "#", "\\\n", "'#", "\\\\"):
+    for form in ("$'", "\\'", '$"', '\\"', "#", "\\\n", "'#", "\\\\", "\\$"):
         assert form in corpus, form
+    assert any(dollar in corpus for dollar in LITERAL_DOLLARS)
+    assert any(f'"{dollar}' in corpus or f'{dollar}"' in corpus for dollar in LITERAL_DOLLARS)
     heredocs = [_heredoc_command(rng) for _ in range(HEREDOC_COMMANDS)]
     assert any(q for _, q, _ in heredocs) and any(not q for _, q, _ in heredocs)
     assert any(d for _, _, d in heredocs)
     assert any("qx\\\n" in c for c, _, _ in heredocs)
+
+
+# ---------------------------------------------------------------------------
+# Differential test: substitutions (task 3133, IND3128-07)
+# ---------------------------------------------------------------------------
+#
+# The word corpus above never expands anything. This one places numbered
+# marker substitutions - `m N`, a shell function that only writes N to a
+# file descriptor - in every context the review found disagreements in,
+# runs the lines in bash, and checks the fail-closed property: a marker bash
+# RAN is never classified as proven inert, and the whole line is refused.
+# Only the prelude's functions and bash builtins can run (PATH=/nonexistent,
+# cwd in tmp_path), and `m` touches nothing but the marks file.
+
+SUBSTITUTION_LINES = 300
+OPENER = "\x01"  # placeholder: the first character of the substitution
+MARKER = "\x02"  # placeholder: replaced by the marker call "m N"
+
+# Word-position templates. Comments say what bash does, for the reader; the
+# test takes the answer from bash, not from these comments.
+SUBSTITUTION_WORDS = [
+    f"{OPENER}$({MARKER})",                       # runs
+    f'"{OPENER}$({MARKER})"',                     # runs
+    f"{OPENER}`{MARKER}`",                        # runs
+    f'"{OPENER}`{MARKER}`"',                      # runs
+    f"'{OPENER}$({MARKER})'",                     # inert: top-level quote
+    f"'{OPENER}`{MARKER}`'",                      # inert
+    f'"\\{OPENER}$({MARKER})"',                   # inert: \$ in "..."
+    f'"\\{OPENER}`{MARKER}\\`"',                  # inert
+    f"$'{OPENER}$({MARKER})'",                    # literal, not proven
+    f"{OPENER}$\\\n({MARKER})",                   # runs (continuation)
+    f'"{OPENER}$\\\n({MARKER})"',                 # runs
+    f"'{OPENER}$\\\n({MARKER})'",                 # inert: no join in '...'
+    f"{OPENER}$\\\n\\\n({MARKER})",               # runs
+    f"{OPENER}<({MARKER})",                       # runs
+    f"{OPENER}<\\\n({MARKER})",                   # runs
+    f"{OPENER}>({MARKER})",                       # runs
+    f"$(( 0 {OPENER}$({MARKER}) ))",              # runs
+    f'"$(( 0 {OPENER}$({MARKER}) ))"',            # runs
+    f"$[ 0 {OPENER}$({MARKER}) ]",                # runs
+    f'"$[ 0 {OPENER}$({MARKER}) ]"',              # runs
+    f"${{v:-{OPENER}$({MARKER})}}",               # runs (v is unset)
+    f'"${{v:-{OPENER}$({MARKER})}}"',             # runs
+    f"\"${{v:-'{OPENER}$({MARKER})'}}\"",         # runs: ' is literal
+    f"\"${{w:+'{OPENER}$({MARKER})'}}\"",         # runs (w is set)
+    f"\"${{v:-'{OPENER}`{MARKER}`'}}\"",          # runs
+    f"\"${{w#'{OPENER}$({MARKER})'}}\"",          # inert: pattern quotes
+    f"\"${{w/'{OPENER}$({MARKER})'/q}}\"",        # inert
+    f"${{v:+{OPENER}$({MARKER})}}",               # does not run
+    f"\"$(p '{OPENER}$({MARKER})')\"",            # nested quote: literal
+]
+# Command-position templates, run before the `p` command on the same line.
+SUBSTITUTION_STATEMENTS = [
+    f"(( 0 {OPENER}$({MARKER}) ))",               # runs
+    f"let 'a[{OPENER}$({MARKER})]'",              # runs (IND3128-03)
+    f"xa='a[{OPENER}$({MARKER})]'; (( xa ))",     # runs
+    f"xa='a[{OPENER}$({MARKER})]'; : $(( xa ))",  # runs
+    f"test -v 'a[{OPENER}$({MARKER})]'",          # runs
+    f"printf -v 'a[{OPENER}$({MARKER})]' q",      # runs
+    f"xa='a[{OPENER}$({MARKER})]'; [[ xa -eq 1 ]]",  # runs
+    f": '{OPENER}$({MARKER})'",                   # inert
+    f"let {OPENER}$'a[\\x24({MARKER})]'",         # runs: escapes decoded
+]
+SUBSTITUTION_HEREDOCS = [
+    f"p <<'EOF'\n{OPENER}$({MARKER})\nEOF",       # inert: quoted body
+    f"p <<EOF\n{OPENER}$({MARKER})\nEOF",         # runs
+    f"p <<E\\\nOF\n{OPENER}$({MARKER})\nEOF",     # runs: EOF is unquoted
+    f"p <<EOF\n{OPENER}$\\\n({MARKER})\nEOF",     # runs
+    f"p <<\"EOF\"\nq {OPENER}`{MARKER}`\nEOF",    # inert
+    f"p <<EOF\n${{v:-'{OPENER}$({MARKER})'}}\nEOF",   # runs: ' is literal
+    f"p <<EOF\n${{w#'{OPENER}$({MARKER})'}}\nEOF",    # inert: pattern quotes
+]
+
+SUBSTITUTION_PRELUDE = (
+    "set -f\n"
+    "exec 3>>marks.txt\n"
+    "p() { :; }\n"
+    "m() { printf '%s\\n' \"$1\" >&3; }\n"
+    "unset v\n"
+    "w=set\n"
+)
+
+
+def _fill(template: str, prefix: str, marker: int) -> tuple[str, int]:
+    """Return (text, opener index in prefix + text) for one template."""
+    opener = template.index(OPENER)
+    text = template.replace(OPENER, "", 1).replace(MARKER, f"m {marker}", 1)
+    return text, len(prefix) + opener
+
+
+def _substitution_line(rng: random.Random, first_marker: int) -> tuple[str, list[tuple[int, int]]]:
+    """One generated line and its (marker, opener index) pairs."""
+    markers: list[tuple[int, int]] = []
+    marker = first_marker
+    if rng.random() < 0.12:
+        text, opener = _fill(rng.choice(SUBSTITUTION_HEREDOCS), "", marker)
+        return text, [(marker, opener)]
+    line = ""
+    if rng.random() < 0.25:
+        text, opener = _fill(rng.choice(SUBSTITUTION_STATEMENTS), line, marker)
+        markers.append((marker, opener))
+        marker += 1
+        line += text + "; "
+    line += "p"
+    for _ in range(rng.randint(0, 3)):
+        line += " "
+        if rng.random() < 0.3:
+            line += "".join(rng.choice("qxz019") for _ in range(rng.randint(1, 3)))
+            continue
+        text, opener = _fill(rng.choice(SUBSTITUTION_WORDS), line, marker)
+        markers.append((marker, opener))
+        marker += 1
+        line += text
+    if rng.random() < 0.15:
+        text, opener = _fill(f" # {OPENER}$({MARKER})", line, marker)  # comment
+        markers.append((marker, opener))
+        line += text
+    return line, markers
+
+
+def _substitution_corpus() -> list[tuple[str, list[tuple[int, int]]]]:
+    rng = random.Random(SEED + 5)
+    corpus = []
+    next_marker = 1
+    for _ in range(SUBSTITUTION_LINES):
+        line, markers = _substitution_line(rng, next_marker)
+        next_marker += len(markers) + 1
+        corpus.append((line, markers))
+    return corpus
+
+
+def _lookalikes_by_original_index(line: str) -> dict[int, "bash_security._Lookalike"]:
+    joined = bash_security._join_line_continuations(line)
+    assert joined.complete, line
+    return {
+        joined.origin[item.start]: item
+        for item in bash_security._substitution_lookalikes(joined.text)
+    }
+
+
+def test_substitutions_bash_runs_are_never_proven_inert(tmp_path: Path):
+    bash = _require_bash()
+    corpus = _substitution_corpus()
+    script = tmp_path / "substitutions.sh"
+    script.write_text(
+        SUBSTITUTION_PRELUDE + "".join(line + "\n" for line, _ in corpus),
+        encoding="utf-8",
+    )
+    start = time.perf_counter()
+    proc = subprocess.run(
+        [bash, "--norc", "--noprofile", str(script)],
+        capture_output=True, timeout=20, cwd=tmp_path,
+        env={"PATH": "/nonexistent", "LC_ALL": "C"},
+    )
+    # Arithmetic on literal apostrophes is an expansion error in bash; it
+    # aborts only that line. Anything else on stderr is a generator bug.
+    for message in proc.stderr.decode(errors="replace").splitlines():
+        assert "syntax error" in message and "error token" in message, message
+    ran = {int(n) for n in (tmp_path / "marks.txt").read_text().split()}
+
+    inert_seen = ran_seen = 0
+    for line, markers in corpus:
+        lookalikes = _lookalikes_by_original_index(line)
+        for marker, opener in markers:
+            lookalike = lookalikes.get(opener)
+            assert lookalike is not None, (line, marker, opener)
+            if marker in ran:
+                ran_seen += 1
+                assert not lookalike.inert, f"bash ran marker {marker} in {line!r}"
+            inert_seen += lookalike.inert
+        if any(marker in ran for marker, _ in markers):
+            assert not check_bash_command(line).safe, f"allowed, but bash ran: {line!r}"
+    # The corpus exercises both sides of the property.
+    assert ran_seen >= 150, ran_seen
+    assert inert_seen >= 40, inert_seen
+    assert time.perf_counter() - start < 20
+
+
+def test_substitution_corpus_exercises_every_template():
+    corpus = "\n".join(line for line, _ in _substitution_corpus())
+    for template in SUBSTITUTION_WORDS + SUBSTITUTION_STATEMENTS + SUBSTITUTION_HEREDOCS:
+        head = template.split(MARKER)[0].replace(OPENER, "")
+        assert head in corpus, template

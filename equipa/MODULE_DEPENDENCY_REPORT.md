@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **57 Python modules** totaling **43,020 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **57 Python modules** totaling **43,500 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -16,7 +16,7 @@ The `equipa/` package contains **57 Python modules** totaling **43,020 lines** o
 |---|---:|:---:|---|---|---:|
 | `abort_controller.py` | 218 | L0 | — | — | 3 |
 | `agent_launcher.py` | 479 | L0 | — | — | 13 |
-| `bash_security.py` | 3477 | L0 | — | — | 5 |
+| `bash_security.py` | 3954 | L0 | — | — | 5 |
 | `classifier.py` | 167 | L0 | — | — | 3 |
 | `constants.py` | 337 | L0 | — | — | 67 |
 | `env_loader.py` | 315 | L0 | — | `config.py` | 8 |
@@ -34,7 +34,7 @@ The `equipa/` package contains **57 Python modules** totaling **43,020 lines** o
 | `scaffold.py` | 633 | L0 | — | `db.py` | 8 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
-| `config.py` | 512 | L1 | `constants.py` | — | 23 |
+| `config.py` | 515 | L1 | `constants.py` | — | 23 |
 | `db.py` | 798 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
 | `hooks/__init__.py` | 441 | L1 | `hooks/dispatcher.py` | `config.py`, `env_loader.py` | 17 |
 | `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
@@ -72,7 +72,7 @@ The `equipa/` package contains **57 Python modules** totaling **43,020 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 43,020 lines | 778 public exports
+**Total:** 43,500 lines | 778 public exports
 
 ## Modules by Layer
 
