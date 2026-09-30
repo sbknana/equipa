@@ -85,7 +85,6 @@ def test_uncounted_finding_form_blocks_under_zero_footer(
         "6. **High value (2-4 hr):** replace Test 1.",
         "**The reported HIGH is fixed, and fixed in depth.**",
         "- **Why not MEDIUM:** the primitive is unreachable.",
-        "- **Severity:** HIGH is not reachable from this diff.",
     ],
 )
 def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
@@ -96,6 +95,29 @@ def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
     )
 
     assert _analyze_review_file(review).verdict == REVIEW_VERDICT_OK
+
+
+def test_severity_field_under_zero_footer_now_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """gate-06: a ``Severity:`` field is a finding form, whatever follows it.
+
+    Task #3038 treated "**Severity:** HIGH" as prose because it assumed an
+    enclosing heading carried the severity. A "### Finding 1" heading with
+    no severity plus this field merged a HIGH behind a zero footer, so the
+    field is counted now and the reviewer prompt forbids severity words in
+    it. Exempting "HIGH is not ..." would let "HIGH exploitable ..." through.
+    """
+    review = _write_review(
+        tmp_path,
+        TITLE + BODY + "- **Severity:** HIGH is not reachable from this diff.\n"
+        + ZERO_FOOTER,
+    )
+
+    analysis = _analyze_review_file(review)
+
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert "HIGH=1" in analysis.detail
 
 
 def test_fix_review_title_naming_upstream_finding_is_not_a_candidate(

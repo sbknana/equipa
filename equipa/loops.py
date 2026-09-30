@@ -935,10 +935,11 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 # count-mismatch (fail closed). A candidate whose title span ends in the
 # strict resolved status (_RESOLVED_FINDING_HEADER_RE) is ADDED to the
 # merge counts, exactly like a resolved level-3 heading (IR38-01).
-# Not candidates: checklist boxes ("- [x] XSS: PASS"), bold
-# prose ("**No CRITICAL or HIGH findings.**", "**Medium (30 min):**") and a
-# severity after the bold span ("**Severity:** HIGH"), which belongs to an
-# enclosing heading that is itself a candidate.
+# Not candidates: checklist boxes ("- [x] XSS: PASS") and bold prose
+# ("**No CRITICAL or HIGH findings.**", "**Medium (30 min):**"). A
+# severity after the bold span ("**Severity:** HIGH") is not matched HERE;
+# gate-06 found its heading need not carry a severity ("### Finding 1"),
+# so _SEVERITY_FIELD_RE below counts it.
 # An unbracketed tag ("S1", "SR29-00", "RT-01") is matched only up to its
 # FIRST digit; the lazy [^*\n]*? covers the rest. Spelling the tail out as
 # "\d+[\w-]*" matched the same lines but let three overlapping quantifiers
