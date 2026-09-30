@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
@@ -65,6 +66,12 @@ from equipa.git_ops import (
     pinned_git_env,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
+from equipa.merge_safety import (
+    MergeSignalShield,
+    main_checkout_dirty_reason,
+    report_leftover_dispatch_state,
+    shutdown_requested,
+)
 from equipa.merge_integrity import (
     DefaultBranchGuard,
     MergeAttempt,
@@ -2053,6 +2060,19 @@ async def _merge_task_branch(
             print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
             record.reason = f"no trusted merge target: {exc}"
             return False
+        # dispatch-06 (task #3112): never stash the operator's uncommitted
+        # work to make room for a merge. The old stash / merge / stash-pop
+        # sequence stranded the edits in `git stash` when the orchestrator
+        # was killed in between. A dirty main checkout is refused instead.
+        dirty_reason = await main_checkout_dirty_reason(project_dir)
+        if dirty_reason:
+            print(
+                f"  [Isolation] Merge REFUSED for task #{task_id}: "
+                f"{dirty_reason}"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = f"main checkout is not clean: {dirty_reason}"
+            return False
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
         )
@@ -2137,161 +2157,160 @@ async def _merge_task_branch(
             f"{commits_ahead} commit(s) to merge"
         )
 
-        stash_result = await git_run_async(
-            ["stash"], project_dir, timeout=30,
+        merge_result = await git_run_async(
+            ["merge", "--no-edit", "-m",
+             f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})",
+             target_sha],
+            project_dir, timeout=60,
         )
-        had_stash = "Saved working directory" in stash_result.stdout
+        post_head_res = await git_run_async(
+            ["rev-parse", "HEAD"], project_dir, timeout=10,
+        )
+        post_head = post_head_res.stdout.strip()
 
-        try:
-            merge_result = await git_run_async(
-                ["merge", "--no-edit", "-m",
-                 f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})",
-                 target_sha],
-                project_dir, timeout=60,
-            )
-            post_head_res = await git_run_async(
-                ["rev-parse", "HEAD"], project_dir, timeout=10,
-            )
-            post_head = post_head_res.stdout.strip()
-
-            if merge_result.returncode == 0 and post_head != pre_head:
-                print(
-                    f"  [Isolation] Merged task #{task_id} into main "
-                    f"({pre_head[:8]} -> {post_head[:8]})"
-                )
-                record.merged_sha = target_sha
-                record.post_head = post_head
-                return True
-            if merge_result.returncode == 0 and post_head == pre_head:
-                print(
-                    f"  [Isolation] WARNING: Merge returned 0 for task "
-                    f"#{task_id} but HEAD unchanged ({pre_head[:8]})"
-                )
-                print(
-                    f"  [Isolation] Merge output: "
-                    f"{_git_output(merge_result)}"
-                )
-                record.reason = "merge returned 0 but the default branch did not move"
-                return False
-
-            # dispatch-17: git reports conflicts on stdout, so log both.
-            merge_output = _git_output(merge_result)
+        if merge_result.returncode == 0 and post_head != pre_head:
             print(
-                f"  [Isolation] Merge of task #{task_id} failed "
-                f"(rc={merge_result.returncode}): {merge_output}"
+                f"  [Isolation] Merged task #{task_id} into main "
+                f"({pre_head[:8]} -> {post_head[:8]})"
             )
-            await git_run_async(
-                ["merge", "--abort"], project_dir, timeout=15,
+            record.merged_sha = target_sha
+            record.post_head = post_head
+            return True
+        if merge_result.returncode == 0 and post_head == pre_head:
+            print(
+                f"  [Isolation] WARNING: Merge returned 0 for task "
+                f"#{task_id} but HEAD unchanged ({pre_head[:8]})"
             )
+            print(
+                f"  [Isolation] Merge output: "
+                f"{_git_output(merge_result)}"
+            )
+            record.reason = "merge returned 0 but the default branch did not move"
+            return False
 
-            # dispatch-08: rebase the pinned commit onto the default branch in
-            # the task's OWN worktree, then fast-forward the default branch
-            # from the main checkout. The old in-place `rebase HEAD <branch>`
-            # checked the task branch out here and then merged it into itself
-            # ("Already up to date", rc 0), reporting a merge that never
-            # happened.
-            if not worktree_dir:
-                print(
-                    f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_output} (no task worktree to rebase in)"
-                )
-                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                record.reason = f"merge conflict: {merge_output}"
-                return False
-            wt_branch = await git_run_async(
-                ["branch", "--show-current"], worktree_dir, timeout=10,
+        # dispatch-17: git reports conflicts on stdout, so log both.
+        merge_output = _git_output(merge_result)
+        print(
+            f"  [Isolation] Merge of task #{task_id} failed "
+            f"(rc={merge_result.returncode}): {merge_output}"
+        )
+        await git_run_async(
+            ["merge", "--abort"], project_dir, timeout=15,
+        )
+        if shutdown_requested() is not None:
+            # dispatch-06: the operator asked the orchestrator to stop; do
+            # not start the rebase fallback on the way out.
+            print(
+                f"  [Isolation] Merge of task #{task_id} aborted: shutdown "
+                f"requested; rebase fallback skipped"
             )
-            wt_head = await git_run_async(
-                ["rev-parse", "HEAD"], worktree_dir, timeout=10,
-            )
-            if (
-                wt_branch.stdout.strip() != branch_name
-                or wt_head.stdout.strip() != target_sha
-            ):
-                print(
-                    f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_output}; worktree {worktree_dir} is on "
-                    f"'{wt_branch.stdout.strip() or 'DETACHED'}' at "
-                    f"{wt_head.stdout.strip()[:12] or 'unknown'}, not "
-                    f"'{branch_name}' at {target_sha[:12]} — not rebasing"
-                )
-                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                record.reason = (
-                    f"merge conflict; worktree not at the approved commit: "
-                    f"{merge_output}"
-                )
-                return False
-            rebase_result = await git_run_async(
-                ["rebase", pre_head], worktree_dir, timeout=60,
-            )
-            if rebase_result.returncode != 0:
-                await git_run_async(
-                    ["rebase", "--abort"], worktree_dir, timeout=15,
-                )
-                print(
-                    f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_output}; rebase onto {pre_head[:8]} also failed: "
-                    f"{_git_output(rebase_result)}"
-                )
-                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                record.reason = f"merge and rebase conflict: {merge_output}"
-                return False
-            rebased = await git_run_async(
-                ["rev-parse", "HEAD"], worktree_dir, timeout=10,
-            )
-            rebased_sha = rebased.stdout.strip()
-            # MI-03 (task #3116): the worktree HEAD is agent-writable, so the
-            # SHA read above is only merged once its range is verified to be
-            # exactly the approved commits; from here on only that SHA is used.
-            range_problem = await rebased_range_problem(
-                project_dir, pre_head, target_sha, rebased_sha,
-            )
-            if range_problem:
-                print(
-                    f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_output}; rebased {rebased_sha[:12] or 'unknown'} "
-                    f"is not the approved commits: {range_problem}"
-                )
-                print(f"  [Isolation] Branch '{branch_name}' PRESERVED (rebased)")
-                record.reason = (
-                    f"rebased commits are not the approved commits: {range_problem}"
-                )
-                return False
-            fast_forward = await git_run_async(
-                ["merge", "--ff-only", rebased_sha], project_dir, timeout=60,
-            )
-            ff_head_res = await git_run_async(
-                ["rev-parse", "HEAD"], project_dir, timeout=10,
-            )
-            ff_head = ff_head_res.stdout.strip()
-            if (
-                fast_forward.returncode == 0
-                and rebased_sha
-                and ff_head == rebased_sha
-                and ff_head != pre_head
-            ):
-                print(
-                    f"  [Isolation] Merged task #{task_id} after rebase "
-                    f"({pre_head[:8]} -> {ff_head[:8]}, rebased from "
-                    f"{target_sha[:8]})"
-                )
-                record.merged_sha = rebased_sha
-                record.post_head = ff_head
-                return True
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = f"merge interrupted by shutdown: {merge_output}"
+            return False
+
+        # dispatch-08: rebase the pinned commit onto the default branch in
+        # the task's OWN worktree, then fast-forward the default branch
+        # from the main checkout. The old in-place `rebase HEAD <branch>`
+        # checked the task branch out here and then merged it into itself
+        # ("Already up to date", rc 0), reporting a merge that never
+        # happened.
+        if not worktree_dir:
             print(
                 f"  [Isolation] Merge FAILED for task #{task_id}: "
-                f"fast-forward to rebased {rebased_sha[:8] or 'unknown'} did "
-                f"not move '{default_branch}' ({pre_head[:8]} -> "
-                f"{ff_head[:8]}): {_git_output(fast_forward)}"
+                f"{merge_output} (no task worktree to rebase in)"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = f"merge conflict: {merge_output}"
+            return False
+        wt_branch = await git_run_async(
+            ["branch", "--show-current"], worktree_dir, timeout=10,
+        )
+        wt_head = await git_run_async(
+            ["rev-parse", "HEAD"], worktree_dir, timeout=10,
+        )
+        if (
+            wt_branch.stdout.strip() != branch_name
+            or wt_head.stdout.strip() != target_sha
+        ):
+            print(
+                f"  [Isolation] Merge FAILED for task #{task_id}: "
+                f"{merge_output}; worktree {worktree_dir} is on "
+                f"'{wt_branch.stdout.strip() or 'DETACHED'}' at "
+                f"{wt_head.stdout.strip()[:12] or 'unknown'}, not "
+                f"'{branch_name}' at {target_sha[:12]} — not rebasing"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = (
+                f"merge conflict; worktree not at the approved commit: "
+                f"{merge_output}"
+            )
+            return False
+        rebase_result = await git_run_async(
+            ["rebase", pre_head], worktree_dir, timeout=60,
+        )
+        if rebase_result.returncode != 0:
+            await git_run_async(
+                ["rebase", "--abort"], worktree_dir, timeout=15,
+            )
+            print(
+                f"  [Isolation] Merge FAILED for task #{task_id}: "
+                f"{merge_output}; rebase onto {pre_head[:8]} also failed: "
+                f"{_git_output(rebase_result)}"
+            )
+            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+            record.reason = f"merge and rebase conflict: {merge_output}"
+            return False
+        rebased = await git_run_async(
+            ["rev-parse", "HEAD"], worktree_dir, timeout=10,
+        )
+        rebased_sha = rebased.stdout.strip()
+        # MI-03 (task #3116): the worktree HEAD is agent-writable, so the
+        # SHA read above is only merged once its range is verified to be
+        # exactly the approved commits; from here on only that SHA is used.
+        range_problem = await rebased_range_problem(
+            project_dir, pre_head, target_sha, rebased_sha,
+        )
+        if range_problem:
+            print(
+                f"  [Isolation] Merge FAILED for task #{task_id}: "
+                f"{merge_output}; rebased {rebased_sha[:12] or 'unknown'} "
+                f"is not the approved commits: {range_problem}"
             )
             print(f"  [Isolation] Branch '{branch_name}' PRESERVED (rebased)")
-            record.reason = "fast-forward after rebase did not move the default branch"
+            record.reason = (
+                f"rebased commits are not the approved commits: {range_problem}"
+            )
             return False
-        finally:
-            if had_stash:
-                await git_run_async(
-                    ["stash", "pop"], project_dir, timeout=30,
-                )
+        fast_forward = await git_run_async(
+            ["merge", "--ff-only", rebased_sha], project_dir, timeout=60,
+        )
+        ff_head_res = await git_run_async(
+            ["rev-parse", "HEAD"], project_dir, timeout=10,
+        )
+        ff_head = ff_head_res.stdout.strip()
+        if (
+            fast_forward.returncode == 0
+            and rebased_sha
+            and ff_head == rebased_sha
+            and ff_head != pre_head
+        ):
+            print(
+                f"  [Isolation] Merged task #{task_id} after rebase "
+                f"({pre_head[:8]} -> {ff_head[:8]}, rebased from "
+                f"{target_sha[:8]})"
+            )
+            record.merged_sha = rebased_sha
+            record.post_head = ff_head
+            return True
+        print(
+            f"  [Isolation] Merge FAILED for task #{task_id}: "
+            f"fast-forward to rebased {rebased_sha[:8] or 'unknown'} did "
+            f"not move '{default_branch}' ({pre_head[:8]} -> "
+            f"{ff_head[:8]}): {_git_output(fast_forward)}"
+        )
+        print(f"  [Isolation] Branch '{branch_name}' PRESERVED (rebased)")
+        record.reason = "fast-forward after rebase did not move the default branch"
+        return False
     except (subprocess.SubprocessError, OSError) as e:
         # Explicit error log — do NOT silently swallow. Branch is preserved
         # because we did not add it to the merged set.
@@ -2736,6 +2755,21 @@ async def _gated_merge_task(
 
     if not await guard.verify(f"pre-merge task={task_id}", task_id=task_id):
         return finish("blocked", guard.alert or "default branch moved")
+    shutdown_signal = shutdown_requested()
+    if shutdown_signal is not None:
+        # dispatch-06: a SIGTERM/SIGINT deferred during an earlier merge
+        # stops every later merge; the branch is kept for the operator.
+        reason = (
+            f"orchestrator shutting down "
+            f"({signal.Signals(shutdown_signal).name}); merge not started"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=shutdown-requested "
+            f"branch={branch}",
+            task_id=task_id,
+            event="merge-skipped",
+        )
+        return finish("merge_failed", reason)
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
         f"sha={merge_sha or 'MISSING'} doc_only={decision.doc_only} "
@@ -2748,13 +2782,16 @@ async def _gated_merge_task(
         # expect_artifact is DERIVED from the ground-truth decision, never a
         # caller flag. Doc-only diffs (re-derived from the real diff) skip
         # the artifact requirement; everything else demands it fail-closed.
-        merged = await _merge_task_branch(
-            project_dir, task_id, branch,
-            expect_artifact=decision.expect_artifact,
-            merge_sha=merge_sha,
-            worktree_dir=worktree_dir,
-            merge_record=attempt,
-        )
+        # dispatch-06: SIGTERM/SIGINT are deferred for the merge, so it
+        # finishes or is aborted before the orchestrator acts on them.
+        async with MergeSignalShield(project_dir, context=f"merge of {branch}"):
+            merged = await _merge_task_branch(
+                project_dir, task_id, branch,
+                expect_artifact=decision.expect_artifact,
+                merge_sha=merge_sha,
+                worktree_dir=worktree_dir,
+                merge_record=attempt,
+            )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-blocked detail={exc}",
@@ -3035,6 +3072,9 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
     use_worktrees = _is_git_repo(project_dir)
+    if use_worktrees:
+        # dispatch-06: surface what earlier runs left behind (report only).
+        await report_leftover_dispatch_state(project_dir)
     # dispatch-03 / gate-12 (task #3111): pin the default branch BEFORE any
     # agent runs. From here on only the orchestrator's own merges may move
     # it; anything else trips the guard and nothing further is merged.

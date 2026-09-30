@@ -48,6 +48,10 @@ from equipa.merge_integrity import (
     MergeIntegrityError,
     MergeOutcome,
 )
+from equipa.merge_safety import (
+    exit_if_shutdown_requested,
+    report_leftover_dispatch_state,
+)
 from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
@@ -2197,6 +2201,9 @@ def main() -> None:
         while True:
             try:
                 asyncio.run(async_main())
+                # dispatch-06: a signal deferred during a merge ends the loop
+                # here, after the run finished its merge and bookkeeping.
+                exit_if_shutdown_requested()
                 task_count += 1
                 print(f"\n{'='*60}")
                 print(f"Task complete ({task_count} so far). Checking for more...")
@@ -2225,3 +2232,4 @@ def main() -> None:
     else:
         # Single task or parallel tasks mode: run once
         asyncio.run(async_main())
+        exit_if_shutdown_requested()
