@@ -339,9 +339,13 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"\b(?:run|execute)\s+(?:this|the\s+following)\s*(?:commands?\b|:)|"
             # An imperative "Execute this script", but not "CI will execute
-            # this script" or "cannot run this code" (commit ef40ff5).
+            # this script" or "cannot run this code" (commit ef40ff5). The
+            # gap after the start token is horizontal whitespace only: "\s*"
+            # there overlaps the "\n" start class, so every newline in a run
+            # started an attempt that ate the rest of the run and backtracked
+            # (23 s on 60k newlines, review N1 of task 3129).
             r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|first|and|just|"
-            r"immediately)\b)\s*execute\s+(?:this|these|the\s+following)\s+"
+            r"immediately)\b)[ \t]*execute\s+(?:this|these|the\s+following)\s+"
             r"(?:[\w-]+\s+)?(?:scripts?|code|snippets?|payloads?|programs?)\b|"
             r"\bpipe\s+(?:this|the\s+output)\s+to\b",
             re.IGNORECASE,
