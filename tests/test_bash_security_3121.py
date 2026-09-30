@@ -336,11 +336,20 @@ DESYNC_WORDS = {
 
 
 def _desync_variants(command: str) -> list[str]:
-    """The desync word chained before *command*, and (for a plain first
-    word) inserted as the first argument, the reviewer's probe shape."""
-    variants = [
-        f"echo {word} && {command}" for word in DESYNC_WORDS.values()
-    ]
+    """Variants of *command* with a desync word in front of it.
+
+    * ``<first> WORD <rest>``: the word as the first argument (the review's
+      probe shape), when the first word is plain.
+    * ``echo WORD <command>``: the whole case becomes echo's arguments, so
+      its substitutions and redirects still run. Check 4 blocks ``$'...'``
+      except in an ``echo`` without ``|&;``, so this is the form that
+      reached checks 8 and 10 before task 3128.
+    * ``echo WORD && <command>``: chained.
+    """
+    variants = []
+    for word in DESYNC_WORDS.values():
+        variants.append(f"echo {word} {command}")
+        variants.append(f"echo {word} && {command}")
     first, _, rest = command.partition(" ")
     if rest and first.isidentifier():
         variants += [f"{first} {word} {rest}" for word in DESYNC_WORDS.values()]
@@ -372,6 +381,8 @@ DESYNC_BYPASSES = sorted({
     # its "body" is live code, and the inert-heredoc strip must not hide it.
     "cat $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF\n#'",
     "cat $'\\' <<'EOF'\n'; echo x >> /tmp/../etc/zz-fake #\nEOF\n#'",
+    "cat $'\\' <<'EOF'\n'; echo $(touch /tmp/zz-sentinel) #\nEOF\n\\'",
+    "cat $'\\' <<'EOF'\n' > /tmp/../etc/zz-fake #\nEOF\n\\'",
 })
 
 
