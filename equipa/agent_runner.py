@@ -3193,6 +3193,16 @@ async def dispatch_agent(
         provider = get_provider(role, dispatch_config)
 
     if provider == "ollama" and system_prompt and project_dir:
+        # R3136-01: Ollama tool calls run in-process as the orchestrator user,
+        # never through the isolated launcher, so the flag refuses them.
+        refusal = isolation.unisolated_spawn_refusal(
+            "Ollama agent", isolation.OLLAMA_REFUSAL_REMEDY,
+            action=isolation.OLLAMA_REFUSAL_ACTION)
+        if refusal:
+            refused = _dispatch_refused_result(AgentDispatchRefused(refusal))
+            refused["result"] = "blocked"
+            refused["result_text"] = f"RESULT: blocked\nBLOCKERS: {refusal}"
+            return refused
         from ollama_agent import run_ollama_agent
         model = get_ollama_model(role, dispatch_config)
         base_url = get_ollama_base_url(dispatch_config)

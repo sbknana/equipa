@@ -348,19 +348,28 @@ def isolation_enabled(dispatch_config: Mapping[str, Any] | None = None) -> bool:
 
 def unisolated_spawn_refusal(
         purpose: str,
-        remedy: str = "turn off rlm_decompose or agent_isolation") -> str | None:
+        remedy: str = "turn off rlm_decompose or agent_isolation",
+        *, action: str = "start the Claude CLI") -> str | None:
     """Why ``purpose`` must not start the CLI itself, or None.
 
     Helpers that run ``claude`` directly (RLM decomposition, the ForgeSmith
     GHOST scout, OPRO and SIMBA) would run it as the orchestrator's user,
     outside the agent cgroup, on text agents wrote (reviews CT-04, ISO-06).
-    With isolation on they refuse instead.
+    The Ollama provider runs the model's shell commands in-process the same
+    way (review R3136-01); ``action`` names what the path would do. With
+    isolation on they refuse instead.
     """
     if not isolation_enabled():
         return None
     return (f"{purpose} refused: agent_isolation is on and this path would "
-            f"start the Claude CLI as the orchestrator's user outside the "
+            f"{action} as the orchestrator's user outside the "
             f"agent sandbox; {remedy}")
+
+
+# What the Ollama provider would do unsandboxed, and how to avoid the refusal.
+OLLAMA_REFUSAL_ACTION = "run the model's shell commands"
+OLLAMA_REFUSAL_REMEDY = ("use the Claude provider for every role, or turn off "
+                         "agent_isolation")
 
 
 def worktree_execution_refusal(action: str) -> str | None:
