@@ -1063,6 +1063,63 @@ def test_verify_script_reports_failures_for_an_unisolated_user(
     assert not list(git_dir.iterdir())
 
 
+def _verification_config(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "exchange").mkdir(exist_ok=True)
+    monkeypatch.setattr(isolation, "get_active_dispatch_config", lambda: {
+        "features": {"agent_isolation": True},
+        "agent_isolation": {"exchange_dir": str(tmp_path / "exchange")}})
+    monkeypatch.setattr(isolation, "THEFORGE_DB", tmp_path / "missing.db")
+
+
+@pytest.mark.parametrize("rule_status, probe_output, expected", [
+    (0, "PASS a\nRESULT: PASS\n", 0),
+    (0, "FAIL agent can read x\nRESULT: FAIL (1 failed)\n", 1),
+    (1, "PASS a\nRESULT: PASS\n", 1),   # sudoers rule missing
+])
+def test_verification_entry_point_exit_codes(tmp_path: Path, monkeypatch, capsys,
+                                             rule_status, probe_output,
+                                             expected) -> None:
+    _verification_config(tmp_path, monkeypatch)
+    seen = {}
+    monkeypatch.setattr(isolation, "_exit_status", lambda argv: rule_status)
+
+    async def fake_probe(command, config):
+        seen["command"], seen["config"] = command, config
+        return probe_output
+
+    monkeypatch.setattr(isolation, "_run_probe", fake_probe)
+    status = isolation.verification_main(["--verify-probe", str(VERIFY_SCRIPT)])
+    assert status == expected
+    # The probe replaces the CLI, so it runs through the real launch path.
+    assert seen["config"]["agent_isolation"]["claude_executable"] == \
+        str(VERIFY_SCRIPT)
+    assert seen["command"][1] == "--inside"
+    if rule_status:
+        assert "EQUIPA_AGENT_LAUNCH" in capsys.readouterr().out
+
+
+def test_verification_entry_point_reports_refusal(tmp_path: Path, monkeypatch,
+                                                  capsys) -> None:
+    _verification_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+
+    async def refused(*args, **kwargs):
+        raise isolation.AgentIsolationError("agent user 'equipa-agent' does "
+                                            "not exist")
+
+    monkeypatch.setattr(isolation, "spawn_isolated_agent", refused)
+    status = isolation.verification_main(["--verify-probe", str(VERIFY_SCRIPT)])
+    assert status == 2
+    assert "isolation could not be established" in capsys.readouterr().out
+
+
+def test_verification_entry_point_refuses_root(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(isolation.os, "geteuid", lambda: 0)
+    assert isolation.verification_main(
+        ["--verify-probe", str(VERIFY_SCRIPT)]) == 2
+    assert "not root" in capsys.readouterr().out
+
+
 def test_verify_script_refuses_root_outer_mode() -> None:
     text = VERIFY_SCRIPT.read_text()
     assert 'if [ "$(id -u)" -eq 0 ]; then' in text
