@@ -465,6 +465,12 @@ FALSE_POSITIVE_TABLE = [
     ("cp file{,.bak}", "echo {1..99999999}"),
     # Process substitution of read-only commands / of a download.
     ("diff <(sort a) <(sort b)", f"diff <({PAYLOAD}) b"),
+    # Task 3133: substitution text that is proven inert / that bash runs.
+    ("grep -rn '\\$(' equipa/", f"echo $\\\n({PAYLOAD})"),
+    ('echo "\\$(id) is literal"', f"echo \"${{UNSET:-'$({PAYLOAD})'}}\""),
+    ("awk '{print $(NF)}' data/in.txt", f"let 'a[$({PAYLOAD})]'"),
+    ('echo "$((1 + 2))"', f"echo \"$(( '$({PAYLOAD})' ))\""),
+    ("cd tests && ls > out.txt", "cd /etc; echo x > zz-fake"),
 ]
 
 
