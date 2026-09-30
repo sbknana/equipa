@@ -210,18 +210,41 @@ def test_shipped_example_equipa_server_is_isolated():
 PLANTED_CLI_MARKER = "PLANTED-3127-equipa-cli"
 
 
-def _resolve_module_origin(module: str, cwd: str | None) -> str:
-    """Where ``python -m <module>`` started in ``cwd`` would load it from.
+def _resolve_module_origin(module: str, cwd: str | None,
+                           flags: tuple[str, ...] = (),
+                           env: dict[str, str] | None = None) -> str:
+    """Where ``python <flags> -m <module>`` started in ``cwd`` loads it from.
 
-    ``-c`` puts the cwd first on sys.path exactly as ``-m`` does, so the
-    spec origin printed here is the file ``-m`` would run.
+    ``-c`` puts the cwd first on sys.path exactly as ``-m`` does (and ``-P``
+    suppresses it for both), so the spec origin printed here is the file
+    ``-m`` would run.
     """
     probe = ("import importlib.util, sys; "
              f"print(importlib.util.find_spec({module!r}).origin)")
     completed = subprocess.run(
-        [sys.executable, "-c", probe], cwd=cwd, capture_output=True,
-        text=True, timeout=60, env={"PATH": "/usr/bin:/bin"}, check=True)
+        [sys.executable, *flags, "-c", probe], cwd=cwd, capture_output=True,
+        text=True, timeout=60, check=True,
+        env={"PATH": "/usr/bin:/bin", **(env or {})})
     return completed.stdout.strip()
+
+
+def test_example_isolated_form_loads_the_checkout_from_a_planted_project(
+        planted_project):
+    """The CLI ignores the per-server cwd and starts the server in the
+    project; the example's -P plus absolute PYTHONPATH must still load the
+    trusted checkout's module, not the plant."""
+    example = json.loads((REPO_ROOT / "mcp_config.example.json").read_text(
+        encoding="utf-8"))["mcpServers"]["equipa"]
+    flags = tuple(arg for arg in example["args"][:example["args"].index("-m")])
+    assert flags == ("-P",)
+
+    planted = _resolve_module_origin("equipa.mcp_server", str(planted_project),
+                                     env={"PYTHONPATH": str(REPO_ROOT)})
+    assert planted == str(planted_project / "equipa" / "mcp_server.py")
+    isolated = _resolve_module_origin("equipa.mcp_server", str(planted_project),
+                                      flags=flags,
+                                      env={"PYTHONPATH": str(REPO_ROOT)})
+    assert isolated == str(REPO_ROOT / "equipa" / "mcp_server.py")
 
 
 def test_mcp_dispatch_child_resolves_equipa_cli_from_the_trusted_checkout(
