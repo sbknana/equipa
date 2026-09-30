@@ -731,6 +731,8 @@ def update_task_status(
     task_id: int,
     outcome: str,
     output: list | None = None,
+    *,
+    merged_sha: str | None = None,
 ) -> None:
     """Update task status in TheForge based on dev-test outcome.
 
@@ -740,6 +742,12 @@ def update_task_status(
     Maps outcomes to statuses:
         tests_passed, no_tests -> done
         Everything else (blocked, failed, timeout, no_progress) -> blocked
+
+    ``merged_sha`` (task #3111, dispatch-05) is the task commit the gated
+    merge put on the default branch; it is stored in ``tasks.merged_sha`` so a
+    ``done`` task can be verified against git. A status other than ``done``
+    clears the column. A database not yet migrated to v12 has no such column:
+    the status is still written and a lost SHA is logged loudly.
     """
     from equipa.output import log
 
@@ -760,7 +768,29 @@ def update_task_status(
                 "UPDATE tasks SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?",
                 (new_status, new_status, task_id),
             )
-        log(f"  [DB] Task {task_id}: {current} -> {new_status} (outcome: {outcome})", output)
+            recorded_sha = merged_sha if new_status == "done" else None
+            if recorded_sha is not None or new_status != "done":
+                try:
+                    conn.execute(
+                        "UPDATE tasks SET merged_sha = ? WHERE id = ?",
+                        (recorded_sha, task_id),
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "no such column" not in str(exc):
+                        raise
+                    if recorded_sha is not None:
+                        log(
+                            f"  [DB] WARNING: tasks.merged_sha missing — run "
+                            f"db_migrate.py; task {task_id} merged_sha="
+                            f"{recorded_sha} recorded only in the gate audit",
+                            output,
+                        )
+        sha_note = f", merged_sha={merged_sha[:12]}" if merged_sha else ""
+        log(
+            f"  [DB] Task {task_id}: {current} -> {new_status} "
+            f"(outcome: {outcome}{sha_note})",
+            output,
+        )
     except sqlite3.Error as e:
         # Real logic path (not telemetry) — narrow to sqlite errors only so
         # programmer bugs (KeyError, AttributeError) still surface as crashes.

@@ -29,6 +29,7 @@ from equipa.constants import (
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
 )
+from equipa.git_ops import pinned_git_env
 from equipa.hooks import fire as fire_hook_sync
 
 # --- Compaction Detection Constants ---
@@ -279,6 +280,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
         )
         if diff_result.returncode == 0 and diff_result.stdout.strip():
             return True
@@ -290,6 +292,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
         )
         if status_result.returncode == 0 and status_result.stdout.strip():
             return True
@@ -312,6 +315,7 @@ def get_starting_sha(project_dir: str | None) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -338,6 +342,7 @@ def has_session_commits(
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
         )
         if result.returncode == 0 and result.stdout.strip():
             current_sha = result.stdout.strip()
@@ -376,6 +381,7 @@ def has_branch_commits(project_dir: str | None) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=pinned_git_env(),
             )
             if merge_base.returncode == 0 and merge_base.stdout.strip():
                 base_sha = merge_base.stdout.strip()
@@ -385,6 +391,7 @@ def has_branch_commits(project_dir: str | None) -> bool:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    env=pinned_git_env(),
                 )
                 if log_result.returncode == 0:
                     commits = [
@@ -399,6 +406,7 @@ def has_branch_commits(project_dir: str | None) -> bool:
             capture_output=True,
             text=True,
             timeout=10,
+            env=pinned_git_env(),
         )
         if diff_result.returncode == 0 and diff_result.stdout.strip():
             return True

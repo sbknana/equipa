@@ -1130,12 +1130,15 @@ def _run_git(repo_path: str, args: list[str]) -> str:
     """
     import subprocess
 
+    from equipa.git_ops import pinned_git_env
+
     completed = subprocess.run(
         ["git", "-C", repo_path, *args],
         capture_output=True,
         text=True,
         check=True,
         timeout=30,
+        env=pinned_git_env(),
     )
     return completed.stdout.strip()
 

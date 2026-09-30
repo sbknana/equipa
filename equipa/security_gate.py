@@ -302,6 +302,17 @@ class ReviewerRunRecord:
     run_id: str = ""
     model: str | None = None
     prompt_sha256: str | None = None
+    # gate-01 (task #3111): the commit the reviewer read. ``reviewed_sha`` is
+    # HEAD of the reviewed worktree when the reviewer started and
+    # ``reviewed_sha_end`` when it finished; ``reviewed_tree_clean`` is False
+    # when tracked files differed from that commit (or the repo had a git
+    # hazard), so the review did not cover exactly ``reviewed_sha``. The merge
+    # uses ``reviewed_sha`` itself, never the branch name.
+    reviewed_sha: str | None = None
+    reviewed_sha_end: str | None = None
+    reviewed_branch: str | None = None
+    reviewed_tree_clean: bool = False
+    reviewed_tree_detail: str = ""
 
     def describe_identity(self) -> str:
         """Render as ``reviewer_run=<id> model=<m> prompt_sha256=<16 hex>``."""
@@ -561,6 +572,9 @@ def audit_reviewer_run(record: ReviewerRunRecord) -> None:
         f"attempts={record.attempts} duration={record.duration:.1f}s "
         f"timeouts={timeouts} nonce={record.nonce[:8]} "
         f"{record.describe_identity()} "
+        f"reviewed_sha={(record.reviewed_sha or 'none')[:12]} "
+        f"reviewed_sha_end={(record.reviewed_sha_end or 'none')[:12]} "
+        f"tree_clean={record.reviewed_tree_clean} "
         f"{post.describe() if post is not None else 'artifact=unknown'}"
     )
     if failed:

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,16 @@ from equipa.monitoring import (
 )
 from equipa.output import log
 from equipa.git_ops import git_run_async
+from equipa.merge_integrity import (
+    MergeIntegrityError,
+    ReviewCheckout,
+    TreeSnapshot,
+    create_review_checkout,
+    remove_review_checkout,
+    resolve_commit,
+    review_checkout_problem,
+    snapshot_reviewed_tree,
+)
 from equipa.security_gate import (
     REVIEWER_STATUS_FAILED,
     REVIEWER_STATUS_RUNNING,
@@ -489,12 +500,89 @@ async def run_security_review(
         output,
     )
 
+    # gate-01 (task #3111): pin the commit the reviewer is about to read. The
+    # merge uses this SHA, and refuses if the branch has moved on since.
+    reviewed_tree = await snapshot_reviewed_tree(project_dir)
+    # MI-01 (task #3116): the reviewer reads an orchestrator-made, read-only
+    # checkout of that commit, never the developer's worktree, so the bytes
+    # it reviews are the bytes that are merged, whatever the developer did
+    # to its own index or files. No checkout means no clean review: the
+    # reviewer still runs in the worktree, and the merge is refused.
+    review_checkout: ReviewCheckout | None = None
+    if reviewed_tree.clean and reviewed_tree.sha:
+        try:
+            review_checkout = await create_review_checkout(
+                project_dir, reviewed_tree.sha,
+                label=str(task_id), writable_subdir=ARTIFACTS_DIR_NAME,
+            )
+        except MergeIntegrityError as exc:
+            reviewed_tree = replace(
+                reviewed_tree, clean=False, detail=f"no review checkout: {exc}",
+            )
+    review_dir = str(review_checkout.path) if review_checkout else project_dir
+    log(f"  Reviewing {reviewed_tree.describe()} in {review_dir}", output)
     # Task #3041: fingerprint whatever sits at the artifact path BEFORE the
     # reviewer starts (e.g. a developer self-review committed on the branch)
     # so the gate can reject it if the reviewer never replaces it.
     pre_artifact = fingerprint_artifact(
-        find_review_artifact(project_dir, "SECURITY-REVIEW", task_id),
+        find_review_artifact(review_dir, "SECURITY-REVIEW", task_id),
     )
+    checkout_instructions = (
+        f"The project directory {review_dir} is a read-only checkout of the "
+        f"exact commit under review ({reviewed_tree.sha}, detached HEAD); "
+        f"compare it with the default branch using git (for example "
+        f"`git diff <default-branch>...HEAD`). Only `{ARTIFACTS_DIR_NAME}/` "
+        f"is writable. "
+        if review_checkout else ""
+    )
+    try:
+        return await _run_reviewer_in(
+            review_dir, review_checkout, reviewed_tree, pre_artifact,
+            checkout_instructions,
+            task=task, task_id=task_id, security_task=security_task,
+            review_instructions=review_instructions,
+            original_description=original_description,
+            project_dir=project_dir, project_context=project_context,
+            args=args, sec_turns=sec_turns, sec_model=sec_model,
+            sec_timeout=sec_timeout, max_timeout=max_timeout,
+            max_attempts=max_attempts, output=output,
+            stable_project_dir=stable_project_dir,
+        )
+    finally:
+        if review_checkout is not None:
+            await remove_review_checkout(review_checkout)
+
+
+async def _run_reviewer_in(
+    review_dir: str,
+    review_checkout: ReviewCheckout | None,
+    reviewed_tree: TreeSnapshot,
+    pre_artifact: Any,
+    checkout_instructions: str,
+    *,
+    task: dict,
+    task_id: Any,
+    security_task: dict,
+    review_instructions: str,
+    original_description: str,
+    project_dir: str,
+    project_context: dict,
+    args: Any,
+    sec_turns: int,
+    sec_model: str,
+    sec_timeout: int,
+    max_timeout: int,
+    max_attempts: int,
+    output: Any,
+    stable_project_dir: str | None,
+) -> dict:
+    """Second half of :func:`run_security_review`: run, record, persist.
+
+    ``review_dir`` is where the reviewer works: the orchestrator-made review
+    checkout when there is one (MI-01), else ``project_dir``. The review
+    artifact it writes there is published to ``project_dir``, where the
+    merge gate and the stable-path copy read it.
+    """
     run_started = time.monotonic()
     run_started_wall = time.time()
     # SR41-04 (task #3063): the audit line names which reviewer ran — a run
@@ -520,20 +608,24 @@ async def run_security_review(
             timeouts=tuple(attempt_timeouts),
             run_id=run_id,
             model=sec_model,
+            reviewed_sha=reviewed_tree.sha,
+            reviewed_branch=reviewed_tree.branch,
+            reviewed_tree_clean=reviewed_tree.clean,
+            reviewed_tree_detail=reviewed_tree.detail,
         ))
         security_task["description"] = (
-            f"{review_instructions}{_reviewer_nonce_instructions(nonce)}"
-            f"{original_description}"
+            f"{review_instructions}{checkout_instructions}"
+            f"{_reviewer_nonce_instructions(nonce)}{original_description}"
         )
         sec_prompt = build_system_prompt(
-            security_task, project_context, project_dir,
+            security_task, project_context, review_dir,
             role="security-reviewer",
             dispatch_config=getattr(args, "dispatch_config", None),
             max_turns=sec_turns,
         )
         prompt_sha256 = reviewer_prompt_sha256(str(sec_prompt))
         with build_cli_command(
-            sec_prompt, project_dir, sec_turns, sec_model,
+            sec_prompt, review_dir, sec_turns, sec_model,
             role="security-reviewer",
         ) as sec_cmd:
             sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
@@ -561,7 +653,21 @@ async def run_security_review(
         )
         sec_timeout = retry_timeout
 
-    review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
+    review_path = find_review_artifact(review_dir, "SECURITY-REVIEW", task_id)
+    post_artifact = fingerprint_artifact(review_path)
+    # The task branch at review end: a commit landing during the review is
+    # refused even though the reviewer read the pinned checkout.
+    reviewed_sha_end = await resolve_commit(project_dir, "HEAD")
+    if review_checkout is not None:
+        checkout_problem = await review_checkout_problem(review_checkout)
+        if checkout_problem:
+            reviewed_tree = replace(
+                reviewed_tree, clean=False,
+                detail=f"review checkout changed during review: {checkout_problem}",
+            )
+        review_path = _publish_review_artifact(
+            review_path, project_dir, task_id, output,
+        )
     run_record = ReviewerRunRecord(
         task_id=task_id,
         nonce=nonce,
@@ -571,7 +677,7 @@ async def run_security_review(
         ),
         started_at=run_started_wall,
         pre_artifact=pre_artifact,
-        post_artifact=fingerprint_artifact(review_path),
+        post_artifact=post_artifact,
         attempts=len(attempt_timeouts),
         duration=time.monotonic() - run_started,
         timeouts=tuple(attempt_timeouts),
@@ -582,6 +688,11 @@ async def run_security_review(
         run_id=run_id,
         model=sec_model,
         prompt_sha256=prompt_sha256,
+        reviewed_sha=reviewed_tree.sha,
+        reviewed_sha_end=reviewed_sha_end,
+        reviewed_branch=reviewed_tree.branch,
+        reviewed_tree_clean=reviewed_tree.clean,
+        reviewed_tree_detail=reviewed_tree.detail,
     )
     record_reviewer_run(run_record)
     audit_reviewer_run(run_record)
@@ -705,6 +816,44 @@ async def run_security_review(
         )
 
     return sec_result
+
+
+def _publish_review_artifact(
+    checkout_artifact: Path, project_dir: str, task_id: Any, output: Any = None,
+) -> Path:
+    """Copy the reviewer's artifact from the review checkout to ``project_dir``.
+
+    The merge gate and the stable-path copy read the artifact under
+    ``project_dir``; provenance compares sha256 only, so a byte-exact copy
+    verifies exactly like the original. Whatever sits at the destination is
+    unlinked first and the copy is created exclusively without following a
+    symlink, so a link or FIFO planted there is never written through.
+    Returns the destination path (left untouched when the reviewer wrote
+    nothing: the gate then finds no reviewer output and blocks).
+    """
+    destination = review_artifact_path(project_dir, "SECURITY-REVIEW", task_id)
+    text = read_artifact_text(checkout_artifact)
+    if text is None:
+        return destination
+    try:
+        ensure_artifacts_dir(project_dir)
+        if destination.is_symlink() or destination.exists():
+            destination.unlink()
+        fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o644,
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+    except OSError as exc:
+        # The gate reads a missing or stale file as untrusted and blocks.
+        log(
+            f"  WARNING: could not publish the security review from the review "
+            f"checkout to {destination} ({exc}); the merge gate will block",
+            output,
+        )
+    return destination
 
 
 def _persist_security_review_artifact(
@@ -3218,7 +3367,8 @@ async def run_dev_test_loop(
                         # though the deliverable is on disk. See bug 2263.
                         try:
                             status_result = await git_run_async(
-                                ["status", "--porcelain"], project_dir, timeout=5,
+                                ["status", "--porcelain", "--ignore-submodules=all"],
+                                project_dir, timeout=5,
                             )
                             if status_result.returncode == 0:
                                 md_files = [
