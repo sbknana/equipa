@@ -13,8 +13,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import equipa.constants as _equipa_constants
@@ -54,8 +56,13 @@ from equipa.merge_safety import (
 )
 from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
+    EXIT_DISPATCH_REFUSED,
+    AttemptCleanupError,
+    IsolatedTaskRun,
+    _audit_task_abort,
     _build_dispatch_attempt_reflection,
     _gated_merge_task,
+    _require_task_branch,
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
@@ -68,6 +75,7 @@ from equipa.dispatch import (
     run_auto_dispatch,
     run_parallel_goals,
     run_parallel_tasks,
+    run_task_in_isolation,
     scan_pending_work,
     score_project,
     validate_goals,
@@ -82,6 +90,7 @@ from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
+    ensure_artifacts_dir,
     run_dev_test_loop,
     run_quality_scoring,
     run_security_review,
@@ -1475,11 +1484,20 @@ def _run_task_dry_run(task, project_context, project_dir, args):
         print("\n--- END DRY RUN ---")
 
 
-async def _run_dev_test_mode(task, project_dir, project_context, args):
+async def _run_dev_test_mode(
+    task, project_dir, project_context, args, *, task_branch: str | None = None,
+):
     """Dev+Tester iteration loop (Phase 2) with autoresearch retry.
 
     Handles circuit-breaker demotion and the autoresearch retry/cleanup
-    loop. Returns ``(result, cycles, outcome)``."""
+    loop. Returns ``(result, cycles, outcome)``.
+
+    ``task_branch`` is set when ``project_dir`` is the task's isolation
+    worktree (task #3112): the worktree must be on that branch before every
+    attempt, and a failed attempt is reset to the commit it started from.
+    A reset that fails (:class:`AttemptCleanupError`) stops the retries and
+    leaves the task blocked with outcome ``attempt_cleanup_failed`` instead
+    of crashing with the task stuck in_progress."""
     # Dev+Tester iteration loop (Phase 2) with autoresearch retry
     print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
 
@@ -1489,8 +1507,20 @@ async def _run_dev_test_mode(task, project_dir, project_context, args):
     max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
     retry_count = 0
     attempt_reflections: list[str] = []
+    base_sha: str | None = None
+    result: dict = {"cost": 0.0, "duration": 0.0}
+    cycles = 0
 
     while True:
+        if task_branch is not None:
+            try:
+                head_sha = await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(task["id"], "worktree-branch-mismatch", exc, None)
+                outcome = "worktree_branch_mismatch"
+                break
+            if base_sha is None:
+                base_sha = head_sha
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args,
@@ -1546,10 +1576,23 @@ async def _run_dev_test_mode(task, project_dir, project_context, args):
         print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
               f"Retry {retry_count}/{max_retries}...")
 
-        # Clean up failed branch and reset task (with reflection memory)
-        await cleanup_failed_attempt(
-            task["id"], project_dir, attempt_reflections,
-        )
+        # Clean up failed branch and reset task (with reflection memory).
+        # 3107 review N1: a failed reset must not crash the run and leave the
+        # task in_progress — stop retrying and record why (same as
+        # equipa.dispatch.run_dev_test_loop_with_autoresearch).
+        try:
+            await cleanup_failed_attempt(
+                task["id"], project_dir, attempt_reflections, base_sha=base_sha,
+            )
+        except AttemptCleanupError as exc:
+            _audit_task_abort(task["id"], "attempt-cleanup-failed", exc, None)
+            print(
+                f"  [Autoresearch] Task #{task['id']}: resetting the failed "
+                f"attempt failed ({' '.join(str(exc).split())}); no further "
+                f"retries, task left blocked."
+            )
+            outcome = "attempt_cleanup_failed"
+            break
     return result, cycles, outcome
 
 
@@ -1830,10 +1873,49 @@ async def _record_task_telemetry(
     print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
 
 
+@dataclass
+class _SingleAgentRun:
+    """One single-agent run: its result, outcome and the model/budget used."""
+
+    result: dict
+    outcome: str
+    attempts: int
+    model: str
+    max_turns: int
+
+
 async def _run_single_agent_mode(task, project_dir, project_context, args):
     """Single-agent mode (Phase 1 — with model tiering): dynamic budget,
     dispatch, outcome determination, the vacuous-pass / no-output guard
-    (task #2371), telemetry and summary."""
+    (task #2371), telemetry and summary.
+
+    Runs in ``project_dir`` as given; ``run_mode_task`` routes a git project
+    through an isolation worktree instead (task #3112)."""
+    run = await _execute_single_agent(task, project_dir, project_context, args)
+    await _finish_single_agent(task, run, args)
+
+
+async def _finish_single_agent(task, run: _SingleAgentRun, args, *, merged_sha=None):
+    """Telemetry, TheForge status check and summary for a single-agent run."""
+    await _post_task_telemetry(
+        task, run.result, run.outcome, role=args.role,
+        model=run.model, max_turns=run.max_turns,
+        dispatch_config=getattr(args, "dispatch_config", None),
+        merged_sha=merged_sha)
+
+    # Verify the task status in TheForge
+    verified, verify_msg = verify_task_updated(task["id"])
+
+    # Print summary
+    print_summary(task, run.result, verified, verify_msg)
+    if run.attempts > 1:
+        print(f"  Attempts: {run.attempts}/{args.retries}")
+
+
+async def _execute_single_agent(task, project_dir, project_context, args) -> _SingleAgentRun:
+    """Run the single agent in ``project_dir`` (the project checkout or the
+    task's isolation worktree) and judge its outcome, including the
+    no-output guard. Writes no status."""
     # Single-agent mode (Phase 1 — with model tiering)
     from equipa.role_resolver import is_role_early_term_exempt
     use_streaming = not is_role_early_term_exempt(args.role, project_dir)
@@ -1940,19 +2022,90 @@ async def _run_single_agent_mode(task, project_dir, project_context, args):
                     single_outcome = "no_output"
                     result["tasks_created_rejection"] = tc_check.reason
 
-    # Post-task telemetry
-    await _post_task_telemetry(
-        task, result, single_outcome, role=args.role,
+    return _SingleAgentRun(
+        result=result, outcome=single_outcome, attempts=attempts,
         model=role_model, max_turns=role_turns_max,
-        dispatch_config=getattr(args, "dispatch_config", None))
+    )
 
-    # Verify the task status in TheForge
-    verified, verify_msg = verify_task_updated(task["id"])
 
-    # Print summary
-    print_summary(task, result, verified, verify_msg)
-    if attempts > 1:
-        print(f"  Attempts: {attempts}/{args.retries}")
+# Report artifacts a single agent writes under .equipa-artifacts/ are
+# gitignored, so they would vanish with its worktree; the task's own ones are
+# copied back to the project checkout. SECURITY-REVIEW-* is excluded: only the
+# orchestrator's reviewer run may write the gate's artifact.
+_PRESERVED_ARTIFACT_MAX_BYTES = 1024 * 1024
+
+
+def _preserve_task_artifacts(worktree_dir: str, project_dir: str, task_id: int) -> list[str]:
+    """Copy this task's ``.equipa-artifacts`` files from its worktree back to
+    the project checkout; returns the copied file names."""
+    source_dir = Path(worktree_dir) / ".equipa-artifacts"
+    if source_dir.is_symlink() or not source_dir.is_dir():
+        return []
+    task_name_re = re.compile(rf"-{int(task_id)}(?!\d)")
+    copied: list[str] = []
+    destination_dir: Path | None = None
+    for source in sorted(source_dir.iterdir()):
+        name = source.name
+        if name.startswith("SECURITY-REVIEW") or not task_name_re.search(name):
+            continue
+        if source.is_symlink() or not source.is_file():
+            continue
+        if source.stat().st_size > _PRESERVED_ARTIFACT_MAX_BYTES:
+            print(f"  [Isolation] NOT preserving {name}: larger than "
+                  f"{_PRESERVED_ARTIFACT_MAX_BYTES} bytes")
+            continue
+        if destination_dir is None:
+            destination_dir = ensure_artifacts_dir(project_dir)
+        destination = destination_dir / name
+        if destination.is_symlink():
+            destination.unlink()
+        shutil.copyfile(source, destination)
+        copied.append(name)
+    if copied:
+        print(f"  [Isolation] Preserved task artifact(s) in the project "
+              f"checkout: {', '.join(copied)}")
+    return copied
+
+
+async def _run_task_isolated(task, project_dir, project_context, args) -> None:
+    """``--task`` / ``--project`` in a git project (dispatch-04/07).
+
+    The Dev+Test loop (``--dev-test``) or the single agent runs in a
+    ``forge-task-<id>`` worktree made by ``_create_isolation_worktrees``;
+    ``run_task_in_isolation`` reviews the branch and merges it only through
+    ``_gated_merge_task``, and the status written afterwards reflects the
+    merge. A task refused before any agent ran (stale branch, leftover
+    worktree, unpinnable default branch) is left blocked and the process
+    exits with ``EXIT_DISPATCH_REFUSED``.
+    """
+    single_runs: list[_SingleAgentRun] = []
+
+    async def execute(worktree_dir: str, task_branch: str) -> tuple[dict, int, str]:
+        if args.dev_test:
+            return await _run_dev_test_mode(
+                task, worktree_dir, project_context, args, task_branch=task_branch,
+            )
+        run = await _execute_single_agent(task, worktree_dir, project_context, args)
+        single_runs.append(run)
+        _preserve_task_artifacts(worktree_dir, project_dir, task["id"])
+        return run.result, 1, run.outcome
+
+    isolated: IsolatedTaskRun = await run_task_in_isolation(
+        task, project_dir, project_context, args, execute=execute,
+    )
+    if isolated.agent_outcome is None:
+        update_task_status(task["id"], isolated.outcome)
+        print(f"\nTask #{task['id']} NOT run: {isolated.reason}")
+        sys.exit(EXIT_DISPATCH_REFUSED)
+    if args.dev_test:
+        await _record_task_telemetry(
+            task, isolated.result, isolated.outcome, isolated.cycles, args,
+            merged_sha=isolated.merged_sha,
+        )
+        return
+    run = single_runs[-1]
+    run.outcome = isolated.outcome
+    await _finish_single_agent(task, run, args, merged_sha=isolated.merged_sha)
 
 
 async def run_mode_task(args: argparse.Namespace) -> None:
@@ -1978,6 +2131,16 @@ async def run_mode_task(args: argparse.Namespace) -> None:
 
     # --- Execute ---
 
+    if _is_git_repo(project_dir):
+        # dispatch-04/07 (task #3112): in a git project the agent works in a
+        # forge-task-<id> worktree and its commits reach the default branch
+        # only through the gated merge — never by committing in the project
+        # checkout.
+        await report_leftover_dispatch_state(project_dir)
+        await _run_task_isolated(task, project_dir, project_context, args)
+        return
+
+    # Not a git repo: there are no branches to protect or merge.
     if args.dev_test:
         # dispatch-03 (task #3111): pin the default branch before any agent
         # runs; only the gated merge below may move it.
