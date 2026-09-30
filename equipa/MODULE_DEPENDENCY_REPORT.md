@@ -8,14 +8,14 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **47,303 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **47,723 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
 | Module | Lines | Layer | Imports (equipa) | Late Imports | Exports |
 |---|---:|:---:|---|---|---:|
 | `abort_controller.py` | 218 | L0 | — | — | 3 |
-| `agent_launcher.py` | 1166 | L0 | — | — | 24 |
+| `agent_launcher.py` | 1207 | L0 | — | — | 24 |
 | `bash_security.py` | 3954 | L0 | — | — | 5 |
 | `classifier.py` | 167 | L0 | — | — | 3 |
 | `cli_isolation.py` | 93 | L0 | — | — | 7 |
@@ -53,7 +53,7 @@ The `equipa/` package contains **60 Python modules** totaling **47,303 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `isolation.py` | 1877 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 56 |
+| `isolation.py` | 2244 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 65 |
 | `mcp_server.py` | 967 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `merge_safety.py` | 293 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 894 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
@@ -66,7 +66,7 @@ The `equipa/` package contains **60 Python modules** totaling **47,303 lines** o
 | `generated_files.py` | 421 | L5 | `env_loader.py`, `git_ops.py`, `merge_integrity.py` | — | 12 |
 | `prompts.py` | 875 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 158 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
-| `agent_runner.py` | 3262 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `cli_isolation.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `isolation.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 26 |
+| `agent_runner.py` | 3274 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `cli_isolation.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `isolation.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 26 |
 | `preflight.py` | 379 | L7 | `agent_runner.py`, `constants.py`, `env_loader.py`, `isolation.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 4100 | L8 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
 | `manager.py` | 699 | L9 | `agent_runner.py`, `constants.py`, `db.py`, `git_ops.py`, `loops.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `prompts.py`, `roles.py`, `single_agent_guard.py`, `tasks.py` | `dispatch.py` | 18 |
@@ -75,7 +75,7 @@ The `equipa/` package contains **60 Python modules** totaling **47,303 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 47,303 lines | 871 public exports
+**Total:** 47,723 lines | 880 public exports
 
 ## Modules by Layer
 
