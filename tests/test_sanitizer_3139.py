@@ -133,6 +133,25 @@ def test_prompt_call_sites_are_fast_on_whitespace_runs(target, case):
     assert elapsed < CALL_SITE_LIMIT_SECONDS, f"{target} took {elapsed:.2f}s on {case}"
 
 
+def test_lesson_allowlist_is_fast_on_repeated_if_clauses():
+    # The "if ... then" allowlist rule ran ".*" to the end of the line from
+    # every "if": 7.8 s on 60k chars (found by the N1 audit of every pattern).
+    elapsed = _best_seconds(CALL_SITE_LIMIT_SECONDS, "validate", "if-clauses-repeated", "60000")
+    assert elapsed < CALL_SITE_LIMIT_SECONDS, f"validate took {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize(
+    "lesson",
+    [
+        "If the build fails, rerun it with verbose logging.",
+        "If a migration is pending then seed data is stale.",
+    ],
+)
+def test_if_then_lessons_still_pass_the_allowlist(lesson):
+    assert ls._VALID_LESSON_PATTERNS[2].search(lesson)
+    assert ls.validate_lesson_structure(lesson)
+
+
 # Verdicts of the execute rule before and after the N1 change (the table the
 # independent review checked), plus the commit ef40ff5 negatives.
 EXECUTE_VERDICTS = [

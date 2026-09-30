@@ -11,6 +11,7 @@ Usage: sanitizer_timing_probe.py REPO_ROOT TARGET CASE SIZE
           cap): prints the elapsed wall time in seconds.
           "each-pattern": times every pattern the case targets separately
           and prints one "SECONDS<TAB>REASON" line per pattern.
+          "validate": validate_lesson_structure(), the lesson allowlist.
           "db-context", "checkpoint", "compaction-summary", "episode": one
           real call site that injects the text into a prompt.
   CASE    a key of ADVERSARIAL_CASES
@@ -133,7 +134,8 @@ ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
         ("encoded payload",),
         lambda n: "\\u00" * (n // 4),
     ),
-    # Normalisation costs rather than a single pattern.
+    # Normalisation and lesson-allowlist costs rather than a single pattern.
+    "if-clauses-repeated": ((), lambda n: "if a " * (n // 5)),
     "joiner-splits": ((), lambda n: "ig-" * (n // 3)),
     "identifier-splits": ((), lambda n: "sudo_mode " * (n // 10)),
     "small-capitals": ((), lambda n: "ɪɢɴᴏʀᴇ " * (n // 7)),
@@ -208,6 +210,9 @@ def main(argv: list[str]) -> int:
     elif target == "boundaries":
         def call() -> None:
             lesson_sanitizer.neutralize_boundaries(text)
+    elif target == "validate":
+        def call() -> None:
+            lesson_sanitizer.validate_lesson_structure(text)
     elif target == "pattern":
         def call() -> None:
             for _, pattern in patterns:

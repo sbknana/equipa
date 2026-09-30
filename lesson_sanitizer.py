@@ -830,9 +830,11 @@ _VALID_LESSON_PATTERNS = [
     ),
     # Numbered steps: "(1)", "1.", "Step 1"
     re.compile(r'(?:\(\d\)|\d\.\s|step\s+\d)', re.IGNORECASE),
-    # Cause-effect: "because", "since", "when", "if ... then"
+    # Cause-effect: "because", "since", "when", "if ... then". The gap after
+    # "if" is bounded: ".*" ran to the end of the line from every "if" and
+    # backtracked, so "if a " repeated took 7.8 s on 60k chars (task 3139).
     re.compile(
-        r'(?:because|since|when\s+\w+|if\s+\w+.*(?:then|,)|'
+        r'(?:because|since|when\s+\w+|if\s+\w+[^\n]{0,200}?(?:then|,)|'
         r'results?\s+in|leads?\s+to|causes?|prevents?)',
         re.IGNORECASE,
     ),
