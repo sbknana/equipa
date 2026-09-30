@@ -39,7 +39,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -451,25 +451,38 @@ def _parse_tasks_created_ids(stdout: str) -> list[int]:
 
 def _parse_iso_timestamp(value: Any) -> datetime | None:
     """Best-effort ISO-8601 parser; returns None on garbage."""
-    if value is None:
-        return None
     if isinstance(value, datetime):
         return value
     if not isinstance(value, str):
         return None
-    text = value.strip().replace("Z", "+00:00")
-    # Try a few common shapes.
-    for fmt in (None,):
-        try:
-            return datetime.fromisoformat(text)
-        except ValueError:
-            pass
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
     return None
+
+
+def _parse_naive_utc(value: Any) -> datetime | None:
+    """:func:`_parse_iso_timestamp`, with an aware value converted to naive UTC.
+
+    ``tasks.created_at`` is naive UTC (SQLite ``CURRENT_TIMESTAMP``) and so
+    is ``run_started_at``, but a row written by another client may carry an
+    offset or a ``Z`` suffix. Comparing an aware value with a naive one
+    raised ``TypeError`` and crashed the goal's planner check (3112 review
+    LOW, task #3119).
+    """
+    parsed = _parse_iso_timestamp(value)
+    if parsed is not None and parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 class TasksCreatedDb:
@@ -558,7 +571,7 @@ def validate_tasks_created_claim(
         )
 
     rows_by_id = {int(r["id"]): r for r in rows if r.get("id") is not None}
-    run_started = _parse_iso_timestamp(run_started_at)
+    run_started = _parse_naive_utc(run_started_at)
 
     invalid: list[int] = []
     reasons: list[str] = []
@@ -579,8 +592,17 @@ def validate_tasks_created_claim(
             continue
         # Pre-existing id (created before the agent run started)
         if run_started is not None:
-            created = _parse_iso_timestamp(row.get("created_at"))
-            if created is not None and created < run_started:
+            created = _parse_naive_utc(row.get("created_at"))
+            if created is None:
+                # A NULL or unreadable created_at cannot prove the task is
+                # new, so it is rejected (fail closed, task #3119).
+                invalid.append(tid)
+                reasons.append(
+                    f"#{tid}: created_at={row.get('created_at')!r} is missing "
+                    f"or unreadable, so it cannot be shown to postdate "
+                    f"run_started_at={run_started_at!r}"
+                )
+            elif created < run_started:
                 invalid.append(tid)
                 reasons.append(
                     f"#{tid}: created_at={row.get('created_at')!r} predates "
