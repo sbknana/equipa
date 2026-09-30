@@ -145,7 +145,9 @@ The generator is code from the merged tree, which agents can write, so:
 
 - it runs only if its blob is identical on the pinned default branch, on the
   task branch and in the merged tree. A branch that changed the generator ends
-  `merge_failed` with "the task branch changed the generator"; it is never run;
+  `merge_failed` with "the task branch changed the generator"; it is never run.
+  A generator updated on the default branch after the task branched is not run
+  either, and the reason says "the default branch changed the generator";
 - it runs as `python -I` in a private `git archive` export of the merged tree
   (never in the main checkout or the orchestrator's process), with the scrubbed
   agent environment minus the Claude CLI credential, and a timeout that kills
