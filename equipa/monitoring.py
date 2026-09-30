@@ -642,7 +642,11 @@ def _build_streaming_result(
 
         subtype = result_data.get("subtype", "")
         if subtype == "error_max_turns":
-            result["success"] = True
+            # The run was cut off, not finished: report it as incomplete and
+            # flag it, so a caller that needs complete output (a reviewer) can
+            # tell. The error text is what the dev loop's continuation keys on.
+            result["success"] = False
+            result["hit_max_turns"] = True
             result["errors"].append("Agent hit max turns limit")
         elif result_data.get("is_error"):
             result["errors"].append(
