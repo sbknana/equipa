@@ -40,6 +40,15 @@ _VALUE = (
     r"|[^\s'\"`\\;&|,)}\]]+)"
 )
 
+# The value of a command-line password flag (``mysql -p...``, ``sshpass -p
+# ...``): a quoted string as in _VALUE, or a bare word that may contain the
+# commas and brackets a variable value may not.
+_FLAG_VALUE = (
+    r"(?:\\?\"(?:[^\"\\]|\\(?!\"))*(?:\\?\")?"
+    r"|'[^']*'?"
+    r"|[^\s'\"\\;&|]+)"
+)
+
 # Names that hold credentials by convention: anything containing SECRET,
 # PASSWORD or PASSWD (PGPASSWORD, DB_PASSWORD, CLIENT_SECRET_ID, ...), and
 # anything ending in _TOKEN or _KEY (GITHUB_TOKEN, ANTHROPIC_API_KEY, ...).
@@ -122,10 +131,22 @@ _PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # --password VALUE / --api-key VALUE (the = form is covered below).
     (re.compile(rf"{_KEY_START}(--{_SECRET_KEY}\s+)(?![-\[])({_VALUE})"),
      r"\1" + REDACTED),
-    # mysql -p<value> (attached; a bare -p prompts and is left alone). Scoped
-    # to the mysql/mariadb clients: -p means something else to most tools.
+    # mysql -p<value> (attached, bare or quoted; a bare -p prompts and is left
+    # alone). Scoped to the mysql/mariadb clients: -p means something else to
+    # most tools.
     (re.compile(
         r"((?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))\b[^\n;&|]*?\s-p)"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    # sshpass -p <value> / -p<value>. Scoped to sshpass: ssh -p is a port.
+    (re.compile(
+        r"(\bsshpass\b[^\n;&|]*?\s-p\s*)"
+        rf"(?!\[REDACTED\])({_FLAG_VALUE})"),
+     r"\1" + REDACTED),
+    # curl -u user:password / --user user:password (no colon: curl prompts).
+    (re.compile(
+        r"(\bcurl\b[^\n;&|]*?\s(?:-u\s*|--user(?:=|\s+))"
+        r"(?:\\?[\"'])?[^\s:'\"\\]*:)"
         r"(?!\[REDACTED\])([^\s'\"\\;&|]+)"),
      r"\1" + REDACTED),
     # key = value / key: value / "key": "value" of credential-named keys in
