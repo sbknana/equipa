@@ -1918,12 +1918,31 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
 # only add blocks ("HIGH: &#48; SQLi" is a tally once decoded, but still
 # blocks as written, as it did before).
 #
-# The provenance and completion comments the gate itself asks for. A review
-# whose rendered view differs from its text only by these (nearly every one)
-# is parsed once.
-_EQUIPA_MARKER_COMMENT_RE = re.compile(
-    r"<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}[ \t]*-->",
+# The provenance and completion comments the gate itself asks for, each on a
+# line of its own. A review whose rendered view differs from its text only by
+# these is parsed once. Task 3137 (N1): the comment must fill its line. One
+# inside a word ("HI<!-- EQUIPA-X -->GH: SQLi") joins the word when rendered,
+# so that review must be parsed as rendered too.
+_STANDALONE_MARKER_COMMENT_RE = re.compile(
+    r"^[ \t]{0,3}<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}"
+    r"[ \t]*-->[ \t]*$",
+    re.MULTILINE,
 )
+# Task 3137 (N3): a run of blank lines renders as one paragraph break, and a
+# 200 KB review of nothing but line breaks took about 1 s to parse (every rule
+# pays per line). Each run of two or more blank lines is folded into ONE
+# whitespace-only line of the same length, so every character offset and
+# every rule bounded in characters ("<h3>...</h3>" over at most 500) still
+# sees what it saw before. Linear: each whitespace run is scanned from the
+# line break before it only.
+_BLANK_LINE_RUN_RE = re.compile(r"\n(?:[ \t]*\n){2,}")
+
+
+def _fold_blank_line_runs(text: str) -> str:
+    """``text`` with each run of 2+ blank lines folded into one blank line."""
+    return _BLANK_LINE_RUN_RE.sub(
+        lambda run: "\n" + " " * (len(run.group(0)) - 2) + "\n", text,
+    )
 # CommonMark character references: the semicolon is required.
 _CHARACTER_REFERENCE_RE = re.compile(
     r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});",
@@ -2191,6 +2210,7 @@ def _analyze_review_file(
 
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+    text = _fold_blank_line_runs(text)
     # Task 3130: parse the text as written (what every earlier task parsed)
     # and as rendered (comments removed, references decoded, lookalike
     # letters folded, blank runs collapsed); the stricter result wins. The
@@ -2199,8 +2219,9 @@ def _analyze_review_file(
     # inside a multi-line comment.
     as_written = _analyze_review_text(text, nonblank_lines)
     rendered = _rendered_review_text(text)
-    if rendered == _EQUIPA_MARKER_COMMENT_RE.sub("", text):
-        return as_written  # only the gate's own marker comments differ
+    if rendered == _STANDALONE_MARKER_COMMENT_RE.sub("", text):
+        # Only the gate's own marker comments, each on its own line, differ.
+        return as_written
     return _stricter_analysis(
         as_written, _analyze_review_text(rendered, nonblank_lines),
     )

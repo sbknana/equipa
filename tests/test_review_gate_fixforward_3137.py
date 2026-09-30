@@ -19,6 +19,7 @@ Benign prose of the same look must still merge.
 Copyright 2026 Forgeborn
 """
 
+import time
 from pathlib import Path
 
 import pytest
@@ -134,3 +135,69 @@ def test_f4_leftover_shapes_fail_closed(line, severity):
 ])
 def test_f4_leftover_prose_merges(line):
     assert_prose_merges([line])
+
+
+# --- N1: EQUIPA's own marker comment splitting a word ---------------------------
+
+@pytest.mark.parametrize("line", [
+    # The reviewer's three shapes.
+    f"HI<!-- EQUIPA-REVIEWER-RUN: {NONCE} -->GH: SQL injection",
+    "- SQL injection in login - H<!--EQUIPA-X-->IGH",
+    "### [S1] H<!-- EQUIPA-REVIEW-COMPLETE -->IGH \N{EM DASH} SQL injection",
+    # A marker comment that shares its line with text is not standalone.
+    f"<!-- EQUIPA-REVIEWER-RUN: {NONCE} -->HIGH: SQL injection",
+    f"CRI<!-- EQUIPA-REVIEW-COMPLETE {NONCE} -->TICAL: RCE in upload",
+])
+def test_marker_comment_inside_a_line_fails_closed(line):
+    severity = "CRITICAL" if "TICAL" in line else "HIGH"
+    assert_blocks_behind_zero_footer([line], severity)
+
+
+def test_standalone_marker_comments_still_parse_once(monkeypatch):
+    """A clean review whose only comments are the gate's own markers, each on
+    its own line, is parsed once (the rendered view adds nothing)."""
+    calls = []
+    real = loops._analyze_review_text
+
+    def counting(text, nonblank_lines):
+        calls.append(text)
+        return real(text, nonblank_lines)
+
+    monkeypatch.setattr(loops, "_analyze_review_text", counting)
+    analysis = analyze(review("1 finding.", ["## Notes", "", "Plain prose."],
+                              ONE_LOW, low_heading=True))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.counts == ONE_LOW_COUNTS
+    assert len(calls) == 1
+
+
+# --- N3: line-break floods --------------------------------------------------------
+
+REVIEW_BYTES = 200 * 1024
+
+
+@pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n", " ",
+                                        " \n", "\t\n"])
+def test_200kb_of_line_breaks_parses_in_half_a_second(line_break):
+    body = [line_break * (REVIEW_BYTES // len(line_break))]
+    text = review("No findings.", body, ZERO, low_heading=False)
+    assert len(text.encode()) >= REVIEW_BYTES
+    started = time.perf_counter()
+    analysis = analyze(text)
+    elapsed = time.perf_counter() - started
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("gap", [3, 40, 5000])
+def test_folded_blank_lines_keep_findings_and_footer(gap):
+    """Folding blank-line runs changes no verdict: a finding far below the
+    Summary still blocks, and a footer far below its heading still counts."""
+    body = ["## Findings"] + [""] * gap + ["HIGH: SQL injection in login"]
+    assert_blocks_behind_zero_footer(body)
+    text = review("1 finding.", ["## Notes"] + [""] * gap + ["Plain prose."],
+                  ONE_LOW, low_heading=True).replace(
+                      "## Counts\n", "## Counts\n" + "\n" * gap)
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.counts == ONE_LOW_COUNTS
