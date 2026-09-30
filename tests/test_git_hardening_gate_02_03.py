@@ -186,8 +186,20 @@ def hooked_repo(tmp_path: Path) -> tuple[Path, Path]:
     _git(repo, "checkout", "-q", "forge-task-7")
     _git(repo, "checkout", "-q", "main")
     assert marker.is_file(), "control: hooks should fire for plain git"
+    assert "post-checkout" in marker.read_text(encoding="utf-8")
     marker.unlink()
     return repo, marker
+
+
+def test_control_plain_git_merge_fires_the_agents_post_merge_hook(
+    hooked_repo: tuple[Path, Path],
+) -> None:
+    """Positive control: post-merge is live, so its absence below is meaningful."""
+    repo, marker = hooked_repo
+
+    _git(repo, "merge", "--no-edit", "forge-task-7")
+
+    assert "post-merge" in marker.read_text(encoding="utf-8")
 
 
 def test_merge_task_branch_runs_no_repo_config_hooks(
