@@ -42,7 +42,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-from equipa.git_ops import git_run_async
+from equipa.git_ops import git_run_async, git_toplevel_async
 
 logger = logging.getLogger(__name__)
 
@@ -1035,7 +1035,20 @@ async def get_changed_files_for_branch(
     doc-only-ness" — :func:`is_doc_only_diff` already returns False for
     an empty list precisely so a failed lookup never silently disables
     the gate.
+
+    R3119-01 (task #3126): the diff runs at the work-tree ROOT of
+    ``project_dir`` with ``--no-relative``. ``project_dir`` may be a
+    project nested in a sub-directory of its repository, and from there an
+    agent-written ``diff.relative=true`` hid every change outside it. Paths
+    are always relative to the work-tree root.
     """
+    repo_root = await git_toplevel_async(project_dir)
+    if repo_root is None:
+        logger.warning(
+            "[security-gate] %s is not inside a readable git work tree", project_dir,
+        )
+        return []
+    project_dir = str(repo_root)
     if base_ref is None:
         # SR-2997 S1 sibling: the diff base is the operator-named branch,
         # never origin/HEAD — an agent that repoints origin/HEAD at its own
@@ -1054,7 +1067,7 @@ async def get_changed_files_for_branch(
         # must list the source path too, not only the destination (SR-2997
         # S4). -z: paths verbatim, never C-quoted (SR-2997 S6).
         result = await git_run_async(
-            ["diff", "--name-only", "--no-renames", "-z",
+            ["diff", "--name-only", "--no-renames", "--no-relative", "-z",
              f"{base_ref}...{head_ref}"],
             project_dir,
             timeout=10,
