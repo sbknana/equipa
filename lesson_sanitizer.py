@@ -20,7 +20,10 @@ Policy (reject, never strip-and-keep):
   capitals, IPA, Armenian, Cyrillic, Greek) mapped to Latin. Keyword
   patterns also run with hyphen / underscore / dot joiners between letters
   deleted and spaced. So ``ig<ZWSP>nore``, Cyrillic ``іgnоre``, small-capital
-  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught.
+  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught. Plain
+  lowercase code identifiers (``system_override``, ``sudo_mode``) are not
+  spaced for the fake-header class, and a few phrases ("act as the admin",
+  "new rules:") count only in imperative position.
 * If ANY injection pattern matches, the whole text is REJECTED: ``sanitize()``
   returns ``""`` and logs the reason at WARNING. Stripping the matched phrase
   and keeping the rest is the defect sandbox-09 describes — "Ignore previous
@@ -335,16 +338,21 @@ class _ImperativePhrase:
 
 
 # --- Injection patterns (any match => reject) -------------------------------
-# Each entry is (reason, compiled pattern). Patterns run against the output
-# of normalize_for_matching(). The reason is logged and returned by
-# detect_injection() so operators can see why content was refused.
+# Each entry is (reason, compiled pattern or _ImperativePhrase). Patterns run
+# against the output of normalize_for_matching(). The reason is logged and
+# returned by detect_injection() so operators can see why content was
+# refused; a reason may have more than one entry.
 #
 # Every pattern must stay linear in the input length: this text is agent-
 # writable and is scanned on every prompt build (review F2/F3 of task 3123).
 # Never put two unbounded quantifiers over overlapping characters next to
-# each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces), and
-# never follow an unbounded lazy run with another one. Bound runs with
-# {0,N} instead. tests/test_lesson_sanitizer_3129.py times every pattern.
+# each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces, and
+# a "\n" start class followed by ``\s*`` does so on newline runs), and never
+# follow an unbounded lazy run with another one. Bound runs with {0,N}
+# instead. tests/test_lesson_sanitizer_3129.py times each pattern on the
+# inputs aimed at it, and tests/fixtures/sanitizer_timing_probe.py adds
+# whitespace-run families that tests/test_sanitizer_3139.py runs against
+# EVERY entry (under 0.2 s per MB each), including ones added later.
 _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
     # Our own trust-boundary markers: an opening or closing <task-input> tag,
     # or anything shaped like the per-prompt untrusted-content delimiter.
@@ -417,6 +425,12 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
             r"system|above))\s+(?:instructions?|rules?|guidelines?|"
             r"behaviou?r|programming|directives?|safety|restrictions)|"
             r"act\s+as\s+if\s+you\b|"
+            # "Act as a senior admin", but not "act as a good API citizen".
+            # "root" is left to the imperative entry below: "the CA will act
+            # as the root CA" is ordinary text.
+            r"act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
+            r"(?:admin(?:istrator)?|sysadmin|superuser|unrestricted|"
+            r"jailbroken)\b|"
             r"pretend\s+(?:you\s+are|to\s+be|you're)\b|"
             r"switch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
             r"\s+(?:mode|role|persona)\b|"
@@ -429,16 +443,15 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
         ),
     ),
     # The same class for phrases that are ordinary text outside imperative
-    # position (review N4 of task 3129): "Act as a senior admin", "I want you
-    # to act as the admin", "Forget all of that", "New rules: ...", but not
-    # "the intermediate CA will act as the root CA", "don't forget all of
-    # this setup" or "ruff ships new rules: E501".
+    # position (review N4 of task 3129): "Please act as the root user",
+    # "Forget all of that", "New rules: ...", but not "the intermediate CA
+    # will act as the root CA", "don't forget all of this setup" or "ruff
+    # ships new rules: E501".
     (
         "role override",
         _ImperativePhrase(
             r"\b(?:act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
-            r"(?:admin(?:istrator)?|sysadmin|root|superuser|unrestricted|"
-            r"jailbroken)\b|"
+            r"root\b|"
             r"forget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
             r"context|you)\b|"
             r"new\s+(?:rules?|orders?)\s*:)",
