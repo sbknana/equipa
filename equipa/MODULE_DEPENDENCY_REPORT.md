@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **59 Python modules** totaling **44,649 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **59 Python modules** totaling **44,682 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -62,7 +62,7 @@ The `equipa/` package contains **59 Python modules** totaling **44,649 lines** o
 | `lessons.py` | 723 | L4 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 13 |
 | `merge_integrity.py` | 1137 | L4 | `git_ops.py`, `security_gate.py` | — | 26 |
 | `rlm_decompose.py` | 750 | L4 | `cli_isolation.py`, `config.py`, `env_loader.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
-| `generated_files.py` | 388 | L5 | `env_loader.py`, `git_ops.py`, `merge_integrity.py` | — | 12 |
+| `generated_files.py` | 421 | L5 | `env_loader.py`, `git_ops.py`, `merge_integrity.py` | — | 12 |
 | `prompts.py` | 875 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 158 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 3253 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `cli_isolation.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 26 |
@@ -74,7 +74,7 @@ The `equipa/` package contains **59 Python modules** totaling **44,649 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 44,649 lines | 804 public exports
+**Total:** 44,682 lines | 804 public exports
 
 ## Modules by Layer
 

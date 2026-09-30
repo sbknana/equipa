@@ -295,11 +295,41 @@ def test_branch_that_changed_the_generator_is_not_run(repo, tmp_path, capsys):
 
     assert status == "merge_failed"
     reason = guard.outcomes[TASK].reason
-    assert f"changed the generator {GENERATOR}" in reason
+    assert f"the task branch changed the generator {GENERATOR}" in reason
     assert REPORT in reason
     assert not marker.exists(), "the branch's generator must never run"
     _assert_failed_cleanly(repo, guard, main_sha, branch_sha)
     assert "event=generated-files-not-regenerated" in capsys.readouterr().err
+
+
+def test_generator_changed_on_the_default_branch_is_not_blamed_on_the_task(
+    tmp_path,
+):
+    """Blob equality with the pinned default branch is still required, but
+    when only the default branch moved the generator the reason says so:
+    an operator must not read it as the agent tampering with the generator."""
+    marker = tmp_path / "generator-ran"
+    writes_marker = (
+        f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        "print('fresh report')\n"
+    )
+    repo = _repo_with_generator(tmp_path, writes_marker)
+    worktree = _add_task_worktree(repo)
+    _write(worktree, "equipa/feature_b.py", "B = 1\n")
+    _write(worktree, REPORT, "report from the branch\n")
+    branch_sha = _commit_all(worktree, "branch leaves the generator alone")
+    _write(repo, GENERATOR, "# updated on main\n" + writes_marker)
+    _write(repo, REPORT, "report from main\n")
+    main_sha = _commit_all(repo, "main updates the generator")
+
+    status, guard = _gate(repo, worktree)
+
+    assert status == "merge_failed"
+    reason = guard.outcomes[TASK].reason
+    assert f"the default branch changed the generator {GENERATOR}" in reason
+    assert "task branch changed" not in reason
+    assert not marker.exists(), "neither side's generator may run"
+    _assert_failed_cleanly(repo, guard, main_sha, branch_sha)
 
 
 # --- branch-written code in the merged tree is data, never run ----------------

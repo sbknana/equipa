@@ -166,6 +166,41 @@ async def _blob(repo: str | os.PathLike, treeish: str, path: str) -> str | None:
     return fields[2] if fields[1] == "blob" else None
 
 
+async def _generator_mismatch_reason(
+    repo: str,
+    ours: str,
+    theirs: str,
+    generator: str,
+    on_branch: str | None,
+    expected: str,
+) -> str:
+    """Refusal text for a generator whose blob differs between the two sides.
+
+    Either way the generator is not run. The merge base tells which side
+    changed it: an operator must not read a generator updated on the default
+    branch after the task branched as the agent tampering with it.
+    """
+    detail = (
+        f"(task branch blob {(on_branch or 'deleted')[:12]}, default branch "
+        f"{expected[:12]}); it is not run"
+    )
+    base = await git_run_async(
+        ["merge-base", ours, theirs], repo, timeout=_GIT_TIMEOUT,
+    )
+    base_sha = base.stdout.strip()
+    if (
+        on_branch is not None
+        and base.returncode == 0
+        and base_sha
+        and await _blob(repo, base_sha, generator) == on_branch
+    ):
+        return (
+            f"the default branch changed the generator {generator} after the "
+            f"task branched {detail}"
+        )
+    return f"the task branch changed the generator {generator} {detail}"
+
+
 def _content_conflict_problem(path: str, entries: set[tuple[int, str]]) -> str | None:
     """Why ``path`` is not a both-sides-modified regular-file conflict."""
     stages = {stage for stage, _mode in entries}
@@ -334,11 +369,9 @@ async def resolve_generated_conflicts(
     for generator, expected in generator_blobs.items():
         on_branch = await _blob(repo, theirs, generator)
         if on_branch != expected:
-            return refuse(
-                f"the task branch changed the generator {generator} (blob "
-                f"{(on_branch or 'deleted')[:12]}, default branch "
-                f"{expected[:12]}); it is not run"
-            )
+            return refuse(await _generator_mismatch_reason(
+                repo, ours, theirs, generator, on_branch, expected,
+            ))
     merged = await merged_tree(repo, ours, theirs)
     if merged is None or merged.conflicted != frozenset(paths):
         return refuse("git merge-tree does not reproduce the checkout's conflict")
