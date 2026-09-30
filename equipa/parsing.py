@@ -870,39 +870,84 @@ def build_compaction_summary(
     return summary
 
 
+def wrap_agent_output(tag_type: str, text: str) -> str:
+    """Confine agent-authored *text* to a ``<task-input>`` block.
+
+    Every wrapper token inside *text* is escaped first, so the text cannot
+    close the block and carry anything out into instruction position.
+    """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
+    return (
+        f'<task-input type="{tag_type}" trust="agent-output">\n'
+        f"{neutralize_boundaries(text)}\n"
+        f"</task-input>"
+    )
+
+
+def _sanitize_tester_line(text: object, label: str, max_chars: int = 200) -> str:
+    """Reject-mode sanitize one Tester-authored line, then cap it.
+
+    The whole line is scanned before it is cut, so truncation cannot hide
+    the end of an injection phrase from the sanitizer.
+    """
+    from lesson_sanitizer import sanitize  # HARD dependency
+
+    clean = sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
+    return clean[:max_chars] + "..." if len(clean) > max_chars else clean
+
+
 def build_test_failure_context(test_results: dict, cycle: int) -> str:
     """Format Tester failures + recommendations for the Developer's next attempt.
 
     Returns a string to append to the Developer's system prompt.
     Caps output to prevent unbounded context growth: max 5 failure details,
     each truncated to 200 chars; max 3 recommendations.
+
+    Failure details, recommendations and the framework name are Tester
+    output, and this text reaches compaction history, so each one goes
+    through the reject-mode sanitizer (a rejected line becomes
+    AGENT_OUTPUT_WITHHELD) and the block sits in an escaped <task-input>
+    wrapper, like the compaction summary (review N3 of task 3129).
     """
+    framework = _sanitize_tester_line(
+        test_results["test_framework"], "tester test_framework", max_chars=80
+    )
+    tester_lines: list[str] = []
+
+    if test_results["failure_details"]:
+        tester_lines.append("### Failing Tests:")
+        # Cap at 5 details, truncate each to 200 chars
+        for detail in test_results["failure_details"][:5]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(detail, 'tester failure detail')}"
+            )
+        remaining = len(test_results["failure_details"]) - 5
+        if remaining > 0:
+            tester_lines.append(f"- ...and {remaining} more failure(s)")
+        tester_lines.append("")
+
+    if test_results["recommendations"]:
+        tester_lines.append("### Tester Recommendations:")
+        # Cap at 3 recommendations
+        for rec in test_results["recommendations"][:3]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(rec, 'tester recommendation')}"
+            )
+        tester_lines.append("")
+
     lines = [
         f"## Test Failures from Cycle {cycle}",
         "",
         f"The Tester agent ran {test_results['tests_run']} tests "
-        f"using {test_results['test_framework']}.",
+        f"using {framework}.",
         f"**{test_results['tests_failed']} tests failed.**",
         "",
     ]
-
-    if test_results["failure_details"]:
-        lines.append("### Failing Tests:")
-        # Cap at 5 details, truncate each to 200 chars
-        for detail in test_results["failure_details"][:5]:
-            truncated = detail[:200] + "..." if len(detail) > 200 else detail
-            lines.append(f"- {truncated}")
-        remaining = len(test_results["failure_details"]) - 5
-        if remaining > 0:
-            lines.append(f"- ...and {remaining} more failure(s)")
-        lines.append("")
-
-    if test_results["recommendations"]:
-        lines.append("### Tester Recommendations:")
-        # Cap at 3 recommendations
-        for rec in test_results["recommendations"][:3]:
-            truncated = rec[:200] + "..." if len(rec) > 200 else rec
-            lines.append(f"- {truncated}")
+    if tester_lines:
+        lines.append(
+            wrap_agent_output("tester-failures", "\n".join(tester_lines).strip())
+        )
         lines.append("")
 
     lines.append("**Fix these test failures. Do NOT skip or delete failing tests.**")
