@@ -880,7 +880,10 @@ _RELAXED_LAUNCHER = textwrap.dedent("""\
 
 _FAKE_CLI = textwrap.dedent("""\
     #!{python}
-    import json, os, subprocess, sys
+    import json, os, subprocess, sys, time
+    # Work for a moment first: a stop request that arrives too early (for
+    # example communicate() closing the stop channel) would kill us here.
+    time.sleep(1.0)
     open("feature.txt", "w").write("from the isolated agent\\n")
     subprocess.run([{git!r}, "add", "feature.txt"], check=True)
     subprocess.run([{git!r}, "commit", "-q", "-m", "isolated agent"], check=True)
@@ -892,8 +895,11 @@ _FAKE_CLI = textwrap.dedent("""\
     """)
 
 
+@pytest.mark.parametrize("reader", ["streaming", "communicate"])
 def test_isolated_agent_end_to_end(repo: dict[str, Path], tmp_path: Path,
-                                   monkeypatch) -> None:
+                                   monkeypatch, reader: str) -> None:
+    """Both agent_runner read styles: line streaming, and communicate(),
+    which closes a visible stdin (the stop channel) at once."""
     home = tmp_path / "agent-home"
     home.mkdir()
     wrapper = tmp_path / "relaxed_launcher.py"
@@ -910,7 +916,11 @@ def test_isolated_agent_end_to_end(repo: dict[str, Path], tmp_path: Path,
             ["claude", "-p", f"Work in: {worktree}", "--add-dir", str(worktree)],
             str(worktree), {"PATH": os.environ["PATH"], "GITHUB_TOKEN": "leak"},
             config)
-        output = await asyncio.wait_for(process.stdout.read(), 60)
+        assert process.stdin is None  # the stop channel is the handle's
+        if reader == "communicate":
+            output, _ = await asyncio.wait_for(process.communicate(), 60)
+        else:
+            output = await asyncio.wait_for(process.stdout.read(), 60)
         await agent.terminate()
         return output, agent
 

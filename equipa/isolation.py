@@ -1167,6 +1167,7 @@ class IsolatedAgent:
         self.imported = False
         self.closed = False
         self.leftover_killer: asyncio.Task | None = None
+        self.stop_channel: asyncio.StreamWriter | None = None
         # A forked child inherits the registry; only the spawner may stop it.
         self.owner_pid = os.getpid()
 
@@ -1186,6 +1187,11 @@ class IsolatedAgent:
         except asyncio.TimeoutError as exc:
             raise AgentIsolationError("sending the handoff timed out") from exc
         await self._wait_until_ready()
+        # The stop channel is ours alone from here on. Process.communicate()
+        # (agent_runner's non-streaming path) closes a visible stdin at once,
+        # which the launcher would take as "stop the agent".
+        self.stop_channel = self.process.stdin
+        self.process.stdin = None
         self.started = True
 
     async def _wait_for_scope(self) -> str:
@@ -1263,10 +1269,10 @@ class IsolatedAgent:
 
     def request_termination(self) -> None:
         """Close the stop channel. Never blocks."""
-        stdin = self.process.stdin
-        if stdin is not None:
+        channel = self.stop_channel or self.process.stdin
+        if channel is not None:
             with contextlib.suppress(OSError, RuntimeError):
-                stdin.close()
+                channel.close()
 
     def _kill_everything(self) -> None:
         if self.cgroup is not None:
