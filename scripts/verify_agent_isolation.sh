@@ -142,10 +142,16 @@ inside() {
     else
         pass "agent cannot raise its pids.max"
     fi
-    if (echo "$$" > "/sys/fs/cgroup${cgroup%/*}/cgroup.procs") 2>/dev/null; then
-        fail "agent could move itself out of its scope"
+    # Leaving the scope needs write access to some other cgroup.procs; one
+    # also exists if the agent user has its own systemd user manager
+    # (lingering or a login session), which would let it start units that
+    # outlive the agent.
+    local writable_procs
+    writable_procs="$(find /sys/fs/cgroup -name cgroup.procs -writable 2>/dev/null | head -n 3 | tr '\n' ' ')"
+    if [ -n "$writable_procs" ]; then
+        fail "agent can move processes into other cgroups: $writable_procs"
     else
-        pass "agent cannot leave its scope"
+        pass "agent cannot leave its scope (no writable cgroup.procs)"
     fi
 
     # --- cannot signal the orchestrator --------------------------------------
