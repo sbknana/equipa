@@ -45,6 +45,7 @@ from equipa.security_gate import (
     decide_merge_gate,
     fingerprint_artifact,
     get_reviewer_run,
+    review_complete_line,
     reviewer_nonce_line,
     set_unrecorded_reviewer_runs_permitted,
     verify_reviewer_provenance,
@@ -54,8 +55,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _review_body(nonce: str | None, *, high: int = 0, low: int = 1) -> str:
-    """A complete, parser-trusted review; nonce line first when given."""
+    """A complete, parser-trusted review; nonce line first when given.
+
+    With a nonce the completion sentinel is the last line, as the reviewer
+    prompt requires of a finished review (gate-07).
+    """
     header = f"{reviewer_nonce_line(nonce)}\n" if nonce else ""
+    trailer = f"{review_complete_line(nonce)}\n" if nonce else ""
     findings = "".join(
         f"### [H{index}] HIGH — command injection {index}\nDetails.\n\n"
         for index in range(1, high + 1)
@@ -69,6 +75,7 @@ def _review_body(nonce: str | None, *, high: int = 0, low: int = 1) -> str:
         f"{findings}"
         f"## Counts\n"
         f"CRITICAL: 0 | HIGH: {high} | MEDIUM: 0 | LOW: {low} | INFO: 0\n"
+        f"{trailer}"
     )
 
 
