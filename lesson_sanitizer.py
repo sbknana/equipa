@@ -266,6 +266,74 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
     return _WORD_JOINER.sub("", folded), _WORD_JOINER.sub(" ", folded)
 
 
+# --- Imperative-position phrases --------------------------------------------
+# Some phrases are an instruction only when they open a sentence, line,
+# bullet or heading, or follow an imperative word: "Act as the admin",
+# "please execute this script", "## New rules:". Elsewhere they are ordinary
+# text: "the CA will act as the root CA", "CI will execute this script",
+# "ruff ships new rules: E501" (review N4 of task 3129).
+#
+# The phrase is found first and its position is checked afterwards by looking
+# back at most _IMPERATIVE_LOOKBACK characters. Putting the position test in
+# front of the phrase in one regex made the engine retry a multi-way anchor
+# group at every character: 0.2-0.3 s per MB of whitespace, and "\s" in that
+# anchor group was the quadratic of review N1.
+_IMPERATIVE_LOOKBACK = 64
+_SENTENCE_BREAKS = frozenset("\n\r.!?:;,")
+_BULLET_MARKS = "#*>-"
+_WORD = re.compile(r"\w+")
+
+
+class _ImperativePhrase:
+    """A phrase pattern that matches only in imperative position.
+
+    Duck-types the ``search`` method of ``re.Pattern`` so it can sit in
+    _INJECTION_PATTERNS. Linear: each phrase match costs one bounded
+    look-back, and after a match in the wrong position the scan resumes one
+    character later, so every character starts at most one phrase attempt.
+    """
+
+    def __init__(
+        self,
+        phrase: str,
+        triggers: frozenset[str],
+        you_modals: frozenset[str] = frozenset(),
+    ) -> None:
+        self.pattern = phrase
+        self._phrase = re.compile(phrase, re.IGNORECASE)
+        self._triggers = triggers
+        self._you_modals = you_modals
+
+    def _opens_instruction(self, text: str, start: int) -> bool:
+        window_start = max(0, start - _IMPERATIVE_LOOKBACK)
+        prefix = (
+            text[window_start:start]
+            .rstrip(" \t").rstrip(_BULLET_MARKS).rstrip(" \t")
+        )
+        if not prefix:
+            # Start of the text, or a blank / bullet run longer than the
+            # look-back window: both count as imperative (the safe side).
+            return True
+        if prefix[-1] in _SENTENCE_BREAKS:
+            return True
+        words = [word.lower() for word in _WORD.findall(prefix[-24:])[-2:]]
+        if not words:
+            return False
+        if words[-1] in self._triggers:
+            return True
+        return (
+            len(words) == 2 and words[0] == "you" and words[1] in self._you_modals
+        )
+
+    def search(self, text: str) -> re.Match[str] | None:
+        position = 0
+        while True:
+            match = self._phrase.search(text, position)
+            if match is None or self._opens_instruction(text, match.start()):
+                return match
+            position = match.start() + 1
+
+
 # --- Injection patterns (any match => reject) -------------------------------
 # Each entry is (reason, compiled pattern). Patterns run against the output
 # of normalize_for_matching(). The reason is logged and returned by
@@ -277,7 +345,7 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
 # each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces), and
 # never follow an unbounded lazy run with another one. Bound runs with
 # {0,N} instead. tests/test_lesson_sanitizer_3129.py times every pattern.
-_INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+_INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
     # Our own trust-boundary markers: an opening or closing <task-input> tag,
     # or anything shaped like the per-prompt untrusted-content delimiter.
     (
@@ -312,16 +380,19 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     # Fake privileged headers such as "## SYSTEM OVERRIDE" or "ADMIN NOTICE".
+    # The keyword alternations below share one leading \b: one boundary test
+    # per position instead of one per alternative keeps a 1 MB scan of a
+    # whitespace run well under 0.2 s (review N2 of task 3129).
     (
         "fake system header",
         re.compile(
-            r"\b(?:system|admin|administrator|root)\s+(?:override|directive|"
+            r"\b(?:(?:system|admin|administrator|root)\s+(?:override|directive|"
             r"instructions?|command|notice|alert)s?\b|"
-            r"\b(?:priority|emergency|urgent)\s+(?:override|directive|"
+            r"(?:priority|emergency|urgent)\s+(?:override|directive|"
             r"instructions?)\b|"
-            r"\boverride\s+(?:mode|code|protocol|activated|enabled|engaged)\b|"
-            r"\bBEGIN\s+(?:SYSTEM|ADMIN|NEW\s+INSTRUCTIONS)\b|"
-            r"\b(?:god|dan|jailbreak|unrestricted|sudo)\s+mode\b",
+            r"override\s+(?:mode|code|protocol|activated|enabled|engaged)\b|"
+            r"BEGIN\s+(?:SYSTEM|ADMIN|NEW\s+INSTRUCTIONS)\b|"
+            r"(?:god|dan|jailbreak|unrestricted|sudo)\s+mode\b)",
             re.IGNORECASE,
         ),
     ),
@@ -329,71 +400,81 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "role override",
         re.compile(
-            r"\byou\s+are\s+now\b|"
-            r"\bignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
+            r"\b(?:you\s+are\s+now\b|"
+            r"ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
             r"earlier|preceding|your|other|system)\s+(?:instructions?|prompts?|"
             r"rules?|guidelines?|context|directions?|messages?)|"
-            r"\bignore\s+(?:all|any|everything)\s+(?:instructions?|rules?|"
+            r"ignore\s+(?:all|any|everything)\s+(?:instructions?|rules?|"
             r"above|before)|"
-            r"\bdisregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
+            r"disregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
             r"earlier|preceding|your|instructions?|rules?)|"
-            r"\bforget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
+            r"forget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
             r"(?:your|the|all)\s+(?:previous\s+)?(?:instructions?|rules?|"
             r"guidelines?|training))|"
-            # "Forget all of that", but not "don't forget all of this setup"
-            # or "the cache will forget all context entries": imperative
-            # position only, like the execute rule below.
-            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|just|and|so|also)\b)"
-            r"[ \t]*forget\s+all\s+(?:of\s+)?(?:that|this|above|before|"
-            r"earlier|context|you)\b|"
-            r"\bnew\s+(?:instructions?|system\s+prompt|directives?)\b|"
-            # "New rules: ..." as a sentence or heading, but not "add new
-            # rules to the linter" or "ruff ships new rules: E501".
-            r"(?:^|[\n.!?:;,])[ \t]*(?:[#*>-]+[ \t]*)?"
-            r"new\s+(?:rules?|orders?)\s*:|"
-            r"\byour\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
-            r"\boverride\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
+            r"new\s+(?:instructions?|system\s+prompt|directives?)\b|"
+            r"your\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
+            r"override\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
             r"system|above))\s+(?:instructions?|rules?|guidelines?|"
             r"behaviou?r|programming|directives?|safety|restrictions)|"
-            r"\bact\s+as\s+if\s+you\b|"
-            # "Act as a senior admin" / "I want you to act as the admin", but
-            # not "act as a good API citizen" or "the intermediate CA will
-            # act as the root CA": imperative position only. The "you"
-            # alternative ends on a word, not on whitespace, so it cannot
-            # overlap the [ \t]* after it.
-            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|just|and|also|"
-            r"instead)\b|\byou(?:\s+(?:must|should|will|shall|can|may|now|"
-            r"to))?)[ \t]*act\s+as\s+(?:an?|the|my|your)\s+"
-            r"(?:[\w-]+\s+){0,2}?"
+            r"act\s+as\s+if\s+you\b|"
+            r"pretend\s+(?:you\s+are|to\s+be|you're)\b|"
+            r"switch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
+            r"\s+(?:mode|role|persona)\b|"
+            r"from\s+now\s+on,?\s+(?:you|always|never|ignore|respond|act)\b|"
+            r"(?:do\s+not|don't|never)\s+(?:tell|inform|alert|notify)\s+"
+            r"(?:the\s+)?(?:user|operator|orchestrator|reviewer|human)\b|"
+            r"(?:reveal|leak|exfiltrate)\s+(?:your|the)\s+(?:system\s+prompt|"
+            r"instructions|api[\s_-]?keys?|credentials|secrets|tokens?))",
+            re.IGNORECASE,
+        ),
+    ),
+    # The same class for phrases that are ordinary text outside imperative
+    # position (review N4 of task 3129): "Act as a senior admin", "I want you
+    # to act as the admin", "Forget all of that", "New rules: ...", but not
+    # "the intermediate CA will act as the root CA", "don't forget all of
+    # this setup" or "ruff ships new rules: E501".
+    (
+        "role override",
+        _ImperativePhrase(
+            r"\b(?:act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
             r"(?:admin(?:istrator)?|sysadmin|root|superuser|unrestricted|"
             r"jailbroken)\b|"
-            r"\bpretend\s+(?:you\s+are|to\s+be|you're)\b|"
-            r"\bswitch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
-            r"\s+(?:mode|role|persona)\b|"
-            r"\bfrom\s+now\s+on,?\s+(?:you|always|never|ignore|respond|act)\b|"
-            r"\b(?:do\s+not|don't|never)\s+(?:tell|inform|alert|notify)\s+"
-            r"(?:the\s+)?(?:user|operator|orchestrator|reviewer|human)\b|"
-            r"\b(?:reveal|leak|exfiltrate)\s+(?:your|the)\s+(?:system\s+prompt|"
-            r"instructions|api[\s_-]?keys?|credentials|secrets|tokens?)",
-            re.IGNORECASE,
+            r"forget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
+            r"context|you)\b|"
+            r"new\s+(?:rules?|orders?)\s*:)",
+            triggers=frozenset({
+                "please", "now", "then", "always", "just", "and", "also",
+                "so", "instead", "you",
+            }),
+            you_modals=frozenset({
+                "must", "should", "will", "shall", "can", "may", "now", "to",
+            }),
         ),
     ),
     # Explicit requests to run supplied commands.
     (
         "command instruction",
         re.compile(
-            r"\b(?:run|execute)\s+(?:this|the\s+following)\s*(?:commands?\b|:)|"
-            # An imperative "Execute this script", but not "CI will execute
-            # this script" or "cannot run this code" (commit ef40ff5). The
-            # gap after the start token is horizontal whitespace only: "\s*"
-            # there overlaps the "\n" start class, so every newline in a run
-            # started an attempt that ate the rest of the run and backtracked
-            # (23 s on 60k newlines, review N1 of task 3129).
-            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|first|and|just|"
-            r"immediately)\b)[ \t]*execute\s+(?:this|these|the\s+following)\s+"
-            r"(?:[\w-]+\s+)?(?:scripts?|code|snippets?|payloads?|programs?)\b|"
-            r"\bpipe\s+(?:this|the\s+output)\s+to\b",
+            r"\b(?:(?:run|execute)\s+(?:this|the\s+following)\s*"
+            r"(?:commands?\b|:)|pipe\s+(?:this|the\s+output)\s+to\b)",
             re.IGNORECASE,
+        ),
+    ),
+    # An imperative "Execute this script", but not "CI will execute this
+    # script" or "cannot run this code" (commit ef40ff5). This was one regex
+    # with the position test in front, and "\s*" there overlapped its "\n"
+    # start class: every newline in a run started an attempt that ate the
+    # rest of the run and backtracked (23 s on 60k newlines, review N1 of
+    # task 3129).
+    (
+        "command instruction",
+        _ImperativePhrase(
+            r"\bexecute\s+(?:this|these|the\s+following)\s+(?:[\w-]+\s+)?"
+            r"(?:scripts?|code|snippets?|payloads?|programs?)\b",
+            triggers=frozenset({
+                "please", "now", "then", "always", "first", "and", "just",
+                "immediately",
+            }),
         ),
     ),
     # Shell payload signatures: download-and-execute, destructive deletes of
@@ -401,22 +482,20 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "dangerous command",
         re.compile(
-            r"\b(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
-            r"(?:ba|z|da|k)?sh\b|"
-            r"\b(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
-            r"(?:python[23]?|perl|ruby|node)\b|"
-            r"\brm\s+-[a-z]{0,10}(?:rf|fr)[a-z]{0,10}\s+(?:--no-preserve-root\s+)?"
+            r"\b(?:(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
+            r"(?:(?:ba|z|da|k)?sh|python[23]?|perl|ruby|node)\b|"
+            r"rm\s+-[a-z]{0,10}(?:rf|fr)[a-z]{0,10}\s+(?:--no-preserve-root\s+)?"
             r"(?:/(?=\s|$|\*)|~|\$HOME|\$\{HOME\}|\*|\.{1,2}(?=\s|$|/\s|/$))|"
-            r"/dev/(?:tcp|udp)/|"
-            r"\bnc(?:at)?\b[^\n]{0,40}\s-[a-z]*e\s|"
-            r"\bbase64\s+(?:-d|--decode)\b[^\n]{0,100}\|\s*(?:ba)?sh\b|"
-            r"\beval\s+[\"']?\$\(|"
-            r"\bpython[23]?\s+-c\s+[\"'][^\"']{0,2000}(?:import\s+os|subprocess|"
+            r"nc(?:at)?\b[^\n]{0,40}\s-[a-z]*e\s|"
+            r"base64\s+(?:-d|--decode)\b[^\n]{0,100}\|\s*(?:ba)?sh\b|"
+            r"eval\s+[\"']?\$\(|"
+            r"python[23]?\s+-c\s+[\"'][^\"']{0,2000}(?:import\s+os|subprocess|"
             r"socket|__import__)|"
-            r"\b(?:cat|cp|scp|curl|tar)\b[^\n]{0,60}(?:~|\$HOME)/\."
+            r"(?:cat|cp|scp|curl|tar)\b[^\n]{0,60}(?:~|\$HOME)/\."
             r"(?:ssh|aws|gnupg|netrc|claude|config/gh)\b|"
-            r"\b(?:env|printenv)\s*\|\s*(?:curl|nc|wget)\b|"
-            r"\bInvoke-Expression\b|\biex\s*\(",
+            r"(?:env|printenv)\s*\|\s*(?:curl|nc|wget)\b|"
+            r"Invoke-Expression\b|iex\s*\()|"
+            r"/dev/(?:tcp|udp)/",
             re.IGNORECASE,
         ),
     ),

@@ -1,17 +1,23 @@
-"""Time one lesson-sanitizer call on one adversarial input (task 3129).
+"""Time one lesson-sanitizer call on one adversarial input (tasks 3129, 3139).
 
-Run as a child process by tests/test_lesson_sanitizer_3129.py, so that a
-super-linear regex fails the test at the subprocess timeout instead of
-freezing the whole suite (``re`` holds the GIL, so no in-process timeout can
-interrupt it).
+Run as a child process by tests/test_lesson_sanitizer_3129.py and
+tests/test_sanitizer_3139.py, so that a super-linear regex fails the test at
+the subprocess timeout instead of freezing the whole suite (``re`` holds the
+GIL, so no in-process timeout can interrupt it).
 
 Usage: sanitizer_timing_probe.py REPO_ROOT TARGET CASE SIZE
   TARGET  "sanitize", "boundaries" or "pattern" (the compiled patterns the
-          case targets, searched directly on the raw input, with no input cap)
+          case targets, searched directly on the raw input, with no input
+          cap): prints the elapsed wall time in seconds.
+          "each-pattern": times every pattern the case targets separately
+          and prints one "SECONDS<TAB>REASON" line per pattern.
+          "db-context", "checkpoint", "compaction-summary", "episode": one
+          real call site that injects the text into a prompt.
   CASE    a key of ADVERSARIAL_CASES
   SIZE    input length in characters
 
-Prints the elapsed wall time in seconds.
+Usage: sanitizer_timing_probe.py REPO_ROOT dedup LINES
+  Times the compaction duplicate-line removal on LINES distinct lines.
 
 Copyright 2026 Forgeborn.
 """
@@ -21,6 +27,33 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable
+
+# Reasons tuple meaning "every pattern in _INJECTION_PATTERNS", resolved at
+# run time so a pattern added later is attacked without editing this file.
+EVERY_PATTERN: tuple[str, ...] = ("*",)
+
+# A word the joiner folding splits ("ig-nore" becomes "ignore" and
+# "ig nore"), so sanitize() scans the run three times (review N1 of 3129).
+_HYPHENATED_PREFIX = "ig-nore."
+
+# Whitespace runs (review N1/N2 of task 3129): "\s" before a keyword overlapped
+# a "\n" start class and made one rule quadratic on newline runs, and no case
+# had a long whitespace run. Each family runs against EVERY pattern, alone and
+# after a hyphenated word.
+_WHITESPACE_RUNS: dict[str, Callable[[int], str]] = {
+    "newlines": lambda n: "\n" * n,
+    "crlf": lambda n: "\r\n" * (n // 2),
+    "newline-space": lambda n: "\n " * (n // 2),
+    "spaces": lambda n: " " * n,
+    "tabs": lambda n: "\t" * n,
+    "mixed-whitespace": lambda n: " \t\n\r\n" * (n // 5),
+    "sentence-end-newlines": lambda n: ". \n" * (n // 3),
+}
+
+
+def _prefixed(build: Callable[[int], str]) -> Callable[[int], str]:
+    return lambda n: _HYPHENATED_PREFIX + build(n - len(_HYPHENATED_PREFIX))
+
 
 # case name -> (pattern reasons it attacks, input builder taking a length)
 ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
@@ -60,6 +93,14 @@ ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
         ("role override",),
         lambda n: "ignore all act as a forget all " * (n // 31),
     ),
+    "act-as-after-you-then-spaces": (
+        ("role override",),
+        lambda n: "you" + " " * n,
+    ),
+    "new-rules-after-bullet-spaces": (
+        ("role override",),
+        lambda n: ".-" + " " * n,
+    ),
     "command-words-repeated": (
         ("command instruction",),
         lambda n: ". execute these run this " * (n // 25),
@@ -94,19 +135,73 @@ ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
     ),
     # Normalisation costs rather than a single pattern.
     "joiner-splits": ((), lambda n: "ig-" * (n // 3)),
+    "identifier-splits": ((), lambda n: "sudo_mode " * (n // 10)),
     "small-capitals": ((), lambda n: "ɪɢɴᴏʀᴇ " * (n // 7)),
     "format-characters": ((), lambda n: "a؀" * (n // 2)),
     "nfkd-expansion": ((), lambda n: "<" + "ﷺ" * (n - 1)),
 }
 
+for _name, _build in _WHITESPACE_RUNS.items():
+    ADVERSARIAL_CASES[f"ws-{_name}"] = (EVERY_PATTERN, _build)
+    ADVERSARIAL_CASES[f"ws-hyphenated-{_name}"] = (EVERY_PATTERN, _prefixed(_build))
+
+WHITESPACE_CASES: tuple[str, ...] = tuple(
+    name for name, (reasons, _) in ADVERSARIAL_CASES.items()
+    if reasons == EVERY_PATTERN
+)
+
+
+def distinct_log_lines(count: int) -> list[str]:
+    """*count* log lines that share no grouping key and few character n-grams."""
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+    def word(value: int) -> str:
+        letters = []
+        for _ in range(5):
+            value, digit = divmod(value * 7919 + 13, 26)
+            letters.append(alphabet[digit])
+        return "".join(letters)
+
+    return [" ".join(word(line * 8 + slot) for slot in range(8)) for line in range(count)]
+
+
+def _selected_patterns(lesson_sanitizer, reasons: tuple[str, ...]) -> list:
+    return [
+        (reason, pattern)
+        for reason, pattern in lesson_sanitizer._INJECTION_PATTERNS
+        if reasons == EVERY_PATTERN or reason in reasons
+    ]
+
+
+def _elapsed(call: Callable[[], object]) -> float:
+    start = time.perf_counter()
+    call()
+    return time.perf_counter() - start
+
 
 def main(argv: list[str]) -> int:
-    repo_root, target, case, size = argv[1], argv[2], argv[3], int(argv[4])
+    repo_root, target = argv[1], argv[2]
     sys.path.insert(0, repo_root)
     import lesson_sanitizer
 
+    if target == "dedup":
+        from equipa.parsing import _deduplicate_log_lines
+
+        lines = distinct_log_lines(int(argv[3]))
+        print(f"{_elapsed(lambda: _deduplicate_log_lines(lines)):.6f}")
+        return 0
+
+    case, size = argv[3], int(argv[4])
     reasons, build = ADVERSARIAL_CASES[case]
     text = build(size)
+    patterns = _selected_patterns(lesson_sanitizer, reasons)
+
+    if target == "each-pattern":
+        for reason, pattern in patterns:
+            elapsed = _elapsed(lambda: pattern.search(text))
+            print(f"{elapsed:.6f}\t{reason}")
+        return 0
+
     if target == "sanitize":
         def call() -> None:
             lesson_sanitizer.sanitize(text)
@@ -114,21 +209,35 @@ def main(argv: list[str]) -> int:
         def call() -> None:
             lesson_sanitizer.neutralize_boundaries(text)
     elif target == "pattern":
-        patterns = [
-            pattern
-            for reason, pattern in lesson_sanitizer._INJECTION_PATTERNS
-            if reason in reasons
-        ]
+        def call() -> None:
+            for _, pattern in patterns:
+                pattern.search(text)
+    elif target == "db-context":
+        from equipa.prompts import _sanitize_db_context
 
         def call() -> None:
-            for pattern in patterns:
-                pattern.search(text)
+            _sanitize_db_context(text, "decision")
+    elif target == "checkpoint":
+        from equipa.prompts import build_checkpoint_context
+
+        def call() -> None:
+            build_checkpoint_context(text, 2)
+    elif target == "compaction-summary":
+        from equipa.parsing import build_compaction_summary
+
+        def call() -> None:
+            build_compaction_summary(
+                "developer", {"result_text": text}, 1, {"id": 1, "title": "t"}
+            )
+    elif target == "episode":
+        from equipa.lessons import sanitize_episode_text
+
+        def call() -> None:
+            sanitize_episode_text(text)
     else:
         raise SystemExit(f"unknown target {target!r}")
 
-    start = time.perf_counter()
-    call()
-    print(f"{time.perf_counter() - start:.6f}")
+    print(f"{_elapsed(call):.6f}")
     return 0
 
 
