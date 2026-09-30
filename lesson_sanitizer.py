@@ -132,13 +132,16 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
-    # Role / instruction tags that impersonate a conversation turn.
+    # Role / instruction tags that impersonate a conversation turn. The name
+    # must end the tag name, so <system-design> or <prompt-template> do not
+    # match; <user> and <root> are left out because they are common
+    # placeholders ("C:\Users\<user>"). Any other tag is escaped, not rejected.
     (
         "role tag",
         re.compile(
-            r"<\s*/?\s*(?:system|assistant|user|human|admin|root|sudo|"
+            r"<\s*/?\s*(?:system|assistant|human|admin|sudo|"
             r"instructions?|prompt|override|ignore|jailbreak|bypass|"
-            r"injection)\b[^>]*>",
+            r"injection)(?=[\s/>])[^>]*>",
             re.IGNORECASE,
         ),
     ),
@@ -202,9 +205,7 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "command instruction",
         re.compile(
-            r"\brun\s+(?:this|the\s+following)\s*(?:command|script|code|"
-            r"snippet|:)|"
-            r"\bexecute\s+(?:this|the\s+following)\b|"
+            r"\b(?:run|execute)\s+(?:this|the\s+following)\s*(?:commands?\b|:)|"
             r"\bpipe\s+(?:this|the\s+output)\s+to\b",
             re.IGNORECASE,
         ),

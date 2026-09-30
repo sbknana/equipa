@@ -110,6 +110,14 @@ GENUINE_LESSONS = [
     "Avoid long lessons: they re-inflate the system prompt on every retry.",
     "Retry with exponential backoff and act as a good API citizen by "
     "honouring Retry-After when a 429 error appears.",
+    # Shapes seen in real decision rows that must not trip the role-tag or
+    # command-instruction patterns.
+    "Store per-user limits under the key ai:generate:<user> so existing "
+    "rows carry over.",
+    "If the sandbox cannot run this code, verify the interpreter path "
+    "before retrying.",
+    "Wrap user-supplied values in <user-culture-params> tags and validate "
+    "them before use.",
 ]
 
 
