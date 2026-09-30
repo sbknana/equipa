@@ -111,6 +111,7 @@ _BUNDLE_TIMEOUT_SECONDS = 900
 _SCOPE_TIMEOUT_SECONDS = 15.0
 _CGROUP_KILL_TIMEOUT_SECONDS = 5.0
 _POLL_SECONDS = 0.05
+_LEFTOVER_POLL_SECONDS = 0.25
 _LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _USER_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1165,6 +1166,7 @@ class IsolatedAgent:
         self.started = False
         self.imported = False
         self.closed = False
+        self.leftover_killer: asyncio.Task | None = None
         # A forked child inherits the registry; only the spawner may stop it.
         self.owner_pid = os.getpid()
 
@@ -1291,26 +1293,42 @@ class IsolatedAgent:
 
     async def _terminate_async(self) -> None:
         self.request_termination()
-        try:
+        # Poll the leader rather than await process.wait(): since Python
+        # 3.12 wait() only returns once every pipe is closed, and a process
+        # the agent left behind can hold stdout open indefinitely.
+        deadline = time.monotonic() + self.settings.stop_timeout_sec
+        while not self.leader_exited():
+            if time.monotonic() >= deadline:
+                logger.warning("[Isolation] agent %s did not stop within "
+                               "%.0fs; killing its cgroup", self.unit,
+                               self.settings.stop_timeout_sec)
+                break
+            await asyncio.sleep(_POLL_SECONDS)
+        await self._empty_cgroup()
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.process.wait(),
-                                   timeout=self.settings.stop_timeout_sec)
-        except asyncio.TimeoutError:
-            logger.warning("[Isolation] agent %s did not stop within %.0fs; "
-                           "killing its cgroup", self.unit,
-                           self.settings.stop_timeout_sec)
+                                   timeout=_CGROUP_KILL_TIMEOUT_SECONDS)
+        await asyncio.to_thread(self._import_once)
+
+    async def _empty_cgroup(self) -> None:
         deadline = time.monotonic() + _CGROUP_KILL_TIMEOUT_SECONDS
         while not self._cgroup_empty():
             self._kill_everything()
             if time.monotonic() >= deadline:
                 logger.error("[Isolation] agent scope %s survived cgroup.kill",
                              self.cgroup)
-                break
+                return
             await asyncio.sleep(_POLL_SECONDS)
-        if self.process.returncode is None:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.process.wait(),
-                                       timeout=_CGROUP_KILL_TIMEOUT_SECONDS)
-        await asyncio.to_thread(self._import_once)
+
+    async def kill_leftovers_when_launcher_exits(self) -> None:
+        """Background task: once the launcher is gone (its export written,
+        or the agent killed it), kill whatever the agent left in the scope,
+        so no leftover can keep the CLI's stdout open and stall the
+        orchestrator's read loop (review CT-01/CT-02)."""
+        while not self.closed and not self.leader_exited():
+            await asyncio.sleep(_LEFTOVER_POLL_SECONDS)
+        if not self.closed:
+            await self._empty_cgroup()
 
     def terminate_sync(self) -> None:
         """Blocking variant for cancellation, loop shutdown and atexit."""
@@ -1367,6 +1385,9 @@ class IsolatedAgent:
         self.closed = True
         _LIVE_ISOLATED_AGENTS.discard(self)
         self.request_termination()
+        if self.leftover_killer is not None and not self.leftover_killer.done():
+            with contextlib.suppress(RuntimeError):  # loop already closed
+                self.leftover_killer.cancel()
 
 
 def _terminate_live_isolated_agents_at_exit() -> None:
@@ -1441,6 +1462,8 @@ async def spawn_isolated_agent(
             raise
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+    agent.leftover_killer = asyncio.create_task(
+        agent.kill_leftovers_when_launcher_exits())
     logger.info("[Isolation] agent %s runs as %s in %s", unit,
                 settings.agent_user, agent.cgroup)
     return process, agent
