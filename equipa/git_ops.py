@@ -342,26 +342,101 @@ def _contained_root(path: str | Path, toplevel: str) -> tuple[Path | None, str]:
     return root, ""
 
 
+# ``rev-parse`` prints one line per option, in the order given.
+_WORK_TREE_PROBE = ("rev-parse", "--absolute-git-dir", "--show-toplevel")
+_GIT_DIR_PROBE = ("rev-parse", "--absolute-git-dir")
+
+
+def _parse_work_tree_probe(stdout: str | None) -> tuple[str, str] | None:
+    """``(git dir, work-tree root)`` from :data:`_WORK_TREE_PROBE` output."""
+    lines = (stdout or "").splitlines()
+    if len(lines) != 2 or not all(line.strip() for line in lines):
+        return None
+    return lines[0].strip(), lines[1].strip()
+
+
+def _root_needs_repository_check(path: str | Path, root: Path) -> bool:
+    """True when ``root`` is an ancestor of ``path``, not ``path`` itself.
+
+    git run at ``path`` already answered for ``path``'s repository; only a
+    different directory can discover a different one.
+    """
+    return root.resolve() != Path(path).resolve()
+
+
+def _same_repository_problem(
+    path: str | Path, root: Path, git_dir: str, root_git_dir: str | None,
+) -> str | None:
+    """Why git run AT ``root`` would not work on ``path``'s repository.
+
+    IND-02 (task #3132): an agent-written ``core.worktree`` naming an
+    ANCESTOR directory passes the containment check. When that ancestor is
+    another repository's checkout, every orchestrator git call re-rooted
+    there (gate diff, merge, reset) discovers that repository instead.
+    """
+    if root_git_dir is None:
+        return (
+            f"git names {root} as the work-tree root of {path}, but git run "
+            f"there finds no repository (core.worktree or a similar redirect)"
+        )
+    if Path(root_git_dir).resolve() != Path(git_dir).resolve():
+        return (
+            f"git names {root} as the work-tree root of {path}, but git run "
+            f"there uses the repository at {root_git_dir}, not {git_dir} "
+            f"(core.worktree or a similar redirect)"
+        )
+    return None
+
+
+def _git_dir_at(directory: Path) -> str | None:
+    """Absolute git dir that git discovers from ``directory``, None if none."""
+    try:
+        result = git_run(list(_GIT_DIR_PROBE), directory, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[git] no git dir at %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    return printed if result.returncode == 0 and printed else None
+
+
+async def _git_dir_at_async(directory: Path) -> str | None:
+    """:func:`_git_dir_at` without blocking the event loop."""
+    try:
+        result = await git_run_async(list(_GIT_DIR_PROBE), directory, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[git] no git dir at %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    return printed if result.returncode == 0 and printed else None
+
+
 def _probe_work_tree(path: str | Path) -> tuple[Path | None, str]:
     """``(work-tree root, "")``, or ``(None, why git named no root)``.
+
+    The root must contain ``path`` and, when it is an ancestor, git run
+    there must find the same repository (IND-02, task #3132).
 
     Raises :class:`GitNotRunnableError` when the git executable itself
     could not be started; every other failure is reported, not raised.
     """
     try:
         result = git_run(
-            ["rev-parse", "--show-toplevel"], path, timeout=10,
-            env={"LC_ALL": "C"},
+            list(_WORK_TREE_PROBE), path, timeout=10, env={"LC_ALL": "C"},
         )
     except subprocess.SubprocessError as exc:
         return None, f"git could not be run: {exc}"
     except OSError as exc:
         raise GitNotRunnableError(f"git could not be run: {exc}") from exc
-    toplevel = (result.stdout or "").strip()
-    if result.returncode == 0 and toplevel:
-        return _contained_root(path, toplevel)
-    detail = (result.stderr or "").strip()[:300]
-    return None, detail or f"git rev-parse exited {result.returncode}"
+    probed = _parse_work_tree_probe(result.stdout) if result.returncode == 0 else None
+    if probed is None:
+        detail = (result.stderr or "").strip()[:300]
+        return None, detail or f"git rev-parse exited {result.returncode}"
+    git_dir, toplevel = probed
+    root, problem = _contained_root(path, toplevel)
+    if root is None or not _root_needs_repository_check(path, root):
+        return root, problem
+    problem = _same_repository_problem(path, root, git_dir, _git_dir_at(root))
+    return (None, problem) if problem else (root, "")
 
 
 def _nearest_git_entry(path: Path) -> Path | None:
@@ -402,14 +477,21 @@ async def git_toplevel_async(path: str | Path) -> Path | None:
     if not Path(path).is_dir():
         return None
     try:
-        result = await git_run_async(["rev-parse", "--show-toplevel"], path, timeout=10)
+        result = await git_run_async(list(_WORK_TREE_PROBE), path, timeout=10)
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning("[git] could not locate the work tree of %s: %s", path, exc)
         return None
-    toplevel = (result.stdout or "").strip()
-    if result.returncode != 0 or not toplevel:
+    probed = _parse_work_tree_probe(result.stdout) if result.returncode == 0 else None
+    if probed is None:
         return None
+    git_dir, toplevel = probed
     root, problem = _contained_root(path, toplevel)
+    if root is not None and _root_needs_repository_check(path, root):
+        problem = _same_repository_problem(
+            path, root, git_dir, await _git_dir_at_async(root),
+        ) or ""
+        if problem:
+            root = None
     if root is None:
         logger.warning("[git] refusing the work-tree root of %s: %s", path, problem)
     return root

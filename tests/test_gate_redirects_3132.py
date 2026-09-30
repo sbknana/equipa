@@ -221,6 +221,70 @@ def test_planted_git_file_in_a_nested_project_is_refused(
     assert "GIT_DIR" in capsys.readouterr().out
 
 
+def _ancestor_pivot(tmp_path: Path) -> tuple[Path, Path]:
+    """``real`` nested in ``outer``'s work tree with ``core.worktree = outer``.
+
+    The root git names (``outer``) CONTAINS ``real``, so a containment check
+    alone accepts it, but git run at that root is ``outer``'s repository,
+    whose same-named branch only edits README.md.
+    """
+    outer = _init_repo(tmp_path / "outer")
+    _git(outer, "checkout", "-q", "-b", TASK_BRANCH)
+    _commit_files(outer, {"README.md": "decoy docs\n"}, "decoy doc change")
+    _git(outer, "checkout", "-q", "master")
+    real = _init_repo(outer / "nested" / "real")
+    _git(real, "checkout", "-q", "-b", TASK_BRANCH)
+    _commit_files(real, {"lib/code.py": PAYLOAD}, "task code")
+    _git(real, "checkout", "-q", "master")
+    _git(real, "config", "core.worktree", str(outer))
+    return real, outer
+
+
+def test_ancestor_root_of_another_repository_is_refused(tmp_path: Path) -> None:
+    real, _outer = _ancestor_pivot(tmp_path)
+
+    assert git_ops_mod.git_toplevel(real) is None
+    assert _run(git_ops_mod.git_toplevel_async(real)) is None
+    with pytest.raises(git_ops_mod.GitRepositoryUnreadableError):
+        git_ops_mod._is_git_repo(real)
+    changed = _run(get_changed_files_for_branch(
+        str(real), base_ref="master", head_ref=TASK_BRANCH,
+    ))
+    assert changed == [], f"the gate diffed the enclosing repository: {changed}"
+    assert _run(index_flag_problem(real)) is not None
+
+
+def test_ancestor_root_pivot_is_blocked_even_without_the_hazard_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real, outer = _ancestor_pivot(tmp_path)
+    real_master, outer_master = _master(real), _master(outer)
+
+    async def no_hazards(_directory):
+        return []
+
+    monkeypatch.setattr(dispatch_mod, "find_repo_execution_hazards", no_hazards)
+    status = _run(dispatch_mod._gated_merge_task(
+        repo=str(real), branch=TASK_BRANCH, outcome="tests_passed",
+        task_id=TASK_ID,
+    ))
+
+    assert status == "blocked"
+    assert _master(outer) == outer_master, "the enclosing repository's master moved"
+    assert _master(real) == real_master
+
+
+def test_nested_project_root_is_its_own_repository_control(tmp_path: Path) -> None:
+    """A nested project inside its own repository keeps working."""
+    real, _outer = _ancestor_pivot(tmp_path)
+    _git(real, "config", "--unset", "core.worktree")
+    (real / "sub").mkdir()
+
+    assert git_ops_mod.git_toplevel(real / "sub") == real.resolve()
+    assert _run(git_ops_mod.git_toplevel_async(real / "sub")) == real.resolve()
+    assert git_ops_mod._is_git_repo(real / "sub") is True
+
+
 @pytest.mark.parametrize(
     ("value", "flagged"), [("true", True), ("false", False)],
     ids=["bare", "not-bare-control"],
