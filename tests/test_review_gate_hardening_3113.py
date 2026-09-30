@@ -439,9 +439,13 @@ def review_writer(root, newline="\n", extra=None):
     return behave
 
 
+# The agent env is allowlisted (loop-03), so the fake finds result.json next
+# to itself rather than through an inherited variable.
 FAKE_CLI_PRINTING_RESULT = (
     "import os, sys\n"
-    "sys.stdout.write(open(os.environ['FAKE_RESULT'], encoding='utf-8').read())\n"
+    "here = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.stdout.write(open(os.path.join(here, 'result.json'),"
+    " encoding='utf-8').read())\n"
 )
 
 
@@ -464,7 +468,6 @@ def test_run_agent_flags_a_run_that_hit_max_turns(
     }), encoding="utf-8")
     fake_cli = tmp_path / "fake_claude.py"
     fake_cli.write_text(FAKE_CLI_PRINTING_RESULT, encoding="utf-8")
-    monkeypatch.setenv("FAKE_RESULT", str(result_file))
 
     result = asyncio.run(agent_runner.run_agent(
         [sys.executable, str(fake_cli)], timeout=30, max_retries=0,
