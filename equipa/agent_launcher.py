@@ -130,6 +130,14 @@ _UNIT_PRIVATE_ENTRIES = ("home", "gitconfig", "files", "tmp")
 # Exported bundles older than this are removed from the exchange directory.
 _STALE_EXPORT_SECONDS = 24 * 3600
 _GIT_TIMEOUT_SECONDS = 900
+# A cron or at job, or a lingering systemd user manager, runs outside the
+# unit's scope, so cgroup.kill never ends it and it outlives the unit
+# (review R3136-04). The agent user must be denied all three.
+_LINGER_DIR = "/var/lib/systemd/linger"
+_SCHEDULERS = (("crontab", ("/usr/bin/crontab", "/bin/crontab")),
+               ("at", ("/usr/bin/at", "/bin/at")))
+_SCHEDULER_DENIED = ("not allowed", "permission", "not permitted")
+_SCHEDULER_TIMEOUT_SECONDS = 30
 _FILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _UNIT_RE = re.compile(r"^equipa-agent-[0-9]+-[0-9]+-[0-9a-f]{8,32}$")
 _REF_RE = re.compile(r"^refs/[A-Za-z0-9._/-]+$")
@@ -755,9 +763,42 @@ class _IsolatedSession:
         """Every isolation property the agent's safety rests on, checked
         from the inside. The first failure refuses the run."""
         self._verify_identity()
+        self._verify_no_scheduler()
         self._verify_cgroup()
         self._verify_denied_access()
         self._verify_required_access()
+
+    def _verify_no_scheduler(self) -> None:
+        """The agent user may neither linger nor use cron or at."""
+        if os.path.lexists(os.path.join(_LINGER_DIR, self.user)):
+            raise IsolationRefused(
+                f"lingering is enabled for {self.user}, so it has a systemd "
+                f"user manager outside the unit (loginctl disable-linger)")
+        for name, candidates in _SCHEDULERS:
+            executable = next((path for path in candidates
+                               if os.access(path, os.X_OK)), None)
+            if executable is None:
+                continue
+            try:
+                result = subprocess.run(
+                    [executable, "-l"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                    timeout=_SCHEDULER_TIMEOUT_SECONDS, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise IsolationRefused(
+                    f"cannot check whether {self.user} may use {name}: "
+                    f"{exc}") from exc
+            output = (result.stdout + result.stderr).decode("utf-8", "replace")
+            if result.returncode != 0 and any(
+                    marker in output.lower() for marker in _SCHEDULER_DENIED):
+                continue
+            deny_file = "/etc/cron.deny" if name == "crontab" else "/etc/at.deny"
+            raise IsolationRefused(
+                f"the agent user may use {name} ({executable} -l: "
+                f"{output.strip()[:200]!r}); a scheduled job would outlive "
+                f"the unit - list {self.user} in {deny_file} "
+                f"(docs/AGENT_ISOLATION.md step 1)")
 
     def _verify_identity(self) -> None:
         import grp

@@ -25,7 +25,8 @@
 #     memory.max set, and cannot leave that cgroup or raise its limits;
 #   * cannot signal the orchestrator;
 #   * sees a TheForge view without the excluded tables (api_keys);
-#   * has no credential in its environment except CLAUDE_CODE_OAUTH_TOKEN.
+#   * has no credential in its environment except CLAUDE_CODE_OAUTH_TOKEN;
+#   * cannot use crontab or at, and does not linger (nothing outlives it).
 # Every check prints PASS or FAIL; the last line is RESULT: PASS|FAIL.
 # Exit status: 0 all checks passed, 1 a check failed, 2 isolation could not
 # be established at all.
@@ -198,6 +199,29 @@ inside() {
         fail "agent can move processes into other cgroups: $writable_procs"
     else
         pass "agent cannot leave its scope (no writable cgroup.procs)"
+    fi
+
+    # --- nothing outlives the unit: no cron, no at, no lingering -----------
+    # A scheduled job or a lingering user manager runs outside the scope, so
+    # cgroup.kill never ends it (review R3136-04).
+    local scheduler scheduler_output linger
+    for scheduler in crontab at; do
+        command -v "$scheduler" >/dev/null 2>&1 || continue
+        if scheduler_output="$(LC_ALL=C "$scheduler" -l 2>&1)"; then
+            fail "agent user can use $scheduler ($scheduler -l succeeded)"
+            continue
+        fi
+        case "$scheduler_output" in
+            *"not allowed"*|*[Pp]ermission*|*"not permitted"*)
+                pass "agent user cannot use $scheduler" ;;
+            *) fail "agent user can use $scheduler ($scheduler -l: $(printf '%s' "$scheduler_output" | head -n 1))" ;;
+        esac
+    done
+    linger="$(loginctl show-user "$user" --property=Linger --value 2>/dev/null)"
+    if [ -e "/var/lib/systemd/linger/$user" ] || [ "$linger" = "yes" ]; then
+        fail "lingering is enabled for $user (a user manager outside the scope)"
+    else
+        pass "lingering is off for $user"
     fi
 
     # --- cannot signal the orchestrator --------------------------------------

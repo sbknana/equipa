@@ -1971,6 +1971,65 @@ def find_database_copies(directories: Iterable[str],
     return sorted(found), False
 
 
+# Below the project roots: the same pruning and depth as the verify script's
+# secret-file search, and only real SQLite files are opened.
+_SCAN_PRUNED_DIRS = frozenset({"node_modules", ".git", ".venv", "venv"})
+_SCAN_MAX_DEPTH = 6
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _sqlite_tables(path: str) -> set[str]:
+    """Lower-cased table names of the SQLite database at ``path`` (a
+    regular file, opened read-only and immutable), or an empty set."""
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return set()
+        with open(path, "rb") as handle:
+            if handle.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER:
+                return set()
+        uri = f"{Path(path).absolute().as_uri()}?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=1)
+        try:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return set()
+    return {str(name).lower() for (name,) in rows}
+
+
+def find_credential_databases(roots: Iterable[str], tables: Iterable[str],
+                              limit: int = _MAX_DATABASE_COPIES
+                              ) -> tuple[list[str], bool]:
+    """Database files below ``roots`` whose schema holds one of ``tables``
+    (the excluded ones, api_keys): TheForge copies outside its protected
+    directories, which the verify probe then tries to read as the agent
+    (review R3136-08). Returns (paths, truncated at ``limit`` candidates)."""
+    wanted = {table.lower() for table in tables}
+    found: list[str] = []
+    examined = 0
+    for root in dict.fromkeys(roots):
+        root_depth = os.path.normpath(root).count(os.sep)
+        for directory, subdirs, files in os.walk(root, followlinks=False):
+            if directory.count(os.sep) - root_depth >= _SCAN_MAX_DEPTH:
+                subdirs[:] = []
+            else:
+                subdirs[:] = [name for name in subdirs
+                              if name not in _SCAN_PRUNED_DIRS]
+            for name in files:
+                if not _DATABASE_COPY_RE.search(name):
+                    continue
+                examined += 1
+                if examined > limit:
+                    return found, True
+                path = os.path.join(directory, name)
+                if wanted & _sqlite_tables(path):
+                    found.append(path)
+    return found, False
+
+
 def forge_source_database(settings: IsolationSettings) -> str | None:
     """The --db-path of the forge MCP server in mcp_config.json, or None."""
     try:
@@ -2051,6 +2110,17 @@ def _outer_checks(settings: IsolationSettings) -> list[str]:
         failures.append(f"{CONFIG_KEY}.secret_scan_roots is empty; list the "
                         f"directories that hold project checkouts so the "
                         f"agent's access to their secrets is checked")
+    copies, truncated = find_credential_databases(settings.secret_scan_roots,
+                                                  settings.exclude_tables)
+    for copy in copies:
+        with contextlib.suppress(OSError):
+            if os.stat(copy).st_mode & stat.S_IROTH:
+                failures.append(f"{copy} holds an excluded table "
+                                f"({', '.join(settings.exclude_tables)}) and "
+                                f"is world-readable (chmod 0600 or remove it)")
+    if truncated:
+        failures.append(f"more than {_MAX_DATABASE_COPIES} database files "
+                        f"below secret_scan_roots; the search stopped there")
     return failures
 
 
@@ -2101,8 +2171,15 @@ def build_probe_command(probe: str, settings: IsolationSettings,
     for path in dict.fromkeys([*side_files, *copies]):
         command += ["--db-copy", path]
     # ISO-05: secret-shaped files readable below the project roots.
-    for root in dict.fromkeys([*settings.secret_scan_roots, *repos]):
+    roots = list(dict.fromkeys([*settings.secret_scan_roots, *repos]))
+    for root in roots:
         command += ["--secret-root", root]
+    # R3136-08: a database copy holding an excluded table anywhere below
+    # them is probed by name too.
+    credential_copies, _truncated = find_credential_databases(
+        roots, settings.exclude_tables)
+    for path in credential_copies:
+        command += ["--db-copy", path]
     return command
 
 

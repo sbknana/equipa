@@ -864,3 +864,180 @@ def test_unit_wait_timeout_setting(tmp_path: Path) -> None:
     with pytest.raises(isolation.AgentIsolationError,
                        match="unit_wait_timeout_sec"):
         _settings(tmp_path, unit_wait_timeout_sec=1)
+
+
+# --- R3136-04: nothing may outlive the unit (cron, at, lingering) ----------------------
+
+_CRON_DENIED = "You (equipa-agent) are not allowed to use this program (crontab)"
+_AT_DENIED = "You do not have permission to use at."
+
+
+def _fake_tool(directory: Path, name: str, output: str, status: int) -> str:
+    directory.mkdir(exist_ok=True)
+    path = directory / name
+    path.write_text(f"#!/bin/sh\necho '{output}' >&2\nexit {status}\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def _launcher_session(tmp_path: Path, monkeypatch, crontab: tuple[str, int],
+                      at: tuple[str, int] | None) -> agent_launcher._IsolatedSession:
+    tools = tmp_path / "tools"
+    schedulers = [("crontab", (_fake_tool(tools, "crontab", *crontab),))]
+    if at is not None:
+        schedulers.append(("at", (_fake_tool(tools, "at", *at),)))
+    linger = tmp_path / "linger"
+    linger.mkdir(exist_ok=True)
+    monkeypatch.setattr(agent_launcher, "_SCHEDULERS", tuple(schedulers))
+    monkeypatch.setattr(agent_launcher, "_LINGER_DIR", str(linger))
+    unit = "equipa-agent-1-1-00000000000000a4"
+    header = {
+        "unit": unit, "argv": ["claude", "-p", "x"], "executable": sys.executable,
+        "env": {"PATH": os.environ["PATH"]}, "files": [], "workdir_sources": [],
+        "identity": {"user": "equipa-agent", "orchestrator_uid": os.getuid() + 1,
+                     "privileged_groups": []},
+        "cgroup": {"path": f"/app.slice/{unit}.scope", "pids_max": 64,
+                   "memory_max": 256 * 1024 ** 2, "cpu_weight": 100},
+        "deny_read": [], "deny_write": [], "must_execute": [], "must_read": [],
+        "git": {"executable": _GIT, "hardening_args": [], "hardening_env": {},
+                "user_name": "Forgeborn", "user_email": "forgeborn@example.invalid"},
+        "workspace": None, "grace": 1.0,
+    }
+    return agent_launcher._IsolatedSession(header)
+
+
+def test_launcher_refuses_an_agent_that_may_use_cron(tmp_path, monkeypatch) -> None:
+    session = _launcher_session(tmp_path, monkeypatch,
+                                ("no crontab for equipa-agent", 1), None)
+    with pytest.raises(agent_launcher.IsolationRefused,
+                       match="may use crontab.*cron.deny"):
+        session._verify_no_scheduler()
+
+
+def test_launcher_refuses_an_agent_that_may_use_at(tmp_path, monkeypatch) -> None:
+    session = _launcher_session(tmp_path, monkeypatch, (_CRON_DENIED, 1), ("", 0))
+    with pytest.raises(agent_launcher.IsolationRefused, match="may use at"):
+        session._verify_no_scheduler()
+
+
+def test_launcher_refuses_a_lingering_agent_user(tmp_path, monkeypatch) -> None:
+    session = _launcher_session(tmp_path, monkeypatch, (_CRON_DENIED, 1),
+                                (_AT_DENIED, 1))
+    (tmp_path / "linger" / "equipa-agent").write_text("")
+    with pytest.raises(agent_launcher.IsolationRefused, match="lingering"):
+        session._verify_no_scheduler()
+
+
+def test_launcher_accepts_denied_cron_and_at(tmp_path, monkeypatch) -> None:
+    session = _launcher_session(tmp_path, monkeypatch, (_CRON_DENIED, 1),
+                                (_AT_DENIED, 1))
+    session._verify_no_scheduler()
+
+
+def test_launcher_verify_runs_the_scheduler_check(tmp_path, monkeypatch) -> None:
+    session = _launcher_session(tmp_path, monkeypatch, (_CRON_DENIED, 1), None)
+    order: list[str] = []
+    for name in ("_verify_identity", "_verify_no_scheduler", "_verify_cgroup",
+                 "_verify_denied_access", "_verify_required_access"):
+        monkeypatch.setattr(session, name,
+                            lambda name=name: order.append(name))
+    session.verify()
+    assert "_verify_no_scheduler" in order
+
+
+VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_agent_isolation.sh"
+
+
+def _run_inside_with(tmp_path: Path, tools: dict[str, tuple[str, int]],
+                     linger: str = "no") -> list[str]:
+    fake_bin = tmp_path / "bin"
+    _fake_tool(fake_bin, "sudo", "", 1)
+    for name, (output, status) in tools.items():
+        _fake_tool(fake_bin, name, output, status)
+    loginctl = fake_bin / "loginctl"
+    loginctl.write_text(f"#!/bin/sh\necho {linger}\n")
+    loginctl.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    result = subprocess.run([str(VERIFY_SCRIPT), "--inside"],
+                            capture_output=True, text=True, env=env,
+                            timeout=120, check=False)
+    return result.stdout.splitlines()
+
+
+def test_verify_script_fails_when_the_agent_may_schedule_jobs(tmp_path) -> None:
+    lines = _run_inside_with(tmp_path, {"crontab": ("no crontab for x", 1),
+                                        "at": ("", 0)}, linger="yes")
+    assert "FAIL agent user can use crontab (crontab -l: no crontab for x)" in lines
+    assert "FAIL agent user can use at (at -l succeeded)" in lines
+    assert any(line.startswith("FAIL lingering is enabled for") for line in lines)
+    assert lines[-1].startswith("RESULT: FAIL")
+
+
+def test_verify_script_passes_denied_cron_and_at(tmp_path) -> None:
+    lines = _run_inside_with(tmp_path, {"crontab": (_CRON_DENIED, 1),
+                                        "at": (_AT_DENIED, 1)})
+    assert "PASS agent user cannot use crontab" in lines
+    assert "PASS agent user cannot use at" in lines
+
+
+# --- R3136-08: TheForge copies with an excluded table below the project roots -----------
+
+
+def _sqlite(path: Path, *tables: str) -> Path:
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    for table in tables:
+        connection.execute(f"CREATE TABLE {table} (x)")
+    connection.commit()
+    connection.close()
+    return path
+
+
+@pytest.fixture
+def project_roots(tmp_path: Path) -> dict[str, Path]:
+    projects = tmp_path / "projects"
+    copy = _sqlite(projects / "shop" / "data" / "theforge.db", "tasks", "API_KEYS")
+    _sqlite(projects / "shop" / "fixtures.sqlite3", "orders")
+    _sqlite(projects / "shop" / "node_modules" / "x" / "keys.db", "api_keys")
+    (projects / "shop" / "notes.db").write_text("not a database")
+    (projects / "shop" / "link.db").symlink_to(copy)
+    return {"projects": projects, "copy": copy}
+
+
+def test_credential_databases_below_project_roots_are_found(
+        project_roots: dict[str, Path]) -> None:
+    found, truncated = isolation.find_credential_databases(
+        [str(project_roots["projects"])], ["api_keys"])
+    assert found == [str(project_roots["copy"])] and not truncated
+
+
+def test_probe_command_probes_credential_copies_as_the_agent(
+        tmp_path: Path, monkeypatch, project_roots: dict[str, Path]) -> None:
+    forge = tmp_path / "TheForge"
+    forge.mkdir()
+    (forge / "theforge.db").write_text("x")
+    monkeypatch.setattr(isolation, "THEFORGE_DB", forge / "theforge.db")
+    monkeypatch.setattr(isolation, "MCP_CONFIG", tmp_path / "no-mcp.json")
+    settings = _settings(tmp_path,
+                         secret_scan_roots=[str(project_roots["projects"])])
+    command = isolation.build_probe_command("probe", settings, [], str(tmp_path))
+    copies = [command[i + 1] for i, arg in enumerate(command) if arg == "--db-copy"]
+    assert str(project_roots["copy"]) in copies
+
+
+def test_outer_checks_fail_on_a_world_readable_credential_copy(
+        tmp_path: Path, monkeypatch, project_roots: dict[str, Path]) -> None:
+    forge = tmp_path / "TheForge"
+    forge.mkdir(mode=0o700)
+    monkeypatch.setattr(isolation, "THEFORGE_DB", forge / "theforge.db")
+    monkeypatch.setattr(isolation, "MCP_CONFIG", tmp_path / "no-mcp.json")
+    monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+    settings = _settings(tmp_path,
+                         secret_scan_roots=[str(project_roots["projects"])])
+    project_roots["copy"].chmod(0o644)
+    failures = "\n".join(isolation._outer_checks(settings))
+    assert f"{project_roots['copy']} holds an excluded table" in failures
+    project_roots["copy"].chmod(0o600)
+    assert isolation._outer_checks(settings) == []

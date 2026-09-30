@@ -862,8 +862,9 @@ def test_spawn_refused_when_scope_never_appears(tmp_path: Path,
 
 
 _RELAXED_LAUNCHER = textwrap.dedent("""\
-    # Test-only wrapper: the real launcher with the three inside checks that
-    # need a second user and a real cgroup relaxed; everything else is real.
+    # Test-only wrapper: the real launcher with the four inside checks that
+    # need a second user, host scheduler config and a real cgroup relaxed;
+    # everything else is real.
     import importlib.util, sys
     spec = importlib.util.spec_from_file_location("agent_launcher", {launcher!r})
     launcher = importlib.util.module_from_spec(spec)
@@ -875,6 +876,7 @@ _RELAXED_LAUNCHER = textwrap.dedent("""\
     session._verify_identity = identity
     session._verify_cgroup = lambda self: None
     session._verify_denied_access = lambda self: None
+    session._verify_no_scheduler = lambda self: None
     sys.exit(launcher._run_isolated())
     """)
 
