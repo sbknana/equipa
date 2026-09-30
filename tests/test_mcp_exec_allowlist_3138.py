@@ -174,6 +174,31 @@ REFUSED = {
                             "args": ["--python", "./venv/bin/python", "srv"]},
     "uvx later --with-editable": {"command": "{bin}/uvx", "args": [
         "--from", "mcp-server-sqlite==0.6", "--with-editable", ".", "srv"]},
+    # Short aliases, attached values and flag clusters (-w is --with).
+    "uvx -w pkg/sub": {"command": "{bin}/uvx", "args": ["-w", "pkg/sub", "srv"]},
+    "uvx -w./pkg": {"command": "{bin}/uvx", "args": ["-w./pkg", "srv"]},
+    "uvx -w=pkg/sub": {"command": "{bin}/uvx", "args": ["-w=pkg/sub", "srv"]},
+    "uvx -qw pkg/sub": {"command": "{bin}/uvx", "args": ["-qw", "pkg/sub", "srv"]},
+    "uvx -w project dir": {"command": "{bin}/uvx",
+                           "args": ["-w", "{project}/pkg", "srv"]},
+    "uvx -c sub/c.txt": {"command": "{bin}/uvx",
+                         "args": ["-c", "sub/c.txt", "srv"]},
+    "uvx -fwheels/": {"command": "{bin}/uvx", "args": ["-fwheels/", "srv"]},
+    "uvx -f project dir": {"command": "{bin}/uvx",
+                           "args": ["-f", "{project}/wheels", "srv"]},
+    # A package index can be a local directory.
+    "uvx --index-url bare dir": {"command": "{bin}/uvx",
+                                 "args": ["--index-url", "idx", "srv"]},
+    "uvx --extra-index-url idx/simple": {"command": "{bin}/uvx", "args": [
+        "--extra-index-url", "idx/simple", "srv"]},
+    "uvx -i idx/simple": {"command": "{bin}/uvx",
+                          "args": ["-i", "idx/simple", "srv"]},
+    "uvx --index name=./idx": {"command": "{bin}/uvx",
+                               "args": ["--index", "local=./idx", "srv"]},
+    "uvx --default-index=file URL": {"command": "{bin}/uvx", "args": [
+        "--default-index=file://{project}/idx", "srv"]},
+    "uvx relative file URL": {"command": "{bin}/uvx",
+                              "args": ["srv", "--config", "file:conf/srv"]},
     # --- path arguments hidden behind = or inside a project ---------------
     "--config=./relative": {"command": "{bin}/mcp-server",
                             "args": ["--config=./srv.toml"]},
@@ -240,6 +265,20 @@ ACCEPTED = {
                              "args": ["--python", "3.12", "srv"]},
     "uvx tool option -p port": {"command": "{bin}/uvx",
                                 "args": ["srv", "-p", "8080"]},
+    "uvx tool option -b bind": {"command": "{bin}/uvx",
+                                "args": ["srv", "-b", "0.0.0.0"]},
+    "uvx tool option -f format": {"command": "{bin}/uvx",
+                                  "args": ["srv", "-f", "json"]},
+    "uvx -w package": {"command": "{bin}/uvx",
+                       "args": ["-w", "httpx==0.27", "srv"]},
+    "uvx -i remote index": {"command": "{bin}/uvx", "args": [
+        "-i", "https://pypi.example.invalid/simple", "srv"]},
+    "uvx --index named remote": {"command": "{bin}/uvx", "args": [
+        "--index", "internal=https://pypi.example.invalid/simple", "srv"]},
+    "uvx --index-url absolute outside projects": {"command": "{bin}/uvx",
+                                                  "args": ["--index-url",
+                                                           "/opt/wheelhouse",
+                                                           "srv"]},
     # The --db-path value is the IR-02 check's: a data file, not code.
     "uvx --db-path in project": {"command": "{bin}/uvx", "args": [
         "mcp-server-sqlite", "--db-path", "{project}/theforge.db"]},

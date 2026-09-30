@@ -1165,16 +1165,66 @@ _UVX_PATH_OPTIONS = frozenset({
     "--with-requirements", "--constraints", "--overrides",
     "--build-constraints", "--find-links", "--cache-dir",
 })
-# uvx options whose value is a path only when it looks like one (--python
-# 3.12 is a version).
-_UVX_MAYBE_PATH_OPTIONS = frozenset({"--python", "-p"})
+# uvx options whose value is a package index: a URL, or a local directory
+# (``--index name=./dir`` too), where a bare name is relative as well.
+_UVX_INDEX_OPTIONS = frozenset({
+    "--index", "--default-index", "--index-url", "--extra-index-url",
+})
+# uvx options whose value is a path only when it looks like one: --python
+# 3.12 is a version, and the short aliases of path options (-c, -b, -f, -i)
+# are scanned in the tool's own arguments too, where they can mean other
+# things (-b 0.0.0.0).
+_UVX_MAYBE_PATH_OPTIONS = frozenset({"--python", "-p", "-c", "-b", "-f", "-i"})
 # uvx options whose value is a package: a name, or a local path or file: URL.
-_UVX_PACKAGE_OPTIONS = frozenset({"--from", "--with"})
+_UVX_PACKAGE_OPTIONS = frozenset({"--from", "--with", "-w"})
+# Every short uvx option that takes a value, so an attached value (-w./pkg,
+# -w=./pkg) or a cluster of flags ending in one (-qw ./pkg) is read too.
+_UVX_SHORT_VALUE_LETTERS = frozenset("wcbifpPC")
+# A file: URL names a local path wherever it appears.
+_FILE_URL = re.compile(r"file:(?://(?:localhost)?)?([^\s#?]+)")
 
 
 def _is_path_like(value: str) -> bool:
     return (value in (".", "..") or value.startswith(("/", "./", "../", "~"))
             or "/" in value)
+
+
+def _uvx_option(args: list[str], index: int) -> tuple[str, str] | None:
+    """``(option, value)`` when ``args[index]`` is an option, else None.
+
+    Reads ``--opt value``, ``--opt=value``, ``-o value``, ``-ovalue``,
+    ``-o=value`` and a cluster of short flags ending in a value option
+    (``-qw value``). ``value`` is the next argument when none is attached,
+    whether or not the option takes one; callers only look at the value of
+    options they know take one.
+    """
+    arg = args[index]
+    following = args[index + 1] if index + 1 < len(args) else ""
+    if arg.startswith("--"):
+        option, has_value, attached = arg.partition("=")
+        return option, attached if has_value else following
+    if not arg.startswith("-") or len(arg) < 2:
+        return None
+    for position, letter in enumerate(arg[1:], start=1):
+        if letter in _UVX_SHORT_VALUE_LETTERS:
+            attached = arg[position + 1:]
+            attached = attached[1:] if attached.startswith("=") else attached
+            return f"-{letter}", attached or following
+        if not letter.isalpha():
+            break
+    return arg, following
+
+
+def _index_paths(value: str) -> list[str]:
+    """Local directories a uvx index option reads: ``./idx``, ``idx``,
+    ``/abs/idx``, ``name=./idx``. A remote URL gives none; a ``file:`` URL
+    is checked by the caller's file: URL scan."""
+    name, has_name, location = value.partition("=")
+    if has_name and re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        value = location
+    if not value or "://" in value or value.startswith("file:"):
+        return []
+    return [value]
 
 
 def _local_package_paths(spec: str) -> list[str]:
@@ -1183,8 +1233,7 @@ def _local_package_paths(spec: str) -> list[str]:
 
     A package name (``mcp-server-sqlite==0.6``) or a remote URL gives none.
     """
-    paths = [match.group(1) for match in
-             re.finditer(r"file:(?://(?:localhost)?)?([^\s#?]+)", spec)]
+    paths = [match.group(1) for match in _FILE_URL.finditer(spec)]
     for part in spec.split("@"):
         part = part.strip()
         if part and "://" not in part and not part.startswith("file:") and (
@@ -1199,38 +1248,45 @@ def _check_uvx_launch(args: list[str], refuse: Any,
     """uvx installs a package and runs it (RR-02).
 
     Refused: ``--with-editable`` (it always installs a local directory), and
-    ``--from`` / ``--with`` / path options naming a relative path, which
-    resolves in the agent-writable project directory, or a path inside a
-    project. Every argument is scanned, the tool's own too: the tool name
-    cannot be told from an option value without uvx's option table.
+    ``--from`` / ``--with`` / index / path options (long or short, value
+    attached or not) naming a relative path, which resolves in the
+    agent-writable project directory, or a path inside a project; so is a
+    ``file:`` URL anywhere that names one. Every argument is scanned, the
+    tool's own too: the tool name cannot be told from an option value
+    without uvx's option table.
     """
     for index, arg in enumerate(args):
-        option, has_value, attached = arg.partition("=")
-        if not option.startswith("-"):
-            continue
-        if option in _UVX_REFUSED_OPTIONS:
-            raise refuse(f"passes uvx {option}, which installs a local "
-                         f"directory an agent can write",
-                         "Install the server from a package index, or from "
-                         "an absolute path outside every project directory.")
-        value = attached if has_value else (
-            args[index + 1] if index + 1 < len(args) else "")
-        if option in _UVX_PACKAGE_OPTIONS:
-            paths = _local_package_paths(value)
-        elif option in _UVX_PATH_OPTIONS:
-            paths = [] if "://" in value else [value]
-        elif option in _UVX_MAYBE_PATH_OPTIONS:
-            paths = [value] if _is_path_like(value) else []
-        else:
-            continue
-        for path in paths:
-            expanded = os.path.expanduser(path)
-            if not os.path.isabs(expanded):
-                raise refuse(f"passes uvx {option} {value!r}, a path relative "
-                             f"to the project directory",
-                             "Use a package from an index, or an absolute "
-                             "path outside every project directory.")
-            refuse_inside_project(f"uvx {option} path", expanded)
+        checked: list[tuple[str, str, list[str]]] = [
+            ("file: URL", arg, [match.group(1)
+                                for match in _FILE_URL.finditer(arg)])]
+        parsed = _uvx_option(args, index)
+        if parsed is not None:
+            option, value = parsed
+            if option in _UVX_REFUSED_OPTIONS:
+                raise refuse(f"passes uvx {option}, which installs a local "
+                             f"directory an agent can write",
+                             "Install the server from a package index, or "
+                             "from an absolute path outside every project "
+                             "directory.")
+            if option in _UVX_PACKAGE_OPTIONS:
+                checked.append((option, value, _local_package_paths(value)))
+            elif option in _UVX_PATH_OPTIONS:
+                checked.append((option, value,
+                                [] if "://" in value else [value]))
+            elif option in _UVX_INDEX_OPTIONS:
+                checked.append((option, value, _index_paths(value)))
+            elif (option in _UVX_MAYBE_PATH_OPTIONS and _is_path_like(value)
+                  and "://" not in value):
+                checked.append((option, value, [value]))
+        for option, value, paths in checked:
+            for path in paths:
+                expanded = os.path.expanduser(path)
+                if not os.path.isabs(expanded):
+                    raise refuse(f"passes uvx {option} {value!r}, a path "
+                                 f"relative to the project directory",
+                                 "Use a package from an index, or an absolute "
+                                 "path outside every project directory.")
+                refuse_inside_project(f"uvx {option} path", expanded)
 
 
 _DB_PATH_PLACEHOLDER = "/absolute/path/to/theforge.db"
