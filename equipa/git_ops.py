@@ -319,18 +319,47 @@ class GitRepositoryUnreadableError(RuntimeError):
 _NOT_A_REPOSITORY = "not a git repository"
 
 
+class GitNotRunnableError(OSError):
+    """The git executable could not be started (missing from PATH, ...)."""
+
+
+def _contained_root(path: str | Path, toplevel: str) -> tuple[Path | None, str]:
+    """``toplevel`` as the root of ``path``, or ``(None, why not)``.
+
+    IND-02 (task #3132): ``rev-parse --show-toplevel`` answers with an
+    agent-writable ``core.worktree``, which can name ANOTHER repository's
+    checkout. A root that does not contain ``path`` is never ``path``'s work
+    tree, so every gate, merge and cleanup refuses it.
+    """
+    root = Path(toplevel)
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except ValueError:
+        return None, (
+            f"git names {root} as the work-tree root of {path}, which does "
+            f"not contain it (core.worktree or a similar redirect)"
+        )
+    return root, ""
+
+
 def _probe_work_tree(path: str | Path) -> tuple[Path | None, str]:
-    """``(work-tree root, "")``, or ``(None, why git named no root)``."""
+    """``(work-tree root, "")``, or ``(None, why git named no root)``.
+
+    Raises :class:`GitNotRunnableError` when the git executable itself
+    could not be started; every other failure is reported, not raised.
+    """
     try:
         result = git_run(
             ["rev-parse", "--show-toplevel"], path, timeout=10,
             env={"LC_ALL": "C"},
         )
-    except (subprocess.SubprocessError, OSError) as exc:
+    except subprocess.SubprocessError as exc:
         return None, f"git could not be run: {exc}"
+    except OSError as exc:
+        raise GitNotRunnableError(f"git could not be run: {exc}") from exc
     toplevel = (result.stdout or "").strip()
     if result.returncode == 0 and toplevel:
-        return Path(toplevel), ""
+        return _contained_root(path, toplevel)
     detail = (result.stderr or "").strip()[:300]
     return None, detail or f"git rev-parse exited {result.returncode}"
 
@@ -353,12 +382,16 @@ def git_toplevel(path: str | Path) -> Path | None:
     """Root of the git work tree that contains ``path``, or None.
 
     None when ``path`` is not a directory inside a git work tree (a plain
-    directory, a bare repository, a ``.git`` directory itself) or git
+    directory, a bare repository, a ``.git`` directory itself), when git
+    names a root that does not contain ``path`` (IND-02, task #3132) or git
     cannot be run there. Use :func:`_is_git_repo` to tell those apart.
     """
     if not Path(path).is_dir():
         return None
-    toplevel, problem = _probe_work_tree(path)
+    try:
+        toplevel, problem = _probe_work_tree(path)
+    except GitNotRunnableError as exc:
+        toplevel, problem = None, str(exc)
     if toplevel is None:
         logger.debug("[git] no work tree for %s: %s", path, problem)
     return toplevel
@@ -376,7 +409,10 @@ async def git_toplevel_async(path: str | Path) -> Path | None:
     toplevel = (result.stdout or "").strip()
     if result.returncode != 0 or not toplevel:
         return None
-    return Path(toplevel)
+    root, problem = _contained_root(path, toplevel)
+    if root is None:
+        logger.warning("[git] refusing the work-tree root of %s: %s", path, problem)
+    return root
 
 
 def _is_git_repo(path: str | Path) -> bool:
@@ -391,14 +427,28 @@ def _is_git_repo(path: str | Path) -> bool:
     R3119-02 (task #3126): fails closed. False only for a missing
     directory, or when git positively answers "not a git repository" and
     there is no ``.git`` at ``path`` or above it. Any other failure (a
-    corrupted config, a broken ``.git`` file, a timeout, no ``git``
-    binary) raises :class:`GitRepositoryUnreadableError`: an agent-broken
-    repository must not turn the next dispatch into an ungated one.
+    corrupted config, a broken ``.git`` file, a timeout, a work-tree root
+    that does not contain ``path``) raises
+    :class:`GitRepositoryUnreadableError`: an agent-broken repository must
+    not turn the next dispatch into an ungated one.
+
+    IND-03 (task #3132): with no ``git`` binary at all, a directory with no
+    ``.git`` at or above it is simply not git (it runs as before); one that
+    has a ``.git`` is refused.
     """
     directory = Path(path)
     if not directory.is_dir():
         return False
-    toplevel, problem = _probe_work_tree(directory)
+    try:
+        toplevel, problem = _probe_work_tree(directory)
+    except GitNotRunnableError as exc:
+        git_entry = _nearest_git_entry(directory)
+        if git_entry is None:
+            return False
+        raise GitRepositoryUnreadableError(
+            f"{exc}, but {git_entry} exists. Refusing to treat {directory} "
+            "as a non-git project; install git before dispatching."
+        ) from exc
     if toplevel is not None:
         return True
     git_entry = _nearest_git_entry(directory)
@@ -574,9 +624,15 @@ _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
 # log / show drop every path outside that directory, so code elsewhere in
 # the repository read as a doc-only change. Paths are always reported from
 # the work-tree root, whatever the repo config says.
+#
+# IND-01 (task #3132): ``diff.ignoreSubmodules`` likewise drops a submodule
+# pointer bump from porcelain ``git diff``. The pin overrides repo config;
+# ``submodule.<name>.ignore`` (config or ``.gitmodules``) is only overridden
+# by the ``--ignore-submodules=none`` flag the gate diff passes.
 _GIT_PATH_SCOPE_PINS: tuple[tuple[str, str], ...] = (
     ("diff.relative", "false"),
     ("status.relativePaths", "false"),
+    ("diff.ignoreSubmodules", "none"),
 )
 
 GIT_HARDENING_ARGS: tuple[str, ...] = (
@@ -674,9 +730,57 @@ def _hardened_git_argv(args: Sequence[str], env: Mapping[str, str]) -> list[str]
     return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *command]
 
 
+# IR-04 (task #3132): agents share the orchestrator's UID, so any agent shell
+# can read /proc/<pid>/environ of every git / gh child the orchestrator
+# starts. Those children therefore get an allowlisted environment, never a
+# copy of the orchestrator's (which holds DATABASE_URL, API keys, tokens).
+# Kept: what git needs to run, find the operator's own config and identity,
+# and reach a remote over ssh. Dropped with everything else: GIT_DIR,
+# GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS and
+# friends, which would redirect or reconfigure the repository git works on.
+_GIT_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR",
+    "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "SSH_ASKPASS",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT", "GIT_CONFIG_GLOBAL",
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL",
+    # Windows: git for Windows and gh need these to start at all.
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "PROGRAMDATA",
+})
+_GIT_ENV_ALLOWED_PREFIXES = ("LC_",)
+
+# Given only to the calls that talk to GitHub (gh, git push): credentials,
+# gh's own config location and the proxy settings (a proxy URL can carry a
+# password too).
+GITHUB_CREDENTIAL_ENV_KEYS: tuple[str, ...] = (
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST", "GH_CONFIG_DIR",
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+)
+
+
+def github_credential_env() -> dict[str, str]:
+    """The GitHub credential / proxy variables set in the orchestrator's env.
+
+    Pass as ``env=`` to exactly the git calls that push to GitHub; gh calls
+    through :func:`_gh_run` get them automatically.
+    """
+    return {
+        key: os.environ[key] for key in GITHUB_CREDENTIAL_ENV_KEYS
+        if key in os.environ
+    }
+
+
 def _get_repo_env() -> dict[str, str]:
-    """Build an environment dict with git and gh on the PATH."""
-    env = os.environ.copy()
+    """Allowlisted environment for a git / gh child, git and gh on the PATH."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if key in _GIT_ENV_ALLOWLIST or key.startswith(_GIT_ENV_ALLOWED_PREFIXES)
+    }
     extra_paths = []
     for candidate in [
         r"C:\Program Files\Git\cmd",
@@ -1049,8 +1153,11 @@ def _gh_run(
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
 ) -> subprocess.CompletedProcess:
-    """Run a gh (GitHub CLI) command with the same env as git_run."""
-    return _run_with_env(["gh", *args], cwd, timeout)
+    """Run a gh (GitHub CLI) command: git's allowlisted env plus the GitHub
+    credentials (IR-04, task #3132)."""
+    env = _get_repo_env()
+    env.update(github_credential_env())
+    return _run_with_env(["gh", *args], cwd, timeout, env)
 
 
 # Per-process cache of detected default branch, keyed by resolved repo path.
@@ -1348,10 +1455,7 @@ def check_gh_installed() -> bool:
         return False
 
     try:
-        result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True, text=True, timeout=10,
-        )
+        result = _gh_run(["auth", "status"], Path.cwd(), timeout=10)
         if result.returncode != 0:
             print("ERROR: GitHub CLI is not authenticated.")
             print("Run: gh auth login")
@@ -1462,6 +1566,7 @@ def setup_single_repo(
             default_branch = get_default_branch(p)
             pr = git_run(
                 ["push", "-u", "origin", default_branch], p, timeout=120,
+                env=github_credential_env(),
             )
             if pr.returncode != 0:
                 if default_branch == "main":
@@ -1471,6 +1576,7 @@ def setup_single_repo(
                     )
                 pr2 = git_run(
                     ["push", "-u", "origin", "main"], p, timeout=120,
+                    env=github_credential_env(),
                 )
                 if pr2.returncode != 0:
                     return False, (
