@@ -132,11 +132,20 @@ def _looks_like_credential(name: str) -> bool:
     )
 
 
+# Names that move the CLI off the subscription or to another endpoint
+# (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
+# CLAUDE_CODE_USE_BEDROCK/_VERTEX, ...): all need agent_allow_api_key (P2A-09).
+_API_BILLING_PREFIXES: tuple[str, ...] = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+
+
 def _passthrough_names(dispatch_config: Mapping[str, Any] | None) -> set[str]:
     """Exact names ``dispatch_config['agent_env_passthrough']`` adds.
 
-    Only valid identifiers are honoured (no wildcards). ANTHROPIC_API_KEY is
-    refused unless ``agent_allow_api_key`` is literally ``True``.
+    Only valid identifiers are honoured (no wildcards). ``ANTHROPIC_*`` and
+    ``CLAUDE_CODE_USE_*`` names are refused unless ``agent_allow_api_key`` is
+    literally ``True``; any other credential-shaped name (DATABASE_URL, PG*,
+    *_TOKEN, *_KEY, *SECRET*, *PASSWORD*) unless ``agent_allow_credentials``
+    is literally ``True`` (P2A-09).
     """
     if not isinstance(dispatch_config, Mapping):
         return set()
@@ -148,6 +157,7 @@ def _passthrough_names(dispatch_config: Mapping[str, Any] | None) -> set[str]:
         )
         return set()
     allow_api_key = dispatch_config.get("agent_allow_api_key") is True
+    allow_credentials = dispatch_config.get("agent_allow_credentials") is True
     names: set[str] = set()
     for name in raw:
         if not isinstance(name, str) or not _is_valid_env_key(name):
@@ -156,11 +166,19 @@ def _passthrough_names(dispatch_config: Mapping[str, Any] | None) -> set[str]:
                 "variable names only)", name,
             )
             continue
-        if name == ANTHROPIC_API_KEY_VAR and not allow_api_key:
+        if name.upper().startswith(_API_BILLING_PREFIXES):
+            if not allow_api_key:
+                logger.warning(
+                    "agent_env_passthrough: %s refused; set agent_allow_api_key "
+                    "true to let agents bill the API or use another endpoint "
+                    "instead of the subscription", name,
+                )
+                continue
+        elif _looks_like_credential(name) and not allow_credentials:
             logger.warning(
-                "agent_env_passthrough: %s refused; set agent_allow_api_key "
-                "true to bill the API instead of the subscription",
-                ANTHROPIC_API_KEY_VAR,
+                "agent_env_passthrough: %s looks like a credential and was "
+                "refused; set agent_allow_credentials true to hand it to "
+                "every agent", name,
             )
             continue
         names.add(name)

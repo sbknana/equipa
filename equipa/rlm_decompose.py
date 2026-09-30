@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from equipa.config import get_configured_model
+# The claude -p calls below embed project files in their prompt, so they get
+# the allowlisted agent env like every other agent CLI (P2A-07).
+from equipa.env_loader import active_agent_env
 from equipa.output import log
 from equipa.parsing import estimate_tokens
 
@@ -273,6 +276,7 @@ def _run_sub_query(
             text=True,
             timeout=SUB_QUERY_TIMEOUT,
             cwd=project_dir,
+            env=active_agent_env(),
         )
         if result.returncode == 0:
             try:
@@ -604,6 +608,7 @@ def _call_outer_agent(
             text=True,
             timeout=timeout,
             cwd=project_dir,
+            env=active_agent_env(),
         )
         if result.returncode == 0:
             return result.stdout
