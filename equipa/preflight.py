@@ -1,7 +1,12 @@
 """EQUIPA preflight — dependency installation and build checks.
 
 Layer 7: Imports from equipa.constants, equipa.output, equipa.agent_runner, equipa.prompts,
-         equipa.roles.
+         equipa.roles, equipa.isolation.
+
+With ``agent_isolation`` on, nothing here executes project files: installs,
+build checks and the auto-fix re-checks are refused (review ISO-01), because
+the worktree holds agent-written files and this code runs as the
+orchestrator's user.
 
 Copyright 2026 Forgeborn
 """
@@ -28,6 +33,8 @@ from equipa.constants import (
 # and build backends, MSBuild targets), often written by an agent in this very
 # dispatch, so they get the allowlisted agent env, never ours (P2A-06).
 from equipa.env_loader import active_agent_env
+# Called through the module so the flag is read at call time (fail closed).
+from equipa import isolation
 from equipa.output import log
 
 # Mirrors equipa.agent_runner.OVERLOADED_OUTCOME; this module imports
@@ -59,6 +66,10 @@ async def _run_install_cmd(
     output: Any = None,
 ) -> bool:
     """Run an install command, log result. Returns True on success."""
+    refusal = isolation.worktree_execution_refusal(f"Installing {label}")
+    if refusal:
+        log(f"  [Auto-Install] {refusal}.", output)
+        return False
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd, env=active_agent_env(),
@@ -78,7 +89,15 @@ async def _run_install_cmd(
 
 
 async def auto_install_dependencies(project_dir: str, output: Any = None) -> None:
-    """Auto-install project dependencies if manifest exists but deps are missing."""
+    """Auto-install project dependencies if manifest exists but deps are missing.
+
+    Skipped with agent_isolation on: an install runs project code, and an
+    isolated agent's clone would not see gitignored dependency trees anyway.
+    """
+    refusal = isolation.worktree_execution_refusal("Dependency auto-install")
+    if refusal:
+        log(f"  [Auto-Install] {refusal}. Skipping.", output)
+        return
     pdir = Path(project_dir)
 
     # Python: pyproject.toml or requirements.txt without venv
@@ -153,6 +172,12 @@ async def preflight_build_check(
                 return (True, "unknown", f"Skipped: task description contains '{keyword}'")
 
     language, build_cmd, skip_reason = _resolve_build_command(project_dir)
+    refusal = isolation.worktree_execution_refusal("Preflight build check")
+    if build_cmd and refusal:
+        # Reported as skipped (like a missing build tool), not as a broken
+        # build: a failure would start auto-fix, which cannot re-check.
+        log(f"  [Preflight] {refusal}. Skipping build check.", output)
+        return (True, language, f"Skipped: {refusal}")
     if not build_cmd:
         msg = skip_reason or ""
         if msg:
@@ -248,6 +273,13 @@ async def _handle_preflight_failure(
     """
     task_id = task["id"]
     total_cost = 0.0
+
+    # Every phase ends in a build re-check, which isolation refuses; without
+    # it a debugger's claim of a fixed build could not be verified.
+    refusal = isolation.worktree_execution_refusal("Build auto-fix")
+    if refusal:
+        log(f"  [AutoFix] {refusal}. Not dispatching the debugger.", output)
+        return False, total_cost, "agent_isolation_refused"
 
     log(f"  [AutoFix] Build broken — dispatching debugger agent", output)
     log(f"  [AutoFix] Language: {preflight_lang}, error preview: "

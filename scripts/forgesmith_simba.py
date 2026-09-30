@@ -63,6 +63,17 @@ except ImportError:
     CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
                                  "--strict-mcp-config")
 
+# ISO-06: `claude -p` on agent-derived lessons runs as the orchestrator's
+# user; with agent_isolation on it refuses. Standalone, the flag cannot be
+# read, so the call is refused (fail closed).
+try:
+    from equipa.isolation import unisolated_spawn_refusal
+except ImportError:
+    def unisolated_spawn_refusal(purpose, remedy=""):
+        """Standalone fallback: agent_isolation cannot be checked; refuse."""
+        return (f"{purpose} refused: equipa is not importable, so "
+                f"agent_isolation cannot be checked")
+
 # --- Paths ---
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -385,6 +396,12 @@ def call_claude_for_rules(prompt, cfg=None):
         "--no-session-persistence",
         *CLAUDE_CLI_ISOLATION_ARGS,
     ]
+
+    refusal = unisolated_spawn_refusal(
+        "SIMBA rule generation", "run SIMBA with agent_isolation off")
+    if refusal:
+        log(refusal)
+        return None
 
     try:
         result = subprocess.run(
