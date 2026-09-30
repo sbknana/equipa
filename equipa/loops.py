@@ -2044,14 +2044,11 @@ def _create_review_lessons(
 
     Sanitizes finding descriptions before storage (PM-33) since they originate
     from agent output which could contain prompt-injection payloads.
+
+    sandbox-15: the sanitizer is a HARD dependency. An ImportError propagates
+    instead of falling back to storing reviewer text unsanitized.
     """
-    try:
-        from lesson_sanitizer import sanitize_lesson_content, validate_lesson_structure
-    except ImportError:
-        def sanitize_lesson_content(text):
-            return text or ""
-        def validate_lesson_structure(text):
-            return bool(text)
+    from lesson_sanitizer import sanitize_lesson_content, validate_lesson_structure
 
     if lesson_prefix is None:
         # Default phrasing matches the original security-reviewer lesson text
