@@ -731,6 +731,103 @@ def test_import_accepts_in_tree_links_and_links_from_the_base(
     assert (worktree / ".equipa-artifacts" / "SECURITY-REVIEW-1.md").is_file()
 
 
+def _no_cli(calls: list):
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '{"result": "[]"}', "")
+    return run
+
+
+def _import_forgesmith(monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT))
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts"))
+    import forgesmith
+    import forgesmith_simba
+
+    monkeypatch.setattr(forgesmith_simba, "resolve_claude_model",
+                        lambda *_a, **_k: "fake-model")
+    return forgesmith, forgesmith_simba
+
+
+def test_forgesmith_cli_spawns_refuse_with_isolation_on(monkeypatch) -> None:
+    """ISO-06: GHOST, OPRO and SIMBA prompts carry agent-derived text; with
+    the flag on none of them may start ``claude`` as the orchestrator."""
+    forgesmith, simba = _import_forgesmith(monkeypatch)
+    _flag(monkeypatch, True)
+    calls: list = []
+    monkeypatch.setattr(forgesmith.subprocess, "run", _no_cli(calls))
+    monkeypatch.setattr(simba.subprocess, "run", _no_cli(calls))
+    assert forgesmith.dispatch_ghost_scout("finding text") is None
+    assert forgesmith.call_claude_for_proposals("p", {"opro": {}}) is None
+    assert simba.call_claude_for_rules("p", {}) is None
+    assert calls == []
+
+
+def test_forgesmith_cli_spawns_unchanged_with_isolation_off(monkeypatch) -> None:
+    forgesmith, simba = _import_forgesmith(monkeypatch)
+    _flag(monkeypatch, False)
+    calls: list = []
+    monkeypatch.setattr(forgesmith.subprocess, "run", _no_cli(calls))
+    monkeypatch.setattr(simba.subprocess, "run", _no_cli(calls))
+    forgesmith.dispatch_ghost_scout("finding text")
+    forgesmith.call_claude_for_proposals("p", {"opro": {}})
+    simba.call_claude_for_rules("p", {})
+    assert [call[0] for call in calls] == ["claude", "claude", "claude"]
+
+
+# Reach the CLI only through agent_runner._spawn_agent_process, which hands
+# every agent to the isolation launcher when the flag is on (tested by
+# test_agent_runner_refuses_instead_of_falling_back in the 3135 tests).
+_THROUGH_RUN_AGENT = {"equipa/agent_runner.py", "equipa/reflexion.py"}
+
+
+def _direct_claude_spawns(path: Path):
+    """(function, argv literal) for every ``claude -p`` argv in ``path``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.List) or not node.elts:
+                continue
+            first = node.elts[0]
+            prints = any(isinstance(elt, ast.Constant) and elt.value == "-p"
+                         for elt in node.elts)
+            if prints and ((isinstance(first, ast.Constant)
+                            and first.value == "claude")
+                           or (isinstance(first, ast.Name)
+                               and first.id == "claude_bin")):
+                yield function, node
+
+
+def test_every_direct_claude_spawn_checks_isolation_first() -> None:
+    """ISO-06 fence: a new ``claude -p`` spawn outside agent_runner fails
+    unless its function calls unisolated_spawn_refusal() first."""
+    sources = [*sorted((REPO_ROOT / "equipa").rglob("*.py")),
+               *sorted((REPO_ROOT / "scripts").glob("*.py")),
+               *sorted(REPO_ROOT.glob("*.py"))]
+    found, unguarded = [], []
+    for path in sources:
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        if relative in _THROUGH_RUN_AGENT:
+            continue
+        for function, argv in _direct_claude_spawns(path):
+            found.append(f"{relative}:{function.name}")
+            guards = [node.lineno for node in ast.walk(function)
+                      if isinstance(node, ast.Call)
+                      and getattr(node.func, "id",
+                                  getattr(node.func, "attr", None))
+                      == "unisolated_spawn_refusal"]
+            if not guards:
+                unguarded.append(f"{relative}:{argv.lineno} in {function.name}")
+    for expected in ("forgesmith.py:dispatch_ghost_scout",
+                     "forgesmith.py:call_claude_for_proposals",
+                     "scripts/forgesmith_simba.py:call_claude_for_rules",
+                     "equipa/rlm_decompose.py:_call_outer_agent"):
+        assert expected in found, f"the fence no longer sees {expected}"
+    assert not unguarded, f"claude spawns without the isolation check: {unguarded}"
+
+
 def test_link_escape_detection() -> None:
     assert isolation._link_escapes("a/b", "/abs")
     assert isolation._link_escapes("a/b", "../../x")
