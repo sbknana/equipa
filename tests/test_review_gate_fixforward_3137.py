@@ -101,3 +101,36 @@ def test_html_list_item_with_its_own_marker_is_counted_once():
 ])
 def test_html_list_item_with_its_own_marker_prose_merges(line):
     assert_prose_merges([line])
+
+
+# --- F4 leftovers of the 3122 review ------------------------------------------
+
+@pytest.mark.parametrize("line, severity", [
+    ("Open redirect, severity HIGH in auth.py", "HIGH"),
+    ("HIGH SQL injection in login handler", "HIGH"),
+    # The same shapes in the other positions a finding is written in.
+    ("- Open redirect, severity HIGH in auth.py", "HIGH"),
+    ("SQL injection (severity CRITICAL) in the search endpoint", "CRITICAL"),
+    ("Token leak; severity MEDIUM for the session cookie", "MEDIUM"),
+    ("- HIGH SQL injection in login handler", "HIGH"),
+    ("1. CRITICAL RCE in the upload handler", "CRITICAL"),
+    ("> HIGH SQL injection in login handler", "HIGH"),
+    ("\N{LARGE RED CIRCLE} HIGH SQL injection in login handler", "HIGH"),
+    ("**HIGH** SQL injection in login handler", "HIGH"),
+])
+def test_f4_leftover_shapes_fail_closed(line, severity):
+    assert_blocks_behind_zero_footer([line], severity)
+
+
+@pytest.mark.parametrize("line", [
+    "HIGH availability is out of scope for this change.",
+    "CRITICAL and HIGH findings block the merge.",
+    "CRITICAL OR HIGH findings block the merge.",
+    "HIGH MEDIUM LOW INFO are the levels the gate reads.",
+    "No issues of severity HIGH in this diff.",
+    "Findings are ordered, severity HIGH or above first.",
+    "Nothing here, severity HIGH and above, was found.",
+    "INFO Semgrep finished with no results.",
+])
+def test_f4_leftover_prose_merges(line):
+    assert_prose_merges([line])

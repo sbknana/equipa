@@ -1328,6 +1328,32 @@ _DASH_DELIMITED_SEVERITY_RE = re.compile(
     r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)[*_]{0,3}[ \t]{1,4}(?:[—–]|-{1,2})"
     r"(?=[ \t])",
 )
+# Task 3137 (F4 leftovers of the 3122 review): "severity" opening a clause,
+# then an UPPER-case severity and the rest of the finding: "Open redirect,
+# severity HIGH in auth.py", "SQLi (severity HIGH) in search". "No issues of
+# severity HIGH in this diff" (no clause break before the word) and "...,
+# severity HIGH or above, ..." stay prose.
+_SEVERITY_CLAUSE_RE = re.compile(
+    r"(?:[,;(—–]|(?<=[ \t])-)[ \t]{0,4}[*_]{0,3}(?i:severity)"
+    r"(?:[ \t]{1,8}(?i:rating|level))?[*_]{0,3}[ \t]{1,8}[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
+    r"(?![*_]{0,3}[ \t]{1,4}(?:or|and)[ \t]{1,4}"
+    r"(?:above|higher|more|greater|worse)(?![A-Za-z]))",
+)
+# Task 3137 (F4 leftovers): a line or list item that opens with an UPPER-case
+# CRITICAL, HIGH or MEDIUM and then a capitalised title, with no separator:
+# "HIGH SQL injection in login handler", "- CRITICAL RCE in upload". A
+# lower-case word after it is prose ("HIGH availability", "CRITICAL and HIGH
+# findings block the merge"), and so are a run of severities ("HIGH MEDIUM
+# LOW") and an UPPER-case conjunction ("CRITICAL OR HIGH ...").
+_LEADING_SEVERITY_TITLE_RE = re.compile(
+    r"^(?:[ \t]{0,3}(?:>[ \t]?){0,4}"
+    r"|[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})"
+    r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM)[*_]{0,3}[ \t]{1,4}"
+    r"(?!(?:AND|OR|NOR|TO|VS|CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z]))[A-Z]",
+    re.MULTILINE,
+)
 # A line that is not a list item and OPENS with an UPPER-case severity and a
 # separator, optionally after a blockquote marker, an emoji or a finding ID:
 # "HIGH: SQL injection", "> CRITICAL - RCE", "🔴 HIGH: ...", "S2 (HIGH):
@@ -1723,15 +1749,16 @@ def _matched_severity(match: re.Match[str]) -> str:
 
 _NEWLINE_RE = re.compile("\n")
 
-# Rules added by tasks 3122 and 3130. Unlike the older rules they report a
-# severity only on a line where no earlier rule saw it (see
+# Rules added by tasks 3122, 3130 and 3137. Unlike the older rules they
+# report a severity only on a line where no earlier rule saw it (see
 # _shape_candidates).
 _TASK_3122_LINE_RULES = (
     _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
     _BARE_LEADING_SEVERITY_RE, _BRACKETED_LEADING_SEVERITY_RE,
     _ID_TAGGED_SEVERITY_RE, _LIST_ITEM_LONE_SEVERITY_RE,
     _SEVERITY_ALIAS_AFTER_SENTENCE_RE, _RATED_SEVERITY_RE,
-    _DASH_DELIMITED_SEVERITY_RE,
+    _DASH_DELIMITED_SEVERITY_RE, _SEVERITY_CLAUSE_RE,
+    _LEADING_SEVERITY_TITLE_RE,
 )
 
 
