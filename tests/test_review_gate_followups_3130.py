@@ -323,6 +323,35 @@ def test_entity_comment_and_non_latin_prose_merges(body):
     assert_prose_merges(["## Notes", ""] + body)
 
 
+def test_comment_markers_quoted_in_code_open_no_comment():
+    """Real review: a "<!--" in one code span and a "-->" in another, 30 lines
+    later, hid the two finding headings between them."""
+    body = [
+        "## Findings", "",
+        "Parser probes: `<!-x`, `<!--`, `<![CDATA[` and unclosed quotes.", "",
+        "### [S1] MEDIUM — preview has no post-parse backstop",
+        "Details.", "",
+        "### [S2] LOW — deep import of an internal file",
+        "- **Detail:** `<mj-raw><!-- 3000 x --></mj-raw>` compiles.",
+    ]
+    footer = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 1 | LOW: 1 | INFO: 0"
+    analysis = analyze(review("2 findings.", body, footer, low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.header_counts["MEDIUM"] == 1
+    assert analysis.header_counts["LOW"] == 1
+
+
+@pytest.mark.parametrize("body", [
+    # Real review: a wrapped prose line that happens to open with an ID and
+    # an upstream finding's severity.
+    ["The guard now covers the tables named by the upstream findings (the",
+     "  SR-2937 CRITICAL and the SR-2949 grounding findings)."],
+    ["Re-checked earlier work:", "SR-12 HIGH was fixed in the previous round."],
+])
+def test_wrapped_prose_line_opening_with_an_id_merges(body):
+    assert_prose_merges(["## Notes", ""] + body)
+
+
 def test_terse_review_with_comment_lines_is_not_near_empty():
     """Stripping the provenance comments does not make a review near-empty."""
     text = "\n".join([

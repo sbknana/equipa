@@ -1332,13 +1332,15 @@ _BRACKETED_LEADING_SEVERITY_RE = re.compile(
 )
 # Task 3130 (R3122-03): a line or list item that opens with a finding ID, then
 # an UPPER-case severity, then the title: "[S2] HIGH SQL injection", "1. S1
-# HIGH SQLi", "- R3122-01 LOW padded cell".
+# HIGH SQLi", "- R3122-01 LOW padded cell". Outside a list the ID must be
+# bracketed: a wrapped prose line such as "SR-2937 CRITICAL and the SR-2949
+# findings)" (a real review) is not a finding.
+_FINDING_ID = r"[A-Za-z]{1,8}-?\d{1,5}(?:-\d{1,3})?"
+_BRACKETED_FINDING_ID = r"(?:\[" + _FINDING_ID + r"\]|\(" + _FINDING_ID + r"\))"
 _ID_TAGGED_SEVERITY_RE = re.compile(
-    r"^(?:[ \t]{0,3}(?:>[ \t]?){0,4}"
-    r"|[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})"
-    r"[*_]{0,3}(?:\[[A-Za-z]{1,8}-?\d{1,5}(?:-\d{1,3})?\]"
-    r"|\([A-Za-z]{1,8}-?\d{1,5}(?:-\d{1,3})?\)"
-    r"|[A-Za-z]{1,8}-?\d{1,5}(?:-\d{1,3})?)"
+    r"^(?:[ \t]{0,3}(?:>[ \t]?){0,4}[*_]{0,3}" + _BRACKETED_FINDING_ID
+    + r"|[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}[*_]{0,3}"
+    r"(?:" + _BRACKETED_FINDING_ID + r"|" + _FINDING_ID + r"))"
     r"[*_]{0,3}[ \t]{1,4}[*_]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))"
     r"[*_]{0,3}[ \t]{1,4}(?=[^\W\d_])",
     re.MULTILINE | re.IGNORECASE,
@@ -1891,6 +1893,34 @@ def _carry_line_breaks(segment: str, carried: int) -> tuple[str, int]:
     return segment[:newline] + "\n" * carried + segment[newline:], 0
 
 
+def _mask_code(text: str) -> str:
+    """``text`` with code blanked to spaces, keeping every offset.
+
+    The same code as :func:`_blank_code` (fenced blocks, inline spans, and
+    nothing after an unterminated fence), but each masked character becomes
+    a space, so an offset found in the mask is an offset in ``text``.
+    """
+    lines = text.split("\n")
+    masked: list[str] = []
+    fence: str | None = None
+    fence_start = 0
+    for index, line in enumerate(lines):
+        opener = _CODE_FENCE_RE.match(line)
+        if fence is None and opener is None:
+            masked.append(_INLINE_CODE_RE.sub(
+                lambda span: " " * len(span.group(0)), line,
+            ))
+            continue
+        if fence is None:
+            fence, fence_start = opener.group(1)[0], index
+        elif opener is not None and opener.group(1)[0] == fence:
+            fence = None
+        masked.append(" " * len(line))
+    if fence is not None:
+        masked[fence_start:] = lines[fence_start:]
+    return "\n".join(masked)
+
+
 def _strip_html_comments(text: str) -> tuple[str, bool]:
     """Remove HTML comments the way a renderer hides them (task 3130).
 
@@ -1899,21 +1929,26 @@ def _strip_html_comments(text: str) -> tuple[str, bool]:
     replacement, so the word it split is joined ("HI<!-- x -->GH" reads
     HIGH); the line breaks it spanned are re-inserted at the end of the line
     it closed on, so every later line keeps its number. "<!-->" and
-    "<!--->" are empty comments. An unterminated comment is left in place,
-    so its text stays visible (fail closed). Linear: every search starts
-    where the previous one ended.
+    "<!--->" are empty comments. Code is not HTML: a "<!--" quoted in a code
+    span opens nothing (a real review quoted one, and a "-->" in another span
+    30 lines later hid two finding headings). An unterminated comment is
+    left in place, so its text stays visible (fail closed). Linear: every
+    search starts where the previous one ended.
     """
+    if "<!--" not in text:
+        return text, False
+    masked = _mask_code(text)
     pieces: list[str] = []
     carried_breaks = 0
     hid_content = False
     position = 0
-    while (start := text.find("<!--", position)) != -1:
-        if text.startswith("<!-->", start):
+    while (start := masked.find("<!--", position)) != -1:
+        if masked.startswith("<!-->", start):
             body_end, end = start + 4, start + 5
-        elif text.startswith("<!--->", start):
+        elif masked.startswith("<!--->", start):
             body_end, end = start + 4, start + 6
         else:
-            body_end = text.find("-->", start + 4)
+            body_end = masked.find("-->", start + 4)
             if body_end == -1:
                 break
             end = body_end + 3
