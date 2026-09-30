@@ -56,6 +56,7 @@ from test_dispatch_modes_gated_3112 import (
 )
 from test_goal_isolation_3119 import (
     _captured_agent_command,
+    _committing_loop,
     _nested_project,
     _patch_auto_run,
     _run_project,
@@ -291,6 +292,31 @@ def test_nested_project_code_outside_subdir_is_reviewed_and_blocked(
     assert probe.statuses == [(3402, "security_review_blocked", None)]
     assert _master(outer) == probe.baseline, "unreviewed code reached master"
     assert _branch_sha(outer, "forge-task-3402") not in (None, probe.baseline)
+    nested_dirs = {project.resolve(), (worktree / "apps" / "web").resolve()}
+    assert recorder.path_scoped_calls_in(nested_dirs) == [], (
+        "orchestrator git ran from the nested sub-directory"
+    )
+
+
+def test_nested_project_merge_runs_at_the_work_tree_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, project_dirs: dict,
+) -> None:
+    """A clean review: checkout / merge run at the root, not the sub-directory."""
+    outer, project = _nested_project(tmp_path)
+    task = _task(3407)
+    probe = GateProbe(outer, 0)
+    probe.install(monkeypatch)
+    _patch_auto_run(monkeypatch, task, probe, _committing_loop(probe))
+    recorder = GitCwdRecorder()
+    recorder.install(monkeypatch)
+    project_dirs["nestedproj"] = str(project)
+
+    _run_project("nestedproj", 3407)
+
+    [(task_id, outcome, merged_sha)] = probe.statuses
+    assert (task_id, outcome) == (3407, "tests_passed") and merged_sha
+    assert merged_sha == _master(outer)
+    worktree = project / ".forge-worktrees" / "task-3407"
     nested_dirs = {project.resolve(), (worktree / "apps" / "web").resolve()}
     assert recorder.path_scoped_calls_in(nested_dirs) == [], (
         "orchestrator git ran from the nested sub-directory"
