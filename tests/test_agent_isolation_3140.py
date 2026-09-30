@@ -479,13 +479,16 @@ def _autoresearch(monkeypatch):
 def test_autoresearch_mutation_refuses_with_isolation_on(monkeypatch) -> None:
     autoresearch = _autoresearch(monkeypatch)
     _flag(monkeypatch, True)
+    calls: list = []
 
-    def no_run(*args, **kwargs):
-        raise AssertionError("the CLI was started outside the sandbox")
+    def run(cmd, **kwargs):
+        calls.append(cmd)  # mutate_prompt swallows exceptions, so record
+        return subprocess.CompletedProcess(cmd, 0, "new prompt", "")
 
-    monkeypatch.setattr(autoresearch.subprocess, "run", no_run)
+    monkeypatch.setattr(autoresearch.subprocess, "run", run)
     assert autoresearch.mutate_prompt("developer", "prompt", "failures",
                                       {"total": 1}) == ""
+    assert calls == []
 
 
 def test_autoresearch_mutation_runs_the_cli_without_a_shell(monkeypatch) -> None:
@@ -833,6 +836,64 @@ def test_failed_setup_gives_the_slot_back(tmp_path: Path, monkeypatch,
     asyncio.run(scenario())
 
 
+class _Handoff:
+    export_path = None
+
+
+class _LiveProcess(_FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.returncode = None
+
+
+def test_reviewer_spawn_waits_for_a_running_developer_unit(
+        tmp_path: Path, monkeypatch) -> None:
+    """End to end through build_cli_command and spawn_isolated_agent, with
+    only the launch itself faked: the security reviewer's agent does not
+    start while a developer's isolated agent is still running."""
+    from equipa import agent_runner
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    app_slice = tmp_path / "app.slice"
+    app_slice.mkdir()
+    _fake_setup(tmp_path, monkeypatch, run_dir)
+    monkeypatch.setattr(isolation, "user_app_slice", lambda: app_slice)
+    monkeypatch.setattr(isolation, "resolve_oauth_token", lambda s: "tok")
+    monkeypatch.setattr(isolation, "build_handoff", lambda *a: _Handoff())
+    monkeypatch.setattr(isolation, "_SLOT_POLL_SECONDS", 0.01, raising=False)
+    launched: list[str] = []
+
+    async def fake_exec(*argv, **kwargs):
+        launched.append(f"launch {len(launched) + 1}")
+        return _LiveProcess()
+
+    async def established(self, handoff):
+        self.started = True
+
+    monkeypatch.setattr(isolation.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(isolation.IsolatedAgent, "establish", established)
+
+    async def spawn(role: str):
+        with agent_runner.build_cli_command("prompt", str(tmp_path), 5, "opus",
+                                            role=role,
+                                            dispatch_config={"x": 1}) as cmd:
+            return await isolation.spawn_isolated_agent(cmd, None, {}, {})
+
+    async def scenario():
+        _process, developer = await spawn("developer")
+        reviewer_task = await _pending(spawn("security-reviewer"), 0.3)
+        overlapped = reviewer_task.done()
+        developer.release()
+        _process, reviewer = await asyncio.wait_for(reviewer_task, 2)
+        reviewer.release()
+        return overlapped
+
+    assert asyncio.run(scenario()) is False, \
+        "the reviewer's agent started while the developer's was running"
+    assert launched == ["launch 1", "launch 2"]
+
+
 def test_build_cli_command_marks_the_role_for_the_isolated_spawn(
         tmp_path: Path) -> None:
     from equipa import agent_runner
@@ -888,8 +949,10 @@ def _launcher_session(tmp_path: Path, monkeypatch, crontab: tuple[str, int],
         schedulers.append(("at", (_fake_tool(tools, "at", *at),)))
     linger = tmp_path / "linger"
     linger.mkdir(exist_ok=True)
-    monkeypatch.setattr(agent_launcher, "_SCHEDULERS", tuple(schedulers))
-    monkeypatch.setattr(agent_launcher, "_LINGER_DIR", str(linger))
+    # raising=False: the same fakes show the pre-fix launcher accepting it.
+    monkeypatch.setattr(agent_launcher, "_SCHEDULERS", tuple(schedulers),
+                        raising=False)
+    monkeypatch.setattr(agent_launcher, "_LINGER_DIR", str(linger), raising=False)
     unit = "equipa-agent-1-1-00000000000000a4"
     header = {
         "unit": unit, "argv": ["claude", "-p", "x"], "executable": sys.executable,
@@ -934,15 +997,17 @@ def test_launcher_accepts_denied_cron_and_at(tmp_path, monkeypatch) -> None:
     session._verify_no_scheduler()
 
 
-def test_launcher_verify_runs_the_scheduler_check(tmp_path, monkeypatch) -> None:
-    session = _launcher_session(tmp_path, monkeypatch, (_CRON_DENIED, 1), None)
-    order: list[str] = []
-    for name in ("_verify_identity", "_verify_no_scheduler", "_verify_cgroup",
-                 "_verify_denied_access", "_verify_required_access"):
-        monkeypatch.setattr(session, name,
-                            lambda name=name: order.append(name))
-    session.verify()
-    assert "_verify_no_scheduler" in order
+def test_launcher_verify_refuses_an_agent_that_may_use_cron(
+        tmp_path, monkeypatch) -> None:
+    """verify() itself runs the check (the other inside checks, which need
+    a second user and a real cgroup, pass here)."""
+    session = _launcher_session(tmp_path, monkeypatch,
+                                ("no crontab for equipa-agent", 1), None)
+    for name in ("_verify_identity", "_verify_cgroup", "_verify_denied_access",
+                 "_verify_required_access"):
+        monkeypatch.setattr(session, name, lambda: None)
+    with pytest.raises(agent_launcher.IsolationRefused, match="may use crontab"):
+        session.verify()
 
 
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_agent_isolation.sh"
