@@ -441,6 +441,132 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     }
 
 
+# --- Reactive Bash check vs the PreToolUse gate (review finding sandbox-04) ---
+#
+# With features.bash_security_pretooluse on, the PreToolUse hook runs the same
+# check_bash_command BEFORE a Bash command executes and refuses it (exit 2),
+# telling the agent why so it can self-correct. The reactive stream check used
+# to kill the agent anyway, for a command that never ran, so every false
+# positive cost a whole attempt. Now a flagged command is judged by its own
+# tool_result: the gate's refusal is a strike, anything else means the command
+# executed (the gate failed open) and the agent is killed as before.
+_HOOK_BLOCK_STRIKE_LIMIT = 8
+
+
+def _pretooluse_hook_command(cmd: list[str]) -> str | None:
+    """Return the Bash-gate hook command this CLI run was given, or None.
+
+    Reads the --settings file that build_cli_command wrote (it exists for the
+    whole run). Anything unexpected returns None, and the reactive check then
+    keeps the old kill-on-flag behaviour: fail closed.
+    """
+    try:
+        path = cmd[cmd.index("--settings") + 1]
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        for entry in payload.get("hooks", {}).get("PreToolUse", []):
+            if entry.get("matcher") != "Bash":
+                continue
+            for hook in entry.get("hooks", []):
+                command = hook.get("command", "")
+                expected = _pretooluse_settings_payload(
+                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3",
+                )["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                if command == expected:
+                    return command
+    except (ValueError, IndexError, OSError, AttributeError, TypeError):
+        return None
+    return None
+
+
+def _tool_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            c.get("text", "") for c in content if isinstance(c, dict)
+        )
+    return ""
+
+
+def _is_hook_block_result(
+    content: Any, is_error: bool, hook_command: str | None, check_id: Any,
+) -> bool:
+    """True only when this tool_result is the PreToolUse gate refusing the call.
+
+    The CLI reports a hook that exits 2 as an error result whose text starts
+    ``PreToolUse:Bash hook error: [<hook command>]: `` followed by the hook's
+    stderr, which names the check that fired. All of it must match; a command
+    that actually ran produces its own output instead.
+    """
+    if not is_error or not hook_command:
+        return False
+    text = _tool_result_text(content)
+    return (
+        text.startswith(f"PreToolUse:Bash hook error: [{hook_command}]: ")
+        and f"Bash security check {check_id} BLOCKED" in text
+    )
+
+
+def _read_budget_scale() -> float:
+    """``dispatch_config['early_term_read_budget_scale']``, clamped to [1, 3].
+
+    Lets one dispatch (via --dispatch-config) give read-heavy work, such as a
+    task continuing from a saved patch and review, more turns before the
+    no-edit watchdog fires. It can only loosen, never tighten, and anything
+    invalid falls back to 1.0, which is today's thresholds.
+    """
+    try:
+        from equipa.config import get_active_dispatch_config
+        scale = float(get_active_dispatch_config().get(
+            "early_term_read_budget_scale", 1.0))
+    except (TypeError, ValueError, AttributeError, OSError):
+        return 1.0
+    if scale != scale:  # NaN
+        return 1.0
+    return min(3.0, max(1.0, scale))
+
+
+# A reactive check slower than this means the hook, which runs the same check
+# under the CLI's hook timeout, may have timed out and let the command run
+# (sandbox-07). Such commands are killed on sight, as before.
+_SLOW_CHECK_SECONDS = 5.0
+_CANARY_COMMAND = "ls -la <(echo equipa-canary)"  # process substitution: always refused (check 8)
+
+
+def _gate_fingerprint() -> str | None:
+    """sha256 over the hook script and the checker it loads, or None."""
+    h = hashlib.sha256()
+    try:
+        for path in (PRETOOLUSE_HOOK_SCRIPT,
+                     Path(__file__).with_name("bash_security.py")):
+            h.update(path.read_bytes())
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _gate_canary_ok(hook_command: str) -> bool:
+    """Run the hook on a command it must refuse; True only on a correct refusal.
+
+    If the gate cannot load, crashes or allows the canary, it would also fail
+    open for real commands, so the reactive check must keep killing on sight.
+    """
+    payload = json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": _CANARY_COMMAND},
+        "hook_event_name": "PreToolUse",
+    })
+    try:
+        proc = subprocess.run(
+            shlex.split(hook_command), input=payload, capture_output=True,
+            text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
+
+
 @contextlib.contextmanager
 def build_cli_command(
     system_prompt: str | PromptResult,
@@ -974,6 +1100,12 @@ async def _run_agent_streaming_impl(
         int(EARLY_TERM_KILL_TURNS * 1.25),
         max(EARLY_TERM_KILL_TURNS, int((max_turns or EARLY_TERM_KILL_TURNS) * 0.15))
     )
+    read_budget_scale = _read_budget_scale()
+    if read_budget_scale != 1.0:
+        effective_kill_turns = int(effective_kill_turns * read_budget_scale)
+        log(f"  [EarlyTerm] read budget x{read_budget_scale:g} (dispatch config): "
+            f"kill threshold {effective_kill_turns} turns", output)
+    fast_escalation_reads = int(12 * read_budget_scale)
     # On paralysis retries, progressively tighten kill thresholds.
     # Each retry halves remaining patience: retry 1 → -2 turns, retry 2 → -3, etc.
     # Floor at 3 turns — even the most aggressive retry needs a couple turns.
@@ -1006,6 +1138,17 @@ async def _run_agent_streaming_impl(
     # before editing. Killing on the very first post-warning read created an
     # unrecoverable FINAL_WARNING → kill → retry → FINAL_WARNING loop.
     post_final_warning_reads = 0
+    # sandbox-04: with the PreToolUse gate active, a flagged Bash command is
+    # judged by its tool_result (refused vs executed), not killed on sight.
+    hook_command = _pretooluse_hook_command(cmd)
+    gate_fingerprint = _gate_fingerprint() if hook_command else None
+    if hook_command and (gate_fingerprint is None
+                         or not _gate_canary_ok(hook_command)):
+        log("  [BashSecurity] pre-execution gate failed its canary; flagged "
+            "commands will be killed on sight", output)
+        hook_command = None
+    pending_flagged: dict[str, tuple[Any, str]] = {}
+    hook_block_strikes = 0
     # Task #2242 Phase A3: accumulate framework stdout printed by bash/test
     # tool_result events so the downstream Phase-B grep can see what the
     # actual test runner reported (e.g. pytest's "= 3 skipped =" footer).
@@ -1187,8 +1330,21 @@ async def _run_agent_streaming_impl(
                             bash_cmd = tool_input.get("command", "")
 
                             # --- Bash security pre-execution filter ---
+                            _check_started = time.monotonic()
                             sec_result = check_bash_command(bash_cmd)
-                            if not sec_result.safe:
+                            slow_check = (time.monotonic() - _check_started
+                                          > _SLOW_CHECK_SECONDS)
+                            tool_use_id = block.get("id")
+                            if (not sec_result.safe and hook_command and tool_use_id
+                                    and not slow_check):
+                                # The gate ran this same check before execution;
+                                # its tool_result says whether it was refused.
+                                pending_flagged[tool_use_id] = (
+                                    sec_result.check_id, sec_result.message)
+                                log(f"  [BashSecurity] flagged check={sec_result.check_id}: "
+                                    f"{sec_result.message} (awaiting pre-execution gate) "
+                                    f"— cmd={bash_cmd[:120]}", output)
+                            elif not sec_result.safe:
                                 log(f"  [BashSecurity] BLOCKED check={sec_result.check_id}: "
                                     f"{sec_result.message} — cmd={bash_cmd[:120]}", output)
                                 early_term_reason = (
@@ -1252,7 +1408,7 @@ async def _run_agent_streaming_impl(
                         # to 2 (was tuned for 4.6 + FeatureBench task 3).
                         if tool_name in ("Read", "Grep", "Glob", "Agent"):
                             consecutive_readonly_tools += 1
-                        if (consecutive_readonly_tools >= 12
+                        if (consecutive_readonly_tools >= fast_escalation_reads
                                 and not final_warning_injected):
                             log(f"  [EarlyTerm] FAST ESCALATION: "
                                 f"{consecutive_readonly_tools} consecutive "
@@ -1528,6 +1684,37 @@ async def _run_agent_streaming_impl(
                         is_error = block.get("is_error", False)
                         content = block.get("content", "")
 
+                        flagged = pending_flagged.pop(block.get("tool_use_id"), None)
+                        if flagged is not None:
+                            check_id, check_msg = flagged
+                            if _gate_fingerprint() != gate_fingerprint:
+                                early_term_reason = (
+                                    "Bash security: the pre-execution gate or its "
+                                    "checker changed during the run; failing closed"
+                                )
+                                log(f"  [BashSecurity] {early_term_reason}", output)
+                            elif _is_hook_block_result(
+                                content, is_error, hook_command, check_id,
+                            ):
+                                hook_block_strikes += 1
+                                log(f"  [BashSecurity] refused before execution by the "
+                                    f"gate (check {check_id}); agent told why, not killed "
+                                    f"(strike {hook_block_strikes}/"
+                                    f"{_HOOK_BLOCK_STRIKE_LIMIT})", output)
+                                if hook_block_strikes >= _HOOK_BLOCK_STRIKE_LIMIT:
+                                    early_term_reason = (
+                                        f"Bash security: {hook_block_strikes} commands "
+                                        f"refused by the pre-execution gate; the agent "
+                                        f"is not self-correcting"
+                                    )
+                            else:
+                                early_term_reason = (
+                                    f"Bash security violation (check {check_id}): "
+                                    f"{check_msg} (the command EXECUTED: the "
+                                    f"pre-execution gate did not refuse it)"
+                                )
+                                log(f"  [BashSecurity] {early_term_reason}", output)
+
                         # Task #2242 Phase A3: capture the raw stdout of tool
                         # results (bash, etc.) so Phase B can grep framework
                         # skip counts that never appear in assistant text.
@@ -1591,12 +1778,21 @@ async def _run_agent_streaming_impl(
                                     log(f"  [FileDetect] Git detected file changes "
                                         f"via {tool_label}", output)
 
+                if early_term_reason:
+                    break
+
     except Exception as e:
         # Justified broad catch: the streaming monitor parses arbitrary JSON tool events
         # from a long-lived subprocess; any unexpected event shape must NOT crash the
         # orchestrator. Reason captured into early_term_reason for surfacing upstream.
         early_term_reason = f"Streaming monitor error: {e}"
         logger.exception("[Telemetry] streaming monitor caught unexpected error")
+
+    if pending_flagged and not early_term_reason:
+        early_term_reason = (
+            "Bash security: a flagged command got no tool_result, so whether it "
+            "ran is unknown; failing closed"
+        )
 
     # --- Kill process if still running ---
     if process.returncode is None:
