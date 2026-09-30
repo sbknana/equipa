@@ -39,6 +39,7 @@ from equipa.config import (
     is_security_review_enabled,
     load_dispatch_config,
 )
+import equipa.constants as _equipa_constants
 from equipa.constants import (
     ATTEMPT_REFLECTIONS_MAX_CHARS,
     ATTEMPT_SECTION_TRIM_CHARS,
@@ -47,7 +48,6 @@ from equipa.constants import (
     MAX_MANAGER_ROUNDS,
     MAX_TASK_RANGE,
     PRIORITY_ORDER,
-    PROJECT_DIRS,
 )
 from equipa.db import (
     db_conn,
@@ -1081,7 +1081,7 @@ async def run_project_tasks(
 
     # Resolve project directory
     codename_lower = codename.lower().strip()
-    project_dir = PROJECT_DIRS.get(codename_lower)
+    project_dir = _equipa_constants.PROJECT_DIRS.get(codename_lower)
     if not project_dir:
         log(f"  [{codename}] ERROR: No directory mapped. Skipping.", output)
         return {
@@ -1450,7 +1450,10 @@ def validate_goals(goals: list[dict]) -> list[dict]:
 
         codename = project_info.get("codename", "").lower().strip()
         pname = project_info.get("name", "").lower().strip()
-        project_dir = PROJECT_DIRS.get(codename) or PROJECT_DIRS.get(pname)
+        project_dir = (
+            _equipa_constants.PROJECT_DIRS.get(codename)
+            or _equipa_constants.PROJECT_DIRS.get(pname)
+        )
 
         if not project_dir:
             print(f"ERROR: Goal #{i + 1}: No directory mapped for project "

@@ -216,7 +216,13 @@ def load_config() -> None:
             if base_dir and v.startswith("$PROJECT_BASE_DIR/"):
                 v = v.replace("$PROJECT_BASE_DIR", base_dir, 1)
             resolved[k.lower()] = v
-        _equipa_constants.PROJECT_DIRS = resolved
+        # Updated in place, never rebound: equipa.dispatch, equipa.tasks,
+        # equipa.git_ops and equipa.output import this dict by name at
+        # startup, so a new object here left them all with the empty
+        # default and --auto-run / --parallel-goals resolved no project
+        # directory (3112 review, task #3119).
+        _equipa_constants.PROJECT_DIRS.clear()
+        _equipa_constants.PROJECT_DIRS.update(resolved)
     if "github_owner" in cfg:
         _equipa_constants.GITHUB_OWNER = cfg["github_owner"]
     if "mcp_config" in cfg:
