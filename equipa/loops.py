@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import html
 import json
 import os
 import re
 import subprocess
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1239,90 +1241,183 @@ _TABLE_SEVERITY_CELL_RE = re.compile(
 # Every quantifier is bounded or anchored so each rule stays linear per line.
 #
 # A list item that ENDS with a severity after a separator: "- SQLi in the
-# search endpoint - HIGH", "- **Token leak** — CRITICAL". A LOW/INFO
-# "- Overall risk: LOW" item rates the review and is skipped by
-# _shape_candidate_severities.
+# search endpoint - HIGH", "- **Token leak** — CRITICAL", "- SQLi -- HIGH".
+# Task 3130: Title case counts for CRITICAL/HIGH/MEDIUM ("- SQLi - High");
+# "- Performance impact - Low" stays prose. A LOW/INFO "- Overall risk:
+# LOW" item rates the review and is skipped by _shape_candidates.
 _LIST_ITEM_TRAILING_SEVERITY_RE = re.compile(
     r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}"
-    r"[^\n]*?[^\s|](?:[ \t]{0,4}[:,—–]|[ \t]{1,4}-)[ \t]{1,4}[*_\[(]{0,3}"
-    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
+    r"[^\n]*?[^\s|](?:[ \t]{0,4}[:,—–]|[ \t]{1,4}-{1,2})[ \t]{1,4}[*_\[(]{0,3}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium))"
+    r"(?:[ -]severity)?[*_\])]{0,3}[ \t.]{0,4}$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130: a list item that is ONLY an UPPER-case severity, optionally after
+# an emoji or a finding ID ("- HIGH", "- 🔴 HIGH", "- [S1] HIGH"). It is also
+# what "<li>HIGH</li>" becomes once HTML list items keep their bullet, so it
+# takes the prefixes _BARE_LEADING_SEVERITY_RE took from that line before.
+_LIST_ITEM_LONE_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}"
+    r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?"
+    r"(?:[\[(`]?[A-Za-z]{1,4}-?\d{1,3}[\])`]?[ \t]{0,2}[:—–-]?[ \t]{1,4})?"
+    r"[*_\[(]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
     r"[*_\])]{0,3}[ \t.]{0,4}$",
     re.MULTILINE | re.IGNORECASE,
 )
 # A Severity field anywhere on a line: "Finding 3: open redirect, severity
 # HIGH, in auth.py", "- SQLi in search. **Severity:** High", "- Missing CSRF
 # token - Severity: Medium". Without a colon the severity must be UPPER case
-# and end the clause, so "no finding reached severity HIGH or above" and
-# "ordered by severity (HIGH first)" are prose.
+# (task 3130: or Title case for CRITICAL/HIGH/MEDIUM) and end the clause, so
+# "no finding reached severity HIGH or above" and "ordered by severity (HIGH
+# first)" are prose. Task 3130: up to two verbs may sit between the word and
+# the value ("the severity is HIGH.", "severity is rated HIGH", "a severity
+# of HIGH."); "findings whose severity is HIGH or above" is still prose.
 _SEVERITY_FIELD_ANYWHERE_RE = re.compile(
     r"(?<![A-Za-z_-])severity(?:[ \t]{1,8}(?:rating|level))?"
     r"(?:[ \t]{0,4}\([^()\n]{0,40}\))?[*_]{0,3}[ \t]{0,8}(?:"
     r"[:=][*_]{0,3}[ \t]{0,8}[*_]{0,3}(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
     r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
-    r"|(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))[*_]{0,3}"
+    r"|(?:(?:is|was|remains|rated|of)[ \t]{1,4}){0,2}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium))[*_]{0,3}"
     r"(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w)))"
     r")",
     re.MULTILINE | re.IGNORECASE,
 )
 # Aliases of the Severity field: "Risk: High", "- **Impact:** CRITICAL",
-# "Sev: HIGH". The label must open the line or list item ("Overall risk:
-# LOW" rates the review) and be followed by a separator. An UPPER-case
-# value always counts; any other case only when it ends the clause, so
-# "- **Impact:** High if exploited, but not reachable" (task #3038) and
-# "Impact: High-value sessions ..." stay prose.
+# "Sev: HIGH", "Priority: HIGH" (task 3130). The label must open the line
+# or list item ("Overall risk: LOW" rates the review) and be followed by a
+# separator. An UPPER-case value always counts; any other case only when it
+# ends the clause, so "- **Impact:** High if exploited, but not reachable"
+# (task #3038) and "Impact: High-value sessions ..." stay prose.
 _ALIAS_SEVERITY_VALUE = (
     r"(?:(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))"
     r"(?![A-Za-z_]|-(?!severity(?![A-Za-z])))"
     r"|(CRITICAL|HIGH|MEDIUM)(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w))))"
 )
+_SEVERITY_ALIAS_LABEL = r"(?:sev|risk|impact|priority|rating)"
 _SEVERITY_ALIAS_FIELD_RE = re.compile(
     r"^[ \t]{0,12}(?:>[ \t]?){0,4}(?:(?:[-*+]|\d{1,3}[.)])[ \t]{1,8})?"
-    r"[*_]{0,3}[ \t]{0,8}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?"
+    r"[*_]{0,3}[ \t]{0,8}" + _SEVERITY_ALIAS_LABEL
+    + r"(?:[ \t]{1,8}(?:rating|level))?"
     r"[*_]{0,3}[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}"
     + _ALIAS_SEVERITY_VALUE,
     re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130: the same field opening a sentence in the middle of a line, with a
+# colon: "SQL injection in login. Risk: HIGH." "The endpoint is internal.
+# Risk: low." stays prose.
+_SEVERITY_ALIAS_AFTER_SENTENCE_RE = re.compile(
+    r"(?<=[.;!?])[ \t]{1,4}[*_]{0,3}" + _SEVERITY_ALIAS_LABEL
+    + r"(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}[ \t]{0,4}[:=]"
+    r"[*_]{0,3}[ \t]{0,8}[*_]{0,3}" + _ALIAS_SEVERITY_VALUE,
+    re.IGNORECASE,
+)
+# Task 3130: "rated" and a severity that ends the clause or is followed by
+# "severity": "Finding S1 is rated HIGH.", "SQLi, rated HIGH", "rated HIGH
+# severity". "Findings rated HIGH or above block the merge" is prose.
+_RATED_SEVERITY_RE = re.compile(
+    r"(?<![A-Za-z_-])rated[ \t]{1,4}(?:as[ \t]{1,4})?[*_]{0,3}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium))[*_]{0,3}"
+    r"(?=[ \t]{0,4}(?:$|[,;.)|]|[—–]|-(?!\w))|[ \t]{1,4}severity(?![A-Za-z]))",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130: an UPPER-case severity set off by dashes in the middle of a line:
+# "- SQLi — HIGH — auth.py", "SQLi - HIGH - login handler".
+_DASH_DELIMITED_SEVERITY_RE = re.compile(
+    r"(?<=[ \t])(?:[—–]|-{1,2})[ \t]{1,4}[*_]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)[*_]{0,3}[ \t]{1,4}(?:[—–]|-{1,2})"
+    r"(?=[ \t])",
 )
 # A line that is not a list item and OPENS with an UPPER-case severity and a
 # separator, optionally after a blockquote marker, an emoji or a finding ID:
 # "HIGH: SQL injection", "> CRITICAL - RCE", "🔴 HIGH: ...", "S2 (HIGH):
 # XSS", or that holds only an ID and a severity ("S1: HIGH"). A severity
 # followed by a number ("CRITICAL: 0 | HIGH: 0", the Counts footer) is a
-# tally, not a finding.
+# tally, not a finding. Task 3130: Title case CRITICAL/HIGH/MEDIUM counts
+# when a separator follows ("High: SQLi", "**High — nonce reuse**");
+# "High-level design" and "Info: semgrep ..." stay prose.
 _BARE_LEADING_SEVERITY_RE = re.compile(
     r"^[ \t]{0,3}(?:>[ \t]?){0,4}"
     r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?"
     r"(?:[\[(`]?[A-Za-z]{1,4}-?\d{1,3}[\])`]?[ \t]{0,2}[:—–-]?[ \t]{1,4})?"
-    r"[*_\[(]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
-    r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w)|$)(?![ \t]{0,4}\d)",
+    r"[*_\[(]{0,3}(?:"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))(?:[ -]severity)?"
+    r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w)|$)"
+    r"|(?-i:(Critical|High|Medium))(?:[ -]severity)?"
+    r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w))"
+    r")(?![ \t]{0,4}\d)",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130 (R3122-03): a line that opens with a bracketed severity and then
+# the title, with no separator: "[HIGH] SQL injection", "(HIGH) SQLi",
+# "**[HIGH]** SQLi". A list item of that shape is _LIST_ITEM_SEVERITY_RE's.
+_BRACKETED_LEADING_SEVERITY_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?){0,4}"
+    r"(?:[^\w\s*_\[(`<>#|+-]{1,4}[ \t]{0,2})?"
+    r"[*_]{0,3}[\[(][ \t]{0,2}"
+    r"(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium))"
+    r"(?:[ -]severity)?[ \t]{0,2}[\])][*_]{0,3}[ \t]{1,4}(?=[^\W\d_])",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Task 3130 (R3122-03): a line or list item that opens with a finding ID, then
+# an UPPER-case severity, then the title: "[S2] HIGH SQL injection", "1. S1
+# HIGH SQLi", "- R3122-01 LOW padded cell". Outside a list the ID must be
+# bracketed: a wrapped prose line such as "SR-2937 CRITICAL and the SR-2949
+# findings)" (a real review) is not a finding.
+_FINDING_ID = r"[A-Za-z]{1,8}-?\d{1,5}(?:-\d{1,3})?"
+_BRACKETED_FINDING_ID = r"(?:\[" + _FINDING_ID + r"\]|\(" + _FINDING_ID + r"\))"
+_ID_TAGGED_SEVERITY_RE = re.compile(
+    r"^(?:[ \t]{0,3}(?:>[ \t]?){0,4}[*_]{0,3}" + _BRACKETED_FINDING_ID
+    + r"|[ \t]{0,12}(?:>[ \t]?){0,4}(?:[-*+]|\d{1,3}[.)])[ \t]{1,8}[*_]{0,3}"
+    r"(?:" + _BRACKETED_FINDING_ID + r"|" + _FINDING_ID + r"))"
+    r"[*_]{0,3}[ \t]{1,4}[*_]{0,3}(?-i:(CRITICAL|HIGH|MEDIUM|LOW|INFO))"
+    r"[*_]{0,3}[ \t]{1,4}(?=[^\W\d_])",
     re.MULTILINE | re.IGNORECASE,
 )
 # Table cells (all matched against one stripped cell): a severity qualified
 # as a risk or impact ("High risk", "**Critical impact**", fullmatch); a
-# cell that opens with an UPPER-case severity and a separator ("HIGH: SQL
-# injection", match); a Severity-field alias opening the cell ("Risk:
-# HIGH", "Sev: High", match). "Low risk" and "High memory use" are prose.
+# cell that opens with an UPPER-case (task 3130: or Title-case
+# CRITICAL/HIGH/MEDIUM) severity and a separator ("HIGH: SQL injection",
+# "High: token leak", match); a Severity-field alias opening the cell
+# ("Risk: HIGH", "Sev: High", "Priority: HIGH", match); a range of two
+# severities ("HIGH/MEDIUM", "Medium to High", fullmatch), which counts as
+# the higher one. "Low risk" and "High memory use" are prose.
 _TABLE_QUALIFIED_SEVERITY_CELL_RE = re.compile(
     r"[^A-Za-z0-9]{0,8}(CRITICAL|HIGH|MEDIUM|(?-i:LOW|INFO))"
     r"[ \t-]{1,3}(?:risk|impact)[^A-Za-z0-9]{0,8}",
     re.IGNORECASE,
 )
 _TABLE_LEADING_SEVERITY_CELL_RE = re.compile(
-    r"[^\w\s|]{0,4}[ \t]{0,2}[*_\[(]{0,3}(CRITICAL|HIGH|MEDIUM|LOW|INFO)"
+    r"[^\w\s|]{0,4}[ \t]{0,2}[*_\[(]{0,3}"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO|Critical|High|Medium)"
     r"[*_\])]{0,3}[ \t]{0,4}(?:[:—–]|-(?!\w))(?![ \t]{0,4}\d)",
 )
 _TABLE_ALIAS_FIELD_CELL_RE = re.compile(
-    r"[*_]{0,3}(?:sev|risk|impact)(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}"
+    r"[*_]{0,3}" + _SEVERITY_ALIAS_LABEL
+    + r"(?:[ \t]{1,8}(?:rating|level))?[*_]{0,3}"
     r"[ \t]{0,8}[:=—–-][*_]{0,3}[ \t]{0,8}[*_]{0,3}" + _ALIAS_SEVERITY_VALUE,
+    re.IGNORECASE,
+)
+_TABLE_SEVERITY_RANGE_CELL_RE = re.compile(
+    r"[^A-Za-z0-9]{0,8}(CRITICAL|HIGH|MEDIUM|LOW|INFO)"
+    r"(?:[ \t]{0,2}[/–—→-][ \t]{0,2}|[ \t]{1,2}(?:to|or)[ \t]{1,2})"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)[^A-Za-z0-9]{0,8}",
     re.IGNORECASE,
 )
 # Inline HTML a Markdown renderer shows as a finding: "<details><summary>
 # <b>HIGH</b> ...</summary>", "<p><b>Severity:</b> High</p>", "<li>HIGH:
 # ...</li>", "<td>HIGH</td>". Lines that carry a tag are rewritten as
-# Markdown (bold tags as "**", table cells as "|", block tags as line
-# breaks, any other tag as a space) and scanned again by
-# _html_candidate_severities; every other line is left to the rules above.
+# Markdown (bold tags as "**", table cells as "|", list items as "- "
+# bullets, block tags, <br> and <hr> as line breaks, any other tag as a
+# space) and scanned again by _html_candidates; every other line is left
+# to the rules above. Task 3130 (R3122-02): "<li>SQLi (HIGH)</li>" and
+# "Finding 1<br>HIGH: SQLi" lost their bullet / line break and merged.
 _HTML_BOLD_TAG_RE = re.compile(r"</?(?:b|strong)\b[^<>\n]{0,200}>", re.IGNORECASE)
 _HTML_CELL_OPEN_TAG_RE = re.compile(r"<t[dh]\b[^<>\n]{0,200}>", re.IGNORECASE)
+_HTML_LIST_ITEM_OPEN_TAG_RE = re.compile(r"<li\b[^<>\n]{0,200}>", re.IGNORECASE)
+_HTML_LINE_BREAK_TAG_RE = re.compile(
+    r"<(?:br|hr)\b[^<>\n]{0,200}>", re.IGNORECASE,
+)
 _HTML_BLOCK_TAG_RE = re.compile(
     r"</?(?:summary|details|li|ul|ol|p|div|tr|table|thead|tbody|dl|dt|dd"
     r"|blockquote|h[1-6])\b[^<>\n]{0,200}>",
@@ -1580,6 +1675,7 @@ def _table_candidate_severities(visible_text: str) -> list[tuple[int, str]]:
         severity_cells: dict[int, str] = {}
         for column, cell in enumerate(cells):
             match = (_TABLE_SEVERITY_CELL_RE.fullmatch(cell)
+                     or _TABLE_SEVERITY_RANGE_CELL_RE.fullmatch(cell)
                      or _TABLE_QUALIFIED_SEVERITY_CELL_RE.fullmatch(cell)
                      or _TABLE_LEADING_SEVERITY_CELL_RE.match(cell)
                      or _TABLE_SEVERITY_FIELD_CELL_RE.search(cell)
@@ -1614,17 +1710,28 @@ def _table_candidate_severities(visible_text: str) -> list[tuple[int, str]]:
 
 
 def _matched_severity(match: re.Match[str]) -> str:
-    """The severity a candidate regex captured, whichever group caught it."""
-    return next(group for group in match.groups() if group).upper()
+    """The severity a candidate regex captured, whichever group caught it.
+
+    A rule that captures two severities (a "HIGH/MEDIUM" range cell) reports
+    the higher one (task 3130).
+    """
+    return min(
+        (group.upper() for group in match.groups() if group),
+        key=_REVIEW_SEVERITIES.index,
+    )
 
 
 _NEWLINE_RE = re.compile("\n")
 
-# Rules added by task 3122. Unlike the older rules they report a severity
-# only on a line where no earlier rule saw it (see _shape_candidates).
+# Rules added by tasks 3122 and 3130. Unlike the older rules they report a
+# severity only on a line where no earlier rule saw it (see
+# _shape_candidates).
 _TASK_3122_LINE_RULES = (
     _SEVERITY_FIELD_ANYWHERE_RE, _SEVERITY_ALIAS_FIELD_RE,
-    _BARE_LEADING_SEVERITY_RE,
+    _BARE_LEADING_SEVERITY_RE, _BRACKETED_LEADING_SEVERITY_RE,
+    _ID_TAGGED_SEVERITY_RE, _LIST_ITEM_LONE_SEVERITY_RE,
+    _SEVERITY_ALIAS_AFTER_SENTENCE_RE, _RATED_SEVERITY_RE,
+    _DASH_DELIMITED_SEVERITY_RE,
 )
 
 
@@ -1673,7 +1780,7 @@ def _shape_candidates(
         for match in regex.finditer(text):
             report_once(match.start(), _matched_severity(match))
     for match in _LIST_ITEM_TRAILING_SEVERITY_RE.finditer(text):
-        severity = match.group(1)
+        severity = match.group(1).upper()
         if severity in ("LOW", "INFO") and _OVERALL_RISK_RE.search(match.group(0)):
             continue  # "- Overall risk: LOW" rates the review, not a finding
         report_once(match.start(), severity)
@@ -1684,6 +1791,8 @@ def _html_as_markdown(html_line: str) -> str:
     """Rewrite inline HTML as the Markdown a renderer would show (task 3122)."""
     markdown = _HTML_BOLD_TAG_RE.sub("**", html_line)
     markdown = _HTML_CELL_OPEN_TAG_RE.sub("|", markdown)
+    markdown = _HTML_LIST_ITEM_OPEN_TAG_RE.sub("\n- ", markdown)
+    markdown = _HTML_LINE_BREAK_TAG_RE.sub("\n", markdown)
     markdown = _HTML_BLOCK_TAG_RE.sub("\n", markdown)
     return _HTML_TAG_RE.sub(" ", markdown)
 
@@ -1736,6 +1845,226 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
     found = _shape_candidates(visible_text, seen)
     found += _html_candidates(visible_text, seen)
     return [severity for _line, severity in found]
+
+
+# Task 3130 (R3122-01, R3122-04): the review as a Markdown renderer shows it.
+# "&#72;IGH", "HI<!-- x -->GH" and HIGH spelled with a Greek capital Eta
+# (U+0397) all render as HIGH, and a Severity cell padded with 12 spaces
+# renders as "Severity: HIGH"; each was invisible to every rule. _analyze_review_file parses this rendered view
+# AND the text as written, and the stricter result wins, so the rewrite can
+# only add blocks ("HIGH: &#48; SQLi" is a tally once decoded, but still
+# blocks as written, as it did before).
+#
+# The provenance and completion comments the gate itself asks for. A review
+# whose rendered view differs from its text only by these (nearly every one)
+# is parsed once.
+_EQUIPA_MARKER_COMMENT_RE = re.compile(
+    r"<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?[ \t]*[0-9A-Fa-f]{0,64}[ \t]*-->",
+)
+# CommonMark character references: the semicolon is required.
+_CHARACTER_REFERENCE_RE = re.compile(
+    r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});",
+)
+# A reference is decoded only to letters, digits, blanks and this punctuation.
+# Anything else ("`", "~", "#", "<", "|", "*", "=", line breaks) would build
+# Markdown the renderer never builds from a reference: "&#96;HIGH: ...&#96;"
+# is literal backticks around a finding, not a code span that hides it. Such
+# references become U+FFFD, which no rule treats as structure.
+_SAFE_REFERENCE_PUNCTUATION = frozenset(":;,.!?-—–/'\"()&")
+_UNSAFE_REFERENCE_CHAR = "\N{REPLACEMENT CHARACTER}"
+# Decoded blanks are marked first, so the ones that would open a line (and
+# turn "&nbsp;&nbsp;&nbsp;&nbsp;HIGH: SQLi" into indented code) are dropped.
+_REFERENCE_BLANK = "\x00"
+_LEADING_REFERENCE_BLANKS_RE = re.compile(r"^[ \t\x00]+", re.MULTILINE)
+# A run of two or more blanks inside a line renders as one space. Leading
+# indentation is kept: it decides what is a list item or indented code.
+_INTERIOR_BLANK_RUN_RE = re.compile(r"(?<=[^ \t\n])[ \t]{2,}")
+# "*" emphasis inside a word ("**H**IGH", "HI*G*H") renders as one word.
+# "_" does not emphasise inside a word in CommonMark, so it is left alone.
+_INTRAWORD_EMPHASIS_RE = re.compile(r"(?<=[A-Za-z])\*{1,3}(?=[A-Za-z])")
+# Code points from other scripts that look like the Latin letters of the five
+# severity words, UPPER and Title case: Greek, Cyrillic, Cherokee, Lisu and
+# Latin small capitals. A subset of Unicode confusables.txt; NFKC
+# (normalize_review_text) already folds fullwidth and mathematical letters
+# but leaves these alone.
+_CONFUSABLES_BY_LETTER = {
+    "A": (0x0391, 0x0410, 0x13AA, 0xA4EE),
+    "C": (0x03F9, 0x0421, 0x13DF, 0xA4DA),
+    "D": (0x13A0, 0xA4D3),
+    "E": (0x0395, 0x0415, 0x13AC, 0xA4F0),
+    "F": (0x03DC, 0xA4DD),
+    "G": (0x050C, 0x13C0, 0xA4D6, 0x0262),
+    "H": (0x0397, 0x041D, 0x13BB, 0xA4E7, 0x029C),
+    "I": (0x0399, 0x0406, 0x04C0, 0xA4F2, 0x01C0, 0x026A),
+    "L": (0x13DE, 0xA4E1),
+    "M": (0x039C, 0x041C, 0x13B7, 0xA4DF),
+    "N": (0x039D, 0xA4E0),
+    "O": (0x039F, 0x041E, 0xA4F3),
+    "R": (0x13A1, 0x13D2, 0xA4E3),
+    "T": (0x03A4, 0x0422, 0x13A2, 0xA4D4),
+    "U": (0xA4F4,),
+    "W": (0x051C, 0x13B3, 0xA4EA),
+    "a": (0x0430, 0x0251),
+    "c": (0x0441, 0x03F2),
+    "d": (0x0501,),
+    "e": (0x0435,),
+    "g": (0x0261,),
+    "h": (0x04BB,),
+    "i": (0x0456, 0x0131, 0x03B9),
+    "l": (0x04CF,),
+    "o": (0x03BF, 0x043E),
+    "w": (0x051D,),
+}
+_CONFUSABLE_LETTERS = {
+    code_point: letter
+    for letter, code_points in _CONFUSABLES_BY_LETTER.items()
+    for code_point in code_points
+}
+
+
+def _carry_line_breaks(segment: str, carried: int) -> tuple[str, int]:
+    """Insert ``carried`` line breaks at the end of ``segment``'s first line."""
+    if carried == 0:
+        return segment, 0
+    newline = segment.find("\n")
+    if newline == -1:
+        return segment, carried
+    return segment[:newline] + "\n" * carried + segment[newline:], 0
+
+
+def _mask_code(text: str) -> str:
+    """``text`` with code blanked to spaces, keeping every offset.
+
+    The same code as :func:`_blank_code` (fenced blocks, inline spans, and
+    nothing after an unterminated fence), but each masked character becomes
+    a space, so an offset found in the mask is an offset in ``text``.
+    """
+    lines = text.split("\n")
+    masked: list[str] = []
+    fence: str | None = None
+    fence_start = 0
+    for index, line in enumerate(lines):
+        opener = _CODE_FENCE_RE.match(line)
+        if fence is None and opener is None:
+            masked.append(_INLINE_CODE_RE.sub(
+                lambda span: " " * len(span.group(0)), line,
+            ))
+            continue
+        if fence is None:
+            fence, fence_start = opener.group(1)[0], index
+        elif opener is not None and opener.group(1)[0] == fence:
+            fence = None
+        masked.append(" " * len(line))
+    if fence is not None:
+        masked[fence_start:] = lines[fence_start:]
+    return "\n".join(masked)
+
+
+def _strip_html_comments(text: str) -> str:
+    """Remove HTML comments the way a renderer hides them (task 3130).
+
+    A comment is removed with no replacement, so the word it split is joined
+    ("HI<!-- x -->GH" reads HIGH); the line breaks it spanned are re-inserted
+    at the end of the line it closed on, so every later line keeps its
+    number. "<!-->" and "<!--->" are empty comments. Code is not HTML: a
+    "<!--" quoted in a code span opens nothing (a real review quoted one, and
+    a "-->" in another span 30 lines later hid two finding headings). An
+    unterminated comment is left in place, so its text stays visible. Linear:
+    every search starts where the previous one ended.
+    """
+    if "<!--" not in text:
+        return text
+    masked = _mask_code(text)
+    pieces: list[str] = []
+    carried_breaks = 0
+    position = 0
+    while (start := masked.find("<!--", position)) != -1:
+        if masked.startswith("<!-->", start):
+            body_end, end = start + 4, start + 5
+        elif masked.startswith("<!--->", start):
+            body_end, end = start + 4, start + 6
+        else:
+            body_end = masked.find("-->", start + 4)
+            if body_end == -1:
+                break
+            end = body_end + 3
+        segment, carried_breaks = _carry_line_breaks(
+            text[position:start], carried_breaks,
+        )
+        pieces.append(segment)
+        carried_breaks += text.count("\n", start, end)
+        position = end
+    rest, carried_breaks = _carry_line_breaks(text[position:], carried_breaks)
+    pieces.append(rest + "\n" * carried_breaks)
+    return "".join(pieces)
+
+
+def _decode_character_reference(match: re.Match[str]) -> str:
+    """One character reference as the text the parser should see."""
+    reference = match.group(0)
+    decoded = html.unescape(reference)
+    if decoded == reference:
+        return reference  # unknown name: the renderer shows it literally
+    # Fullwidth letters fold to ASCII; a zero-width space or soft hyphen
+    # ("HI&#8203;GH") renders as nothing and must join the word.
+    decoded = normalize_review_text(decoded)
+    if not decoded:
+        return ""
+    if all(char.isalnum() or char in _SAFE_REFERENCE_PUNCTUATION
+           for char in decoded):
+        return decoded
+    if all(char == "\t" or unicodedata.category(char) == "Zs"
+           for char in decoded):
+        return _REFERENCE_BLANK
+    return _UNSAFE_REFERENCE_CHAR
+
+
+def _rendered_review_text(text: str) -> str:
+    """The review as a renderer shows it: comments removed, character
+    references decoded, lookalike letters folded, "*" emphasis inside a word
+    removed, blank runs collapsed.
+
+    ``text`` is already normalised (normalize_review_text). Comments go
+    first, so a decoded "&lt;!--" never opens one.
+    """
+    text = _strip_html_comments(text)
+    if "&" in text:
+        # A raw NUL renders as U+FFFD; it must not pass for a decoded blank.
+        text = text.replace(_REFERENCE_BLANK, _UNSAFE_REFERENCE_CHAR)
+        text = _CHARACTER_REFERENCE_RE.sub(_decode_character_reference, text)
+        if _REFERENCE_BLANK in text:
+            text = _LEADING_REFERENCE_BLANKS_RE.sub(
+                lambda run: run.group(0).replace(_REFERENCE_BLANK, ""), text,
+            )
+            text = text.replace(_REFERENCE_BLANK, " ")
+        # A decoded reference may itself be fullwidth or invisible.
+        text = normalize_review_text(text)
+    text = text.translate(_CONFUSABLE_LETTERS)
+    text = _INTRAWORD_EMPHASIS_RE.sub("", text)
+    return _INTERIOR_BLANK_RUN_RE.sub(" ", text)
+
+
+def _stricter_analysis(
+    as_written: ReviewCountAnalysis, rendered: ReviewCountAnalysis,
+) -> ReviewCountAnalysis:
+    """Combine the two views of one review so neither can loosen the gate.
+
+    A view that does not trust the review wins, the text as written first
+    (its verdict and detail are the ones earlier tasks produced). When both
+    trust it, the rendered view is returned with the per-severity maximum of
+    the two views' merge counts.
+    """
+    if not as_written.trusted:
+        return as_written
+    if not rendered.trusted:
+        return rendered
+    written_counts = as_written.counts or {}
+    rendered_counts = rendered.counts or {}
+    return replace(rendered, counts={
+        severity: max(written_counts.get(severity, 0),
+                      rendered_counts.get(severity, 0))
+        for severity in _REVIEW_SEVERITIES
+    })
 
 
 def _analyze_review_file(
@@ -1797,6 +2126,29 @@ def _analyze_review_file(
     if SECURITY_REVIEW_FALLBACK_MARKER in text[:512]:
         return ReviewCountAnalysis(verdict=REVIEW_VERDICT_FALLBACK)
 
+    # Comments count toward the near-empty check, as they always have.
+    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+    # Task 3130: parse the text as written (what every earlier task parsed)
+    # and as rendered (comments removed, references decoded, lookalike
+    # letters folded, blank runs collapsed); the stricter result wins. The
+    # rendered view catches "&#72;IGH" and "HI<!-- -->GH"; the text as
+    # written keeps every block it produced before, including a finding
+    # inside a multi-line comment.
+    as_written = _analyze_review_text(text, nonblank_lines)
+    rendered = _rendered_review_text(text)
+    if rendered == _EQUIPA_MARKER_COMMENT_RE.sub("", text):
+        return as_written  # only the gate's own marker comments differ
+    return _stricter_analysis(
+        as_written, _analyze_review_text(rendered, nonblank_lines),
+    )
+
+
+def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
+    """The body of :func:`_analyze_review_file` for one view of the review.
+
+    ``nonblank_lines`` is counted on the review as written, so removing its
+    comments cannot make a finished review look near-empty.
+    """
     header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     resolved_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
@@ -1952,7 +2304,6 @@ def _analyze_review_file(
                 f"summary marker {summary_marker.group(0).strip()!r}",
             )
 
-    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     if headers_total == 0 and footer_total == 0:
         if nonblank_lines < _REVIEW_MIN_NONBLANK_LINES:
             return _verdict(
