@@ -3368,10 +3368,24 @@ def _refuse_task_without_worktree(
 EXIT_DISPATCH_REFUSED = 2
 
 
+class DispatchRefused(SystemExit):
+    """A dispatch refused before any agent ran (dispatch-15).
+
+    A ``SystemExit``, so the CLI exits with :data:`EXIT_DISPATCH_REFUSED`.
+    In-process callers that dispatch on their own schedule (the initiative
+    wave dispatcher) catch it and record a failed wave instead of ending
+    the whole process mid-run.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(EXIT_DISPATCH_REFUSED)
+        self.message = message
+
+
 def refuse_dispatch(message: str) -> NoReturn:
-    """Print ``ERROR: message`` and exit with :data:`EXIT_DISPATCH_REFUSED`."""
+    """Print ``ERROR: message`` and raise :class:`DispatchRefused`."""
     print(f"ERROR: {message}")
-    sys.exit(EXIT_DISPATCH_REFUSED)
+    raise DispatchRefused(message)
 
 
 def resolve_max_concurrent(args) -> int:

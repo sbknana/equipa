@@ -1276,7 +1276,7 @@ async def _default_dispatch_wave(
     A task whose terminal status is ``done`` (or which produced a passing
     outcome) counts as succeeded; anything else halts the initiative.
     """
-    from equipa.dispatch import run_parallel_tasks
+    from equipa.dispatch import DispatchRefused, run_parallel_tasks
     from equipa.db import get_db_connection
 
     repo_path = _resolve_repo_path(getattr(args, "repo_path", None), [], None)
@@ -1323,7 +1323,18 @@ async def _default_dispatch_wave(
     finally:
         conn_hw.close()
 
-    await run_parallel_tasks(list(task_ids), args)
+    try:
+        await run_parallel_tasks(list(task_ids), args)
+    except DispatchRefused as exc:
+        # Task #3112: the wave was refused before any agent ran (a missing
+        # id, mixed projects, a bad concurrency cap). Its tasks keep their
+        # status, so the read-back below judges the wave failed and the
+        # initiative halts with a recorded reason instead of the process
+        # exiting mid-run.
+        logger.error(
+            "[Initiative] wave %s refused before dispatch: %s",
+            list(task_ids), exc.message,
+        )
 
     # S2: independently verify per-task branch isolation BEFORE trusting the
     # dispatch results. A violation downgrades the task so the runner halts.

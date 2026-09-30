@@ -901,3 +901,49 @@ def test_task_retry_cleanup_failure_blocks_instead_of_crashing(
 
     assert outcome == "attempt_cleanup_failed"
     assert len(attempts) == 1, "retried on top of a failed reset"
+
+
+# ---------------------------------------------------------------------------
+# dispatch-15 refusals inside an --initiative wave
+# ---------------------------------------------------------------------------
+
+def test_initiative_wave_refusal_is_a_failed_wave_not_a_process_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wave that ``run_parallel_tasks`` refuses must halt the initiative
+    through the normal failed-wave path. Letting the exit escape would end
+    the whole run without recording why the initiative stopped."""
+    import equipa.db as db_mod
+    import equipa.initiative_runner as initiative_mod
+
+    db_path = tmp_path / "wave.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER, status TEXT)")
+    conn.execute("CREATE TABLE agent_runs (id INTEGER PRIMARY KEY, task_id INTEGER, cost_usd REAL)")
+    conn.execute("INSERT INTO tasks VALUES (3320, 23, 'todo')")
+    conn.commit()
+    conn.close()
+
+    refused: list[int] = []
+
+    async def refusing_run_parallel_tasks(task_ids, args):
+        refused.extend(task_ids)
+        dispatch_mod.refuse_dispatch("task id(s) not found in TheForge: 3321")
+
+    monkeypatch.setattr(db_mod, "get_db_connection", lambda write=False: sqlite3.connect(db_path))
+    monkeypatch.setattr(dispatch_mod, "run_parallel_tasks", refusing_run_parallel_tasks)
+    monkeypatch.setattr(initiative_mod, "verify_wave_branch_isolation", lambda *a, **k: {})
+
+    results = asyncio.run(initiative_mod._default_dispatch_wave(
+        [3320], SimpleNamespace(repo_path=str(tmp_path)),
+    ))
+
+    assert refused == [3320]
+    assert [(r.task_id, r.outcome, r.succeeded) for r in results] == [(3320, "todo", False)]
+
+
+def test_refused_dispatch_still_exits_the_cli_with_code_2() -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        dispatch_mod.refuse_dispatch("nothing to run")
+
+    assert excinfo.value.code == dispatch_mod.EXIT_DISPATCH_REFUSED == 2
