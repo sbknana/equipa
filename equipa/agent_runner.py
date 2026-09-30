@@ -432,6 +432,39 @@ PRETOOLUSE_HOOK_SCRIPT = (
 )
 
 
+# Environment variables the --settings file sets to empty (RR-03). The CLI
+# still loads the agent-writable ~/.claude/settings.json (user scope), whose
+# "env" block reaches the CLI's own environment and every tool, hook and MCP
+# server it starts. The CLI applies the env blocks in source order and the
+# --settings file (flag scope) comes after user scope, so each name below is
+# overwritten with "", which every consumer treats as unset:
+# * shell and loader startup code: BASH_ENV/ENV run a file before every
+#   non-interactive shell; SHELLOPTS=xtrace with PS4='$(...)' runs code per
+#   command; LD_* load libraries into every program;
+# * interpreter startup code: NODE_OPTIONS (--require), PYTHON*, PERL5*,
+#   RUBY*, JAVA_TOOL_OPTIONS;
+# * Claude CLI switches: CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE (bare
+#   mode) turn every non-managed hook off, which is the Bash gate;
+#   CLAUDE_CODE_SHELL_PREFIX wraps and CLAUDE_CODE_SHELL replaces the shell
+#   that runs each command, and CLAUDE_ENV_FILE is sourced before it, all
+#   after the gate has judged the command.
+# An operator passthrough of one of these names is overridden too while the
+# gate is on; they load code and have no place in an agent environment.
+# Residual: user scope can still set other variables (PATH, HOME, SHELL,
+# GIT_*), other settings (apiKeyHelper runs a command, extra hooks) and
+# ~/.claude/CLAUDE.md. The complete fix is a per-unit CLAUDE_CONFIG_DIR that
+# agents cannot write, under agent isolation (task 3136).
+SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
+    "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "PERL5OPT", "PERL5LIB", "RUBYOPT",
+    "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+    "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SHELL_PREFIX",
+    "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
+)
+
+
 def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
     """Build the Claude CLI ``--settings`` payload wiring the Bash gate hook.
 
@@ -441,6 +474,15 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     the failing check + reason on stderr) to block an unsafe command BEFORE
     the CLI executes it — the pre-execution half of the bash security story.
 
+    The payload also pins ``"disableAllHooks": false`` (RR-03). Agents can
+    write the user-scope ``~/.claude/settings.json``, and one
+    ``{"disableAllHooks": true}`` there would switch the gate off for every
+    later run; flag-scope settings (this file) outrank user scope. That is
+    the only hook switch the CLI reads outside managed policy
+    (``allowManagedHooksOnly`` is read from policy settings only). The
+    ``env`` block empties SETTINGS_ENV_NEUTRALISED, including the two
+    variables that turn hooks off.
+
     Args:
         hook_script: Absolute path to ``pretooluse_bash_gate.py``.
         python_bin: Interpreter used to run the hook (normally the same
@@ -448,6 +490,8 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     """
     command = f"{shlex.quote(str(python_bin))} {shlex.quote(str(hook_script))}"
     return {
+        "disableAllHooks": False,
+        "env": {name: "" for name in SETTINGS_ENV_NEUTRALISED},
         "hooks": {
             "PreToolUse": [
                 {

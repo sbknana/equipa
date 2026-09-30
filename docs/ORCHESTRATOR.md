@@ -207,6 +207,23 @@ the `--settings` file EQUIPA passes and only the servers in EQUIPA's own
 `--mcp-config`. A project `CLAUDE.md` is therefore no longer seen by agents;
 put anything agents must know into the task or role prompt.
 
+User settings (`~/.claude/settings.json`) are still loaded, and agents running
+as the orchestrator's user can write them. With `bash_security_pretooluse` on,
+the `--settings` file EQUIPA generates therefore pins `"disableAllHooks":
+false` (flag-scope settings outrank user scope; RR-03) and sets to empty the
+variables a user-scope `env` block could use to turn hooks off
+(`CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`) or to run code around every
+command (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `LD_PRELOAD`, `NODE_OPTIONS`,
+`CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE`, ...; the list is
+`SETTINGS_ENV_NEUTRALISED` in `equipa/agent_runner.py`). An operator
+passthrough of one of those names is overridden as well. **Residual risk:**
+user scope can still set other variables (`PATH`, `HOME`, `GIT_*`), other
+settings (`apiKeyHelper` runs a command, extra hooks run on every tool call)
+and `~/.claude/CLAUDE.md` instructions. The complete fix is a per-unit
+`CLAUDE_CONFIG_DIR` that agents cannot write, under agent isolation (task
+3136). With the flag off no `--settings` file is passed and none of this
+applies.
+
 ## Agent isolation: what is and is not covered
 
 Agents run as the orchestrator's Unix user. The current controls are defence
