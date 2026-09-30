@@ -150,14 +150,20 @@ async def unmerged_entries(repo: str | os.PathLike) -> dict[str, set[tuple[int, 
 
 
 async def _blob(repo: str | os.PathLike, treeish: str, path: str) -> str | None:
-    """Blob SHA of ``path`` in ``treeish``, or None when it is not a blob there."""
+    """Blob SHA of ``path`` in ``treeish``, or None when it is not a blob there.
+
+    ``ls-tree`` rather than ``rev-parse <tree>:<path>^{blob}``: after the
+    colon git reads everything, suffix included, as the path.
+    """
     result = await git_run_async(
-        ["rev-parse", "--verify", "--quiet", "--end-of-options",
-         f"{treeish}:{path}^{{blob}}"],
+        ["ls-tree", "-z", "--full-tree", treeish, "--", path],
         repo, timeout=_GIT_TIMEOUT,
     )
-    sha = result.stdout.strip()
-    return sha if result.returncode == 0 and sha else None
+    meta, _, listed = result.stdout.rstrip("\0").partition("\t")
+    fields = meta.split()
+    if result.returncode != 0 or listed != path or len(fields) != 3:
+        return None
+    return fields[2] if fields[1] == "blob" else None
 
 
 def _content_conflict_problem(path: str, entries: set[tuple[int, str]]) -> str | None:

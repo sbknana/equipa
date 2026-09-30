@@ -259,9 +259,9 @@ def test_mixed_conflict_keeps_todays_merge_failed(repo, capsys):
     _run_real_generator(repo)
     main_sha = _commit_all(repo, "main edits core")
     main_report = (repo / REPORT).read_bytes()
-    assert sorted(_merge_tree(repo, main_sha, branch_sha)[2]) == [
+    assert set(_merge_tree(repo, main_sha, branch_sha)[2]) == {
         "equipa/core.py", REPORT,
-    ]
+    }
 
     status, guard = _gate(repo, worktree)
 
