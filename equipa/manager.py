@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 
 # dispatch-07 (task #3119): the planner and evaluator run in the project's
 # MAIN checkout, where a commit lands straight on the default branch. They
-# only read the project and create tasks through TheForge's MCP tools, so
-# their built-in tools are limited to this read-only allowlist (``--tools``):
-# no Write, Edit, NotebookEdit or Bash, hence nothing to commit with.
+# only read the project and return the tasks they want in a TASKS_JSON
+# block (the manager inserts them, R3126-03, task #3132), so their built-in
+# tools are limited to this read-only allowlist (``--tools``): no Write,
+# Edit, NotebookEdit or Bash, hence nothing to commit with.
 GOAL_AGENT_READ_ONLY_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 # Goal outcomes that mean the dispatch was refused rather than run to an
