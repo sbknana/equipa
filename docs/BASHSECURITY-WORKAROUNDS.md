@@ -8,14 +8,16 @@
 
 The classifier is enforced in two places, with different guarantees:
 
-- **Pre-execution gate** (`hooks/pretooluse_bash_gate.py`, feature flag `features.bash_security_pretooluse`, default OFF in code). When the flag is on, every agent CLI built by `build_cli_command` gets a Claude Code PreToolUse hook. It runs the classifier *before* the Bash tool executes and refuses an unsafe command (exit 2, reason on stderr), so the command never runs. The gate **fails closed**: if the payload cannot be parsed, the checker cannot be loaded (import or syntax error), the checker raises, or it returns something unusable, the command is blocked with a `pretooluse_bash_gate: ... fails closed` reason. If `dispatch_config.json` exists but cannot be read or parsed, the flag is forced ON and an ERROR is logged, so a corrupt config cannot silently turn the gate off.
+- **Pre-execution gate** (`hooks/pretooluse_bash_gate.py`, feature flag `features.bash_security_pretooluse`, default OFF in code). When the flag is on, `build_cli_command` wires a Claude Code PreToolUse hook into the agent CLI through a generated `--settings` file. Exception, still open (SECURITY-REVIEW-3121 BS3121-04, in `agent_runner.py`): if the hook script is missing or the settings file cannot be written, the agent is started without the gate and only a WARNING is logged. The hook runs the classifier *before* the Bash tool executes and refuses an unsafe command (exit 2, reason on stderr), so the command never runs. The gate **fails closed**: if the payload cannot be parsed, the checker cannot be loaded (import or syntax error), the checker raises, or it returns something unusable, the command is blocked with a `pretooluse_bash_gate: ... fails closed` reason. The flag is forced ON, with an ERROR logged, when `dispatch_config.json` exists but cannot be read or parsed, when its `features` value is not an object, or when the flag's value is not one of `true`/`false`, `0`/`1` or the strings `"true"`/`"false"`/`"1"`/`"0"` (so `"yes"`, `"on"` or `null` keep the gate on rather than turning it off).
 - **Reactive stream check** (`equipa/agent_runner.py`). For roles that run with streaming output, the orchestrator also runs the classifier on each Bash call it sees in the stream. The CLI has already executed the call by then, so this detects and terminates; it does not prevent. Roles that run without streaming (the early-term-exempt ones, such as planner, evaluator, the reviewers and researcher) are **not** checked this way.
 
 What it is **not**:
 
 - **Not every command is checked.** With the flag off, only streaming roles get the (after-the-fact) reactive check.
 - **Not a permission policy.** The classifier detects parser-confusion and substitution tricks. Plainly destructive or powerful commands pass: `rm -rf build/`, `bash scripts/x.sh`, `git push --force`, and writing any file through the Write/Edit tools.
-- **Not a sandbox.** A task worktree is a separate git checkout, not an isolation boundary. Agents run as the same user as the orchestrator, and the redirect checks below are textual: a symlink inside the tree that points elsewhere is not detected.
+- **Not a sandbox.** A task worktree is a separate git checkout, not an isolation boundary. Agents run as the same user as the orchestrator, and the redirect checks below are textual: a symlink that points elsewhere (even one created earlier in the same command) is not detected, and neither is a writer that is not a redirect, such as `tee -a`.
+
+How it reads a command: one tokenizer (`_scan_shell` in `equipa/bash_security.py`) classifies every character the way bash parses it: `'...'`, `"..."`, `$'...'` with its backslash escapes, `$"..."`, quoting that starts afresh inside `$(...)` (even within double quotes), backticks, `${...}`, `#` comments and heredoc bodies. Every check that cares about quoting reads that one classification, and a separate test compares it with bash on a generated corpus. A command it cannot parse to a clean end is **refused** (check 25) rather than guessed at: an unterminated quote or substitution, a `case` statement inside `$(...)`, a `((` that is not an arithmetic command (write `( (`), a heredoc delimiter containing `$` or a backtick, or a heredoc whose body would begin inside a multi-line substitution.
 
 ## Status of known BashSecurity false-positives
 
@@ -34,6 +36,7 @@ What it is **not**:
 | 3121 | check 16: brace list in an argument (`ls {src,tests}`, `cp f{,.bak}`) | FIXED in source |
 | 3121 | check 8: read-only process substitution (`diff <(sort a) <(sort b)`) | FIXED in source |
 | 3121 | check 10: fd duplication (`echo msg >&2`) | FIXED in source |
+| 3128 | checks 9/10: `<` or `>` inside a `#` comment read as a redirect (`grep x f # see <foo>`) | FIXED in source |
 
 "FIXED in source" means merged to this repo. Production runs whatever `bash_security.py` was last deployed, so a fix only helps once it is deployed. When in doubt, assume production is stricter than the file you are editing.
 
@@ -48,6 +51,8 @@ What it is **not**:
 | `ls {src,tests}`, `cp config.json{,.bak}` | `{rm,-rf,x}`, `ls {-la,/}`, `echo {1..5}`, `xargs {rm,x}` | Brace lists are allowed only in arguments of commands that do not run their arguments (`echo`, `ls`, `cat`, `cp`, `mv`, `mkdir`, `diff`, `grep`, ...), one list per word, no flags, no `{a..b}` ranges. |
 | `diff <(sort a) <(sort b)` | `diff <(curl ... \| sh) b`, `cat <(echo x)`, `tee >(sort)` | `<(...)` takes the same read-only allowlist as `$(...)`, except `echo`/`printf` (use `<<<` instead). `>(...)` is always blocked. |
 | `echo "$(git rev-parse HEAD)"`, `echo '$(anything)'` | `echo "$(curl ... \| sh)"`, ``echo "`id`"`` | Substitution inside double quotes is judged like the unquoted form. Single quotes stay inert. |
+| `echo $'\''`, `echo "$(echo '"')"` | `echo $'\'' >> /etc/x`, `echo "$(echo '"')" $(touch x)` | A complete quoted word no longer hides what follows it. |
+| `( (cd a && ls) )`, `$(grep case notes.txt)` | `echo 'unterminated`, `((cd a) ; ls)`, `$(case $x in a) ls;; esac)` | Check 25: quoting the checker cannot parse is refused. Close every quote, write `( (` for nested subshells, move `case` out of `$(...)`. |
 | a command up to 16384 bytes | anything longer | Write long content to a file with the Write tool and run a short command that reads it. |
 
 ## Workaround patterns

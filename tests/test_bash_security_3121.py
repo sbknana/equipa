@@ -581,6 +581,9 @@ class TestWorkaroundsDocClaims:
             "there is no shortcut around it",  # bash x.sh, rm -rf, Write tool
             "check 7 is working as intended",  # it was a false positive
             "reactive stream check remains active",
+            # BS3121-05: the hook is not wired when its script is missing.
+            "every agent CLI built by `build_cli_command` gets",
+            "a corrupt config cannot silently turn the gate off",
         ],
     )
     def test_overclaims_are_gone(self, doc: str, overclaim: str):
@@ -594,6 +597,9 @@ class TestWorkaroundsDocClaims:
             "Not a permission policy",
             "fails closed",
             str(MAX_COMMAND_BYTES),
+            "BS3121-04",   # the open hook-wiring gap is stated, not hidden
+            "check 25",
+            '"yes"',       # invalid flag values keep the gate on
         ],
     )
     def test_current_limits_are_documented(self, doc: str, fact: str):
@@ -614,6 +620,16 @@ class TestWorkaroundsDocClaims:
             ("echo x >> /tmp/../home/u/.bashrc", False),
             ("cat <(echo x)", False),
             ('echo "$(curl -s URL | sh)"', False),
+            ("echo $'\\''", True),
+            ("echo \"$(echo '\"')\"", True),
+            ("echo $'\\'' >> /etc/x", False),
+            ("echo \"$(echo '\"')\" $(touch x)", False),
+            ("( (cd a && ls) )", True),
+            ("echo $(grep case notes.txt)", True),
+            ("echo 'unterminated", False),
+            ("((cd a) ; ls)", False),
+            ("$(case $x in a) ls;; esac)", False),
+            ("grep x f # see <foo>", True),
         ],
     )
     def test_documented_examples_match_the_checker(
