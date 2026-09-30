@@ -552,11 +552,14 @@ def _gate_fingerprint() -> str | None:
     return h.hexdigest()
 
 
-def _gate_canary_ok(hook_command: str) -> bool:
+def _gate_canary_ok(hook_command: str, cwd: str | None = None) -> bool:
     """Run the hook on a command it must refuse; True only on a correct refusal.
 
     If the gate cannot load, crashes or allows the canary, it would also fail
     open for real commands, so the reactive check must keep killing on sight.
+    The canary runs with the agent's allowlisted environment and working
+    directory, the conditions the CLI runs the real hook under, so a pass
+    means the hook is active for THIS run (sandbox-04).
     """
     payload = json.dumps({
         "tool_name": "Bash",
@@ -566,11 +569,31 @@ def _gate_canary_ok(hook_command: str) -> bool:
     try:
         proc = subprocess.run(
             shlex.split(hook_command), input=payload, capture_output=True,
-            text=True, timeout=30,
+            text=True, timeout=30, env=_agent_subprocess_env(), cwd=cwd,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
     return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
+
+
+async def _reactive_bash_check(bash_cmd: str) -> Any | None:
+    """``check_bash_command`` off the event loop; None when it timed out.
+
+    Runs in a worker thread with a ``_SLOW_CHECK_SECONDS`` deadline, so a
+    pathological command cannot freeze the event loop that monitors every
+    parallel agent (sandbox-07 iii). Past the deadline the hook (same check,
+    same input) may itself have timed out and let the command run, so the
+    caller treats None as a block. A timed-out worker thread cannot be
+    interrupted and finishes on its own; the caller stops the agent, so no
+    further checks queue up behind it.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(check_bash_command, bash_cmd),
+            timeout=_SLOW_CHECK_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return None
 
 
 class AgentDispatchRefused(RuntimeError):
@@ -1689,8 +1712,13 @@ async def _run_agent_streaming_impl(
     # judged by its tool_result (refused vs executed), not killed on sight.
     hook_command = _pretooluse_hook_command(cmd)
     gate_fingerprint = _gate_fingerprint() if hook_command else None
-    if hook_command and (gate_fingerprint is None
-                         or not _gate_canary_ok(hook_command)):
+    agent_cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if agent_cwd is not None and not os.path.isdir(agent_cwd):
+        agent_cwd = None  # the spawn below refuses it with a clear error
+    if hook_command and (
+        gate_fingerprint is None
+        or not await asyncio.to_thread(_gate_canary_ok, hook_command, agent_cwd)
+    ):
         log("  [BashSecurity] pre-execution gate failed its canary; flagged "
             "commands will be killed on sight", output)
         hook_command = None
@@ -1843,7 +1871,8 @@ async def _run_agent_streaming_impl(
                         turn_count += 1
                         turn_has_tool_calls = True
 
-                        # Record action entry for action logging
+                        # Record action entry for action logging. The preview
+                        # is persisted to agent_actions: redact it (sandbox-12).
                         try:
                             input_str = json.dumps(tool_input, default=str)
                         except (TypeError, ValueError):
@@ -1851,7 +1880,7 @@ async def _run_agent_streaming_impl(
                         action_log.append({
                             "turn": turn_count,
                             "tool": tool_name,
-                            "input_preview": input_str[:200],
+                            "input_preview": redacted_preview(input_str, 200),
                             "input_hash": hashlib.sha256(
                                 input_str.encode("utf-8", errors="replace")
                             ).hexdigest(),
@@ -1877,27 +1906,37 @@ async def _run_agent_streaming_impl(
                         elif tool_name == "Bash":
                             bash_cmd = tool_input.get("command", "")
 
-                            # --- Bash security pre-execution filter ---
-                            _check_started = time.monotonic()
-                            sec_result = check_bash_command(bash_cmd)
-                            slow_check = (time.monotonic() - _check_started
-                                          > _SLOW_CHECK_SECONDS)
+                            # --- Bash security reactive check ---
+                            # Off the event loop, with a deadline (sandbox-07).
+                            # Commands and checker messages are redacted before
+                            # they reach a log line or a result (sandbox-12).
+                            sec_result = await _reactive_bash_check(bash_cmd)
+                            cmd_preview = redacted_preview(bash_cmd, 120)
                             tool_use_id = block.get("id")
-                            if (not sec_result.safe and hook_command and tool_use_id
-                                    and not slow_check):
+                            if sec_result is None:
+                                early_term_reason = (
+                                    f"Bash security: the reactive check did not "
+                                    f"finish within {_SLOW_CHECK_SECONDS:g}s; "
+                                    f"failing closed"
+                                )
+                                log(f"  [BashSecurity] BLOCKED: {early_term_reason} "
+                                    f"— cmd={cmd_preview}", output)
+                            elif not sec_result.safe and hook_command and tool_use_id:
                                 # The gate ran this same check before execution;
                                 # its tool_result says whether it was refused.
+                                check_msg = redact_secrets(sec_result.message)
                                 pending_flagged[tool_use_id] = (
-                                    sec_result.check_id, sec_result.message)
+                                    sec_result.check_id, check_msg)
                                 log(f"  [BashSecurity] flagged check={sec_result.check_id}: "
-                                    f"{sec_result.message} (awaiting pre-execution gate) "
-                                    f"— cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} (awaiting pre-execution gate) "
+                                    f"— cmd={cmd_preview}", output)
                             elif not sec_result.safe:
+                                check_msg = redact_secrets(sec_result.message)
                                 log(f"  [BashSecurity] BLOCKED check={sec_result.check_id}: "
-                                    f"{sec_result.message} — cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} — cmd={cmd_preview}", output)
                                 early_term_reason = (
                                     f"Bash security violation (check {sec_result.check_id}): "
-                                    f"{sec_result.message}"
+                                    f"{check_msg}"
                                 )
 
                             if any(kw in bash_cmd for kw in [
@@ -2276,17 +2315,19 @@ async def _run_agent_streaming_impl(
                                     if _t:
                                         tool_output_text_chunks.append(_t)
 
+                        # Error output often echoes the command; it is
+                        # persisted as agent_actions.error_summary (sandbox-12).
                         error_text = None
                         if is_error:
                             if isinstance(content, str):
-                                error_text = content[:200]
+                                error_text = redacted_preview(content, 200)
                             elif isinstance(content, list):
                                 texts = []
                                 for c in content:
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         texts.append(c.get("text", ""))
                                 if texts:
-                                    error_text = " ".join(texts)[:200]
+                                    error_text = redacted_preview(" ".join(texts), 200)
 
                         tool_errors.append(error_text)
 
@@ -2356,8 +2397,13 @@ async def _run_agent_streaming_impl(
     # Runs on every exit path. After a normal exit the launcher has already
     # swept whatever the agent left running; this confirms and releases.
     was_running = process.returncode is None
-    if was_running:
+    if was_running and early_term_reason:
         log(f"  [EarlyTerm] Killing agent process (reason: {early_term_reason})", output)
+    elif was_running:
+        # A normal finish: the stream ended (result event or EARLY_COMPLETE)
+        # while the CLI or the launcher's sweep was still winding down.
+        log("  [Cleanup] Agent stream finished; stopping the agent process "
+            "tree", output)
     await _terminate_agent(process, contained)
     if was_running:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, OSError):
