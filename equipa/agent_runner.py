@@ -607,16 +607,20 @@ def _cmd_option(cmd: list[str], flag: str) -> str | None:
         return None
 
 
-def _check_mcp_db_paths(mcp_config: str | os.PathLike[str]) -> None:
-    """Refuse an MCP config that gives a server a relative ``--db-path``.
+def _check_mcp_servers(mcp_config: str | os.PathLike[str]) -> None:
+    """Refuse an MCP config whose servers would resolve inside the project.
 
-    The agent CLI runs in the project directory (sandbox-11), and the MCP
-    servers it starts inherit that cwd, so a relative path would silently
-    open a different database. Fail closed rather than guess which one was
-    meant. A missing config is left to the CLI, which reports it itself.
+    The agent CLI runs in the project directory (sandbox-11), and the stdio
+    MCP servers it starts inherit that cwd. Anything a server resolves
+    relative to its cwd is therefore agent-writable: a relative
+    ``--db-path`` silently opens a different database, and a relative
+    command, a relative script or ``python -m`` (which puts the cwd first on
+    ``sys.path``) runs agent-planted code holding the server's credentials,
+    such as the EQUIPA_MCP_TOKEN (P2A-02). Fail closed rather than guess. A
+    missing config is left to the CLI, which reports it itself.
 
     Raises:
-        AgentDispatchRefused: relative ``--db-path``, or an unreadable config.
+        AgentDispatchRefused: a cwd-relative server, or an unreadable config.
     """
     path = Path(mcp_config)
     if not path.is_file():
@@ -626,12 +630,156 @@ def _check_mcp_db_paths(mcp_config: str | os.PathLike[str]) -> None:
         entries = list(servers.items())
     except (OSError, ValueError, AttributeError) as exc:
         raise AgentDispatchRefused(
-            f"cannot read MCP config {path} to verify its --db-path: {exc}"
+            f"cannot read MCP config {path} to verify its servers: {exc}"
         ) from exc
     for name, server in entries:
-        args = server.get("args") if isinstance(server, dict) else None
-        if not isinstance(args, list):
+        if not isinstance(server, dict):
             continue
+        _check_mcp_db_path(name, server, path)
+        _check_mcp_launch(name, server, path)
+
+
+# Interpreters whose first non-option argument is a script path.
+_MCP_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# Python options that take a value (from ``python --help``).
+_PYTHON_VALUE_OPTIONS = frozenset("cmWX")
+_PYTHON_LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs"})
+# Suffixes that make a relative argument a script or module file.
+_SCRIPT_SUFFIXES = (".py", ".pyc", ".pyz", ".js", ".mjs", ".cjs", ".ts", ".mts",
+                    ".sh", ".bash", ".rb", ".pl", ".php", ".jar")
+
+
+def _is_python_command(command: str) -> bool:
+    """True for python, python3, python3.12, pypy3 and the like."""
+    name = os.path.basename(command).lower().removesuffix(".exe")
+    for prefix in ("python", "pypy"):
+        if name.startswith(prefix):
+            return all(char.isdigit() or char == "."
+                       for char in name[len(prefix):])
+    return False
+
+
+def _python_invocation(args: list[str]) -> tuple[str, str | None, set[str]]:
+    """How ``python <args>`` picks its code: (mode, target, single-letter flags).
+
+    mode is "module" (-m), "code" (-c), "stdin" (no script, or ``-``) or
+    "script". Clustered short options (``-IBm mod``) are honoured.
+    """
+    flags: set[str] = set()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "-":
+            return "stdin", None, flags
+        if arg == "--":
+            return ("script", following, flags) if following else ("stdin", None, flags)
+        if arg.startswith("--"):
+            index += 2 if arg in _PYTHON_LONG_VALUE_OPTIONS else 1
+            continue
+        if not arg.startswith("-"):
+            return "script", arg, flags
+        cluster = arg[1:]
+        for position, letter in enumerate(cluster):
+            if letter not in _PYTHON_VALUE_OPTIONS:
+                flags.add(letter)
+                continue
+            attached = cluster[position + 1:]
+            value = attached or following
+            if letter == "m":
+                return "module", value, flags
+            if letter == "c":
+                return "code", value, flags
+            if not attached:
+                index += 1  # -W / -X consumed the next argument
+            break
+        index += 1
+    return "stdin", None, flags
+
+
+def _looks_like_relative_path(arg: str) -> bool:
+    if os.path.isabs(arg) or arg.startswith("-"):
+        return False
+    return (arg.startswith(("./", "../", "~")) or arg in (".", "..")
+            or arg.lower().endswith(_SCRIPT_SUFFIXES))
+
+
+def _check_mcp_launch(name: str, server: dict, config_path: Path) -> None:
+    """Refuse a stdio server that would load code relative to its cwd."""
+    if server.get("type") in ("http", "sse") or (
+            "url" in server and "command" not in server):
+        return  # remote server: nothing is started in the project directory
+
+    def refuse(problem: str, fix: str) -> AgentDispatchRefused:
+        return AgentDispatchRefused(
+            f"MCP server {name!r} in {config_path} {problem}. Agents run in "
+            f"the project directory and MCP servers inherit it, so this "
+            f"would run agent-writable code. {fix}"
+        )
+
+    command = server.get("command")
+    args = server.get("args", [])
+    cwd = server.get("cwd")
+    if not isinstance(command, str) or not os.path.isabs(command):
+        raise refuse(f"has a relative command {command!r}",
+                     "Use an absolute path to the executable.")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise refuse("has non-string args", "Use a list of strings.")
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise refuse(f"has a relative cwd {cwd!r}", "Use an absolute cwd.")
+    basename = os.path.basename(command)
+    if basename == "env":
+        raise refuse("is started through env(1), which resolves its target "
+                     "through PATH", 'Use an absolute command and the "env" key.')
+    if _is_python_command(command):
+        _check_python_launch(server, args, cwd, refuse)
+    elif basename in _MCP_SHELLS:
+        options = [a for a in args if a.startswith("-")]
+        if any("c" in option.lstrip("-") for option in options
+               if not option.startswith("--")):
+            raise refuse("runs an inline shell command (-c), which cannot be "
+                         "verified", "Point the shell at an absolute script.")
+        script = next((a for a in args if not a.startswith("-")), None)
+        if script is not None and not os.path.isabs(script):
+            raise refuse(f"runs the relative script {script!r}",
+                         "Use an absolute script path.")
+    for arg in args:
+        if _looks_like_relative_path(arg):
+            raise refuse(f"has the relative path argument {arg!r}",
+                         "Use an absolute path.")
+
+
+def _check_python_launch(server: dict, args: list[str], cwd: str | None,
+                         refuse: Any) -> None:
+    mode, target, flags = _python_invocation(args)
+    if mode == "script":
+        if not target or not os.path.isabs(target):
+            raise refuse(f"runs the relative Python script {target!r}",
+                         "Use an absolute script path.")
+    elif not (flags & {"I", "P"}) or cwd is None:
+        shown = {"module": f"-m {target}", "code": "-c ...",
+                 "stdin": "(stdin)"}[mode]
+        raise refuse(
+            f"runs python {shown} without both an isolation flag (-I or -P) "
+            f"and an absolute \"cwd\"; Python would put the project directory "
+            f"first on sys.path",
+            'Add "-I" or "-P" before -m and an absolute "cwd" (with PYTHONPATH '
+            'in "env" pointing at the trusted checkout if needed), or run an '
+            "absolute script path.",
+        )
+    env = server.get("env")
+    pythonpath = env.get("PYTHONPATH") if isinstance(env, dict) else None
+    if pythonpath is not None:
+        entries = str(pythonpath).split(os.pathsep)
+        if not all(entry and os.path.isabs(entry) for entry in entries):
+            raise refuse(f"has a relative PYTHONPATH entry in {pythonpath!r}",
+                         "Use absolute PYTHONPATH entries only.")
+
+
+def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
+    """Refuse a relative ``--db-path`` (sandbox-11)."""
+    args = server.get("args")
+    if isinstance(args, list):
         for index, arg in enumerate(args):
             if arg == "--db-path":
                 db_path = args[index + 1] if index + 1 < len(args) else ""
@@ -708,7 +856,7 @@ def build_cli_command(
     )
     claude_bin = shutil.which("claude") or "claude"
     # sandbox-11: checked before any tempfile exists, so a refusal leaks none.
-    _check_mcp_db_paths(MCP_CONFIG)
+    _check_mcp_servers(MCP_CONFIG)
 
     # Write system prompt to a temp file to avoid Windows command-line length
     # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
@@ -1230,7 +1378,7 @@ async def _spawn_agent_process(
         raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
     mcp_config = _cmd_option(cmd, "--mcp-config")
     if mcp_config:
-        _check_mcp_db_paths(mcp_config)
+        _check_mcp_servers(mcp_config)
     # P2A-05: the scrubbed env below is pointless if the agent can read ours
     # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
     # failure refuses the dispatch instead of starting an agent anyway.

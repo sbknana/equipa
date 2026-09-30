@@ -282,7 +282,8 @@ def test_streaming_project_dir_argument_sets_cwd(agent):
 def _mcp_config(tmp_path: Path, db_args: list[str]) -> Path:
     path = tmp_path / "mcp_config.json"
     path.write_text(json.dumps({"mcpServers": {
-        "theforge": {"type": "stdio", "command": "uvx",
+        # Absolute command: relative commands are refused since 3127 (P2A-02).
+        "theforge": {"type": "stdio", "command": "/opt/fake/bin/uvx",
                      "args": ["mcp-server-sqlite", *db_args]},
     }}), encoding="utf-8")
     return path
