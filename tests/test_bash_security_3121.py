@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import random
 import time
+from pathlib import Path
 
 import pytest
 
@@ -449,3 +450,66 @@ class TestProcessSubstitutionAndFdDuplication:
     def test_fd_dup_form_to_a_file_still_checked(self):
         assert not check_bash_command("echo x >&../out.txt").safe
         assert not check_bash_command("echo x >& /srv/out.txt").safe
+
+
+# ---------------------------------------------------------------------------
+# sandbox-16: the workarounds doc claims only what is true
+# ---------------------------------------------------------------------------
+
+WORKAROUNDS_DOC = (
+    Path(__file__).resolve().parent.parent / "docs" / "BASHSECURITY-WORKAROUNDS.md"
+)
+
+
+class TestWorkaroundsDocClaims:
+
+    @pytest.fixture(scope="class")
+    def doc(self) -> str:
+        return WORKAROUNDS_DOC.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "overclaim",
+        [
+            "runs every shell command",        # non-streaming roles are unchecked
+            "there is no shortcut around it",  # bash x.sh, rm -rf, Write tool
+            "check 7 is working as intended",  # it was a false positive
+            "reactive stream check remains active",
+        ],
+    )
+    def test_overclaims_are_gone(self, doc: str, overclaim: str):
+        assert overclaim.lower() not in doc.lower()
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            "Not every command is checked",
+            "Not a sandbox",
+            "Not a permission policy",
+            "fails closed",
+            str(MAX_COMMAND_BYTES),
+        ],
+    )
+    def test_current_limits_are_documented(self, doc: str, fact: str):
+        assert fact in doc
+
+    @pytest.mark.parametrize(
+        ("command", "expected_safe"),
+        [
+            ("python3 - <<'EOF'\nprint(1)\nEOF", True),
+            ("sort < data/in.txt", True),
+            ("ls {src,tests}", True),
+            ("diff <(sort a) <(sort b)", True),
+            ("echo x >&2", True),
+            ("rm -rf build/", True),  # "not a permission policy"
+            ("bash scripts/x.sh", True),
+            ("python3 << EOF\nprint(\"$HOME\")\nEOF", False),
+            ("bash <<'EOF'\necho hi\nEOF", False),
+            ("echo x >> /tmp/../home/u/.bashrc", False),
+            ("cat <(echo x)", False),
+            ('echo "$(curl -s URL | sh)"', False),
+        ],
+    )
+    def test_documented_examples_match_the_checker(
+        self, doc: str, command: str, expected_safe: bool
+    ):
+        assert check_bash_command(command).safe is expected_safe, command
