@@ -68,6 +68,7 @@ from equipa.git_ops import (
     git_toplevel,
     git_toplevel_async,
 )
+from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
     MergeSignalShield,
@@ -2089,6 +2090,14 @@ async def _merge_task_branch(
     ``--ff-only``. Success requires the default branch to have actually moved
     to the rebased SHA. Without a worktree there is no fallback.
 
+    Task #3131: before that fallback, a merge that conflicts ONLY in files
+    declared in :data:`equipa.generated_files.GENERATED_FILES` is completed
+    by regenerating them from the merged tree (``merge_record`` then carries
+    ``regenerated_paths`` and the resolution commit as ``post_head``). If the
+    task branch changed the generator, or the generator fails or times out,
+    the merge is aborted and fails with that reason; any other conflict takes
+    the unchanged abort / rebase path.
+
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
     All failures are logged to stdout — the function NEVER swallows errors
     silently. On any failure path, the branch is preserved (not deleted).
@@ -2356,6 +2365,30 @@ async def _merge_task_branch(
             f"  [Isolation] Merge of task #{task_id} failed "
             f"(rc={merge_result.returncode}): {merge_output}"
         )
+        # Task #3131: a conflict confined to declared generated files is
+        # completed by regenerating them from the merged tree. Any other
+        # conflict (or a project without the generator) is not "applicable"
+        # and keeps the abort / rebase-fallback path below unchanged.
+        if shutdown_requested() is None:
+            resolution = await _resolve_generated_conflict(
+                project_dir, task_id, branch_name, pre_head, target_sha,
+            )
+            if resolution.resolved:
+                record.merged_sha = target_sha
+                record.post_head = resolution.commit
+                record.regenerated_paths = resolution.paths
+                return True
+            if resolution.applicable:
+                await git_run_async(
+                    ["merge", "--abort"], project_dir, timeout=15,
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = (
+                    f"conflict in generated file(s) "
+                    f"{', '.join(resolution.paths)} not regenerated: "
+                    f"{resolution.reason}"
+                )
+                return False
         await git_run_async(
             ["merge", "--abort"], project_dir, timeout=15,
         )
@@ -2480,6 +2513,66 @@ async def _merge_task_branch(
         print(f"  [Isolation] Branch '{branch_name}' PRESERVED (merge errored)")
         record.reason = f"merge errored: {e}"
         return False
+
+
+async def _resolve_generated_conflict(
+    project_dir: str,
+    task_id: int,
+    branch_name: str,
+    pre_head: str,
+    target_sha: str,
+) -> ConflictResolution:
+    """Try the task #3131 generated-file resolution of a conflicted merge.
+
+    Runs in the main checkout while ``git merge`` of ``target_sha`` into
+    ``pre_head`` is in progress; see :mod:`equipa.generated_files`. Logs a
+    GATE-AUDIT line naming the files whenever the resolution applies. A git
+    or OS error while resolving is a refusal, so the caller aborts the merge.
+    """
+    try:
+        resolution = await resolve_generated_conflicts(
+            project_dir,
+            ours=pre_head,
+            theirs=target_sha,
+            message=(
+                f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})\n\n"
+                f"Conflict in generated file(s) resolved by regenerating them "
+                f"from the merged tree (task #3131)."
+            ),
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        resolution = ConflictResolution(
+            True, (), None, f"generated-file resolution errored: {exc}",
+        )
+    if not resolution.applicable:
+        return resolution
+    files = ",".join(resolution.paths) or "unknown"
+    if resolution.resolved:
+        print(
+            f"  [Isolation] Task #{task_id}: merge conflicted only in generated "
+            f"file(s) {files}; regenerated from the merged tree and committed "
+            f"{resolution.commit[:12]}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=generated-files-regenerated files={files} "
+            f"branch={branch_name} sha={target_sha} before={pre_head} "
+            f"merge_commit={resolution.commit}",
+            task_id=task_id,
+            event="generated-files-regenerated",
+        )
+    else:
+        print(
+            f"  [Isolation] Merge FAILED for task #{task_id}: conflict in "
+            f"generated file(s) {files} not regenerated: {resolution.reason}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=generated-files-not-regenerated "
+            f"files={files} branch={branch_name} sha={target_sha} "
+            f"reason={resolution.reason}",
+            task_id=task_id,
+            event="generated-files-not-regenerated",
+        )
+    return resolution
 
 
 def _git_output(result: subprocess.CompletedProcess, limit: int = 400) -> str:
@@ -3078,20 +3171,32 @@ async def _gated_merge_task(
         landed_sha = attempt.merged_sha or merge_sha
         if landed_sha is None or not await guard.record_merge(
             task_id, landed_sha, post_head=attempt.post_head,
+            regenerated_paths=attempt.regenerated_paths,
         ):
             return finish(
                 "blocked",
                 guard.alert or "merged commit could not be verified on the "
                 "default branch",
             )
+        reason = "merged"
+        regenerated_note = ""
+        if attempt.regenerated_paths:
+            # Task #3131: the regenerated content is part of what was merged,
+            # so the recorded merged SHA is the resolution commit itself (the
+            # guard has just verified it differs from the approved merge in
+            # the regenerated generated files only).
+            landed_sha = attempt.post_head
+            files = ",".join(attempt.regenerated_paths)
+            reason = f"merged; regenerated generated file(s) {files}"
+            regenerated_note = f" regenerated={files}"
         _gate_audit_log(
             f"task={task_id} event=merge-succeeded branch={branch} "
             f"merged_sha={landed_sha} "
-            f"default_after={guard.expected_sha}",
+            f"default_after={guard.expected_sha}{regenerated_note}",
             task_id=task_id,
             event="merge-succeeded",
         )
-        return finish("merged", "merged", landed_sha)
+        return finish("merged", reason, landed_sha)
     if not await guard.verify(f"after-failed-merge task={task_id}", task_id=task_id):
         return finish("blocked", guard.alert or "default branch moved")
     reason = attempt.reason or "merge failed"
