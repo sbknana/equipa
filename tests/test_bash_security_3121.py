@@ -396,3 +396,56 @@ class TestFalsePositiveTable:
     )
     def test_heredoc_strip_refuses_non_inert_shapes(self, command: str):
         assert bash_security._strip_inert_heredoc_body(command) is None
+
+
+class TestProcessSubstitutionAndFdDuplication:
+
+    def test_agent_runner_gate_canary_is_still_refused(self):
+        """Drift fence: agent_runner's gate canary must stay refused, or the
+        orchestrator decides the gate is broken and kills on sight. Allowing
+        ``<(sort a)`` must not allow ``<(echo ...)``."""
+        from equipa.agent_runner import _CANARY_COMMAND
+
+        result = check_bash_command(_CANARY_COMMAND)
+        assert not result.safe
+        assert result.check_id == CheckID.COMMAND_SUBSTITUTION
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "diff <(sort a) <(sort b)",
+            "comm -12 <(ls src) <(ls tests)",
+            "diff <(git show HEAD:a.py) a.py",
+            "wc -l <(grep -rn TODO src | sort)",
+        ],
+    )
+    def test_read_only_process_substitution_allowed(self, command: str):
+        result = check_bash_command(command)
+        assert result.safe, f"{command!r}: {result.message}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            f"diff <({PAYLOAD}) b",
+            "diff <(rm -rf /tmp/zz-sentinel) b",
+            "cat <(echo x)",
+            f"diff <(sort $({PAYLOAD})) b",  # dangerous nested substitution
+            "diff <(cat < /etc/shadow) b",  # sensitive redirect inside
+            "tee >(sort) < in.txt",         # >(...) stays blocked
+        ],
+    )
+    def test_other_process_substitution_blocked(self, command: str):
+        assert not check_bash_command(command).safe, command
+
+    @pytest.mark.parametrize(
+        "command",
+        ["echo oops >&2", "echo oops 1>&2", "exec 3<&0", "cmd >&-",
+         "printf 'x\\n' >/dev/stderr"],
+    )
+    def test_fd_duplication_and_std_streams_allowed(self, command: str):
+        result = check_bash_command(command)
+        assert result.safe, f"{command!r}: {result.message}"
+
+    def test_fd_dup_form_to_a_file_still_checked(self):
+        assert not check_bash_command("echo x >&../out.txt").safe
+        assert not check_bash_command("echo x >& /srv/out.txt").safe

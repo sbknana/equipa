@@ -1109,6 +1109,24 @@ def _is_safe_substitution_inner(inner: str) -> bool:
     return True
 
 
+# Constant-text emitters are NOT allowed inside <(...): a here-string
+# (`cmd <<< "text"`) covers that use, and `ls -la <(echo ...)` is the
+# command agent_runner's gate canary (_CANARY_COMMAND) and its guard-rail
+# tests rely on the gate refusing. Changing this set means changing that
+# canary first.
+_PROCESS_SUBSTITUTION_EXCLUDED_BASES: frozenset[str] = frozenset({"echo", "printf"})
+
+
+def _is_safe_process_substitution_inner(inner: str) -> bool:
+    """True if ``<(inner)`` only reads data through read-only commands."""
+    if not _is_safe_substitution_inner(inner):
+        return False
+    return all(
+        _get_base_command(segment) not in _PROCESS_SUBSTITUTION_EXCLUDED_BASES
+        for segment in _split_command_segments(inner.strip())
+    )
+
+
 def _check_command_substitution(unquoted: str) -> BashSecurityResult:
     """Check 8: Backticks and command substitution patterns.
 
@@ -1147,12 +1165,13 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
 
     # <(...) process substitution (sandbox-13): `diff <(sort a) <(sort b)`
     # only reads the output of the inner commands, so it gets the same
-    # read-only allowlist as $(...). >(...) feeds data INTO a command and
-    # stays blocked unconditionally.
+    # read-only allowlist as $(...) (minus constant-text emitters, see
+    # _is_safe_process_substitution_inner). >(...) feeds data INTO a command
+    # and stays blocked unconditionally.
     if "<(" in scrubbed:
         process_inners = _extract_paren_inners(scrubbed, "<")
         if process_inners and all(
-            _is_safe_substitution_inner(inner) for inner in process_inners
+            _is_safe_process_substitution_inner(inner) for inner in process_inners
         ):
             scrubbed = re.sub(r"<\([^()]*\)", "", scrubbed)
 
@@ -1623,8 +1642,12 @@ def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
         r"<\s*\./[\w./-]+",
         r"<\s*[A-Za-z0-9_][\w./-]*",
         r"2\s*>\s*&\s*1",                  # 2>&1
+        # fd duplication/close (>&2, 1>&2, <&0, >&-): no file is opened;
+        # _shell_redirects above skips exactly these forms too.
+        r"[0-9]*[<>]&(?:[0-9]+|-)",
         r"2\s*>\s*/dev/null",              # 2>/dev/null
         r">\s*/dev/null",                  # >/dev/null
+        r">>?\s*/dev/std(?:out|err)\b",    # >/dev/stderr
         r"2\s*>>\s*[\w./-]+\.log",         # 2>>somefile.log
         r">>\s*[\w./-]+\.log",             # >>somefile.log (dev append)
         # > or >> targeting /tmp/...
