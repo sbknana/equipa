@@ -330,8 +330,12 @@ def test_dedup_of_ten_thousand_distinct_lines_is_fast():
 
 
 def test_distinct_line_fixture_has_no_repeated_keys():
+    # Lowercase letters and single spaces only, so no two lines can share a
+    # grouping key and the timing above measures 10k separate groups.
     lines = _probe.distinct_log_lines(10_000)
-    assert len(_deduplicate_log_lines(lines)) == 10_000
+    assert len(set(lines)) == 10_000
+    assert all(line == " ".join(line.lower().split()) for line in lines)
+    assert not any(char.isdigit() for line in lines for char in line)
 
 
 def test_dedup_groups_repeats_and_lines_that_differ_only_in_numbers():
