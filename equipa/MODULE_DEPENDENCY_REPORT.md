@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **47,723 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **47,745 lines** of code across **13 dependency layers** (L0–L12). 33 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -53,7 +53,7 @@ The `equipa/` package contains **60 Python modules** totaling **47,723 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `isolation.py` | 2244 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 65 |
+| `isolation.py` | 2266 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 65 |
 | `mcp_server.py` | 967 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `merge_safety.py` | 293 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 894 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
@@ -75,7 +75,7 @@ The `equipa/` package contains **60 Python modules** totaling **47,723 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 47,723 lines | 880 public exports
+**Total:** 47,745 lines | 880 public exports
 
 ## Modules by Layer
 
