@@ -713,8 +713,12 @@ def build_checkpoint_context(checkpoint_text: str, attempt: int) -> str:
     Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
     BLOCKERS, SUMMARY) instead of passing raw text, preventing context rot.
     """
-    # Compact checkpoint to structured summary (max 200 words)
+    # Compact checkpoint to structured summary (max 200 words). The result is
+    # agent-authored, so it goes in the same escaped wrapper as DB context.
     compacted = compact_agent_output(checkpoint_text, max_words=200)
+    checkpoint_block = _wrap_untrusted_block(
+        "checkpoint", compacted, None, "agent-output"
+    )
 
     return (
         f"## Previous Attempt (#{attempt}) — Continue From Here\n\n"
@@ -726,7 +730,7 @@ def build_checkpoint_context(checkpoint_text: str, attempt: int) -> str:
         f"not Read, not Glob, not Grep. You have the previous agent's summary below. "
         f"Use it to skip exploration entirely and go straight to implementation.\n\n"
         f"### Previous Agent Summary:\n"
-        f"<task-input type=\"checkpoint\" trust=\"agent-output\">\n{compacted}\n</task-input>\n\n"
+        f"{checkpoint_block}\n\n"
         f"**CRITICAL:** Do NOT repeat the previous agent's exploration. Do NOT re-read "
         f"files they already read. Do NOT analyze the codebase from scratch. Look at "
         f"what remains to be done and START CODING in your FIRST turn.\n\n"

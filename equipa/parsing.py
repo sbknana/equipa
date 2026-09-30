@@ -25,6 +25,11 @@ SYSTEM_PROMPT_TOKEN_TARGET: int = 8000   # 8K token target
 SYSTEM_PROMPT_TOKEN_HARD_LIMIT: int = 10000  # absolute max before aggressive trimming
 EPISODE_REDUCTION_THRESHOLD: int = 6000  # reduce episodes from 3->2 above this
 
+# Emitted by compact_agent_output() in place of agent output the sanitizer
+# rejected. Checkpoint and compaction context must never fall back to the raw
+# text (review finding F1 of task 3123).
+AGENT_OUTPUT_WITHHELD: str = "[agent output withheld: failed sanitization]"
+
 
 # --- Token Estimation ---
 
@@ -271,7 +276,10 @@ def compact_agent_output(
     raw_output = "\n".join(deduped_lines)
 
     # Late import to avoid circular dependency — sanitizer may not be available
-    from lesson_sanitizer import sanitize_lesson_content  # HARD dependency — no silent fallback
+    from lesson_sanitizer import (  # HARD dependency — no silent fallback
+        sanitize,
+        sanitize_lesson_content,
+    )
 
     sections = {
         "SUMMARY": _extract_section(raw_output, "SUMMARY"),
@@ -281,10 +289,18 @@ def compact_agent_output(
         "REFLECTION": _extract_section(raw_output, "REFLECTION", max_lines=3),
     }
 
-    # Sanitize all extracted sections to prevent cross-agent prompt injection (PS-02)
-    for key in sections:
-        if sections[key]:
-            sections[key] = sanitize_lesson_content(sections[key])
+    # Sanitize all extracted sections to prevent cross-agent prompt injection
+    # (PS-02). The sanitizer rejects rather than strips, so a rejected section
+    # comes back empty and is recorded here: it must be reported as withheld,
+    # never replaced by the raw text it was extracted from (review F1).
+    rejected: list[str] = []
+    for key, section_text in sections.items():
+        if section_text:
+            sections[key] = sanitize_lesson_content(
+                section_text, label=f"agent output {key}"
+            )
+            if not sections[key]:
+                rejected.append(key)
 
     parts: list[str] = []
     if sections["SUMMARY"]:
@@ -296,12 +312,19 @@ def compact_agent_output(
             parts.append(sections[key])
     if sections["REFLECTION"]:
         parts.append(sections["REFLECTION"])
+    if rejected:
+        parts.append(
+            f"[agent output withheld: {', '.join(rejected)} failed sanitization]"
+        )
 
     compact = "\n".join(parts)
 
     if not compact.strip():
+        # No structured section at all: fall back to the tail of the output,
+        # which is agent-authored too and gets the same reject-mode pass.
         words = raw_output.split()
-        compact = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
+        tail = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
+        compact = sanitize(tail, label="agent output tail") or AGENT_OUTPUT_WITHHELD
 
     words = compact.split()
     if len(words) > max_words:
@@ -824,17 +847,25 @@ def build_compaction_summary(
     Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
     BLOCKERS, SUMMARY) from raw output instead of passing raw tail content.
     Target: ~200 words max to prevent context rot across cycles.
+
+    The summary reaches the next agent's prompt through compaction history,
+    outside any other wrapper, so the agent-authored part is confined to a
+    <task-input> block here and every wrapper token in it is escaped.
     """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
     text = result.get("result_text", "")
     # Compact to 200 words max, preserving file paths and error messages
     compacted = compact_agent_output(text, max_words=200)
 
     summary = (
         f"## Prior Work Summary (Cycle {cycle}, {role})\n"
-        f"Task: #{task['id']} - {task['title']}\n"
+        f"Task: #{task['id']} - {neutralize_boundaries(task['title'])}\n"
         f"Turns used: {result.get('num_turns', '?')}\n"
         f"---\n"
-        f"{compacted}\n"
+        f'<task-input type="compaction-summary" trust="agent-output">\n'
+        f"{neutralize_boundaries(compacted)}\n"
+        f"</task-input>\n"
     )
     return summary
 
