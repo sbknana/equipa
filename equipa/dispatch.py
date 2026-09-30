@@ -62,8 +62,8 @@ from equipa.git_ops import (
     _is_git_repo,
     get_default_branch,
     get_trusted_default_branch,
+    git_run,
     git_run_async,
-    pinned_git_env,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
@@ -682,48 +682,32 @@ def _maybe_record_initiative_completion(
 
 
 def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) -> None:
-    """Stage and commit ``.equipa/initiative-<id>.md`` to the task branch."""
-    import subprocess
-    from pathlib import Path
+    """Stage and commit ``.equipa/initiative-<id>.md`` to the task branch.
 
+    Task #3112 (3108 review): runs the hardened ``git_run``, so the
+    orchestrator's commit runs no repository hook, fsmonitor or driver an
+    agent may have configured in the worktree.
+    """
     plan_rel = f".equipa/initiative-{initiative_id}.md"
     plan_abs = Path(project_dir) / plan_rel
     if not plan_abs.exists():
         return
     try:
-        subprocess.run(
-            ["git", "add", plan_rel],
-            cwd=project_dir,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=pinned_git_env(),
-        )
+        git_run(["add", "--", plan_rel], project_dir)
         # Only commit if there are staged changes for the plan file.
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet", "--", plan_rel],
-            cwd=project_dir,
-            check=False,
-            capture_output=True,
-            env=pinned_git_env(),
-        )
+        diff = git_run(["diff", "--cached", "--quiet", "--", plan_rel], project_dir)
         if diff.returncode == 0:
             return  # nothing to commit
-        subprocess.run(
+        git_run(
             [
-                "git", "commit",
-                "-m",
+                "commit", "-m",
                 f"chore(initiative-{initiative_id}): record task #{task_id} completion",
+                "--", plan_rel,
             ],
-            cwd=project_dir,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=pinned_git_env(),
+            project_dir,
         )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception(
+    except (subprocess.SubprocessError, OSError):
+        logger.exception(
             "Failed to git-commit initiative plan for task=%s", task_id,
         )
 

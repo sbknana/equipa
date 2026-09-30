@@ -581,13 +581,15 @@ def _run_with_env(
     cwd: str | Path,
     timeout: int,
     env: Mapping[str, str] | None = None,
+    *,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
     """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only.
 
     ``env`` replaces the default :func:`_get_repo_env` environment when given.
     """
     return subprocess.run(
-        args_list, capture_output=True, text=True,
+        args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
         env=dict(env) if env is not None else _get_repo_env(),
     )
@@ -598,6 +600,8 @@ def git_run(
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
     env: Mapping[str, str] | None = None,
+    *,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run a hardened git command with standard env (Windows PATH fix) and timeout.
 
@@ -611,10 +615,13 @@ def git_run(
 
     ``env`` holds extra variables layered over the process environment; the
     hardening variables are applied last and cannot be overridden.
+    ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
     """
     run_env = _hardened_git_env(env)
-    return _run_with_env(_hardened_git_argv(args, run_env), cwd, timeout, run_env)
+    return _run_with_env(
+        _hardened_git_argv(args, run_env), cwd, timeout, run_env, text=text,
+    )
 
 
 async def git_run_async(

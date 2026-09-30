@@ -43,7 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from equipa.git_ops import pinned_git_env
+from equipa.git_ops import git_run
 
 logger = logging.getLogger(__name__)
 
@@ -146,30 +146,19 @@ def _git_diff_files(repo_path: Path) -> list[str]:
     """
     try:
         # Prefer the diff against the merge-base of master/main if one exists.
+        # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
         for base in ("master", "main", "HEAD~1"):
             try:
-                out = subprocess.run(
-                    ["git", "diff", "--name-only", f"{base}...HEAD"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    env=pinned_git_env(),
-                    check=False,
+                out = git_run(
+                    ["diff", "--name-only", f"{base}...HEAD"], repo_path, timeout=10,
                 )
                 if out.returncode == 0 and out.stdout.strip():
                     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
             except (subprocess.SubprocessError, OSError):
                 continue
         # Fallback: untracked + modified working-tree files.
-        out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=pinned_git_env(),
-            check=False,
+        out = git_run(
+            ["status", "--porcelain", "--ignore-submodules=all"], repo_path, timeout=10,
         )
         if out.returncode != 0:
             return []

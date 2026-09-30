@@ -1130,16 +1130,15 @@ def _run_git(repo_path: str, args: list[str]) -> str:
     """
     import subprocess
 
-    from equipa.git_ops import pinned_git_env
+    # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
+    from equipa.git_ops import git_run
 
-    completed = subprocess.run(
-        ["git", "-C", repo_path, *args],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-        env=pinned_git_env(),
-    )
+    completed = git_run(list(args), repo_path, timeout=30)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, completed.args,
+            output=completed.stdout, stderr=completed.stderr,
+        )
     return completed.stdout.strip()
 
 
