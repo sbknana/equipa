@@ -2849,6 +2849,148 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Quoted-delimiter heredoc into a non-shell consumer (task 3121, sandbox-13)
+# ---------------------------------------------------------------------------
+
+# Commands whose heredoc body is data or a program in their OWN language
+# (``python3 - <<'EOF'``), never shell code. Shells, eval/source, xargs and
+# writers other than ``cat`` are deliberately absent: a heredoc into
+# sh/bash IS shell code and keeps full scrutiny (check 7 blocks it).
+_INERT_HEREDOC_CONSUMERS: frozenset[str] = frozenset([
+    "cat", "python", "py", "perl", "ruby", "node", "nodejs",
+    "gh", "wc", "sort", "head", "tail", "grep",
+])
+
+_HEREDOC_OPENER_RE = re.compile(
+    r"<<(?P<dash>-?)[ \t]*"
+    r"(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"
+    r'|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)"'
+    r"|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+# All that may follow the opener on its line: plain output redirections to
+# literal words. Their targets are validated by check 10 afterwards.
+_HEREDOC_OPENER_LINE_REST_RE = re.compile(
+    r"(?:[ \t]*[0-9]?>>?[ \t]*[\w./-]+)*[ \t]*"
+)
+_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-s", "-k", "--signal", "--kill-after"})
+
+
+def _heredoc_consumer(segment: str) -> str:
+    """Return the normalised command name that receives a heredoc.
+
+    Strips a path (``.venv/bin/python3``), folds ``python3.12`` to
+    ``python`` and looks through a leading ``timeout [opts] DURATION``.
+    Returns ``""`` when the command word cannot be determined.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return ""
+    index = 0
+    if tokens and tokens[0] == "timeout":
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            if tokens[index] in _TIMEOUT_OPTIONS_WITH_VALUE:
+                index += 1
+            index += 1
+        index += 1  # the duration
+    if index >= len(tokens):
+        return ""
+    name = tokens[index].rsplit("/", 1)[-1]
+    if re.fullmatch(r"python[0-9.]*", name):
+        return "python"
+    return name
+
+
+def _strip_inert_heredoc_body(command: str) -> str | None:
+    """Remove the body of an inert quoted-delimiter heredoc; None if not one.
+
+    Recognises ``<consumer> ... <<'DELIM' [> file]`` on the first line,
+    followed by a literal body and a ``DELIM`` line, where the consumer is in
+    ``_INERT_HEREDOC_CONSUMERS``. A quoted (or backslash-escaped) delimiter
+    stops the shell from expanding anything in the body, so the body cannot
+    run shell code or redirect files; for these consumers it is data or
+    their own-language program - the same thing ``python3 -c '...'`` passes
+    as an argument. Checks 7/9/22/23 used to fire on ordinary body text
+    (newlines, ``<``, ``#``), which left ``python3 - <<'EOF'`` with no
+    permitted form.
+
+    Returns the command with ONLY the body and terminator line removed.
+    The opener line is returned for normal checking, and anything after the
+    terminator is kept (on its own line, so check 7 still blocks it).
+    Returns None - the command is checked unchanged - when the delimiter is
+    unquoted (the body is expanded), the consumer is a shell or unknown,
+    the first line holds more than one heredoc, a substitution, an open
+    quote or anything but redirections after the opener, or the terminator
+    is missing.
+    """
+    first_newline = command.find("\n")
+    if first_newline < 0 or "<<" not in command[:first_newline]:
+        return None
+    line = command[:first_newline]
+
+    # Shell-level scan of the opener line.
+    opener_positions: list[int] = []
+    in_single = in_double = False
+    index = 0
+    while index < len(line):
+        ch = line[index]
+        if ch == "\\" and not in_single:
+            index += 2
+            continue
+        if in_single:
+            in_single = ch != "'"
+        elif in_double:
+            if ch in "$`":
+                return None
+            in_double = ch != '"'
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "`" or line.startswith("$(", index) or line.startswith(
+            "<(", index
+        ) or line.startswith(">(", index):
+            return None
+        elif line.startswith("<<<", index):
+            index += 3
+            continue
+        elif line.startswith("<<", index):
+            opener_positions.append(index)
+            index += 2
+            continue
+        index += 1
+    if in_single or in_double or len(opener_positions) != 1:
+        return None
+
+    opener_pos = opener_positions[0]
+    opener = _HEREDOC_OPENER_RE.match(line, opener_pos)
+    if opener is None or opener.group("bare"):
+        return None
+    following = line[opener.end():opener.end() + 1]
+    if following and (following.isalnum() or following in "_'\"\\"):
+        return None  # <<'E'OF style: the real delimiter differs from ours
+    if not _HEREDOC_OPENER_LINE_REST_RE.fullmatch(line[opener.end():]):
+        return None
+
+    prefix = line[:opener_pos]
+    consumer = _heredoc_consumer(prefix[_last_segment_start(prefix):])
+    if consumer not in _INERT_HEREDOC_CONSUMERS:
+        return None
+
+    delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
+    leading_tabs = r"\t*" if opener.group("dash") else ""
+    terminator = re.compile(
+        rf"^{leading_tabs}{re.escape(delim)}$", re.MULTILINE
+    ).search(command, first_newline + 1)
+    if terminator is None:
+        return None
+    after = command[terminator.end():]
+    return line + after if after.strip() else line
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -2887,6 +3029,10 @@ def check_bash_command(command: str) -> BashSecurityResult:
     # the real git command line. Prevents checks 7/9/10/21/23 from
     # false-positiving on ordinary prose in the commit body (task 2468).
     sanitized = _benign_git_heredoc_sanitized(command)
+    if sanitized is None:
+        # Same idea for `python3 - <<'EOF'`, `cat > f <<'EOF'` and other
+        # non-shell consumers of a quoted-delimiter heredoc (sandbox-13).
+        sanitized = _strip_inert_heredoc_body(command)
     if sanitized is not None:
         command = sanitized
 
