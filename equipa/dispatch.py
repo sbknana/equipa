@@ -93,7 +93,7 @@ from equipa.loops import (
     run_quality_scoring,
     run_security_review,
 )
-from equipa.manager import run_manager_loop
+from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.parsing import _extract_section
 from equipa.output import (
     log,
@@ -1092,6 +1092,7 @@ async def run_project_tasks(
             "tasks_blocked": [],
             "tasks_skipped": len(tasks),
             "error": "No directory mapped",
+            "refusals": ["no directory mapped for the project"],
             "total_cost": 0.0,
             "total_duration": 0.0,
         }
@@ -1119,6 +1120,7 @@ async def run_project_tasks(
             "tasks_blocked": [],
             "tasks_skipped": len(tasks),
             "error": "Directory does not exist",
+            "refusals": [f"project directory does not exist: {project_dir}"],
             "total_cost": 0.0,
             "total_duration": 0.0,
         }
@@ -1127,6 +1129,7 @@ async def run_project_tasks(
 
     completed = []
     blocked = []
+    refusals: list[str] = []
     total_cost = 0.0
     total_duration = 0.0
 
@@ -1164,6 +1167,7 @@ async def run_project_tasks(
                 "tasks_blocked": [],
                 "tasks_skipped": len(tasks),
                 "error": f"default branch could not be pinned: {exc}",
+                "refusals": [f"default branch could not be pinned: {exc}"],
                 "total_cost": 0.0,
                 "total_duration": 0.0,
             }
@@ -1219,6 +1223,14 @@ async def run_project_tasks(
                 # Never started: the task and the rest of the queue stay todo.
                 log(f"  [{codename}] {isolated.reason}; not starting further tasks.", output)
                 break
+            if isolated.agent_outcome is None:
+                # Refused before any agent ran: recorded blocked, no agent
+                # telemetry, and the CLI exits with EXIT_DISPATCH_REFUSED.
+                update_task_status(task_id, isolated.outcome, output=output)
+                refusals.append(f"task #{task_id} {isolated.outcome}: {isolated.reason}")
+                blocked.append(task)
+                log(f"  [{codename}] Task #{task_id}: REFUSED ({isolated.reason})", output)
+                continue
             result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
             merged_sha = isolated.merged_sha
             task = loop_totals.get("task", task)
@@ -1289,6 +1301,7 @@ async def run_project_tasks(
         "tasks_blocked": blocked,
         "tasks_skipped": 0,
         "error": None,
+        "refusals": refusals,
         "total_cost": total_cost,
         "total_duration": total_duration,
     }
@@ -1342,10 +1355,12 @@ async def run_project_dispatch(
     return result
 
 
-async def run_auto_dispatch(scored: list[dict], config: dict, args) -> None:
+async def run_auto_dispatch(scored: list[dict], config: dict, args) -> list:
     """Run all project dispatches concurrently with semaphore.
 
     Prints each project's buffered output as it completes, then summary.
+    Returns the per-project results; their ``refusals`` feed
+    :func:`collect_refusals`.
     """
     max_concurrent = config.get("max_concurrent", 4)
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -1376,6 +1391,7 @@ async def run_auto_dispatch(scored: list[dict], config: dict, args) -> None:
 
     # Print combined summary
     print_dispatch_summary(results)
+    return results
 
 
 # --- Goals ---
@@ -1555,6 +1571,9 @@ async def run_single_goal(
         "project_name": project_name,
         "project_id": project_id,
         "outcome": outcome,
+        "refusals": (
+            [f"goal stopped: {outcome}"] if outcome in GOAL_REFUSED_OUTCOMES else []
+        ),
         "rounds": rounds,
         "completed": completed,
         "blocked": blocked,
@@ -1564,10 +1583,12 @@ async def run_single_goal(
     }
 
 
-async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -> None:
+async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -> list:
     """Run multiple Manager loops concurrently with a semaphore.
 
-    Prints each goal's buffered output as it completes, then a combined summary.
+    Prints each goal's buffered output as it completes, then a combined
+    summary. Returns the per-goal results (an exception for a goal that
+    raised); their ``refusals`` feed :func:`collect_refusals`.
     """
     max_concurrent = args.max_concurrent or defaults["max_concurrent"]
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -1599,6 +1620,7 @@ async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -
 
     # Print combined summary
     print_parallel_summary(results)
+    return results
 
 
 # --- Parallel Tasks ---
@@ -3495,6 +3517,24 @@ def refuse_dispatch(message: str) -> NoReturn:
     """Print ``ERROR: message`` and raise :class:`DispatchRefused`."""
     print(f"ERROR: {message}")
     raise DispatchRefused(message)
+
+
+def collect_refusals(results: list) -> list[str]:
+    """Every refusal recorded in ``--auto-run`` or ``--parallel-goals`` results.
+
+    3112 review (task #3119): a project or goal refused inside a
+    multi-project run (unmapped directory, unpinnable default branch, a task
+    refused its worktree, a goal stopped because the default branch moved)
+    used to leave the process exiting 0. Each entry is prefixed with its
+    project so the CLI can name it when it exits non-zero.
+    """
+    refusals: list[str] = []
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("codename") or entry.get("project_name") or "?"
+        refusals.extend(f"{label}: {reason}" for reason in entry.get("refusals") or ())
+    return refusals
 
 
 def resolve_max_concurrent(args) -> int:

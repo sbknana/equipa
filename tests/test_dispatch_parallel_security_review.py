@@ -347,6 +347,12 @@ def _pretend_git_repo():
     """
     with patch("equipa.dispatch._is_git_repo", return_value=True), \
             patch(
+                # Task #3119: the project is the root of its (pretend) repo,
+                # so agents run at the root of each fake worktree.
+                "equipa.dispatch.git_toplevel",
+                side_effect=lambda project_dir: Path(project_dir),
+            ), \
+            patch(
                 "equipa.dispatch.DefaultBranchGuard.snapshot",
                 new=AsyncMock(side_effect=lambda *_a, **_k: _FakeMergeGuard()),
             ), \

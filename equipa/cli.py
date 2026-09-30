@@ -66,6 +66,7 @@ from equipa.dispatch import (
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
+    collect_refusals,
     is_feature_enabled,
     load_dispatch_config,
     load_goals_file,
@@ -95,7 +96,7 @@ from equipa.loops import (
     run_quality_scoring,
     run_security_review,
 )
-from equipa.manager import run_manager_loop
+from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.mcp_server import run_server
 from equipa.monitoring import calculate_dynamic_budget
 from equipa.output import (
@@ -1178,7 +1179,16 @@ async def run_mode_auto_run(args: argparse.Namespace) -> None:
             return
 
     # Dispatch
-    await run_auto_dispatch(work, dispatch_config, args)
+    _refuse_if_any_refused(await run_auto_dispatch(work, dispatch_config, args))
+
+
+def _refuse_if_any_refused(results: list) -> None:
+    """Exit with EXIT_DISPATCH_REFUSED when a project or goal was refused."""
+    refusals = collect_refusals(results)
+    if refusals:
+        refuse_dispatch(
+            f"{len(refusals)} refusal(s) in this run: " + "; ".join(refusals)
+        )
 
 
 async def run_mode_parallel_goals(args: argparse.Namespace) -> None:
@@ -1225,7 +1235,7 @@ async def run_mode_parallel_goals(args: argparse.Namespace) -> None:
             print("Aborted.")
             return
 
-    await run_parallel_goals(resolved_goals, defaults, args)
+    _refuse_if_any_refused(await run_parallel_goals(resolved_goals, defaults, args))
 
 
 async def run_mode_goal(args: argparse.Namespace) -> None:
@@ -1289,6 +1299,9 @@ async def run_mode_goal(args: argparse.Namespace) -> None:
     )
 
     print_manager_summary(args.goal, outcome, rounds, completed, blocked, cost, duration)
+    if outcome in GOAL_REFUSED_OUTCOMES:
+        # 3112 review (task #3119): a refused goal used to exit 0.
+        refuse_dispatch(f"goal stopped: {outcome}")
 
 
 async def run_mode_tasks(args: argparse.Namespace) -> None:

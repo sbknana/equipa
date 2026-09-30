@@ -37,6 +37,42 @@ from equipa.tasks import _get_task_status, fetch_tasks_by_ids
 
 logger = logging.getLogger(__name__)
 
+# dispatch-07 (task #3119): the planner and evaluator run in the project's
+# MAIN checkout, where a commit lands straight on the default branch. They
+# only read the project and create tasks through TheForge's MCP tools, so
+# their built-in tools are limited to this read-only allowlist (``--tools``):
+# no Write, Edit, NotebookEdit or Bash, hence nothing to commit with.
+GOAL_AGENT_READ_ONLY_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
+# Goal outcomes that mean the dispatch was refused rather than run to an
+# end: the default branch moved outside the gated merge or could not be
+# pinned, or a task was refused its isolation worktree. The CLI exits with
+# EXIT_DISPATCH_REFUSED for these (3112 review, task #3119).
+GOAL_REFUSED_OUTCOMES: frozenset[str] = frozenset({
+    "merge_integrity_failed",
+    "worktree_refused",
+})
+
+
+def restrict_to_read_only_tools(cmd: list[str]) -> list[str]:
+    """``cmd`` with the agent's built-in tools limited to the read-only set.
+
+    ``--tools`` is an allowlist of built-in tools, so a tool added to the
+    CLI later is excluded too; MCP tools (TheForge) stay available.
+    """
+    if "--tools" in cmd:
+        raise ValueError("agent command already selects its tools (--tools)")
+    return [*cmd, "--tools", ",".join(GOAL_AGENT_READ_ONLY_TOOLS)]
+
+
+def _read_only_notice(project_dir: str) -> str:
+    """Tell a goal agent up front that it cannot change the checkout."""
+    return (
+        f"Project dir: {project_dir}. You are read-only: your only built-in "
+        f"tools are {', '.join(GOAL_AGENT_READ_ONLY_TOOLS)} (TheForge MCP tools "
+        f"are available). Do not try to edit files, run commands or commit."
+    )
+
 
 def parse_planner_output(result_text: str) -> list[int]:
     """Extract TASKS_CREATED list from Planner agent output.
@@ -157,11 +193,12 @@ async def run_planner_agent(
         get_role_turns("planner", args),
         args.model,
         role="planner",
-        prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
+        prompt_message=f"Break this goal into tasks. {_read_only_notice(project_dir)}",
     ) as cmd:
-        log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars, "
+            f"read-only tools)...", output)
         run_started_at = _run_started_at_utc()
-        result = await run_agent(cmd)
+        result = await run_agent(restrict_to_read_only_tools(cmd))
 
     if is_overloaded_result(result):
         log("  [Planner] Agent FAILED: model overloaded (529) through every "
@@ -220,11 +257,12 @@ async def run_evaluator_agent(
         args.model,
         role="evaluator",
         prompt_message=(
-            f"Evaluate whether this goal is complete. Project dir: {project_dir}"
+            f"Evaluate whether this goal is complete. {_read_only_notice(project_dir)}"
         ),
     ) as cmd:
-        log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
-        result = await run_agent(cmd)
+        log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars, "
+            f"read-only tools)...", output)
+        result = await run_agent(restrict_to_read_only_tools(cmd))
 
     if is_overloaded_result(result):
         # Never parse an overloaded run: it did no evaluation (#2994 S1).
@@ -277,9 +315,10 @@ async def run_manager_loop(
     # dispatch-07 (task #3112): in a git project each task runs in its own
     # worktree and reaches the default branch only through the gated merge
     # (equipa.dispatch.run_task_in_isolation). The planner and evaluator
-    # still run in the project checkout, so the goal's guard is verified
-    # after each of them: if either moved the default branch, the goal stops
-    # and nothing further is merged.
+    # run in the project checkout with read-only tools (task #3119), and the
+    # goal's guard is still verified after each of them: if the default
+    # branch moved anyway, the goal stops, nothing further is merged and the
+    # CLI exits non-zero (GOAL_REFUSED_OUTCOMES).
     goal_guard: DefaultBranchGuard | None = None
     if _is_git_repo(project_dir):
         # Imported here: equipa.dispatch imports this module.
@@ -376,6 +415,23 @@ async def run_manager_loop(
                 update_task_status(
                     task["id"], outcome, output=output, merged_sha=isolated.merged_sha,
                 )
+                if isolated.agent_outcome is None or goal_guard.tripped:
+                    # Refused before any agent ran (stale branch, leftover
+                    # worktree), or the default branch moved outside the
+                    # gated merge: the operator has to look, so the goal
+                    # stops here instead of paying for more agents.
+                    goal_outcome = (
+                        "merge_integrity_failed" if goal_guard.tripped else outcome
+                    )
+                    log(f"\n  [Manager] Task #{task['id']} {outcome}: "
+                        f"{isolated.reason or goal_guard.alert}. Stopping the goal.",
+                        output)
+                    all_completed.extend(round_completed)
+                    all_blocked.extend([*round_blocked, task])
+                    return (
+                        goal_outcome, round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
             else:
                 # Not a git repo: there are no branches to protect.
                 result, cycles, outcome = await run_dev_test_loop(
