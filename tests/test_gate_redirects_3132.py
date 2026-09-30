@@ -113,6 +113,9 @@ def _set_core_worktree(real: Path, other: Path, scope: str, tmp_path: Path) -> N
 def test_core_worktree_does_not_move_the_gate_or_the_merge_to_another_repo(
     tmp_path: Path, capsys: pytest.CaptureFixture, scope: str,
 ) -> None:
+    """``include``: git does not follow an included ``core.worktree`` when it
+    discovers the work tree, so that case never pivoted; it pins that the
+    scan still refuses the key (it passed before the fix too)."""
     real, other = _redirect_pair(tmp_path)
     real_master, other_master = _master(real), _master(other)
     _set_core_worktree(real, other, scope, tmp_path)
@@ -311,13 +314,14 @@ def test_hidden_submodule_bump_is_not_merged_unreviewed(
 
 
 def test_submodule_pointer_with_a_doc_name_is_never_doc_only(tmp_path: Path) -> None:
-    repo = _submodule_repo(tmp_path, "none", link_path="NOTES.md")
+    """``docs/notes.md`` is a doc path by name; as a gitlink it pulls in code."""
+    repo = _submodule_repo(tmp_path, "none", link_path="docs/notes.md")
 
     changed = _run(get_changed_files_for_branch(
         str(repo), base_ref="master", head_ref=TASK_BRANCH,
     ))
 
-    assert "NOTES.md" in changed
+    assert sorted(changed) == ["README.md", "docs/notes.md"]
     assert not is_doc_only_diff(changed)
 
 
