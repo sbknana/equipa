@@ -19,6 +19,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -195,3 +196,72 @@ def test_shipped_example_equipa_server_is_isolated():
     assert Path(server["command"]).is_absolute()
     assert "-P" in server["args"] or "-I" in server["args"]
     assert Path(server["cwd"]).is_absolute()
+
+
+# --- The equipa MCP server's own dispatch child ------------------------------
+#
+# The Claude CLI starts every stdio MCP server in its own working directory
+# (the project) and ignores a per-server "cwd" key, so the server itself runs
+# with the project as its cwd. Its equipa_dispatch then starts
+# ``python -m equipa.cli``, and -m puts THAT process's cwd first on sys.path:
+# without an explicit cwd, the dispatch child would run a planted
+# ``<project>/equipa/cli.py`` holding EQUIPA_MCP_TOKEN.
+
+PLANTED_CLI_MARKER = "PLANTED-3127-equipa-cli"
+
+
+def _resolve_module_origin(module: str, cwd: str | None) -> str:
+    """Where ``python -m <module>`` started in ``cwd`` would load it from.
+
+    ``-c`` puts the cwd first on sys.path exactly as ``-m`` does, so the
+    spec origin printed here is the file ``-m`` would run.
+    """
+    probe = ("import importlib.util, sys; "
+             f"print(importlib.util.find_spec({module!r}).origin)")
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], cwd=cwd, capture_output=True,
+        text=True, timeout=60, env={"PATH": "/usr/bin:/bin"}, check=True)
+    return completed.stdout.strip()
+
+
+def test_mcp_dispatch_child_resolves_equipa_cli_from_the_trusted_checkout(
+        tmp_path, monkeypatch):
+    from equipa import mcp_server as srv
+
+    project = tmp_path / "project"
+    (project / "equipa").mkdir(parents=True)
+    (project / "equipa" / "__init__.py").write_text("", encoding="utf-8")
+    (project / "equipa" / "cli.py").write_text(
+        f"print({PLANTED_CLI_MARKER!r})\n", encoding="utf-8")
+    # The MCP server runs where the agent CLI runs: in the project.
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("EQUIPA_MCP_TOKEN", FAKE_TOKEN)
+    monkeypatch.setattr(srv, "_DISPATCH_BUCKET", srv._TokenBucket(
+        srv.DISPATCH_RATE_CAPACITY, srv.DISPATCH_RATE_REFILL_SECONDS))
+    monkeypatch.setattr(srv, "_dispatch_cost_cap_usd", lambda: None)
+    spawned: list[tuple[list[str], dict]] = []
+
+    class _FakeProc:
+        pid = 0
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append((list(cmd), kwargs))
+        return _FakeProc()
+
+    # Only the server's view of subprocess is faked; the resolver below
+    # still spawns real interpreters.
+    monkeypatch.setattr(srv, "subprocess", types.SimpleNamespace(
+        Popen=fake_popen, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL))
+
+    result = srv._handle_equipa_dispatch(
+        {"auth_token": FAKE_TOKEN, "task_id": 1, "role": "developer"})
+
+    assert result.get("status") == "spawned", result
+    [(cmd, kwargs)] = spawned
+    assert cmd[1:3] == ["-m", "equipa.cli"]
+    child_cwd = kwargs.get("cwd")
+    # The hazard is real: resolved from the project, -m finds the plant.
+    assert _resolve_module_origin("equipa.cli", str(project)) == str(
+        project / "equipa" / "cli.py")
+    origin = _resolve_module_origin("equipa.cli", child_cwd)
+    assert origin == str(REPO_ROOT / "equipa" / "cli.py")
