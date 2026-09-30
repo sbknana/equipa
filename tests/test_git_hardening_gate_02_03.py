@@ -263,6 +263,34 @@ def _case_diff_external(repo: Path, script: Path) -> list[str]:
     return ["diff"]
 
 
+def _plant_diff_driver(repo: Path, key: str, script: Path) -> None:
+    """Route README.md through an agent-defined diff driver via .gitattributes."""
+    (repo / ".gitattributes").write_text("*.md diff=agent\n", encoding="utf-8")
+    _git(repo, "config", f"diff.agent.{key}", str(script))
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+
+
+def _case_diff_driver_command(repo: Path, script: Path) -> list[str]:
+    _plant_diff_driver(repo, "command", script)
+    return ["diff"]
+
+
+def _case_diff_textconv(repo: Path, script: Path) -> list[str]:
+    _plant_diff_driver(repo, "textconv", script)
+    return ["diff", "HEAD"]
+
+
+def _case_log_textconv(repo: Path, script: Path) -> list[str]:
+    _plant_diff_driver(repo, "textconv", script)
+    # A leading -c pair must not hide the subcommand from the hardening.
+    return ["-c", "log.showSignature=false", "log", "-p", "-1"]
+
+
+def _case_show_textconv(repo: Path, script: Path) -> list[str]:
+    _plant_diff_driver(repo, "textconv", script)
+    return ["show", "HEAD"]
+
+
 def _case_editor(repo: Path, script: Path) -> list[str]:
     _git(repo, "config", "core.editor", str(script))
     return ["commit", "--allow-empty"]
@@ -282,6 +310,10 @@ def _case_ext_transport(repo: Path, script: Path) -> list[str]:
 _CONFIG_EXEC_CASES = {
     "core.fsmonitor": _case_fsmonitor,
     "diff.external": _case_diff_external,
+    "diff.<driver>.command": _case_diff_driver_command,
+    "diff.<driver>.textconv": _case_diff_textconv,
+    "diff.<driver>.textconv via log -p": _case_log_textconv,
+    "diff.<driver>.textconv via show": _case_show_textconv,
     "core.editor": _case_editor,
     "commit.gpgSign+gpg.program": _case_commit_signing,
     "protocol.ext.allow": _case_ext_transport,

@@ -12,12 +12,15 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from equipa.constants import (
     GIT_DEFAULT_TIMEOUT,
@@ -25,6 +28,7 @@ from equipa.constants import (
     GITHUB_OWNER,
     PROJECT_DIRS,
 )
+from equipa.role_resolver import _GIT_SAFE_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +411,140 @@ def detect_project_language(project_dir: str | Path) -> dict:
     }
 
 
+# --- Hardened git invocation (gate-02, gate-03) -------------------------------
+#
+# Agent worktrees share the repository's common git dir, so ``.git/config``,
+# hook directories and ``refs/replace/*`` are all agent-writable. Every git
+# subprocess started by this module therefore:
+#
+# * runs with GIT_NO_REPLACE_OBJECTS=1, so a replace ref cannot make a code
+#   commit read as a README-only change to the gate diff, or make a merge use
+#   a tree other than the commit's real one (gate-02);
+# * pins, with ``-c``, every config key whose value is a program git may run.
+#   Command-line config outranks system, global, repo and worktree config, so
+#   agent-written repo config cannot run code inside the orchestrator's
+#   checkout/merge/rebase/stash/diff (gate-03);
+# * passes ``--no-pager``, and ``--no-ext-diff --no-textconv`` to the
+#   diff-family subcommands.
+#
+# Programs named by the orchestrator's OWN environment (GIT_SSH_COMMAND,
+# GIT_EDITOR, GIT_ASKPASS, ...) still outrank these pins. That environment is
+# operator-controlled, not agent-writable.
+#
+# Residual, not neutralisable by a fixed argument list, because the driver
+# name is chosen by agent-writable .gitattributes / info/attributes:
+# filter.<driver>.clean/smudge/process and merge.<driver>.driver (both run
+# during checkout/merge/rebase/stash), plus diff.<driver>.textconv for
+# subcommands outside _DIFF_DRIVER_SUBCOMMANDS (blame, grep, cat-file,
+# none of which EQUIPA calls). Reached by network operations only:
+# credential.helper (an empty -c value would also discard the operator's
+# global helper), core.gitProxy (the first matching value wins, so a -c value
+# cannot override repo config) and remote.<name>.uploadpack/receivepack/vcs.
+
+_GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
+    # A non-directory, so no hook can be found under it. role_resolver's
+    # _GIT_SAFE_CONFIG sets an empty value; this later -c supersedes it.
+    ("core.hooksPath", "/dev/null"),
+    ("core.pager", "cat"),
+    # ":" is git's own "no editor" value: nothing is launched.
+    ("core.editor", ":"),
+    ("sequence.editor", ":"),
+    ("protocol.ext.allow", "never"),
+    # Signing stays off, so gpg.ssh.defaultKeyCommand is never reached, and
+    # signature verification (log.showSignature, merge.verifySignatures) can
+    # only run the stock programs.
+    ("commit.gpgSign", "false"),
+    ("tag.gpgSign", "false"),
+    ("gpg.program", "gpg"),
+    ("gpg.openpgp.program", "gpg"),
+    ("gpg.x509.program", "gpgsm"),
+    ("gpg.ssh.program", "ssh-keygen"),
+)
+
+GIT_HARDENING_ARGS: tuple[str, ...] = (
+    "--no-pager",
+    *_GIT_SAFE_CONFIG,
+    *(
+        flag
+        for key, value in _GIT_PROGRAM_CONFIG_PINS
+        for flag in ("-c", f"{key}={value}")
+    ),
+)
+
+GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType(
+    {"GIT_NO_REPLACE_OBJECTS": "1"}
+)
+
+# diff.external cannot be cleared with -c: git runs an empty value as a
+# command and every patch diff dies. Diff drivers are switched off per
+# subcommand instead. --no-ext-diff covers diff.external and
+# diff.<driver>.command; --no-textconv covers diff.<driver>.textconv, which
+# could also show the security reviewer a converted view that hides code.
+_DIFF_DRIVER_SUBCOMMANDS = frozenset({"diff", "log", "show"})
+_DIFF_DRIVER_OFF_ARGS: tuple[str, ...] = ("--no-ext-diff", "--no-textconv")
+
+# git global options whose value is the NEXT token (``-c k=v``, ``-C dir``).
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({
+    "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env",
+    "--attr-source", "--super-prefix",
+})
+
+
+def _operator_program_pins(env: Mapping[str, str]) -> tuple[str, ...]:
+    """``-c`` pins for programs whose operator fallback lives in ``env``.
+
+    git ranks ``core.sshCommand`` above ``GIT_SSH`` and ``core.askPass`` above
+    ``SSH_ASKPASS``. Pinning either to a constant would silently discard the
+    operator's choice, so each pin carries the operator's value instead.
+    """
+    operator_ssh = env.get("GIT_SSH")
+    ssh_command = shlex.quote(operator_ssh) if operator_ssh else "ssh"
+    ask_pass = env.get("SSH_ASKPASS", "")
+    return (
+        "-c", f"core.sshCommand={ssh_command}",
+        "-c", f"core.askPass={ask_pass}",
+    )
+
+
+def _hardened_git_env(extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Process env, then the caller's ``extra_env``, then the hardening.
+
+    The hardening is applied last so no caller can switch it back off.
+    """
+    env = _get_repo_env()
+    if extra_env:
+        env.update(extra_env)
+    env.update(GIT_HARDENING_ENV)
+    return env
+
+
+def _git_subcommand_index(args: Sequence[str]) -> int | None:
+    """Index of the subcommand in ``args``, past any leading global options."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            return index
+    return None
+
+
+def _hardened_git_argv(args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+    """Full argv for ``git <args>`` with the hardening flags in front.
+
+    Diff-family subcommands also get ``_DIFF_DRIVER_OFF_ARGS`` directly after
+    the subcommand name, ahead of any ``--`` the caller passes.
+    """
+    command = list(args)
+    subcommand = _git_subcommand_index(command)
+    if subcommand is not None and command[subcommand] in _DIFF_DRIVER_SUBCOMMANDS:
+        command[subcommand + 1:subcommand + 1] = _DIFF_DRIVER_OFF_ARGS
+    return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *command]
+
+
 def _get_repo_env() -> dict[str, str]:
     """Build an environment dict with git and gh on the PATH."""
     env = os.environ.copy()
@@ -426,11 +564,16 @@ def _run_with_env(
     args_list: list[str],
     cwd: str | Path,
     timeout: int,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only."""
+    """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only.
+
+    ``env`` replaces the default :func:`_get_repo_env` environment when given.
+    """
     return subprocess.run(
         args_list, capture_output=True, text=True,
-        cwd=str(cwd), timeout=timeout, env=_get_repo_env(),
+        cwd=str(cwd), timeout=timeout,
+        env=dict(env) if env is not None else _get_repo_env(),
     )
 
 
@@ -438,22 +581,31 @@ def git_run(
     args: list[str],
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run a git command with standard env (Windows PATH fix) and timeout.
+    """Run a hardened git command with standard env (Windows PATH fix) and timeout.
 
     The "git" prefix is added automatically — pass only the subcommand and
     its arguments, e.g. ``git_run(["status", "--porcelain"], cwd=repo)``.
 
     This is the single supported entry point for every git invocation in
-    EQUIPA. It guarantees consistent timeout handling and PATH resolution.
+    EQUIPA. It guarantees consistent timeout handling, PATH resolution and
+    the gate-02/gate-03 hardening: replace refs are ignored and no hook or
+    program named in repo config can run (see ``GIT_HARDENING_ARGS``).
+
+    ``env`` holds extra variables layered over the process environment; the
+    hardening variables are applied last and cannot be overridden.
+    ``CompletedProcess.args`` is the full argv that actually ran.
     """
-    return _run_with_env(["git", *args], cwd, timeout)
+    run_env = _hardened_git_env(env)
+    return _run_with_env(_hardened_git_argv(args, run_env), cwd, timeout, run_env)
 
 
 async def git_run_async(
     args: list[str],
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Async equivalent of ``git_run`` — does NOT block the event loop.
 
@@ -461,15 +613,18 @@ async def git_run_async(
     async function (dispatch loops, dev-test loop) can issue git commands
     without serialising the loop. Returns a ``subprocess.CompletedProcess``
     with the same ``returncode``, ``stdout``, and ``stderr`` shape as
-    ``git_run`` so call sites can be migrated incrementally.
+    ``git_run`` so call sites can be migrated incrementally. Applies the
+    same hardening and ``env`` merging as ``git_run``.
 
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
+    run_env = _hardened_git_env(env)
+    argv = _hardened_git_argv(args, run_env)
     proc = await asyncio.create_subprocess_exec(
-        "git", *args,
+        *argv,
         cwd=str(cwd),
-        env=_get_repo_env(),
+        env=run_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -483,9 +638,9 @@ async def git_run_async(
             await proc.wait()
         except ProcessLookupError:
             pass
-        raise subprocess.TimeoutExpired(["git", *args], timeout) from e
+        raise subprocess.TimeoutExpired(argv, timeout) from e
     return subprocess.CompletedProcess(
-        args=["git", *args],
+        args=argv,
         returncode=proc.returncode if proc.returncode is not None else -1,
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
