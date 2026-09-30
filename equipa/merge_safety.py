@@ -118,13 +118,35 @@ async def abort_unfinished_merge(repo: str | os.PathLike, *, context: str) -> bo
     return True
 
 
+# Shields currently inside their block, and the handlers they displaced.
+# Overlapping merges (concurrent goals or projects) share ONE installed
+# handler: the first shield in saves the operator's handlers, the last one
+# out restores them. Per-shield save/restore broke when merges overlapped:
+# shield A saved the real handler, B saved A's, A left first and restored
+# the real one, then B restored A's deferring handler for good, so SIGTERM
+# never terminated the process again (3112 review LOW, task #3119).
+_active_shields: list[MergeSignalShield] = []
+_displaced_handlers: dict[signal.Signals, object] = {}
+
+
+def _deliver_to_active_shields(signum: int, _frame: FrameType | None) -> None:
+    """Shared SIGTERM / SIGINT handler while at least one merge is shielded."""
+    for shield in tuple(_active_shields):
+        if shield.received is None:
+            shield.received = signum
+    request_shutdown(signum)
+
+
 class MergeSignalShield:
     """Async context manager that defers SIGTERM / SIGINT around a merge.
 
-    Inside the block both signals only record a shutdown request. On exit the
-    previous handlers are restored; if a signal arrived, an unfinished merge
+    Inside the block both signals only record a shutdown request. When the
+    last active shield exits, the handlers that were in place before the
+    first one entered are restored; if a signal arrived, an unfinished merge
     left in ``repo`` is aborted so the main checkout is clean. A second
     signal after the block uses the restored handler (normally: terminate).
+    Shields may overlap (several merges awaiting git at once); every active
+    shield sees a signal that arrives while it is active.
 
     Signal handlers can only be installed from the main thread. Elsewhere
     the shield is inert and says so in the log.
@@ -133,13 +155,8 @@ class MergeSignalShield:
     def __init__(self, repo: str | os.PathLike, *, context: str) -> None:
         self._repo = os.fspath(repo)
         self._context = context
-        self._previous: dict[signal.Signals, object] = {}
+        self._active = False
         self.received: int | None = None
-
-    def _handle(self, signum: int, _frame: FrameType | None) -> None:
-        if self.received is None:
-            self.received = signum
-        request_shutdown(signum)
 
     async def __aenter__(self) -> MergeSignalShield:
         if threading.current_thread() is not threading.main_thread():
@@ -148,8 +165,13 @@ class MergeSignalShield:
                 "signal shield", self._context,
             )
             return self
-        for signum in SHIELDED_SIGNALS:
-            self._previous[signum] = signal.signal(signum, self._handle)
+        if not _active_shields:
+            for signum in SHIELDED_SIGNALS:
+                _displaced_handlers[signum] = signal.signal(
+                    signum, _deliver_to_active_shields,
+                )
+        _active_shields.append(self)
+        self._active = True
         return self
 
     async def __aexit__(
@@ -158,11 +180,17 @@ class MergeSignalShield:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        for signum, previous in self._previous.items():
-            # None means the previous handler was not installed from Python;
-            # the closest restorable equivalent is the default action.
-            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
-        self._previous.clear()
+        if self._active:
+            self._active = False
+            _active_shields.remove(self)
+            if not _active_shields:
+                for signum, previous in _displaced_handlers.items():
+                    # None means the previous handler was not installed from
+                    # Python; the closest restorable equivalent is SIG_DFL.
+                    signal.signal(
+                        signum, previous if previous is not None else signal.SIG_DFL,
+                    )
+                _displaced_handlers.clear()
         if self.received is None:
             return
         name = signal.Signals(self.received).name
