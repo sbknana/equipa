@@ -223,7 +223,7 @@ def _patch_parallel_mode(
     SECURITY-REVIEW-NNNN.md artifact.
     """
     async def fake_dev_test(task, project_dir, project_context, args,
-                            config, output=None):
+                            config, output=None, **kwargs):
         return (
             {"cost": 0.0, "duration": 0.0},
             1,
@@ -247,7 +247,7 @@ def _patch_parallel_mode(
                 dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         return {"success": True, "duration": 0.0, "result_text": ""}
 
-    async def fake_create_worktrees(tasks, project_dir, worktree_base):
+    async def fake_create_worktrees(tasks, project_dir, worktree_base, **kwargs):
         out = {}
         for t in tasks:
             d = tmp_project / f"wt-{t['id']}"
