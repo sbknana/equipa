@@ -52,48 +52,151 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # C0/C1 control characters except tab, newline and carriage return.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
-# Invisible formatting characters used to split keywords past a filter:
-# soft hyphen, combining grapheme joiner, Arabic letter mark, Hangul fillers,
-# Mongolian variation selectors, zero-width space / joiners / marks, bidi
-# embeddings and isolates, word joiner and invisible operators, variation
-# selectors and the byte-order mark.
-_INVISIBLE_CHARS = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏"
-    "​-‏‪-‮⁠-⁯ㅤ"
-    "︀-️﻿ﾠ]"
-)
+# Characters that render as nothing (or as a blank) and so can split a keyword
+# without a reader noticing. Every Unicode format character (category Cf:
+# soft hyphen, zero-width space / joiners, bidi controls, U+0600-U+0605,
+# U+FFF9-U+FFFB, U+13430 onwards, the tag block ...) is removed by category
+# in _strip_invisible(); this set adds the invisible characters that are not
+# Cf. Written as code points so review can see exactly what is in it.
+_INVISIBLE_NON_FORMAT = frozenset(map(chr, (
+    0x034F,                              # combining grapheme joiner (Mn)
+    0x115F, 0x1160, 0x3164, 0xFFA0,      # Hangul fillers (Lo)
+    0x17B4, 0x17B5,                      # Khmer inherent vowels (Mn)
+    0x180B, 0x180C, 0x180D, 0x180F,      # Mongolian variation selectors (Mn)
+    0x2065,                              # unassigned gap in U+2060..U+206F
+    0x2800,                              # braille pattern blank (So)
+    *range(0xFE00, 0xFE10),              # variation selectors 1-16 (Mn)
+    *range(0xE0100, 0xE01F0),            # variation selectors 17-256 (Mn)
+)))
 
 # Unicode "tag" characters (U+E0000..U+E007F) encode invisible ASCII that a
 # model still reads ("ASCII smuggling"). They have no place in a lesson, so
 # their presence alone is grounds for rejection.
 _TAG_CHARS = re.compile("[\U000e0000-\U000e007f]")
 
-# Cyrillic and Greek letters that render like Latin ones. Applied to the
-# matching copy only; stored text keeps its original letters.
-_HOMOGLYPHS = str.maketrans({
+# Non-ASCII letters that render like Latin ones and that NFKD does not fold:
+# Latin small capitals and IPA letters, Latin letters with strokes, Armenian,
+# Cyrillic and Greek lookalikes. A hand-picked subset of the Unicode TR39
+# confusables data, applied to the matching copy only; stored text keeps its
+# original letters. Keys are code points so review can see exactly what is
+# mapped (a lookalike key is indistinguishable from its Latin twin in a diff).
+_CONFUSABLES = str.maketrans({chr(code): latin for code, latin in {
+    # Latin small capitals (Phonetic Extensions, Latin Extended-D)
+    0x1D00: "a", 0x1D01: "ae", 0x1D03: "b", 0x1D04: "c", 0x1D05: "d",
+    0x1D06: "d", 0x1D07: "e", 0x1D0A: "j", 0x1D0B: "k", 0x1D0C: "l",
+    0x1D0D: "m", 0x1D0E: "n", 0x1D0F: "o", 0x1D10: "o", 0x1D18: "p",
+    0x1D19: "r", 0x1D1A: "r", 0x1D1B: "t", 0x1D1C: "u", 0x1D20: "v",
+    0x1D21: "w", 0x1D22: "z", 0x1D29: "p", 0x1D7B: "i", 0x1D7E: "u",
+    0xA730: "f", 0xA731: "s", 0xA7AF: "q",
+    # IPA small capitals
+    0x0262: "g", 0x026A: "i", 0x0274: "n", 0x0276: "oe", 0x0280: "r",
+    0x0281: "r", 0x028F: "y", 0x0299: "b", 0x029C: "h", 0x029F: "l",
+    # IPA letters that read as Latin
+    0x0251: "a", 0x0253: "b", 0x0255: "c", 0x0256: "d", 0x0257: "d",
+    0x0258: "e", 0x0259: "e", 0x025B: "e", 0x025F: "j", 0x0260: "g",
+    0x0261: "g", 0x0266: "h", 0x0267: "h", 0x0268: "i", 0x0269: "i",
+    0x026B: "l", 0x026C: "l", 0x026D: "l", 0x0271: "m", 0x0272: "n",
+    0x0273: "n", 0x0275: "o", 0x027C: "r", 0x027D: "r", 0x027E: "r",
+    0x0282: "s", 0x0284: "j", 0x0288: "t", 0x0289: "u", 0x028B: "v",
+    0x0290: "z", 0x0291: "z", 0x029D: "j", 0x02A0: "q",
+    # Latin letters with strokes or hooks that NFKD leaves alone
+    0x00D8: "O", 0x00F8: "o", 0x0110: "D", 0x0111: "d", 0x0126: "H",
+    0x0127: "h", 0x0131: "i", 0x0138: "k", 0x0141: "L", 0x0142: "l",
+    0x0166: "T", 0x0167: "t", 0x0180: "b", 0x0183: "b", 0x0188: "c",
+    0x018C: "d", 0x0192: "f", 0x0199: "k", 0x019A: "l", 0x019E: "n",
+    0x01A5: "p", 0x01AD: "t", 0x01B6: "z", 0x01C0: "l", 0x0237: "j",
+    # Armenian
+    0x053C: "L", 0x0548: "n", 0x054D: "U", 0x054F: "S", 0x0555: "O",
+    0x0561: "w", 0x0563: "q", 0x0566: "q", 0x0570: "h", 0x0575: "j",
+    0x0578: "n", 0x057C: "n", 0x057D: "u", 0x0581: "g", 0x0584: "p",
+    0x0585: "o",
     # Cyrillic lowercase
-    "а": "a", "е": "e", "о": "o", "р": "p",
-    "с": "c", "у": "y", "х": "x", "і": "i",
-    "ј": "j", "ѕ": "s", "ԁ": "d", "һ": "h",
-    "ӏ": "l", "ԛ": "q", "ԝ": "w", "в": "b",
-    "к": "k", "м": "m", "н": "h", "т": "t",
+    0x0430: "a", 0x0432: "b", 0x0433: "r", 0x0435: "e", 0x043A: "k",
+    0x043C: "m", 0x043D: "h", 0x043E: "o", 0x043F: "n", 0x0440: "p",
+    0x0441: "c", 0x0442: "t", 0x0443: "y", 0x0445: "x", 0x044C: "b",
+    0x0455: "s", 0x0456: "i", 0x0458: "j", 0x0475: "v", 0x04AF: "y",
+    0x04BB: "h", 0x04BD: "e", 0x04CF: "l", 0x0501: "d", 0x050D: "g",
+    0x051B: "q", 0x051D: "w",
     # Cyrillic uppercase
-    "А": "A", "В": "B", "Е": "E", "К": "K",
-    "М": "M", "Н": "H", "О": "O", "Р": "P",
-    "С": "C", "Т": "T", "У": "Y", "Х": "X",
-    "І": "I", "Ј": "J", "Ѕ": "S", "Ӏ": "I",
+    0x0405: "S", 0x0406: "I", 0x0408: "J", 0x0410: "A", 0x0412: "B",
+    0x0415: "E", 0x041A: "K", 0x041C: "M", 0x041D: "H", 0x041E: "O",
+    0x0420: "P", 0x0421: "C", 0x0422: "T", 0x0423: "Y", 0x0425: "X",
+    0x04AE: "Y", 0x04C0: "I", 0x051A: "Q", 0x051C: "W",
     # Greek lowercase
-    "α": "a", "ε": "e", "ι": "i", "κ": "k",
-    "ν": "v", "ο": "o", "ρ": "p", "τ": "t",
-    "υ": "u", "χ": "x",
+    0x03B1: "a", 0x03B2: "b", 0x03B3: "y", 0x03B5: "e", 0x03B7: "n",
+    0x03B9: "i", 0x03BA: "k", 0x03BD: "v", 0x03BF: "o", 0x03C1: "p",
+    0x03C4: "t", 0x03C5: "u", 0x03C7: "x", 0x03C9: "w", 0x03F2: "c",
+    0x03F3: "j",
     # Greek uppercase
-    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z",
-    "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M",
-    "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T",
-    "Υ": "Y", "Χ": "X",
-    # Latin lookalikes outside ASCII
-    "ı": "i", "ɡ": "g", "ǀ": "l", "ɩ": "i",
-})
+    0x0391: "A", 0x0392: "B", 0x0395: "E", 0x0396: "Z", 0x0397: "H",
+    0x0399: "I", 0x039A: "K", 0x039C: "M", 0x039D: "N", 0x039F: "O",
+    0x03A1: "P", 0x03A4: "T", 0x03A5: "Y", 0x03A7: "X", 0x037F: "J",
+    0x03F9: "C",
+}.items()})
+
+# Categories dropped from the matching copy after NFKD: combining and
+# enclosing marks (diacritics a keyword can hide under) and format characters.
+_DROPPED_AFTER_DECOMPOSITION = frozenset({"Mn", "Me", "Cf"})
+
+# A run of hyphens, underscores, dots or lookalike joiners between two letters
+# or digits. "ig-nore", "i.g.n.o.r.e" and "ignore_previous_instructions" all
+# read as the phrase they spell, so the keyword patterns also run on copies
+# with these runs deleted (split inside a word) and replaced by a space
+# (split between words). Linear: a run can only start after a letter/digit.
+_WORD_JOINER = re.compile(
+    "(?<=[^\\W_])[-_.·‐-―‧−∙⋅]+(?=[^\\W_])"
+)
+
+
+def _is_invisible(ch: str) -> bool:
+    return ch in _INVISIBLE_NON_FORMAT or unicodedata.category(ch) == "Cf"
+
+
+def _strip_invisible(text: str) -> str:
+    """Remove every format (Cf) character plus the other invisible fillers."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in text if not _is_invisible(ch))
+
+
+# NFKD can expand one code point into up to 18 (U+FDFA). Real text grows at
+# most about 3x (Hangul syllables into jamo, stacked Vietnamese diacritics),
+# so a text that grows more than this is refused rather than folded: folding
+# it would scan many times the input and void the input cap.
+_MAX_DECOMPOSITION_GROWTH = 4
+_DECOMPOSITION_SLACK = 256
+
+
+def _fold_unicode(text: str) -> str | None:
+    """NFKD-fold *text*, drop marks and invisibles, map confusables to Latin.
+
+    Returns None when decomposition grows the text abnormally (see
+    _MAX_DECOMPOSITION_GROWTH); the caller must treat that as hostile.
+    """
+    if text.isascii():
+        return text
+    decomposed = unicodedata.normalize("NFKD", text)
+    if len(decomposed) > (
+        _MAX_DECOMPOSITION_GROWTH * len(text) + _DECOMPOSITION_SLACK
+    ):
+        return None
+    # Invisible characters can reappear after decomposition.
+    kept = "".join(
+        ch for ch in decomposed
+        if unicodedata.category(ch) not in _DROPPED_AFTER_DECOMPOSITION
+        and ch not in _INVISIBLE_NON_FORMAT
+    )
+    return kept.translate(_CONFUSABLES)
+
+
+def _normalize(text: str) -> str | None:
+    """normalize_for_matching(), or None if decomposition grows abnormally."""
+    folded = html.unescape(str(text))
+    folded = _ANSI_ESCAPE.sub("", folded)
+    folded = _fold_unicode(_strip_invisible(folded))
+    if folded is None:
+        return None
+    return _CONTROL_CHARS.sub("", folded)
 
 
 def normalize_for_matching(text: str) -> str:
@@ -101,33 +204,46 @@ def normalize_for_matching(text: str) -> str:
 
     Used only for pattern matching, never stored. Decodes HTML entities (so a
     pre-escaped ``&lt;/task-input&gt;`` is still seen as a tag), applies NFKD
-    compatibility folding, drops combining marks, zero-width and control
-    characters and ANSI escapes, and maps common homoglyphs to Latin.
+    compatibility folding (fullwidth, mathematical and circled letters),
+    drops combining marks, every format character, the other invisible
+    fillers, control characters and ANSI escapes, and folds confusable
+    letters (small capitals, IPA, Armenian, Cyrillic, Greek) to Latin.
+
+    Raises:
+        ValueError: if NFKD decomposition grows the text abnormally.
+            detect_injection() rejects such text instead of folding it.
     """
-    folded = html.unescape(str(text))
-    folded = _ANSI_ESCAPE.sub("", folded)
-    folded = _INVISIBLE_CHARS.sub("", folded)
-    folded = unicodedata.normalize("NFKD", folded)
-    folded = "".join(
-        ch for ch in folded if unicodedata.category(ch) != "Mn"
-    )
-    folded = folded.translate(_HOMOGLYPHS)
-    # Invisible characters can reappear after decomposition; strip again.
-    folded = _INVISIBLE_CHARS.sub("", folded)
-    return _CONTROL_CHARS.sub("", folded)
+    folded = _normalize(text)
+    if folded is None:
+        raise ValueError("text grows abnormally under NFKD decomposition")
+    return folded
+
+
+def _joiner_variants(folded: str) -> tuple[str, ...]:
+    """Copies of *folded* with word-joiner runs deleted and spaced, if any."""
+    if not _WORD_JOINER.search(folded):
+        return ()
+    return _WORD_JOINER.sub("", folded), _WORD_JOINER.sub(" ", folded)
 
 
 # --- Injection patterns (any match => reject) -------------------------------
 # Each entry is (reason, compiled pattern). Patterns run against the output
 # of normalize_for_matching(). The reason is logged and returned by
 # detect_injection() so operators can see why content was refused.
+#
+# Every pattern must stay linear in the input length: this text is agent-
+# writable and is scanned on every prompt build (review F2/F3 of task 3123).
+# Never put two unbounded quantifiers over overlapping characters next to
+# each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces), and
+# never follow an unbounded lazy run with another one. Bound runs with
+# {0,N} instead. tests/test_lesson_sanitizer_3129.py times every pattern.
 _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # Our own trust-boundary markers: an opening or closing <task-input> tag,
     # or anything shaped like the per-prompt untrusted-content delimiter.
     (
         "trust-boundary marker",
         re.compile(
-            r"<\s*/?\s*task-input\b|<<<\s*(?:END_)?UNTRUSTED|"
+            r"<\s*(?:/\s*)?task-input\b|<<<\s*(?:END_)?UNTRUSTED|"
             r"\b(?:END_)?UNTRUSTED_[0-9a-f]{8}\b",
             re.IGNORECASE,
         ),
@@ -139,9 +255,9 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "role tag",
         re.compile(
-            r"<\s*/?\s*(?:system|assistant|human|admin|sudo|"
+            r"<\s*(?:/\s*)?(?:system|assistant|human|admin|sudo|"
             r"instructions?|prompt|override|ignore|jailbreak|bypass|"
-            r"injection)(?=[\s/>])[^>]*>",
+            r"injection)(?=[\s/>])[^>]{0,200}>",
             re.IGNORECASE,
         ),
     ),
@@ -184,12 +300,21 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"\bforget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
             r"(?:your|the|all)\s+(?:previous\s+)?(?:instructions?|rules?|"
             r"guidelines?|training))|"
+            # "Forget all of that", but not "don't forget all migrations".
+            r"\bforget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
+            r"context|you)\b|"
             r"\bnew\s+(?:instructions?|system\s+prompt|directives?)\b|"
+            # "New rules: ...", but not "add new rules to the linter".
+            r"\bnew\s+(?:rules?|orders?)\s*:|"
             r"\byour\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
             r"\boverride\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
             r"system|above))\s+(?:instructions?|rules?|guidelines?|"
             r"behaviou?r|programming|directives?|safety|restrictions)|"
             r"\bact\s+as\s+if\s+you\b|"
+            # "Act as a senior admin", but not "act as a good API citizen".
+            r"\bact\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
+            r"(?:admin(?:istrator)?|sysadmin|root|superuser|unrestricted|"
+            r"jailbroken)\b|"
             r"\bpretend\s+(?:you\s+are|to\s+be|you're)\b|"
             r"\bswitch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
             r"\s+(?:mode|role|persona)\b|"
@@ -206,6 +331,11 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "command instruction",
         re.compile(
             r"\b(?:run|execute)\s+(?:this|the\s+following)\s*(?:commands?\b|:)|"
+            # An imperative "Execute this script", but not "CI will execute
+            # this script" or "cannot run this code" (commit ef40ff5).
+            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|first|and|just|"
+            r"immediately)\b)\s*execute\s+(?:this|these|the\s+following)\s+"
+            r"(?:[\w-]+\s+)?(?:scripts?|code|snippets?|payloads?|programs?)\b|"
             r"\bpipe\s+(?:this|the\s+output)\s+to\b",
             re.IGNORECASE,
         ),
@@ -219,13 +349,13 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"(?:ba|z|da|k)?sh\b|"
             r"\b(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
             r"(?:python[23]?|perl|ruby|node)\b|"
-            r"\brm\s+-[a-z]*(?:rf|fr)[a-z]*\s+(?:--no-preserve-root\s+)?"
+            r"\brm\s+-[a-z]{0,10}(?:rf|fr)[a-z]{0,10}\s+(?:--no-preserve-root\s+)?"
             r"(?:/(?=\s|$|\*)|~|\$HOME|\$\{HOME\}|\*|\.{1,2}(?=\s|$|/\s|/$))|"
             r"/dev/(?:tcp|udp)/|"
             r"\bnc(?:at)?\b[^\n]{0,40}\s-[a-z]*e\s|"
             r"\bbase64\s+(?:-d|--decode)\b[^\n]{0,100}\|\s*(?:ba)?sh\b|"
             r"\beval\s+[\"']?\$\(|"
-            r"\bpython[23]?\s+-c\s+[\"'][^\"']*(?:import\s+os|subprocess|"
+            r"\bpython[23]?\s+-c\s+[\"'][^\"']{0,2000}(?:import\s+os|subprocess|"
             r"socket|__import__)|"
             r"\b(?:cat|cp|scp|curl|tar)\b[^\n]{0,60}(?:~|\$HOME)/\."
             r"(?:ssh|aws|gnupg|netrc|claude|config/gh)\b|"
@@ -234,15 +364,19 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
-    # Fenced code blocks carrying executable payloads.
+    # Fenced code blocks carrying executable payloads. The closing fence is
+    # deliberately not required: an unclosed block is just as executable, and
+    # a second lazy run up to the closing fence is what made the old pattern
+    # quadratic. The single run stops at the next backtick, so scans of
+    # successive fences never overlap.
     (
         "code block with command",
         re.compile(
             r"```(?:bash|sh|shell|zsh|python|py|node|js|javascript|ruby|perl|"
-            r"php|powershell|ps1)?\s*\n[^`]*?(?:rm\s|curl\s|wget\s|eval\s|"
-            r"exec\s|import\s+os|subprocess|__import__|compile\(|system\()"
-            r"[^`]*?```",
-            re.IGNORECASE | re.DOTALL,
+            r"php|powershell|ps1)?[ \t]*\r?\n[^`]*?(?:rm\s|curl\s|wget\s|"
+            r"eval\s|exec\s|import\s+os|subprocess|__import__|compile\(|"
+            r"system\()",
+            re.IGNORECASE,
         ),
     ),
     # Encoded payloads that could hide instructions from the filters above.
@@ -256,20 +390,43 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+# Natural-language keyword classes that are also matched on the word-joiner
+# variants ("ig-nore", "ignore_previous_instructions"). Structural patterns
+# (tags, markers, commands, encoded runs) are not: deleting joiners there
+# would turn "task-input" or long hyphenated paths into false matches.
+_JOINER_AWARE_REASONS = frozenset({
+    "fake system header",
+    "role override",
+    "command instruction",
+})
+
+
 def detect_injection(text) -> str | None:
     """Return the reason *text* looks like a prompt injection, else None.
 
-    Matching runs on normalize_for_matching(text), so zero-width splits,
-    homoglyphs, fullwidth letters and pre-escaped tags are all seen.
+    Matching runs on normalize_for_matching(text), so format-character and
+    joiner splits, confusable letters, fullwidth letters and pre-escaped tags
+    are all seen. Text longer than MAX_SANITIZE_INPUT_LENGTH is refused
+    unscanned ("oversized content"); sanitize() truncates to that cap first,
+    so only direct callers such as validate_lesson_structure() see this.
     """
     if not text:
         return None
     raw = str(text)
+    if len(raw) > MAX_SANITIZE_INPUT_LENGTH:
+        return "oversized content"
     if _TAG_CHARS.search(raw):
         return "unicode tag characters"
-    folded = normalize_for_matching(raw)
+    folded = _normalize(raw)
+    if folded is None:
+        return "abnormal unicode decomposition"
+    variants = _joiner_variants(folded)
     for reason, pattern in _INJECTION_PATTERNS:
         if pattern.search(folded):
+            return reason
+        if reason in _JOINER_AWARE_REASONS and any(
+            pattern.search(variant) for variant in variants
+        ):
             return reason
     return None
 
@@ -292,26 +449,42 @@ def neutralize_markup(text) -> str:
     if not text:
         return ""
     cleaned = _ANSI_ESCAPE.sub("", str(text))
-    cleaned = _INVISIBLE_CHARS.sub("", cleaned)
-    cleaned = _TAG_CHARS.sub("", cleaned)
+    # Every format character (tag characters included) and invisible filler.
+    cleaned = _strip_invisible(cleaned)
     cleaned = _CONTROL_CHARS.sub("", cleaned)
     return cleaned.translate(_ANGLE_BRACKET_ESCAPES)
 
 
 # Tokens that could open or close an injection wrapper: a <task-input> tag or
-# a <<<UNTRUSTED_*>>> / <<<END_UNTRUSTED_*>>> delimiter.
+# a <<<UNTRUSTED_*>>> / <<<END_UNTRUSTED_*>>> delimiter. Runs on unbounded
+# task text, so it must stay linear (no "<\s*/?\s*": see the pattern notes).
 _BOUNDARY_MARKER = re.compile(
-    r"<\s*/?\s*task-input\b|<<<\s*(?:END_)?UNTRUSTED",
+    r"<\s*(?:/\s*)?task-input\b|<<<\s*(?:END_)?UNTRUSTED",
     re.IGNORECASE,
 )
 
 
+# Every code point whose NFKD decomposition contains "<".
+_LESS_THAN_LIKE = ("<", "＜", "﹤", "≮")
+
+
 def _has_live_boundary_marker(text: str) -> bool:
-    """True if *text*, once homoglyphs and fullwidth forms are folded, still
-    contains an unescaped trust-boundary marker."""
-    folded = unicodedata.normalize("NFKD", text)
-    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
-    return bool(_BOUNDARY_MARKER.search(folded.translate(_HOMOGLYPHS)))
+    """True if *text*, once confusables and fullwidth forms are folded, still
+    contains an unescaped trust-boundary marker.
+
+    Task text is not length-capped, so folding is bounded instead: text
+    with no "<"-like character cannot hold a marker, and text too long or
+    too expansive to fold cheaply is treated as live, so the caller escapes
+    every angle bracket (over-escaping is the safe direction).
+    """
+    if text.isascii():
+        return bool(_BOUNDARY_MARKER.search(text))
+    if not any(ch in text for ch in _LESS_THAN_LIKE):
+        return False
+    if len(text) > MAX_SANITIZE_INPUT_LENGTH:
+        return True
+    folded = _fold_unicode(text)
+    return folded is None or bool(_BOUNDARY_MARKER.search(folded))
 
 
 def neutralize_boundaries(text) -> str:
@@ -324,7 +497,7 @@ def neutralize_boundaries(text) -> str:
     """
     if not text:
         return ""
-    cleaned = _TAG_CHARS.sub("", _INVISIBLE_CHARS.sub("", str(text)))
+    cleaned = _strip_invisible(str(text))
     escaped = _BOUNDARY_MARKER.sub(
         lambda match: match.group(0).replace("<", "&lt;"), cleaned
     )
@@ -347,9 +520,34 @@ MAX_ERROR_SIGNATURE_LENGTH = 200   # short identifiers
 MAX_SESSION_NOTE_LENGTH = 50_000   # narrative session summaries (generous backstop)
 MAX_DECISION_LENGTH = 8_000        # decision rationales
 
+# Input cap applied BEFORE any pattern matching (review F2 of task 3123). The
+# patterns are linear, but the text is agent-writable and scanned on every
+# prompt build, so the constant factor is bounded too. It sits above every
+# per-type cap above, so no stored content type is cut by it.
+MAX_SANITIZE_INPUT_LENGTH = 64_000
+# Room left under the cap for the truncation marker itself.
+_TRUNCATION_MARKER_RESERVE = 64
+
+
+def _cap_input(text: str, *, label: str) -> str:
+    """Truncate *text* to MAX_SANITIZE_INPUT_LENGTH with a visible marker."""
+    if len(text) <= MAX_SANITIZE_INPUT_LENGTH:
+        return text
+    keep = MAX_SANITIZE_INPUT_LENGTH - _TRUNCATION_MARKER_RESERVE
+    dropped = len(text) - keep
+    _log.warning(
+        "lesson_sanitizer: %s truncated from %d to %d chars before sanitization",
+        label, len(text), keep,
+    )
+    return f"{text[:keep]}\n[... {dropped} chars truncated before sanitization]"
+
 
 def sanitize(text, *, label="content"):
-    """Reject prompt-injection content; neutralise markup. No length cap.
+    """Reject prompt-injection content; neutralise markup.
+
+    Input longer than MAX_SANITIZE_INPUT_LENGTH is truncated, with a marker
+    and a WARNING, before any matching. There is no other length cap here;
+    see enforce_limit().
 
     Args:
         text: Raw text (agent output, error summaries, session notes, etc.)
@@ -362,7 +560,7 @@ def sanitize(text, *, label="content"):
     """
     if not text:
         return ""
-    text = str(text)
+    text = _cap_input(str(text), label=label)
     reason = detect_injection(text)
     if reason:
         _log.warning(
