@@ -64,6 +64,7 @@ from equipa.git_ops import (
     get_trusted_default_branch,
     git_run,
     git_run_async,
+    git_toplevel,
 )
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
@@ -1864,6 +1865,41 @@ async def _create_isolation_worktrees(
     return worktree_dirs
 
 
+def project_dir_in_worktree(
+    project_dir: str, worktree_dir: str,
+) -> tuple[str | None, str]:
+    """The project's directory inside a task worktree of its repository.
+
+    Task #3119: a project nested inside another repository gets a worktree
+    of the ENCLOSING repository, so its agents must run in the project's
+    sub-directory of that worktree, not at the worktree root. For a project
+    at the root of its own repository this is ``worktree_dir`` itself.
+
+    Returns ``(directory, "")``, or ``(None, reason)`` when the project is
+    not part of the checked-out tree (for example untracked or ignored in
+    the enclosing repository); the task must then be refused, never run in
+    ``project_dir``.
+    """
+    toplevel = git_toplevel(project_dir)
+    if toplevel is None:
+        return None, f"{project_dir} is not inside a git work tree"
+    try:
+        relative = Path(project_dir).resolve().relative_to(toplevel.resolve())
+    except ValueError:
+        return None, (
+            f"{project_dir} does not resolve inside its repository {toplevel}"
+        )
+    if relative == Path("."):
+        return worktree_dir, ""
+    nested_dir = Path(worktree_dir) / relative
+    if not nested_dir.is_dir():
+        return None, (
+            f"'{relative}' is not tracked by the enclosing repository "
+            f"{toplevel}, so the task worktree has no such directory"
+        )
+    return str(nested_dir), ""
+
+
 async def _log_stale_branch_commits(project_dir: str, branch_name: str) -> None:
     """Log the commits on a stale task branch that are not on the default.
 
@@ -2882,6 +2918,38 @@ async def _gated_merge_task(
 
 MERGE_ELIGIBLE_OUTCOMES: tuple[str, ...] = ("tests_passed", "no_tests")
 
+# An agent that reports "already implemented / no changes needed" ends with
+# this outcome, which update_task_status records as done WITHOUT a merge.
+NO_CHANGES_OUTCOME = "early_completed_no_changes"
+# That claim contradicted by the task branch (commits or uncommitted work):
+# recorded as blocked, nothing reviewed or merged, the branch kept.
+NO_CHANGES_CONTRADICTED_OUTCOME = "no_changes_claim_contradicted"
+
+
+async def _no_changes_claim_problem(
+    project_dir: str,
+    worktree_dir: str,
+    task_branch: str,
+    trusted_sha: str | None,
+) -> str | None:
+    """Why a "no changes needed" claim is false for this branch, or None.
+
+    3112 review LOW (task #3119): the claim is true only when the task
+    branch's tip is already on the trusted default branch and the worktree
+    holds no uncommitted work. Anything else means the agent changed the
+    project, and marking the task done would strand those changes
+    unreviewed on the branch.
+    """
+    tip = await resolve_commit(project_dir, f"refs/heads/{task_branch}")
+    if tip is None:
+        return f"{task_branch} could not be resolved"
+    if trusted_sha is None or not await is_ancestor(project_dir, tip, trusted_sha):
+        return f"{task_branch} has commits that are not on the default branch"
+    dirty = await _worktree_dirty_reason(worktree_dir)
+    if dirty is not None:
+        return f"the worktree has uncommitted work ({dirty})"
+    return None
+
 
 async def review_task_branch(
     task: dict,
@@ -3137,8 +3205,29 @@ async def run_task_in_isolation(
 
     delete_branch = False
     try:
+        # A nested project runs in its sub-directory of the worktree.
+        agent_dir, agent_dir_problem = project_dir_in_worktree(
+            project_dir, worktree_dir,
+        )
+        if agent_dir is None:
+            # Nothing ran: the branch is still at its fork point.
+            delete_branch = True
+            reason = f"no project directory in the task worktree: {agent_dir_problem}"
+            log(f"[Task #{task_id}] REFUSED: {reason}", output)
+            _audit_task_abort(task_id, "worktree-refused", reason, output)
+            return IsolatedTaskRun(
+                "worktree_refused", _empty_run_result(), 0, reason=reason,
+            )
+        if agent_dir != worktree_dir:
+            log(
+                f"  [Isolation] Nested project: task #{task_id} runs in "
+                f"{Path(agent_dir).relative_to(worktree_dir)} of its worktree",
+                output,
+            )
         base_sha = await resolve_commit(worktree_dir, "HEAD")
-        result, cycles, agent_outcome = await execute(worktree_dir, task_branch)
+        result, cycles, agent_outcome = await execute(agent_dir, task_branch)
+        if agent_dir != worktree_dir:
+            (Path(agent_dir) / ".forge-state.json").unlink(missing_ok=True)
         # Task #3111 (3107 review R1): an agent that left its worktree on
         # another branch must not have that branch's commits treated as the
         # task's result.
@@ -3161,7 +3250,25 @@ async def run_task_in_isolation(
             and await is_ancestor(project_dir, branch_sha, guard.expected_sha)
         )
         outcome = agent_outcome
-        if outcome in MERGE_ELIGIBLE_OUTCOMES and nothing_to_merge:
+        reason = ""
+        claim_problem = (
+            await _no_changes_claim_problem(
+                project_dir, worktree_dir, task_branch, guard.expected_sha,
+            )
+            if outcome == NO_CHANGES_OUTCOME else None
+        )
+        if claim_problem is not None:
+            # 3112 review LOW: "no changes needed" is recorded as done without
+            # a merge, so commits behind it would stay unreviewed on the branch.
+            outcome = NO_CHANGES_CONTRADICTED_OUTCOME
+            reason = (
+                f"agent reported no changes needed, but {claim_problem}; "
+                f"not reviewed or merged, {task_branch} kept"
+            )
+            guard.outcomes[task_id] = MergeOutcome("skipped", reason)
+            log(f"[Task #{task_id}] {reason}", output)
+            _audit_task_abort(task_id, "no-changes-claim-contradicted", reason, output)
+        elif outcome in MERGE_ELIGIBLE_OUTCOMES and nothing_to_merge:
             dirty = await _worktree_dirty_reason(worktree_dir)
             if dirty:
                 guard.outcomes[task_id] = MergeOutcome(
@@ -3183,7 +3290,7 @@ async def run_task_in_isolation(
             if not guard.tripped:
                 # A tripped guard blocks the merge anyway; no reviewer is paid for.
                 outcome, _ = await review_task_branch(
-                    task, worktree_dir, project_dir, project_context, args,
+                    task, agent_dir, project_dir, project_context, args,
                     outcome, output=output,
                 )
             try:
@@ -3212,7 +3319,6 @@ async def run_task_in_isolation(
                     "blocked", f"defensive invariant: {exc}",
                 )
         merged_sha: str | None = None
-        reason = ""
         if outcome in MERGE_ELIGIBLE_OUTCOMES:
             await guard.verify(f"end-of-task task={task_id}", task_id=task_id)
             final_outcome, merged_sha, reason = outcome_after_merge(
@@ -3549,10 +3655,25 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         )
         if use_worktrees else {}
     )
+    # Task #3119: a nested project runs in its sub-directory of each
+    # worktree; a task whose worktree lacks that directory is refused.
+    agent_dirs: dict[int, str] = {}
+    for task_id, worktree_dir in list(worktree_dirs.items()):
+        agent_dir, agent_dir_problem = project_dir_in_worktree(project_dir, worktree_dir)
+        if agent_dir is None:
+            worktree_refusals[task_id] = (
+                f"no project directory in the task worktree: {agent_dir_problem}"
+            )
+            del worktree_dirs[task_id]
+            await _cleanup_worktrees(
+                project_dir, {task_id: worktree_dir}, {task_id}, worktree_base,
+            )
+            continue
+        agent_dirs[task_id] = agent_dir
 
     async def run_one_task(task):
         output = []
-        task_dir = worktree_dirs.get(task["id"])
+        task_dir = agent_dirs.get(task["id"])
         if task_dir is None and use_worktrees:
             # dispatch-01: never fall back to the shared main checkout. A
             # task run there commits straight onto whatever it has checked
@@ -3623,6 +3744,21 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     ),
                 )
             )
+
+            if outcome == NO_CHANGES_OUTCOME and task["id"] in worktree_dirs:
+                claim_problem = await _no_changes_claim_problem(
+                    project_dir, worktree_dirs[task["id"]],
+                    f"forge-task-{task['id']}",
+                    merge_guard.expected_sha if merge_guard is not None else None,
+                )
+                if claim_problem is not None:
+                    # 3112 review LOW: never "done" with unreviewed commits.
+                    outcome = NO_CHANGES_CONTRADICTED_OUTCOME
+                    _audit_task_abort(
+                        task["id"], "no-changes-claim-contradicted",
+                        f"agent reported no changes needed, but {claim_problem}; "
+                        f"branch kept", output,
+                    )
 
             # Bug 2321: review BEFORE the task can be marked done; CRITICAL/
             # HIGH findings demote the outcome so the task stays blocked and

@@ -307,9 +307,36 @@ def _git_identity_args() -> list[str]:
     return args
 
 
+def git_toplevel(path: str | Path) -> Path | None:
+    """Root of the git work tree that contains ``path``, or None.
+
+    None when ``path`` is not a directory inside a git work tree (a plain
+    directory, a bare repository, a ``.git`` directory itself) or git
+    cannot be run there.
+    """
+    if not Path(path).is_dir():
+        return None
+    try:
+        result = git_run(["rev-parse", "--show-toplevel"], path, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[git] could not locate the work tree of %s: %s", path, exc)
+        return None
+    toplevel = (result.stdout or "").strip()
+    if result.returncode != 0 or not toplevel:
+        return None
+    return Path(toplevel)
+
+
 def _is_git_repo(path: str | Path) -> bool:
-    """Check if a directory is a git repository."""
-    return (Path(path) / ".git").exists()
+    """True when ``path`` lies inside a git work tree.
+
+    Task #3119: a project nested in another repository has no ``.git`` of
+    its own, yet every commit made there lands on the enclosing repository.
+    Checking for a ``.git`` entry treated it as "not git", so it got no
+    worktree, no guard and no gate. ``git rev-parse --show-toplevel``
+    answers for the enclosing repository as well.
+    """
+    return git_toplevel(path) is not None
 
 
 def detect_project_language(project_dir: str | Path) -> dict:
