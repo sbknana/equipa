@@ -26,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -268,13 +268,34 @@ def is_overloaded_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is an overloaded/529 error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in [
-        "529",
-        "overloaded",
-        "overloaded_error",
-        "temporarily overloaded",
-    ])
+    return bool(_OVERLOADED_RE.search(f"{stderr} {stdout}"))
+
+
+# Retry classifiers (F1, task 3134). A status code only counts as a whole
+# token: "529" inside "15290 tokens" or "500" inside "1500" is not an API
+# error. Callers pass structured error fields (stderr, the CLI's error
+# result), never the agent's own RESULT text.
+_OVERLOADED_RE = re.compile(r"\b529\b|overloaded", re.IGNORECASE)
+_CAPACITY_RE = re.compile(r"\b(?:429|529)\b|rate limit|overloaded", re.IGNORECASE)
+_RETRYABLE_RE = re.compile(
+    r"\b(?:429|500|502|503|504)\b|rate limit|connection|timeout|econnreset"
+    r"|epipe", re.IGNORECASE)
+# The error entry both result builders add for an error_max_turns run.
+_MAX_TURNS_ERROR = "Agent hit max turns limit"
+
+
+def _structured_error_text(result: Mapping[str, Any]) -> str:
+    """The error fields the retry classifiers may read (F1, task 3134).
+
+    ``errors`` holds what the orchestrator recorded: CLI stderr, the CLI's
+    error result (an API error message), early-termination reasons. The
+    agent's ``result_text`` is never included: a RESULT block that mentions
+    "timeout" or "HTTP 500" is not an API error, and matching it relaunched
+    a finished agent up to ten times.
+    """
+    errors = result.get("errors") or []
+    return " ".join(error for error in errors
+                    if isinstance(error, str) and error != _MAX_TURNS_ERROR)
 
 
 def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
@@ -289,8 +310,7 @@ def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is a 429 or 529 capacity error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in ["429", "rate limit", "529", "overloaded"])
+    return bool(_CAPACITY_RE.search(f"{stderr} {stdout}"))
 
 
 def is_retryable_error(stderr: str, stdout: str) -> bool:
@@ -303,20 +323,7 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if error should be retried
     """
-    combined = f"{stderr} {stdout}".lower()
-    retryable_markers = [
-        "429",
-        "rate limit",
-        "connection",
-        "timeout",
-        "econnreset",
-        "epipe",
-        "500",
-        "502",
-        "503",
-        "504",
-    ]
-    return any(marker in combined for marker in retryable_markers)
+    return bool(_RETRYABLE_RE.search(f"{stderr} {stdout}"))
 
 
 def _cmd_model(cmd: list[str]) -> str | None:
@@ -1847,6 +1854,11 @@ async def run_agent(
         if stderr_text:
             result["errors"].append(f"stderr: {stderr_text}")
 
+        # The CLI's own error message (an is_error result). With stderr it is
+        # all the retry classifiers below may read: the JSON stdout also holds
+        # the agent's text and token counts ("cache_read_input_tokens": 5029
+        # contains "502"), neither of which is an API error (F1).
+        api_error_text = ""
         if not stdout_text:
             result["errors"].append("No output from agent")
             last_error = "No output from agent"
@@ -1860,18 +1872,19 @@ async def run_agent(
                 # Check for error subtypes
                 subtype = data.get("subtype", "")
                 if subtype == "error_max_turns":
-                    # Agent ran out of turns but may have done useful work.
-                    # gate-07: the run did NOT finish, so a caller whose
-                    # output must be complete (the security reviewer) reads
-                    # ``hit_max_turns`` and treats the run as failed.
-                    result["success"] = True
+                    # The run was cut off, not finished (F8, as the streaming
+                    # path reports it): not a success, and ``hit_max_turns``
+                    # tells a caller that wants the partial work (the dev
+                    # loop) or needs complete output (a reviewer, gate-07).
+                    result["success"] = False
                     result["hit_max_turns"] = True
-                    result["errors"].append("Agent hit max turns limit")
+                    result["errors"].append(_MAX_TURNS_ERROR)
                 elif data.get("is_error"):
                     result["success"] = False
                     error_msg = data.get('result', 'unknown')
                     result["errors"].append(f"Agent error: {error_msg}")
                     last_error = error_msg
+                    api_error_text = str(error_msg)
                 else:
                     result["success"] = True
 
@@ -1885,9 +1898,13 @@ async def run_agent(
         # If successful, return immediately
         if result["success"]:
             return result
+        # A run cut off by its turn budget is never relaunched (F1/F8): a
+        # fresh agent with a full budget on a dirty worktree is not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, api_error_text)
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -1895,13 +1912,13 @@ async def run_agent(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, api_error_text):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, api_error_text)
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:
@@ -2889,6 +2906,10 @@ async def run_agent_with_retries(
         if is_overloaded_result(result):
             print("  Not retrying: model overloaded (529) through every retry")
             return result, attempt
+        # Out of turns is not a transient failure: never relaunch (F1).
+        if result.get("hit_max_turns"):
+            print("  Not retrying: agent hit its max turns")
+            return result, attempt
 
         # Check if output is valid
         is_valid, reason = validate_output(result)
@@ -2972,11 +2993,17 @@ async def run_agent_streaming_with_retry(
         # If successful, return immediately
         if result.get("success"):
             return result
+        # A run cut off by its turn budget is never relaunched (F1, indep
+        # review of 3122): the dev loop's continuation owns what happens
+        # next, and a fresh agent with a full budget on a dirty worktree is
+        # not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
-        # Extract error info
-        stderr_text = " ".join(result.get("errors", []))
-        stdout_text = result.get("result_text", "")
-        last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+        # Extract error info. Only structured error fields are classified,
+        # never the agent's RESULT text (F1).
+        stderr_text = _structured_error_text(result)
+        last_error = (stderr_text or result.get("result_text", ""))[:200]
 
         # Non-retryable: analysis paralysis kills must fail fast, not retry.
         # Retrying after a paralysis kill restarts the exact same pattern
@@ -2993,7 +3020,7 @@ async def run_agent_streaming_with_retry(
                 return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, "")
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -3001,13 +3028,13 @@ async def run_agent_streaming_with_retry(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, ""):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, "")
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:
