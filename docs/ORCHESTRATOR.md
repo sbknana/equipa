@@ -239,7 +239,9 @@ The CLI environment also pins `CLAUDE_CODE_SHELL` to an absolute,
 root-owned bash (`/bin/bash`, verified at run time), which the CLI prefers
 over `SHELL`, and drops `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`,
 `BASHOPTS`, `PS4` and every `BASH_FUNC_*` name, even when an operator
-passthrough lists them.
+passthrough lists them. Under agent isolation the launcher sets the unit's
+own HOME and CLAUDE_CONFIG_DIR, and the same pin and removals apply
+(`claude_cli_shell_env`).
 
 **Deploy note:** the login in `~/.claude/.credentials.json` is no longer
 used by any of these runs. Export `CLAUDE_CODE_OAUTH_TOKEN` (create one
