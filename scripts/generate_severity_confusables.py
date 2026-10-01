@@ -36,6 +36,24 @@ MODULE_PATH = REPO / "equipa" / "severity_confusables.py"
 EXTRACT_PATH = REPO / "tests" / "fixtures" / "confusables_severity_letters.txt"
 LETTERS = "CRITALHGMEDU"
 _VERSION_RE = re.compile(r"^#\s*Version:\s*(\S+)", re.MULTILINE)
+# Task 3157 (R3154-06): the prototypes of LETTERS as confusables.txt gives
+# them (the capital I maps to the small l), and a plain scan of the raw
+# mapping lines "SOURCE ; TARGET ;" with one code point on each side. It
+# shares no code with severity_confusables, so a bug there that drops a
+# source line changes the table but not this count.
+LETTER_PROTOTYPES = frozenset("CRlTALHGMEDU")
+_SINGLE_MAPPING_LINE_RE = re.compile(
+    r"^([0-9A-Fa-f]{4,6})[ \t]*;[ \t]*([0-9A-Fa-f]{4,6})[ \t]*;", re.MULTILINE)
+
+
+def count_letter_mappings(text: str) -> int:
+    """How many mapping lines of ``text`` map one code point other than
+    ASCII to the prototype of a letter of LETTERS."""
+    return sum(
+        1 for match in _SINGLE_MAPPING_LINE_RE.finditer(text)
+        if int(match.group(1), 16) >= 0x80
+        and chr(int(match.group(2), 16)) in LETTER_PROTOTYPES
+    )
 
 
 def parse_confusables(text: str) -> list[tuple[str, str, str]]:
@@ -81,7 +99,7 @@ def severity_confusables(
 
 
 def render_module(table: dict[str, tuple[int, ...]], version: str,
-                  digest: str) -> str:
+                  digest: str, mappings: int, extract_digest: str) -> str:
     rows = []
     for letter in sorted(table):
         values = [f"0x{code_point:04X}," for code_point in table[letter]]
@@ -109,6 +127,12 @@ def render_module(table: dict[str, tuple[int, ...]], version: str,
         "\n"
         f'CONFUSABLES_VERSION = "{version}"\n'
         f'CONFUSABLES_SHA256 = (\n    "{digest}"\n)\n'
+        "# Mapping lines of the full file whose source is one code point\n"
+        "# other than ASCII and whose target is a letter's prototype, counted\n"
+        "# apart from the table (count_letter_mappings), and the sha256 of\n"
+        "# tests/fixtures/confusables_severity_letters.txt.\n"
+        f"CONFUSABLES_LETTER_MAPPINGS = {mappings}\n"
+        f'CONFUSABLES_EXTRACT_SHA256 = (\n    "{extract_digest}"\n)\n'
         "SEVERITY_LETTER_CONFUSABLES: dict[str, tuple[int, ...]] = {\n"
         + "\n".join(rows) + "\n}\n"
     )
@@ -137,12 +161,18 @@ def main() -> int:
         parser.error(f"{args.confusables}: no '# Version:' header")
     entries = parse_confusables(text)
     table, lines = severity_confusables(entries)
+    total = sum(map(len, table.values()))
+    mappings = count_letter_mappings(text)
+    if total != mappings:
+        parser.error(f"the table holds {total} code points, but the file "
+                     f"maps {mappings} to the letters' prototypes")
+    extract = render_extract(text, lines)
     MODULE_PATH.write_text(
         render_module(table, version_match.group(1),
-                      hashlib.sha256(data).hexdigest()),
+                      hashlib.sha256(data).hexdigest(), mappings,
+                      hashlib.sha256(extract.encode("utf-8")).hexdigest()),
         encoding="utf-8")
-    EXTRACT_PATH.write_text(render_extract(text, lines), encoding="utf-8")
-    total = sum(map(len, table.values()))
+    EXTRACT_PATH.write_text(extract, encoding="utf-8")
     print(f"wrote {MODULE_PATH.name} ({total} code points) and "
           f"{EXTRACT_PATH.name} ({len(lines)} lines)")
     return 0

@@ -14,6 +14,14 @@ CONFUSABLES_VERSION = "18.0.0"
 CONFUSABLES_SHA256 = (
     "6ed3ee967c9dfdf6677d563c9985182fbc50a2efb7d6059cd57b2e2ce18f5b92"
 )
+# Mapping lines of the full file whose source is one code point
+# other than ASCII and whose target is a letter's prototype, counted
+# apart from the table (count_letter_mappings), and the sha256 of
+# tests/fixtures/confusables_severity_letters.txt.
+CONFUSABLES_LETTER_MAPPINGS = 410
+CONFUSABLES_EXTRACT_SHA256 = (
+    "bfa870c084d0c50d6855bc50fa8185228589a2de18747859619c5363c8191d31"
+)
 SEVERITY_LETTER_CONFUSABLES: dict[str, tuple[int, ...]] = {
     "A": (
         0x0391, 0x0410, 0x13AA, 0x15C5, 0xA4EE, 0xFF21, 0x102A0, 0x16F40,
