@@ -3148,7 +3148,10 @@ def _severity_token_backstop(
             unaccounted += count
             lines.append(line + 1)
         counted = max(len(heading_lines), parser_headings.get(severity, 0))
-        footer_count = footer.get(severity, 0)
+        # What the review reports: the footer, or more when the parser
+        # counted more (a resolved "- **[S1] HIGH ...: FIXED**" recap is
+        # counted with no footer at all).
+        footer_count = max(footer.get(severity, 0), covered.get(severity, 0))
         if unaccounted and footer_count < counted + unaccounted:
             lines.sort()
             shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
