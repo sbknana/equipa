@@ -3229,15 +3229,20 @@ def _backstop_translated(text: str) -> str:
 
 # --- Task 3154: the separated reading (I3152-01, I3152-02) ----------------------
 
-# Lookalikes only the separated reading folds (see _BACKSTOP_CONFUSABLES).
+def _backstop_same_letter(folded: str, letter: str) -> bool:
+    """True when the other views' fold ``folded`` reads as ``letter``."""
+    return folded.upper() == letter or (letter == "I" and folded in "Il")
+
+
+# Lookalikes only the separated reading folds (see _BACKSTOP_CONFUSABLES),
+# and those the other views fold to another letter: U+102A2 is a T there
+# (task 3149) and a C in the Unicode data, so each reading has one of them.
 _BACKSTOP_NEW_FOLDS = {
     code_point: letter
     for code_point, letter in _BACKSTOP_CONFUSABLES.items()
     if code_point not in _BACKSTOP_LETTER_FOLDS
+    or not _backstop_same_letter(_BACKSTOP_LETTER_FOLDS[code_point], letter)
 }
-_BACKSTOP_WORD_LETTER_CATEGORIES = frozenset(("Lu", "Ll", "Lt", "Lo"))
-_BACKSTOP_ORDINAL_INDICATORS = "\N{FEMININE ORDINAL INDICATOR}" \
-    "\N{MASCULINE ORDINAL INDICATOR}"
 # The line breaks normalize_review_text maps to "\n" are kept as written.
 _BACKSTOP_KEPT_BREAKS = "\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
 # The ASCII controls the other views delete; tab, CR, LF and the controls
@@ -3255,21 +3260,31 @@ def _backstop_separator_mark(code_point: int) -> str:
         return char
     if 0xE000 <= code_point <= 0xE1FF:
         return _BACKSTOP_FOREIGN_MARK
-    if code_point in _BACKSTOP_LETTER_FOLDS:
-        return chr(_BACKSTOP_FOLD_MARK + ord(_BACKSTOP_LETTER_FOLDS[code_point]))
     if code_point in _BACKSTOP_NEW_FOLDS:
-        return chr(_BACKSTOP_NEW_FOLD_MARK + ord(_BACKSTOP_NEW_FOLDS[code_point]))
+        letter = _BACKSTOP_NEW_FOLDS[code_point]
+        return chr(_BACKSTOP_NEW_FOLD_MARK + ord(letter))
+    if code_point in _BACKSTOP_LETTER_FOLDS:
+        letter = _BACKSTOP_LETTER_FOLDS[code_point]
+        return chr(_BACKSTOP_FOLD_MARK + ord(letter))
     category = unicodedata.category(char)
-    if (code_point in _BACKSTOP_DELETED_FILLERS
-            or category in _BACKSTOP_DELETED_CATEGORIES):
+    decomposed = unicodedata.normalize("NFKD", char)
+    # Deleted as written, or once decomposed (U+FF9E, a halfwidth sound
+    # mark, decomposes to a combining mark).
+    if all(ord(part) in _BACKSTOP_DELETED_FILLERS
+           or unicodedata.category(part) in _BACKSTOP_DELETED_CATEGORIES
+           for part in decomposed):
         return _BACKSTOP_GONE_MARK
-    if (category in _BACKSTOP_WORD_LETTER_CATEGORIES
-            and char not in _BACKSTOP_ORDINAL_INDICATORS):
-        return char  # a letter, read as the other views read it
-    if any(part in _BACKSTOP_ASCII_ALNUM or ord(part) in _BACKSTOP_LETTER_FOLDS
-           for part in unicodedata.normalize("NFKD", char)):
-        return _BACKSTOP_GLUE_MARK
-    return char
+    folds_to_a_word_letter = any(
+        part in _BACKSTOP_ASCII_ALNUM or ord(part) in _BACKSTOP_LETTER_FOLDS
+        for part in decomposed)
+    # A cased letter ("E" with an accent, fullwidth and mathematical letters)
+    # is read as the other views read it. Any other character that they read
+    # as an ASCII letter or digit is no letter of the word: a number form, a
+    # modifier letter, an ordinal indicator, or a letter of another script
+    # that decomposes to a lookalike (U+FB35, a Hebrew VAV with a dot).
+    if category in ("Lu", "Ll", "Lt") or not folds_to_a_word_letter:
+        return char
+    return _BACKSTOP_GLUE_MARK
 
 
 class _BackstopSeparatorTable(dict):
@@ -3291,6 +3306,10 @@ def _backstop_separated_reference(match: re.Match[str]) -> str:
     that mark ("Rated&#x3164;HIGH" separates the words); any other reference
     is left for _backstop_normalized to decode."""
     decoded = _backstop_decoded_reference(match)
+    if not decoded:
+        # html.unescape drops a noncharacter ("&#x3FFFF;"), which a browser
+        # shows (as a box).
+        return _BACKSTOP_GONE_MARK
     if len(decoded) != 1:
         return match.group(0)
     if _BACKSTOP_SEPARATED_CONTROLS_RE.match(decoded):
