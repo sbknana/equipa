@@ -2814,13 +2814,18 @@ _BACKSTOP_SEVERITY_BY_INITIAL = {"C": "CRITICAL", "H": "HIGH", "M": "MEDIUM"}
 # HTML5 character references, with or without the semicolon. html.unescape
 # decides what each means (legacy names such as "&amp" need no semicolon) and
 # leaves an unknown one as written. Task 3149 (R3143-04): leading zeros are
-# read in full ("&#000000072;" is H) but at most 8 decimal or 7 hex
-# significant digits, so int() never sees thousands of them; any longer
-# value is past U+10FFFF and decodes to U+FFFD whatever its digits.
+# read in full ("&#000000072;" is H). Task 3152 (R3149-04): like a browser,
+# a numeric reference takes EVERY digit that follows, so none is left glued
+# to the next word ("&#999999999HIGH" shows U+FFFD and a standalone HIGH).
+# A value of more than 7 decimal or 6 hex significant digits is past
+# U+10FFFF and decodes to U+FFFD without int() (see
+# _backstop_decoded_reference), so thousands of digits cost nothing.
 _BACKSTOP_REFERENCE_RE = re.compile(
-    r"&(?:#(0*)([0-9]{1,8});?|#[xX](0*)([0-9A-Fa-f]{1,7});?"
+    r"&(?:#(0*)([0-9]++);?|#[xX](0*)([0-9A-Fa-f]++);?"
     r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
 )
+_BACKSTOP_MAX_DECIMAL_DIGITS = 7
+_BACKSTOP_MAX_HEX_DIGITS = 6
 # Markup a browser does not show: start and end tags, "<!DOCTYPE ...>" and
 # the bogus comments "<!x>", "<?x>" and "</ x>". The body stops at the next
 # "<", so a flood of unclosed "<a" is scanned once.
@@ -3076,13 +3081,18 @@ def _backstop_decoded_reference(match: re.Match[str]) -> str:
     """One character reference as a browser shows it, on the same line.
 
     A numeric reference is looked up without its leading zeros, so the
-    cached key and the text html.unescape parses stay short.
+    cached key and the text html.unescape parses stay short. One with more
+    significant digits than any code point is U+FFFD outright.
     """
     decimal, hexadecimal = match.group(2), match.group(4)
     if decimal is not None:
+        if len(decimal) > _BACKSTOP_MAX_DECIMAL_DIGITS:
+            return "\N{REPLACEMENT CHARACTER}"
         return _BACKSTOP_REFERENCES[f"&#{int(decimal)};"]
     if hexadecimal is not None:
-        return _BACKSTOP_REFERENCES[f"&#x{hexadecimal.lstrip('0') or '0'};"]
+        if len(hexadecimal) > _BACKSTOP_MAX_HEX_DIGITS:
+            return "\N{REPLACEMENT CHARACTER}"
+        return _BACKSTOP_REFERENCES[f"&#x{hexadecimal};"]
     return _BACKSTOP_REFERENCES[match.group(0)]
 
 
