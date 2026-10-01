@@ -302,3 +302,59 @@ def test_single_task_mode_plant_after_the_snapshot_is_refused(
     assert captured.get("outcome") != "tests_passed"
     assert not captured.get("merged_sha")
     assert "event=repository-identity-changed" in capsys.readouterr().err
+
+
+def _replace_with_clone_files(directory: Path, clone: Path) -> None:
+    """Empty ``directory`` (keeping the git entries and a nested
+    ``.forge-worktrees``) and copy the clone's files in, so it reads as a
+    clean checkout of the clone."""
+    for entry in directory.iterdir():
+        if entry.name in (".git", ".git.bak", ".forge-worktrees"):
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    _mirror_checkout(clone, directory)
+
+
+def test_single_task_mode_clone_left_on_the_task_branch_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """The reviewer's p1 in ``--task --dev-test`` mode, carried through: the
+    agent leaves its clone on the task branch and makes the project and its
+    worktree clean checkouts of the clone, so the worktree branch check
+    passes through the planted ``.git`` files. On the task #3141 code the
+    README-only decoy branch is doc-only, needs no review, and merges into
+    the clone's master. The pinned repository identity refuses it."""
+    repo = _init_repo(tmp_path / "repo")
+    other = tmp_path / "other"
+    task = _task(TASK_ID)
+    probe = GateProbe(repo, review_high=0)
+    probe.install(monkeypatch)
+    captured = _patch_cli_task_basics(monkeypatch, repo, task, probe)
+    masters: dict[str, str] = {}
+
+    async def planting_dev_test_loop(task, project_dir, project_context, args, output=None):
+        probe.agent_commits(project_dir, task["id"])
+        _clone_with_decoy_branch(repo, other)
+        _git(other, "checkout", "-q", TASK_BRANCH)
+        with open(other / ".git" / "info" / "exclude", "a", encoding="utf-8") as exclude:
+            exclude.write(".forge-worktrees/\n")
+        masters["repo"], masters["other"] = _master(repo), _master(other)
+        os.rename(repo / ".git", repo / ".git.bak")
+        for directory in (repo, Path(project_dir)):
+            _replace_with_clone_files(directory, other)
+            _plant_git_file(directory, other / ".git")
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    monkeypatch.setattr(cli_mod, "run_dev_test_loop", planting_dev_test_loop)
+
+    asyncio.run(cli_mod.run_mode_task(_cli_args(task=TASK_ID)))
+
+    assert masters, "the agent never ran"
+    assert _master(other) == masters["other"], "merged into the agent's clone"
+    assert _master_in(repo / ".git.bak") == masters["repo"]
+    assert captured.get("outcome") != "tests_passed"
+    assert not captured.get("merged_sha")
+    assert "event=repository-identity-changed" in capsys.readouterr().err
