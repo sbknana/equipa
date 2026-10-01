@@ -361,8 +361,13 @@ def test_prompt_no_longer_claims_what_the_gate_does_not_count():
 REVIEW_BYTES = 200 * 1024
 
 
-@pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n", "\N{LINE SEPARATOR}",
-                                        " \n", "\t\n"])
+@pytest.mark.parametrize("line_break", [
+    "\n", "\r", "\r\n", "\N{LINE SEPARATOR}", " \n", "\t\n",
+    # Every other character str.splitlines() breaks a line on. Before task
+    # 3137 each single-byte one took about 1 s per 200 KB, like "\n".
+    "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
+    "\N{PARAGRAPH SEPARATOR}",
+])
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     # Inside the Summary section, and after a heading that ends it (where
