@@ -4144,9 +4144,13 @@ def _shown_lines(lines: list[int]) -> str:
     return shown
 
 
-def _backstop_views(text: str) -> list[tuple[str, list[int] | None]]:
+def _backstop_views(
+    text: str, *, links: bool = True,
+) -> list[tuple[str, list[int] | None]]:
     """The views the backstop reads ``text`` in, each with its line origins
-    (None: the lines of ``text``)."""
+    (None: the lines of ``text``). ``links=False`` leaves out the Markdown
+    link readings, the costliest views (task 3154: the separated reading
+    goes without them so a 200 KB link flood stays under 0.5 s)."""
     views: list[tuple[str, list[int] | None]] = [
         (_backstop_normalized(text), None),
     ]
@@ -4165,6 +4169,8 @@ def _backstop_views(text: str) -> list[tuple[str, list[int] | None]]:
         math = _backstop_math_joined(base_view)
         if math is not None:
             views.append((math, base_origins))
+        if not links:
+            continue
         for link_text, link_origins in _backstop_links_read(base_view):
             if link_origins is None:
                 link_origins = base_origins
@@ -4216,7 +4222,7 @@ def _severity_token_backstop(
     # Task 3154 (I3152-01, I3152-02): the separated reading only adds words,
     # so it can never trust a review the other views block.
     if separated_text is not None:
-        for view, origins in _backstop_views(separated_text):
+        for view, origins in _backstop_views(separated_text, links=False):
             for key, count in _backstop_tokens(view, origins, covered,
                                                separated=True).items():
                 if count > tokens.get(key, 0):
