@@ -217,10 +217,14 @@ ways that switched the Bash gate off with the real CLI: a user-scope
 PreToolUse hook answering `updatedInput` (the CLI runs the rewritten command,
 the gate judged the original) and a function in `~/.bashrc`.
 
-Every Claude CLI run EQUIPA starts from the orchestrator (agents, testers,
-reviewers, reflexion through `_spawn_agent_process`, and the RLM `claude -p`
-calls) therefore gets its **own CLAUDE_CONFIG_DIR**
-(`equipa/cli_isolation.py`):
+Every Claude CLI run EQUIPA starts (agents, testers, reviewers and
+reflexion through `_spawn_agent_process`; the RLM `claude -p` calls; the
+ForgeSmith GHOST scout and OPRO proposals, SIMBA rule generation and the
+autoresearch prompt mutation through `claude_cli_run_env`, and the
+autoresearch SSH path through `REMOTE_RUN_CONFIG_DIR_PREFIX`) therefore gets
+its **own CLAUDE_CONFIG_DIR** (`equipa/cli_isolation.py`). A drift fence in
+`tests/test_cli_config_isolation_3150.py` fails when a new `claude` argv
+appears in a function that uses none of these:
 
 - created per run with `mkdtemp` (mode 0700, owned by the orchestrator's
   user, checked after creation) in the orchestrator's temp directory;
@@ -238,12 +242,12 @@ over `SHELL`, and drops `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`,
 passthrough lists them.
 
 **Deploy note:** the login in `~/.claude/.credentials.json` is no longer
-used by agent runs. Export `CLAUDE_CODE_OAUTH_TOKEN` (create one with
-`claude setup-token`) for the orchestrator, or every run fails to
-authenticate; the orchestrator logs a WARNING naming the variable on the
-first run without it. ForgeSmith, the autoresearch loop and other standalone
-operator scripts still run the CLI with the operator's own environment and
-configuration.
+used by any of these runs. Export `CLAUDE_CODE_OAUTH_TOKEN` (create one
+with `claude setup-token`) for the orchestrator and for the ForgeSmith,
+SIMBA and autoresearch jobs (cron does not read `~/.bashrc`), or every run
+fails to authenticate; the orchestrator logs a WARNING naming the variable
+on the first run without it. The startup check in `equipa/cli.py` still
+accepts the credentials file as a login and does not yet say this.
 
 With `bash_security_pretooluse` on, the `--settings` file EQUIPA generates
 is the second layer. It pins `"disableAllHooks": false` (flag-scope
