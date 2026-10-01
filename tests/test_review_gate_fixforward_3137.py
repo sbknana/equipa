@@ -339,14 +339,24 @@ def test_rendered_view_counts_a_nested_finding_once():
 
 def test_honest_review_of_the_new_shapes_merges():
     """A review that writes these shapes and counts them in its footer is
-    trusted, with the counts it states."""
+    trusted, with the counts it states.
+
+    Task 3152: only the counted heading's own label may be an UPPER-case
+    HIGH (no section exemption), so the repeats are written in lower case;
+    in UPPER case the review blocks (the merge was blocked before as well,
+    by HIGH=1).
+    """
     body = ["### [S1] HIGH \N{EM DASH} SQL injection in login", "Details.", "",
-            "- Finding 1", "", "    HIGH: SQL injection in login",
-            "", "[^1]: HIGH: SQL injection in login"]
+            "- Finding 1", "", "    high: SQL injection in login",
+            "", "[^1]: high: SQL injection in login"]
     footer = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
     analysis = analyze(review("1 finding.", body, footer, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["HIGH"] == 1
+    upper = [line.replace("high:", "HIGH:") for line in body]
+    blocked = analyze(review("1 finding.", upper, footer, low_heading=False))
+    assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
+    assert blocked.detail.startswith(loops.BACKSTOP_REASON + " at line ")
 
 
 # --- prompt: the format rule claims only what the gate counts --------------------
