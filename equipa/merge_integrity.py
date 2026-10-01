@@ -524,6 +524,39 @@ async def _git_path(repo: str | os.PathLike, *args: str) -> Path | None:
     return path if path.is_absolute() else Path(repo) / path
 
 
+# IND3132-06 (task #3146): files that change which objects or parents git
+# sees. ``info/grafts`` rewrites commit parents even with
+# GIT_NO_REPLACE_OBJECTS set, and ``objects/info/alternates`` adds another
+# object store (one the agent can write) to every lookup.
+_OBJECT_GRAPH_FILES = (
+    ("info/grafts", "commit parents"),
+    ("objects/info/alternates", "the object store"),
+)
+
+
+async def _object_graph_hazards(repo: str | os.PathLike) -> list[str]:
+    """A grafts or alternates file present in the repository (fail closed)."""
+    hazards: list[str] = []
+    for relative, effect in _OBJECT_GRAPH_FILES:
+        path = await _git_path(repo, "--git-path", relative)
+        if path is None:
+            hazards.append(f"could not locate {relative}")
+            continue
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            hazards.append(f"{relative} is unreadable ({exc.strerror})")
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
+            hazards.append(
+                f"{relative} is present and rewrites {effect} for every git "
+                f"call; remove it before the merge"
+            )
+    return hazards
+
+
 async def _submodule_config_hazards(repo: str | os.PathLike) -> list[str]:
     """Drivers defined in, or selected by, submodule git dirs (MI-05).
 
@@ -603,6 +636,8 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
       anything but ``none`` (IND-02, IND-01, task #3132).
     * ``info/attributes`` or the global attributes file selecting a driver
       outside the built-in / git-lfs set.
+    * a non-empty ``info/grafts`` or ``objects/info/alternates`` (IND3132-06,
+      task #3146).
     * submodule git dirs defining or selecting such a driver (MI-05).
     """
     hazards: list[str] = []
@@ -658,6 +693,7 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
         hazards.append("could not locate info/attributes")
     else:
         hazards.extend(attribute_file_hazards(info_attributes, "info/attributes"))
+    hazards.extend(await _object_graph_hazards(repo))
     attributes_file = await git_run_async(
         ["config", "--type=path", "--get", "core.attributesFile"],
         repo, timeout=_GIT_TIMEOUT,

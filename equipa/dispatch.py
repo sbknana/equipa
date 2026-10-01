@@ -115,6 +115,7 @@ from equipa.security_gate import (
     SecurityGateBypassError,
     _gate_audit_log,
     decide_merge_gate,
+    describe_submodule_pointer_changes,
     format_counts,
     get_changed_files_for_branch,
     get_reviewer_run,
@@ -3324,11 +3325,27 @@ async def review_task_branch(
         )
         return outcome, False
 
+    # IND3132-02 (task #3146): a submodule pointer bump can be hidden from
+    # the reviewer's own `git diff`, so it is named in the context the
+    # reviewer is given (its prompt quotes the task description).
+    review_task = task
+    pointer_note = describe_submodule_pointer_changes(changed_files)
+    if pointer_note is not None:
+        review_task = {
+            **task,
+            "description": f"{task.get('description') or ''}\n\n{pointer_note}",
+        }
+        log(
+            f"[Task #{task_id}] SECURITY GATE: reviewer told about submodule "
+            f"pointer change(s).",
+            output,
+        )
+
     review_crashed = False
     sec_result = None
     try:
         sec_result = await run_security_review(
-            task, task_dir, project_context, args,
+            review_task, task_dir, project_context, args,
             output=output,
             stable_project_dir=project_dir,
         )

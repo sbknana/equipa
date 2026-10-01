@@ -1040,7 +1040,52 @@ class SubmodulePointerPath(str):
 
     Returned by :func:`get_changed_files_for_branch`. It is an ordinary
     ``str`` for every other purpose; :func:`is_doc_only_diff` refuses it.
+    ``old_sha`` / ``new_sha`` (task #3146) are the submodule commits the
+    pointer moves between (all zeros when it is added or removed).
     """
+
+    old_sha: str
+    new_sha: str
+
+    def __new__(
+        cls, path: str, old_sha: str = "", new_sha: str = "",
+    ) -> SubmodulePointerPath:
+        instance = super().__new__(cls, path)
+        instance.old_sha = old_sha
+        instance.new_sha = new_sha
+        return instance
+
+
+def describe_submodule_pointer_changes(changed_files: list[str]) -> str | None:
+    """Reviewer note listing every submodule pointer change, or None.
+
+    IND3132-02 (task #3146): a committed ``.gitmodules`` ``ignore = all``
+    (or similar config) hides a gitlink bump from a plain ``git diff``, so
+    the reviewer must be told about it explicitly. Paths are branch-authored
+    and quoted; SHAs are git's hex output.
+    """
+    pointers = [
+        path for path in changed_files if isinstance(path, SubmodulePointerPath)
+    ]
+    if not pointers:
+        return None
+    lines = [
+        "ORCHESTRATOR NOTE (added by the merge gate, not part of the task): "
+        "this branch changes the following submodule pointer(s). A plain "
+        "`git diff` may hide them (`.gitmodules` `ignore = all` or "
+        "`diff.ignoreSubmodules`); `git diff --ignore-submodules=none` shows "
+        "them. The code they point at is outside this repository's diff. "
+        "Review every pointer change and report one you cannot verify as a "
+        "finding:",
+    ]
+    for path in pointers[:50]:
+        lines.append(
+            f"- {path[:200]!r}: {(path.old_sha or 'unknown')[:40]} -> "
+            f"{(path.new_sha or 'unknown')[:40]}"
+        )
+    if len(pointers) > 50:
+        lines.append(f"- ... and {len(pointers) - 50} more")
+    return "\n".join(lines)
 
 
 # git's file mode for a gitlink (a submodule pointer) in a tree.
@@ -1064,14 +1109,21 @@ def _parse_raw_diff_z(raw: str) -> list[str] | None:
         if len(header) != 5 or not header[0].startswith(":"):
             return None
         old_mode, new_mode, status = header[0][1:], header[1], header[4]
+        old_sha, new_sha = header[2], header[3]
         path_count = 2 if status[:1] in ("R", "C") else 1
         record_paths = fields[index + 1:index + 1 + path_count]
         if len(record_paths) != path_count:
             return None
         gitlink = _GITLINK_MODE in (old_mode, new_mode)
         for path in record_paths:
-            if path.strip():
-                paths.append(SubmodulePointerPath(path) if gitlink else path)
+            # IND3132-03 (task #3146): a name that is only whitespace (or
+            # otherwise odd) is still a changed file; is_doc_path judges it.
+            # git never prints an empty path, so one means malformed output.
+            if not path:
+                return None
+            paths.append(
+                SubmodulePointerPath(path, old_sha, new_sha) if gitlink else path
+            )
         index += 1 + path_count
     return paths
 

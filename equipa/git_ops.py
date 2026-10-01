@@ -837,8 +837,11 @@ _GIT_ENV_ALLOWLIST = frozenset({
     "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
     "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
     "PROGRAMDATA",
+    # IND3132-04 (task #3146): only the locale variables git and gh read
+    # for text handling, not every LC_* name (an arbitrary LC_SECRET used to
+    # reach every child).
+    "LC_ALL", "LC_CTYPE",
 })
-_GIT_ENV_ALLOWED_PREFIXES = ("LC_",)
 
 # Given only to the calls that talk to GitHub (gh, git push): credentials,
 # gh's own config location and the proxy settings (a proxy URL can carry a
@@ -880,7 +883,7 @@ def _get_repo_env() -> dict[str, str]:
     """Allowlisted environment for a git / gh child, git and gh on the PATH."""
     env = {
         key: value for key, value in os.environ.items()
-        if key in _GIT_ENV_ALLOWLIST or key.startswith(_GIT_ENV_ALLOWED_PREFIXES)
+        if key in _GIT_ENV_ALLOWLIST
     }
     extra_paths = []
     for candidate in [
