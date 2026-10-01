@@ -856,7 +856,7 @@ def escape_audit_text(text: str) -> str:
         code = ord(char)
         if code < 0x20 or 0x7F <= code <= 0x9F:
             escaped.append(f"\\x{code:02x}")
-        elif char in "  ":
+        elif char in "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}":
             escaped.append(f"\\u{code:04x}")
         else:
             escaped.append(char)
