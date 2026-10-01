@@ -357,7 +357,14 @@ def test_hidden_high_form_counted_in_footer_is_trusted(tmp_path, form):
     task_id = 94200 + list(HIDDEN_HIGH_FORMS).index(form)
     write_recorded_review(tmp_path, task_id, text)
     blocks, counts = gate_result(tmp_path, task_id)
-    assert blocks is True and counts and counts["HIGH"] == 1, (blocks, counts)
+    if SEVERITY_TOKEN.search(HIDDEN_HIGH_FORMS[form]):
+        # Task 3152: an UPPER-case HIGH that is not a counted heading's label
+        # blocks even when the footer counts it (no section or footer-count
+        # exemption); the merge was blocked before too, by HIGH=1.
+        assert (blocks, counts) == (True, None)
+    else:
+        assert blocks is True and counts and counts["HIGH"] == 1, (
+            blocks, counts)
 
 
 # Lines that mention a severity word but report no finding. A clean review
@@ -375,9 +382,6 @@ BENIGN_SEVERITY_MENTIONS = {
     "clean-summary-prose": "No CRITICAL or HIGH findings in this area.",
     "html-comment": "<!-- reviewer note: HIGH bar for evidence -->",
 }
-EXEMPT_AS_WRITTEN = {"tally-table", "clean-summary-prose"}
-
-
 @pytest.mark.parametrize(
     "mention", list(BENIGN_SEVERITY_MENTIONS),
     ids=list(BENIGN_SEVERITY_MENTIONS),
@@ -386,17 +390,13 @@ def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention)
     """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
     MEDIUM only as a finding's label, so a compliant mention is in lower case
     and merges. In UPPER case every rule still reads it as no finding (the
-    review is trusted) and only the severity-token backstop blocks it."""
+    review is trusted) and only the severity-token backstop blocks it.
+
+    Task 3152: "tally-table" and "clean-summary-prose" (a zero tally and a
+    negation) merged as written under the 3143 exemptions; CRITICAL and HIGH
+    have none now, so they block like every other UPPER-case mention."""
     mention_text = BENIGN_SEVERITY_MENTIONS[mention]
-    if mention in EXEMPT_AS_WRITTEN:
-        # A zero tally or a negation cannot label a finding; the backstop
-        # exempts it, so it merges as written, as before task 3143.
-        written = finished_review().replace("Details.", mention_text)
-        write_recorded_review(tmp_path, 93099, written)
-        blocks, counts = gate_result(tmp_path, 93099)
-        assert blocks is False and counts and counts["LOW"] == 1, (
-            blocks, counts)
-    elif SEVERITY_TOKEN.search(mention_text):
+    if SEVERITY_TOKEN.search(mention_text):
         assert_only_the_backstop_blocks(
             finished_review().replace("Details.", mention_text))
     text = finished_review().replace(
