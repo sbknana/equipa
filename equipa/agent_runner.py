@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import weakref
 from collections.abc import Iterable, Iterator, Mapping
@@ -54,6 +55,8 @@ def _run_started_at_utc() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from equipa.prompts import PromptResult
 
 
@@ -2300,18 +2303,121 @@ _CLI_CONFIG_DIRS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # Process objects that cannot be weak-referenced (test doubles): by identity,
 # removed at termination or, failing that, when the orchestrator exits.
 _CLI_CONFIG_DIRS_BY_ID: dict[int, str] = {}
+# Every per-run directory created and not removed yet, with the PID that
+# created it. The stop-signal handler below removes only its own process's
+# entries: a forked child inherits this dict and the handler.
+_LIVE_CLI_CONFIG_DIRS: dict[str, int] = {}
 _env_auth_warning_logged = False
+
+# F-3 of the 3153 review: SIGTERM (systemctl stop, timeout) ends the process
+# without atexit, so neither the finalizers above nor
+# _remove_unreleased_cli_config_dirs ran, and a live run's directory stayed
+# behind until a later process swept it a day later. Same for a SIGINT whose
+# disposition is SIG_DFL.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# Marks a handler installed by _install_stop_signal_cleanup().
+_STOP_CLEANUP_MARKER = "_equipa_cli_config_dir_cleanup"
+# Set while a stop-signal handler cleans up; a second stop signal arriving
+# meanwhile returns at once, and the interrupted handler finishes.
+_stop_cleanup_running = False
 
 
 def _create_cli_config_dir() -> str:
     try:
-        return create_run_config_dir()
+        config_dir = create_run_config_dir()
     except RunConfigDirError as exc:
         raise AgentDispatchRefused(str(exc)) from exc
+    _LIVE_CLI_CONFIG_DIRS[config_dir] = os.getpid()
+    _install_stop_signal_cleanup()
+    return config_dir
+
+
+def _install_stop_signal_cleanup() -> None:
+    """Make SIGTERM / SIGINT remove this process's live per-run directories.
+
+    Runs for every new directory, so a handler that was displaced (a merge
+    shield restores the handler it found, which may predate this one) is
+    put back. Only the main thread may install signal handlers; elsewhere
+    this is a no-op.
+
+    A signal is taken over when its disposition is SIG_DFL (the process
+    would end without atexit) and, for SIGTERM, when a Python handler is in
+    place, which is chained. SIG_IGN and handlers installed outside Python
+    are left alone. So is a Python SIGINT handler: KeyboardInterrupt or
+    asyncio's cancellation unwind normally and atexit runs, and asyncio.run
+    installs its own Ctrl-C handler only over signal.default_int_handler.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in _STOP_SIGNALS:
+        current = signal.getsignal(signum)
+        if getattr(current, _STOP_CLEANUP_MARKER, False):
+            continue
+        if not (current == signal.SIG_DFL
+                or (signum == signal.SIGTERM and callable(current))):
+            continue
+        try:
+            signal.signal(signum, _stop_signal_cleanup_handler(current))
+        except (ValueError, OSError) as exc:
+            logger.warning("[Dispatch] cannot install the %s handler that "
+                           "removes per-run Claude config directories: %s",
+                           signal.Signals(signum).name, exc)
+
+
+def _stop_signal_cleanup_handler(previous: Any) -> Any:
+    """A stop-signal handler that chains ``previous`` (SIG_DFL or callable).
+
+    SIG_DFL: terminate this process's live agents (a CLI still running
+    could write into its directory while it is removed), remove its live
+    per-run directories, then restore SIG_DFL and re-send the signal, so the
+    process still dies of it. A callable runs first and decides: when it
+    returns, the process carries on (a merge shield only records the
+    request) and its runs stay intact; when it raises (SystemExit,
+    KeyboardInterrupt) the directories are removed before the exception
+    unwinds, which a slow shutdown cut short by SIGKILL would skip.
+    """
+    def handler(signum: int, frame: FrameType | None) -> None:
+        if _stop_cleanup_running:
+            return
+        if callable(previous):
+            try:
+                previous(signum, frame)
+            except BaseException:
+                _remove_live_cli_config_dirs_on_stop(terminate_agents=False)
+                raise
+            return
+        _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    setattr(handler, _STOP_CLEANUP_MARKER, True)
+    return handler
+
+
+def _remove_live_cli_config_dirs_on_stop(*, terminate_agents: bool) -> None:
+    """Remove every live per-run directory this process created.
+
+    Never raises: the caller must still re-send or re-raise the signal.
+    """
+    global _stop_cleanup_running
+    _stop_cleanup_running = True
+    try:
+        if terminate_agents:
+            _terminate_live_agents_at_exit()
+        own_pid = os.getpid()
+        for config_dir, creator_pid in _LIVE_CLI_CONFIG_DIRS.copy().items():
+            if creator_pid == own_pid:
+                _remove_cli_config_dir(config_dir)
+    except Exception:  # noqa: BLE001 - the signal must still end the process
+        logger.exception("[Dispatch] per-run Claude config directory "
+                         "cleanup on a stop signal failed")
+    finally:
+        _stop_cleanup_running = False
 
 
 def _remove_cli_config_dir(config_dir: str) -> None:
     errors = remove_run_config_dir(config_dir)
+    _LIVE_CLI_CONFIG_DIRS.pop(config_dir, None)
     if errors:
         logger.warning("[Dispatch] per-run Claude config directory %s not "
                        "fully removed: %s", config_dir, "; ".join(errors[:5]))
