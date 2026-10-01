@@ -769,7 +769,49 @@ def test_verify_script_runs_each_of_the_four_probes(probe, marker):
 # sources $HOME/.bashrc for its shell snapshot. Otherwise it "runs" ls and
 # prints the stream-json events the script parses. No network.
 SIMULATED_CLI = r'''#!{python}
-import json, os, re, sys
+import json, os, re, subprocess, sys
+argv = sys.argv[1:]
+prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
+sources = None
+for index, arg in enumerate(argv):
+    if arg == "--setting-sources" and index + 1 < len(argv):
+        sources = argv[index + 1]
+# Probe W (task 3153): the Write tool puts a settings.json into the config
+# dir mid-run. Like the real CLI, a run that loads the user source re-reads
+# it and runs its hooks through /bin/sh; --setting-sources "" does not.
+HONOR_SOURCES = True
+write = re.search(r"Write tool to create the file (\S+) with exactly this "
+                  r"content: (\{{.*\}}) -- Step 2", prompt)
+if write:
+    path, content = write.group(1), write.group(2)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    if not HONOR_SOURCES or "user" in (sources or "").split(","):
+        for entry in json.loads(content).get("hooks", {{}}).get("PreToolUse", []):
+            for hook in entry.get("hooks", []):
+                subprocess.run(["/bin/sh", "-c", hook["command"]], check=False)
+    blocked = "echo `touch blocked_ran.txt`"
+    for event in [
+        {{"type": "assistant", "message": {{"content": [
+            {{"type": "tool_use", "name": "Write",
+              "input": {{"file_path": path}}}}]}}}},
+        {{"type": "user", "message": {{"content": [
+            {{"type": "tool_result", "is_error": False, "content": "ok"}}]}}}},
+        {{"type": "assistant", "message": {{"content": [
+            {{"type": "tool_use", "name": "Bash",
+              "input": {{"command": "sleep 6"}}}}]}}}},
+        {{"type": "user", "message": {{"content": [
+            {{"type": "tool_result", "is_error": False, "content": ""}}]}}}},
+        {{"type": "assistant", "message": {{"content": [
+            {{"type": "tool_use", "name": "Bash",
+              "input": {{"command": blocked}}}}]}}}},
+        {{"type": "user", "message": {{"content": [
+            {{"type": "tool_result", "is_error": True,
+              "content": "PreToolUse:Bash hook error: blocked"}}]}}}},
+        {{"type": "result", "is_error": False, "result": "DONE"}},
+    ]:
+        print(json.dumps(event))
+    sys.exit(0)
 config = os.environ.get("CLAUDE_CONFIG_DIR", "")
 settings = {{}}
 try:

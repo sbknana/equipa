@@ -159,6 +159,57 @@ def test_docs_describe_the_empty_value():
     assert "isolation closes both" not in orchestrator
 
 
+# --- R3150-01: the operator's live check gets a mid-run probe ----------------------
+
+
+def _verify_script(cli_source: str, tmp_path: Path, *args: str):
+    from tests.test_cli_config_isolation_3150 import _run_verify_script_with
+
+    return _run_verify_script_with(cli_source, tmp_path, *args)
+
+
+def _simulated_cli() -> str:
+    from tests.test_cli_config_isolation_3150 import SIMULATED_CLI
+
+    assert "HONOR_SOURCES = True" in SIMULATED_CLI
+    return SIMULATED_CLI
+
+
+def test_midrun_settings_write_probe_passes_when_the_cli_loads_no_settings(
+        tmp_path):
+    """The simulated CLI re-reads a mid-run settings.json only when the user
+    source is loaded; EQUIPA's argv loads none, so W PASSes."""
+    result = _verify_script(_simulated_cli(), tmp_path)
+    out = result.stdout
+    assert "[PASS] probe W_midrun_settings_write" in out, out + result.stderr
+    assert "shell snapshot in the per-run config directory is not probed" in out
+    assert result.returncode == 0, out + result.stderr
+
+
+def test_midrun_settings_write_probe_fails_when_the_hook_is_hot_loaded(
+        tmp_path):
+    """A CLI that loads the file written mid-run runs the planted hook: W
+    must FAIL and the whole check must fail."""
+    hot_loading = _simulated_cli().replace("HONOR_SOURCES = True",
+                                           "HONOR_SOURCES = False")
+    result = _verify_script(hot_loading, tmp_path)
+    assert "[FAIL] probe W_midrun_settings_write" in result.stdout, (
+        result.stdout + result.stderr)
+    assert "RESULT: FAIL" in result.stdout
+    assert result.returncode == 1
+
+
+def test_midrun_probe_without_the_write_is_inconclusive_not_pass(tmp_path):
+    """No settings.json written mid-run proves nothing about R3150-01."""
+    never_writes = _simulated_cli().replace("Write tool to create the file",
+                                            "never matches this prompt")
+    result = _verify_script(never_writes, tmp_path)
+    assert "[INCONCLUSIVE] probe W_midrun_settings_write" in result.stdout, (
+        result.stdout + result.stderr)
+    assert "RESULT: PASS" not in result.stdout
+    assert result.returncode == 3
+
+
 # --- R3150-07: the isolated unit ---------------------------------------------------
 
 
