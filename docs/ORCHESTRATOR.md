@@ -207,22 +207,91 @@ the `--settings` file EQUIPA passes and only the servers in EQUIPA's own
 `--mcp-config`. A project `CLAUDE.md` is therefore no longer seen by agents;
 put anything agents must know into the task or role prompt.
 
-User settings (`~/.claude/settings.json`) are still loaded, and agents running
-as the orchestrator's user can write them. With `bash_security_pretooluse` on,
-the `--settings` file EQUIPA generates therefore pins `"disableAllHooks":
-false` (flag-scope settings outrank user scope; RR-03) and sets to empty the
-variables a user-scope `env` block could use to turn hooks off
-(`CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`) or to run code around every
-command (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `LD_PRELOAD`, `NODE_OPTIONS`,
-`CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE`, ...; the list is
-`SETTINGS_ENV_NEUTRALISED` in `equipa/agent_runner.py`). An operator
-passthrough of one of those names is overridden as well. **Residual risk:**
-user scope can still set other variables (`PATH`, `HOME`, `GIT_*`), other
-settings (`apiKeyHelper` runs a command, extra hooks run on every tool call)
-and `~/.claude/CLAUDE.md` instructions. The complete fix is a per-unit
-`CLAUDE_CONFIG_DIR` that agents cannot write, under agent isolation (task
-3136). With the flag off no `--settings` file is passed and none of this
-applies.
+### User-scope Claude configuration is not loaded either
+
+`--setting-sources user` still loads the USER scope, and without agent
+isolation that was the operator's `~/.claude`, which agents running as the
+orchestrator's user can write. The independent review (RR3144-A) showed four
+ways that switched the Bash gate off with the real CLI: a user-scope
+`env.SHELL` naming a planted shell, a user-scope `env.BASH_FUNC_ls%%`, a user
+PreToolUse hook answering `updatedInput` (the CLI runs the rewritten command,
+the gate judged the original) and a function in `~/.bashrc`.
+
+Every Claude CLI run EQUIPA starts from the orchestrator (agents, testers,
+reviewers, reflexion through `_spawn_agent_process`, and the RLM `claude -p`
+calls) therefore gets its **own CLAUDE_CONFIG_DIR**
+(`equipa/cli_isolation.py`):
+
+- created per run with `mkdtemp` (mode 0700, owned by the orchestrator's
+  user, checked after creation) in the orchestrator's temp directory;
+- seeded with nothing, so no user `settings.json`, hooks, `env` block,
+  `CLAUDE.md` or `.claude.json` MCP servers exist for the run. The CLI
+  authenticates from `CLAUDE_CODE_OAUTH_TOKEN` in its environment, which
+  needs nothing in the directory;
+- removed when the run ends (`_terminate_agent`, every exit path; a
+  finalizer covers a process object that is never terminated).
+
+The CLI environment also pins `CLAUDE_CODE_SHELL` to an absolute,
+root-owned bash (`/bin/bash`, verified at run time), which the CLI prefers
+over `SHELL`, and drops `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`,
+`BASHOPTS`, `PS4` and every `BASH_FUNC_*` name, even when an operator
+passthrough lists them.
+
+**Deploy note:** the login in `~/.claude/.credentials.json` is no longer
+used by agent runs. Export `CLAUDE_CODE_OAUTH_TOKEN` (create one with
+`claude setup-token`) for the orchestrator, or every run fails to
+authenticate; the orchestrator logs a WARNING naming the variable on the
+first run without it. ForgeSmith, the autoresearch loop and other standalone
+operator scripts still run the CLI with the operator's own environment and
+configuration.
+
+With `bash_security_pretooluse` on, the `--settings` file EQUIPA generates
+is the second layer. It pins `"disableAllHooks": false` (flag-scope
+settings outrank user scope; RR-03), pins `CLAUDE_CODE_SHELL` to the same
+absolute bash, and sets to empty the variables an `env` block could use to
+turn hooks off (`CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`) or to run code
+around every command (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `LD_PRELOAD`,
+`NODE_OPTIONS`, `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_ENV_FILE`, ...; the list
+is `SETTINGS_ENV_NEUTRALISED` in `equipa/agent_runner.py`). An operator
+passthrough of one of those names is overridden as well. With the flag off
+no `--settings` file is passed; the per-run config directory and the CLI
+environment above still apply.
+
+**Live check:** `scripts/verify_gate_config_isolation.sh` (run by the
+operator with `CLAUDE_CODE_OAUTH_TOKEN` exported; four short CLI runs) plants
+each of the review's four vectors in a throwaway HOME and runs the real CLI
+through EQUIPA's own `build_cli_command` and `_spawn_agent_process` with the
+gate on. It reports PASS, FAIL or INCONCLUSIVE per probe. The three
+user-scope probes must PASS; the `~/.bashrc` probe is expected to FAIL until
+agent isolation (see the limitations below).
+
+### Bash gate limitations without agent isolation
+
+Until agent isolation is on (separate agent user and a per-unit HOME,
+[AGENT_ISOLATION.md](AGENT_ISOLATION.md)), the gate is a guard rail, not a
+boundary, for these reasons:
+
+- **`~/.bashrc` functions are still a bypass (RR3144-A (4)).** The CLI
+  takes a snapshot of the user's shell with `bash -c -l`, which sources the
+  rc files in `HOME`, and replays it before every command. A function `ls()`
+  planted in `~/.bashrc` runs in place of the `ls` the gate allowed. The
+  per-run CLAUDE_CONFIG_DIR does not change `HOME`, so this stays open until
+  each unit has its own HOME. Before relying on the gate, check that the
+  host's `~/.bashrc`, `~/.bash_profile` and `~/.profile` define no functions
+  or aliases for common commands.
+- **The hook and its checker live in an agent-writable tree (RR3144-B).**
+  `hooks/pretooluse_bash_gate.py` loads `equipa/bash_security.py` by path
+  from the deployed checkout, which is owned by the user agents run as. An
+  agent that edits either file turns the gate into allow-all for every later
+  run. `-I` on the hook's interpreter does not address this. The deploy must
+  make the runtime tree read-only to the agent user, which agent isolation
+  provides; until then, treat both files as part of the deploy checklist.
+- **The run's own config directory is writable by the run.** The CLI needs
+  to write to it, and the agent shares its user, so an agent can add a
+  `settings.json` there while it runs. That directory is never read by a
+  later run (each run gets a new one and it is removed afterwards), so the
+  effect is limited to the run itself. Concurrent runs share the user too;
+  isolation closes both.
 
 ## Agent isolation: what is and is not covered
 

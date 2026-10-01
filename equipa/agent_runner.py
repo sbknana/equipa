@@ -477,7 +477,7 @@ PRETOOLUSE_HOOK_SCRIPT = (
 # user-scope env blocks (BASH_FUNC_<name>%%, SHELL), hooks and CLAUDE.md
 # written by an agent are never loaded. This block stays as the second layer.
 # Residual until agent isolation (per-unit HOME): ~/.bashrc functions reach
-# the CLI's shell snapshot (docs/BASH_SECURITY_GATE.md).
+# the CLI's shell snapshot (docs/ORCHESTRATOR.md, gate limitations).
 SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
     "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
