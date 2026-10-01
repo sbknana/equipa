@@ -17,6 +17,7 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,24 @@ def _write(tmp_path: Path, markdown: str) -> Path:
     path = tmp_path / "SECURITY-REVIEW-3038.md"
     path.write_text(markdown, encoding="utf-8")
     return path
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+_SEVERITY_TOKEN_RE = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def _lowercase_severity_words(text: str) -> str:
+    return _SEVERITY_TOKEN_RE.sub(lambda match: match.group(1).lower(), text)
+
+
+def _assert_only_the_backstop_blocks(path: Path) -> None:
+    """Task 3143: the rules trusted the review (the backstop runs only then)
+    and the severity-token backstop blocked it: the reviewer prompt allows
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith("unaccounted severity token:"), (
+        analysis.detail)
 
 
 # ---------- S3033-01: resolved headings never lower the merge counts ----------
@@ -196,11 +215,15 @@ def test_fixed_inside_bold_span_resolves_bullet_recap(tmp_path: Path) -> None:
 
 
 def test_candidate_in_inline_code_is_ignored(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path,
-        BODY + "No findings. Headings look like `### [S1] HIGH — title`.\n"
+    # Task 3143: code is not exempt from the backstop, so the examples in
+    # UPPER case block; in lower case (reviewer prompt) no rule reads them.
+    examples = (
+        "No findings. Headings look like `### [S1] HIGH — title`.\n"
         + "`- **[S2] CRITICAL** — example`\n"
-        + _footer(),
+    )
+    _assert_only_the_backstop_blocks(_write(tmp_path, BODY + examples + _footer()))
+    path = _write(
+        tmp_path, BODY + _lowercase_severity_words(examples) + _footer(),
     )
 
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
@@ -212,10 +235,15 @@ def test_candidate_in_inline_code_is_ignored(tmp_path: Path) -> None:
 def test_fenced_heading_after_footer_is_not_trailing_structure(
     tmp_path: Path,
 ) -> None:
+    # Task 3143: the example in UPPER case is a severity word in code, which
+    # the backstop blocks; in lower case (reviewer prompt) it is no trailing
+    # structure.
+    example = "\n```markdown\n## Notes\n- **[S9] HIGH** — example only\n```\n"
+    _assert_only_the_backstop_blocks(
+        _write(tmp_path, BODY + "No findings.\n" + _footer() + example))
     path = _write(
         tmp_path,
-        BODY + "No findings.\n" + _footer()
-        + "\n```markdown\n## Notes\n- **[S9] HIGH** — example only\n```\n",
+        BODY + "No findings.\n" + _footer() + _lowercase_severity_words(example),
     )
 
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK

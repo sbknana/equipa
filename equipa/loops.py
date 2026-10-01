@@ -996,15 +996,68 @@ _REVIEW_FINDING_HEADER_RE = re.compile(
 # a stale all-zero footer behind; preferring it merged an unfinished review
 # with MEDIUM/LOW headers as clean. Both tallies are now computed and must
 # agree (see _analyze_review_file).
-_REVIEW_COUNTS_FOOTER_RE = re.compile(
-    r"^##\s+Counts\s*\n[^\n]*?"
-    r"CRITICAL\s*:\s*(\d+)[^\n]*?"
-    r"HIGH\s*:\s*(\d+)[^\n]*?"
-    r"MEDIUM\s*:\s*(\d+)[^\n]*?"
-    r"LOW\s*:\s*(\d+)[^\n]*?"
-    r"INFO\s*:\s*(\d+)",
-    re.MULTILINE | re.IGNORECASE,
+#
+# Task 3143: the footer used to be one regex, "^##\s+Counts\s*\n" and then
+# "[^\n]*?CRITICAL\s*:\s*(\d+)" and so on for each severity. Its five nested
+# lazy runs retried every later field for every earlier occurrence, so one
+# 200 KB tally line of "CRITICAL: 0 " took 30 s. The same footers are now
+# found field by field: each field is the first "SEVERITY: N" whose label
+# starts on the line where the previous field ended (a later occurrence can
+# never succeed where the first one failed), which is the match the regex
+# returned, in linear time.
+_COUNTS_HEADING_RE = re.compile(r"^##\s+Counts\s*\n",
+                                re.MULTILINE | re.IGNORECASE)
+_COUNTS_FIELD_RES = tuple(
+    (re.compile(severity, re.IGNORECASE),
+     re.compile(severity + r"\s*:\s*(\d+)", re.IGNORECASE))
+    for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 )
+
+
+@dataclass(frozen=True)
+class _CountsFooter:
+    """One "## Counts" footer: its span, counts and severity label offsets."""
+
+    start: int
+    end: int
+    counts: tuple[int, ...]
+    label_starts: tuple[int, ...]
+
+
+def _counts_footer_at(text: str, heading: re.Match[str]) -> _CountsFooter | None:
+    """The footer whose "## Counts" heading is ``heading``, or None."""
+    position = heading.end()
+    counts: list[int] = []
+    label_starts: list[int] = []
+    for label_re, field_re in _COUNTS_FIELD_RES:
+        line_end = text.find("\n", position)
+        line_end = len(text) if line_end == -1 else line_end
+        field = None
+        for label in label_re.finditer(text, position, line_end):
+            field = field_re.match(text, label.start())
+            if field is not None:
+                break
+        if field is None:
+            return None
+        counts.append(int(field.group(1)))
+        label_starts.append(field.start())
+        position = field.end()
+    return _CountsFooter(heading.start(), position, tuple(counts),
+                         tuple(label_starts))
+
+
+def _counts_footers(text: str) -> list[_CountsFooter]:
+    """Every "## Counts" footer in ``text``, in order, never overlapping."""
+    footers: list[_CountsFooter] = []
+    position = 0
+    while (heading := _COUNTS_HEADING_RE.search(text, position)) is not None:
+        footer = _counts_footer_at(text, heading)
+        if footer is None:
+            position = heading.start() + 1
+            continue
+        footers.append(footer)
+        position = footer.end
+    return footers
 
 # Sentinel marker written into orchestrator-saved fallback dumps when the
 # reviewer agent failed to write a structured SECURITY-REVIEW artifact.
@@ -1494,6 +1547,9 @@ _SETEXT_NON_TEXT_RE = re.compile(
 # prose, footer) must still pass; the Summary markers and the header/footer
 # agreement check are the primary signals.
 _REVIEW_MIN_NONBLANK_LINES = 4
+# Task 3143: the longest of the ~870 distinct real reviews has about 1,000
+# lines; ten times that is the most the gate parses.
+_REVIEW_MAX_PARSED_LINES = 10_000
 
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
@@ -1934,10 +1990,15 @@ def _html_candidates(
     severity ``seen`` already holds for that line is not reported again.
     Heading lines are left to the heading rules, which read through tags.
     A list item that opens with its own marker ("<li>1. HIGH: SQLi") keeps
-    only the innermost marker (task 3137, SR3130-01).
+    only the innermost marker (task 3137, SR3130-01). Task 3143 (R3137-00):
+    the piece is read as rewritten AND as reduced, under the same source
+    line, so the reduction can only add candidates. "<li>> SQLi - HIGH" is
+    a list item ("- > SQLi - HIGH") that the reduction turned into a quote,
+    which the trailing-severity rules do not read.
     """
     source_lines: list[int] = []
     pieces: list[str] = []
+    reduced_pieces: list[str] = []
     for line_number, line in enumerate(visible_text.split("\n")):
         if "<" not in line or not _HTML_TAG_RE.search(line):
             continue
@@ -1945,25 +2006,32 @@ def _html_candidates(
             # A gap ends any table the previous tagged line was part of.
             source_lines.append(line_number - 1)
             pieces.append("")
+            reduced_pieces.append("")
         for piece in _html_as_markdown(line).split("\n"):
             source_lines.append(line_number)
-            pieces.append(_innermost_container_line(piece))
+            pieces.append(piece)
+            reduced_pieces.append(_innermost_container_line(piece))
     if not pieces:
         return []
-    markdown = "\n".join(pieces)
-    line_of = _line_number_finder(markdown)
-    markdown_candidates = [
-        (line_of(match.start()), match.group(1).upper())
-        for match in _FINDING_CANDIDATE_RE.finditer(markdown)
-        if not _candidate_line(match).lstrip(" \t").startswith("#")
-    ]
-    markdown_candidates += _shape_candidates(markdown, set())
     found: list[tuple[int, str]] = []
-    for markdown_line, severity in markdown_candidates:
-        key = (source_lines[markdown_line], severity)
-        if key not in seen:
-            seen.add(key)
-            found.append(key)
+    # Both documents have one piece per entry of source_lines, so every piece
+    # is read in the same context as before; the second adds candidates only.
+    for document in (pieces, reduced_pieces):
+        markdown = "\n".join(document)
+        line_of = _line_number_finder(markdown)
+        markdown_candidates = [
+            (line_of(match.start()), match.group(1).upper())
+            for match in _FINDING_CANDIDATE_RE.finditer(markdown)
+            if not _candidate_line(match).lstrip(" \t").startswith("#")
+        ]
+        markdown_candidates += _shape_candidates(markdown, set())
+        for markdown_line, severity in markdown_candidates:
+            key = (source_lines[markdown_line], severity)
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+        if reduced_pieces == pieces:
+            break  # nothing was reduced: the second read is the same
     return found
 
 
@@ -1984,15 +2052,36 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
 # blocks as written, as it did before).
 #
 # The provenance and completion comments the gate itself asks for, each on a
-# line of its own. A review whose rendered view differs from its text only by
-# these is parsed once. Task 3137 (N1): the comment must fill its line. One
+# line of its own. Task 3137 (N1): the comment must fill its line. One
 # inside a word ("HI<!-- EQUIPA-X -->GH: SQLi") joins the word when rendered,
-# so that review must be parsed as rendered too.
+# so that review must be parsed as rendered too. Task 3143 (R3137-03): only
+# the first and the last line of the review may hold one for the review to
+# be parsed once. Anywhere else a marker line is text as written and a blank
+# line as rendered: between "## Counts" and its tally it hid the footer.
 _STANDALONE_MARKER_COMMENT_RE = re.compile(
     r"^[ \t]{0,3}<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?(?:[ \t]*[0-9A-Fa-f]{1,64})?"
     r"[ \t]*-->[ \t]*$",
     re.MULTILINE,
 )
+
+
+def _without_edge_markers(text: str) -> str:
+    """``text`` with a marker comment line on its first or last line emptied.
+
+    The last line is the last non-blank one, so a trailing line break after
+    the completion line does not hide it. Markers elsewhere are kept.
+    """
+    first_end = text.find("\n")
+    first_end = len(text) if first_end == -1 else first_end
+    if _STANDALONE_MARKER_COMMENT_RE.fullmatch(text, 0, first_end):
+        text = text[first_end:]
+    body = text.rstrip(" \t\n")
+    last_start = body.rfind("\n") + 1
+    if last_start > 0 and _STANDALONE_MARKER_COMMENT_RE.fullmatch(
+        body, last_start,
+    ):
+        text = text[:last_start] + text[len(body):]
+    return text
 # Task 3137 (N3): a run of blank lines renders as one paragraph break, and a
 # 200 KB review of nothing but line breaks took about 1 s to parse (every rule
 # pays per line). Each run of two or more blank lines is folded into ONE
@@ -2126,6 +2215,8 @@ _BACKTICK_RUN_RE = re.compile(r"`+")
 # The tag form is looser than CommonMark's, so it can only keep a backtick
 # from opening code (more text shown, fail closed).
 _INLINE_OPENER_RE = re.compile(r"`+|<!--|<[A-Za-z/?!][^<>\n]{0,500}>")
+# "\`" pairs right after an escaped lone backtick, each backtick alone.
+_ESCAPED_BACKTICK_RUN_RE = re.compile(r"(?:\\`(?!`))*")
 # A line the per-line _blank_code would take for a fence. In the rendered
 # text every real fence is already blanked, so what is left is text.
 _TILDE_FENCE_LINE_RE = re.compile(r"^([ \t]{0,3})(~{3,})", re.MULTILINE)
@@ -2154,18 +2245,26 @@ def _closes_fence(stripped: str, fence: str) -> bool:
     return run >= len(fence) and not stripped[run:].strip(" \t")
 
 
+# Either closer, whichever comes first: one scan that stops at the first
+# "-->" or "--!>", so a flood of "<!-- a --!>" is not searched to the end.
+_COMMENT_CLOSER_RE = re.compile(r"--!?>")
+
+
 def _comment_end(text: str, start: int, limit: int) -> int:
     """Offset just past the HTML comment that opens at ``start``, or -1.
 
     "<!-->" and "<!--->" are empty comments; any other comment ends at the
-    first "-->" before ``limit``.
+    first "-->" or "--!>" before ``limit``. Task 3143 (I-01): a browser also
+    closes a comment at "--!>" (WHATWG "incorrectly-closed-comment"), so
+    "<!-- a --!>HIGH: SQLi -->" shows "HIGH: SQLi -->". -1 means neither
+    closer occurs before ``limit``, which callers remember.
     """
     if text.startswith("<!-->", start):
         return start + 5
     if text.startswith("<!--->", start):
         return start + 6
-    close = text.find("-->", start + 4, limit)
-    return -1 if close == -1 else close + 3
+    close = _COMMENT_CLOSER_RE.search(text, start + 4, limit)
+    return -1 if close is None else close.end()
 
 
 def _neutralize_backticks(line: str) -> str:
@@ -2445,6 +2544,20 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
 
     while (token := _INLINE_OPENER_RE.search(text, position)) is not None:
         start = token.start()
+        if (token.end() - start == 1 and text[start] == "`" and start
+                and text[start - 1] == "\\" and _is_escaped(text, start, 0)):
+            # Task 3143 (timing): a lone escaped backtick is text and opens
+            # nothing (it may still close an earlier span, as a closer
+            # candidate above), so the block lookups below are skipped; a
+            # 200 KB flood of "\`" took 0.46 s. A backslash run never
+            # crosses a line break, so the floor of 0 reads the same run.
+            # Every "\`" straight after it is one too (its backslash follows
+            # a backtick, so it is a run of one) and is read in one step.
+            run_end = _ESCAPED_BACKTICK_RUN_RE.match(text, token.end()).end()
+            emit(text[position:start] + _LITERAL_CODE_MARK
+                 + text[token.end():run_end].replace("`", _LITERAL_CODE_MARK))
+            position = run_end
+            continue
         line = bisect.bisect_right(line_starts, start) - 1
         line_start = line_starts[line]
         if line in blocks.table_rows:
@@ -2506,9 +2619,40 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
     return _TILDE_FENCE_LINE_RE.sub(_neutralize_tilde_fence, "".join(pieces))
 
 
+class _ReferenceTable(dict):
+    """Decoded text per character reference, filled per reference seen.
+
+    Task 3143 (timing): a 200 KB flood of one reference ("&#10;" 40,000
+    times) decoded each one with ``html.unescape`` and took 0.2 s per view;
+    repeats are now one dict lookup. Only references of at most
+    ``_CACHED_REFERENCE_LENGTH`` characters and at most
+    ``_REFERENCE_TABLE_LIMIT`` of them are kept, so memory stays bounded
+    however many digits or distinct references a review holds.
+    """
+
+    def __init__(self, decode: Callable[[str], str]) -> None:
+        super().__init__()
+        self._decode = decode
+
+    def __missing__(self, reference: str) -> str:
+        value = self._decode(reference)
+        if (len(reference) <= _CACHED_REFERENCE_LENGTH
+                and len(self) < _REFERENCE_TABLE_LIMIT):
+            self[reference] = value
+        return value
+
+
+_CACHED_REFERENCE_LENGTH = 40
+_REFERENCE_TABLE_LIMIT = 65536
+
+
 def _decode_character_reference(match: re.Match[str]) -> str:
     """One character reference as the text the parser should see."""
-    reference = match.group(0)
+    return _RENDERED_REFERENCES[match.group(0)]
+
+
+def _decoded_reference_text(reference: str) -> str:
+    """``reference`` ("&#72;", "&Eta;") as the text the parser should see."""
     decoded = html.unescape(reference)
     if decoded == reference:
         return reference  # unknown name: the renderer shows it literally
@@ -2529,6 +2673,9 @@ def _decode_character_reference(match: re.Match[str]) -> str:
            for char in decoded):
         return _REFERENCE_BLANK
     return _UNSAFE_REFERENCE_CHAR
+
+
+_RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
 
 
 # Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
@@ -2582,6 +2729,503 @@ def _rendered_review_text(text: str) -> str:
     text = _INTRAWORD_EMPHASIS_RE.sub("", text)
     # Removed code and comments can leave long runs of blank lines (task 3137).
     return _fold_blank_line_runs(_INTERIOR_BLANK_RUN_RE.sub(" ", text))
+
+
+# --- Task 3143: fail-closed severity-token backstop -----------------------------
+#
+# Three rounds of rule-by-rule fixes (tasks 3122, 3130, 3137) each left or
+# opened a shape that renders as a finding and that no rule above counts. The
+# backstop models no shape. After the rules have run, every standalone
+# UPPER-case CRITICAL, HIGH and MEDIUM anywhere in the review, code blocks and
+# quotes included, must be a counted finding; only the labels of the final
+# "## Counts" tally and the completion line are exempt. The reviewer prompt
+# tells reviewers to write severity words in lower case everywhere except a
+# finding's label. LOW and INFO never block a merge and are not read.
+
+BACKSTOP_REASON = "unaccounted severity token"
+_BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
+# The word must not touch a letter or digit. "_" is not a word character
+# here: "_HIGH_" renders as an emphasised HIGH. The character before the word
+# is checked in Python, so the scan starts at a word's first letter.
+_BACKSTOP_TOKEN_RE = re.compile(r"(?:CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+# HTML5 character references, with or without the semicolon. html.unescape
+# decides what each means (legacy names such as "&amp" need no semicolon) and
+# leaves an unknown one as written.
+_BACKSTOP_REFERENCE_RE = re.compile(
+    r"&(?:#[0-9]+;?|#[xX][0-9A-Fa-f]+;?|[A-Za-z][A-Za-z0-9]{0,31};?)",
+)
+# Markup a browser does not show: start and end tags, "<!DOCTYPE ...>" and
+# the bogus comments "<!x>", "<?x>" and "</ x>". The body stops at the next
+# "<", so a flood of unclosed "<a" is scanned once.
+_BACKSTOP_TAG_RE = re.compile(r"<[A-Za-z/!?][^<>]*>")
+_BACKSTOP_MULTILINE_TAG_RE = re.compile(r"<[A-Za-z/!?][^<>\n]*\n[^<>]*>")
+# A decoded reference never starts a new line ("HI&#10;GH" is "HI GH").
+_BACKSTOP_LINE_BREAKS = str.maketrans(
+    dict.fromkeys("\n\r\x0b\x0c\x1c\x1d\x1e\x85  ", " "),
+)
+_BACKSTOP_REPORTED_LINES = 20
+# Positions that cannot label a finding (task 3143, corpus item C). Each is
+# read in a window of at most _BACKSTOP_CONTEXT characters on the token's
+# own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a view are
+# read at all: any later token counts (a real review has far fewer).
+#   * a tally: a bare count right before the word ("0 HIGH", "**2** MEDIUM")
+#     or after it and a ":", "=" or "|" ("HIGH: 0", "| MEDIUM | 2 |"). The
+#     count must end there ("HIGH: 2FA bypass" is a title), and it must not
+#     exceed what the review counts of that severity (footer or headings),
+#     so a tally never claims a finding the review did not count;
+#   * a negation or comparison: "no", "not", "nor", "zero", "without",
+#     "than" or "none at/of/reached" right before the word ("No CRITICAL or
+#     HIGH findings", "MEDIUM, not HIGH", "LOW rather than MEDIUM"), not
+#     followed by a ":" (so it cannot open a "HIGH: title" label);
+#   * the next word of a list that opens with one of these ("0 CRITICAL/HIGH",
+#     "no CRITICAL, HIGH or MEDIUM issues"), which takes its count.
+#   * "Overall risk: MEDIUM" (also "LOW-MEDIUM"), which states one finding of
+#     that severity and so needs the footer to count at least one.
+_BACKSTOP_CONTEXT = 40
+_BACKSTOP_CLASSIFY_LIMIT = 2000
+_BACKSTOP_NUMBER_WORDS = {
+    "one": 1, "single": 1, "two": 2, "both": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12,
+}
+_BACKSTOP_COUNT_BEFORE_RE = re.compile(
+    r"(?:^|[^\w.,-])(\d{1,4}|" + "|".join(_BACKSTOP_NUMBER_WORDS)
+    + r")[*_` \t]{1,6}\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_COUNT_AFTER_RE = re.compile(
+    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)",
+)
+_BACKSTOP_NEGATION_BEFORE_RE = re.compile(
+    r"(?:^|[^\w-])(?:no|not|nor|zero|without|than|nothing|neither|never|"
+    r"none(?:[ \t]+(?:is|are|was|were|at|of|reach|reaches|reached|rated))?)"
+    r"[*_` \t]{1,6}\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_OVERALL_RISK_BEFORE_RE = re.compile(
+    r"overall[ \t]+risk[*_` \t]*(?:[:=]|is)?[*_` \t]*"
+    r"(?:(?:low|medium|high)[ \t]*(?:-|\N{EN DASH}|/|to)[ \t]*(?:to[ \t]+)?)?\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_COLON_AFTER_RE = re.compile(r"[*_`]{0,3}[ \t]*:")
+_BACKSTOP_LIST_JOINER_RE = re.compile(
+    r"[*_`]{0,3}[ \t]*(?:/|,|&|\+|and\b|or\b|nor\b|,[ \t]*(?:and|or)\b)"
+    r"[ \t]*[*_`]{0,3}",
+)
+# Headings that end a finding's section: levels 1 to 3, like the finding
+# headings themselves ("#### Evidence" inside a finding does not end it).
+_BACKSTOP_SECTION_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,3}(?:[ \t]|$)",
+                                          re.MULTILINE)
+# Lookalikes of the letters of CRITICAL, HIGH and MEDIUM that NFKD does not
+# fold, beyond the parser's table: the remaining Latin small capitals, Coptic
+# capitals, and the negative circled, negative squared and regional
+# indicator letters A-Z (which decompose to nothing).
+_BACKSTOP_EXTRA_LOOKALIKES = {
+    "A": (0x1D00, 0x2C80), "C": (0x1D04, 0x2CA4), "D": (0x1D05,),
+    "E": (0x1D07, 0x2C88), "H": (0x2C8E,), "I": (0xA7AE, 0x2C92),
+    "L": (0x029F,), "M": (0x1D0D, 0x2C98), "R": (0x0280,),
+    "T": (0x1D1B, 0x2CA6), "U": (0x1D1C,),
+}
+_BACKSTOP_LETTER_FOLDS = {
+    **_CONFUSABLE_LETTERS,
+    **{
+        code_point: letter
+        for letter, code_points in _BACKSTOP_EXTRA_LOOKALIKES.items()
+        for code_point in code_points
+    },
+    **{
+        first + offset: chr(ord("A") + offset)
+        for first in (0x1F150, 0x1F170, 0x1F1E6)
+        for offset in range(26)
+    },
+}
+# Marks draw on the letter before them; format, control and unassigned
+# characters (zero-width joiners, soft hyphens, U+1D173-1D17A, U+1BCA0-1BCA3)
+# and the Hangul fillers render as nothing. All of them join the word.
+_BACKSTOP_DELETED_CATEGORIES = frozenset(("Mn", "Me", "Cf", "Cc", "Cn"))
+_BACKSTOP_DELETED_FILLERS = frozenset((0x115F, 0x1160, 0x3164, 0xFFA0))
+_BACKSTOP_TABLE_LIMIT = 65536
+
+
+class _BackstopCharacterTable(dict):
+    """``str.translate`` table of the backstop, filled per code point seen.
+
+    Deletes the characters that join a word, folds lookalike letters to
+    Latin, keeps line breaks, tabs and everything else. At most
+    ``_BACKSTOP_TABLE_LIMIT`` entries are kept, so a review of many distinct
+    code points cannot grow it without bound.
+    """
+
+    def __missing__(self, code_point: int) -> str:
+        char = chr(code_point)
+        if char in "\n\t":
+            value = char
+        elif code_point in _BACKSTOP_LETTER_FOLDS:
+            value = _BACKSTOP_LETTER_FOLDS[code_point]
+        elif (code_point in _BACKSTOP_DELETED_FILLERS
+              or unicodedata.category(char) in _BACKSTOP_DELETED_CATEGORIES):
+            value = ""
+        else:
+            value = char
+        if len(self) < _BACKSTOP_TABLE_LIMIT:
+            self[code_point] = value
+        return value
+
+
+_BACKSTOP_CHARACTERS = _BackstopCharacterTable()
+
+
+def _backstop_reference_text(reference: str) -> str:
+    """``reference`` as a browser shows it, on the same line."""
+    return html.unescape(reference).translate(_BACKSTOP_LINE_BREAKS)
+
+
+_BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
+
+
+def _backstop_decoded_reference(match: re.Match[str]) -> str:
+    """One character reference as a browser shows it, on the same line."""
+    return _BACKSTOP_REFERENCES[match.group(0)]
+
+
+def _backstop_normalized(text: str) -> str:
+    """``text`` with every spelling of a severity word folded to ASCII.
+
+    References are decoded with or without ";". Lookalike letters are folded
+    before NFKD (U+03F9, a lunate sigma drawn as C, decomposes to a sigma)
+    and after it (mathematical Greek decomposes to Greek). Marks are split
+    off their letters by NFKD and removed with the other characters that
+    join a word; NFKC last. No step adds or removes a line break, so every
+    line keeps its number.
+    """
+    if "&" in text:
+        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_decoded_reference, text)
+    text = text.translate(_BACKSTOP_CHARACTERS)
+    if text.isascii():
+        return text
+    text = unicodedata.normalize("NFKD", text).translate(_BACKSTOP_CHARACTERS)
+    return unicodedata.normalize("NFKC", text)
+
+
+def _backstop_line_origins(text: str, spans: list[tuple[int, int]]) -> list[int]:
+    """Per line of ``text`` with ``spans`` removed, its line in ``text``.
+
+    ``spans`` are sorted and disjoint. A removed span holding line breaks
+    joins lines, so the line numbers after it shift.
+    """
+    newlines = [match.start() for match in _NEWLINE_RE.finditer(text)]
+    origins = [0]
+    kept_from = 0  # index of the first line break not yet accounted for
+    for start, end in spans:
+        first_removed = bisect.bisect_left(newlines, start, kept_from)
+        if first_removed == len(newlines) or newlines[first_removed] >= end:
+            continue
+        origins.extend(range(kept_from + 1, first_removed + 1))
+        kept_from = bisect.bisect_left(newlines, end, first_removed)
+    origins.extend(range(kept_from + 1, len(newlines) + 1))
+    return origins
+
+
+def _html5_comment_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of the HTML comments in ``text`` under HTML5 rules.
+
+    "<!-->" and "<!--->" are empty; any other comment closes at the first
+    "-->" or "--!>" (task 3143, I-01), and an unclosed one runs to the end.
+    Linear: each closer search starts at its own opener.
+    """
+    spans: list[tuple[int, int]] = []
+    position = 0
+    while (start := text.find("<!--", position)) != -1:
+        end = _comment_end(text, start, len(text))
+        end = len(text) if end == -1 else end
+        spans.append((start, end))
+        position = end
+    return spans
+
+
+def _backstop_without_markup(text: str) -> tuple[str, list[int] | None] | None:
+    """``text`` as a browser shows it: HTML comments, then tags, removed.
+
+    Returns the text and the line origins (None when no line was joined;
+    "HI<!--\\n-->GH" reads HIGH on its first line), or None when there is no
+    markup. What a comment or tag hides is still read in the other view.
+    """
+    if "<" not in text:
+        return None
+    origins: list[int] | None = None
+    if "<!--" in text:
+        spans = _html5_comment_spans(text)
+        origins = _backstop_line_origins(text, spans)
+        kept = [text[end:start] for (_, end), (start, _) in zip(
+            [(0, 0)] + spans, spans + [(len(text), len(text))])]
+        text = "".join(kept)
+    without_tags = _BACKSTOP_TAG_RE.sub("", text)
+    if origins is None and without_tags == text:
+        return None
+    if without_tags.count("\n") != text.count("\n"):
+        tag_origins = _backstop_line_origins(text, [
+            match.span() for match in _BACKSTOP_MULTILINE_TAG_RE.finditer(text)
+        ])
+        origins = (tag_origins if origins is None
+                   else [origins[line] for line in tag_origins])
+    return without_tags, origins
+
+
+def _backstop_exempt_count(
+    view: str, start: int, end: int, previous: tuple[int, int] | None,
+) -> int | None:
+    """The count a token states when it sits in a tally, negation or list.
+
+    0 for a negation, the tally's count for a tally, the count of the word
+    before for the next word of such a list (``previous`` is that word's
+    end and count), None when the token may label a finding.
+    """
+    window_start = view.rfind("\n", max(0, start - _BACKSTOP_CONTEXT), start) + 1
+    before = view[max(window_start, start - _BACKSTOP_CONTEXT):start]
+    after_end = view.find("\n", end, end + _BACKSTOP_CONTEXT)
+    after = view[end:after_end if after_end != -1 else end + _BACKSTOP_CONTEXT]
+    tally = _BACKSTOP_COUNT_BEFORE_RE.search(before)
+    if tally is None:
+        tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
+    if tally is not None:
+        stated = tally.group(1)
+        return (int(stated) if stated.isdigit()
+                else _BACKSTOP_NUMBER_WORDS[stated.lower()])
+    if (_BACKSTOP_NEGATION_BEFORE_RE.search(before)
+            and not _BACKSTOP_COLON_AFTER_RE.match(after)):
+        return 0
+    if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
+        return 1
+    if (previous is not None and start - previous[0] <= _BACKSTOP_CONTEXT
+            and _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)):
+        return previous[1]
+    return None
+
+
+def _backstop_tokens(
+    view: str, origins: list[int] | None, covered: dict[str, int],
+) -> dict[tuple[int, str], int]:
+    """(line, severity) -> number of standalone UPPER-case severity words.
+
+    Words in a tally whose count the review covers, in a negation, or in a
+    list one of those opens are left out (see ``_BACKSTOP_CONTEXT``).
+    """
+    found: dict[tuple[int, str], int] = {}
+    newlines: list[int] | None = None
+    previous: tuple[int, int] | None = None
+    classified = 0
+    for match in _BACKSTOP_TOKEN_RE.finditer(view):
+        start, end = match.span()
+        if start and view[start - 1].isalnum():
+            continue
+        severity = match.group(0)
+        stated = None
+        if classified < _BACKSTOP_CLASSIFY_LIMIT:
+            classified += 1
+            stated = _backstop_exempt_count(view, start, end, previous)
+        previous = None if stated is None else (end, stated)
+        if stated is not None and stated <= covered.get(severity, 0):
+            continue
+        if newlines is None:
+            newlines = [line_break.start()
+                        for line_break in _NEWLINE_RE.finditer(view)]
+        line = bisect.bisect_left(newlines, start)
+        if origins is not None:
+            line = origins[line]
+        key = (line, severity)
+        found[key] = found.get(key, 0) + 1
+    return found
+
+
+def _backstop_heading_lines(
+    view: str, origins: list[int] | None,
+) -> set[tuple[int, str]]:
+    """(line, severity) of the finding headings the parser counts."""
+    headings: set[tuple[int, str]] = set()
+    newlines: list[int] | None = None
+    for match in _REVIEW_FINDING_HEADER_RE.finditer(view):
+        severity = match.group(1)
+        if severity not in _BACKSTOP_SEVERITIES:
+            continue
+        if newlines is None:
+            newlines = [line_break.start()
+                        for line_break in _NEWLINE_RE.finditer(view)]
+        line = bisect.bisect_left(newlines, match.start())
+        headings.add((line if origins is None else origins[line], severity))
+    return headings
+
+
+def _in_finding_section(
+    line: int, heading_lines: list[int], section_starts: list[int],
+) -> bool:
+    """True when ``line`` is a finding heading or in that finding's section.
+
+    ``heading_lines`` and ``section_starts`` (lines of level 1-3 headings)
+    are sorted; a section ends where the next heading after its own begins.
+    """
+    index = bisect.bisect_right(heading_lines, line) - 1
+    if index < 0:
+        return False
+    next_heading = bisect.bisect_right(section_starts, heading_lines[index])
+    return (next_heading == len(section_starts)
+            or line < section_starts[next_heading])
+
+
+_BACKSTOP_HEADING_ID_RE = re.compile(
+    r"\[([A-Za-z0-9][\w.-]{0,24})\]|(?<![\w-])(" + _FINDING_ID + r")(?![\w-])",
+)
+
+
+_BACKSTOP_WORD_RE = re.compile(r"[\w.-]+")
+
+
+def _finding_ids(lines: list[str], heading_lines: list[int]) -> set[str]:
+    """The IDs of the finding headings on ``heading_lines``.
+
+    The ID is the first bracketed tag ("[S1]") or finding-ID-shaped word
+    ("SR3130-01") of the heading, and must hold a digit (so "[HIGH]" is no
+    ID). A line naming one as a whole word refers to that counted finding.
+    """
+    identifiers: set[str] = set()
+    for line in heading_lines:
+        if line < len(lines):
+            found = _BACKSTOP_HEADING_ID_RE.search(lines[line])
+            if found is None:
+                continue
+            identifier = found.group(1) or found.group(2)
+            if any(char.isdigit() for char in identifier):
+                identifiers.add(identifier)
+    return identifiers
+
+
+def _names_finding(line: str, identifiers: set[str]) -> bool:
+    """True when ``line`` names one of ``identifiers`` as a whole word.
+
+    Linear in the line: its words are looked up in the set, so a review with
+    thousands of finding IDs costs no more per line than one with a few.
+    """
+    return any(
+        word in identifiers or word.rstrip(".") in identifiers
+        for word in _BACKSTOP_WORD_RE.findall(line)
+    )
+
+
+def _blank_like(match: re.Match[str]) -> str:
+    return " " * len(match.group(0))
+
+
+def _backstop_masked(text: str) -> str:
+    """``text`` without the final footer's labels and the completion line.
+
+    The footer is the last one the parser's footer scan finds, with the
+    gate's marker-comment lines read as blank (R3137-03). Only its CRITICAL,
+    HIGH and MEDIUM labels are lowered, each where it is written in UPPER
+    case; anything else on the tally line is still read.
+    """
+    footers = _counts_footers(_STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text))
+    if footers:
+        for severity, label_start in zip(_BACKSTOP_SEVERITIES,
+                                         footers[-1].label_starts):
+            label_end = label_start + len(severity)
+            if text[label_start:label_end] == severity:
+                text = text[:label_start] + severity.lower() + text[label_end:]
+    body = text.rstrip(" \t\n")
+    last_start = body.rfind("\n") + 1
+    last_line = body[last_start:]
+    if ("EQUIPA-REVIEW-COMPLETE" in last_line
+            and _STANDALONE_MARKER_COMMENT_RE.fullmatch(last_line)):
+        text = text[:last_start] + " " * len(last_line) + text[len(body):]
+    return text
+
+
+def _severity_token_backstop(
+    text: str, analysis: ReviewCountAnalysis,
+) -> ReviewCountAnalysis:
+    """Block a trusted review holding a severity word nothing counted.
+
+    ``text`` is the normalised review. The whole body is read in two views:
+    as written and with HTML comments and tags removed (which can join a
+    word); per line and severity the larger count is used. A token on a
+    finding heading of its severity is that finding's; every other one is
+    unaccounted. Per severity the review blocks (count-mismatch, reason
+    ``BACKSTOP_REASON`` with the 1-based line numbers) when any token is
+    unaccounted and the footer counts fewer findings than the headings plus
+    the unaccounted tokens. An untrusted analysis is returned unchanged.
+    """
+    if not analysis.trusted:
+        return analysis
+    masked = _backstop_masked(text)
+    views: list[tuple[str, list[int] | None]] = [
+        (_backstop_normalized(masked), None),
+    ]
+    without_markup = _backstop_without_markup(masked)
+    if without_markup is not None:
+        views.append((_backstop_normalized(without_markup[0]),
+                      without_markup[1]))
+    footer = analysis.footer_counts or {}
+    # What the review counts per severity (footer, headings, resolved).
+    covered = analysis.counts or footer
+    tokens: dict[tuple[int, str], int] = {}
+    for view, origins in views:
+        for key, count in _backstop_tokens(view, origins, covered).items():
+            if count > tokens.get(key, 0):
+                tokens[key] = count
+    if not tokens:
+        return analysis
+    headings: set[tuple[int, str]] = set()
+    for view, origins in views:
+        headings |= _backstop_heading_lines(view, origins)
+    # A finding's section runs from its heading to the next heading of
+    # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
+    # "MEDIUM because ...") is that finding, not another one.
+    section_starts: list[int] = []
+    if headings:
+        newlines = [match.start() for match in _NEWLINE_RE.finditer(masked)]
+        section_starts = [
+            bisect.bisect_left(newlines, match.start())
+            for match in _BACKSTOP_SECTION_HEADING_RE.finditer(masked)
+        ]
+
+    parser_headings = analysis.header_counts or {}
+    masked_lines = masked.split("\n") if headings else []
+    problems: list[str] = []
+    for severity in _BACKSTOP_SEVERITIES:
+        heading_lines = sorted(line for line, word in headings
+                               if word == severity)
+        identifiers = _finding_ids(masked_lines, heading_lines)
+        unaccounted = 0
+        lines: list[int] = []
+        for (line, word), count in tokens.items():
+            if word != severity or _in_finding_section(
+                line, heading_lines, section_starts,
+            ):
+                continue
+            if (identifiers and line < len(masked_lines)
+                    and _names_finding(masked_lines[line], identifiers)):
+                continue  # "| S1 | MEDIUM | ..." names counted finding S1
+            unaccounted += count
+            lines.append(line + 1)
+        counted = max(len(heading_lines), parser_headings.get(severity, 0))
+        # What the review reports: the footer, or more when the parser
+        # counted more (a resolved "- **[S1] HIGH ...: FIXED**" recap is
+        # counted with no footer at all).
+        footer_count = max(footer.get(severity, 0), covered.get(severity, 0))
+        if unaccounted and footer_count < counted + unaccounted:
+            lines.sort()
+            shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
+            if len(lines) > _BACKSTOP_REPORTED_LINES:
+                shown += f" and {len(lines) - _BACKSTOP_REPORTED_LINES} more"
+            problems.append(
+                f"{severity}={unaccounted} at line {shown} (footer "
+                f"{footer_count}, finding headings {counted})",
+            )
+    if not problems:
+        return analysis
+    return replace(
+        analysis,
+        verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+        detail=f"{BACKSTOP_REASON}: " + "; ".join(problems),
+    )
 
 
 def _stricter_analysis(
@@ -2656,6 +3300,15 @@ def _analyze_review_file(
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised
     # passes through unchanged.
+    # Task 3143: NFKC turns some lookalikes into a letter of another shape
+    # (GREEK CAPITAL LUNATE SIGMA SYMBOL, drawn as a C, becomes a Sigma), so
+    # the backstop reads a copy whose lookalikes were folded BEFORE NFKC.
+    # Each fold is one letter for one letter, so no line moves.
+    folded_first = None
+    if not text.isascii():
+        folded_first = normalize_review_text(
+            text.translate(_BACKSTOP_LETTER_FOLDS),
+        )
     text = normalize_review_text(text)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
@@ -2665,10 +3318,40 @@ def _analyze_review_file(
     # body cannot self-DoS the gate.
     if SECURITY_REVIEW_FALLBACK_MARKER in text[:512]:
         return ReviewCountAnalysis(verdict=REVIEW_VERDICT_FALLBACK)
+    # Task 3143: the shape rules first, then the fail-closed backstop over
+    # every UPPER-case severity word they did not count.
+    analysis = _analyze_review_views(text)
+    backstop_text = text
+    if folded_first is not None and folded_first != text:
+        if folded_first.count("\n") != text.count("\n"):
+            # Not expected (see above); the line numbers would not hold.
+            if not analysis.trusted:
+                return analysis
+            return replace(
+                analysis,
+                verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+                detail=(f"{BACKSTOP_REASON}: folding lookalike letters "
+                        f"changed the line count"),
+            )
+        backstop_text = folded_first
+    return _severity_token_backstop(backstop_text, analysis)
 
+
+def _analyze_review_views(text: str) -> ReviewCountAnalysis:
+    """The shape rules of :func:`_analyze_review_file`, on normalised text."""
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     text = _fold_blank_line_runs(text)
+    # Task 3143 (timing, R3137-06): every rule pays a few microseconds per
+    # line, so a 200 KB flood of one-character lines ("-", ">", "`") took
+    # 0.6 s. A review longer than any real one is not parsed (fail closed).
+    line_count = text.count("\n") + 1
+    if line_count > _REVIEW_MAX_PARSED_LINES:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_INCOMPLETE,
+            detail=(f"review too long to parse: {line_count} lines after "
+                    f"folding blank runs (at most {_REVIEW_MAX_PARSED_LINES})"),
+        )
     # Task 3130: parse the text as written (what every earlier task parsed)
     # and as rendered (comments removed, references decoded, lookalike
     # letters folded, blank runs collapsed); the stricter result wins. The
@@ -2677,8 +3360,10 @@ def _analyze_review_file(
     # inside a multi-line comment.
     as_written = _analyze_review_text(text, nonblank_lines)
     rendered = _rendered_review_text(text)
-    if rendered == _STANDALONE_MARKER_COMMENT_RE.sub("", text):
-        # Only the gate's own marker comments, each on its own line, differ.
+    if rendered == _without_edge_markers(text):
+        # Only the provenance line on top and the completion line at the end
+        # differ: nothing comes before the first or after the last line, so
+        # reading them as text or as blank lines changes no other line.
         return as_written
     return _stricter_analysis(
         as_written, _analyze_review_text(rendered, nonblank_lines),
@@ -2738,15 +3423,13 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     # cannot mask the final tally, and a later quoted all-zero footer cannot
     # mask an earlier correct one. The LAST footer is still the one that
     # must close the review.
-    footer_matches = list(_REVIEW_COUNTS_FOOTER_RE.finditer(visible_text))
+    footer_matches = _counts_footers(visible_text)
     footer = footer_matches[-1] if footer_matches else None
     footer_counts: dict[str, int] | None = None
     if footer_matches:
         footer_counts = {
-            severity: max(
-                int(match.group(index)) for match in footer_matches
-            )
-            for index, severity in enumerate(_REVIEW_SEVERITIES, start=1)
+            severity: max(match.counts[index] for match in footer_matches)
+            for index, severity in enumerate(_REVIEW_SEVERITIES)
         }
 
     # S3033-01: resolved headings are never subtracted from the merge
@@ -2816,7 +3499,7 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     # S3033-04: the footer closes the review. A heading or finding after it
     # means the footer was written first (a skeleton) and never updated.
     if footer is not None:
-        trailing = visible_text[footer.end():]
+        trailing = visible_text[footer.end:]
         if (
             _ANY_MARKDOWN_HEADING_RE.search(trailing)
             or _FINDING_CANDIDATE_RE.search(trailing)

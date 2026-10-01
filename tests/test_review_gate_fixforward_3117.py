@@ -11,6 +11,7 @@
 Copyright 2026 Forgeborn
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,28 @@ def review(summary: str, body: list[str], footer: str, low_heading: bool) -> str
 
 def verdict(text: str) -> str:
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text).verdict
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+EXEMPT_AS_WRITTEN = {
+    "E1 was rated LOW rather than HIGH because the path is admin-only.",
+    "No HIGH or CRITICAL issues were found.",
+    "semgrep: 0 CRITICAL/HIGH results across the diff.",
+}
+
+
+def lowercase_severity_words(text: str) -> str:
+    return SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), text)
+
+
+def assert_only_the_backstop_blocks(text: str) -> None:
+    """The rules trusted ``text`` (the backstop runs only then) and the
+    severity-token backstop blocked it."""
+    analysis = loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith("unaccounted severity token:"), (
+        analysis.detail)
 
 
 # --- 1. finding shapes that used to merge behind a zero footer ---------------
@@ -70,8 +93,20 @@ def test_leading_high_next_to_a_counted_low_fails_closed():
     "    indented prose that mentions HIGH in passing",
 ])
 def test_prose_mentions_still_merge(line):
-    text = review("1 finding.", ["## Notes", line], ONE_LOW, low_heading=True)
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label, so compliant prose is written in lower
+    case and merges. The UPPER-case original is still read as prose by every
+    rule: only the severity-token backstop blocks it."""
+    text = review("1 finding.", ["## Notes", lowercase_severity_words(line)],
+                  ONE_LOW, low_heading=True)
     assert verdict(text) == loops.REVIEW_VERDICT_OK, line
+    written = review("1 finding.", ["## Notes", line], ONE_LOW, low_heading=True)
+    if line in EXEMPT_AS_WRITTEN:
+        # A negation or zero tally cannot label a finding; the backstop
+        # exempts it, so it merges as written, as before task 3143.
+        assert verdict(written) == loops.REVIEW_VERDICT_OK, line
+    elif SEVERITY_TOKEN.search(line):
+        assert_only_the_backstop_blocks(written)
 
 
 # --- 3. unfinished-summary markers only in status position -------------------

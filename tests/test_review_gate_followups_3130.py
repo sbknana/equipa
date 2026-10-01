@@ -14,6 +14,7 @@ Copyright 2026 Forgeborn
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -69,6 +70,36 @@ def assert_prose_merges(body: list[str]) -> None:
                                "LOW": 1, "INFO": 0}
 
 
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def lowercase_severity_words(line: str) -> str:
+    return SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), line)
+
+
+def assert_only_the_backstop_blocks(text: str) -> loops.ReviewCountAnalysis:
+    """The rules trusted ``text`` (the backstop runs only then) and the
+    severity-token backstop blocked it."""
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith("unaccounted severity token:"), (
+        analysis.detail)
+    return analysis
+
+
+def assert_compliant_prose_merges(body: list[str]) -> None:
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label (never in prose, code or examples), so
+    compliant prose is written in lower case and merges. The UPPER-case
+    original is still read as prose or code by every rule: only the
+    severity-token backstop blocks it."""
+    assert_prose_merges([lowercase_severity_words(line) for line in body])
+    if any(SEVERITY_TOKEN.search(line) for line in body):
+        assert_only_the_backstop_blocks(
+            review("1 finding.", body, ONE_LOW, low_heading=True))
+
+
 # --- F2 / R3122-02: HTML list items and line breaks ----------------------------
 
 @pytest.mark.parametrize("body", [
@@ -119,9 +150,10 @@ def test_padded_severity_field_fails_closed(body):
 
 
 def test_padded_indented_code_stays_code():
-    """Leading indentation is kept, so an indented code line is not a field."""
-    assert_prose_merges(["## Notes", "", "Example output:", "",
-                         "        log.info('HIGH:   ' + message)"])
+    """Leading indentation is kept, so an indented code line is not a field.
+    Task 3143: severity words in code are lower case (reviewer prompt)."""
+    assert_compliant_prose_merges(["## Notes", "", "Example output:", "",
+                                   "        log.info('HIGH:   ' + message)"])
 
 
 # --- F4 / R3122-03: shapes the prompt promised -----------------------------------
@@ -179,7 +211,7 @@ def test_priority_field_fails_closed(line):
     "- Priority of the cleanup is high.",
 ])
 def test_verb_and_priority_prose_merges(line):
-    assert_prose_merges(["## Notes", "", line])
+    assert_compliant_prose_merges(["## Notes", "", line])
 
 
 @pytest.mark.parametrize("line", [
@@ -211,7 +243,7 @@ def test_rated_rating_mid_line_alias_dashes_and_split_emphasis_fail_closed(
     "Use - dashes - freely in prose.",
 ])
 def test_rated_rating_mid_line_alias_dash_and_emphasis_prose_merges(line):
-    assert_prose_merges(["## Notes", "", line])
+    assert_compliant_prose_merges(["## Notes", "", line])
 
 
 @pytest.mark.parametrize("cell, higher", [
@@ -239,8 +271,18 @@ def test_severity_range_cell_counts_the_higher(cell, higher):
 
 
 def test_severity_range_cell_counted_by_footer_merges():
+    """Task 3143: only the higher bound of a range is a counted finding, so
+    the UPPER-case lower bound is a severity word that labels no counted
+    finding: the rules trust the review and the backstop blocks it. With
+    the lower bound in lower case (reviewer prompt) the review merges with
+    the count the footer states."""
     body = ["## Findings", "", "| ID | Issue | Rating |", "|---|---|---|",
             "| S1 | SQL injection | HIGH/MEDIUM |"]
+    blocked = assert_only_the_backstop_blocks(
+        review("1 finding.", body, ONE_HIGH, low_heading=False))
+    assert blocked.counts["HIGH"] == 1
+    assert "MEDIUM=1" in blocked.detail
+    body[-1] = "| S1 | SQL injection | HIGH/medium |"
     analysis = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["HIGH"] == 1
@@ -252,7 +294,7 @@ def test_severity_range_cell_counted_by_footer_merges():
     "| docs | see HIGH/MEDIUM guidance in the README |",
 ])
 def test_range_prose_cell_merges(row):
-    assert_prose_merges(["## Notes", "", "| Item | Note |", "|---|---|", row])
+    assert_compliant_prose_merges(["## Notes", "", "| Item | Note |", "|---|---|", row])
 
 
 # --- F4 / R3122-04: lookalike letters, entities and comments ---------------------
@@ -386,7 +428,7 @@ def test_comment_markers_quoted_in_code_open_no_comment():
     ["Re-checked earlier work:", "SR-12 HIGH was fixed in the previous round."],
 ])
 def test_wrapped_prose_line_opening_with_an_id_merges(body):
-    assert_prose_merges(["## Notes", ""] + body)
+    assert_compliant_prose_merges(["## Notes", ""] + body)
 
 
 @pytest.mark.parametrize("line", [
@@ -470,9 +512,13 @@ def test_prompt_tells_reviewers_to_write_upper_case_without_an_escape_hint():
     rule = _prompt_format_rule()
     assert "other cases in most" not in rule
     assert "other cases" not in rule
-    assert "Always write every severity word in UPPER case" in rule
-    # The instruction comes before the list of places, not as a caveat on it.
-    assert rule.index("UPPER case") < rule.index("in: any other heading")
+    # Task 3143 replaced "Always write every severity word in UPPER case" and
+    # the list of places after it: UPPER case is now for a finding's label
+    # only, and any other UPPER-case severity word blocks (the backstop).
+    assert ("Write CRITICAL, HIGH and MEDIUM in UPPER case ONLY when "
+            "labelling an actual finding") in rule
+    # The instruction comes before its consequence, not as a caveat on it.
+    assert rule.index("UPPER case ONLY") < rule.index("BLOCKS the merge")
 
 
 def test_prompt_keeps_every_other_format_obligation():
@@ -481,17 +527,20 @@ def test_prompt_keeps_every_other_format_obligation():
         "**One heading per finding:** `### [TAG-NN] SEVERITY — title`",
         "**A finding heading still counts when it is marked fixed or resolved.**",
         "**The `## Counts` footer must agree with the finding headings.**",
-        "Keep severity words out of those places; mentioning one in ordinary "
-        "prose is fine.",
         "BLOCKS the merge",
         "Write it ONCE, as the LAST line of the file",
     ):
         assert obligation in text, obligation
+    # Task 3143: "mentioning one in ordinary prose is fine" and the list of
+    # places (`<li>`, `Risk:`, "(HIGH)", ...) were replaced by one rule that
+    # covers every place: the whole review, code and HTML included.
+    assert "mentioning one in ordinary prose is fine" not in text
     rule = _prompt_format_rule()
-    for place in ("`<li>`", "`<td>`", "`Sev:`", "`Risk:`", "`Impact:`",
-                  "`Priority:`", "`Rating:`", "(HIGH)", "High risk",
-                  "Critical impact", "HIGH/MEDIUM", "[HIGH] ..."):
-        assert place in rule, place
+    for obligation in ("In any other prose", "lower case",
+                       "Do not put severity words inside code blocks",
+                       "anywhere in the review that is not a counted finding "
+                       "BLOCKS the merge"):
+        assert obligation in rule, obligation
 
 
 def test_prompt_hash_in_skill_manifest_matches_the_file():

@@ -20,6 +20,7 @@ Copyright 2026 Forgeborn
 """
 
 import random
+import re
 import time
 from pathlib import Path
 
@@ -66,6 +67,28 @@ def assert_prose_merges(body: list[str]) -> None:
                               low_heading=True))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (body, analysis.detail)
     assert analysis.counts == ONE_LOW_COUNTS
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def assert_compliant_prose_merges(body: list[str]) -> None:
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label (never in prose, code or examples), so
+    compliant prose is written in lower case and merges. The UPPER-case
+    original is still read as prose or code by every rule: only the
+    severity-token backstop blocks it."""
+    assert_prose_merges([
+        SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), line)
+        for line in body
+    ])
+    if any(SEVERITY_TOKEN.search(line) for line in body):
+        analysis = analyze(review("1 finding.", ["## Notes", ""] + body,
+                                  ONE_LOW, low_heading=True))
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+        assert analysis.detail.startswith("unaccounted severity token:"), (
+            body, analysis.detail)
 
 
 # --- M1 (SR3130-01): list items that open with their own marker ---------------
@@ -135,7 +158,7 @@ def test_f4_leftover_shapes_fail_closed(line, severity):
     "INFO Semgrep finished with no results.",
 ])
 def test_f4_leftover_prose_merges(line):
-    assert_prose_merges([line])
+    assert_compliant_prose_merges([line])
 
 
 # --- N1: EQUIPA's own marker comment splitting a word ---------------------------
@@ -193,15 +216,19 @@ SHORTCUT_LINE_POOL = [
 
 
 def _parse_both_views(text: str) -> loops.ReviewCountAnalysis:
-    """``text`` parsed as written AND as rendered, with no shortcut."""
+    """``text`` parsed as written AND as rendered, with no shortcut.
+
+    Task 3143: as _analyze_review_file does, the severity-token backstop
+    runs last, over the whole normalised review.
+    """
     text = loops.normalize_review_text(text)
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
-    text = loops._fold_blank_line_runs(text)
-    rendered = loops._rendered_review_text(text)
-    return loops._stricter_analysis(
-        loops._analyze_review_text(text, nonblank_lines),
+    folded = loops._fold_blank_line_runs(text)
+    rendered = loops._rendered_review_text(folded)
+    return loops._severity_token_backstop(text, loops._stricter_analysis(
+        loops._analyze_review_text(folded, nonblank_lines),
         loops._analyze_review_text(rendered, nonblank_lines),
-    )
+    ))
 
 
 def test_parsing_once_gives_the_verdict_of_both_views():
@@ -300,7 +327,7 @@ def test_markdown_the_renderer_shows_as_text_fails_closed(body):
      "A `-->` quoted in code closes nothing."],
 ])
 def test_markdown_the_renderer_hides_or_shows_as_prose_merges(body):
-    assert_prose_merges(body)
+    assert_compliant_prose_merges(body)
 
 
 def test_rendered_view_counts_a_nested_finding_once():
@@ -334,26 +361,34 @@ def _prompt_format_rule() -> str:
 
 
 def test_prompt_names_the_places_task_3137_counts():
+    # Task 3143 replaced the list of places (nested lists and quotes, a list
+    # item's later paragraphs, footnotes, "<li>1. HIGH: ...</li>", combining
+    # marks, ...) with one rule that names every place at once; each place
+    # task 3137 counts is still checked against the parser below
+    # (test_every_place_the_prompt_names_counts_in_every_spelling_it_names).
     rule = _prompt_format_rule()
-    for place in ("..., severity HIGH in auth.py", "HIGH SQL injection in ...",
-                  "- 1. HIGH: ...", "> > > > > HIGH: ...",
-                  "a list item's later paragraphs", "[^1]: HIGH: ...",
-                  "<li>1. HIGH: ...</li>", "combining marks"):
+    for place in ("the whole review", "code blocks and HTML included",
+                  "anywhere in the review"):
         assert place in rule, place
 
 
 def test_prompt_no_longer_claims_what_the_gate_does_not_count():
     rule = _prompt_format_rule()
-    # Only the folded lookalikes count (not Coptic or every Cyrillic letter),
-    # only one-line HTML counts, only these separators end a list item, and a
-    # line opening with a severity needs a separator or a capitalised title.
     assert "lookalike letters from another script" not in rule
-    assert "the Greek, Cyrillic, Cherokee or Lisu lookalike letters" in rule
     assert "written in HTML (" not in rule
-    assert "one-line HTML" in rule
-    assert "a list item that ends with one after a dash, colon or comma" in rule
     assert "starts with a severity (" not in rule
-    assert "starts with a severity and a separator" in rule
+    # Task 3143 (I-05 of indep-3137): the rule no longer lists the shapes,
+    # scripts and kinds of HTML the parser reads, which told the reviewer
+    # what it does NOT read ("one-line HTML", four named scripts). A
+    # catch-all line promises nothing and hints at no gap.
+    for gap_map in ("one-line HTML",
+                    "the Greek, Cyrillic, Cherokee or Lisu lookalike letters",
+                    "a list item that ends with one after a dash, colon or comma",
+                    "starts with a severity and a separator"):
+        assert gap_map not in rule, gap_map
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    assert ("- **Anything else that renders as a severity word may also block "
+            "the merge.**") in text
 
 
 # Every place the rule names, in every nested position and spelling it says

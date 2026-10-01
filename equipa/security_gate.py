@@ -101,14 +101,21 @@ REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
 # while splitlines() still split it.
 _LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
 # gate-06: invisible characters that split a severity word ("HI​GH") so
-# no regex sees it, while the operator reading the rendered file does. Covers
-# the Unicode Cf (format) characters that occur in text, the combining
-# grapheme joiner, variation selectors and the Hangul fillers.
+# no regex sees it, while the operator reading the rendered file does.
+# Task 3143 (I-04): every Default_Ignorable_Code_Point and every Unicode Cf
+# (format) character, not a hand-picked subset. The musical beam controls
+# (U+1D173-1D17A), the shorthand format controls (U+1BCA0-1BCA3) and the
+# Egyptian hieroglyph format controls (U+13430-1343F) split "HI?GH" too.
+# Escapes, not literal characters, so the list can be read and reviewed.
 _INVISIBLE_CHARS_RE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏"
-    "​-‏‪-‮⁠-⁤⁦-⁯ㅤ"
-    "︀-️﻿ﾠ￹-￻\U000e0000-\U000e007f"
-    "\U000e0100-\U000e01ef]"
+    "["
+    "­͏؀-؅؜۝܏࢐࢑࣢"
+    "ᅟᅠ឴឵᠋-᠏"
+    "​-‏‪-‮⁠-⁯ㅤ"
+    "︀-️﻿ﾠ￰-￻"
+    "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff"
+    "]"
 )
 
 

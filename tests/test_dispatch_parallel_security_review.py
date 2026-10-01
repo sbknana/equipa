@@ -189,12 +189,20 @@ def test_artifact_count_ignores_severity_words_in_prose(tmp_path):
     like '[S1] LOW — this is NOT a CRITICAL because…'.
     """
     review = tmp_path / "SECURITY-REVIEW-42.md"
-    review.write_text(
+    text = (
         "# Review\n\n"
         "### [S1] LOW — this is NOT a CRITICAL vulnerability\n"
         "The reviewer considered HIGH severity but downgraded after analysis.\n"
         "\n"
-        "### [S2] INFO — discussion of HIGH-impact edge cases\n",
+        "### [S2] INFO — discussion of HIGH-impact edge cases\n"
+    )
+    # Task 3143: UPPER-case severity words in prose label no finding, so the
+    # severity-token backstop holds the merge; the reviewer prompt has them
+    # written in lower case, and then only the finding headers count.
+    review.write_text(text, encoding="utf-8")
+    assert _security_review_blocks_merge(str(tmp_path), 42) == (True, None)
+    review.write_text(
+        text.replace("CRITICAL", "critical").replace("HIGH", "high"),
         encoding="utf-8",
     )
     blocks, counts = _security_review_blocks_merge(str(tmp_path), 42)
