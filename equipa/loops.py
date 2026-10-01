@@ -3346,6 +3346,9 @@ _LINK_TAIL_END_RE = re.compile(
     + _LINK_SPACE + r"\)",
 )
 _LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}+\]")
+# The longest label a definition holds (_LINK_DEFINITION_RE); in characters,
+# so an escape counts two and a longer text is never a defined label.
+_LINK_LABEL_LIMIT = 2 * 999
 # A raw destination ends at a space or a control character.
 _LINK_DESTINATION_END_RE = re.compile(r"[\x00-\x20\x7f]")
 # Unescaped parentheses; "\(" and "\\" are read (and skipped) as pairs.
@@ -3444,13 +3447,20 @@ class _LinkTails:
             index = partner + 1
         return run_end
 
-    def end(self, position: int, text: str, labels: frozenset[str]) -> int | None:
+    def end(
+        self, position: int, text_span: tuple[int, int], labels: frozenset[str],
+    ) -> int | None:
         """End of the tail after a "]" that ends before ``position``.
 
-        ``text`` is the link text and ``labels`` the defined references. An
-        inline tail first, then a "[label]" that is defined (an empty one
-        names ``text``), then a shortcut: ``position`` itself when ``text``
-        is defined. None when the brackets are not a link.
+        ``text_span`` is where the link text lies in the view and ``labels``
+        the defined references. An inline tail first, then a "[label]" that
+        is defined (an empty one names the link text), then a shortcut:
+        ``position`` itself when the link text is defined. None when the
+        brackets are not a link.
+
+        Task 3152 (R3149-05): the link text is only read when it can be a
+        label (at most _LINK_LABEL_LIMIT characters, the longest a definition
+        holds), so a rejected "]" after a long run of text costs nothing.
         """
         view = self.view
         if view.startswith("(", position):
@@ -3465,10 +3475,21 @@ class _LinkTails:
         if view.startswith("[", position):
             label = _LINK_LABEL_RE.match(view, position)
             if label is not None:
-                named = view[position + 1:label.end() - 1] or text
-                if _link_label_key(named) in labels:
+                named_span = (position + 1, label.end() - 1)
+                if named_span[0] == named_span[1]:
+                    named_span = text_span
+                if self._names_label(named_span, labels):
                     return label.end()
-        return position if _link_label_key(text) in labels else None
+        return position if self._names_label(text_span, labels) else None
+
+    def _names_label(
+        self, span: tuple[int, int], labels: frozenset[str],
+    ) -> bool:
+        """True when the view's text at ``span`` names a defined label."""
+        start, end = span
+        if end - start > _LINK_LABEL_LIMIT:
+            return False
+        return _link_label_key(self.view[start:end]) in labels
 
 
 def _link_label_key(label: str) -> str:
@@ -3488,22 +3509,36 @@ def _backstop_link_reading(
     renderer shows them; the marks inside severity words go. Returns the
     text, its line origins (None when no line was joined; a destination on
     the next line joins two) and whether an image was read.
+
+    Task 3152 (R3149-05): one forward pass. The nearest "[" before each "]"
+    is kept in a running index, and each stretch of the view is searched for
+    "[" once; rescanning back to the last link for every "]" that formed
+    none was quadratic (23 s on 200 KB of "a[" and "b]").
     """
     closes = _LINK_ANY_CLOSE_RE if labels else _LINK_CLOSE_RE
     kept: list[str] = []
     joined_spans: list[tuple[int, int]] = []
     copied = searched = 0
+    last_open = -1  # the last "[" before ``scanned``
+    scanned = 0
     saw_image = False
     while (close := closes.search(view, searched)) is not None:
         bracket = close.end() - 1
+        found = view.rfind("[", scanned, bracket)
+        if found >= 0:
+            last_open = found
+        scanned = max(scanned, bracket)
         image = view.startswith("!", close.start())
-        opener = (close.start() + 1 if image
-                  else view.rfind("[", copied, bracket))
-        text = view[opener + 1:bracket] if opener >= 0 else ""
-        end = tails.end(close.end(), text, labels)
+        if image:
+            opener = close.start() + 1
+        else:
+            opener = last_open if last_open >= copied else -1
+        text_span = (opener + 1, bracket) if opener >= 0 else (bracket, bracket)
+        end = tails.end(close.end(), text_span, labels)
         if end is None:
             searched = close.end()
             continue
+        text = view[text_span[0]:text_span[1]]
         if image:
             saw_image = True
             kept.append(view[copied:close.start()])
