@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import FrameType, TracebackType
 
@@ -135,6 +136,26 @@ def _deliver_to_active_shields(signum: int, _frame: FrameType | None) -> None:
         if shield.received is None:
             shield.received = signum
     request_shutdown(signum)
+
+
+def wrap_restored_handler(
+    signum: signal.Signals, wrap: Callable[[object], object | None],
+) -> None:
+    """Replace the handler the last shield out restores for ``signum``.
+
+    ``wrap`` receives that handler (SIG_DFL for one installed outside
+    Python, which is what the restore puts back) and returns its
+    replacement, or None to keep it. No-op while no shield is active.
+    Without this a handler installed during a merge is dropped when the
+    merge ends, because the restore puts back the one found on entry
+    (task 3156: the per-run config dir cleanup of a run started then).
+    """
+    if signum not in _displaced_handlers:
+        return
+    restored = _displaced_handlers[signum]
+    replacement = wrap(signal.SIG_DFL if restored is None else restored)
+    if replacement is not None:
+        _displaced_handlers[signum] = replacement
 
 
 class MergeSignalShield:

@@ -174,7 +174,7 @@ class AgentResult(_AgentResultRequired, total=False):
     # _run_started_at_utc.
     started_at: str
 
-from equipa import agent_launcher, isolation
+from equipa import agent_launcher, isolation, merge_safety
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.cli_isolation import (
     CLAUDE_CLI_ISOLATION_ARGS,
@@ -2346,22 +2346,40 @@ def _install_stop_signal_cleanup() -> None:
     are left alone. So is a Python SIGINT handler: KeyboardInterrupt or
     asyncio's cancellation unwind normally and atexit runs, and asyncio.run
     installs its own Ctrl-C handler only over signal.default_int_handler.
+
+    While a merge is shielded, the handler the shield restores when it ends
+    is wrapped the same way; otherwise a run started during the merge would
+    lose its cleanup when the merge ended.
     """
     if threading.current_thread() is not threading.main_thread():
         return
     for signum in _STOP_SIGNALS:
-        current = signal.getsignal(signum)
-        if getattr(current, _STOP_CLEANUP_MARKER, False):
-            continue
-        if not (current == signal.SIG_DFL
-                or (signum == signal.SIGTERM and callable(current))):
-            continue
-        try:
-            signal.signal(signum, _stop_signal_cleanup_handler(current))
-        except (ValueError, OSError) as exc:
-            logger.warning("[Dispatch] cannot install the %s handler that "
-                           "removes per-run Claude config directories: %s",
-                           signal.Signals(signum).name, exc)
+        handler = _stop_cleanup_replacing(signum, signal.getsignal(signum))
+        if handler is not None:
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError) as exc:
+                logger.warning("[Dispatch] cannot install the %s handler "
+                               "that removes per-run Claude config "
+                               "directories: %s",
+                               signal.Signals(signum).name, exc)
+        merge_safety.wrap_restored_handler(
+            signum,
+            lambda previous, signum=signum: _stop_cleanup_replacing(
+                signum, previous),
+        )
+
+
+def _stop_cleanup_replacing(signum: int, current: Any) -> Any:
+    """The cleanup handler to put in place of ``current``, or None to keep it
+    (already ours, SIG_IGN, a non-Python handler, a Python SIGINT handler).
+    """
+    if getattr(current, _STOP_CLEANUP_MARKER, False):
+        return None
+    if not (current == signal.SIG_DFL
+            or (signum == signal.SIGTERM and callable(current))):
+        return None
+    return _stop_signal_cleanup_handler(current)
 
 
 def _stop_signal_cleanup_handler(previous: Any) -> Any:

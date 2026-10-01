@@ -67,9 +67,20 @@ agent_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
              "HOME": project, "CLAUDE_CODE_OAUTH_TOKEN": "fake-3156-token"}
 agent_runner._agent_subprocess_env = lambda: dict(agent_env)
 
-async def main():
-    process, agent = await agent_runner._spawn_agent_process(
+async def spawn():
+    return await agent_runner._spawn_agent_process(
         [fake, "-p", "x", "--add-dir", project], project_dir=project)
+
+async def main():
+    if mode == "spawned-in-merge":
+        # The run starts while a merge is shielded and outlives the merge.
+        from equipa.merge_safety import MergeSignalShield
+        async with MergeSignalShield(project, context="test merge"):
+            process, agent = await spawn()
+        merge_ended = os.path.join(os.path.dirname(parent), "merge-ended")
+        open(merge_ended, "w").close()
+    else:
+        process, agent = await spawn()
     await process.wait()
 
 asyncio.run(main())
@@ -173,6 +184,24 @@ def test_chained_handler_that_exits_still_removes_the_dir(orchestrator):
     # The operator's own handler decided the exit status.
     assert process.returncode == 70, output[-3000:]
     assert not os.path.lexists(config_dir), output[-3000:]
+    _wait_for(lambda: not _pid_alive(report["pid"]), 30,
+              "the fake CLI to be stopped")
+
+
+def test_a_run_started_during_a_merge_keeps_its_cleanup(orchestrator):
+    """The shield restores the handler it found when the merge began, which
+    predates the run; the cleanup must survive that restore."""
+    process, report = orchestrator("spawned-in-merge")
+    config_dir = Path(report["config_dir"])
+    merge_ended = config_dir.parent.parent / "merge-ended"
+    _wait_for(merge_ended.exists, 60, "the merge shield to end")
+
+    output = _stop(process, signal.SIGTERM)
+
+    assert process.returncode == -signal.SIGTERM, output[-3000:]
+    assert not os.path.lexists(config_dir), (
+        f"per-run config dir of a run started during a merge left behind:"
+        f" {sorted(p.name for p in config_dir.rglob('*'))}\n{output[-3000:]}")
     _wait_for(lambda: not _pid_alive(report["pid"]), 30,
               "the fake CLI to be stopped")
 
@@ -289,6 +318,50 @@ def test_install_takes_over_default_dispositions(saved_handlers):
 
     assert _is_cleanup_handler(signal.getsignal(signal.SIGTERM))
     assert _is_cleanup_handler(signal.getsignal(signal.SIGINT))
+
+
+def test_install_during_a_merge_survives_the_shield_restore(saved_handlers,
+                                                           tmp_path):
+    import asyncio
+
+    from equipa.merge_safety import MergeSignalShield
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    async def merge_with_a_run_started_inside():
+        async with MergeSignalShield(tmp_path, context="test merge"):
+            agent_runner._install_stop_signal_cleanup()
+            # A second run during the same merge changes nothing.
+            agent_runner._install_stop_signal_cleanup()
+
+    asyncio.run(merge_with_a_run_started_inside())
+
+    for signum in agent_runner._STOP_SIGNALS:
+        restored = signal.getsignal(signum)
+        assert _is_cleanup_handler(restored), (
+            f"{signal.Signals(signum).name}: the merge shield restored "
+            f"{restored!r} and dropped the cleanup")
+
+
+def test_a_shield_restoring_a_cleanup_handler_keeps_it(saved_handlers,
+                                                       tmp_path):
+    """Installed before the merge: the shield restores the same handler."""
+    import asyncio
+
+    from equipa.merge_safety import MergeSignalShield
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    agent_runner._install_stop_signal_cleanup()
+    installed = signal.getsignal(signal.SIGTERM)
+
+    async def merge_with_a_run_started_inside():
+        async with MergeSignalShield(tmp_path, context="test merge"):
+            agent_runner._install_stop_signal_cleanup()
+
+    asyncio.run(merge_with_a_run_started_inside())
+
+    assert signal.getsignal(signal.SIGTERM) is installed
 
 
 def test_install_leaves_ignored_signals_ignored(saved_handlers):
