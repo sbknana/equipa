@@ -866,18 +866,182 @@ _SUBSTITUTION_LOOKALIKE_RE = re.compile(
     r"\$(?:\\\n)*[(\[]|\$(?:\\\n)+\{|`|[<>](?:\\\n)*\("
 )
 
-# Constructs that make bash evaluate text as arithmetic, where an array
-# subscript is expanded AGAIN - `let 'a[$(id)]'`, `x='a[$(id)]'; (( x ))`,
-# `[[ x -eq 1 ]]`, `test -v`, `printf -v`, `declare -i` all run id
-# (IND3128-03) - or re-parse a quoted compound assignment. Any `[` counts,
-# because a subscript can only come from one. Matched on the command with
-# quotes and backslashes deleted (`l'e't` is `let`); a spurious match only
-# means a quoted look-alike is no longer trusted.
+# Constructs that make bash evaluate text again, whatever their arguments:
+# arithmetic that expands an array subscript AGAIN (`let 'a[$(id)]'`,
+# `x='a[$(id)]'; [[ x -eq 1 ]]`, `${s:x}`, `${@:x}`, `${a[x]}`, `$[x]`,
+# `${!x}`, and an assignment of any kind to an integer special such as
+# `RANDOM='a[$(id)]'` or `read RANDOM`), the re-parse of a quoted compound
+# assignment (`declare -a 'x=($(id))'`, `readonly -a`, `=(`), a mapfile
+# callback (`mapfile -C`) and prompt expansion (`${x@P}`, PS4 with set -x).
+# Each was checked against bash 5.2 (IND3128-03, IV3133-01). Matched on the
+# command with quotes and backslashes deleted (`l'e't` is `let`); a spurious
+# match only means a quoted look-alike is no longer trusted.
 _EVALUATES_TEXT_RE = re.compile(
-    r"\(\(|\[|=\(|\$\{!"
-    r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|read|readarray"
-    r"|mapfile|unset|printf|test|getopts|wait)(?![\w.-])"
+    r"\[\[|=\(|\$\[|\$\{!|\$\{#?(?:\w+|[@*])(?:\[|:(?![-=?+])|@P)"
+    r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|readarray"
+    r"|mapfile|HISTCMD|OPTIND|S?RANDOM|PS[0-4]|PROMPT_COMMAND)(?![\w.-])"
 )
+
+# Builtins that evaluate a subscript only in a variable NAME they are given:
+# `read 'a[$(id)]'`, `printf -v 'a[$(id)]'`, `[ -v 'a[$(id)]' ]`, `unset`,
+# `wait -p`, `getopts`. With plain names (`while read -r f`, `[ -f x ]`,
+# `printf '%s\n' ...`) they store or test text and never evaluate it
+# (IV3133-01), so they count only when an argument could name a subscript.
+_ARGUMENT_EVALUATOR_RE = re.compile(
+    r"(?<![\w.-])(?:read|printf|test|wait|getopts|unset)(?![\w.-])"
+)
+
+# `((`, `$((` and `for ((` re-expand subscripts through the variables they
+# name (`x='a[$(id)]'; (( x ))`). An expression of number literals and
+# operators names none (`"$((1+2))"`), so it is the only exception. The
+# bound keeps the scan linear; a longer literal expression simply counts.
+_ARITHMETIC_OPEN_RE = re.compile(r"\(\(")
+_LITERAL_ARITHMETIC_RE = re.compile(r"\(\([0-9\s+\-*/%<>=!&|^~?:,()]{0,256}?\)\)")
+
+_ARGUMENT_EVALUATORS = frozenset({"[", "read", "printf", "test", "wait", "getopts", "unset"})
+
+# Top-level code characters that end a simple command.
+_COMMAND_SEPARATORS = frozenset(";&|()\n")
+# Unquoted characters that make a word expand to text the checker cannot
+# see: globs and braces (a file named `-v` or `a[$(id)]`) and tilde.
+_EXPANDING_CODE_CHARS = frozenset("*?[]{}~")
+# An unquoted redirection operator at the start of a word, matched on the
+# raw word so that a quoted `'>'` stays an ordinary word.
+_REDIRECTION_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|>>|>\||<&|>&|&>>?|[<>])")
+# `NAME=` / `NAME+=` before the command name: its value is not a command.
+_ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*\+?=")
+# Words that come before a command name without being one.
+_COMMAND_PREFIX_WORDS = frozenset({
+    "!", "{", "}", "if", "then", "elif", "else", "while", "until", "do",
+    "time", "command", "builtin", "exec",
+})
+
+
+@dataclass(frozen=True)
+class _ShellWord:
+    """One top-level word: raw text, quote-free text, and whether it expands."""
+    raw: str
+    text: str
+    expands: bool
+
+
+def _top_level_commands(command: str, kinds: bytes) -> list[list[_ShellWord]]:
+    """Split the top-level code of *command* into simple commands of words.
+
+    Only top-level code blanks and separators split; anything nested (a
+    substitution, a quoted string) stays inside its word. Comments and
+    heredoc bodies are not words. Quote and escape characters are dropped
+    from ``text``. A word ``expands`` when it holds a ``$`` or backtick
+    outside single quotes, or an unquoted glob, brace or tilde character:
+    its final text is then unknown, so callers must not trust it.
+    """
+    commands: list[list[_ShellWord]] = [[]]
+    raw: list[str] = []
+    text: list[str] = []
+    expands = False
+
+    def end_word() -> None:
+        nonlocal raw, text, expands
+        if raw:
+            commands[-1].append(_ShellWord("".join(raw), "".join(text), expands))
+        raw, text, expands = [], [], False
+
+    for ch, kind in zip(command, kinds):
+        base = kind & _KIND_MASK
+        if base in (_K_COMMENT, _K_HEREDOC):
+            continue
+        if kind == _K_CODE and (ch in " \t" or ch in _COMMAND_SEPARATORS):
+            end_word()
+            if ch in _COMMAND_SEPARATORS and commands[-1]:
+                commands.append([])
+            continue
+        raw.append(ch)
+        if ch in "$`" and base not in (_K_SQ, _K_ANSI):
+            expands = True
+        elif kind == _K_CODE and ch in _EXPANDING_CODE_CHARS:
+            expands = True
+        if base not in (_K_SQ_DELIM, _K_DQ_DELIM, _K_ESCAPE):
+            text.append(ch)
+    end_word()
+    return [words for words in commands if words]
+
+
+def _without_redirections(words: list[_ShellWord]) -> list[_ShellWord]:
+    """*words* minus redirection operators and their targets."""
+    kept: list[_ShellWord] = []
+    skip_target = False
+    for word in words:
+        if skip_target:
+            skip_target = False
+            continue
+        operator = _REDIRECTION_RE.match(word.raw)
+        if operator:
+            skip_target = operator.end() == len(word.raw)
+            continue
+        kept.append(word)
+    return kept
+
+
+def _argument_evaluator(words: list[_ShellWord]) -> str | None:
+    """The builtin in one simple command that would evaluate a subscript.
+
+    A builtin name hidden inside a larger word (``x=read``, brace or quote
+    splicing) counts: the word may become that builtin later. So does a
+    command name that expands, since it may become any builtin.
+    """
+    words = _without_redirections(words)
+    at_command_name = True
+    for index, word in enumerate(words):
+        if at_command_name:
+            if _ASSIGNMENT_WORD_RE.match(word.text) or word.text in _COMMAND_PREFIX_WORDS:
+                continue
+            at_command_name = False
+            if word.expands:
+                return f"the expanded command name {word.text!r}"
+        if word.text != "[" and not _ARGUMENT_EVALUATOR_RE.search(word.text):
+            continue
+        if word.text not in _ARGUMENT_EVALUATORS:
+            return repr(word.text)
+        arguments = words[index + 1:]
+        if word.text == "printf":
+            # Only -v names a variable, and it must come first.
+            if arguments and (arguments[0].expands or arguments[0].text.startswith("-")):
+                return "'printf -v'"
+            continue
+        if any(argument.expands or "[" in argument.text for argument in arguments):
+            return f"{word.text!r} with a subscript or expanded argument"
+    return None
+
+
+def _evaluating_construct(command: str) -> str | None:
+    """Name a construct in *command* that makes bash evaluate text again.
+
+    Returns None when there is none, which is what lets a top-level quoted
+    look-alike count as inert (_substitution_lookalikes). See
+    _EVALUATES_TEXT_RE, _ARGUMENT_EVALUATOR_RE and _LITERAL_ARITHMETIC_RE
+    for what counts and why.
+    """
+    stripped = re.sub(r"[\\'\"]", "", command)
+    match = _EVALUATES_TEXT_RE.search(stripped)
+    if match:
+        return repr(match.group(0))
+    for opening in _ARITHMETIC_OPEN_RE.finditer(stripped):
+        if not _LITERAL_ARITHMETIC_RE.match(stripped, opening.start()):
+            return "'((' naming a variable"
+    kinds = _scan_shell(command).kinds
+    for index in range(1, len(command)):
+        # An array subscript in code: `a[x]=1`, `a[$x]+=1`.
+        if (
+            command[index] == "["
+            and kinds[index] & _KIND_MASK in (_K_CODE, _K_PARAM)
+            and (command[index - 1].isalnum() or command[index - 1] == "_")
+        ):
+            return "an array subscript"
+    for words in _top_level_commands(command, kinds):
+        found = _argument_evaluator(words)
+        if found:
+            return found
+    return None
 
 # Where a look-alike sits, for the refusal message.
 _LOOKALIKE_CONTEXTS = {
@@ -916,8 +1080,8 @@ def _substitution_lookalikes(command: str) -> list[_Lookalike]:
     top-level double-quoted string (``"\\$(x)"``, required by sandbox-01
     and covered by the differential test), and a quoted-delimiter heredoc
     body. None of them is proof when the command also contains a construct
-    that evaluates text as arithmetic (see _EVALUATES_TEXT_RE), because
-    bash expands an array subscript inside such text again. Everything
+    that evaluates text again (see _evaluating_construct), because bash
+    expands an array subscript inside such text again. Everything
     else - other double-quoted text, ``$'...'``, comments, ``${...}``
     operators, arithmetic, unquoted backslash escapes, single quotes nested
     in a substitution - is treated as executing the sequence.
@@ -926,9 +1090,7 @@ def _substitution_lookalikes(command: str) -> list[_Lookalike]:
     if not matches and "$'" not in command:
         return []
     scan = _scan_shell(command)
-    evaluates_text = bool(
-        _EVALUATES_TEXT_RE.search(re.sub(r"[\\'\"]", "", command))
-    )
+    evaluates_text = _evaluating_construct(command) is not None
     # Heredoc bodies never overlap and are recorded in order, so a bisect
     # finds the only body that can hold a position (linear overall).
     quoted_bodies = [
@@ -1038,25 +1200,36 @@ def _check_substitution_lookalikes(command: str) -> BashSecurityResult:
     for lookalike in _substitution_lookalikes(command):
         if lookalike.inert or lookalike.kind & _KIND_MASK == _K_CODE:
             continue
+        shown = lookalike.text.replace("\\\n", "\\<newline>")
         if lookalike.quoted_context:
-            where = (
-                "quoted text in a command that also evaluates arithmetic or "
-                "array subscripts (let, ((, [[, [, test, printf -v, declare, "
-                "read, unset ...), which expands a subscript again"
+            # The text is already quoted; the evaluating construct elsewhere
+            # in the command is what revokes the proof (IV3133-01).
+            evaluator = _evaluating_construct(command) or "a construct"
+            message = (
+                f"Command contains {shown!r} in quoted text, and the command "
+                f"also evaluates arithmetic or array subscripts ({evaluator}), "
+                "which expands a subscript in that text again. Run the "
+                "evaluating part as a separate command: the quoted text is "
+                "inert on its own"
             )
         else:
-            where = _LOOKALIKE_CONTEXTS.get(
-                lookalike.kind & _KIND_MASK, "a context the checker cannot prove inert"
-            )
-        shown = lookalike.text.replace("\\\n", "\\<newline>")
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.SUBSTITUTION_LOOKALIKE,
-            message=(
+            kind = lookalike.kind & _KIND_MASK
+            where = _LOOKALIKE_CONTEXTS.get(kind, "a context the checker cannot prove inert")
+            if kind == _K_SQ:
+                advice = (
+                    "Quotes inside a substitution or expansion do not count: "
+                    "move the text to a top-level single-quoted word, or put "
+                    "it in a file"
+                )
+            else:
+                advice = "Single-quote it at the top level, or put the text in a file"
+            message = (
                 f"Command contains {shown!r} inside {where}; only a top-level "
                 "single-quoted word, a \\$ or \\` in a top-level double-quoted "
-                "string, or a quoted heredoc body is proven inert. "
-                "Single-quote it, or put the text in a file"
-            ),
+                f"string, or a quoted heredoc body is proven inert. {advice}"
+            )
+        return BashSecurityResult(
+            safe=False, check_id=CheckID.SUBSTITUTION_LOOKALIKE, message=message,
         )
     return _SAFE
 
@@ -1276,7 +1449,10 @@ _COMMAND_SUBSTITUTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r">\("), "process substitution >()"),
     (re.compile(r"=\("), "Zsh process substitution =()"),
     (re.compile(r"(?:^|[\s;&|])=[a-zA-Z_]"), "Zsh equals expansion (=cmd)"),
-    (re.compile(r"\$\("), "$() command substitution"),
+    # `$((` is arithmetic expansion, not a command (IV3133-04); a `$(` that
+    # runs a command anywhere in the line is still named first.
+    (re.compile(r"\$\((?!\()"), "$() command substitution"),
+    (re.compile(r"\$\(\("), "$(( )) arithmetic expansion"),
     (re.compile(r"\$\{"), "${} parameter substitution"),
     (re.compile(r"\$\["), "$[] legacy arithmetic expansion"),
     (re.compile(r"~\["), "Zsh-style parameter expansion"),
