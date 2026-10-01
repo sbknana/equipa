@@ -173,6 +173,9 @@ def test_split_contractions(words, expected):
     (["security", "got"], True),
     (["supply", "processes"], False),
     (["kindly", "fetch", "the"], True),
+    # A request word is not skipped like an "-ly" adverb.
+    (["ruff", "kindly", "add"], True),
+    (["it's", "kindly", "load"], True),
 ])
 def test_rule_header_lead_judge(words, expected):
     assert ls._is_rule_header_lead(words) is expected
