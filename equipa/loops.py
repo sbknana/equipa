@@ -1934,10 +1934,15 @@ def _html_candidates(
     severity ``seen`` already holds for that line is not reported again.
     Heading lines are left to the heading rules, which read through tags.
     A list item that opens with its own marker ("<li>1. HIGH: SQLi") keeps
-    only the innermost marker (task 3137, SR3130-01).
+    only the innermost marker (task 3137, SR3130-01). Task 3143 (R3137-00):
+    the piece is read as rewritten AND as reduced, under the same source
+    line, so the reduction can only add candidates. "<li>> SQLi - HIGH" is
+    a list item ("- > SQLi - HIGH") that the reduction turned into a quote,
+    which the trailing-severity rules do not read.
     """
     source_lines: list[int] = []
     pieces: list[str] = []
+    reduced_pieces: list[str] = []
     for line_number, line in enumerate(visible_text.split("\n")):
         if "<" not in line or not _HTML_TAG_RE.search(line):
             continue
@@ -1945,25 +1950,32 @@ def _html_candidates(
             # A gap ends any table the previous tagged line was part of.
             source_lines.append(line_number - 1)
             pieces.append("")
+            reduced_pieces.append("")
         for piece in _html_as_markdown(line).split("\n"):
             source_lines.append(line_number)
-            pieces.append(_innermost_container_line(piece))
+            pieces.append(piece)
+            reduced_pieces.append(_innermost_container_line(piece))
     if not pieces:
         return []
-    markdown = "\n".join(pieces)
-    line_of = _line_number_finder(markdown)
-    markdown_candidates = [
-        (line_of(match.start()), match.group(1).upper())
-        for match in _FINDING_CANDIDATE_RE.finditer(markdown)
-        if not _candidate_line(match).lstrip(" \t").startswith("#")
-    ]
-    markdown_candidates += _shape_candidates(markdown, set())
     found: list[tuple[int, str]] = []
-    for markdown_line, severity in markdown_candidates:
-        key = (source_lines[markdown_line], severity)
-        if key not in seen:
-            seen.add(key)
-            found.append(key)
+    # Both documents have one piece per entry of source_lines, so every piece
+    # is read in the same context as before; the second adds candidates only.
+    for document in (pieces, reduced_pieces):
+        markdown = "\n".join(document)
+        line_of = _line_number_finder(markdown)
+        markdown_candidates = [
+            (line_of(match.start()), match.group(1).upper())
+            for match in _FINDING_CANDIDATE_RE.finditer(markdown)
+            if not _candidate_line(match).lstrip(" \t").startswith("#")
+        ]
+        markdown_candidates += _shape_candidates(markdown, set())
+        for markdown_line, severity in markdown_candidates:
+            key = (source_lines[markdown_line], severity)
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+        if reduced_pieces == pieces:
+            break  # nothing was reduced: the second read is the same
     return found
 
 
@@ -1984,15 +1996,36 @@ def _extra_candidate_severities(visible_text: str) -> list[str]:
 # blocks as written, as it did before).
 #
 # The provenance and completion comments the gate itself asks for, each on a
-# line of its own. A review whose rendered view differs from its text only by
-# these is parsed once. Task 3137 (N1): the comment must fill its line. One
+# line of its own. Task 3137 (N1): the comment must fill its line. One
 # inside a word ("HI<!-- EQUIPA-X -->GH: SQLi") joins the word when rendered,
-# so that review must be parsed as rendered too.
+# so that review must be parsed as rendered too. Task 3143 (R3137-03): only
+# the first and the last line of the review may hold one for the review to
+# be parsed once. Anywhere else a marker line is text as written and a blank
+# line as rendered: between "## Counts" and its tally it hid the footer.
 _STANDALONE_MARKER_COMMENT_RE = re.compile(
     r"^[ \t]{0,3}<!--[ \t]*EQUIPA-[A-Z-]{1,40}:?(?:[ \t]*[0-9A-Fa-f]{1,64})?"
     r"[ \t]*-->[ \t]*$",
     re.MULTILINE,
 )
+
+
+def _without_edge_markers(text: str) -> str:
+    """``text`` with a marker comment line on its first or last line emptied.
+
+    The last line is the last non-blank one, so a trailing line break after
+    the completion line does not hide it. Markers elsewhere are kept.
+    """
+    first_end = text.find("\n")
+    first_end = len(text) if first_end == -1 else first_end
+    if _STANDALONE_MARKER_COMMENT_RE.fullmatch(text, 0, first_end):
+        text = text[first_end:]
+    body = text.rstrip(" \t\n")
+    last_start = body.rfind("\n") + 1
+    if last_start > 0 and _STANDALONE_MARKER_COMMENT_RE.fullmatch(
+        body, last_start,
+    ):
+        text = text[:last_start] + text[len(body):]
+    return text
 # Task 3137 (N3): a run of blank lines renders as one paragraph break, and a
 # 200 KB review of nothing but line breaks took about 1 s to parse (every rule
 # pays per line). Each run of two or more blank lines is folded into ONE
@@ -2158,13 +2191,19 @@ def _comment_end(text: str, start: int, limit: int) -> int:
     """Offset just past the HTML comment that opens at ``start``, or -1.
 
     "<!-->" and "<!--->" are empty comments; any other comment ends at the
-    first "-->" before ``limit``.
+    first "-->" or "--!>" before ``limit``. Task 3143 (I-01): a browser also
+    closes a comment at "--!>" (WHATWG "incorrectly-closed-comment"), so
+    "<!-- a --!>HIGH: SQLi -->" shows "HIGH: SQLi -->". -1 means neither
+    closer occurs before ``limit``, which callers remember.
     """
     if text.startswith("<!-->", start):
         return start + 5
     if text.startswith("<!--->", start):
         return start + 6
     close = text.find("-->", start + 4, limit)
+    bang_close = text.find("--!>", start + 4, limit if close == -1 else close)
+    if bang_close != -1:
+        return bang_close + 4
     return -1 if close == -1 else close + 3
 
 
@@ -2677,8 +2716,10 @@ def _analyze_review_file(
     # inside a multi-line comment.
     as_written = _analyze_review_text(text, nonblank_lines)
     rendered = _rendered_review_text(text)
-    if rendered == _STANDALONE_MARKER_COMMENT_RE.sub("", text):
-        # Only the gate's own marker comments, each on its own line, differ.
+    if rendered == _without_edge_markers(text):
+        # Only the provenance line on top and the completion line at the end
+        # differ: nothing comes before the first or after the last line, so
+        # reading them as text or as blank lines changes no other line.
         return as_written
     return _stricter_analysis(
         as_written, _analyze_review_text(rendered, nonblank_lines),
