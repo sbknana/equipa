@@ -452,8 +452,9 @@ def test_a_swap_while_the_pin_is_made_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The pin-time window of R3155-02: the checkout swapped right after it
-    was looked up for the pin. The pin must not record the swapped-in
-    directory as the pinned work tree."""
+    was looked up for the pin, its ``.git`` carried into the swapped-in
+    tree so the git-dir inode checks still pass. On the old code the pin
+    recorded the swapped-in directory as the pinned work tree."""
     real = _real_with_task_branch(tmp_path)
     guard = _run(DefaultBranchGuard.snapshot(real))
     swapped_in = _swapped_in_tree(tmp_path)
@@ -462,7 +463,9 @@ def test_a_swap_while_the_pin_is_made_is_refused(
     def swap_once() -> None:
         if not swapped:
             swapped.append(True)
-            os.rename(real, real.with_name("real.moved"))
+            moved = real.with_name("real.moved")
+            os.rename(real, moved)
+            os.rename(moved / ".git", swapped_in / ".git")
             os.rename(swapped_in, real)
 
     real_realpath = os.path.realpath
