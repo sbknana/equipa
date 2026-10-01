@@ -440,6 +440,44 @@ def test_missing_env_credential_is_named_in_the_log(
     assert len(warnings) == 1, "warned once, naming the variable"
 
 
+# --- the RLM claude -p calls ----------------------------------------------------
+
+@pytest.mark.parametrize("call", ["sub_query", "outer_agent"])
+def test_rlm_claude_calls_get_a_fresh_config_dir(
+        tmp_path, operator_config_dir, monkeypatch, call):
+    """On base the RLM calls passed the operator's CLAUDE_CONFIG_DIR."""
+    from equipa import rlm_decompose
+
+    monkeypatch.setattr(rlm_decompose, "active_agent_env", lambda: {
+        "PATH": "/usr/bin:/bin", "HOME": str(operator_config_dir.parent),
+        "CLAUDE_CONFIG_DIR": str(operator_config_dir),
+        "CLAUDE_CODE_OAUTH_TOKEN": FAKE_TOKEN,
+        "BASH_FUNC_ls%%": "() { id; }"})
+    monkeypatch.setattr(rlm_decompose, "unisolated_spawn_refusal",
+                        lambda *args, **kwargs: None)
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        config_dir = kwargs["env"]["CLAUDE_CONFIG_DIR"]
+        seen.update(env=kwargs["env"], config_dir=config_dir,
+                    entries=os.listdir(config_dir),
+                    mode=stat.S_IMODE(os.lstat(config_dir).st_mode))
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(rlm_decompose.subprocess, "run", fake_run)
+    if call == "sub_query":
+        rlm_decompose._run_sub_query("q", {"a.py": "x"}, "haiku",
+                                     str(tmp_path), "")
+    else:
+        rlm_decompose._call_outer_agent("p", "haiku", str(tmp_path), 30)
+    assert seen["config_dir"] != str(operator_config_dir)
+    assert seen["entries"] == [] and seen["mode"] == 0o700
+    assert seen["env"]["CLAUDE_CODE_SHELL"] == trusted_bash()
+    assert "BASH_FUNC_ls%%" not in seen["env"]
+    assert seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == FAKE_TOKEN
+    assert not os.path.lexists(seen["config_dir"])
+
+
 # --- the operator's live probe script -----------------------------------------
 
 def test_verify_script_exists_and_is_executable():
