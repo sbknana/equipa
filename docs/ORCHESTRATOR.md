@@ -244,7 +244,10 @@ appears in a function that uses none of these:
   directory any EQUIPA process creates also removes the `equipa-claude-config-*`
   directories in the same temp directory that are owned by its user, are real
   directories (never symlinks) and have not changed for 24 hours
-  (`sweep_stale_run_config_dirs`, R3150-08).
+  (`sweep_stale_run_config_dirs`, R3150-08). The test suite keeps every
+  directory it creates in one session temp directory (`eqt-*`), which it
+  removes at the end and on SIGTERM (`timeout`); the next session removes
+  one a SIGKILLed session left once it is a day old (`tests/conftest.py`).
 
 The directory is still writable by the run itself: the CLI writes its state
 there, and an agent running as the same user can write there too. The CLI
