@@ -277,6 +277,56 @@ def test_retiring_a_leftover_worktree_never_runs_an_agent_driver(
         assert not worktree.exists()
 
 
+class _NoDb:
+    """The task-status write of ``cleanup_failed_attempt``, discarded."""
+
+    def __init__(self, write: bool = False) -> None:
+        pass
+
+    def execute(self, *args, **kwargs):
+        return self
+
+    def commit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("kind", PLANTS)
+def test_failed_attempt_reset_never_runs_an_agent_driver(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry path: ``reset --hard`` and ``clean -fd`` between attempts
+    write and read file content in the agent's worktree."""
+    repo, worktree = _task_worktree(tmp_path)
+    base_sha = _master(repo)
+    (worktree / "failed.py").write_text("failed attempt\n")
+    _git(worktree, "add", "failed.py")
+    _git(worktree, "commit", "-q", "-m", "failed attempt")
+    failed_sha = _git(worktree, "rev-parse", "HEAD")
+    drivers = Drivers(tmp_path)
+    _plant(kind, repo, worktree, drivers, tmp_path)
+    _leave_unsaved_work(worktree)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+
+    _run(dispatch_mod.cleanup_failed_attempt(
+        TASK_ID, str(worktree), [], output=[], base_sha=base_sha,
+    ))
+
+    assert not drivers.ran(), f"the agent's {kind} driver ran in the orchestrator"
+    assert _git(repo, "rev-parse", TASK_BRANCH) == base_sha
+    assert failed_sha in _git(repo, "reflog", "--format=%H", TASK_BRANCH)
+    assert (worktree / "README.md").read_text() == "seed\n"
+    assert not (worktree / "failed.py").exists()
+    assert not (worktree / "work.py").exists()
+    # The worktree's own index is the reset one.
+    admin = repo / ".git" / "worktrees" / f"task-{TASK_ID}"
+    staged = _git(repo, f"--git-dir={admin}", f"--work-tree={worktree}", "ls-files", "-s")
+    readme_blob = _git(repo, "rev-parse", f"{base_sha}:README.md")
+    assert staged == f"100644 {readme_blob} 0\tREADME.md", staged
+
+
 def test_worktree_swapped_for_a_symlink_to_the_main_checkout_is_not_stashed(
     tmp_path: Path, capsys,
 ) -> None:
