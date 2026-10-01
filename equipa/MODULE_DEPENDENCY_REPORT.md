@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **49,204 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **49,427 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -34,7 +34,7 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `redact.py` | 508 | L0 | — | — | 8 |
 | `scaffold.py` | 633 | L0 | — | `db.py` | 8 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
-| `checkpoints.py` | 349 | L1 | `constants.py` | `parsing.py` | 8 |
+| `checkpoints.py` | 401 | L1 | `constants.py` | `parsing.py` | 10 |
 | `config.py` | 523 | L1 | `constants.py` | — | 23 |
 | `db.py` | 798 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
 | `hooks/__init__.py` | 441 | L1 | `hooks/dispatcher.py` | `config.py`, `env_loader.py` | 17 |
@@ -48,16 +48,16 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `git_ops.py` | 1782 | L2 | `constants.py`, `role_resolver.py` | `config.py`, `tasks.py` | 41 |
 | `graph.py` | 321 | L2 | `db.py` | — | 7 |
 | `initiative_runner.py` | 1380 | L2 | `initiative.py`, `security.py` | `db.py`, `dispatch.py`, `git_ops.py` | 29 |
-| `messages.py` | 124 | L2 | `db.py` | `security.py` | 4 |
+| `messages.py` | 166 | L2 | `db.py` | `parsing.py`, `security.py` | 5 |
 | `roles.py` | 264 | L2 | `config.py`, `constants.py` | `output.py`, `role_resolver.py`, `routing.py`, `tasks.py` | 3 |
-| `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
+| `sessions.py` | 355 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
 | `isolation.py` | 2284 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 65 |
 | `mcp_server.py` | 967 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `merge_safety.py` | 293 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 894 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
-| `parsing.py` | 992 | L3 | `constants.py`, `git_ops.py` | `tool_result_storage.py` | 23 |
+| `parsing.py` | 1101 | L3 | `constants.py`, `git_ops.py` | `tool_result_storage.py` | 24 |
 | `security_gate.py` | 1156 | L3 | `git_ops.py` | `db.py` | 43 |
 | `single_agent_guard.py` | 632 | L3 | `git_ops.py` | `role_resolver.py` | 6 |
 | `lessons.py` | 723 | L4 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 13 |
@@ -75,7 +75,7 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 49,204 lines | 889 public exports
+**Total:** 49,427 lines | 893 public exports
 
 ## Modules by Layer
 
@@ -119,7 +119,7 @@ Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf m
 | `lessons.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` |
 | `loops.py` | `role_resolver.py` |
 | `manager.py` | `dispatch.py` |
-| `messages.py` | `security.py` |
+| `messages.py` | `parsing.py`, `security.py` |
 | `monitoring.py` | `parsing.py` |
 | `output.py` | `monitoring.py` |
 | `parsing.py` | `tool_result_storage.py` |
@@ -180,7 +180,7 @@ How many other `equipa` modules each module imports.
 | `mcp_server.py` | 3 | 0 | **3** |
 | `merge_integrity.py` | 2 | 0 | **2** |
 | `merge_safety.py` | 2 | 0 | **2** |
-| `messages.py` | 1 | 1 | **2** |
+| `messages.py` | 1 | 2 | **3** |
 | `monitoring.py` | 3 | 1 | **4** |
 | `output.py` | 1 | 1 | **2** |
 | `parsing.py` | 2 | 1 | **3** |
