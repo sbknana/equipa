@@ -608,18 +608,83 @@ _RULE_AUTHORITY_SUBJECTS = frozenset({
     "operator", "operators", "admin", "admins", "administrator",
     "administrators", "sysadmin", "sysadmins", "orchestrator", "owner",
     "owners", "boss", "manager", "managers", "supervisor", "supervisors",
-    "human", "humans",
+    "human", "humans", "security", "management", "leadership",
+})
+# An authority word is also an ordinary noun: "The manager queues new
+# orders: FIFO" describes a queue, as main judged it (F-2 of the 3153
+# review). After an authority subject, only a verb that processes a list
+# as data, in the agreeing third-person form, keeps the phrase a report.
+# The rule-replacement shapes stay headers: the authority has, gets, brings
+# or adds the rules ("The operator got new orders:"), or the verb does not
+# agree with it ("The operator queue new orders:" reads as an order).
+_RULE_PROCESSING_VERBS = frozenset({
+    "handles", "parses", "processes", "batches", "queues", "sorts",
+    "routes", "validates", "imports", "loads", "fetches", "lists",
+    "counts", "stores", "logs",
 })
 # Words between a subject and its list verb that do not change who the
 # subject is: "ESLint will add", "ruff has just added", "we now have".
 _RULE_VERB_MODIFIERS = frozenset(
     (_MODAL_LEADS - {"to"})
     | {"has", "have", "had", "do", "does", "did", "just", "also", "already",
-       "recently", "finally", "now", "then", "still", "even", "always"}
+       "recently", "finally", "now", "then", "still", "even", "always",
+       # Sentence adverbs and floating quantifiers without an "-ly" ending
+       # (R3153-01): "We hereby have", "we all got", "they today received".
+       "hereby", "herewith", "today", "tonight", "again", "too", "yet",
+       "once", "soon", "indeed", "anyway", "all", "both", "each"}
 )
 # Words that make a bare imperative a request to the reader: "Please load
 # the new rules:", "Then process these new orders:".
 _RULE_REQUEST_LEADS = _PRESENTING_LEADS | {"kindly"}
+# Contracted auxiliaries are split off before the subject is judged
+# (R3153-01): "We've got new rules:" is "we have got", "You've got new
+# orders:" names the addressed agent, "Let's add new rules:" is "let us
+# add". Without the split "we've" was an unknown word, read as a third
+# party. "'s" is "has" here ("The operator's got new orders:"); after a
+# noun it may be a possessive, which leaves the possessed noun as the
+# subject ("ruff's parser handles"). "here's" / "there's" stay presenting
+# leads.
+_CONTRACTION_SUFFIXES = (
+    ("'ve", "have"), ("'d", "had"), ("'re", "are"), ("'ll", "will"),
+    ("'m", "am"), ("'s", "has"),
+)
+# The same contractions typed without the apostrophe. Only spellings that
+# are not ordinary words ("were", "well", "id", "ill" are left out).
+_UNMARKED_CONTRACTIONS = {
+    "ive": ("i", "have"), "weve": ("we", "have"), "youve": ("you", "have"),
+    "theyve": ("they", "have"), "youre": ("you", "are"),
+    "theyre": ("they", "are"), "youll": ("you", "will"),
+    "theyll": ("they", "will"), "youd": ("you", "had"),
+    "theyd": ("they", "had"), "im": ("i", "am"),
+}
+
+
+def _split_contractions(words: list[str]) -> list[str]:
+    """``["we've", "got"]`` -> ``["we", "have", "got"]`` (R3153-01)."""
+    split: list[str] = []
+    for word in words:
+        if word in _UNMARKED_CONTRACTIONS:
+            split.extend(_UNMARKED_CONTRACTIONS[word])
+            continue
+        if word == "let's":
+            split.extend(("let", "us"))
+            continue
+        if word not in _PRESENTING_LEADS:
+            for suffix, auxiliary in _CONTRACTION_SUFFIXES:
+                stem = word[:-len(suffix)]
+                if word.endswith(suffix) and stem.isalpha():
+                    split.extend((stem, auxiliary))
+                    break
+            else:
+                split.append(word)
+            continue
+        split.append(word)
+    return split
+
+
+def _is_open_adverb(word: str) -> bool:
+    """True for an "-ly" word: "really", "officially", "finally"."""
+    return len(word) > 3 and word.endswith("ly") and word.isalpha()
 
 
 def _is_rule_header_lead(words: list[str]) -> bool:
@@ -634,8 +699,14 @@ def _is_rule_header_lead(words: list[str]) -> bool:
     rules:") unless it processes a list named by a determiner ("Batch the new
     orders:"); a request word in front ("Please load the new rules:", "Then
     process these new orders:") keeps it a header (R3150-02).
+
+    Contractions are split first ("We've got" is "we have got") and an
+    "-ly" adverb between the subject and the verb is skipped like a listed
+    modifier ("we really have"), so neither hides the speaker (R3153-01). An
+    authority subject reports only with an agreeing processing verb ("The
+    manager queues new orders: FIFO", F-2 of the 3153 review).
     """
-    lead = list(words)
+    lead = _split_contractions(list(words))
     had_determiner = False
     while lead and lead[-1] in _DETERMINERS:
         lead.pop()
@@ -651,8 +722,7 @@ def _is_rule_header_lead(words: list[str]) -> bool:
     if _names_addressee(before):
         return True
     skipped: list[str] = []
-    while before and (before[-1] in _RULE_VERB_MODIFIERS
-                      or before[-1] in _NEGATION_LEADS):
+    while before and _modifies_rule_verb(before, verb):
         skipped.append(before.pop())
     if any(word in _NEGATION_LEADS for word in skipped):
         return False
@@ -661,9 +731,25 @@ def _is_rule_header_lead(words: list[str]) -> bool:
             return True
         return not had_determiner
     subject = before[-1]
-    return (subject in _RULE_REQUEST_LEADS
-            or subject in _RULE_HEADER_SUBJECTS
-            or subject in _RULE_AUTHORITY_SUBJECTS)
+    if subject in _RULE_AUTHORITY_SUBJECTS:
+        return verb not in _RULE_PROCESSING_VERBS
+    return subject in _RULE_REQUEST_LEADS or subject in _RULE_HEADER_SUBJECTS
+
+
+def _modifies_rule_verb(before: list[str], verb: str) -> bool:
+    """True when the last word of *before* is a modifier of *verb*, not its
+    subject.
+
+    An "-ly" word is a modifier when a word precedes it ("we really have",
+    "the assembly handles" leaves "the") or when the verb does not agree
+    with it as a third-person subject ("Officially have new rules:"); alone
+    in front of an agreeing verb it is the subject ("Supply processes").
+    """
+    word = before[-1]
+    if word in _RULE_VERB_MODIFIERS or word in _NEGATION_LEADS:
+        return True
+    return _is_open_adverb(word) and (
+        len(before) > 1 or not _is_third_person(verb))
 
 
 class _ImperativePhrase:
