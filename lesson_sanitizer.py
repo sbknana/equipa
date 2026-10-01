@@ -661,12 +661,54 @@ _UNMARKED_CONTRACTIONS = {
     "theyll": ("they", "will"), "youd": ("you", "had"),
     "theyd": ("they", "had"), "im": ("i", "am"),
 }
+# A contraction typed apart from its subject: "We 've got" (the tokenizer
+# strips the apostrophe) or "We" U+00B4 "ve got", which NFKC turns into
+# "We ve got". After another word these are the auxiliary.
+_DETACHED_CONTRACTIONS = {
+    "ve": "have", "d": "had", "re": "are", "ll": "will", "m": "am",
+    "s": "has",
+}
+# Apostrophe lookalikes that normalization leaves in place (U+2019 and
+# U+02BC are "'" already, see _CLAUSE_TABLE): "We" U+2018 "ve", "We`ve".
+_APOSTROPHE_LOOKALIKES = str.maketrans(dict.fromkeys((
+    "`"
+    "\N{LEFT SINGLE QUOTATION MARK}"
+    "\N{SINGLE HIGH-REVERSED-9 QUOTATION MARK}"
+    "\N{PRIME}"
+    "\N{REVERSED PRIME}"
+    "\N{MODIFIER LETTER PRIME}"
+    "\N{MODIFIER LETTER TURNED COMMA}"
+    "\N{MODIFIER LETTER REVERSED COMMA}"
+    "\N{LATIN SMALL LETTER SALTILLO}"
+), "'"))
+
+
+def _rule_header_word(word: str) -> str:
+    """*word* as the rule-header judge reads it.
+
+    Apostrophe lookalikes become "'" and every mark around the word that is
+    not a letter or digit is dropped, so a word opened by a typographic
+    quote (U+201C, U+00AB) or written with U+2018 for the apostrophe reads
+    as "we" or "we've". The shared tokenizer strips ASCII marks only,
+    and here an unknown word is taken for a third-party subject, so a
+    typographic quote glued to the speaker hid it (R3153-01).
+    """
+    folded = word.translate(_APOSTROPHE_LOOKALIKES)
+    start, end = 0, len(folded)
+    while start < end and not folded[start].isalnum():
+        start += 1
+    while end > start and not folded[end - 1].isalnum():
+        end -= 1
+    return folded[start:end]
 
 
 def _split_contractions(words: list[str]) -> list[str]:
     """``["we've", "got"]`` -> ``["we", "have", "got"]`` (R3153-01)."""
     split: list[str] = []
     for word in words:
+        if split and word in _DETACHED_CONTRACTIONS:
+            split.append(_DETACHED_CONTRACTIONS[word])
+            continue
         if word in _UNMARKED_CONTRACTIONS:
             split.extend(_UNMARKED_CONTRACTIONS[word])
             continue
@@ -712,7 +754,7 @@ def _is_rule_header_lead(words: list[str]) -> bool:
     authority subject reports only with an agreeing processing verb ("The
     manager queues new orders: FIFO", F-2 of the 3153 review).
     """
-    lead = list(words)
+    lead = [word for word in map(_rule_header_word, words) if word]
     had_determiner = False
     while lead and lead[-1] in _DETERMINERS:
         lead.pop()
@@ -720,9 +762,10 @@ def _is_rule_header_lead(words: list[str]) -> bool:
     if not lead:
         return True
     # A "'s" word in verb position is "is" or a possessive, never the list
-    # verb "has": "It's the new rules:", "ruff's new rules:". It stays whole,
-    # so it is not a list verb and the phrase is a header, as on main.
-    if lead[-1].endswith("'s"):
+    # verb "has": "It's the new rules:", "ruff's new rules:", "It 's the new
+    # rules:". It stays whole, so it is not a list verb and the phrase is a
+    # header, as on main.
+    if lead[-1].endswith("'s") or lead[-1] == "s":
         lead = _split_contractions(lead[:-1]) + lead[-1:]
     else:
         lead = _split_contractions(lead)
