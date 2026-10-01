@@ -530,3 +530,69 @@ def test_r3143_08_escaped_list_still_strips_every_format_character():
         and not security_gate._INVISIBLE_CHARS_RE.match(chr(code_point))
     ]
     assert missing == []
+
+
+# --- Timing helpers (tester, cycle 2): same output, less time --------------------
+
+TRANSLATE_SAMPLES = [
+    "",
+    "plain ASCII HIGH: 0\n",
+    "ascii \x01\x7f\r controls\n",
+    f"### [S2] HIGH {E} x\n" * 50,
+    "H\N{GREEK CAPITAL LETTER IOTA}GH and \N{CYRILLIC CAPITAL LETTER EN}IGH\n",
+    "HI\N{ZERO WIDTH SPACE}GH \N{COMBINING ACUTE ACCENT}\N{SOFT HYPHEN}\n",
+    "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}" * 40 + "\n",
+    "\N{CJK UNIFIED IDEOGRAPH-4E00}" * 300 + "x\n",
+    "a\N{EM DASH}" * 500,
+    "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}\x85 x",
+]
+
+
+@pytest.mark.parametrize("table_name", [
+    "_BACKSTOP_LETTER_FOLDS", "_CONFUSABLE_LETTERS",
+])
+@pytest.mark.parametrize("text", TRANSLATE_SAMPLES)
+def test_translate_non_ascii_equals_translate(table_name, text):
+    table = getattr(loops, table_name)
+    assert loops._translate_non_ascii(text, table) == text.translate(table)
+
+
+@pytest.mark.parametrize("text", TRANSLATE_SAMPLES)
+def test_backstop_translated_equals_translate(text):
+    expected = text.translate(loops._BACKSTOP_CHARACTERS)
+    assert loops._backstop_translated(text) == expected
+
+
+def test_fold_tables_leave_ascii_and_line_feeds_alone():
+    """_translate_non_ascii's precondition: no table maps an ASCII character
+    or produces a line feed; _backstop_translated's: the backstop table
+    deletes exactly the ASCII controls other than tab and line feed."""
+    for table in (loops._BACKSTOP_LETTER_FOLDS, loops._CONFUSABLE_LETTERS):
+        assert not [key for key in table if key < 0x80]
+        assert not [value for value in table.values() if "\n" in value]
+    for code_point in range(0x80):
+        char = chr(code_point)
+        expected = ("" if loops._BACKSTOP_ASCII_CONTROLS_RE.fullmatch(char)
+                    else char)
+        assert loops._BACKSTOP_CHARACTERS[code_point] == expected, code_point
+    for code_point in range(0x80, 0x30000):
+        assert "\n" not in loops._BACKSTOP_CHARACTERS[code_point], code_point
+
+
+@pytest.mark.parametrize("tail, accepted", [
+    (": 0", True),
+    (": 0 | CRITICAL: 0", True),
+    (": 0 and 0 HIGH from semgrep.", True),
+    (": 0 | 0 HIGH: 0", True),
+    (": 0, **2** MEDIUM", True),
+    (": 0 0 HIGH**: 0", True),
+    (": 0 rate limiting on login", False),
+    (": 0 0 HIGH:", False),
+    (": 0" + " 1" * 95 + " x", False),
+])
+def test_tally_tail_grammar_reads_each_item_once(tail, accepted):
+    """The tail repeats possessively; each item is still read whole."""
+    tally = loops._BACKSTOP_COUNT_AFTER_RE.match(tail)
+    assert tally is not None
+    matched = loops._BACKSTOP_TALLY_TAIL_RE.fullmatch(tail, tally.end())
+    assert (matched is not None) is accepted, tail

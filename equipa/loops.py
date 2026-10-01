@@ -1854,6 +1854,30 @@ _DOTTED_CAPITAL_I_FOLD = {0x0130: "I"}
 
 _NEWLINE_RE = re.compile("\n")
 
+# Task 3149 (tester timing rows): once a text holds one non-ASCII character,
+# str.translate reads every character through its table (about 0.1 us
+# each), which made the letter folds the largest cost of a 200 KB review
+# that is mostly ASCII. The fold tables map no ASCII character, so only the
+# runs of other characters need translating, unless there are so many that
+# one pass over the whole text is cheaper.
+_NON_ASCII_CHARACTERS_RE = re.compile(r"([^\x00-\x7f]+)")
+_SPARSE_TRANSLATE_SHARE = 16
+
+
+def _translate_non_ascii(text: str, table: dict[int, str]) -> str:
+    """``text.translate(table)`` for a ``table`` that maps no ASCII character
+    and maps no character to a line feed."""
+    if text.isascii():
+        return text
+    non_ascii = len(text) - len(text.encode("ascii", "ignore"))
+    if non_ascii * _SPARSE_TRANSLATE_SHARE > len(text):
+        return text.translate(table)
+    parts = _NON_ASCII_CHARACTERS_RE.split(text)
+    # The odd parts are the runs. None holds a line feed and none gains one,
+    # so the runs are translated in one call and split apart again.
+    parts[1::2] = "\n".join(parts[1::2]).translate(table).split("\n")
+    return "".join(parts)
+
 # Rules added by tasks 3122, 3130 and 3137. Unlike the older rules they
 # report a severity only on a line where no earlier rule saw it (see
 # _shape_candidates).
@@ -2743,7 +2767,7 @@ def _rendered_review_text(text: str) -> str:
         # A decoded reference may itself be fullwidth or invisible.
         text = normalize_review_text(text)
     text = _strip_combining_marks(text)
-    text = text.translate(_CONFUSABLE_LETTERS)
+    text = _translate_non_ascii(text, _CONFUSABLE_LETTERS)
     text = _INTRAWORD_EMPHASIS_RE.sub("", text)
     # Removed code and comments can leave long runs of blank lines (task 3137).
     return _fold_blank_line_runs(_INTERIOR_BLANK_RUN_RE.sub(" ", text))
@@ -2915,15 +2939,21 @@ _BACKSTOP_TALLY_TAIL_WORDS = (
     "open", "new", "remaining", "branch", "repo", "repository", "project",
     "dependency", "dependencies", "package", "packages", "check", "checks",
 )
+# The items repeat possessively (a failing tail is read once, never re-split;
+# tester, cycle 2: 0.7 s on 200 KB of "HIGH: 0 1 1 ... x"). So the first
+# alternative that matches must be the right one: "0 HIGH" is taken whole
+# unless a ":" or "=" follows, where "0" ends one item and "HIGH: 0" starts
+# the next.
 _BACKSTOP_TALLY_TAIL_RE = re.compile(
-    r"(?:[ \t]*(?:[|,;/&+]|\.(?![^\W_])|\d{1,6}(?![\w-])"
-    r"|[*_`]{0,3}" + _BACKSTOP_SEVERITY_WORD
+    r"(?:[ \t]*(?:"
+    r"[*_`]{0,3}" + _BACKSTOP_SEVERITY_WORD
     + r"[*_`]{0,3}[ \t]*[:=][ \t]*[*_`]{0,3}\d{1,4}(?![\w-])[*_`]{0,3}"
     r"|[*_`]{0,3}\d{1,4}[*_` \t]{1,6}" + _BACKSTOP_SEVERITY_WORD
-    + r"[*_`]{0,3}"
+    + r"[*_`]{0,3}(?![*_` \t]*[:=])"
+    r"|[|,;/&+]|\.(?![^\W_])|\d{1,6}(?![\w-])"
     r"|(?i:" + "|".join(sorted(_BACKSTOP_TALLY_TAIL_WORDS, key=len,
                                reverse=True)) + r")(?![\w-])"
-    r"))*[ \t]*",
+    r"))*+[ \t]*",
 )
 # A soft-wrapped paragraph line: the line before must hold text and must not
 # be a heading, a table row or a fence.
@@ -3056,11 +3086,22 @@ def _backstop_normalized(text: str) -> str:
     """
     if "&" in text:
         text = _BACKSTOP_REFERENCE_RE.sub(_backstop_decoded_reference, text)
-    text = text.translate(_BACKSTOP_CHARACTERS)
+    text = _backstop_translated(text)
     if text.isascii():
         return text
-    text = unicodedata.normalize("NFKD", text).translate(_BACKSTOP_CHARACTERS)
+    text = _backstop_translated(unicodedata.normalize("NFKD", text))
     return unicodedata.normalize("NFKC", text)
+
+
+# The ASCII characters _BACKSTOP_CHARACTERS deletes (controls other than tab
+# and line feed); it leaves every other ASCII character alone.
+_BACKSTOP_ASCII_CONTROLS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]+")
+
+
+def _backstop_translated(text: str) -> str:
+    """``text.translate(_BACKSTOP_CHARACTERS)``, fast on mostly-ASCII text."""
+    text = _translate_non_ascii(text, _BACKSTOP_CHARACTERS)
+    return _BACKSTOP_ASCII_CONTROLS_RE.sub("", text)
 
 
 def _backstop_line_origins(text: str, spans: list[tuple[int, int]]) -> list[int]:
@@ -3647,7 +3688,7 @@ def _analyze_review_file(
     folded_first = None
     if not text.isascii():
         folded_first = normalize_review_text(
-            text.translate(_BACKSTOP_LETTER_FOLDS),
+            _translate_non_ascii(text, _BACKSTOP_LETTER_FOLDS),
         )
     text = normalize_review_text(text)
 
@@ -3682,7 +3723,7 @@ def _analyze_review_views(text: str) -> ReviewCountAnalysis:
     if not text.isascii():
         # R3143-05: every case-insensitive rule reads "HİGH" as HIGH, so it
         # is spelled that way before any rule runs (one letter for one).
-        text = text.translate(_DOTTED_CAPITAL_I_FOLD)
+        text = text.replace("\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}", "I")
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     text = _fold_blank_line_runs(text)
