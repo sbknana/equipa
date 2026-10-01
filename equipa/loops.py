@@ -2862,10 +2862,9 @@ _BACKSTOP_REPORTED_LINES = 20
 #     or headings), so a tally never claims a finding the review did not
 #     count;
 #   * a negation: "no", "not", "nor", "neither", "zero", "without",
-#     "rather/other/lower/less than", "below" or "none is/of/reached" right
-#     before the word ("No CRITICAL or HIGH findings", "LOW rather than
-#     MEDIUM"), also at the end of the line before when the token opens a
-#     soft-wrapped line of the same paragraph;
+#     "rather/other/lower/less than" or "none is/of/reached" right before
+#     the word on its own line ("No CRITICAL or HIGH findings", "LOW rather
+#     than MEDIUM");
 #   * the next word of a list that opens with one of these ("0 CRITICAL/HIGH",
 #     "no CRITICAL, HIGH or MEDIUM issues"), which takes its count.
 #   * "Overall risk: MEDIUM" (also "LOW-MEDIUM"), which states one finding of
@@ -2902,8 +2901,11 @@ _BACKSTOP_COUNT_AFTER_RE = re.compile(
     r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)"
     r"[*_`]{0,3}",
 )
+# Task 3154 (R3152-02): every negation is one main (ba6065a) had. "below"
+# and a negation ending the line before (both task 3149) excused a MEDIUM
+# word main counts, so seven review shapes main blocks were trusted.
 _BACKSTOP_NEGATION_BEFORE_RE = re.compile(
-    r"(?:^|[^\w-])(no|not|nor|zero|without|nothing|neither|never|below|"
+    r"(?:^|[^\w-])(no|not|nor|zero|without|nothing|neither|never|"
     r"(?:rather|other|lower|less)[ \t]+than|"
     r"none(?:[ \t]+(?:is|are|was|were|at|of|reach|reaches|reached|rated))?)"
     r"[*_` \t]{1,6}\Z",
@@ -3204,29 +3206,6 @@ def _backstop_without_markup(text: str) -> tuple[str, list[int] | None] | None:
         origins = (tag_origins if origins is None
                    else [origins[line] for line in tag_origins])
     return without_tags, origins
-
-
-def _backstop_wrapped_negation(
-    view: str, newlines: list[int], line: int, line_start: int, start: int,
-) -> bool:
-    """True when a token opening a soft-wrapped line follows a negation.
-
-    "... there are no" / "CRITICAL/HIGH issues." is one paragraph: the
-    negation ends the line before. Only when nothing but emphasis comes
-    before the token on its line, and the line before holds text and is not
-    a heading, table row or fence (R3143-06).
-    """
-    if line == 0 or start - line_start > _BACKSTOP_CONTEXT:
-        return False
-    if view[line_start:start].strip(" \t*_`"):
-        return False
-    previous_start = newlines[line - 2] + 1 if line >= 2 else 0
-    previous_end = line_start - 1
-    if _BACKSTOP_BLOCK_LINE_RE.match(view, previous_start, previous_end):
-        return False
-    tail = view[max(previous_start, previous_end - _BACKSTOP_CONTEXT):
-                previous_end].rstrip(" \t")
-    return bool(tail) and _backstop_negates(tail + " ")
 
 
 def _backstop_negates(before: str) -> bool:
@@ -3631,9 +3610,7 @@ def _backstop_exempt_count(
         word = stated.group(1)
         return (int(word) if word.isdigit()
                 else _BACKSTOP_NUMBER_WORDS[word.lower()])
-    if (_backstop_negates(before)
-            or _backstop_wrapped_negation(view, newlines, line, line_start,
-                                          start)):
+    if _backstop_negates(before):
         return 0
     if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
         return 1
