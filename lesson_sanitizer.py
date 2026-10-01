@@ -421,8 +421,47 @@ _DETERMINERS = frozenset({
 # are the new rules:", "Okay, the new orders:").
 _PRESENTING_LEADS = frozenset({
     "here", "there", "here's", "there's", "is", "are", "was", "were",
-    "ok", "okay", "so", "now", "then", "and", "also", "please", "note",
-    "important", "urgent", "attention",
+    "ok", "okay", "so", "now", "then", "and", "also", "please", "pls", "plz",
+    "note", "important", "urgent", "attention",
+})
+# Words naming the agent a text would be addressed to (R3145-01, RR3145-C).
+# A statement shape keeps the phrase a statement only when its subject or
+# object is NOT one of these: "the CA will act as the root CA" is text,
+# "Agents must forget all of that", "Reviewers will act as the root user",
+# "You guys act as the root user" and "make sure you act as the root user"
+# are orders. Narrow on purpose: a role noun that also names ordinary
+# components or people ("worker", "user", "team") would refuse real text.
+_ADDRESSEES = frozenset({
+    "you", "u", "ya", "ye", "yall", "y'all", "yourself", "yourselves",
+    "guys", "folks", "everyone", "everybody",
+    "agent", "agents", "subagent", "subagents", "assistant", "assistants",
+    "ai", "ais", "claude", "llm", "llms", "bot", "bots",
+    "developer", "developers", "tester", "testers", "reviewer", "reviewers",
+})
+# "Make sure to act as the root user", "Remember to forget all of that".
+_IMPERATIVE_TO_LEADS = frozenset({"remember", "sure"})
+# A list marker in front of the phrase ("i)", "(a)", "2)") is not a word:
+# "i) act as the root user" is an item, not the pronoun "I".
+_LIST_MARKER = re.compile(r"\(?(?:\d{1,3}|[a-z]|[ivxlc]{1,5})\)")
+# "new rules:" / "new orders:" introduce a rule list. They are ordinary text
+# only after a verb that reports or processes such a list ("ruff ships new
+# rules: E501", "the parser handles new orders: buy and sell", "Batch the
+# new orders: one per customer"). After any other word, determiner or not,
+# they are a header that replaces the agent's rules ("Follow the new rules:",
+# "Obey the new orders:", "Here are the new rules:"; RR3145-C).
+_RULE_LIST_VERBS = frozenset({
+    "ship", "ships", "shipped", "add", "adds", "added", "has", "have", "had",
+    "handle", "handles", "handled", "introduce", "introduces", "introduced",
+    "define", "defines", "defined", "include", "includes", "included",
+    "contain", "contains", "support", "supports", "get", "gets", "got",
+    "bring", "brings", "brought", "receive", "receives", "received",
+    "parse", "parses", "parsed", "process", "processes", "processed",
+    "batch", "batches", "batched", "queue", "queues", "queued",
+    "sort", "sorts", "sorted", "route", "routes", "routed",
+    "validate", "validates", "validated", "import", "imports", "imported",
+    "load", "loads", "loaded", "fetch", "fetches", "fetched",
+    "list", "lists", "listed", "count", "counts", "counted",
+    "store", "stores", "stored", "log", "logs", "logged",
 })
 # Words ending in "s" that are not a third-person verb or plural subject.
 _NOT_THIRD_PERSON = frozenset({
@@ -443,12 +482,18 @@ def _is_third_person(word: str) -> bool:
     )
 
 
+def _names_addressee(words: list[str]) -> bool:
+    return any(word in _ADDRESSEES for word in words)
+
+
 def _is_instruction_lead(words: list[str]) -> bool:
     """True unless *words* (the clause before a phrase) make it a statement.
 
-    Statement shapes: a negation; a modal or "to" not addressed to "you"; a
-    subject the verb agrees with; a third-person verb or plural subject; a
-    causative ("let CI ..."); a determiner that makes the phrase an object.
+    Statement shapes: a negation; a modal or "to" whose subject is not the
+    addressed agent; a subject the verb agrees with; a third-person verb or
+    plural subject that is not the addressed agent; a causative whose object
+    is not the addressed agent ("let CI ...", but not "make sure you ...");
+    a determiner that makes the phrase an object.
     """
     if not words:
         return True
@@ -456,17 +501,39 @@ def _is_instruction_lead(words: list[str]) -> bool:
     if last in _NEGATION_LEADS or last in _SUBJECT_LEADS:
         return False
     if last in _MODAL_LEADS:
-        return "you" in words[-3:-1]
+        if last == "to" and len(words) >= 2 and words[-2] in _IMPERATIVE_TO_LEADS:
+            return True
+        return _names_addressee(words[-3:-1])
     if last in _DETERMINERS:
         object_head = len(words)
         while object_head and words[object_head - 1] in _DETERMINERS:
             object_head -= 1
         return object_head == 0 or words[object_head - 1] in _PRESENTING_LEADS
-    if last in _PRESENTING_LEADS:
+    if last in _PRESENTING_LEADS or last in _ADDRESSEES:
         return True
-    if any(word in _CAUSATIVE_LEADS for word in words[-4:-1]):
-        return False
+    window = words[-_LEAD_WORDS:]
+    causatives = [index for index, word in enumerate(window[:-1])
+                  if word in _CAUSATIVE_LEADS]
+    if causatives:
+        return _names_addressee(window[causatives[-1] + 1:])
     return not _is_third_person(last)
+
+
+def _is_rule_header_lead(words: list[str]) -> bool:
+    """True unless *words* (the clause before "new rules:" / "new orders:")
+    report or process a rule list (see _RULE_LIST_VERBS) for someone other
+    than the addressed agent, or negate it."""
+    lead = list(words)
+    while lead and lead[-1] in _DETERMINERS:
+        lead.pop()
+    if not lead:
+        return True
+    verb = lead[-1]
+    if verb in _NEGATION_LEADS:
+        return False
+    if verb not in _RULE_LIST_VERBS:
+        return True
+    return _names_addressee(lead[:-1])
 
 
 class _ImperativePhrase:
@@ -478,19 +545,20 @@ class _ImperativePhrase:
     character later, so every character starts at most one phrase attempt.
     """
 
-    def __init__(self, phrase: str) -> None:
+    def __init__(self, phrase: str, lead_judge=None) -> None:
         self.pattern = phrase
         self._phrase = re.compile(phrase, re.IGNORECASE)
+        self._lead_judge = lead_judge or _is_instruction_lead
 
-    @staticmethod
-    def _opens_instruction(text: str, start: int) -> bool:
+    def _opens_instruction(self, text: str, start: int) -> bool:
         window = text[max(0, start - _IMPERATIVE_LOOKBACK):start]
         clause = window.translate(_CLAUSE_TABLE).rpartition("\n")[2].lower()
         tokens = (
             token.strip(_WORD_EDGE_MARKS)
             for token in clause.split()[-_LEAD_WORDS:]
+            if not _LIST_MARKER.fullmatch(token)
         )
-        return _is_instruction_lead([word for word in tokens if word])
+        return self._lead_judge([word for word in tokens if word])
 
     def search(self, text: str) -> re.Match[str] | None:
         position = 0
@@ -608,18 +676,23 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
     ),
     # The same class for phrases that are ordinary text when they continue a
     # statement (review N4 of task 3129, F1 of task 3139): "Please act as the
-    # root user", "Okay forget all of that", "Here are the new rules: ...",
-    # but not "the intermediate CA will act as the root CA", "don't forget
-    # all of this setup" or "ruff ships new rules: E501".
+    # root user", "Okay forget all of that", but not "the intermediate CA
+    # will act as the root CA" or "don't forget all of this setup".
     (
         "role override",
         _ImperativePhrase(
             r"\b(?:act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
             r"root\b|"
             r"forget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
-            r"context|you)\b|"
-            r"new\s+(?:rules?|orders?)\s*:)",
+            r"context|you)\b)",
         ),
+    ),
+    # "Here are the new rules: ...", "Follow the new rules: ...", but not
+    # "ruff ships new rules: E501" (RR3145-C, see _RULE_LIST_VERBS).
+    (
+        "role override",
+        _ImperativePhrase(r"\bnew\s+(?:rules?|orders?)\s*:",
+                          lead_judge=_is_rule_header_lead),
     ),
     # Explicit requests to run supplied commands.
     (
