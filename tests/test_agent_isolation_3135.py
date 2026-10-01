@@ -1081,6 +1081,22 @@ def _verification_config(tmp_path: Path, monkeypatch) -> None:
                             # Required since task 3136 (ISO-05).
                             "secret_scan_roots": [str(tmp_path)]}})
     monkeypatch.setattr(isolation, "THEFORGE_DB", tmp_path / "missing.db")
+    # Task 3142 (I1): the rule is judged by its content in sudo -n -ll.
+    monkeypatch.setattr(isolation, "sudoers_listing", narrow_rule_listing)
+
+
+def narrow_rule_listing(settings) -> tuple[str, int]:
+    """``sudo -n -ll`` output with the installed launcher rule."""
+    command = f"{settings.python} -I {settings.launcher} --isolated"
+    return ("Runas and Command-specific defaults for orchestrator:\n"
+            "    Defaults!EQUIPA_AGENT_LAUNCH !use_pty, !pam_session, "
+            "env_reset, !log_output\n\n"
+            "User orchestrator may run the following commands on host:\n\n"
+            "Sudoers entry: /etc/sudoers.d/equipa-agent\n"
+            f"    RunAsUsers: {settings.agent_user}\n"
+            "    Options: !authenticate\n"
+            "    Commands:\n"
+            f"\t{command}\n", 0)
 
 
 @pytest.mark.parametrize("rule_status, probe_output, expected", [

@@ -536,9 +536,23 @@ def test_probe_command_names_every_directory_and_copy(
         assert f"{option})" in text
 
 
+def _narrow_rule_listing(settings) -> tuple[str, int]:
+    """``sudo -n -ll`` output with the installed launcher rule."""
+    command = f"{settings.python} -I {settings.launcher} --isolated"
+    return ("    Defaults!EQUIPA_AGENT_LAUNCH !use_pty, !pam_session, "
+            "env_reset, !log_output\n\n"
+            "Sudoers entry: /etc/sudoers.d/equipa-agent\n"
+            f"    RunAsUsers: {settings.agent_user}\n"
+            "    Options: !authenticate\n"
+            "    Commands:\n"
+            f"\t{command}\n", 0)
+
+
 def test_outer_checks_fail_on_open_directories_and_copies(
         tmp_path: Path, forge_layout: dict[str, Path], monkeypatch) -> None:
     monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+    # Task 3142 (I1): the rule is judged by its content in sudo -n -ll.
+    monkeypatch.setattr(isolation, "sudoers_listing", _narrow_rule_listing)
     forge = forge_layout["forge"]
     forge.chmod(0o755)
     (forge / "theforge_backup_2026-09-30.db").chmod(0o644)

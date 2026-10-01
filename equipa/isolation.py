@@ -2506,6 +2506,71 @@ def _database_directory_failures(settings: IsolationSettings,
     return failures
 
 
+_SUDOERS_ALIAS = "EQUIPA_AGENT_LAUNCH"
+
+
+def _sudoers_entries(listing: str) -> list[dict[str, Any]]:
+    """The rules of ``sudo -ll`` output: one dict per ``Sudoers entry``
+    with its ``RunAsUsers``, ``Options`` and ``Commands``."""
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    in_commands = False
+    for line in listing.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            in_commands = False
+        elif stripped.startswith("Sudoers entry"):
+            current = {"runas": "", "options": "", "commands": []}
+            entries.append(current)
+            in_commands = False
+        elif current is None:
+            continue
+        elif stripped.startswith("RunAsUsers:"):
+            current["runas"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Options:"):
+            current["options"] = stripped.split(":", 1)[1].strip()
+        elif stripped == "Commands:":
+            in_commands = True
+        elif in_commands:
+            current["commands"].append(" ".join(stripped.split()))
+    return entries
+
+
+def narrow_sudoers_rule_problems(settings: IsolationSettings,
+                                 listing: str) -> list[str]:
+    """What is wrong with the launcher's sudoers rule, judged by the
+    content of ``sudo -n -ll`` (review I1), not by whether the orchestrator
+    may run the command: with ``(ALL) NOPASSWD: ALL`` it always may, rule or
+    no rule, and without the rule's ``!pam_session`` pam_systemd moves the
+    agent out of its scope."""
+    command = " ".join(f"{settings.python} -I {settings.launcher} "
+                       f"{' '.join(agent_launcher.ISOLATED_ARGV)}".split())
+    rule = next((entry for entry in _sudoers_entries(listing)
+                 if entry["runas"] == settings.agent_user
+                 and entry["commands"] in ([command], [_SUDOERS_ALIAS])),
+                None)
+    problems: list[str] = []
+    if rule is None:
+        problems.append(f"no sudoers rule lets the orchestrator run exactly "
+                        f"'{command}' as {settings.agent_user} (an ALL rule "
+                        f"does not count)")
+    elif "!authenticate" not in rule["options"].split(", "):
+        problems.append("the launcher's sudoers rule is not NOPASSWD")
+    defaults = [line for line in listing.splitlines()
+                if "Defaults!" in line
+                and (_SUDOERS_ALIAS in line or command in " ".join(line.split()))]
+    for option in ("!pam_session", "!use_pty"):
+        if not any(option in line for line in defaults):
+            problems.append(f"the launcher's sudoers Defaults lack {option}")
+    return problems
+
+
+def sudoers_listing(settings: IsolationSettings) -> tuple[str, int]:
+    """(``sudo -n -ll`` output, exit status): the orchestrator's own rules,
+    with their options and the command-specific Defaults."""
+    return _run_capture([settings.sudo, "-n", "-ll"])
+
+
 def _outer_checks(settings: IsolationSettings) -> list[str]:
     """Checks made as the orchestrator user; returns failure messages."""
     import pwd
@@ -2515,8 +2580,13 @@ def _outer_checks(settings: IsolationSettings) -> list[str]:
     listed = _exit_status([settings.sudo, "-n", "-l", "-u", settings.agent_user,
                              settings.python, "-I", settings.launcher,
                              *agent_launcher.ISOLATED_ARGV])
-    if listed != 0:
-        failures.append("the sudoers rule is missing; install:\n"
+    listing, status = sudoers_listing(settings)
+    problems = (narrow_sudoers_rule_problems(settings, listing) if status == 0
+                else [f"sudo -n -ll exited {status}: {listing.strip()[-300:]}"])
+    if listed != 0 or problems:
+        failures.append("the sudoers rule is missing or incomplete ("
+                        + "; ".join(problems or ["the command is refused"])
+                        + "); install:\n"
                         + sudoers_snippet(settings, orchestrator_user))
     database = Path(THEFORGE_DB)
     if database.exists() and database.stat().st_mode & stat.S_IROTH:
@@ -2554,10 +2624,61 @@ def _exit_status(argv: Sequence[str]) -> int:
         return 127
 
 
+_PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
+_TCP_LISTEN = "0A"
+_MAX_PROBED_PORTS = 256
+
+
+def _proc_net_address(hex_address: str) -> str | None:
+    """The address of a /proc/net/tcp{,6} ``local_address`` field."""
+    import ipaddress
+
+    try:
+        raw = bytes.fromhex(hex_address)
+    except ValueError:
+        return None
+    if len(raw) == 4:
+        return str(ipaddress.IPv4Address(raw[::-1]))
+    if len(raw) == 16:  # four host-order 32-bit words
+        words = b"".join(raw[index:index + 4][::-1] for index in range(0, 16, 4))
+        address = ipaddress.IPv6Address(words)
+        return str(address.ipv4_mapped or address)
+    return None
+
+
+def listening_loopback_ports() -> list[int]:
+    """TCP ports with a listener reachable at 127.0.0.1: bound to loopback
+    or to every address. The verify probe tries each as the agent (F2)."""
+    import ipaddress
+
+    ports: set[int] = set()
+    for table in _PROC_NET_TCP:
+        try:
+            lines = Path(table).read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != _TCP_LISTEN:
+                continue
+            hex_address, _colon, hex_port = fields[1].partition(":")
+            address = _proc_net_address(hex_address)
+            if address is None:
+                continue
+            ip = ipaddress.ip_address(address)
+            if ip.is_loopback or ip.is_unspecified:
+                ports.add(int(hex_port, 16))
+    return sorted(ports)[:_MAX_PROBED_PORTS]
+
+
 def build_probe_command(probe: str, settings: IsolationSettings,
-                        repos: Sequence[str], orchestrator_home: str) -> list[str]:
+                        repos: Sequence[str], orchestrator_home: str,
+                        loopback_ports: Sequence[int] = ()) -> list[str]:
     """argv for ``verify_agent_isolation.sh --inside`` (argv[0] is replaced
-    by the probe path, as the CLI path is for a real agent)."""
+    by the probe path, as the CLI path is for a real agent).
+
+    ``loopback_ports`` (the operator's ``--loopback-port``) and every port
+    listening on loopback are probed as the agent at 127.0.0.1 (F2)."""
     command = ["claude", "--inside",
                "--orchestrator-pid", str(os.getpid()),
                "--orchestrator-home", orchestrator_home,
@@ -2597,6 +2718,8 @@ def build_probe_command(probe: str, settings: IsolationSettings,
         roots, settings.exclude_tables)
     for path in credential_copies:
         command += ["--db-copy", path]
+    for port in sorted({*loopback_ports, *listening_loopback_ports()}):
+        command += ["--deny-port", str(port)]
     return command
 
 
@@ -2613,6 +2736,18 @@ async def _run_probe(command: list[str], dispatch_config: Mapping[str, Any]
     return output.decode("utf-8", "replace")
 
 
+def _port_number(text: str) -> int:
+    import argparse
+
+    try:
+        port = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a port number: {text!r}") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port out of range: {port}")
+    return port
+
+
 def verification_main(argv: Sequence[str] | None = None) -> int:
     """``python3 -m equipa.isolation --verify-probe <script>``: run the
     operator's checks through the real isolated launch path. 0 = all pass."""
@@ -2627,6 +2762,11 @@ def verification_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--repo", action="append", default=[],
                         help="project repository whose .git the agent must "
                              "not write (repeatable)")
+    parser.add_argument("--loopback-port", action="append", default=[],
+                        type=_port_number,
+                        help="port of a local service the agent must not "
+                             "reach at 127.0.0.1 (repeatable); every port "
+                             "listening on loopback is probed as well")
     args = parser.parse_args(argv)
     if os.geteuid() == 0:
         print("FAIL run this as the orchestrator user, not root")
@@ -2644,7 +2784,8 @@ def verification_main(argv: Sequence[str] | None = None) -> int:
     for failure in failures:
         print(f"FAIL {failure}")
     command = build_probe_command(args.verify_probe, settings, args.repo,
-                                  pwd.getpwuid(os.getuid()).pw_dir)
+                                  pwd.getpwuid(os.getuid()).pw_dir,
+                                  args.loopback_port)
     try:
         output = asyncio.run(_run_probe(command, dispatch_config))
     except AgentIsolationError as exc:

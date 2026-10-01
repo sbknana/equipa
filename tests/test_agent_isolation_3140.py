@@ -1168,6 +1168,18 @@ def test_probe_command_probes_credential_copies_as_the_agent(
     assert str(project_roots["copy"]) in copies
 
 
+def _narrow_rule_listing(settings) -> tuple[str, int]:
+    """``sudo -n -ll`` output with the installed launcher rule."""
+    command = f"{settings.python} -I {settings.launcher} --isolated"
+    return ("    Defaults!EQUIPA_AGENT_LAUNCH !use_pty, !pam_session, "
+            "env_reset, !log_output\n\n"
+            "Sudoers entry: /etc/sudoers.d/equipa-agent\n"
+            f"    RunAsUsers: {settings.agent_user}\n"
+            "    Options: !authenticate\n"
+            "    Commands:\n"
+            f"\t{command}\n", 0)
+
+
 def test_outer_checks_fail_on_a_world_readable_credential_copy(
         tmp_path: Path, monkeypatch, project_roots: dict[str, Path]) -> None:
     forge = tmp_path / "TheForge"
@@ -1175,6 +1187,8 @@ def test_outer_checks_fail_on_a_world_readable_credential_copy(
     monkeypatch.setattr(isolation, "THEFORGE_DB", forge / "theforge.db")
     monkeypatch.setattr(isolation, "MCP_CONFIG", tmp_path / "no-mcp.json")
     monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+    # Task 3142 (I1): the rule is judged by its content in sudo -n -ll.
+    monkeypatch.setattr(isolation, "sudoers_listing", _narrow_rule_listing)
     settings = _settings(tmp_path,
                          secret_scan_roots=[str(project_roots["projects"])])
     project_roots["copy"].chmod(0o644)

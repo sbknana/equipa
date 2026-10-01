@@ -7,7 +7,8 @@
 # docs/AGENT_ISOLATION.md, from the EQUIPA runtime checkout, with the same
 # environment the orchestrator runs with (THEFORGE_DB, the OAuth token):
 #
-#     scripts/verify_agent_isolation.sh [--repo /path/to/project ...]
+#     scripts/verify_agent_isolation.sh [--repo /path/to/project ...] \
+#         [--loopback-port PORT ...]
 #
 # It starts THIS script as an isolated agent through the real launch path
 # (systemd-run --user --scope + the sudoers rule + agent_launcher --isolated)
@@ -26,7 +27,12 @@
 #   * cannot signal the orchestrator;
 #   * sees a TheForge view without the excluded tables (api_keys);
 #   * has no credential in its environment except CLAUDE_CODE_OAUTH_TOKEN;
-#   * cannot use crontab or at, and does not linger (nothing outlives it).
+#   * cannot use crontab or at, and does not linger (nothing outlives it);
+#   * cannot connect to 127.0.0.1 on any --loopback-port or any port that
+#     listens on loopback (the launcher also refuses while its own loopback
+#     and LAN listeners are reachable).
+# As the orchestrator it also checks that the narrow sudoers rule is
+# installed, by its content (an ALL rule does not count).
 # Every check prints PASS or FAIL; the last line is RESULT: PASS|FAIL.
 # Exit status: 0 all checks passed, 1 a check failed, 2 isolation could not
 # be established at all.
@@ -40,10 +46,11 @@ inside() {
     local orchestrator_pid="" orchestrator_home="" database="" runtime=""
     local launcher="" pids_expected="" view_db="" mcp_config=""
     local -a git_dirs=() excluded_tables=() deny_dirs=() db_copies=()
-    local -a secret_roots=()
+    local -a secret_roots=() deny_ports=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --deny-dir) deny_dirs+=("$2"); shift 2 ;;
+            --deny-port) deny_ports+=("$2"); shift 2 ;;
             --db-copy) db_copies+=("$2"); shift 2 ;;
             --secret-root) secret_roots+=("$2"); shift 2 ;;
             --orchestrator-pid) orchestrator_pid="$2"; shift 2 ;;
@@ -222,6 +229,26 @@ inside() {
         fail "lingering is enabled for $user (a user manager outside the scope)"
     else
         pass "lingering is off for $user"
+    fi
+
+    # --- network: no local service is reachable (review F2) -----------------
+    # The launcher already refused unless its own loopback listener was
+    # unreachable; this tries the real services: every --loopback-port the
+    # operator listed and every port listening on loopback. Each try is
+    # bounded and they run side by side (a dropped SYN never answers).
+    local port reached
+    if [ "${#deny_ports[@]}" -eq 0 ]; then
+        pass "no local service port to probe (none listed with --loopback-port, none listening on loopback)"
+    else
+        reached="$(for port in "${deny_ports[@]}"; do
+            { timeout 3 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" \
+                  2>/dev/null && echo "$port"; } &
+        done; wait)"
+        if [ -n "$reached" ]; then
+            fail "agent can connect to 127.0.0.1 on port(s) $(echo $reached) (loopback is not blocked for the agent user)"
+        else
+            pass "agent cannot connect to 127.0.0.1 on any of ${#deny_ports[@]} local service port(s)"
+        fi
     fi
 
     # --- cannot signal the orchestrator --------------------------------------
