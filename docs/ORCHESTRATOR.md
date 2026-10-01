@@ -239,12 +239,17 @@ appears in a function that uses none of these:
   authenticates from `CLAUDE_CODE_OAUTH_TOKEN` in its environment, which
   needs nothing in the directory;
 - removed when the run ends (`_terminate_agent`, every exit path; a
-  finalizer covers a process object that is never terminated). A process
+  finalizer covers a process object that is never terminated). SIGTERM
+  (`systemctl stop`, `timeout`) and a SIGINT left at its default action
+  skip atexit, so the orchestrator handles them, chained with any handler
+  already in place: it terminates its live agents, removes their
+  directories and dies of the signal (F-3 of the 3153 review). A process
   that is SIGKILLed or OOM-killed runs none of these, so the first per-run
   directory any EQUIPA process creates also removes the `equipa-claude-config-*`
   directories in the same temp directory that are owned by its user, are real
-  directories (never symlinks) and have not changed for 24 hours
-  (`sweep_stale_run_config_dirs`, R3150-08). The test suite keeps every
+  directories (never symlinks) and have had nothing in their tree change
+  for 24 hours (`sweep_stale_run_config_dirs`, R3150-08; a bounded walk,
+  so a tree too large to read is kept). The test suite keeps every
   directory it creates in one session temp directory (`eqt-*`), which it
   removes at the end and on SIGTERM (`timeout`); the next session removes
   one a SIGKILLed session left once it is a day old (`tests/conftest.py`).
