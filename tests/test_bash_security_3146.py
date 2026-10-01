@@ -103,6 +103,84 @@ def test_quoted_text_bash_evaluates_is_refused_by_check_26(command: str, tmp_pat
     assert not check_bash_command(command).safe
 
 
+# Before task 3146 every one of these was refused through the "any `[`"
+# rule; the narrowed trigger must still see the evaluating word when a line
+# continuation splits it (bash deletes `\<newline>` before it splits words).
+CONTINUATION_SPLIT_RUNS = [
+    f"x='a[$({MARKER})]'; le\\\nt x",
+    f"x='a[$({MARKER})]'; (\\\n( x ))",
+    f"x='a[$({MARKER})]'; [\\\n[ x -eq 1 ]]",
+    f"x='a[$({MARKER})]'; [[ x -e\\\nq 1 ]]",
+    f"RAN\\\nDOM='a[$({MARKER})]'",
+    f"read OPT\\\nIND <<< 'a[$({MARKER})]'",
+    f"pr\\\nintf -v 'a[$({MARKER})]' x",
+    f"printf -\\\nv 'a[$({MARKER})]' x",
+    f"te\\\nst -v 'a[$({MARKER})]'",
+    f"x='a[$({MARKER})]'; a\\\n[x]=1",
+    f"x='a[$({MARKER})]'; de\\\nclare -i y=x",
+    f"x='a[$({MARKER})]'; : \"${{s:\\\nx}}\"",
+    f"x='a[$({MARKER})]'; : \"$\\\n[x]\"",
+]
+
+
+@pytest.mark.parametrize("command", CONTINUATION_SPLIT_RUNS)
+def test_line_continuation_does_not_hide_the_evaluating_word(command: str, tmp_path: Path):
+    assert _bash_runs_marker(command, tmp_path), f"bash does not run it: {command!r}"
+    assert not check_bash_command(command).safe, command
+
+
+# Shell variables bash may treat as integers. Whichever of them makes bash
+# evaluate an assigned or read value as arithmetic must be refused; the
+# narrowed rule lists them by name, so a missing one would be a bypass.
+SPECIAL_VARIABLES = [
+    "RANDOM", "SRANDOM", "OPTIND", "HISTCMD", "SECONDS", "LINENO",
+    "EPOCHSECONDS", "BASHPID", "OPTERR", "TMOUT", "MAILCHECK", "HISTSIZE",
+    "HISTFILESIZE", "COLUMNS", "LINES", "COMP_CWORD", "COMP_POINT",
+    "BASH_SUBSHELL", "BASH_COMPAT", "BASH_ARGV0", "FUNCNEST", "IGNOREEOF",
+    "SHLVL", "BASH_XTRACEFD", "PPID", "UID",
+]
+
+
+def test_every_special_variable_bash_evaluates_is_refused(tmp_path: Path):
+    evaluated = []
+    for name in SPECIAL_VARIABLES:
+        for command in (
+            f"{name}='a[$({MARKER})]'",
+            f"read {name} <<< 'a[$({MARKER})]'",
+        ):
+            if _bash_runs_marker(command, tmp_path):
+                evaluated.append(command)
+                result = bash_security._check_substitution_lookalikes(command)
+                assert result.check_id == CheckID.SUBSTITUTION_LOOKALIKE, command
+    # The oracle is not vacuous: bash 5 evaluates these four.
+    for name in ("RANDOM", "SRANDOM", "OPTIND", "HISTCMD"):
+        assert f"{name}='a[$({MARKER})]'" in evaluated, evaluated
+
+
+# What the narrowed rule no longer counts, checked in bash: `test` and `[`
+# compare integers with a plain number parse (only `[[` evaluates), and
+# printf without -v, ulimit, shift and read options parse numbers without
+# arithmetic. A quoted look-alike next to them stays inert.
+NUMERIC_ARGUMENTS_NOT_EVALUATED = [
+    f"x='a[$({MARKER})]'; test x -eq 1",
+    f"x='a[$({MARKER})]'; [ x -lt 1 ]",
+    f"test 'a[$({MARKER})]' -gt 1",
+    f"printf '%d' 'a[$({MARKER})]'",
+    f"printf '%*d' 'a[$({MARKER})]' 1",
+    f"x='a[$({MARKER})]'; ulimit -n x",
+    f"x='a[$({MARKER})]'; shift x",
+    f"x='a[$({MARKER})]'; read -t x y < /dev/null",
+]
+
+
+@pytest.mark.parametrize("command", NUMERIC_ARGUMENTS_NOT_EVALUATED)
+def test_numeric_arguments_the_rule_exempts_are_inert_in_bash(command: str, tmp_path: Path):
+    assert not _bash_runs_marker(command, tmp_path), f"bash runs it: {command!r}"
+    if "'a[" not in command.split(";")[-1]:
+        # Only a plain name reaches the builtin: nothing for check 26 to see.
+        assert bash_security._evaluating_construct(command) is None, command
+
+
 @pytest.mark.parametrize(
     "command",
     [
