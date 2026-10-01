@@ -19,6 +19,7 @@ Benign prose of the same look must still merge.
 Copyright 2026 Forgeborn
 """
 
+import random
 import time
 from pathlib import Path
 
@@ -169,6 +170,54 @@ def test_standalone_marker_comments_still_parse_once(monkeypatch):
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts == ONE_LOW_COUNTS
     assert len(calls) == 1
+
+
+# Marker comments on their own line and inside a word, mixed with every block
+# shape that changes how the next line renders (lists, quotes, fences, code,
+# comments, HTML blocks, footnotes, setext underlines, tables).
+SHORTCUT_LINE_POOL = [
+    "", "", "",
+    f"<!-- EQUIPA-REVIEWER-RUN: {NONCE} -->", "<!-- EQUIPA-X -->",
+    "   <!-- EQUIPA-REVIEW-COMPLETE -->",
+    f"<!-- EQUIPA-REVIEW-COMPLETE {NONCE} -->",
+    "HI<!-- EQUIPA-X -->GH: SQL injection",
+    "- SQL injection in login - H<!--EQUIPA-X-->IGH",
+    "- Finding 1", "1. Finding 1", "> quoted", "> > > > >",
+    "    HIGH: SQL injection", "  HIGH: SQL injection", "HIGH: SQL injection",
+    "- SQL injection - HIGH", "HIGH SQL injection in login",
+    "```", "~~~", "    code", "\tcode", "<div>", "</div>", "<!--", "-->",
+    "Plain prose.", "===", "---", "[^1]: note", "[^1]:", "| a | b |",
+    "|---|---|", "`", "``", "<ol><li>1. note</li></ol>", "<li>", "</li>",
+    "## Findings", "### [S1] HIGH \N{EM DASH} SQL injection",
+]
+
+
+def _parse_both_views(text: str) -> loops.ReviewCountAnalysis:
+    """``text`` parsed as written AND as rendered, with no shortcut."""
+    text = loops.normalize_review_text(text)
+    nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+    text = loops._fold_blank_line_runs(text)
+    rendered = loops._rendered_review_text(text)
+    return loops._stricter_analysis(
+        loops._analyze_review_text(text, nonblank_lines),
+        loops._analyze_review_text(rendered, nonblank_lines),
+    )
+
+
+def test_parsing_once_gives_the_verdict_of_both_views():
+    """Whenever the rendered view is skipped, parsing it would have changed
+    nothing: same verdict, same counts, over seeded random reviews. Before
+    task 3137 a marker comment inside a word took the shortcut and merged
+    reviews that parsing both views blocks."""
+    rng = random.Random(3137)
+    for _ in range(1000):
+        body = [rng.choice(SHORTCUT_LINE_POOL)
+                for _ in range(rng.randint(1, 10))]
+        text = review("No findings.", body, ZERO, low_heading=False)
+        parsed_once = analyze(text)
+        both_views = _parse_both_views(text)
+        assert (parsed_once.verdict, parsed_once.counts) == (
+            both_views.verdict, both_views.counts), (body, both_views.detail)
 
 
 # --- N2: shapes a CommonMark renderer shows as text -------------------------------
