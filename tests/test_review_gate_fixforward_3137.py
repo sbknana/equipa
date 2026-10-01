@@ -348,13 +348,14 @@ def test_prompt_no_longer_claims_what_the_gate_does_not_count():
 REVIEW_BYTES = 200 * 1024
 
 
-@pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n", " ",
+@pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n", "\N{LINE SEPARATOR}",
                                         " \n", "\t\n"])
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     # Inside the Summary section, and after a heading that ends it (where
     # every line is also checked for a "Summary:" field).
-    body = section + [line_break * (REVIEW_BYTES // len(line_break))]
+    # Sized in UTF-8 bytes, so a U+2028 flood is 200 KB like the others.
+    body = section + [line_break * (REVIEW_BYTES // len(line_break.encode()))]
     text = review("No findings.", body, ZERO, low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
     started = time.perf_counter()
