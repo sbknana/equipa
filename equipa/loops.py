@@ -2271,6 +2271,54 @@ _HTML_BLOCK_START_RE = re.compile(
     r"|thead|tr|ul)(?:[ \t>]|/>|$)",
     re.IGNORECASE,
 )
+# Task 3157 (R3154-04): CommonMark's HTML block type 7, a line holding only
+# one complete open or closing tag of any other name ("<span>", "</x>"). It
+# cannot interrupt a paragraph. Like a type 6 block it runs to the next
+# blank line, so "<span>" / "```" / "Risk: High" / "```" / "</span>" shows
+# the backticks and the label as text.
+_HTML_BLOCK_TYPE7_RE = re.compile(
+    r"<(?!(?:script|style|pre|textarea)(?![A-Za-z0-9-]))"
+    r"(?:[A-Za-z][A-Za-z0-9-]*+"
+    r"(?:[ \t]++[A-Za-z_:][A-Za-z0-9_.:-]*+"
+    r"(?:[ \t]*+=[ \t]*+(?:[^ \t\"'=<>`]++|'[^'\n]*+'|\"[^\"\n]*+\"))?+)*+"
+    r"[ \t]*+/?"
+    r"|/[A-Za-z][A-Za-z0-9-]*+[ \t]*+)>[ \t]*",
+    re.IGNORECASE,
+)
+# Inside an HTML block a browser decodes a numeric character reference
+# without its ";" ("<p>&#72igh: ...</p>" shows "High: ..."), taking every
+# digit that follows. Markdown text needs the ";" (task 3157, R3154-04).
+_UNTERMINATED_NUMERIC_REFERENCE_RE = re.compile(
+    r"&#(?:0*+([0-9]++)|[xX]0*+([0-9A-Fa-f]++))(?!;)",
+)
+_MAX_REFERENCE_DECIMAL_DIGITS = 7
+_MAX_REFERENCE_HEX_DIGITS = 6
+
+
+def _terminated_reference(match: re.Match[str]) -> str:
+    """One numeric reference with its ";" (U+FFFD when it names no code
+    point a reference can spell)."""
+    decimal, hexadecimal = match.group(1), match.group(2)
+    if decimal is not None:
+        if len(decimal) > _MAX_REFERENCE_DECIMAL_DIGITS:
+            return "&#65533;"
+        return f"&#{decimal};"
+    if len(hexadecimal) > _MAX_REFERENCE_HEX_DIGITS:
+        return "&#65533;"
+    return f"&#x{hexadecimal};"
+
+
+def _html_block_line(line: str) -> str:
+    """A line of an HTML block as the parser should read it: backticks are
+    text, and numeric references end where a browser ends them."""
+    if "`" in line:
+        line = _neutralize_backticks(line)
+    if "&#" in line:
+        line = _UNTERMINATED_NUMERIC_REFERENCE_RE.sub(_terminated_reference,
+                                                      line)
+    return line
+
+
 _BACKTICK_RUN_RE = re.compile(r"`+")
 # Inline constructs that open where they start: a backtick run, an HTML
 # comment, and an inline HTML tag or autolink ("<a href='x`y'>", "<https://
@@ -2392,8 +2440,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             lines[fence_start] = _neutralize_fence(lines[fence_start])
             fence = ""
         if in_html_block:
-            if "`" in line:
-                lines[index] = _neutralize_backticks(line)
+            lines[index] = _html_block_line(line)
             continue
         base = item_columns[-1] if item_columns else 0
         opens_block = (
@@ -2420,6 +2467,8 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             item_columns.pop()
         base = item_columns[-1] if item_columns else 0
         relative = indent - base
+        # An HTML block of type 7 cannot interrupt a paragraph.
+        after_paragraph = in_paragraph
         in_paragraph = quoted_paragraph = False
         if relative >= 4:
             if "`" in line:
@@ -2440,10 +2489,13 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                 lines[closing] = _neutralize_backticks(lines[closing])
                 blocks.breaks.add(closing + 1)
                 continue
-        if stripped[0] == "<" and _HTML_BLOCK_START_RE.match(stripped):
+        if stripped[0] == "<" and (
+            _HTML_BLOCK_START_RE.match(stripped)
+            or (not after_paragraph
+                and _HTML_BLOCK_TYPE7_RE.fullmatch(stripped) is not None)
+        ):
             in_html_block = True
-            if "`" in line:
-                lines[index] = _neutralize_backticks(line)
+            lines[index] = _html_block_line(line)
             continue
         if (index + 1 < len(lines) and "|" in stripped
                 and not _CONTAINER_MARKER_RE.match(stripped)
