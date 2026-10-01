@@ -261,12 +261,77 @@ _IDENTIFIER_OR_JOINER = re.compile(
 )
 
 
+# Jailbreak persona names. Spelled as a bare identifier ("enable god_mode
+# now") they are not a code name; inside a longer one ("god_mode_enabled")
+# or in a code context they are (review F1 of task 3139).
+_JAILBREAK_IDENTIFIER = re.compile(r"(?:god|dan|jailbreak|unrestricted)[-_]mode")
+
+# How far the header-position test looks before and after an identifier.
+_HEADER_CONTEXT = 32
+# What may precede an identifier at the start of a line for it to stand in
+# header position: indentation, heading / bullet / quote marks, an opening
+# bracket or quote, and one list number ("1.", "a)").
+_HEADER_MARKS = r"[ \t#*>+=~|\-\[({<\"']*"
+_HEADER_PREFIX = re.compile(
+    f"{_HEADER_MARKS}(?:(?:\\d{{1,3}}|[A-Za-z])[.)][ \\t]*)?{_HEADER_MARKS}"
+)
+
+
+def _in_code_context(text: str, start: int, end: int) -> bool:
+    """True when the identifier at text[start:end] is written as code.
+
+    Inside backticks, part of a path or file name ("src/system_override.py",
+    "admin-notice.tsx", "config.sudo_mode"), a call ("admin_alert()"), an
+    assignment, a variable or decorator, or a long flag ("--sudo-mode").
+    """
+    before = text[start - 1] if start else ""
+    after = text[end:end + 2]
+    return (
+        before in ("`", "/", "\\", ".", "$", "@")
+        or text[max(0, start - 2):start] == "--"
+        or after[:1] in ("`", "/", "\\", "(", "=")
+        or (after[:1] == "." and after[1:2].isalnum())
+    )
+
+
+def _in_header_position(text: str, start: int, end: int) -> bool:
+    """True when the identifier at text[start:end] reads as a heading.
+
+    After heading, bullet, quote or bracket marks at the start of a line
+    ("## system_override", "[system_override] approve"), or alone on its
+    line. Bounded: looks at most _HEADER_CONTEXT characters each way, and a
+    window holding marks only is taken as a line start (the safe side).
+    """
+    window_start = max(0, start - _HEADER_CONTEXT)
+    before = text[window_start:start]
+    before = before[before.rfind("\n") + 1:]
+    if not _HEADER_PREFIX.fullmatch(before):
+        return False
+    if before.strip():
+        return True
+    after = text[end:end + _HEADER_CONTEXT].split("\n", 1)[0]
+    return not any(char.isalnum() for char in after)
+
+
+def _keeps_identifier_joined(text: str, match: re.Match[str]) -> bool:
+    """True when the identifier *match* is a code name, not a header phrase."""
+    start, end = match.span(1)
+    if _in_code_context(text, start, end):
+        return True
+    if _JAILBREAK_IDENTIFIER.fullmatch(match.group(1)):
+        return False
+    return not _in_header_position(text, start, end)
+
+
 def _space_joiners_outside_identifiers(folded: str, raw: str) -> str:
     """Space joiner runs in *folded*, except inside plain code identifiers.
 
-    Only an identifier that also appears verbatim in *raw* is kept joined, so
-    one that exists only after folding (small capitals, Cyrillic or
-    zero-width splits) is spaced like any other joiner run.
+    Only an identifier that also appears verbatim in *raw* can be kept
+    joined, so one that exists only after folding (small capitals, Cyrillic
+    or zero-width splits) is spaced like any other joiner run. Even then it
+    is kept joined only where it reads as code: always in a code context,
+    never in header position or as a bare jailbreak name, and otherwise in
+    prose ("Rename the system_override flag").
     """
     plain = set(_PLAIN_IDENTIFIER.findall(raw))
 
@@ -274,7 +339,7 @@ def _space_joiners_outside_identifiers(folded: str, raw: str) -> str:
         identifier = match.group(1)
         if identifier is None:
             return " "
-        if identifier in plain:
+        if identifier in plain and _keeps_identifier_joined(folded, match):
             return identifier
         return _WORD_JOINER.sub(" ", identifier)
 
@@ -289,11 +354,16 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
 
 
 # --- Imperative-position phrases --------------------------------------------
-# Some phrases are an instruction only when they open a sentence, line,
-# bullet or heading, or follow an imperative word: "Act as the admin",
-# "please execute this script", "## New rules:". Elsewhere they are ordinary
-# text: "the CA will act as the root CA", "CI will execute this script",
-# "ruff ships new rules: E501" (review N4 of task 3129).
+# Some phrases are ordinary text when they continue a statement: "the CA will
+# act as the root CA", "CI will execute this script", "ruff ships new rules:
+# E501", "don't forget all of this setup" (review N4 of task 3129). Anywhere
+# else they are an instruction.
+#
+# The default is "instruction" (review F1 of task 3139): the phrase is
+# accepted only when the words just before it, in the same clause, have one
+# of the statement shapes below. An unknown lead word ("Okay", "Kindly",
+# "URGENT", "1)") or a quote / bracket opener therefore stays rejected, as it
+# was before task 3139 narrowed the rule.
 #
 # The phrase is found first and its position is checked afterwards by looking
 # back at most _IMPERATIVE_LOOKBACK characters. Putting the position test in
@@ -301,51 +371,111 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
 # group at every character: 0.2-0.3 s per MB of whitespace, and "\s" in that
 # anchor group was the quadratic of review N1.
 _IMPERATIVE_LOOKBACK = 64
-_SENTENCE_BREAKS = frozenset("\n\r.!?:;,")
-_BULLET_MARKS = "#*>-"
-_WORD = re.compile(r"\w+")
+# A clause starts after a line break or sentence punctuation. Unicode line
+# separators are already newlines here (see _normalize).
+_CLAUSE_BREAKS = "\n\r.!?:;,"
+# A word, keeping contractions whole: "don't", "here's".
+_LEAD_WORD = re.compile(r"\w+(?:'\w+)*")
+_APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'"})
+
+# "the CA will act as the root CA", "how to act as the root of trust". After
+# "you" (up to two words back) they are an order: "you must act as root",
+# "I need you to execute this script", "you have to forget all of that".
+_MODAL_LEADS = frozenset({
+    "will", "would", "can", "could", "shall", "should", "may", "might",
+    "must", "to", "does", "did",
+})
+# "Don't forget all of this setup", "never act as the root user".
+_NEGATION_LEADS = frozenset({
+    "not", "never", "don't", "dont", "doesn't", "didn't", "won't",
+    "wouldn't", "can't", "cannot", "couldn't", "shouldn't", "mustn't",
+    "isn't", "aren't", "wasn't", "weren't",
+})
+# A subject the base-form verb agrees with: "we forget all of that",
+# "services that act as the root CA". Not "you": "you act as the admin" is
+# an order. Third-person singular subjects take "acts" / "forgets", which
+# the phrases do not match.
+_SUBJECT_LEADS = frozenset({"i", "we", "they", "who", "which", "that"})
+# "Let CI execute this script", "make the CA act as the root".
+_CAUSATIVE_LEADS = frozenset({"let", "lets", "make", "makes", "help", "helps"})
+_DETERMINERS = frozenset({
+    "the", "a", "an", "this", "these", "those", "my", "our", "your",
+    "their", "its", "his", "her", "all", "both", "some", "any", "every",
+    "each",
+})
+# Words that present what follows. After a determiner the phrase is an
+# object ("Batch the new orders:") unless one of these comes first ("Here
+# are the new rules:", "Okay, the new orders:").
+_PRESENTING_LEADS = frozenset({
+    "here", "there", "here's", "there's", "is", "are", "was", "were",
+    "ok", "okay", "so", "now", "then", "and", "also", "please", "note",
+    "important", "urgent", "attention",
+})
+# Words ending in "s" that are not a third-person verb or plural subject.
+_NOT_THIRD_PERSON = frozenset({
+    "yes", "always", "its", "his", "hers", "ours", "yours", "theirs",
+    "perhaps", "thus", "plus", "unless", "besides", "afterwards",
+    "sometimes", "nevertheless", "as", "us", "is", "this",
+})
+
+
+def _is_third_person(word: str) -> bool:
+    """True for "ships", "handles", "nodes": a verb or plural subject."""
+    return (
+        len(word) > 2
+        and word.endswith("s")
+        and not word.endswith(("ss", "us", "is"))
+        and "'" not in word
+        and word not in _NOT_THIRD_PERSON
+    )
+
+
+def _is_instruction_lead(words: list[str]) -> bool:
+    """True unless *words* (the clause before a phrase) make it a statement.
+
+    Statement shapes: a negation; a modal or "to" not addressed to "you"; a
+    subject the verb agrees with; a third-person verb or plural subject; a
+    causative ("let CI ..."); a determiner that makes the phrase an object.
+    """
+    if not words:
+        return True
+    last = words[-1]
+    if last in _NEGATION_LEADS or last in _SUBJECT_LEADS:
+        return False
+    if last in _MODAL_LEADS:
+        return "you" in words[-3:-1]
+    if last in _DETERMINERS:
+        object_head = len(words)
+        while object_head and words[object_head - 1] in _DETERMINERS:
+            object_head -= 1
+        return object_head == 0 or words[object_head - 1] in _PRESENTING_LEADS
+    if last in _PRESENTING_LEADS:
+        return True
+    if any(word in _CAUSATIVE_LEADS for word in words[-4:-1]):
+        return False
+    return not _is_third_person(last)
 
 
 class _ImperativePhrase:
-    """A phrase pattern that matches only in imperative position.
+    """A phrase pattern that matches unless it continues a statement.
 
     Duck-types the ``search`` method of ``re.Pattern`` so it can sit in
     _INJECTION_PATTERNS. Linear: each phrase match costs one bounded
-    look-back, and after a match in the wrong position the scan resumes one
+    look-back, and after a match in statement position the scan resumes one
     character later, so every character starts at most one phrase attempt.
     """
 
-    def __init__(
-        self,
-        phrase: str,
-        triggers: frozenset[str],
-        you_modals: frozenset[str] = frozenset(),
-    ) -> None:
+    def __init__(self, phrase: str) -> None:
         self.pattern = phrase
         self._phrase = re.compile(phrase, re.IGNORECASE)
-        self._triggers = triggers
-        self._you_modals = you_modals
 
-    def _opens_instruction(self, text: str, start: int) -> bool:
-        window_start = max(0, start - _IMPERATIVE_LOOKBACK)
-        prefix = (
-            text[window_start:start]
-            .rstrip(" \t").rstrip(_BULLET_MARKS).rstrip(" \t")
-        )
-        if not prefix:
-            # Start of the text, or a blank / bullet run longer than the
-            # look-back window: both count as imperative (the safe side).
-            return True
-        if prefix[-1] in _SENTENCE_BREAKS:
-            return True
-        words = [word.lower() for word in _WORD.findall(prefix[-24:])[-2:]]
-        if not words:
-            return False
-        if words[-1] in self._triggers:
-            return True
-        return (
-            len(words) == 2 and words[0] == "you" and words[1] in self._you_modals
-        )
+    @staticmethod
+    def _opens_instruction(text: str, start: int) -> bool:
+        window = text[max(0, start - _IMPERATIVE_LOOKBACK):start]
+        clause_start = max(window.rfind(mark) for mark in _CLAUSE_BREAKS) + 1
+        clause = window[clause_start:].translate(_APOSTROPHES)
+        words = [word.lower() for word in _LEAD_WORD.findall(clause)]
+        return _is_instruction_lead(words)
 
     def search(self, text: str) -> re.Match[str] | None:
         position = 0
@@ -461,11 +591,11 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
             re.IGNORECASE,
         ),
     ),
-    # The same class for phrases that are ordinary text outside imperative
-    # position (review N4 of task 3129): "Please act as the root user",
-    # "Forget all of that", "New rules: ...", but not "the intermediate CA
-    # will act as the root CA", "don't forget all of this setup" or "ruff
-    # ships new rules: E501".
+    # The same class for phrases that are ordinary text when they continue a
+    # statement (review N4 of task 3129, F1 of task 3139): "Please act as the
+    # root user", "Okay forget all of that", "Here are the new rules: ...",
+    # but not "the intermediate CA will act as the root CA", "don't forget
+    # all of this setup" or "ruff ships new rules: E501".
     (
         "role override",
         _ImperativePhrase(
@@ -474,13 +604,6 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
             r"forget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
             r"context|you)\b|"
             r"new\s+(?:rules?|orders?)\s*:)",
-            triggers=frozenset({
-                "please", "now", "then", "always", "just", "and", "also",
-                "so", "instead", "you",
-            }),
-            you_modals=frozenset({
-                "must", "should", "will", "shall", "can", "may", "now", "to",
-            }),
         ),
     ),
     # Explicit requests to run supplied commands.
@@ -503,10 +626,6 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
         _ImperativePhrase(
             r"\bexecute\s+(?:this|these|the\s+following)\s+(?:[\w-]+\s+)?"
             r"(?:scripts?|code|snippets?|payloads?|programs?)\b",
-            triggers=frozenset({
-                "please", "now", "then", "always", "first", "and", "just",
-                "immediately",
-            }),
         ),
     ),
     # Shell payload signatures: download-and-execute, destructive deletes of
