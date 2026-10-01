@@ -178,6 +178,7 @@ from equipa.cli_isolation import (
     CLAUDE_CODE_SHELL_VAR,
     RunConfigDirError,
     claude_cli_env,
+    claude_cli_shell_env,
     create_run_config_dir,
     has_env_auth,
     is_claude_cli,
@@ -2264,7 +2265,10 @@ async def _spawn_agent_process(
     if isolation.isolation_enabled():
         # Task 3135: separate agent UID, per-agent cgroup and clone; refused,
         # never downgraded, when isolation cannot be established. The unit
-        # gets its own empty HOME and CLAUDE_CONFIG_DIR there.
+        # gets its own empty HOME and CLAUDE_CONFIG_DIR there; the shell pin
+        # and the shell-injection names are handled here, as below.
+        if cmd and is_claude_cli(cmd[0]):
+            kwargs["env"] = claude_cli_shell_env(kwargs["env"])
         try:
             return await isolation.spawn_isolated_agent(
                 cmd, cwd, kwargs["env"], limit=kwargs.get("limit"))

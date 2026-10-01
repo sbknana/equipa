@@ -440,6 +440,46 @@ def test_missing_env_credential_is_named_in_the_log(
     assert len(warnings) == 1, "warned once, naming the variable"
 
 
+def test_isolated_spawn_gets_the_shell_pin_and_drops_shell_injection(
+        tmp_path, hostile_agent_env, monkeypatch):
+    """Under agent isolation the launcher sets HOME and CLAUDE_CONFIG_DIR;
+    on base an operator passthrough of BASH_ENV, PROMPT_COMMAND or a
+    BASH_FUNC_* name still reached the unit, and CLAUDE_CODE_SHELL was the
+    passthrough's value."""
+    from equipa import isolation
+    seen: dict = {}
+
+    async def fake_spawn_isolated_agent(cmd, cwd, env, limit=None):
+        seen.update(cmd=cmd, env=dict(env))
+        return "process", None
+
+    monkeypatch.setattr(isolation, "isolation_enabled", lambda: True)
+    monkeypatch.setattr(isolation, "spawn_isolated_agent",
+                        fake_spawn_isolated_agent)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    asyncio.run(agent_runner._spawn_agent_process(
+        ["claude", "-p", "x"], project_dir=str(project)))
+
+    env = seen["env"]
+    for name in ("BASH_ENV", "ENV", "PROMPT_COMMAND", "BASH_FUNC_ls%%",
+                 "BASH_FUNC_git%%"):
+        assert name not in env, name
+    assert env["CLAUDE_CODE_SHELL"] == trusted_bash()
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == FAKE_TOKEN
+
+
+def test_claude_cli_shell_env_leaves_the_config_dir_alone():
+    env = cli_isolation.claude_cli_shell_env(
+        {"CLAUDE_CONFIG_DIR": "/unit/.claude", "BASH_FUNC_x%%": "() { :; }",
+         "PATH": "/usr/bin"}, shell="/bin/bash")
+    assert env == {"CLAUDE_CONFIG_DIR": "/unit/.claude", "PATH": "/usr/bin",
+                   "CLAUDE_CODE_SHELL": "/bin/bash"}
+    with pytest.raises(ValueError, match="CLAUDE_CODE_SHELL"):
+        cli_isolation.claude_cli_shell_env({}, shell="bash")
+
+
 # --- the RLM claude -p calls ----------------------------------------------------
 
 @pytest.mark.parametrize("call", ["sub_query", "outer_agent"])

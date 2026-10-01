@@ -316,13 +316,31 @@ def claude_cli_env(env: Mapping[str, str], config_dir: str,
     if not os.path.isabs(config_dir):
         raise ValueError(
             f"CLAUDE_CONFIG_DIR must be absolute, got {config_dir!r}")
+    cli_env = claude_cli_shell_env(env, shell)
+    cli_env[CLAUDE_CONFIG_DIR_VAR] = config_dir
+    return cli_env
+
+
+def claude_cli_shell_env(env: Mapping[str, str],
+                         shell: str | None = None) -> dict[str, str]:
+    """``env`` with the shell pinned and the shell-injection names removed.
+
+    The part of :func:`claude_cli_env` that does not depend on the config
+    directory, for a run whose CLAUDE_CONFIG_DIR is set elsewhere (an
+    isolated unit gets its own from the launcher). ``CLAUDE_CODE_SHELL`` is
+    ``shell`` (default: :func:`trusted_bash`; left out when no trusted bash
+    exists) and BASH_ENV, ENV, PROMPT_COMMAND, SHELLOPTS, BASHOPTS, PS4 and
+    every BASH_FUNC_* name are dropped.
+
+    Raises:
+        ValueError: ``shell`` is not an absolute path.
+    """
     pinned_shell = trusted_bash() if shell is None else shell
     if pinned_shell is not None and not os.path.isabs(pinned_shell):
         raise ValueError(
             f"CLAUDE_CODE_SHELL must be absolute, got {pinned_shell!r}")
     cli_env = {name: value for name, value in env.items()
                if not is_shell_injection_env_name(name)}
-    cli_env[CLAUDE_CONFIG_DIR_VAR] = config_dir
     if pinned_shell is None:
         cli_env.pop(CLAUDE_CODE_SHELL_VAR, None)
     else:
