@@ -241,8 +241,10 @@ R3143_02_CRITICAL_HIGH_PROSE = [
 
 
 def _lower_case_critical_high(body):
+    # MEDIUM is lowered too: a MEDIUM left outside a lowered negation's list
+    # ("no critical, high or MEDIUM") blocks, as it does on main (task 3152).
     return [line.replace("CRITICAL", "critical").replace("HIGH", "high")
-            for line in body]
+            .replace("MEDIUM", "medium") for line in body]
 
 
 @pytest.mark.parametrize("body", R3143_02_CRITICAL_HIGH_PROSE)
@@ -261,8 +263,7 @@ def test_r3143_06_soft_wrapped_negation_blocks():
     """The corpus shape: "No" ends the line, the list opens the next one.
 
     Task 3152: merged under the 3149 soft-wrap exemption; blocks now. The
-    same sentence with critical/high in lower case merges (its MEDIUM is
-    only counted).
+    same sentence with critical/high/medium in lower case merges.
     """
     body = ["The diff touches only the parser, and the scan found no",
             "CRITICAL/HIGH/MEDIUM issues. Remaining items are LOW/INFO."]
@@ -344,21 +345,23 @@ def test_r3143_04_old_crash_input_blocks_with_a_logged_verdict(monkeypatch, tmp_
     assert any("unaccounted CRITICAL/HIGH token at line" in message for message in logged)
 
 
-# --- R3143-06: MEDIUM-only tokens are counted, never a block ---------------------
+# --- R3143-06: MEDIUM-only tokens block again (task 3152) ------------------------
 
-def test_r3143_06_medium_only_tokens_are_counted_and_logged(monkeypatch,
-                                                           tmp_path):
+def test_r3143_06_medium_only_tokens_block_and_are_logged(monkeypatch,
+                                                         tmp_path):
+    """Task 3152: task 3149 kept this review trusted and logged an advisory;
+    main blocks it, so it blocks again (strictly stricter than main)."""
     logged = []
     monkeypatch.setattr(loops, "_gate_audit_log",
                         lambda message, **fields: logged.append((message, fields)))
     text = one_low_review(["The cache has a MEDIUM issue: stale entries."])
     counts = loops._count_findings_in_review_file(
         tmp_path / "SECURITY-REVIEW-9.md", task_id=9, text=text)
-    assert counts is not None, "MEDIUM never blocks a merge"
-    assert counts["MEDIUM"] == 1 and counts["HIGH"] == counts["CRITICAL"] == 0
+    assert counts is None
     events = [fields["event"] for _, fields in logged]
-    assert events == ["backstop-advisory"], logged
-    assert "MEDIUM=1 at line" in logged[0][0]
+    assert events == ["count-mismatch"], logged
+    assert (loops.BACKSTOP_MEDIUM_REASON + ": MEDIUM=1 at line") in logged[0][0]
+    assert not hasattr(loops, "BACKSTOP_ADVISORY_REASON")
 
 
 def test_r3143_06_medium_with_high_still_blocks_and_names_both():
@@ -370,7 +373,7 @@ def test_r3143_06_medium_with_high_still_blocks_and_names_both():
 
 
 def test_merge_blocking_severities_match_the_gate_policy():
-    """The advisory rule rests on the gate blocking on CRITICAL/HIGH only."""
+    """MERGE_BLOCKING_SEVERITIES names the severities the gate blocks on."""
     source = (REPO / "equipa" / "dispatch.py").read_text(encoding="utf-8")
     assert ('blocks = counts.get("CRITICAL", 0) > 0 or '
             'counts.get("HIGH", 0) > 0') in source
@@ -558,14 +561,14 @@ def test_r3143_07_ordinary_dollar_text_adds_nothing():
 
 @pytest.mark.parametrize("word", R3143_07_WORDS)
 def test_r3143_07_lookalike_severity_word_is_read(word):
-    """CRITICAL and HIGH block; MEDIUM is counted (it never blocks)."""
+    """Every lookalike blocks; MEDIUM with its own reason (task 3152)."""
     body = [f"Notes: the {word} issue is SQL injection in login."]
     if len(word) == 6:   # MEDIUM
         analysis = analyze(one_low_review(body))
-        assert analysis.trusted and analysis.counts["MEDIUM"] == 1, analysis
-        assert analysis.detail.startswith(loops.BACKSTOP_ADVISORY_REASON)
-    else:
-        assert_gate_blocks(body)
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+        assert analysis.detail.startswith(
+            loops.BACKSTOP_MEDIUM_REASON + ": MEDIUM=1 at line"), analysis
+    assert_gate_blocks(body)
 
 
 BIDI_CONTROLS = [

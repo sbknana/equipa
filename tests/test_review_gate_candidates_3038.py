@@ -118,13 +118,14 @@ def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
     # backstop blocks; in lower case (reviewer prompt) it is prose.
     if ("MEDIUM" in prose_line and "HIGH" not in prose_line
           and "CRITICAL" not in prose_line):
-        # Task 3149 (R3143-06): a MEDIUM-only unaccounted token is counted
-        # and logged as an advisory; MEDIUM never blocks a merge.
-        advisory = _analyze_review_file(_write_review(
+        # Task 3152: a MEDIUM-only unaccounted token blocks, as on main
+        # (task 3149, R3143-06, had counted it as a logged advisory).
+        blocked = _analyze_review_file(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
         ))
-        assert advisory.counts["MEDIUM"] == 1, advisory.detail
-        assert "(advisory)" in advisory.detail
+        assert blocked.verdict == REVIEW_VERDICT_COUNT_MISMATCH, blocked
+        assert blocked.detail.startswith(
+            "unaccounted MEDIUM token: MEDIUM=1 at line "), blocked.detail
     elif _SEVERITY_TOKEN_RE.search(prose_line):
         _assert_only_the_backstop_blocks(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,

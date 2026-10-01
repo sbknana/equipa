@@ -22,7 +22,8 @@ Covered here, each with rows that fail before this task:
   read (a differential against the old algorithm on random markup);
 * only the exact counted label and a strict final footer are credited;
 * the exact completion and provenance marker lines alone are blanked;
-* MEDIUM keeps its exemptions (it never blocks a merge).
+* MEDIUM keeps its exemptions, and an unaccounted MEDIUM blocks again as
+  on main (task 3149 had made it a logged advisory).
 
 Copyright 2026 Forgeborn
 """
@@ -471,7 +472,7 @@ def test_the_exact_marker_lines_are_still_blanked():
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
 
 
-# --- MEDIUM keeps its exemptions (it never blocks a merge) -------------------------
+# --- MEDIUM keeps its exemptions; anything else blocks, as on main -----------------
 
 @pytest.mark.parametrize("body", [
     ["No MEDIUM findings."],
@@ -483,10 +484,24 @@ def test_medium_negations_and_tallies_still_merge_quietly(body):
     assert analysis.trusted and analysis.detail == "", analysis
 
 
-def test_an_unaccounted_medium_is_counted_never_a_block():
-    analysis = analyze(build_review(["A MEDIUM issue: stale cache."], "zero"))
-    assert analysis.trusted, analysis
-    assert analysis.counts["MEDIUM"] == 1
+@pytest.mark.parametrize("body", [
+    ["A MEDIUM issue: stale cache."],
+    ["Two MEDIUM issues remain in the cache."],
+    [": 0, **2** MEDIUM"],
+    ["- **Why not MEDIUM:** the primitive is unreachable."],
+])
+@pytest.mark.parametrize("context", CONTEXTS)
+def test_an_unaccounted_medium_blocks_as_on_main(body, context):
+    """Task 3149 (R3143-06) kept these trusted with the MEDIUM counted as a
+    logged advisory; main blocks them, so that let main-blocked reviews
+    merge. They block again, with their own reason."""
+    analysis = analyze(build_review(body, context))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON + ": "), (
+        analysis.detail)
+    assert gate_blocks(build_review(body, context))
+    lower = [line.replace("MEDIUM", "medium") for line in body]
+    assert not gate_blocks(build_review(lower, context)), lower
 
 
 # --- The reviewer prompt states the rule -------------------------------------------
