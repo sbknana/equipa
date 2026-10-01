@@ -1001,7 +1001,7 @@ class _IsolatedSession:
                 f"the agent user can connect to {', '.join(reachable)} "
                 f"(loopback/LAN), so IPAddressDeny= is not in effect; block "
                 f"those ranges for the agent user with nftables "
-                f"(docs/AGENT_ISOLATION.md step 6)")
+                f"(docs/AGENT_ISOLATION.md step 4a)")
 
     def _verify_required_access(self) -> None:
         for path in [self.executable, self.git_executable, *self.must_execute]:

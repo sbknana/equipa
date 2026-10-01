@@ -31,7 +31,8 @@ closes it: the kernel enforces the boundary, not EQUIPA.
 ```
 orchestrator (UID orch)
  └─ systemd-run --user --scope  →  transient unit equipa-agent-<pid>-<start>-<hex>.scope
-     │                             TasksMax / MemoryMax / CPUWeight, cgroup owned by orch
+     │                             TasksMax / MemoryMax / MemorySwapMax=0 / CPUWeight /
+     │                             IOWeight / IPAddressDeny, cgroup owned by orch
      └─ sudo -n -u equipa-agent -- /usr/bin/python3 -I <runtime>/equipa/agent_launcher.py --isolated
          └─ agent_launcher (UID equipa-agent)  ← stdin: handoff, then stop channel
              └─ claude (cwd = the agent's own clone)
@@ -172,7 +173,23 @@ refuses the import (reviews ISO-04, R3136-02) when:
   tree. The target is resolved the way the kernel would, following the
   tree's other links (`a/..` through a link `a` goes where `a` points), with
   at most 40 hops (review R3136-05). Links already in the dispatch base are
-  the project's own and are kept.
+  the project's own and are kept;
+* the check itself would cost too much (review R3140-01, F3): a changed
+  link's target is longer than 4095 bytes (PATH_MAX - 1; the kernel could
+  never create it), a tree holds more than 10,000 links or a commit adds or
+  changes more than 1,000, or the walk of all links of one commit takes more
+  than 1,000,000 path components. Target sizes come from `git ls-tree -l`,
+  so an oversized target is refused before it is read, and the walk looks
+  each component up in a trie of the tree's links, so it is linear in the
+  components it visits (it joined the directory path per component before,
+  which made one long target quadratic: hours for a few MB, while the unit
+  held its slot). Targets are read once per blob.
+
+The import also refuses a committed task-branch tip that does not descend
+from the dispatch base (`git merge-base --is-ancestor`, review F5).
+`update-ref <branch> <tip> <base>` compares only the old value, so without
+it an agent could rewind the branch to an ancestor of the base or replace
+it with unrelated history, dropping commits an earlier review saw.
 
 The task branch has not moved at that point, so a refused import leaves the
 worktree exactly at the dispatch base.
@@ -209,24 +226,37 @@ Therefore:
 The CLI still passes `--setting-sources user --strict-mcp-config` (task
 3134); with the per-unit `CLAUDE_CONFIG_DIR` the user scope is empty.
 
-### Reviewers run alone (until there is a UID pool)
+### Every unit runs alone (until there is a UID pool)
 
 A per-unit HOME does not help against a unit running *at the same time*:
 every unit has the same UID, so a developer agent of task A could read the
 handed-over prompt (with the provenance and completion nonces) of a security
 reviewer running for task B, and write into that reviewer's clone, which is
-exported into task B's worktree (review R3136-03, GP2-02). Until the agents
-get separate UIDs, reviewer units never overlap any other isolated unit:
+exported into task B's worktree (review R3136-03, GP2-02). The same holds
+for every other role (review F4): a developer unit of task B can watch the
+shared exchange directory and replace task A's export between the launcher
+writing it and the orchestrator importing it, or edit task A's tester clone
+and so forge the "tests pass" verdict the gate trusts. Until the agents get
+separate UIDs (`isolation.PER_UNIT_UIDS` is false: no UID pool exists), **no
+isolated unit overlaps any other**, whatever its role
+(`isolation.unit_runs_alone`):
 
-* `security-reviewer` and `code-reviewer` units (`EXCLUSIVE_ROLES`) wait
-  until every running isolated unit has ended, and until no agent scope of
-  the orchestrator user is populated (a unit that survived `cgroup.kill`, or
-  one started by an orchestrator without the lock; a scope whose
-  orchestrator is gone is killed by the sweep instead of waited for);
-* while a reviewer waits or runs, every new unit waits (writer preference,
-  so a steady stream of developers cannot starve the review), and so does a
-  second reviewer;
-* ordinary units run side by side as before.
+* every unit waits until every running isolated unit has ended, and until
+  no agent scope of the orchestrator user is populated (a unit that survived
+  `cgroup.kill`, or one started by an orchestrator without the lock; a scope
+  whose orchestrator is gone is killed by the sweep instead of waited for);
+* while a unit waits or runs, every new unit waits (writer preference, so
+  a steady stream of units cannot starve one that waits).
+
+With the flag on, a `max_concurrent` above 1 is **refused** at dispatch
+(`--tasks`, `--auto-run`, `--parallel-goals`; the CLI's
+`--max-concurrent` and the dispatch config's `max_concurrent` alike):
+tasks could not run side by side anyway, and would only queue for the unit
+slot until `unit_wait_timeout_sec` refused them. Set `"max_concurrent": 1`.
+A per-unit UID pool would lift both; it is not implemented, so there is no
+setting for it (an unknown `agent_isolation` key is refused). Once a pool
+exists, only `security-reviewer` and `code-reviewer` units
+(`EXCLUSIVE_ROLES`) keep running alone.
 
 It is a reader-writer lock over two `flock` files in the orchestrator
 user's private runtime directory, so it covers every dispatch mode and
@@ -240,16 +270,16 @@ unlink a lock file a running unit holds, and the next reviewer would lock a
 fresh file beside that unit. The unit's slot is taken before the handoff is built and given back
 when the agent handle is released, after its cgroup was emptied and its
 export imported; a refused setup gives it back at once. The role comes from
-`build_cli_command(role=...)`, which both reviewer call sites use. Waiting
-is logged (`[Isolation] ... waits for ...`, repeated every 5 minutes, and
-`... runs alone`); a wait longer than `unit_wait_timeout_sec` (default 6 h)
-refuses the dispatch. The cost is throughput: in a parallel wave, a review
-holds back the other tasks' next units while it runs.
+`build_cli_command(role=...)`. Waiting is logged (`[Isolation] ... waits
+for ...`, repeated every 5 minutes, and `... runs alone`); a wait longer than
+`unit_wait_timeout_sec` (default 6 h) refuses the dispatch. The cost is
+throughput: one isolated agent at a time on the host.
 
 **Long-term fix:** a pool of agent users, one UID per unit, or at least a
-reviewer UID that no developer, tester or debugger unit ever shares. The
-reviewer's handed-over files and clone would then be closed to every other
-unit by ordinary file permissions, and the lock above could go.
+reviewer UID that no developer, tester or debugger unit ever shares. Each
+unit's handed-over files, clone and export would then be closed to every
+other unit by ordinary file permissions, ordinary units could run side by
+side again, and only the reviewers would keep the lock.
 
 ### The orchestrator never executes agent output
 
@@ -318,6 +348,58 @@ variables refuses the dispatch: the agent's own processes can read them.
 open_questions, session_notes). Their results still reach the orchestrator
 through the RESULT block.
 
+### Network: no loopback, no LAN
+
+A separate UID closes the file system, not the network. Services that
+listen on `127.0.0.1` (databases, Redis, admin HTTP APIs) often trust any
+local user, so an agent could reach them around every file permission
+(review F2). Every unit is therefore started with
+
+```
+IPAddressDeny=127.0.0.0/8 ::1/128 0.0.0.0/8 ::/128 169.254.0.0/16 fe80::/10
+              224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+```
+
+(loopback, the unspecified addresses, which a connect turns into loopback,
+link-local, multicast and the private ranges), plus any
+`ip_address_deny_extra` (for example a tailnet's `100.64.0.0/10`). The list
+can only grow. Everything else stays reachable: the agent needs the public
+Anthropic API. The ranges are spelled out because `systemd-run` of systemd
+255 rejects the symbolic names (`localhost`, `link-local`, `multicast`).
+
+**A user manager accepts the property but cannot apply it.** BPF firewalling
+needs privileges the orchestrator's user manager does not have; systemd
+logs "unit configures an IP firewall, but not running as root" and starts
+the unit without it (observed on systemd 255). The property alone therefore
+proves nothing, so the launcher checks from inside the unit, as the agent
+user, before the CLI starts: it binds a listener on `127.0.0.1` and on each
+of this host's own addresses that falls in a denied range (from
+`/proc/net/fib_trie`, and `/proc/net/if_inet6` when IPv6 is enabled),
+connects to each, and **refuses the run if any connection is established**
+within 2 s. On such a host the blocking is done by an nftables rule for the
+agent user (runbook step 4a); the launcher's check accepts either mechanism.
+The verify script additionally connects, as the agent, to every port that
+listens on loopback and every `--loopback-port` the operator lists.
+
+### Resources: memory without swap, IO weight, export size
+
+Besides `TasksMax`, `MemoryMax` and `CPUWeight` (review F8):
+
+* `MemorySwapMax=0`: `MemoryMax` alone lets a unit spill into swap. The
+  orchestrator refuses a scope whose `memory.swap.max` is not `0`;
+* `IOWeight=<io_weight>` (default 50 against the default 100 of everything
+  else, so the orchestrator and TheForge keep priority). The orchestrator
+  refuses a scope whose `io.weight` does not start with `default
+  <io_weight>`; that needs the io controller delegated to the user manager
+  (step 4). `"io_weight": null` leaves IO unweighted instead;
+* the export: the launcher writes the bundle with `RLIMIT_FSIZE` set to
+  `max_export_bytes` on the git process (SIGXFSZ ignored, so the write
+  fails with EFBIG) and checks the size before it publishes the file, so an
+  oversized export never lands in the shared exchange directory; the
+  orchestrator still refuses to copy a larger one. A unit's clone, HOME and
+  TMPDIR are not capped by EQUIPA: put the agent user's state root on a
+  filesystem of its own (step 1) so a unit cannot fill `/`.
+
 ### Fail closed
 
 With the flag on, `_spawn_agent_process` hands every agent to
@@ -326,10 +408,18 @@ it, is refused before it runs anything). It never falls back to the same-UID
 launcher. Each of the following refuses the dispatch
 (`AgentDispatchRefused: agent isolation: ...`):
 
+* the host requires isolation (the marker below) and the dispatch config
+  turns it off;
 * invalid, unknown or missing `agent_isolation` settings;
 * the agent user is missing, is root, is the orchestrator's user, or is in a
   privileged group (`sudo`, `admin`, `wheel`, `adm`, `docker`, `lxd`,
-  `incus`, `libvirt`, `kvm`, `disk`, `shadow`, `systemd-journal`, `root`);
+  `incus`, `libvirt`, `kvm`, `disk`, `shadow`, `systemd-journal`, `root`;
+  `privileged_groups` may add groups, never remove these), its primary or
+  any supplementary group (`os.getgrouplist`) counting;
+* `sudo -n -l -U <agent user>` does not report that the agent user "is not
+  allowed to run sudo" (review F7): it lists rules for it, or the
+  orchestrator may not list them (sudo needs the orchestrator to hold `ALL`
+  or the `list` permission, step 6), or sudo is missing;
 * not Linux, no cgroup v2, no systemd user manager for the orchestrator, a
   missing `sudo`/`systemd-run`/python/launcher/CLI/git, or an exchange
   directory that is missing, not owned by the agent user, or world-writable;
@@ -338,9 +428,11 @@ launcher. Each of the following refuses the dispatch
 * the launcher, python, CLI, git, the exchange or view directory, or a hook
   or MCP program lies inside the TheForge database directory or a
   `db_backup_dirs` entry (those must be closed to the agent);
+* `max_concurrent` is above 1 (see "Every unit runs alone");
 * `sudo` fails (no rule), or the scope does not appear within 15 s;
 * the scope's `pids.max`/`memory.max`/`cpu.weight` differ from the settings,
-  or `cgroup.kill` is missing or not writable;
+  `memory.swap.max` is not `0`, `io.weight` is not `default <io_weight>`
+  (unless `io_weight` is null), or `cgroup.kill` is missing or not writable;
 * the launcher's own checks fail. It refuses when it runs as root, as the
   orchestrator's UID, as the wrong user or in a privileged group; when the
   agent user can write its passwd HOME; when the agent user lingers
@@ -356,12 +448,12 @@ launcher. Each of the following refuses the dispatch
   path (the EQUIPA
   runtime, the launcher, the CLI, git, python, the task worktree and its
   parent, the main `.git` and checkout, the view and its directory); when it
-  cannot run a hook or MCP program; or when it cannot become non-dumpable or
-  a child subreaper;
+  can connect to its own listener on loopback or on one of the host's
+  addresses in a denied range (see "Network"); when it cannot run a hook or
+  MCP program; or when it cannot become non-dumpable or a child subreaper;
 * no ready line within `setup_timeout_sec`;
-* a reviewer unit (or a unit held back by one) waited longer than
-  `unit_wait_timeout_sec`, or the unit lock in the runtime directory cannot
-  be opened.
+* a unit waited longer than `unit_wait_timeout_sec` for the units before
+  it, or the unit lock in the runtime directory cannot be opened.
 
 The Ollama provider is refused with a blocked result rather than an
 `AgentDispatchRefused` (see above).
@@ -370,6 +462,34 @@ The feature flag is in `FAIL_CLOSED_FEATURE_FLAGS`. An invalid value
 (`"yes"`) or an unreadable dispatch config turns it **on**, which refuses
 dispatch until isolation is configured. A typo therefore never runs agents
 as the orchestrator's user.
+
+### Once on, it stays on
+
+An unreadable config is not the only way the flag could read as off
+(review F1). `--dispatch-config FILE` is merged over the built-in defaults,
+where the flag is false, so a per-run config without the key, a mistyped
+path or a missing file would silently run agents with the orchestrator's
+user and its sudo. Two things keep the flag on:
+
+* **The host marker.** While `/etc/equipa/require-agent-isolation` exists
+  (any content; created by root, outside every repository, so neither a
+  config nor an agent can remove it), isolation is *required*:
+  `isolation_enabled()` is true whatever the config says, every refusal that
+  depends on it (preflight, RLM, ForgeSmith, Ollama, ...) applies, and a
+  dispatch whose config turns the flag off is refused at startup with
+  `agent isolation is required on this host ...`, before any mode runs (and
+  again at every isolated spawn). A marker that cannot be checked (a
+  directory the orchestrator may not search) counts as present.
+* **Per-run configs may only turn it on.** When `--dispatch-config` names
+  another file than the host's own config (the one a run without the
+  option loads), the host config's `agent_isolation` carries over: if the
+  host has the flag on, the per-run config gets it on (a per-run `false` is
+  overridden with a WARNING) and gets the host's `agent_isolation` section
+  unless it has its own. A missing per-run file logs an ERROR and still
+  carries the host's isolation. Every other key is the per-run file's.
+
+The orchestrator prints `agent_isolation: ON`, `ON (required by ...)` or
+`OFF` at startup.
 
 ## Findings
 
@@ -410,33 +530,55 @@ Security review of task 3136 (fix-forward task 3140). All tests are in
 |---|---|---|
 | R3136-01 HIGH: the Ollama provider runs model-chosen shell commands as the orchestrator user | FIXED: refused with a blocked result in `dispatch_agent` (provider, `provider_<role>`, `--provider`) and again inside `run_ollama_agent`; flag off unchanged. Routing Ollama's tools through the launcher is future work | `test_ollama_provider_is_refused_with_isolation_on` (3 ways to select it), `test_ollama_provider_unchanged_with_isolation_off`, `test_run_ollama_agent_itself_refuses_with_isolation_on`, `test_run_ollama_agent_unchanged_with_isolation_off`, fences `test_every_run_ollama_agent_call_is_gated_by_the_refusal`, `test_run_ollama_agent_refuses_before_its_tool_loop`, `test_every_command_executing_entry_point_is_known`, `test_ollama_tool_execution_is_only_reached_through_run_ollama_agent` |
 | R3136-02 MEDIUM: the link check ignores the committed tip that becomes the task branch | FIXED: the state commit, the tip and the clone's HEAD are each checked with the same rules | `test_import_refuses_a_committed_link_the_working_tree_dropped`, `test_import_refuses_a_committed_escaping_link`, `test_import_refuses_a_link_in_the_clones_detached_head`, `test_import_accepts_a_committed_in_tree_link` |
-| R3136-03 MEDIUM: concurrent units share one UID under parallel dispatch | MITIGATED until a UID pool exists: reviewer units run alone (host-wide reader-writer lock, logged; see "Reviewers run alone"). Long-term fix: per-unit or per-role UIDs | `test_reviewer_waits_for_running_units_and_blocks_new_ones`, `test_reviewers_do_not_overlap_each_other`, `test_reviewer_waits_for_live_agent_scopes`, `test_units_in_another_process_are_waited_for`, `test_unit_lock_ignores_another_xdg_runtime_dir`, `test_wait_past_the_timeout_refuses_and_holds_nothing`, `test_spawn_holds_the_slot_until_the_agent_is_released`, `test_failed_setup_gives_the_slot_back`, `test_a_replaced_lock_file_cannot_let_a_reviewer_overlap`, `test_unit_lock_directory_must_be_private`, `test_build_cli_command_marks_the_role_for_the_isolated_spawn`, `test_reviewer_spawn_sites_build_their_command_with_the_role` |
+| R3136-03 MEDIUM: concurrent units share one UID under parallel dispatch | MITIGATED until a UID pool exists: reviewer units run alone (host-wide reader-writer lock, logged); since task 3142 every unit does (F4, see "Every unit runs alone"). Long-term fix: per-unit or per-role UIDs | `test_reviewer_waits_for_running_units_and_blocks_new_ones`, `test_reviewers_do_not_overlap_each_other`, `test_reviewer_waits_for_live_agent_scopes`, `test_units_in_another_process_are_waited_for`, `test_unit_lock_ignores_another_xdg_runtime_dir`, `test_wait_past_the_timeout_refuses_and_holds_nothing`, `test_spawn_holds_the_slot_until_the_agent_is_released`, `test_failed_setup_gives_the_slot_back`, `test_a_replaced_lock_file_cannot_let_a_reviewer_overlap`, `test_unit_lock_directory_must_be_private`, `test_build_cli_command_marks_the_role_for_the_isolated_spawn`, `test_reviewer_spawn_sites_build_their_command_with_the_role` |
 | R3136-04 LOW: cron/at denial is only a runbook line | FIXED: the launcher refuses when the agent lingers or `crontab -l`/`at -l` are not denied; the verify script checks the same | `test_launcher_refuses_an_agent_that_may_use_cron`, `test_launcher_refuses_an_agent_that_may_use_at`, `test_launcher_refuses_a_lingering_agent_user`, `test_launcher_accepts_denied_cron_and_at`, `test_verify_script_fails_when_the_agent_may_schedule_jobs`, `test_verify_script_passes_denied_cron_and_at` |
 | R3136-05 LOW: the out-of-tree link test is lexical | FIXED: links are resolved through the tree's other links, 40 hops at most | `test_link_escape_follows_links_of_the_tree`, `test_import_refuses_a_link_pair_that_resolves_outside`, `test_import_accepts_a_link_pair_that_stays_inside` |
 | R3136-06 LOW: autoresearch starts `claude --print` through `bash -c` | FIXED: refused with the flag on (and when `equipa` cannot be imported); direct argv with stdin and the isolation args | `test_autoresearch_mutation_refuses_with_isolation_on`, `test_autoresearch_mutation_runs_the_cli_without_a_shell`, `test_every_direct_claude_spawn_is_gated_by_the_refusal` |
 | R3136-07 INFO: the fences prove the refusal exists, not that it gates the spawn | FIXED: the new fences require an `if` on the refusal that returns or raises before the spawn, in an enclosing block | `test_gate_detection_needs_an_exit_before_the_spawn`, `test_every_preflight_spawn_is_gated_by_the_refusal`, `test_every_direct_claude_spawn_is_gated_by_the_refusal`, `test_claude_fence_sees_a_shell_string_spawn` |
 | R3136-08 INFO: the database-copy search covers only the configured directories | FIXED: SQLite files below `secret_scan_roots` and `--repo` whose schema holds an excluded table are probed by name as the agent, and a world-readable one fails the outer check | `test_credential_databases_below_project_roots_are_found`, `test_probe_command_probes_credential_copies_as_the_agent`, `test_outer_checks_fail_on_a_world_readable_credential_copy` |
 
+Independent review of the isolation merge and SECURITY-REVIEW-3140 (task
+3142, pre-enable fixes). All tests are in `tests/test_agent_isolation_3142.py`
+unless named otherwise:
+
+| Finding | Status (flag on) | Test |
+|---|---|---|
+| F1 MEDIUM: a per-run, missing or mistyped dispatch config turns isolation off silently | FIXED: the host marker `/etc/equipa/require-agent-isolation` makes it required (refused at startup and at spawn when the config turns it off); a per-run config carries the host config's isolation and may only turn it on; startup prints the state | `test_marker_turns_isolation_on_whatever_the_config_says`, `test_a_marker_that_cannot_be_checked_counts_as_present`, `test_required_isolation_refuses_a_config_that_turns_it_off`, `test_spawn_refuses_when_required_and_the_config_turns_it_off`, `test_agent_runner_never_spawns_unisolated_while_required`, `test_per_run_config_without_the_key_keeps_host_isolation`, `test_per_run_config_cannot_turn_host_isolation_off`, `test_a_missing_per_run_config_does_not_turn_isolation_off`, `test_an_unreadable_host_config_keeps_isolation_on`, `test_carrying_isolation_keeps_other_gates_fail_closed`, `test_cli_refuses_before_any_mode_runs`, `test_startup_line_names_the_isolation_state` |
+| F2 MEDIUM: localhost and LAN services reachable from the agent UID | FIXED: `IPAddressDeny=` on every unit; since a user manager cannot apply it, the launcher refuses unless its own loopback and LAN listeners are unreachable (nftables rule, step 4a); the verify script probes every listening loopback port and every `--loopback-port` | `test_unit_denies_loopback_link_local_multicast_and_private_ranges`, `test_extra_denied_ranges_add_to_the_defaults`, `test_handoff_names_the_denied_ranges`, `test_launcher_refuses_while_loopback_is_reachable`, `test_launcher_verify_runs_the_network_check`, `test_launcher_refuses_a_deny_list_without_loopback`, `test_local_addresses_include_the_hosts_own_lan_address`, `test_listening_loopback_ports_are_read_from_proc`, `test_probe_command_lists_operator_and_listening_ports`, `test_verify_script_fails_when_a_loopback_service_is_reachable`, `test_verify_script_passes_an_unreachable_port` |
+| F3 MEDIUM / R3140-01: the link walk is quadratic in the target length | FIXED: linear trie walk; targets over 4095 bytes refused unread, at most 10,000 links per tree and 1,000,000 walked components per commit; targets read once per blob | `test_a_one_megabyte_link_target_is_refused_in_under_0_2_seconds`, `test_a_link_target_longer_than_path_max_is_refused`, `test_a_target_of_exactly_the_limit_is_walked`, `test_a_tree_with_too_many_links_is_refused`, `test_many_long_links_are_checked_quickly`, `test_walk_budget_spans_every_link_of_the_check`, `test_trie_walk_is_linear_in_the_directory_depth`, `test_trie_walk_agrees_with_the_path_walk` |
+| F4 MEDIUM: concurrent units of other tasks can replace an export or forge a tester verdict | FIXED until a UID pool exists: every isolated unit runs alone (host-wide lock), and `max_concurrent` above 1 is refused at dispatch | `test_two_ordinary_units_never_overlap`, `test_units_of_another_process_are_waited_for`, `test_every_role_runs_alone_until_units_have_their_own_uid`, `test_concurrency_above_one_is_refused_with_isolation_on`, `test_parallel_tasks_refuse_a_cap_above_one_with_isolation_on`, `test_auto_run_and_parallel_goals_refuse_a_cap_above_one`, `test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal` |
+| F5 LOW: the imported tip need not descend from the base | FIXED: `merge-base --is-ancestor` before `update-ref` | `test_import_refuses_a_rewound_task_branch`, `test_import_refuses_an_unrelated_task_branch_tip`, `test_import_accepts_a_tip_that_descends_from_the_base`, `test_import_accepts_an_unchanged_tip` |
+| F6 LOW: external lifecycle hooks not refused with the flag on | NOT FIXED: outside this task's scope (`equipa/hooks`); still latent (no production caller of `load_hooks_config`), see residual risks | none |
+| F7 LOW: the agent user's sudo is not checked at dispatch | FIXED: `sudo -n -l -U <agent>` must report "not allowed" (fail closed otherwise); root-equivalent groups are a floor `privileged_groups` cannot remove, supplementary groups included; the verify script checks the groups | `test_agent_without_sudo_rights_passes`, `test_agent_sudo_rights_or_an_unclear_answer_refuse`, `test_a_missing_sudo_refuses`, `test_dispatch_refuses_an_agent_user_with_sudo_rights`, `test_root_equivalent_groups_cannot_be_configured_away`, `test_dispatch_refuses_a_supplementary_privileged_group`, `test_verify_script_checks_the_root_equivalent_groups` |
+| F8 LOW: no swap, disk or IO limits | FIXED for swap and IO (`MemorySwapMax=0`, `IOWeight`, both verified in the scope) and for the export (the launcher never publishes one over `max_export_bytes`); disk for the clone and HOME: runbook (own filesystem for the state root) | `test_unit_has_no_swap_and_a_lower_io_weight`, `test_scope_with_swap_is_refused`, `test_scope_io_weight_is_verified_when_set`, `test_handoff_tells_the_launcher_the_export_cap`, `test_launcher_never_publishes_an_export_over_the_cap`, `test_launcher_publishes_an_export_within_the_cap`, `test_launcher_rejects_an_invalid_export_cap`, `test_scope_verification` (3135) |
+| F9 LOW: the launcher's cgroup-path check and the scope check at spawn are not pinned | FIXED: both mutations (M19 `if False:`, M22 the call removed) now fail a test | `test_launcher_refuses_another_cgroup_even_with_the_right_limits`, `test_spawn_refuses_a_scope_whose_limits_are_wrong` |
+| F10 LOW: runbook gaps (MCP server under HOME, `-newer` search, new project dirs) | FIXED in the runbook (steps 0, 3, 7) | none (documentation) |
+| I1 INFO: the sudoers check passes with `(ALL) NOPASSWD: ALL` | FIXED: the rule is judged by the content of `sudo -n -ll` (run-as user, exact command, NOPASSWD, `!pam_session`, `!use_pty`) | `test_narrow_rule_is_recognised_by_content`, `test_an_incomplete_rule_is_reported`, `test_an_all_rule_alone_does_not_pass_the_outer_check` |
+| I2-I4 INFO | NOT FIXED (outside this task's scope; I4 is ISO-13 below) | none |
+| I5 INFO: `--task` (single-task mode) is refused with the flag on | DOCUMENTED (step 9): use `--tasks <id>` | none |
+
 ## Residual risks and limitations
 
 * **All agents share one agent UID.** Sequential units no longer share
-  anything (per-unit HOME, ISO-02), and reviewer units never overlap another
-  unit (R3136-03). Other *concurrent* agents (developers, testers and
-  debuggers of a parallel wave) can still read, write and signal each
-  other's processes and unit directories (not the orchestrator's), so one
-  task's developer can tamper with another task's developer or tester
-  clone while both run; that work still passes that task's own review.
-  Closing it needs a pool of agent users with one UID per unit (future
-  work), which would also let reviewers run in parallel again.
+  anything (per-unit HOME, ISO-02), and since task 3142 no isolated unit
+  overlaps another (F4), so they cannot read, write or signal each other's
+  processes and unit directories while they run. The price is one isolated
+  agent at a time on the host. A pool of agent users with one UID per unit
+  (future work) would let ordinary units run in parallel again.
 * The Ollama provider cannot be used with the flag on (R3136-01).
 * External lifecycle hooks (`equipa/hooks`) run their operator-configured
   command through the shell, as the orchestrator user, with the task
   worktree as the working directory; nothing refuses them with the flag on.
   The command text is the operator's (task data travels in the
-  environment), but a command that names a project file (`./check.sh`,
-  `npm run ...`, `make`) runs whatever the imported agent work put there.
-  With the flag on, configure hooks only with absolute paths outside every
-  project. Refusing or isolating them is future work.
+  environment), but the working directory holds the imported agent work,
+  so even an absolute command runs agent-written code when it reads
+  project files: `/usr/bin/make` reads the Makefile, `npm test` the
+  package.json scripts, `pytest` conftest.py, `python3 -m pkg` imports from
+  the working directory, and the shipped example hooks run linters and
+  builds on the project. An absolute path does not make a hook safe:
+  configure no lifecycle hooks while the flag is on (review F6, R3140-02;
+  the stock orchestrator registers none). Refusing or isolating them is
+  future work.
 * The file-access boundary is a blocklist (`deny_read` plus the verify
   script's scans), not an allowlist: world-readable files outside the
   checked locations stay readable to the agent. The runbook closes project
@@ -449,8 +591,12 @@ Security review of task 3136 (fix-forward task 3140). All tests are in
   store. `read-tree -u` still refuses `.git` and `..` paths.
 * Teardown still fails open (ISO-08): a failed import is logged at ERROR but
   does not mark the run failed.
-* The network is not restricted. An agent can still exfiltrate what it
-  legitimately holds: its OAuth token and the code it works on.
+* Loopback and the LAN are closed (F2), the public internet is not. An
+  agent can still exfiltrate what it legitimately holds: its OAuth token and
+  the code it works on. On a user manager the blocking depends on the
+  operator's nftables rule; the launcher refuses while it is missing.
+* A unit's clone, HOME and TMPDIR have no disk quota of their own; the
+  runbook puts the agent state root on a filesystem of its own (F8).
 * In-tree `.gitattributes` of the agent's commits still apply to the
   orchestrator's git (for example `-diff` or `merge=union`). Drivers must be
   defined in config, which agents can no longer write.
@@ -475,9 +621,41 @@ step as an administrator unless noted. Nothing here is done by EQUIPA itself.
 ### 0. Requirements
 
 Linux 5.14+ with cgroup v2 (`/sys/fs/cgroup/cgroup.controllers` exists),
-systemd with user managers, sudo 1.8.7+, git 2.29+. The Claude CLI must be
-installed at a system path readable and executable by other users (for
-example `/usr/local/bin/claude`), not under `<orch>`'s HOME.
+systemd with user managers, sudo 1.8.7+, git 2.29+, nftables (step 4a). The
+Claude CLI must be installed at a system path readable and executable by
+other users, not under `<orch>`'s HOME. Use the path `command -v claude`
+prints for a system-wide install: `/usr/bin/claude` for an npm global
+install on Ubuntu, `/usr/local/bin/claude` for others. Set it as
+`agent_isolation.claude_executable` (step 7).
+
+**MCP servers run inside the agent unit, as the agent user.** They are the
+agent's tools: the CLI starts them, in the unit, from the commands in the
+agent's MCP config. They are not run as the orchestrator. So every MCP
+server the agent keeps (`allowed_mcp_servers`, by default only `theforge`)
+must be executable by the agent user from a system location, and must not
+depend on `<orch>`'s HOME, which step 3 closes (0700). A `uvx` under
+`~<orch>/.local/bin` fails that, and under a fresh per-unit HOME `uvx` would
+also download the server again for every unit. Install the server into a
+root-owned virtualenv and point `mcp_config.json` at its absolute path:
+
+```bash
+python3 -m venv /opt/equipa-mcp
+/opt/equipa-mcp/bin/pip install mcp-server-sqlite
+chmod -R go-w /opt/equipa-mcp && chmod -R o+rX /opt/equipa-mcp
+```
+
+```json
+"theforge": {
+    "command": "/opt/equipa-mcp/bin/mcp-server-sqlite",
+    "args": ["--db-path", "/absolute/path/to/theforge.db"]
+}
+```
+
+The `--db-path` must be absolute; the orchestrator rewrites it to the
+read-only view (`view_db_path`) for the agent. The launcher refuses a unit
+whose MCP command the agent user cannot execute. Paths handed to the agent
+with `--add-dir` (for example a skills checkout) must stay readable by
+others (`o+rX`) for the same reason.
 
 ### 1. Create the agent user
 
@@ -490,15 +668,34 @@ passwd -l equipa-agent                    # no password login
 install -d -o root -g root -m 0711 /var/lib/equipa-agent
 install -d -o equipa-agent -g equipa-agent -m 0700 /var/lib/equipa-agent/.equipa-agent
 id equipa-agent                           # must show NO sudo/admin/wheel/adm/docker/lxd/... group
+sudo -l -U equipa-agent                   # must say: not allowed to run sudo
 loginctl disable-linger equipa-agent      # no user manager: it could start units that outlive agents
 echo equipa-agent >> /etc/cron.deny       # no cron/at persistence
 echo equipa-agent >> /etc/at.deny
 ```
 
+**The agent user must not be in `docker`, `lxd`, `sudo`, `adm` or any other
+group that grants root-equivalent access** (also `root`, `admin`, `wheel`,
+`incus`, `libvirt`, `kvm`, `disk`, `shadow`, `systemd-journal`), and no
+sudoers rule may name it or one of its groups. Membership of `docker` or
+`lxd` is root on the host as surely as sudo is. The orchestrator checks both
+at every dispatch (`os.getgrouplist` and `sudo -n -l -U equipa-agent`) and
+refuses otherwise; the launcher checks the groups again from inside, and the
+verify script fails on them. `privileged_groups` can add groups to the list,
+never remove these. (The orchestrator user itself may well be in `docker`
+and `sudo`; that is why agents must not run as it.)
+
 The launcher refuses to start an agent while the agent user lingers or may
 use `crontab` or `at` (if they are installed), and the verify script checks
 the same. If `/etc/cron.allow` or `/etc/at.allow` exists, it takes
 precedence: leave the agent user out of it instead.
+
+**Disk.** Each unit's clone, HOME and TMPDIR live under
+`/var/lib/equipa-agent/.equipa-agent`, which EQUIPA does not cap. Put
+`/var/lib/equipa-agent` on a filesystem of its own (a separate partition, or
+a fixed-size image mounted there, for example a 20 GiB ext4 image) so a unit
+cannot fill `/` and break the orchestrator or TheForge. The export into the
+exchange directory is capped by `max_export_bytes` in the launcher itself.
 
 No global git configuration is needed, and none is read: the launcher
 copies `user.name`/`user.email` from the task worktree into each clone and
@@ -536,7 +733,9 @@ chmod 0700 <db-dir>                          # agent may neither list nor enter 
 chmod 0700 <backup-dir>                      # each backup directory, likewise
 find <db-dir> <backup-dir> -xdev -type f \( -name '*.db' -o -name '*.db[-._]*' \
      -o -name '*.sqlite*' \) -exec chmod 0600 {} +   # every copy owner-only
-find / -xdev -type f -name '*.db*' -newer <db> -perm -o=r 2>/dev/null  # stray copies: move them into <backup-dir>
+# Stray copies anywhere, old or new (backups are usually OLDER than <db>, so
+# no -newer): move each into <backup-dir>, or chmod 0600 it.
+find / -xdev -type f \( -name '*.db*' -o -name '*.sqlite*' \) -perm -o=r 2>/dev/null
 
 chmod 0600 <runtime>/mcp_config.json <runtime>/.env 2>/dev/null
 chmod -R go-w <runtime>                      # runtime read-only to others
@@ -546,6 +745,19 @@ chmod -R o+rX <runtime>/equipa <runtime>/hooks <runtime>/skills <runtime>/script
 # Project checkouts: agents get bundles, so they need no access at all.
 chmod -R o-rwx <projects>/<each project>     # or a group the agent user is not in
 ```
+
+Project directories created *later* (a new EQUIPA project, a client copying
+files over Samba) are world-readable under the usual umask 022 until this
+step is repeated. Close that gap at the source:
+
+* run the orchestrator with `umask 027` (`UMask=0027` in its systemd unit,
+  or `umask 027` in the shell profile it starts from), so everything it
+  creates is closed to others;
+* give Samba shares below `<projects>` `create mask = 0660` and
+  `directory mask = 2770` (no bits for others);
+* run `scripts/verify_agent_isolation.sh` (step 8) on a schedule or before
+  each orchestrator start; it fails on any secret-shaped file the agent can
+  read below `secret_scan_roots`.
 
 Neither `<db-dir>` nor a `<backup-dir>` may be open to a group the agent user
 is in. List every `<backup-dir>` in `agent_isolation.db_backup_dirs` and
@@ -568,11 +780,53 @@ rather than their parent.
 ```bash
 loginctl enable-linger <orch>
 cat /sys/fs/cgroup/user.slice/user-$(id -u <orch>).slice/user@$(id -u <orch>).service/cgroup.subtree_control
-# must list: cpu memory pids. If not:
+# must list: cpu io memory pids. If not:
 mkdir -p /etc/systemd/system/user@.service.d
-printf '[Service]\nDelegate=pids memory cpu\n' > /etc/systemd/system/user@.service.d/delegate.conf
+printf '[Service]\nDelegate=pids memory cpu io\n' > /etc/systemd/system/user@.service.d/delegate.conf
 systemctl daemon-reload   # then restart the orchestrator's user manager (log out / reboot)
 ```
+
+The io controller carries the units' `IOWeight` (F8). Without it the scope
+has no `io.weight` and every dispatch is refused; set `"io_weight": null`
+in step 7 only if you accept agents competing for IO on equal terms.
+`memory.swap.max` comes with the memory controller.
+
+### 4a. Network: no loopback or LAN for the agent user
+
+Every unit carries `IPAddressDeny=` for loopback, link-local, multicast and
+the private ranges (see "Network"), but the orchestrator's user manager
+cannot apply it, and the launcher refuses every agent until something else
+does. Block the same ranges for the agent user's UID with nftables, except
+DNS to the local resolver (`127.0.0.53` on Ubuntu, where `/etc/resolv.conf`
+names it; the agent must resolve the API's name):
+
+```bash
+cat > /etc/nftables.d/equipa-agent.nft <<'EOF'
+table inet equipa_agent {
+    chain output {
+        type filter hook output priority 0; policy accept;
+        meta skuid != "equipa-agent" accept
+        ip daddr 127.0.0.53 udp dport 53 accept
+        ip daddr 127.0.0.53 tcp dport 53 accept
+        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+                   172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } reject
+        ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } reject
+    }
+}
+EOF
+nft -f /etc/nftables.d/equipa-agent.nft
+# and load it at boot: include "/etc/nftables.d/*.nft" in /etc/nftables.conf,
+# then systemctl enable nftables
+```
+
+Add every range of `ip_address_deny_extra` (step 7) to the rule as well, a
+tailnet's `100.64.0.0/10` for example (keep its DNS address open if the host
+resolves through it). `reject` rather than `drop` makes each probe fail at
+once instead of after the launcher's 2 s timeout. The launcher's check (its
+own listeners on `127.0.0.1` and on this host's addresses in the denied
+ranges must be unreachable) and the verify script's (every listening
+loopback port, every `--loopback-port`) prove the rule from the agent's
+side.
 
 The orchestrator process needs `XDG_RUNTIME_DIR=/run/user/<uid of orch>`
 (set automatically for login sessions and user services).
@@ -614,16 +868,36 @@ of its scope. `!use_pty` keeps stdout a pipe for the CLI's stream. The
 launcher path must not be writable by the agent user (step 3); it is also in
 the launcher's own `deny_write` check.
 
+The verify script (step 8) checks this rule **by its content** in
+`sudo -n -ll` (review I1): an entry that runs exactly that command line as
+`equipa-agent`, NOPASSWD, and `Defaults!EQUIPA_AGENT_LAUNCH` with
+`!pam_session` and `!use_pty`. That `<orch>` can run the command proves
+nothing while `<orch>` also holds `(ALL) NOPASSWD: ALL`.
+
+At every dispatch the orchestrator runs `sudo -n -l -U equipa-agent` to
+confirm the agent user has no sudo rights (F7). sudo answers that only to a
+user holding `ALL`, or the `list` permission for the agent user. If you
+narrow `<orch>`'s own sudo (recommended once isolation runs), keep that
+listing possible, for example:
+
+```
+<orch> ALL=(equipa-agent) NOPASSWD: list
+```
+
+(sudoers(5), "list"). Without it every dispatch is refused with `cannot
+verify that the agent user ... has no sudo rights`.
+
 ### 7. Configure and switch on
 
 In `dispatch_config.json`:
 
 ```json
 "features": { "agent_isolation": true },
+"max_concurrent": 1,
 "agent_isolation": {
     "agent_user": "equipa-agent",
     "python": "/usr/bin/python3",
-    "claude_executable": "/usr/local/bin/claude",
+    "claude_executable": "/usr/bin/claude",
     "exchange_dir": "/var/lib/equipa-agent/exchange",
     "view_db_path": "/var/lib/equipa-view/theforge-view.db",
     "oauth_token_file": "/home/<orch>/.equipa-agent-token",
@@ -645,15 +919,41 @@ Other keys, with defaults: `launcher` (this checkout's
 directories with TheForge backups, closed to the agent like the database's
 own directory), `secret_scan_roots` (`[]`: project roots the verify script
 scans; it fails while this is empty), `unit_wait_timeout_sec` (21600: how
-long a reviewer may wait for the running units, or any unit for a reviewer,
-before the dispatch is refused). Unknown keys are refused.
+long a unit may wait for the one running before it, before the dispatch is
+refused), `ip_address_deny_extra` (`[]`: more ranges the agent may not
+reach, step 4a), `io_weight` (50; `null` for none). Unknown keys are
+refused. `privileged_groups` adds to the built-in root-equivalent groups.
+
+`max_concurrent` must be 1 while the flag is on (dispatch refuses a higher
+value, from the config or `--max-concurrent`): every isolated unit runs
+alone until per-unit agent UIDs exist ("Every unit runs alone").
+
+Once `scripts/verify_agent_isolation.sh` prints `RESULT: PASS` (step 8),
+make the setting stick, as root:
+
+```bash
+install -d -o root -g root -m 0755 /etc/equipa
+install -o root -g root -m 0644 /dev/null /etc/equipa/require-agent-isolation
+```
+
+While that file exists, isolation is required on this host: a dispatch
+whose config turns the flag off (a per-run `--dispatch-config` without it,
+a mistyped path, `false`) is refused instead of running agents as `<orch>`
+("Once on, it stays on"). The directory must stay searchable by `<orch>`;
+a marker that cannot be checked counts as present. The orchestrator prints
+`agent_isolation: ON (required by /etc/equipa/require-agent-isolation)` at
+startup.
+
+Restart every orchestrator process on the new code before relying on the
+unit lock: a process still running older code takes no lock.
 
 ### 8. Verify on the real host
 
 As `<orch>`, from `<runtime>`, with the orchestrator's environment:
 
 ```bash
-scripts/verify_agent_isolation.sh --repo /path/to/a/project
+scripts/verify_agent_isolation.sh --repo /path/to/a/project \
+    --loopback-port 5432 --loopback-port 6379   # each local service you know of
 ```
 
 It runs its own checks as an isolated agent through the real path (scope,
@@ -673,8 +973,13 @@ credential except the OAuth token is in its environment; its HOME,
 `CLAUDE_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` are the unit's own and it cannot
 write its passwd HOME; it cannot use `crontab` or `at` and does not linger;
 it cannot read any SQLite file below the project roots whose schema holds an
-excluded table (found by the orchestrator, probed by name). From outside, as
-the orchestrator, it also fails when
+excluded table (found by the orchestrator, probed by name); it cannot
+connect to `127.0.0.1` on any `--loopback-port` or on any port that listens
+on loopback (read from `/proc/net/tcp` and `tcp6` by the orchestrator, so
+the list covers services you did not name). The launcher has already
+refused the probe if its own loopback or LAN listeners were reachable. From
+outside, as the orchestrator, it also fails when the narrow sudoers rule is
+not installed as step 6 prints it (judged by `sudo -n -ll`), when
 the database or backup directories are open to others or to a group of the
 agent user, when any copy in them, or any such file below
 `secret_scan_roots`, is world-readable, and when
@@ -685,7 +990,7 @@ established (the message says which refusal).
 ### 9. Operating it
 
 * Logs: `[Isolation]` lines show the unit, cgroup and import result of each
-  agent, and when a unit waits for a reviewer or a reviewer runs alone.
+  agent, and when a unit waits for the one before it or runs alone.
 * Running agents: `systemctl --user list-units 'equipa-agent-*'` (as `<orch>`).
   Kill one: `echo 1 > /sys/fs/cgroup/<ControlGroup of the unit>/cgroup.kill`.
 * If an import fails, the ERROR line names the export bundle in the
@@ -695,4 +1000,14 @@ established (the message says which refusal).
   in `~equipa-agent/.equipa-agent/<unit>/repo` (the unit's HOME and files
   are removed). An import refused because of a symbolic link (ISO-04) names
   the link; the bundle can be inspected the same way.
-* Roll back: set `features.agent_isolation` to `false`. Nothing else changes.
+* Dispatch modes: run tasks with `--tasks <id> [<id> ...]`, which gives
+  each task its own worktree. Single-task mode (`--task <id>`) runs the
+  agent in the project's main checkout, and the isolated spawn refuses a
+  main checkout, so it is refused with the flag on, as are roles that run in
+  the main checkout (goal planner/evaluator).
+* Per-run configs: `--dispatch-config FILE` keeps the host config's
+  isolation (flag and section) unless FILE has its own section; it cannot
+  turn isolation off ("Once on, it stays on").
+* Roll back: as root, `rm /etc/equipa/require-agent-isolation`, then set
+  `features.agent_isolation` to `false`. With the marker still present a
+  config with the flag off is refused, by design.

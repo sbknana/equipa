@@ -1215,7 +1215,7 @@ def test_an_all_rule_alone_does_not_pass_the_outer_check(
                 "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n"
                 "    Options: !authenticate\n    Commands:\n\tALL\n")
     monkeypatch.setattr(isolation, "sudoers_listing",
-                        lambda settings: (only_all, 0))
+                        lambda settings: (only_all, 0), raising=False)
     failures = "\n".join(isolation._outer_checks(settings))
     assert "the sudoers rule is missing or incomplete" in failures
     assert "an ALL rule does not count" in failures

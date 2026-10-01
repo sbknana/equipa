@@ -688,7 +688,7 @@ def check_agent_has_no_sudo(settings: IsolationSettings) -> None:
     raise AgentIsolationError(
         f"cannot verify that the agent user {settings.agent_user!r} has no "
         f"sudo rights: {' '.join(argv)} exited {status}: "
-        f"{output.strip()[-300:]!r} (docs/AGENT_ISOLATION.md step 2)")
+        f"{output.strip()[-300:]!r} (docs/AGENT_ISOLATION.md step 6)")
 
 
 def _run_capture(argv: Sequence[str], timeout: float = 30) -> tuple[str, int]:
