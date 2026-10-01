@@ -25,14 +25,33 @@ import pytest
 from equipa import db as equipa_db
 from equipa.dispatch import _security_review_blocks_merge
 from equipa.loops import (
+    BACKSTOP_REASON,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_INCOMPLETE,
     REVIEW_VERDICT_OK,
     _RESOLVED_FINDING_HEADER_RE,
     _analyze_review_file,
+    _analyze_review_views,
     _blank_code,
     _count_findings_in_review_file,
 )
+from equipa.security_gate import normalize_review_text
+
+
+def _rules_analysis(path: Path):
+    """The shape rules alone, without the severity-token backstop."""
+    return _analyze_review_views(
+        normalize_review_text(path.read_text(encoding="utf-8")))
+
+
+def _assert_backstop_blocks(path: Path) -> None:
+    """Task 3152: an UPPER-case HIGH outside a counted heading's label and
+    the final strict footer blocks whatever the counts (each review here
+    blocked the merge before as well, by HIGH=1)."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert _count_findings_in_review_file(path) is None
 
 TASK_ID = 3038
 
@@ -249,8 +268,12 @@ def test_level_two_finding_counted_by_footer_is_trusted(tmp_path: Path) -> None:
         + _footer(high=1),
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    rules = _rules_analysis(path)
+    assert rules.verdict == REVIEW_VERDICT_OK
+    assert rules.counts == _counts(high=1)
+    # Task 3152: a level-2 heading is no finding heading the parser counts,
+    # so its UPPER-case HIGH is unaccounted.
+    _assert_backstop_blocks(path)
 
 
 def test_candidate_inside_closed_code_fence_is_ignored(tmp_path: Path) -> None:
@@ -340,10 +363,13 @@ def test_non_zero_earlier_footer_is_overridden_by_last(tmp_path: Path) -> None:
         + _footer(high=1, low=1),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = _rules_analysis(path)
 
     assert analysis.verdict == REVIEW_VERDICT_OK
     assert analysis.footer_counts == _counts(high=1, low=1)
+    # Task 3152: the draft tally's CRITICAL and HIGH labels are not the
+    # final footer's.
+    _assert_backstop_blocks(path)
 
 
 # ---------- S3033-03: unfilled template / zero-finding completion ----------
