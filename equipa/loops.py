@@ -1119,12 +1119,16 @@ _RESOLVED_FINDING_HEADER_RE = re.compile(
 # "\d+[\w-]*" matched the same lines but let three overlapping quantifiers
 # backtrack cubically: one "**S1" + 1000-digit line took 17 s and hung the
 # gate (task #3038 ReDoS). Every alternative must stay linear per line.
+# Task 3137: the blanks after "**" and after an opening "[" / "(" are two
+# runs only when the bracket is there. "[\[(]?[ \t]*" let a bracketless
+# "**" + 16 KB of blanks try every split of the run (3 s; "<b>" becomes
+# "**", so the HTML rescan paid it too).
 _FINDING_CANDIDATE_RE = re.compile(
     r"^[ \t]{0,3}(?:"
     r"#{1,6}[ \t][^\n]*?"
     r"|(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?\*\*[ \t]*(?:"
     r"(?:\[(?![ xX]\])[^\]\n]{1,24}\]|[A-Za-z]{1,8}[-_]?\d)[^*\n]*?"
-    r"|[\[(]?[ \t]*(?=(?-i:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-]))"
+    r"|(?:[\[(][ \t]*)?(?=(?-i:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z_-]))"
     r")"
     r"|[-*+][ \t]+\[(?![ xX]\])[^\]\n]{1,24}\][^\n]{0,40}?"
     r")(?<![A-Za-z_-])(CRITICAL|HIGH|MEDIUM|LOW|INFO)"

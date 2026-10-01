@@ -377,6 +377,41 @@ def test_200kb_adversarial_review_parses_under_one_second(name):
     assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
 
 
+# Found by a generated search over token pairs (a + b*n at 4 KB and 16 KB):
+# blanks after a bold opener were split every way between two "[ \t]*"
+# runs in the bold lead-in rule, so 16 KB took 3 s and 200 KB minutes. "<b>"
+# is rewritten as "**", so the HTML rescan paid it too.
+BOLD_OPENER_BYTES = 32 * 1024
+
+
+@pytest.mark.parametrize("line", [
+    "**" + " " * BOLD_OPENER_BYTES + "x",
+    "- **" + "\t" * BOLD_OPENER_BYTES,
+    "<b>" + " " * BOLD_OPENER_BYTES,
+    "<strong>" + "\N{NO-BREAK SPACE}" * BOLD_OPENER_BYTES,
+    "<b>" + "`` " * (BOLD_OPENER_BYTES // 3),
+])
+def test_blanks_after_a_bold_opener_parse_in_linear_time(line):
+    text = review("No findings.", ["## Findings", "", line], ZERO,
+                  low_heading=False)
+    started = time.perf_counter()
+    analysis = analyze(text)
+    elapsed = time.perf_counter() - started
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert elapsed < 0.5, f"{line[:12]!r}: {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("line, severity", [
+    ("**  HIGH** \N{EM DASH} SQL injection in login", "HIGH"),
+    ("**( HIGH )** SQL injection in login", "HIGH"),
+    ("** [ \tCRITICAL ]** RCE in upload", "CRITICAL"),
+    ("- ** (MEDIUM)** Token leak", "MEDIUM"),
+    ("<b>  (HIGH)</b> SQL injection in login", "HIGH"),
+])
+def test_bold_lead_ins_with_blanks_and_brackets_still_fail_closed(line, severity):
+    assert_blocks_behind_zero_footer([line], severity)
+
+
 @pytest.mark.parametrize("gap", [3, 40, 5000])
 def test_folded_blank_lines_keep_findings_and_footer(gap):
     """Folding blank-line runs changes no verdict: a finding far below the
