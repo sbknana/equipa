@@ -2418,6 +2418,13 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
                 or index in blocks.table_rows):
             span_end = line_starts[index] + len(lines[index])
         span_limits[index] = span_end
+    # Offset of the "<!--" that opens each HTML comment block: the first
+    # non-blank character of its line. Found once per line, so a line of
+    # 15,000 comments is not rescanned from its start for each (quadratic).
+    comment_block_starts = {
+        line_starts[index] + len(lines[index]) - len(lines[index].lstrip(" \t"))
+        for index in blocks.comment_openers
+    }
 
     closers_by_length: dict[int, deque[int]] = {}
     for run in _BACKTICK_RUN_RE.finditer(text):
@@ -2459,9 +2466,7 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
             continue
         if token.group(0) == "<!--":
             comment_limit = span_limit
-            if line in blocks.comment_openers and not (
-                text[line_start:start].strip(" \t")
-            ):
+            if start in comment_block_starts:
                 comment_limit = len(text)  # an HTML comment block
             end = -1
             if not escaped and not (

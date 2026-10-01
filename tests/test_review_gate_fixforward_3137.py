@@ -600,6 +600,39 @@ def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
 
+# Found by the same search: on a line that opens an HTML comment block, every
+# later comment on the line rescanned the line from its start to see whether
+# it was the block's opener, so 200 KB of comments took about 0.6 s and
+# 512 KB 3.5 s (quadratic).
+COMMENT_LINE_FLOODS = {
+    "marker-comments-then-backticks":
+        "<!-- EQUIPA-X -->" * (REVIEW_BYTES // 17) + "``",
+    "comments": "<!-- x -->" * (REVIEW_BYTES // 10),
+    "indented-comments": "   " + "<!-- x -->" * (REVIEW_BYTES // 10),
+    "comments-then-unclosed": "<!-- x -->" * (REVIEW_BYTES // 10) + "<!--",
+}
+
+
+@pytest.mark.parametrize("section", [[], ["## Findings"]])
+@pytest.mark.parametrize("name", sorted(COMMENT_LINE_FLOODS))
+def test_200kb_line_of_comments_parses_in_half_a_second(name, section):
+    text = review("No findings.", section + [COMMENT_LINE_FLOODS[name]], ZERO,
+                  low_heading=False)
+    started = time.perf_counter()
+    analysis = analyze(text)
+    elapsed = time.perf_counter() - started
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+
+
+def test_only_the_comment_opening_a_line_may_run_across_blank_lines():
+    """A later comment on a comment block's line must close inside its block,
+    so it hides nothing below the blank line."""
+    assert_blocks_behind_zero_footer(
+        ["<!-- a --> <!--", "", "SQL injection `` ` `` severity: HIGH `x`",
+         "", "-->"])
+
+
 @pytest.mark.parametrize("body, severity", [
     # A severity row after a flood of empty cells.
     (["|" * 5000, "| S1 | HIGH | SQL injection |"], "HIGH"),
