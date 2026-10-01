@@ -960,20 +960,30 @@ def pinned_repository(
     ``common_dir`` are the realpaths, used only where ``/proc/self/fd``
     does not exist.
     """
+    if not fd_pinning_available():
+        return pinned_repository_by_path(work_tree, git_dir=git_dir, common_dir=common_dir)
     path = _pin_key(work_tree)
-    work_tree_id = _work_tree_id(path)
-    if fd_pinning_available():
-        return PinnedGitRepository(
-            os.path.realpath(work_tree),
-            f"{_FD_DIRECTORY}/{git_dir_fd}",
-            f"{_FD_DIRECTORY}/{common_dir_fd}",
-            tuple(sorted({git_dir_fd, common_dir_fd})),
-            path=path,
-            work_tree_id=work_tree_id,
-        )
+    return PinnedGitRepository(
+        os.path.realpath(work_tree),
+        f"{_FD_DIRECTORY}/{git_dir_fd}",
+        f"{_FD_DIRECTORY}/{common_dir_fd}",
+        tuple(sorted({git_dir_fd, common_dir_fd})),
+        path=path,
+        work_tree_id=_work_tree_id(path),
+    )
+
+
+def pinned_repository_by_path(
+    work_tree: str, *, git_dir: str, common_dir: str,
+) -> PinnedGitRepository:
+    """A :class:`PinnedGitRepository` that names the realpaths ``git_dir`` /
+    ``common_dir`` (systems without ``/proc/self/fd``), keyed by
+    ``work_tree`` as the merge path names it, with its (device, inode) now.
+    """
+    path = _pin_key(work_tree)
     return PinnedGitRepository(
         os.path.realpath(work_tree), git_dir, common_dir,
-        path=path, work_tree_id=work_tree_id,
+        path=path, work_tree_id=_work_tree_id(path),
     )
 
 

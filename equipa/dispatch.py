@@ -75,6 +75,7 @@ from equipa.git_ops import (
     git_toplevel_async,
     open_pinned_directory,
     pinned_repository,
+    pinned_repository_by_path,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -2989,16 +2990,15 @@ async def _pin_merge_repositories_by_path(
         None, identity.git_dir, identity.common_dir,
         linked=identity.git_dir_id != identity.common_dir_id,
     )
-    repositories = [PinnedGitRepository(
-        identity.work_tree, identity.git_dir, identity.common_dir, path=work_tree,
+    repositories = [pinned_repository_by_path(
+        work_tree, git_dir=identity.git_dir, common_dir=identity.common_dir,
     )]
     if worktree_dir is not None:
         admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
         admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
         _check_commondir_file(None, admin_dir, identity.common_dir, linked=True)
-        repositories.append(PinnedGitRepository(
-            os.path.realpath(worktree_dir), admin_dir, identity.common_dir,
-            path=worktree_dir,
+        repositories.append(pinned_repository_by_path(
+            worktree_dir, git_dir=admin_dir, common_dir=identity.common_dir,
         ))
     return _MergePins(repositories, [])
 
