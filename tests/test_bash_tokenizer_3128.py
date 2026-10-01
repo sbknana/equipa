@@ -653,6 +653,16 @@ SUBSTITUTION_STATEMENTS = [
     f"xa='a[{OPENER}$({MARKER})]'; [[ xa -eq 1 ]]",  # runs
     f": '{OPENER}$({MARKER})'",                   # inert
     f"let {OPENER}$'a[\\x24({MARKER})]'",         # runs: escapes decoded
+    # Task 3146 (IV3133-01): what check 26 now counts, and what it no longer does.
+    f"RANDOM='a[{OPENER}$({MARKER})]'",           # runs: integer special
+    f"read OPTIND <<< 'a[{OPENER}$({MARKER})]'",  # runs
+    f"xa='a[{OPENER}$({MARKER})]'; : \"${{w:xa}}\"",  # runs: substring offset
+    f"xa='a[{OPENER}$({MARKER})]'; a[xa]=1",      # runs: subscript in code
+    f"xa='{OPENER}$({MARKER})'; : \"${{xa@P}}\"",  # runs: prompt expansion
+    f"read -r xa <<< '{OPENER}$({MARKER})'",      # inert: a plain name
+    f"[ -f qx ] || : '{OPENER}$({MARKER})'",      # inert: [ without -v
+    f"printf '%s' '{OPENER}$({MARKER})'",         # inert: printf without -v
+    f": \"$((1+2))\" '{OPENER}$({MARKER})'",      # inert: literal arithmetic
 ]
 SUBSTITUTION_HEREDOCS = [
     f"p <<'EOF'\n{OPENER}$({MARKER})\nEOF",       # inert: quoted body
@@ -711,8 +721,8 @@ def _substitution_line(rng: random.Random, first_marker: int) -> tuple[str, list
     return line, markers
 
 
-def _substitution_corpus() -> list[tuple[str, list[tuple[int, int]]]]:
-    rng = random.Random(SEED + 5)
+def _substitution_corpus(seed: int = SEED + 5) -> list[tuple[str, list[tuple[int, int]]]]:
+    rng = random.Random(seed)
     corpus = []
     next_marker = 1
     for _ in range(SUBSTITUTION_LINES):
@@ -731,9 +741,10 @@ def _lookalikes_by_original_index(line: str) -> dict[int, "bash_security._Lookal
     }
 
 
-def test_substitutions_bash_runs_are_never_proven_inert(tmp_path: Path):
+@pytest.mark.parametrize("seed", [SEED + 5, 1, 2, 3, 4, 5])
+def test_substitutions_bash_runs_are_never_proven_inert(tmp_path: Path, seed: int):
     bash = _require_bash()
-    corpus = _substitution_corpus()
+    corpus = _substitution_corpus(seed)
     script = tmp_path / "substitutions.sh"
     script.write_text(
         SUBSTITUTION_PRELUDE + "".join(line + "\n" for line, _ in corpus),
