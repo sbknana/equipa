@@ -2803,14 +2803,15 @@ def _rendered_review_text(text: str) -> str:
 # (_strict_footer). Anything else blocks with this reason and its line
 # numbers: no negation, tally, comparison, "below", soft-wrap, section,
 # finding-ID or "Overall risk" exemption. The exemptions below remain for
-# MEDIUM only, which never blocks a merge and is only logged.
+# MEDIUM only.
 BACKSTOP_REASON = "unaccounted CRITICAL/HIGH token"
 # The severities whose count blocks a merge (dispatch._security_review_blocks
-# _merge and the defensive invariant: CRITICAL or HIGH above 0). An
-# unaccounted MEDIUM token is counted and logged under this reason instead
-# of untrusting the review (task 3149, R3143-06).
+# _merge and the defensive invariant: CRITICAL or HIGH above 0).
 MERGE_BLOCKING_SEVERITIES = ("CRITICAL", "HIGH")
-BACKSTOP_ADVISORY_REASON = "unaccounted MEDIUM token (advisory)"
+# A MEDIUM word no heading, section, finding ID or footer accounts for still
+# untrusts the review, as it did on main before task 3149: task 3149 (R3143-06)
+# made it a logged advisory, which let reviews main blocks merge (task 3152).
+BACKSTOP_MEDIUM_REASON = "unaccounted MEDIUM token"
 REVIEW_PARSE_ERROR_REASON = "review parse error"
 REVIEW_BIDI_REASON = "bidi control character"
 _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
@@ -3951,9 +3952,10 @@ def _severity_token_backstop(
     is unaccounted, and the review blocks (count-mismatch, reason
     ``BACKSTOP_REASON`` with the 1-based line numbers) whatever the footer
     counts. A MEDIUM word on a counted MEDIUM heading or in its section is
-    that finding's; other MEDIUM words are counted and logged when the
-    footer counts fewer MEDIUM findings than the headings plus them (they
-    never block). An untrusted analysis is returned unchanged.
+    that finding's; other MEDIUM words block (reason
+    ``BACKSTOP_MEDIUM_REASON``) when the footer counts fewer MEDIUM findings
+    than the headings plus them, as on main. An untrusted analysis is
+    returned unchanged.
     """
     if not analysis.trusted:
         return analysis
@@ -4018,7 +4020,6 @@ def _severity_token_backstop(
     parser_headings = analysis.header_counts or {}
     masked_lines = masked.split("\n") if headings else []
     problems: list[tuple[str, str]] = []
-    reported: dict[str, int] = {}
     blocking_lines: set[int] = set()
     for severity in _BACKSTOP_SEVERITIES:
         blocking = severity in MERGE_BLOCKING_SEVERITIES
@@ -4051,26 +4052,14 @@ def _severity_token_backstop(
                 f"{severity}={unaccounted} at line {_shown_lines(lines)} "
                 f"(footer {footer_count}, finding headings {counted})",
             ))
-            reported[severity] = counted + unaccounted
     if not problems:
         return analysis
     detail = "; ".join(problem for _, problem in problems)
-    if blocking_lines:
-        return replace(
-            analysis,
-            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
-            detail=(f"{BACKSTOP_REASON} at line "
-                    f"{_shown_lines(sorted(blocking_lines))}: {detail}"),
-        )
-    # Task 3149 (R3143-06): only MEDIUM tokens are unaccounted, and MEDIUM
-    # never blocks a merge. Untrusting the review for them blocked the merge
-    # anyway; now they are counted (the MEDIUM count includes them) and the
-    # detail is logged by the gate, and the review stays trusted.
-    counts = dict(analysis.counts or {})
-    for severity, total in reported.items():
-        counts[severity] = max(counts.get(severity, 0), total)
-    return replace(analysis, counts=counts,
-                   detail=f"{BACKSTOP_ADVISORY_REASON}: {detail}")
+    reason = (f"{BACKSTOP_REASON} at line "
+              f"{_shown_lines(sorted(blocking_lines))}"
+              if blocking_lines else BACKSTOP_MEDIUM_REASON)
+    return replace(analysis, verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+                   detail=f"{reason}: {detail}")
 
 
 def _stricter_analysis(
@@ -4467,9 +4456,7 @@ def _count_findings_in_review_file(
     Task 3149 (R3143-04 / R3143-05): ANY exception from the parser is a
     ``count-mismatch`` with detail ``review parse error: <type>``, logged like
     every other untrusted review, and the merge blocks (fail closed with a
-    verdict line, never an exception out of the gate). A trusted review whose
-    MEDIUM count includes unaccounted MEDIUM tokens logs
-    ``event=backstop-advisory``.
+    verdict line, never an exception out of the gate).
     """
     try:
         analysis = _analyze_review_file(review_path, text=text)
@@ -4480,16 +4467,6 @@ def _count_findings_in_review_file(
             detail=f"{REVIEW_PARSE_ERROR_REASON}: {type(error).__name__}",
         )
     if analysis.trusted:
-        if analysis.detail.startswith(BACKSTOP_ADVISORY_REASON):
-            _gate_audit_log(
-                f"task={task_id} event=backstop-advisory "
-                f"artifact={review_path.name} "
-                f"counts=[{format_counts(analysis.counts)}] "
-                f"detail={analysis.detail!r} action=count-only",
-                task_id=task_id,
-                event="backstop-advisory",
-                counts=analysis.counts,
-            )
         return analysis.counts
     if analysis.verdict in (
         REVIEW_VERDICT_COUNT_MISMATCH, REVIEW_VERDICT_INCOMPLETE,
