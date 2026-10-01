@@ -2922,10 +2922,10 @@ async def _pin_merge_repositories(
     only refs, never run another repository's drivers, and the post-merge
     identity check (``record_merge``) trips on it.
 
-    A hand-built guard without an identity pins nothing (hermetic tests).
+    A guard without an identity (hand-built or a test double) pins nothing.
     Raises :class:`PinnedRepositoryError` when anything does not match.
     """
-    identity = guard.identity
+    identity = getattr(guard, "identity", None)
     if identity is None:
         return _MergePins([], [])
     if os.path.realpath(work_tree) != identity.work_tree:

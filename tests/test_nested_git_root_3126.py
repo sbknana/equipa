@@ -242,9 +242,10 @@ class GitCwdRecorder:
         real_run = git_ops_mod._run_with_env
         real_spawn = asyncio.create_subprocess_exec
 
-        def run_with_env(args_list, cwd, timeout, env=None, *, text=True):
+        def run_with_env(args_list, cwd, timeout, env=None, *, text=True, **kwargs):
+            # kwargs: pass_fds of a merge pinned to its repository (task 3151).
             recorder.calls.append((list(args_list), Path(cwd)))
-            return real_run(args_list, cwd, timeout, env, text=text)
+            return real_run(args_list, cwd, timeout, env, text=text, **kwargs)
 
         async def spawn(*argv, **kwargs):
             if argv and argv[0] == "git":

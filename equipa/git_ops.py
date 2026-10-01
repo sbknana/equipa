@@ -1109,9 +1109,12 @@ def git_run(
     """
     pin = _pinned_repository_for(cwd)
     run_env = _hardened_git_env(env, args, pin)
+    # Only a descriptor pin hands anything down; other calls keep the plain
+    # runner signature.
+    inherited = {"pass_fds": pin.fds} if pin is not None and pin.fds else {}
     return _run_with_env(
         _hardened_git_argv(args, run_env, pin), cwd, timeout, run_env, text=text,
-        pass_fds=pin.fds if pin is not None else (),
+        **inherited,
     )
 
 
