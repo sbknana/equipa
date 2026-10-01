@@ -977,6 +977,64 @@ def _launcher_kind(command: str) -> str:
     return "executable"
 
 
+# Where a python, node or uvx command must really be that program
+# (RR3138-C): the root-owned system command directories. The orchestrator's
+# PATH is not used: it usually holds the operator's ~/.local/bin, which an
+# agent sharing the operator UID can write.
+_SYSTEM_COMMAND_DIRS = ("/usr/local/bin", "/usr/bin", "/bin",
+                        "/usr/local/sbin", "/usr/sbin", "/sbin")
+_INTERPRETER_NAMES = {
+    "python": ("python3", "python"),
+    "node": ("node", "nodejs"),
+    "uvx": ("uvx",),
+}
+# Name stems (_launcher_stem) that are versioned names of each interpreter:
+# python3.12 and pypy3 are looked up under their own name too.
+_INTERPRETER_STEMS = {
+    "python": frozenset({"python", "pypy"}),
+    "node": frozenset({"node", "nodejs"}),
+    "uvx": frozenset({"uvx"}),
+}
+
+
+def _is_real_interpreter(command: str, kind: str) -> bool:
+    """True when ``command`` is the real python, node or uvx (RR3138-C).
+
+    The launch check picks its python/node/uvx rules by name, so a copy of
+    perl named python3 or of env named uvx passed as that interpreter. Now
+    the file itself must be the program its name says: the same file as
+    that name (the canonical one, or the command's own basename such as
+    python3.12) found in _SYSTEM_COMMAND_DIRS, the orchestrator's own
+    interpreter for python, or a path the operator listed under
+    mcp_trusted_executables (uv installs uvx in ~/.local/bin, which must be
+    listed).
+
+    Residual risk: the binary's content is not verified. A file at a
+    listed path is trusted as the program its name says, so whoever can
+    write that path (an agent sharing the operator UID, for a path in the
+    operator HOME) can replace it. Only agent isolation (a separate UID)
+    closes that; the system directories are root-owned.
+    """
+    names = set(_INTERPRETER_NAMES[kind])
+    if _launcher_stem(command) in _INTERPRETER_STEMS[kind]:
+        names.add(os.path.basename(command))
+    search_path = os.pathsep.join(_SYSTEM_COMMAND_DIRS)
+    candidates = {shutil.which(name, path=search_path) for name in names}
+    if kind == "python":
+        candidates.update({sys.executable,
+                           getattr(sys, "_base_executable", None)})
+    candidates.update(_trusted_mcp_executables())
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            if os.path.samefile(command, candidate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _trusted_mcp_executables() -> set[str]:
     """Resolved paths listed under mcp_trusted_executables (RR-02).
 
@@ -1125,6 +1183,14 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path,
     if not (os.path.isfile(command) and os.access(command, os.X_OK)):
         raise refuse(f"has the command {command!r}, which is not an "
                      f"executable file", "Point it at the server executable.")
+    if kind != "executable" and not _is_real_interpreter(command, kind):
+        raise refuse(
+            f"runs {command!r} as {kind}, but that file is not the {kind} "
+            f"installed in {', '.join(_SYSTEM_COMMAND_DIRS[:3])} (a renamed "
+            f"copy of another program would pass by name)",
+            f"Point it at the system {kind}, or add its absolute path to "
+            f"\"{MCP_TRUSTED_EXECUTABLES_KEY}\" in dispatch_config.json if "
+            f"it is the real {kind} (uv installs uvx in ~/.local/bin).")
     if kind == "python":
         _check_python_launch(args, cwd, refuse, refuse_inside_project)
     elif kind == "node":

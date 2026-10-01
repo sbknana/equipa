@@ -303,6 +303,10 @@ def test_allowlisted_shape_is_accepted(layout, server, monkeypatch):
     filled = _fill(server, layout)
     if not os.path.exists(filled["command"]):
         pytest.fail(f"{filled['command']} must exist on the test host")
-    _trust(monkeypatch, *filled.pop("trust", []),
-           urls=filled.pop("trust_urls", []))
+    trust = filled.pop("trust", [])
+    if os.path.basename(filled["command"]) == "uvx":
+        # The fake uvx is listed as an operator lists ~/.local/bin/uvx:
+        # since task 3144 (RR3138-C) a uvx must be the real one or listed.
+        trust.append(filled["command"])
+    _trust(monkeypatch, *trust, urls=filled.pop("trust_urls", []))
     _check(layout, filled)

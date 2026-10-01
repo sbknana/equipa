@@ -320,6 +320,11 @@ def test_absolute_db_path_builds(tmp_path, monkeypatch):
     db = tmp_path / "theforge.db"
     monkeypatch.setattr(agent_runner, "MCP_CONFIG",
                         _mcp_config(tmp_path, ["--db-path", str(db)]))
+    # The installed fake uvx is listed as an operator lists ~/.local/bin/uvx:
+    # since task 3144 (RR3138-C) a uvx must be the real one or listed.
+    fake_uvx = tmp_path.parent / f"{tmp_path.name}-installed" / "uvx"
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config", {
+        agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: [str(fake_uvx)]})
     with agent_runner.build_cli_command(
             "prompt", str(tmp_path), 5, "opus",
             dispatch_config={"effort": None}) as cmd:
