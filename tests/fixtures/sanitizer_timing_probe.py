@@ -1,9 +1,10 @@
-"""Time one lesson-sanitizer call on one adversarial input (tasks 3129, 3139).
+"""Time one lesson-sanitizer call on one adversarial input (tasks 3129, 3139, 3145).
 
-Run as a child process by tests/test_lesson_sanitizer_3129.py and
-tests/test_sanitizer_3139.py, so that a super-linear regex fails the test at
-the subprocess timeout instead of freezing the whole suite (``re`` holds the
-GIL, so no in-process timeout can interrupt it).
+Run as a child process by tests/test_lesson_sanitizer_3129.py,
+tests/test_sanitizer_3139.py and tests/test_sanitizer_3145.py, so that a
+super-linear regex fails the test at the subprocess timeout instead of
+freezing the whole suite (``re`` holds the GIL, so no in-process timeout can
+interrupt it).
 
 Usage: sanitizer_timing_probe.py REPO_ROOT TARGET CASE SIZE
   TARGET  "sanitize", "boundaries" or "pattern" (the compiled patterns the
@@ -14,6 +15,9 @@ Usage: sanitizer_timing_probe.py REPO_ROOT TARGET CASE SIZE
           "validate": validate_lesson_structure(), the lesson allowlist.
           "db-context", "checkpoint", "compaction-summary", "episode": one
           real call site that injects the text into a prompt.
+          "tester-context", "recovery", "agent-messages": a prompt builder
+          that sanitizes several agent-authored fields, with the text in
+          every one of them (task 3145).
   CASE    a key of ADVERSARIAL_CASES
   SIZE    input length in characters
 
@@ -49,6 +53,13 @@ _WHITESPACE_RUNS: dict[str, Callable[[int], str]] = {
     "tabs": lambda n: "\t" * n,
     "mixed-whitespace": lambda n: " \t\n\r\n" * (n // 5),
     "sentence-end-newlines": lambda n: ". \n" * (n // 3),
+    # Line separators the sanitizer now matches as newlines (review F6 of
+    # task 3139): Unicode Zl / Zp, and the C0/C1 controls str.splitlines()
+    # breaks on.
+    "line-separators": lambda n: " " * n,
+    "paragraph-separators": lambda n: " " * n,
+    "sentence-end-line-separators": lambda n: ". " * (n // 2),
+    "control-line-breaks": lambda n: "\x0b\x0c\x1c\x1d\x1e\x85" * (n // 6),
 }
 
 
@@ -138,6 +149,17 @@ ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
     "if-clauses-repeated": ((), lambda n: "if a " * (n // 5)),
     "joiner-splits": ((), lambda n: "ig-" * (n // 3)),
     "identifier-splits": ((), lambda n: "sudo_mode " * (n // 10)),
+    # The worst call-site inputs review F6 of task 3139 found: every short
+    # identifier is a joiner run and a context check, and words between
+    # line separators.
+    "short-identifiers": ((), lambda n: "a_b " * (n // 4)),
+    "words-between-line-separators": ((), lambda n: "a " * (n // 2)),
+    # Phrases in statement position: each one is found and its look-back
+    # read, and then the scan moves on.
+    "statement-phrases": (
+        ("role override", "command instruction"),
+        lambda n: "ruff ships new rules: CI will execute this script " * (n // 50),
+    ),
     "small-capitals": ((), lambda n: "ɪɢɴᴏʀᴇ " * (n // 7)),
     "format-characters": ((), lambda n: "a؀" * (n // 2)),
     "nfkd-expansion": ((), lambda n: "<" + "ﷺ" * (n - 1)),
@@ -239,6 +261,61 @@ def main(argv: list[str]) -> int:
 
         def call() -> None:
             sanitize_episode_text(text, "reflection")
+    elif target == "tester-context":
+        from equipa.parsing import build_test_failure_context
+
+        # Every Tester-authored field at SIZE: 5 details, 3 recommendations
+        # and the framework name are each sanitized.
+        tester_results = {
+            "tests_run": 9,
+            "tests_failed": 9,
+            "test_framework": text,
+            "failure_details": [text] * 5,
+            "recommendations": [text] * 3,
+        }
+
+        def call() -> None:
+            build_test_failure_context(tester_results, 1)
+    elif target == "recovery":
+        from equipa.checkpoints import build_compaction_recovery_context
+
+        # The last output, every .forge-state.json field and every path list.
+        soft_checkpoint = {
+            "last_result_text": text,
+            "files_changed": [text],
+            "files_read": [text],
+        }
+        forge_state = {
+            "current_step": text,
+            "next_action": text,
+            "decisions": [text],
+            "files_changed": [text],
+        }
+
+        def call() -> None:
+            build_compaction_recovery_context(soft_checkpoint, forge_state)
+    elif target == "agent-messages":
+        import json
+
+        from equipa.messages import format_messages_for_prompt
+
+        messages = [
+            {
+                "from_role": "tester",
+                "message_type": "test_failures",
+                "cycle_number": 1,
+                "content": json.dumps({"failures": [text], "summary": text}),
+            },
+            {
+                "from_role": "developer",
+                "message_type": "note",
+                "cycle_number": 1,
+                "content": text,
+            },
+        ]
+
+        def call() -> None:
+            format_messages_for_prompt(messages)
     else:
         raise SystemExit(f"unknown target {target!r}")
 
