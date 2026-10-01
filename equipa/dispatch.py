@@ -2817,7 +2817,14 @@ async def _stash_uncommitted_in_worktree(
                 if result.returncode != 0 or "No local changes" in result.stdout:
                     problem = f"git stash saved nothing: {_git_output(result)}"
                 else:
-                    commit = await worktree_git.store_stash()
+                    try:
+                        commit = await worktree_git.store_stash()
+                    except AgentWorktreeGitError:
+                        # The stash already cleared the work tree but is not
+                        # in the repository (refs/stash locked, ...): put the
+                        # work back, so a kept worktree still holds it.
+                        await worktree_git.run(["stash", "pop", "--index"], timeout=30)
+                        raise
                     print(
                         f"  [Isolation] Task #{task_id}: stashed uncommitted work "
                         f"on '{branch_name}' as '{stash_msg}' ({commit[:12]})"

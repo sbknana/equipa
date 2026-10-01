@@ -208,6 +208,28 @@ def test_clean_worktree_reads_clean_without_running_an_agent_driver(
     assert dirty is None
 
 
+def test_stash_that_cannot_be_recorded_leaves_the_work_in_place(
+    tmp_path: Path, capsys,
+) -> None:
+    """The private stash clears the work tree; if the repository's
+    ``refs/stash`` cannot take it (a lock held by another stash), the work
+    must go back into the worktree rather than exist only in a stash that
+    is thrown away with the private git dir."""
+    repo, worktree = _task_worktree(tmp_path)
+    _leave_unsaved_work(worktree)
+    (repo / ".git" / "refs" / "stash.lock").write_text("held by another stash\n")
+
+    problem = _run(_with_project_dir(
+        dispatch_mod._stash_uncommitted_in_worktree,
+        str(worktree), TASK_ID, TASK_BRANCH, project_dir=repo,
+    ))
+
+    assert problem and "could not record stash" in problem, problem
+    assert (worktree / "README.md").read_text() == "SEED\n"
+    assert (worktree / "work.py").read_text() == f"{UNSAVED}\n"
+    assert "Could not stash uncommitted work" in capsys.readouterr().out
+
+
 def test_index_copy_keeps_the_index_timestamps(tmp_path: Path) -> None:
     """git re-hashes an entry whose file is not older than the index
     ("racily clean"). A copy stamped now would let a same-size edit made in
