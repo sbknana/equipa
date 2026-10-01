@@ -180,6 +180,10 @@ R3143_02_BODIES = [
     ["Not CRITICAL because: RCE via upload handler in upload.py."],
     ["None is HIGH or CRITICAL, as: RCE in upload.py"],
     ["No HIGH issues = RCE in upload.py"],
+    # "below" (new in 3149) is guarded like every other negation.
+    ["Rated below CRITICAL: RCE via upload handler"],
+    [f"- below HIGH {E} SQL injection in login.py"],
+    ["Just below HIGH SQL injection in login.py lets anyone in."],
     # A negated next word excuses the word before it, never itself.
     ["No CRITICAL and no HIGH: SQL injection in login.py"],
     [f"No CRITICAL and no HIGH {E} RCE in upload.py"],
@@ -214,6 +218,8 @@ R3143_02_MERGES = [
     ["No HIGH issues remain in this diff."],
     ["No HIGH findings were reported by semgrep, and none by bandit."],
     ["Rated LOW rather than HIGH because the endpoint needs an admin token."],
+    # Corpus shape: a comparison ending the sentence (blocked on main).
+    ["Promotion remains operator-gated, which caps this below HIGH."],
     # Corpus shape: each word negated on its own (merged on main).
     ["**No CRITICAL and no HIGH findings.** There is no new network surface."],
     ["No CRITICAL and no HIGH findings."],
