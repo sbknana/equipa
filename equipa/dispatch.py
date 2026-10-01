@@ -2068,6 +2068,7 @@ async def _merge_task_branch(
     worktree_dir: str | None = None,
     merge_record: MergeAttempt | None = None,
     artifact_dir: str | None = None,
+    pinned_default_sha: str | None = None,
 ) -> bool:
     """Merge a single task branch into the main repo's current branch.
 
@@ -2096,7 +2097,10 @@ async def _merge_task_branch(
     ``regenerated_paths`` and the resolution commit as ``post_head``). If the
     task branch changed the generator, or the generator fails or times out,
     the merge is aborted and fails with that reason; any other conflict takes
-    the unchanged abort / rebase path.
+    the unchanged abort / rebase path. Task #3141 (I-01): the resolution is
+    attempted only with ``pinned_default_sha`` — the run guard's expected
+    default-branch SHA — which is the generator's trust anchor; it is
+    refused unless the merge started from that SHA.
 
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
     All failures are logged to stdout — the function NEVER swallows errors
@@ -2369,14 +2373,18 @@ async def _merge_task_branch(
         # completed by regenerating them from the merged tree. Any other
         # conflict (or a project without the generator) is not "applicable"
         # and keeps the abort / rebase-fallback path below unchanged.
-        if shutdown_requested() is None:
+        # Task #3141 (I-01): only against the guard's pinned SHA, never the
+        # re-read pre_head — without one, no generator is trusted.
+        if shutdown_requested() is None and pinned_default_sha:
             resolution = await _resolve_generated_conflict(
                 project_dir, task_id, branch_name, pre_head, target_sha,
+                pinned_default_sha,
             )
             if resolution.resolved:
                 record.merged_sha = target_sha
                 record.post_head = resolution.commit
                 record.regenerated_paths = resolution.paths
+                record.regenerated_blobs = dict(resolution.blobs)
                 return True
             if resolution.applicable:
                 await git_run_async(
@@ -2521,6 +2529,7 @@ async def _resolve_generated_conflict(
     branch_name: str,
     pre_head: str,
     target_sha: str,
+    pinned_sha: str,
 ) -> ConflictResolution:
     """Try the task #3131 generated-file resolution of a conflicted merge.
 
@@ -2528,12 +2537,17 @@ async def _resolve_generated_conflict(
     ``pre_head`` is in progress; see :mod:`equipa.generated_files`. Logs a
     GATE-AUDIT line naming the files whenever the resolution applies. A git
     or OS error while resolving is a refusal, so the caller aborts the merge.
+
+    ``pinned_sha`` is the default-branch SHA the run's guard pinned: every
+    generator blob comparison uses it, and the resolution is refused unless
+    ``pre_head`` (and HEAD mid-merge) equal it (task #3141, I-01).
     """
     try:
         resolution = await resolve_generated_conflicts(
             project_dir,
-            ours=pre_head,
+            ours=pinned_sha,
             theirs=target_sha,
+            head_before_merge=pre_head,
             message=(
                 f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})\n\n"
                 f"Conflict in generated file(s) resolved by regenerating them "
@@ -2578,6 +2592,7 @@ async def _resolve_generated_conflict(
         _gate_audit_log(
             f"task={task_id} event=generated-files-not-regenerated "
             f"files={files} branch={branch_name} sha={target_sha} "
+            f"pinned={pinned_sha} before={pre_head} "
             f"reason={resolution.reason}",
             task_id=task_id,
             event="generated-files-not-regenerated",
@@ -3169,6 +3184,7 @@ async def _gated_merge_task(
                 worktree_dir=git_worktree_dir,
                 merge_record=attempt,
                 artifact_dir=project_dir,
+                pinned_default_sha=guard.expected_sha,
             )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
@@ -3182,6 +3198,7 @@ async def _gated_merge_task(
         if landed_sha is None or not await guard.record_merge(
             task_id, landed_sha, post_head=attempt.post_head,
             regenerated_paths=attempt.regenerated_paths,
+            regenerated_blobs=attempt.regenerated_blobs,
         ):
             return finish(
                 "blocked",

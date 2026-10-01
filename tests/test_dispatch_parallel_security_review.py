@@ -231,6 +231,7 @@ class _FakeMergeGuard:
 
     async def record_merge(
         self, task_id, merged_sha, *, post_head=None, regenerated_paths=(),
+        regenerated_blobs=None,
     ) -> bool:
         return True
 

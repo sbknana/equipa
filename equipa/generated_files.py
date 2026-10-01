@@ -15,18 +15,26 @@ project without the file or its generator — keeps the ordinary path (abort,
 Security: the generator is code from the merged tree, which agents can write.
 
 * It runs only when the task branch left the generator's blob identical to
-  the pinned default branch (and the merged tree carries that same blob).
-  A branch that changed the generator gets ``merge_failed`` with that reason;
+  the default-branch SHA the run's guard pinned (and the merged tree carries
+  that same blob). The pinned SHA is passed in, never re-read from the
+  checkout, and the merge must have started from it (task #3141, I-01). A
+  branch that changed the generator gets ``merge_failed`` with that reason;
   its generator is never run.
 * It never runs in the orchestrator's process nor in the main checkout: it
   runs as ``python -I`` (no script directory, cwd, user site or ``PYTHON*``
-  variable on the import path) inside a private export of the merged tree,
-  with the scrubbed agent environment minus the Claude CLI credential, and a
-  timeout that kills its whole process group.
+  variable on the import path) inside a private export of its inputs in the
+  merged tree, with the scrubbed agent environment minus the Claude CLI
+  credential, and a timeout that kills its whole process group. The export is
+  written from git objects (``ls-tree`` + ``cat-file``), so no attribute
+  (``export-ignore``, ``export-subst``) can drop or rewrite an input, and no
+  archive is unpacked (task #3141, I-02/I-04). Output is read in chunks and
+  the generator is killed once it exceeds the size cap.
 * The resolution is committed only when its tree differs from
   ``git merge-tree``'s merge of the same two commits in the regenerated,
-  conflicted paths alone; :meth:`DefaultBranchGuard.record_merge` re-checks
-  that on the landed commit (the task #3116 merge-integrity check).
+  conflicted paths alone, each holding exactly the blob of the verified
+  generator output; a commit that is not that tree is refused (task #3141,
+  I-03). :meth:`DefaultBranchGuard.record_merge` re-checks paths and blobs on
+  the landed commit (the task #3116 merge-integrity check).
 
 Agents share the orchestrator's UID, so this is not a sandbox; it keeps the
 orchestrator from running branch-authored code and keeps the merge exact.
@@ -43,14 +51,15 @@ import shutil
 import signal
 import stat
 import sys
-import tarfile
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from equipa.env_loader import build_agent_env
 from equipa.git_ops import git_run_async
 from equipa.merge_integrity import (
+    commit_parents,
     merged_tree,
     regenerated_resolution_problem,
     resolve_commit,
@@ -70,11 +79,15 @@ class GeneratedFile:
     ``path`` and ``generator`` are POSIX paths relative to the work-tree root.
     ``args`` follow the script; the generator must print the file's full new
     content to stdout (it is never allowed to write the file itself).
+    ``inputs`` are the work-tree paths (files or directories) the generator
+    reads; only they and the generator are exported for it to run in. Empty
+    means the whole tree.
     """
 
     path: str
     generator: str
     args: tuple[str, ...] = ()
+    inputs: tuple[str, ...] = ()
 
     def argv(self, root: Path) -> list[str]:
         """The generator command line for an export rooted at ``root``."""
@@ -83,6 +96,14 @@ class GeneratedFile:
             *(arg.replace(ROOT_PLACEHOLDER, str(root)) for arg in self.args),
         ]
 
+    def exports(self, path: str) -> bool:
+        """True when the work-tree ``path`` belongs in this generator's export."""
+        if path == self.generator or not self.inputs:
+            return True
+        return any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in self.inputs
+        )
+
 
 # The one place generated files are declared.
 GENERATED_FILES: tuple[GeneratedFile, ...] = (
@@ -90,13 +111,20 @@ GENERATED_FILES: tuple[GeneratedFile, ...] = (
         path="equipa/MODULE_DEPENDENCY_REPORT.md",
         generator="scripts/gen_module_report.py",
         args=("--repo-root", ROOT_PLACEHOLDER, "--stdout"),
+        inputs=("equipa",),
     ),
 )
 
 GENERATOR_TIMEOUT_SECONDS = 120
 MAX_GENERATED_BYTES = 8 * 1024 * 1024
+MAX_GENERATOR_STDERR_BYTES = 1024 * 1024
+# The generator's inputs written to the private export, summed blob sizes.
+MAX_EXPORT_BYTES = 64 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 _EXPORT_TIMEOUT_SECONDS = 120
 _GIT_TIMEOUT = 30
+# Tree entries the export writes; links and submodules are refused.
+_EXPORTABLE_MODES = frozenset({"100644", "100755"})
 # The agent env keeps the Claude CLI's credential; a generator needs neither.
 _GENERATOR_ENV_EXCLUDED = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"})
 
@@ -117,17 +145,38 @@ class ConflictResolution:
     generated files whose generator exists on the default branch — the
     caller then keeps its ordinary conflict handling. When it is True and
     ``commit`` is None, the resolution was refused for ``reason`` and the
-    caller must abort the merge.
+    caller must abort the merge. ``blobs`` maps each regenerated path to the
+    blob SHA of the verified generator output the commit carries.
     """
 
     applicable: bool
     paths: tuple[str, ...] = ()
     commit: str | None = None
     reason: str = ""
+    blobs: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def resolved(self) -> bool:
         return self.commit is not None
+
+
+@dataclass(frozen=True)
+class _ExportEntry:
+    """One blob of the merged tree written to the generator's export."""
+
+    path: str
+    mode: str
+    blob: str
+    size: int
+
+
+class _OutputTooLarge(Exception):
+    """A generator stream passed its byte cap; the generator is killed."""
+
+    def __init__(self, stream: str, limit: int) -> None:
+        super().__init__(f"{stream} exceeds {limit} bytes")
+        self.stream = stream
+        self.limit = limit
 
 
 async def unmerged_entries(repo: str | os.PathLike) -> dict[str, set[tuple[int, str]]] | None:
@@ -211,11 +260,137 @@ def _content_conflict_problem(path: str, entries: set[tuple[int, str]]) -> str |
     return None
 
 
-def _extract_export(archive: Path, root: Path) -> None:
-    """Unpack the merged-tree tarball; the ``data`` filter refuses links out."""
-    root.mkdir()
-    with tarfile.open(archive) as tar:
-        tar.extractall(root, filter="data")
+def _unsafe_export_path(path: str) -> bool:
+    """True when ``path`` could leave the export or confuse ``--stdin-paths``."""
+    return (
+        not path
+        or path.startswith("/")
+        or "\n" in path
+        or any(part in ("", ".", "..") for part in path.split("/"))
+    )
+
+
+async def _export_entries(
+    repo: str, tree: str, specs: list[GeneratedFile],
+) -> list[_ExportEntry] | str:
+    """The blobs of ``tree`` the generators read, or why they cannot be exported.
+
+    Read from the object store, so neither ``.gitattributes`` in the tree
+    nor ``$GIT_DIR/info/attributes`` can hide or rewrite an input (I-02).
+    """
+    listed = await git_run_async(
+        ["ls-tree", "-r", "-z", "-l", "--full-tree", tree],
+        repo, timeout=_EXPORT_TIMEOUT_SECONDS, text=False,
+    )
+    if listed.returncode != 0:
+        detail = listed.stderr.decode("utf-8", "replace").strip()[:200]
+        return f"git ls-tree of the merged tree failed: {detail}"
+    entries: list[_ExportEntry] = []
+    total = 0
+    for record in listed.stdout.split(b"\0"):
+        if not record:
+            continue
+        meta, separator, raw_path = record.partition(b"\t")
+        fields = meta.decode("ascii", "replace").split()
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"the merged tree has a path that is not UTF-8: {raw_path[:80]!r}"
+        if not separator or len(fields) != 4:
+            return f"unreadable ls-tree entry for {path[:80]!r}"
+        if not any(spec.exports(path) for spec in specs):
+            continue
+        mode, kind, blob, size = fields
+        if kind != "blob" or mode not in _EXPORTABLE_MODES or not size.isdigit():
+            return (
+                f"the merged tree's {path} is not a regular file (mode {mode}); "
+                f"the generator's inputs are not exported"
+            )
+        if _unsafe_export_path(path):
+            return f"the merged tree's path {path[:80]!r} cannot be exported safely"
+        total += int(size)
+        if total > MAX_EXPORT_BYTES:
+            return (
+                f"the generator's inputs in the merged tree exceed "
+                f"{MAX_EXPORT_BYTES} bytes"
+            )
+        entries.append(_ExportEntry(path, mode, blob, int(size)))
+    return entries
+
+
+def _write_export(root: Path, entries: list[_ExportEntry], batch: bytes) -> str | None:
+    """Write each entry's content from ``git cat-file --batch`` output under ``root``.
+
+    ``root`` is a fresh private directory, every file is created exclusively
+    and never through a link. Returns a problem, or None.
+    """
+    offset = 0
+    for entry in entries:
+        header_end = batch.find(b"\n", offset)
+        header = batch[offset:header_end].decode("ascii", "replace").split()
+        start = header_end + 1
+        end = start + entry.size
+        if (
+            header_end < 0
+            or header != [entry.blob, "blob", str(entry.size)]
+            or batch[end:end + 1] != b"\n"
+        ):
+            return f"git cat-file did not return the blob of {entry.path}"
+        target = root.joinpath(*entry.path.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o755 if entry.mode == "100755" else 0o644,
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(batch[start:end])
+        offset = end + 1
+    if offset != len(batch):
+        return "git cat-file returned more objects than requested"
+    return None
+
+
+async def _export_from_objects(
+    repo: str, tree: str, specs: list[GeneratedFile], root: Path,
+) -> str | None:
+    """Write the generators' inputs in ``tree`` to ``root``; a problem, or None.
+
+    After writing, every exported file is hashed with ``--no-filters`` and
+    must be exactly the blob ``ls-tree`` listed for it.
+    """
+    entries = await _export_entries(repo, tree, specs)
+    if isinstance(entries, str):
+        return entries
+    request = "".join(f"{entry.blob}\n" for entry in entries).encode("ascii")
+    batch = await git_run_async(
+        ["cat-file", "--batch"], repo, timeout=_EXPORT_TIMEOUT_SECONDS,
+        input=request, text=False,
+    )
+    if batch.returncode != 0:
+        detail = batch.stderr.decode("utf-8", "replace").strip()[:200]
+        return f"git cat-file of the merged tree failed: {detail}"
+    root.mkdir(mode=0o700)
+    try:
+        problem = await asyncio.to_thread(_write_export, root, entries, batch.stdout)
+    except OSError as exc:
+        return f"merged tree could not be exported: {exc}"
+    if problem:
+        return problem
+    if not entries:
+        return None
+    paths = "".join(
+        f"{root.joinpath(*entry.path.split('/'))}\n" for entry in entries
+    )
+    hashed = await git_run_async(
+        ["hash-object", "--no-filters", "--stdin-paths"], repo,
+        timeout=_EXPORT_TIMEOUT_SECONDS, input=os.fsencode(paths),
+    )
+    if hashed.returncode != 0 or hashed.stdout.split() != [
+        entry.blob for entry in entries
+    ]:
+        return "the export does not match the merged tree's blobs"
+    return None
 
 
 async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -240,6 +415,38 @@ def generator_env() -> dict[str, str]:
     }
 
 
+async def _read_capped(stream: asyncio.StreamReader, limit: int, name: str) -> bytes:
+    """Read ``stream`` to EOF; raise :class:`_OutputTooLarge` past ``limit``."""
+    buffer = bytearray()
+    while True:
+        chunk = await stream.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            return bytes(buffer)
+        if len(buffer) + len(chunk) > limit:
+            raise _OutputTooLarge(name, limit)
+        buffer += chunk
+
+
+async def _collect_output(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """The generator's stdout and stderr, each capped while it streams (I-04)."""
+    readers = [
+        asyncio.ensure_future(
+            _read_capped(proc.stdout, MAX_GENERATED_BYTES, "output"),
+        ),
+        asyncio.ensure_future(
+            _read_capped(proc.stderr, MAX_GENERATOR_STDERR_BYTES, "stderr"),
+        ),
+    ]
+    try:
+        stdout, stderr = await asyncio.gather(*readers)
+    finally:
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+    await proc.wait()
+    return stdout, stderr
+
+
 async def run_generator(
     spec: GeneratedFile, root: Path, *, timeout: float | None = None,
 ) -> bytes | str:
@@ -258,17 +465,18 @@ async def run_generator(
     except OSError as exc:
         return f"generator {spec.generator} could not start: {exc}"
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=limit)
+        stdout, stderr = await asyncio.wait_for(_collect_output(proc), timeout=limit)
     except asyncio.TimeoutError:
         await _kill_process_group(proc)
         return f"generator {spec.generator} timed out after {limit}s"
+    except _OutputTooLarge as exc:
+        await _kill_process_group(proc)
+        return f"generator {spec.generator} {exc}"
     if proc.returncode != 0:
         detail = " ".join(stderr.decode("utf-8", "replace").split())[-300:]
         return f"generator {spec.generator} exited {proc.returncode}: {detail}"
     if not stdout:
         return f"generator {spec.generator} produced no output"
-    if len(stdout) > MAX_GENERATED_BYTES:
-        return f"generator {spec.generator} output exceeds {MAX_GENERATED_BYTES} bytes"
     return stdout
 
 
@@ -278,22 +486,13 @@ async def _regenerate(
     """Run each generator on a private export of ``tree``: {path: content}."""
     workdir = Path(tempfile.mkdtemp(prefix="equipa-regen-"))
     try:
-        archive = workdir / "merged.tar"
         root = workdir / "tree"
-        exported = await git_run_async(
-            ["archive", "--format=tar", f"--output={archive}", tree],
-            repo, timeout=_EXPORT_TIMEOUT_SECONDS,
-        )
-        if exported.returncode != 0:
-            return f"git archive of the merged tree failed: {exported.stderr.strip()[:200]}"
-        try:
-            await asyncio.to_thread(_extract_export, archive, root)
-        except (tarfile.TarError, OSError) as exc:
-            return f"merged tree could not be exported: {exc}"
+        problem = await _export_from_objects(repo, tree, specs, root)
+        if problem:
+            return problem
         outputs: dict[str, bytes] = {}
         for spec in specs:
-            # The bytes that run must be the default branch's blob, whatever
-            # attributes in the merged tree did to the export.
+            # The bytes that run must be the pinned default branch's blob.
             hashed = await git_run_async(
                 ["hash-object", "--no-filters", "--", str(root / spec.generator)],
                 repo, timeout=_GIT_TIMEOUT,
@@ -307,6 +506,21 @@ async def _regenerate(
         return outputs
     finally:
         await asyncio.to_thread(shutil.rmtree, workdir, True)
+
+
+async def _output_blobs(repo: str, outputs: dict[str, bytes]) -> dict[str, str] | str:
+    """Blob SHA of each regenerated file's exact bytes: {path: blob}."""
+    blobs: dict[str, str] = {}
+    for path, content in outputs.items():
+        hashed = await git_run_async(
+            ["hash-object", "--no-filters", "--stdin"], repo,
+            timeout=_GIT_TIMEOUT, input=content,
+        )
+        blob = hashed.stdout.strip()
+        if hashed.returncode != 0 or not blob:
+            return f"git hash-object of the regenerated {path} failed"
+        blobs[path] = blob
+    return blobs
 
 
 def _write_checkout_file(repo: str, rel_path: str, content: bytes) -> None:
@@ -324,17 +538,27 @@ def _write_checkout_file(repo: str, rel_path: str, content: bytes) -> None:
 
 
 async def resolve_generated_conflicts(
-    repo: str | os.PathLike, *, ours: str, theirs: str, message: str,
+    repo: str | os.PathLike,
+    *,
+    ours: str,
+    theirs: str,
+    head_before_merge: str,
+    message: str,
 ) -> ConflictResolution:
     """Complete the in-progress conflicted merge of ``theirs`` into ``ours``.
 
     ``repo`` is the main checkout at the work-tree root, mid-merge: ``ours``
-    is the default-branch SHA pinned before the merge, ``theirs`` the
-    approved commit being merged. Applies only when every unmerged path is a
+    is the default-branch SHA the run's guard pinned, ``theirs`` the approved
+    commit being merged and ``head_before_merge`` the checkout's HEAD read
+    just before ``git merge``. Applies only when every unmerged path is a
     declared generated file whose generator exists at ``ours``; then either
     commits the resolution (``commit`` set) or refuses with a ``reason`` and
     leaves the aborting to the caller. Never raises for git or generator
     failures.
+
+    Task #3141 (I-01): the generator is trusted only as the blob at the
+    pinned ``ours``. A merge that did not start from ``ours``, or a HEAD that
+    moved away from it, is refused before anything runs.
     """
     repo = os.fspath(repo)
     conflicts = await unmerged_entries(repo)
@@ -360,6 +584,19 @@ async def resolve_generated_conflicts(
     def refuse(reason: str) -> ConflictResolution:
         return ConflictResolution(True, paths, None, reason)
 
+    if head_before_merge != ours:
+        return refuse(
+            f"the merge started from {head_before_merge[:12] or 'unknown'}, not "
+            f"the pinned default-branch SHA {ours[:12]}: the default branch "
+            f"moved, so no generator is run"
+        )
+    head_now = await resolve_commit(repo, "HEAD")
+    if head_now != ours:
+        return refuse(
+            f"HEAD is {(head_now or 'unresolved')[:12]}, not the pinned "
+            f"default-branch SHA {ours[:12]}: the default branch moved, so no "
+            f"generator is run"
+        )
     for path in paths:
         problem = _content_conflict_problem(path, conflicts[path])
         if problem:
@@ -382,6 +619,9 @@ async def resolve_generated_conflicts(
     outputs = await _regenerate(repo, merged.tree, specs, generator_blobs)
     if isinstance(outputs, str):
         return refuse(outputs)
+    blobs = await _output_blobs(repo, outputs)
+    if isinstance(blobs, str):
+        return refuse(blobs)
     try:
         for path in paths:
             _write_checkout_file(repo, path, outputs[path])
@@ -399,7 +639,7 @@ async def resolve_generated_conflicts(
     if written.returncode != 0 or not staged_tree:
         return refuse(f"git write-tree failed: {written.stderr.strip()[:200]}")
     problem = await regenerated_resolution_problem(
-        repo, merged, staged_tree, frozenset(paths),
+        repo, merged, staged_tree, frozenset(paths), blobs,
     )
     if problem:
         return refuse(problem)
@@ -411,11 +651,17 @@ async def resolve_generated_conflicts(
     head = await resolve_commit(repo, "HEAD")
     if head is None or head == ours:
         return refuse("git commit did not advance the default branch")
-    if await resolve_tree(repo, head) != staged_tree:
-        # The commit landed but is not the verified tree: report it; the
-        # run's DefaultBranchGuard refuses to record it and raises the alarm.
-        logger.error(
-            "[Generated-Files] resolution commit %s is not the verified tree %s",
-            head[:12], staged_tree[:12],
+    # I-03: a commit that is not exactly the verified resolution is refused,
+    # never reported as merged. It has already landed, so the caller's
+    # DefaultBranchGuard.verify after the failed merge raises the alarm.
+    if await commit_parents(repo, head) != [ours, theirs]:
+        return refuse(
+            f"resolution commit {head[:12]} is not a merge of the pinned "
+            f"default branch {ours[:12]} and the approved commit {theirs[:12]}"
         )
-    return ConflictResolution(True, paths, head, "regenerated")
+    if await resolve_tree(repo, head) != staged_tree:
+        return refuse(
+            f"resolution commit {head[:12]} is not the verified tree "
+            f"{staged_tree[:12]}"
+        )
+    return ConflictResolution(True, paths, head, "regenerated", blobs)
