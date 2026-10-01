@@ -23,11 +23,14 @@ from pathlib import Path
 import pytest
 
 from equipa.loops import (
+    BACKSTOP_REASON,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    _analyze_review_views,
     _count_findings_in_review_file,
 )
+from equipa.security_gate import normalize_review_text
 
 BODY = (
     "# Security Review\n\n## Summary\nReviewed the diff for the payments "
@@ -70,6 +73,26 @@ def _blocks_merge(path: Path) -> bool:
     return counts["CRITICAL"] + counts["HIGH"] > 0
 
 
+def _rules_counts(path: Path) -> dict[str, int] | None:
+    """The merge counts of the shape rules alone (no severity-token
+    backstop), or None when the rules do not trust the review."""
+    analysis = _analyze_review_views(
+        normalize_review_text(path.read_text(encoding="utf-8")))
+    return analysis.counts if analysis.trusted else None
+
+
+def _assert_backstop_blocks(path: Path) -> None:
+    """Task 3152: an UPPER-case CRITICAL or HIGH outside a counted heading's
+    label and the final strict footer (a prose finding, a second footer, a
+    recap bullet) blocks, whatever the counts. Each review below blocked the
+    merge before as well, by its CRITICAL or HIGH count."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert _count_findings_in_review_file(path) is None
+    assert _blocks_merge(path)
+
+
 # ---------- IR38-02: per-severity maximum across all footers ----------
 
 
@@ -85,7 +108,8 @@ def test_later_quoted_zero_footer_cannot_mask_earlier_real_footer(
     )
 
     assert _blocks_merge(path)
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_footer_maximum_is_per_severity(tmp_path: Path) -> None:
@@ -95,9 +119,8 @@ def test_footer_maximum_is_per_severity(tmp_path: Path) -> None:
         + "\nOlder tally:\n" + _footer(high=1, low=1),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(
-        critical=1, high=1, low=2,
-    )
+    assert _rules_counts(path) == _counts(critical=1, high=1, low=2)
+    _assert_backstop_blocks(path)
 
 
 def test_zero_then_real_footer_still_uses_the_real_one(tmp_path: Path) -> None:
@@ -108,7 +131,8 @@ def test_zero_then_real_footer_still_uses_the_real_one(tmp_path: Path) -> None:
         + "\nS1: HIGH SQL injection.\n" + _footer(high=1),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_larger_quoted_footer_disagreeing_with_headers_is_untrusted(
@@ -176,11 +200,11 @@ def test_resolved_candidate_adds_to_merge_counts(
     # omitted from the footer, but it is counted, never subtracted.
     path = _write(tmp_path, BODY + finding_line + "\n" + DETAIL + footer)
 
-    counts = _count_findings_in_review_file(path)
+    counts = _rules_counts(path)
 
     assert counts is not None
     assert counts["CRITICAL"] + counts["HIGH"] == 1
-    assert _blocks_merge(path)
+    _assert_backstop_blocks(path)
 
 
 def test_resolved_medium_candidate_is_counted_not_dropped(
@@ -216,6 +240,14 @@ def test_zero_tally_or_low_risk_heading_is_not_a_finding(
         + "\nFine.\n\n## Files\n- a.py\n- b.py\n" + _footer(),
     )
 
+    assert _rules_counts(path) == _counts()
+    if "CRITICAL" in heading or "HIGH" in heading:
+        # Task 3152: the UPPER-case zero tally merged under the 3143 tally
+        # exemption; CRITICAL and HIGH have none now. In lower case it
+        # merges.
+        _assert_backstop_blocks(path)
+        path = _write(tmp_path, path.read_text(encoding="utf-8").replace(
+            "0 CRITICAL / 0 HIGH", "0 critical / 0 high"))
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
     assert _count_findings_in_review_file(path) == _counts()
 
