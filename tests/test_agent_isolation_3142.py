@@ -253,6 +253,35 @@ def test_trie_walk_is_linear_in_the_directory_depth() -> None:
     assert calls == [f"{deep}/l", f"{deep}/l"]
 
 
+def test_import_check_walks_every_link_through_the_trie(
+        repo: dict[str, Path], tmp_path: Path, monkeypatch) -> None:
+    """check_imported_links must hand _link_escapes the tree's links as a
+    trie and the shared budget: without them the walk falls back to joining
+    the directory path for every component, which is quadratic again."""
+    state = _commit_with_links(repo["worktree"], tmp_path,
+                               {"docs/a": b"index.md", "docs/b": b"a",
+                                "top": b"docs/b"})
+    real = isolation._link_escapes
+    seen: list[tuple[str, object, object]] = []
+
+    def spy(path, target, link_target=None, *, links=None, budget=None):
+        seen.append((path, links, budget))
+        return real(path, target, link_target, links=links, budget=budget)
+
+    monkeypatch.setattr(isolation, "_link_escapes", spy)
+    _check(repo["worktree"], state)
+    assert sorted(path for path, _links, _budget in seen) == \
+        ["docs/a", "docs/b", "top"]
+    tries = {id(links) for _path, links, _budget in seen}
+    budgets = {id(budget) for _path, _links, budget in seen}
+    assert len(tries) == 1 and len(budgets) == 1, "one trie, one budget"
+    trie = seen[0][1]
+    assert isinstance(trie, isolation._LinkTrie)
+    assert trie.children["docs"].children["b"].link == "docs/b"
+    assert trie.children["top"].link == "top"
+    assert isinstance(seen[0][2], isolation._WalkBudget)
+
+
 def test_trie_walk_agrees_with_the_path_walk() -> None:
     links = {"sub/a": "..", "x": "y", "y": "x", "docs/up": "..",
              "abs": "/usr/bin/python3", "deep/er/l": "../../docs"}
