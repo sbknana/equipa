@@ -8,7 +8,7 @@
 # environment the orchestrator runs with (THEFORGE_DB, the OAuth token):
 #
 #     scripts/verify_agent_isolation.sh [--repo /path/to/project ...] \
-#         [--loopback-port PORT ...]
+#         [--loopback-port PORT ...] [--lan-target ADDRESS:PORT ...]
 #
 # It starts THIS script as an isolated agent through the real launch path
 # (systemd-run --user --scope + the sudoers rule + agent_launcher --isolated)
@@ -28,12 +28,20 @@
 #   * sees a TheForge view without the excluded tables (api_keys);
 #   * has no credential in its environment except CLAUDE_CODE_OAUTH_TOKEN;
 #   * cannot use crontab or at, and does not linger (nothing outlives it);
-#   * cannot connect to 127.0.0.1 on any --loopback-port or any port that
-#     listens on loopback (the launcher also refuses while its own loopback
-#     and LAN listeners are reachable).
+#   * cannot connect to its own listener on any address of this host
+#     (loopback, LAN, tailnet, public: the nftables rule's
+#     "fib daddr type local reject"), to any --loopback-port or port that
+#     listens on loopback at 127.0.0.1 or at any host address, or to any
+#     --lan-target (the launcher also refuses while its own loopback and
+#     LAN listeners are reachable);
+#   * has a TMPDIR of its own on a filesystem other than /, and cannot
+#     write a shared /tmp or /var/tmp that lies on / (it could fill /).
 # As the orchestrator it also checks that the narrow sudoers rule is
-# installed, by its content (an ALL rule does not count).
-# Every check prints PASS or FAIL; the last line is RESULT: PASS|FAIL.
+# installed, by its content (an ALL rule does not count), that the agent
+# user's nftables table (inet equipa_agent) is loaded, and that every
+# --lan-target answers the orchestrator (else its probe proves nothing).
+# Every check prints PASS or FAIL (a NOTE names what was not probed); the
+# last line is RESULT: PASS|FAIL.
 # Exit status: 0 all checks passed, 1 a check failed, 2 isolation could not
 # be established at all.
 #
@@ -42,15 +50,230 @@
 
 set -u
 
+# pass/fail count into the caller's "failures" (inside() keeps its own).
+failures=0
+pass() { echo "PASS $*"; }
+fail() { echo "FAIL $*"; failures=$((failures + 1)); }
+
+# The agent's groups ("$@", as id -nG prints them) must include none that
+# is root-equivalent or exposes other users' data (review F7; dispatch and
+# the launcher check the same list).
+check_privileged_groups() {
+    local group member privileged=0
+    for group in root sudo admin wheel adm docker lxd incus libvirt kvm disk shadow systemd-journal; do
+        for member in "$@"; do
+            if [ "$member" = "$group" ]; then
+                fail "agent user is in the privileged group $group"
+                privileged=$((privileged + 1))
+            fi
+        done
+    done
+    if [ "$privileged" -eq 0 ]; then
+        pass "agent user is in no privileged group (groups: $*)"
+    fi
+}
+
+# Each shared temporary directory in "$@" the agent can write must lie on a
+# filesystem other than the root filesystem $1: /tmp and /var/tmp are
+# world-writable, so a TMPDIR of its own does not stop an agent writing
+# /var/tmp/x until / is full (review R3142-04, F8).
+check_shared_tmp() {
+    local root="$1" directory root_device
+    shift
+    root_device="$(stat -c %d -- "$root" 2>/dev/null)"
+    for directory in "$@"; do
+        [ -d "$directory" ] || continue
+        if [ ! -w "$directory" ]; then
+            pass "agent cannot write $directory"
+        elif [ -z "$root_device" ] \
+                || [ "$(stat -c %d -- "$directory" 2>/dev/null)" = "$root_device" ]; then
+            fail "agent can write $directory on the root filesystem $root (it can fill it; make $directory a size-capped filesystem or close it to the agent user, docs/AGENT_ISOLATION.md step 1)"
+        else
+            pass "$directory is on a filesystem other than $root"
+        fi
+    done
+}
+
+# The unit's TMPDIR is its own (in the unit's state directory, mode 0700)
+# and lies on a filesystem other than the root filesystem $1, the
+# size-capped agent state root of runbook step 1 (F8).
+check_unit_tmpdir() {
+    local root="$1" directory="${TMPDIR:-}"
+    case "$directory" in
+        */.equipa-agent/equipa-agent-*/tmp) ;;
+        *) fail "agent TMPDIR '$directory' is not the unit's own"; return 0 ;;
+    esac
+    if [ ! -d "$directory" ] || [ ! -O "$directory" ] \
+            || [ "$(stat -c %a -- "$directory" 2>/dev/null)" != "700" ]; then
+        fail "agent TMPDIR $directory is not a 0700 directory of the agent user"
+    elif [ "$(stat -c %d -- "$directory" 2>/dev/null)" = "$(stat -c %d -- "$root" 2>/dev/null)" ]; then
+        fail "agent TMPDIR $directory is on the root filesystem $root; put the agent state root on a size-capped filesystem of its own (docs/AGENT_ISOLATION.md step 1)"
+    else
+        pass "agent TMPDIR is the unit's own, on a filesystem other than $root"
+    fi
+}
+
+# Tries every target side by side and prints "REACHED <address> <port>"
+# for each connection that was established, "ERROR <address> <port>
+# <reason>" for each that could not be tried. Arguments: the timeout in
+# seconds, then address/port pairs; port 0 means a listener of the
+# probe's own, bound on that address. A batch shares one deadline (a
+# dropped SYN never answers); batches keep the open sockets bounded.
+TCP_PROBE_PY='
+import errno, select, socket, sys, time
+timeout = float(sys.argv[1])
+pairs = sys.argv[2:]
+targets = [(pairs[index], int(pairs[index + 1]))
+           for index in range(0, len(pairs) - 1, 2)]
+waiting = (errno.EINPROGRESS, errno.EALREADY, errno.EAGAIN)
+
+def probe(batch):
+    opened, clients, pending = [], {}, []
+    try:
+        for address, port in batch:
+            family = socket.AF_INET6 if ":" in address else socket.AF_INET
+            try:
+                client = socket.socket(family, socket.SOCK_STREAM)
+                opened.append(client)
+                destination = (address, port)
+                if port == 0:
+                    listener = socket.socket(family, socket.SOCK_STREAM)
+                    opened.append(listener)
+                    listener.bind((address, 0))
+                    listener.listen(1)
+                    destination = listener.getsockname()[:2]
+                client.setblocking(False)
+                code = client.connect_ex(destination)
+            except OSError as exc:
+                print("ERROR", address, port, exc.strerror or exc)
+                continue
+            clients[client] = (address, port)
+            if code == 0:
+                print("REACHED", address, port)
+            elif code in waiting:
+                pending.append(client)
+        deadline = time.monotonic() + timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for client in select.select([], pending, [], remaining)[1]:
+                pending.remove(client)
+                if client.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    print("REACHED", *clients[client])
+    finally:
+        for sock in opened:
+            sock.close()
+
+for start in range(0, len(targets), 200):
+    probe(targets[start:start + 200])
+'
+tcp_probe() {
+    python3 -I -c "$TCP_PROBE_PY" "$@"
+}
+
+# The network checks (review F2, N1, R3142-01/02): its own listener on each
+# host address in $1 (space-separated), every port in $2 at 127.0.0.1 and
+# at each host address (a service bound to every address answers on all of
+# them), and each LAN target (ADDRESS:PORT or [IPV6]:PORT) in $3. The
+# nftables rule of runbook step 4a rejects every local address and the
+# denied ranges for the agent user, so nothing may be reached.
+check_network() {
+    local host_addresses="$1" ports="$2" lan_targets="$3"
+    local address port target host output status kind rest count
+    local -a addresses=() targets=() errors=()
+    local -A reached=()
+    for address in 127.0.0.1 $host_addresses; do
+        case " ${addresses[*]} " in *" $address "*) ;; *) addresses+=("$address") ;; esac
+    done
+    for address in $host_addresses; do targets+=("$address" 0); done
+    for port in $ports; do
+        for address in "${addresses[@]}"; do targets+=("$address" "$port"); done
+    done
+    for target in $lan_targets; do
+        port="${target##*:}"
+        host="${target%:*}"
+        host="${host#[}"
+        targets+=("${host%]}" "$port")
+    done
+    if [ "${#targets[@]}" -gt 0 ]; then
+        output="$(tcp_probe 3 "${targets[@]}")"
+        status=$?
+        if [ "$status" -ne 0 ]; then
+            fail "the network probe could not run (python3 exited $status)"
+        fi
+        while read -r kind address port rest; do
+            case "$kind" in
+                REACHED) reached["$address $port"]=1 ;;
+                ERROR) errors+=("$address port $port: $rest") ;;
+            esac
+        done <<< "$output"
+    fi
+    for target in "${errors[@]}"; do
+        fail "could not probe $target"
+    done
+
+    if [ -z "$host_addresses" ]; then
+        fail "no host address to probe (the orchestrator lists every address of this host)"
+    else
+        rest=""
+        for address in $host_addresses; do
+            if [ -n "${reached["$address 0"]:-}" ]; then rest="$rest $address"; fi
+        done
+        if [ -n "$rest" ]; then
+            fail "agent can connect to its own listener on the host address(es)$rest (the nftables rule must reject every local address for the agent user: fib daddr type local reject)"
+        else
+            pass "agent cannot connect to its own listener on any of $(count_words $host_addresses) host address(es):" $host_addresses
+        fi
+    fi
+
+    if [ -z "$ports" ]; then
+        pass "no local service port to probe (none listed with --loopback-port, none listening on loopback)"
+    else
+        for address in "${addresses[@]}"; do
+            rest=""
+            for port in $ports; do
+                if [ -n "${reached["$address $port"]:-}" ]; then rest="$rest $port"; fi
+            done
+            if [ -n "$rest" ]; then
+                fail "agent can connect to $address on port(s)$rest (not blocked for the agent user)"
+            else
+                pass "agent cannot connect to $address on any of $(count_words $ports) local service port(s)"
+            fi
+        done
+    fi
+
+    if [ -z "$lan_targets" ]; then
+        echo "NOTE no --lan-target listed: the LAN ranges were not probed (list a LAN service, for example a NAS or router port)"
+    else
+        rest=""
+        for target in $lan_targets; do
+            port="${target##*:}"
+            host="${target%:*}"
+            host="${host#[}"
+            if [ -n "${reached["${host%]} $port"]:-}" ]; then rest="$rest $target"; fi
+        done
+        if [ -n "$rest" ]; then
+            fail "agent can connect to the LAN target(s)$rest (not blocked for the agent user)"
+        else
+            pass "agent cannot connect to any of $(count_words $lan_targets) LAN target(s)"
+        fi
+    fi
+}
+
+count_words() { echo "$#"; }
+
 inside() {
     local orchestrator_pid="" orchestrator_home="" database="" runtime=""
     local launcher="" pids_expected="" view_db="" mcp_config=""
     local -a git_dirs=() excluded_tables=() deny_dirs=() db_copies=()
-    local -a secret_roots=() deny_ports=()
+    local -a secret_roots=() deny_ports=() host_addresses=() lan_targets=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --deny-dir) deny_dirs+=("$2"); shift 2 ;;
             --deny-port) deny_ports+=("$2"); shift 2 ;;
+            --host-address) host_addresses+=("$2"); shift 2 ;;
+            --lan-target) lan_targets+=("$2"); shift 2 ;;
             --db-copy) db_copies+=("$2"); shift 2 ;;
             --secret-root) secret_roots+=("$2"); shift 2 ;;
             --orchestrator-pid) orchestrator_pid="$2"; shift 2 ;;
@@ -67,8 +290,6 @@ inside() {
         esac
     done
     local failures=0
-    pass() { echo "PASS $*"; }
-    fail() { echo "FAIL $*"; failures=$((failures + 1)); }
 
     # --- identity: not root, no sudo, no privileged group -------------------
     local uid user
@@ -81,12 +302,9 @@ inside() {
     else
         pass "agent user cannot sudo (sudo -n true refused)"
     fi
-    local group
-    for group in root sudo admin wheel adm docker lxd incus libvirt kvm disk shadow systemd-journal; do
-        if id -nG | tr ' ' '\n' | grep -qx -- "$group"; then
-            fail "agent user is in the privileged group $group"
-        fi
-    done
+    # id -nG prints the names separated by spaces; none contains one.
+    # shellcheck disable=SC2046
+    check_privileged_groups $(id -nG)
 
     # --- secrets: TheForge DB and the orchestrator's HOME ------------------
     local path
@@ -231,25 +449,16 @@ inside() {
         pass "lingering is off for $user"
     fi
 
-    # --- network: no local service is reachable (review F2) -----------------
-    # The launcher already refused unless its own loopback listener was
-    # unreachable; this tries the real services: every --loopback-port the
-    # operator listed and every port listening on loopback. Each try is
-    # bounded and they run side by side (a dropped SYN never answers).
-    local port reached
-    if [ "${#deny_ports[@]}" -eq 0 ]; then
-        pass "no local service port to probe (none listed with --loopback-port, none listening on loopback)"
-    else
-        reached="$(for port in "${deny_ports[@]}"; do
-            { timeout 3 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" \
-                  2>/dev/null && echo "$port"; } &
-        done; wait)"
-        if [ -n "$reached" ]; then
-            fail "agent can connect to 127.0.0.1 on port(s) $(echo $reached) (loopback is not blocked for the agent user)"
-        else
-            pass "agent cannot connect to 127.0.0.1 on any of ${#deny_ports[@]} local service port(s)"
-        fi
-    fi
+    # --- network: no host address, local service or LAN target (F2, N1) ----
+    # The launcher already refused unless its own listeners on loopback and
+    # on the host's addresses in the denied ranges were unreachable; this
+    # covers every host address, whatever its range, the real services and
+    # the operator's LAN targets.
+    check_network "${host_addresses[*]}" "${deny_ports[*]}" "${lan_targets[*]}"
+
+    # --- disk: a TMPDIR of its own, no shared /tmp on / (F8) ------------------
+    check_unit_tmpdir /
+    check_shared_tmp / /tmp /var/tmp
 
     # --- cannot signal the orchestrator --------------------------------------
     if [ -n "$orchestrator_pid" ]; then
@@ -320,6 +529,12 @@ inside() {
         echo "RESULT: FAIL ($failures failed)"; fi
     return 0
 }
+
+# Sourced (the tests call the check functions with fake inputs): define
+# the functions and run nothing.
+if (return 0 2>/dev/null); then
+    return 0
+fi
 
 if [ "${1:-}" = "--inside" ]; then
     shift
