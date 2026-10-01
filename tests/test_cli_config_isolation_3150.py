@@ -634,6 +634,73 @@ def test_remote_prefix_runs_claude_in_a_private_dir_and_removes_it(tmp_path):
     assert not os.path.lexists(config_dir), "removed when the shell exits"
 
 
+# --- drift fence: every claude call site in the tree --------------------------
+
+# Modules whose claude argv reaches the CLI only through _spawn_agent_process
+# (build_cli_command, and run_agent for reflexion), covered above. In
+# equipa/isolation.py the argv is the isolation self-probe, whose argv[0] is
+# replaced by verify_agent_isolation.sh; an isolated unit already runs with
+# its own empty HOME and CLAUDE_CONFIG_DIR.
+_CONFIG_DIR_VIA_SPAWN = {"equipa/agent_runner.py", "equipa/reflexion.py",
+                         "equipa/isolation.py"}
+_CONFIG_DIR_HELPERS = {"claude_cli_run_env", "fresh_claude_config_dir",
+                       "REMOTE_RUN_CONFIG_DIR_PREFIX"}
+
+
+def _is_claude_session_argv(node) -> bool:
+    """A list literal starting with ``claude`` (or ``claude_bin``) that
+    starts a session: it has an option other than --version/--help."""
+    import ast
+    if not isinstance(node, ast.List) or not node.elts:
+        return False
+    first = node.elts[0]
+    if not ((isinstance(first, ast.Constant) and first.value == "claude")
+            or (isinstance(first, ast.Name) and first.id == "claude_bin")):
+        return False
+    options = {elt.value for elt in node.elts[1:]
+               if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+               and elt.value.startswith("-")}
+    return bool(options - {"--version", "--help"})
+
+
+def _helper_names(node) -> set[str]:
+    import ast
+    return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+
+def test_every_claude_call_site_uses_a_fresh_config_dir():
+    """Every function that builds a claude session argv (and the module, for
+    a module-level argv) uses a per-run config directory helper."""
+    import ast
+    sources = [*sorted((REPO_ROOT / "equipa").rglob("*.py")),
+               *sorted((REPO_ROOT / "scripts").glob("*.py")),
+               *sorted(REPO_ROOT.glob("*.py"))]
+    found, missing = 0, []
+    for path in sources:
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        scopes = [node for node in ast.walk(tree)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        in_function = set()
+        for scope in scopes:
+            argvs = [n for n in ast.walk(scope) if _is_claude_session_argv(n)]
+            in_function.update(id(n) for n in argvs)
+            if not argvs:
+                continue
+            found += len(argvs)
+            if (relative not in _CONFIG_DIR_VIA_SPAWN
+                    and not _helper_names(scope) & _CONFIG_DIR_HELPERS):
+                missing.append(f"{relative}:{scope.name}")
+        module_level = [n for n in ast.walk(tree) if _is_claude_session_argv(n)
+                        and id(n) not in in_function]
+        if module_level:
+            found += len(module_level)
+            if not _helper_names(tree) & _CONFIG_DIR_HELPERS:
+                missing.append(f"{relative}:<module>")
+    assert found >= 7, f"the fence found too few claude argv literals: {found}"
+    assert not missing, f"claude runs without a per-run config dir: {missing}"
+
+
 # --- the operator's live probe script -----------------------------------------
 
 def test_verify_script_exists_and_is_executable():
