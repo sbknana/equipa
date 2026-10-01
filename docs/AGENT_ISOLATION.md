@@ -223,8 +223,22 @@ Therefore:
   entry), so a writable passwd HOME would be a persistence channel even
   with a per-unit `$HOME`.
 
-The CLI still passes `--setting-sources user --strict-mcp-config` (task
-3134); with the per-unit `CLAUDE_CONFIG_DIR` the user scope is empty.
+The CLI passes `--setting-sources "" --strict-mcp-config` (tasks 3134 and
+3153): no user, project or local settings file is read, only EQUIPA's own
+`--settings` file, which wires the PreToolUse gate.
+
+**The unit's config directory is agent-writable (R3150-07).** The
+launcher creates `<unit home>/.claude` as the agent user, and the CLI must
+write its state there, so nothing on the filesystem stops the agent adding a
+`settings.json` to it mid-run. The CLI ignores that file only because of the
+empty `--setting-sources` value, so the launcher enforces it inside the unit:
+`materialize_argv` refuses a claude argv whose `--setting-sources` is
+missing, has no value or names any source (`setting_sources_refusal` in
+`equipa/agent_launcher.py`), and the run never starts. Other files the CLI
+writes there and reads back later, the shell snapshot in `shell-snapshots/`
+among them, stay writable by the agent, so a per-unit HOME does not make the
+Bash gate a boundary against the agent's own in-run writes; see "Bash gate
+limitations without agent isolation" in [ORCHESTRATOR.md](ORCHESTRATOR.md).
 
 ### Every unit runs alone (until there is a UID pool)
 
@@ -310,7 +324,7 @@ launcher, on text derived from agent output. With the flag on they refuse
 (CT-04, ISO-06, R3136-06); SIMBA and autoresearch run standalone without an
 importable `equipa` refuse as well. Autoresearch no longer goes through
 `bash -c`: the argv runs directly with the prompt on stdin and the
-`--setting-sources user --strict-mcp-config` pair.
+`--setting-sources "" --strict-mcp-config` pair.
 
 The Ollama provider (`provider` or `provider_<role>` set to `ollama`, or
 `--provider ollama`) runs the model's tool calls, `bash_write` included,
