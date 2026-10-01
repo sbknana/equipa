@@ -343,8 +343,11 @@ def test_hidden_high_form_with_zero_high_footer_fails_closed(tmp_path, form):
 @pytest.mark.parametrize(
     "form", list(HIDDEN_HIGH_FORMS), ids=list(HIDDEN_HIGH_FORMS),
 )
-def test_hidden_high_form_counted_in_footer_is_trusted(tmp_path, form):
-    """An honest review whose only finding uses the form, and counts it.
+def test_hidden_high_form_counted_in_footer_blocks_the_merge(tmp_path, form):
+    """An honest review whose only finding uses the form, and counts it,
+    blocks the merge: untrusted when the form holds an UPPER-case HIGH,
+    otherwise trusted with HIGH=1 (task 3154, I3152-04: named for what it
+    asserts).
 
     The strict ``### [E1] LOW`` header is removed: headers that disagree with
     the footer are a count mismatch on their own (task #3033), whatever else
