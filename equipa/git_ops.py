@@ -1398,6 +1398,12 @@ _INDEX_COPY_LIMIT = 1024 * 1024 * 1024
 # The only settings taken from the pinned global config: who commits the
 # stash and which files the operator ignores. None of them names a program.
 _PRIVATE_SETTINGS_FROM_GLOBAL = r"^(user\.name|user\.email|core\.excludesfile)$"
+# The only settings taken from the repository's own config file: how git
+# compares a file with its index entry (a share without exec bits sets
+# core.filemode=false). Booleans and stat options; none names a program.
+_PRIVATE_SETTINGS_FROM_REPOSITORY = (
+    r"^core\.(filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat)$"
+)
 # Used when neither the environment nor the global config names a committer.
 _FALLBACK_IDENTITY = (("user.name", "EQUIPA orchestrator"), ("user.email", "equipa@localhost"))
 # A branch the private HEAD may name as a plain file under refs/heads.
@@ -1458,8 +1464,15 @@ def _open_agent_work_tree(work_tree: str | os.PathLike) -> tuple[int | None, str
 
 
 def _copy_regular_file(source: str, destination: str, limit: int) -> bool:
-    """Copy the regular file ``source`` (never a symlink or FIFO); False
-    when it does not exist. Raises :class:`AgentWorktreeGitError`."""
+    """Copy the regular file ``source`` (never a symlink or FIFO) with its
+    timestamps; False when it does not exist. Raises
+    :class:`AgentWorktreeGitError`.
+
+    The timestamps matter for an index: git re-hashes an entry whose file
+    is not older than the index itself ("racily clean"). A copy stamped now
+    would make a same-size edit made in the second of the checkout read as
+    unchanged.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(source, flags)
@@ -1480,6 +1493,7 @@ def _copy_regular_file(source: str, destination: str, limit: int) -> bool:
                 if copied > limit:
                     raise AgentWorktreeGitError(f"{source} grew past {limit} bytes")
                 writer.write(chunk)
+        os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
     return True
 
 
@@ -1516,18 +1530,23 @@ async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None
     return commit, branch
 
 
+async def _settings_from_file(config_file: Path, pattern: str) -> list[tuple[str, str | None]]:
+    """The entries of the one config file ``config_file`` (includes not
+    followed) whose key matches ``pattern``; none when it cannot be read."""
+    listing = await git_run_async(
+        ["config", "--file", str(config_file), "-z", "--get-regexp", pattern],
+        config_file.parent, timeout=10,
+    )
+    return parse_config_list_z(listing.stdout) if listing.returncode == 0 else []
+
+
 async def _operator_settings() -> list[tuple[str, str | None]]:
     """The :data:`_PRIVATE_SETTINGS_FROM_GLOBAL` entries of the pinned
     global config; none while it is not pinned or no longer verifies."""
     pin = _global_config_pin
     if pin is None or verify_global_git_config_pin() is not None:
         return []
-    listing = await git_run_async(
-        ["config", "--file", str(pin.path), "-z", "--get-regexp",
-         _PRIVATE_SETTINGS_FROM_GLOBAL],
-        pin.path.parent, timeout=10,
-    )
-    return parse_config_list_z(listing.stdout) if listing.returncode == 0 else []
+    return await _settings_from_file(pin.path, _PRIVATE_SETTINGS_FROM_GLOBAL)
 
 
 @dataclass(frozen=True)
@@ -1593,7 +1612,8 @@ class AgentWorktreeGit:
 
 
 async def _write_private_git_dir(
-    private_dir: str, git_dir: str, head: str, branch: str | None, object_format: str,
+    private_dir: str, common_dir: str, git_dir: str,
+    head: str, branch: str | None, object_format: str,
 ) -> bool:
     """Lay out the private git dir; True when the worktree index was copied."""
     for directory in ("refs/heads", "objects"):
@@ -1609,6 +1629,9 @@ async def _write_private_git_dir(
     ]
     if object_format != "sha1":
         settings.append(("extensions.objectformat", object_format))
+    settings.extend(await _settings_from_file(
+        Path(common_dir, "config"), _PRIVATE_SETTINGS_FROM_REPOSITORY,
+    ))
     operator = await _operator_settings()
     settings.extend(operator)
     named = {key for key, _ in operator}
@@ -1651,7 +1674,7 @@ async def agent_worktree_git(
         head, branch = await _worktree_head(common, git_dir)
         private_dir = tempfile.mkdtemp(prefix="equipa-worktree-git-")
         index_copied = await _write_private_git_dir(
-            private_dir, git_dir, head, branch, object_format,
+            private_dir, common, git_dir, head, branch, object_format,
         )
         worktree_git = AgentWorktreeGit(
             real_work_tree, common, git_dir, head, branch, private_dir,
