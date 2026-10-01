@@ -17,6 +17,7 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,24 @@ def _write(project_dir: Path, body: str) -> Path:
     path = project_dir / f"SECURITY-REVIEW-{TASK_ID}.md"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+_SEVERITY_TOKEN_RE = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def _lowercase_severity_words(text: str) -> str:
+    return _SEVERITY_TOKEN_RE.sub(lambda match: match.group(1).lower(), text)
+
+
+def _assert_only_the_backstop_blocks(path: Path) -> None:
+    """Task 3143: the rules trusted the review (the backstop runs only then)
+    and the severity-token backstop blocked it: the reviewer prompt allows
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith("unaccounted severity token:"), (
+        analysis.detail)
 
 
 @pytest.fixture(autouse=True)
@@ -206,8 +225,16 @@ def test_uncounted_candidate_form_is_a_count_mismatch(
 def test_non_candidate_line_does_not_hold_a_clean_review(
     tmp_path: Path, line: str,
 ) -> None:
+    # Task 3143: an UPPER-case severity word in code or prose is blocked by
+    # the backstop only; written in lower case (reviewer prompt) it merges.
+    if _SEVERITY_TOKEN_RE.search(line):
+        _assert_only_the_backstop_blocks(_write(
+            tmp_path, BODY + "No findings.\n\n" + line + "\n" + _footer(),
+        ))
     path = _write(
-        tmp_path, BODY + "No findings.\n\n" + line + "\n" + _footer(),
+        tmp_path,
+        BODY + "No findings.\n\n" + _lowercase_severity_words(line) + "\n"
+        + _footer(),
     )
 
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
@@ -227,12 +254,15 @@ def test_level_two_finding_counted_by_footer_is_trusted(tmp_path: Path) -> None:
 
 
 def test_candidate_inside_closed_code_fence_is_ignored(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path,
+    # Task 3143: code is not exempt from the backstop (the reviewer prompt
+    # keeps UPPER-case severity words out of code), so the payload quoted in
+    # UPPER case blocks; quoted in lower case, no rule reads it.
+    body = (
         BODY + "No findings. The PoC payload was:\n\n```markdown\n"
         "## [S1] HIGH — example heading inside a quoted payload\n```\n"
-        + _footer(),
     )
+    _assert_only_the_backstop_blocks(_write(tmp_path, body + _footer()))
+    path = _write(tmp_path, _lowercase_severity_words(body) + _footer())
 
     assert _count_findings_in_review_file(path) == _counts()
 

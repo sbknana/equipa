@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,6 +103,31 @@ def gate_result(project_dir: Path, task_id: int):
     return _security_review_blocks_merge(
         str(project_dir), task_id, block_on_missing=True,
     )
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def lowercase_severity_words(text: str) -> str:
+    """``text`` with CRITICAL, HIGH and MEDIUM in lower case, except in the
+    final footer (written last, after every other line)."""
+    body, separator, footer = text.rpartition("## Counts")
+    if not separator:
+        return SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), text)
+    return SEVERITY_TOKEN.sub(
+        lambda match: match.group(1).lower(), body,
+    ) + separator + footer
+
+
+def assert_only_the_backstop_blocks(text: str) -> None:
+    """The rules trusted ``text`` (the backstop runs only then) and the
+    severity-token backstop blocked it."""
+    analysis = loops._analyze_review_file(
+        Path("SECURITY-REVIEW-94300.md"), text=text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith("unaccounted severity token:"), (
+        analysis.detail)
 
 
 # --------------------------------------------------------------- gate-04
@@ -349,6 +375,7 @@ BENIGN_SEVERITY_MENTIONS = {
     "clean-summary-prose": "No CRITICAL or HIGH findings in this area.",
     "html-comment": "<!-- reviewer note: HIGH bar for evidence -->",
 }
+EXEMPT_AS_WRITTEN = {"tally-table", "clean-summary-prose"}
 
 
 @pytest.mark.parametrize(
@@ -356,8 +383,24 @@ BENIGN_SEVERITY_MENTIONS = {
     ids=list(BENIGN_SEVERITY_MENTIONS),
 )
 def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention):
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label, so a compliant mention is in lower case
+    and merges. In UPPER case every rule still reads it as no finding (the
+    review is trusted) and only the severity-token backstop blocks it."""
+    mention_text = BENIGN_SEVERITY_MENTIONS[mention]
+    if mention in EXEMPT_AS_WRITTEN:
+        # A zero tally or a negation cannot label a finding; the backstop
+        # exempts it, so it merges as written, as before task 3143.
+        written = finished_review().replace("Details.", mention_text)
+        write_recorded_review(tmp_path, 93099, written)
+        blocks, counts = gate_result(tmp_path, 93099)
+        assert blocks is False and counts and counts["LOW"] == 1, (
+            blocks, counts)
+    elif SEVERITY_TOKEN.search(mention_text):
+        assert_only_the_backstop_blocks(
+            finished_review().replace("Details.", mention_text))
     text = finished_review().replace(
-        "Details.", BENIGN_SEVERITY_MENTIONS[mention],
+        "Details.", lowercase_severity_words(mention_text),
     )
     task_id = 94300 + list(BENIGN_SEVERITY_MENTIONS).index(mention)
     write_recorded_review(tmp_path, task_id, text)
@@ -380,6 +423,15 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
     start = time.perf_counter()
     analysis = loops._analyze_review_file(path, text=text)
     assert time.perf_counter() - start < 2.0
+    if SEVERITY_TOKEN.search(line):
+        # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
+        # only; the rules still read the padded line as prose.
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+        assert analysis.detail.startswith("unaccounted severity token:")
+        text = lowercase_severity_words(text)
+        start = time.perf_counter()
+        analysis = loops._analyze_review_file(path, text=text)
+        assert time.perf_counter() - start < 2.0
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 

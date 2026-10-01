@@ -10,6 +10,7 @@ review still blocks, and a 200 KB adversarial review parses in under 2 s.
 Copyright 2026 Forgeborn
 """
 
+import re
 import time
 from pathlib import Path
 
@@ -52,6 +53,34 @@ def assert_prose_merges(body: list[str]) -> None:
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (body, analysis.detail)
     assert analysis.counts == {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0,
                                "LOW": 1, "INFO": 0}
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+# A zero tally ("HIGH: 0") cannot label a finding; the backstop exempts it,
+# so these lines merge as written, as they did before task 3143.
+EXEMPT_AS_WRITTEN = {
+    "HIGH: 0 and CRITICAL: 0 from semgrep.",
+    "| semgrep | HIGH: 0 |",
+}
+
+
+def assert_compliant_prose_merges(body: list[str]) -> None:
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label, so compliant prose is written in lower
+    case and merges. The UPPER-case original is still read as prose by every
+    rule: only the severity-token backstop blocks it."""
+    assert_prose_merges([
+        SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), line)
+        for line in body
+    ])
+    if any(line in EXEMPT_AS_WRITTEN for line in body):
+        assert_prose_merges(body)
+    elif any(SEVERITY_TOKEN.search(line) for line in body):
+        analysis = analyze(review("1 finding.", body, ONE_LOW, low_heading=True))
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+        assert analysis.detail.startswith("unaccounted severity token:"), (
+            body, analysis.detail)
 
 
 # --- 1. trailing-severity list items -----------------------------------------
@@ -100,7 +129,7 @@ def test_mid_line_severity_field_fails_closed(line):
     "- Log severity: info for auth events.",
 ])
 def test_mid_line_severity_prose_merges(line):
-    assert_prose_merges(["## Notes", line])
+    assert_compliant_prose_merges(["## Notes", line])
 
 
 # --- 3. bare "HIGH:" / "CRITICAL:" lines ----------------------------------------
@@ -123,7 +152,7 @@ def test_bare_leading_severity_line_fails_closed(line):
     "HIGH: 0 and CRITICAL: 0 from semgrep.",
 ])
 def test_bare_leading_prose_merges(line):
-    assert_prose_merges(["## Notes", "", line, ""])
+    assert_compliant_prose_merges(["## Notes", "", line, ""])
 
 
 # --- 4. HTML ------------------------------------------------------------------
@@ -150,7 +179,7 @@ def test_html_finding_fails_closed(body):
     ["<b>Note:</b> high test coverage on the parser."],
 ])
 def test_html_prose_merges(body):
-    assert_prose_merges(["## Notes", ""] + body)
+    assert_compliant_prose_merges(["## Notes", ""] + body)
 
 
 # --- 5. Sev: / Risk: / Impact: aliases -----------------------------------------
@@ -231,7 +260,7 @@ def test_table_cell_finding_fails_closed(cell):
     "| docs | more info in the README |",
 ])
 def test_table_prose_cell_merges(row):
-    assert_prose_merges(["## Notes", "", "| Item | Note |", "|---|---|", row])
+    assert_compliant_prose_merges(["## Notes", "", "| Item | Note |", "|---|---|", row])
 
 
 # --- 7. lower-case prose, footer cross-check, incomplete, timing -------------------

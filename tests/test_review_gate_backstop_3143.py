@@ -499,10 +499,13 @@ PROMPT = REPO / "prompts" / "security-reviewer.md"
 
 def test_prompt_states_the_backstop_rule():
     text = PROMPT.read_text()
-    assert "only when labelling an actual finding" in text
+    assert "UPPER case ONLY when labelling an actual finding" in text
     assert "no high-severity issues" in text
-    assert "code blocks" in text
-    assert "blocks the merge" in text
+    assert "inside code blocks" in text
+    assert ("anywhere in the review that is not a counted finding BLOCKS the "
+            "merge") in text
+    assert ("- **Anything else that renders as a severity word may also block "
+            "the merge.**") in text
     # The shape-by-shape sentence is gone.
     assert "with character references (`&#72;`) or combining marks" not in text
 
