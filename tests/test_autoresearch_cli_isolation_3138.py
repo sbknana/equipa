@@ -68,9 +68,16 @@ def test_mutate_prompt_runs_claude_isolated(autoresearch, monkeypatch, local):
         "developer", "old prompt", "no failures", {"success_rate": 50})
 
     assert result == "NEW PROMPT"
-    claude_calls = [argv[-1] for argv in calls if "claude" in argv[-1]]
+    # The local call runs the claude argv directly (no shell, task 3140); the
+    # SSH call passes it as one shell command. Collect the claude words of each.
+    claude_calls = []
+    for argv in calls:
+        if argv and argv[0] == "claude":
+            claude_calls.append(list(argv))
+        elif "claude" in argv[-1]:
+            claude_calls.append(_claude_words(argv[-1]))
     assert len(claude_calls) == 1
-    words = _claude_words(claude_calls[0])
+    words = claude_calls[0]
     assert words[0] == "claude"
     assert "--strict-mcp-config" in words
     assert words[words.index("--setting-sources") + 1] == "user"
