@@ -581,8 +581,15 @@ def test_guard_accepts_only_a_resolution_that_touches_the_report(
     )
     _git(repo, "update-ref", "refs/heads/main", resolution)
 
+    # Task #3141 (I-03): the guard also requires the verified report blob.
+    report_blob = subprocess.run(
+        ["git", "hash-object", "--stdin"], cwd=str(repo), input="regenerated\n",
+        text=True, capture_output=True, check=True,
+    ).stdout.strip()
+
     recorded = asyncio.run(guard.record_merge(
         TASK, branch_sha, post_head=resolution, regenerated_paths=(REPORT,),
+        regenerated_blobs={REPORT: report_blob},
     ))
 
     assert recorded is accepted
