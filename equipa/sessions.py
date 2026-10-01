@@ -315,9 +315,29 @@ def build_resume_prompt(state: dict) -> str:
     rendered = _format_recovery_prompt(truncated, forge_state=forge_state)
 
     if len(rendered.encode("utf-8")) > STATE_CAP_BYTES:
-        encoded = rendered.encode("utf-8")[:STATE_CAP_BYTES]
-        rendered = encoded.decode("utf-8", errors="ignore")
+        rendered = _cut_to_cap(rendered, STATE_CAP_BYTES)
     return rendered
+
+
+_WRAPPER_OPENER = "<task-input "
+_WRAPPER_CLOSER = "\n</task-input>"
+
+
+def _cut_to_cap(rendered: str, cap_bytes: int) -> str:
+    """Cut *rendered* to *cap_bytes* at a line end, closing an open wrapper.
+
+    Agent-recorded paths, the last output and the forge state sit in
+    ``<task-input>`` blocks (never nested). A cut inside one must not leave
+    it open, or the opener and closer counts no longer match and whatever
+    the prompt adds next reads as part of the block (review F2 of task 3139).
+    Cutting at a line end never splits an opener, which has a line of its own.
+    """
+    budget = cap_bytes - len(_WRAPPER_CLOSER.encode("utf-8"))
+    text = rendered.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+    text = text[: text.rfind("\n") + 1].rstrip("\n")
+    if text.count(_WRAPPER_OPENER) > text.count(_WRAPPER_CLOSER.lstrip("\n")):
+        text += _WRAPPER_CLOSER
+    return text
 
 
 def purge_expired() -> int:
