@@ -265,8 +265,14 @@ TIMING_FAMILIES = {
                                    "GH: x"),
     # Lookalike letters (R3143-07).
     "ascii_lookalike_tokens": ["HlGH CR1T1CAL MED|UM " * (RB // 21)],
+    # TeX math view (R3143-07).
+    "math_spelled_tokens": ["$\\mathrm{H}\\mathrm{I}\\mathrm{G}\\mathrm{H}$ "
+                            * (RB // 37)],
+    "dollar_flood": ["$" * RB],
+    "unclosed_math_runs": pad("$" + "\\a{ " * 600),
+    "math_gap_flood": ["$" + "\\, " * (RB // 3) + "$"],
     # Bidi (R3143-07).
-    "bidi_override_flood": ["\N{RIGHT-TO-LEFT OVERRIDE}" * (RB // 3)],
+    "bidi_override_flood":["\N{RIGHT-TO-LEFT OVERRIDE}" * (RB // 3)],
     "allowed_mark_flood": ["\N{LEFT-TO-RIGHT MARK}x" * (RB // 4)],
     "entity_bidi_flood": ["&#x202E;" * (RB // 8)],
     # Exemption guard and soft wraps (R3143-02, R3143-06).

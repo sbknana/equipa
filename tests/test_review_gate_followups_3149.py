@@ -484,6 +484,31 @@ R3143_07_WORDS = [
 ]
 
 
+# TeX math draws no gap between letters (indep-3143's LaTeX row), and an
+# empty link between two halves joins them (indep-3143's "HI[](x)GH").
+R3143_07_MATH_BODIES = [
+    ["$\\mathrm{H}\\mathrm{I}\\mathrm{G}\\mathrm{H}$: SQL injection in login.py"],
+    ["The $\\mathrm{H}\\mathrm{I}\\mathrm{G}\\mathrm{H}$ SQL injection is open."],
+    ["$H I G H$: SQL injection in login.py"],
+    ["$\\text{C}\\,\\text{R}\\text{ITICAL}$: RCE via upload"],
+    ["$${\\bf H}{\\bf I}{\\bf G}{\\bf H}$$: SQL injection in login.py"],
+    ["HI[](x)GH: SQL injection in login.py"],
+]
+
+
+@pytest.mark.parametrize("body", R3143_07_MATH_BODIES)
+def test_r3143_07_tex_math_and_empty_links_join_a_word(body):
+    assert_gate_blocks(body)
+
+
+def test_r3143_07_ordinary_dollar_text_adds_nothing():
+    analysis = analyze(one_low_review([
+        "It costs $5 and $10 to run; set $HOME and $PATH first.",
+        "Complexity is $O(n \\log n)$ and $\\mathrm{high}$ is lower case.",
+    ]))
+    assert analysis.trusted and analysis.detail == "", analysis
+
+
 @pytest.mark.parametrize("word", R3143_07_WORDS)
 def test_r3143_07_lookalike_severity_word_is_read(word):
     """CRITICAL and HIGH block; MEDIUM is counted (it never blocks)."""

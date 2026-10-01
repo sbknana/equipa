@@ -3279,6 +3279,29 @@ def _backstop_inline_joined(view: str) -> str | None:
     return None if joined == view else joined
 
 
+# Task 3149 (R3143-07): TeX math draws no gap between the letters of a word.
+# "$\mathrm{H}\mathrm{I}\mathrm{G}\mathrm{H}$" renders as one upper-case
+# word, and so does "$H I G H$". Inside a "$...$" or "$$...$$" span on one
+# line, this view removes control sequences, braces and spaces. It only
+# joins text, so it can only add tokens. Each span stops at the next "$", so
+# no character is read twice. Display math over several lines is not joined.
+_BACKSTOP_MATH_SPAN_RE = re.compile(r"(\$\$?)([^$\n]{1,2000})\$")
+_BACKSTOP_TEX_GAP_RE = re.compile(r"\\[A-Za-z]{1,40}|\\[^A-Za-z\n]|[{} \t]")
+
+
+def _backstop_math_joined(view: str) -> str | None:
+    """``view`` with the gaps inside TeX math spans removed, or None when
+    that changes nothing."""
+    if "$" not in view:
+        return None
+    joined = _BACKSTOP_MATH_SPAN_RE.sub(
+        lambda span: (span.group(1)
+                      + _BACKSTOP_TEX_GAP_RE.sub("", span.group(2)) + "$"),
+        view,
+    )
+    return None if joined == view else joined
+
+
 # Task 3149 (tester, cycle 2): the bounded pattern above missed links a
 # CommonMark renderer still draws as their text: long link text, a long or
 # nested destination, an escaped parenthesis, a title holding parentheses, a
@@ -3790,6 +3813,9 @@ def _severity_token_backstop(
         joined = _backstop_inline_joined(base_view)
         if joined is not None:
             views.append((joined, base_origins))
+        math = _backstop_math_joined(base_view)
+        if math is not None:
+            views.append((math, base_origins))
         for link_text, link_origins in _backstop_links_read(base_view):
             if link_origins is None:
                 link_origins = base_origins
