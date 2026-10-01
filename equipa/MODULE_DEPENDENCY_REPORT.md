@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **51,272 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **51,895 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -16,7 +16,7 @@ The `equipa/` package contains **60 Python modules** totaling **51,272 lines** o
 |---|---:|:---:|---|---|---:|
 | `abort_controller.py` | 218 | L0 | — | — | 3 |
 | `agent_launcher.py` | 1373 | L0 | — | — | 25 |
-| `bash_security.py` | 3954 | L0 | — | — | 5 |
+| `bash_security.py` | 4148 | L0 | — | — | 5 |
 | `classifier.py` | 167 | L0 | — | — | 3 |
 | `cli_isolation.py` | 136 | L0 | — | — | 10 |
 | `constants.py` | 337 | L0 | — | — | 67 |
@@ -45,7 +45,7 @@ The `equipa/` package contains **60 Python modules** totaling **51,272 lines** o
 | `config_versions.py` | 480 | L2 | `constants.py`, `db.py` | — | 8 |
 | `embeddings.py` | 233 | L2 | `config.py`, `constants.py` | `db.py`, `graph.py` | 6 |
 | `flows.py` | 762 | L2 | `config.py`, `db.py` | `sessions.py` | 25 |
-| `git_ops.py` | 1782 | L2 | `constants.py`, `role_resolver.py` | `config.py`, `tasks.py` | 41 |
+| `git_ops.py` | 1785 | L2 | `constants.py`, `role_resolver.py` | `config.py`, `tasks.py` | 41 |
 | `graph.py` | 321 | L2 | `db.py` | — | 7 |
 | `initiative_runner.py` | 1380 | L2 | `initiative.py`, `security.py` | `db.py`, `dispatch.py`, `git_ops.py` | 29 |
 | `messages.py` | 168 | L2 | `db.py` | `parsing.py`, `security.py` | 5 |
@@ -58,24 +58,24 @@ The `equipa/` package contains **60 Python modules** totaling **51,272 lines** o
 | `merge_safety.py` | 293 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 894 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
 | `parsing.py` | 1105 | L3 | `constants.py`, `git_ops.py` | `tool_result_storage.py` | 24 |
-| `security_gate.py` | 1163 | L3 | `git_ops.py` | `db.py` | 43 |
+| `security_gate.py` | 1242 | L3 | `git_ops.py` | `db.py` | 45 |
 | `single_agent_guard.py` | 632 | L3 | `git_ops.py` | `role_resolver.py` | 6 |
 | `lessons.py` | 723 | L4 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 13 |
-| `merge_integrity.py` | 1169 | L4 | `git_ops.py`, `security_gate.py` | — | 26 |
+| `merge_integrity.py` | 1417 | L4 | `git_ops.py`, `security_gate.py` | — | 29 |
 | `rlm_decompose.py` | 758 | L4 | `cli_isolation.py`, `config.py`, `env_loader.py`, `isolation.py`, `output.py`, `parsing.py` | `agent_runner.py` | 21 |
-| `generated_files.py` | 667 | L5 | `env_loader.py`, `git_ops.py`, `merge_integrity.py` | — | 14 |
+| `generated_files.py` | 738 | L5 | `env_loader.py`, `git_ops.py`, `merge_integrity.py` | — | 14 |
 | `prompts.py` | 875 | L5 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
 | `reflexion.py` | 158 | L5 | `config.py`, `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
 | `agent_runner.py` | 3921 | L6 | `abort_controller.py`, `agent_launcher.py`, `checkpoints.py`, `cli_isolation.py`, `config.py`, `constants.py`, `db.py`, `env_loader.py`, `isolation.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `reactive_check.py`, `redact.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 29 |
 | `preflight.py` | 379 | L7 | `agent_runner.py`, `constants.py`, `env_loader.py`, `isolation.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 5327 | L8 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 24 |
 | `manager.py` | 699 | L9 | `agent_runner.py`, `constants.py`, `db.py`, `git_ops.py`, `loops.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `prompts.py`, `roles.py`, `single_agent_guard.py`, `tasks.py` | `dispatch.py` | 18 |
-| `dispatch.py` | 4348 | L10 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `generated_files.py`, `git_ops.py`, `hooks/__init__.py`, `isolation.py`, `lessons.py`, `loops.py`, `manager.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 30 |
+| `dispatch.py` | 4376 | L10 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `generated_files.py`, `git_ops.py`, `hooks/__init__.py`, `isolation.py`, `lessons.py`, `loops.py`, `manager.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 30 |
 | `cli.py` | 2469 | L11 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `isolation.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `merge_integrity.py`, `merge_safety.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py` | 22 |
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 51,272 lines | 914 public exports
+**Total:** 51,895 lines | 919 public exports
 
 ## Modules by Layer
 
