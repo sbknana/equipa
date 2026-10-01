@@ -13,6 +13,7 @@ import asyncio
 import bisect
 import html
 import json
+import logging
 import os
 import re
 import subprocess
@@ -96,6 +97,7 @@ from equipa.security_gate import (
     ReviewerRunRecord,
     _gate_audit_log,
     audit_reviewer_run,
+    find_bidi_control,
     fingerprint_artifact,
     format_counts,
     new_reviewer_nonce,
@@ -134,6 +136,7 @@ from equipa.roles import (
 from equipa import sessions
 from equipa.tasks import _get_task_status, get_task_complexity
 
+logger = logging.getLogger(__name__)
 
 # Task 2476: review-agent output artifacts (SECURITY-REVIEW-{id}.md,
 # CODE-REVIEW-{id}.md, PLAN-{id}.md, RETRY-IMPLEMENTATION-{id}.md, etc.)
@@ -1550,6 +1553,14 @@ _REVIEW_MIN_NONBLANK_LINES = 4
 # Task 3143: the longest of the ~870 distinct real reviews has about 1,000
 # lines; ten times that is the most the gate parses.
 _REVIEW_MAX_PARSED_LINES = 10_000
+# Task 3149 (timing): every line holding a severity word in any case
+# (_SEVERITY_WORD_LINE_RE, which also reads "below" and "information") costs
+# about 40 microseconds: the shape rules read it as written, rewritten from
+# HTML and rendered, and the backstop reads it in up to four views. A 200 KB
+# review of 7,500 such lines took 0.6 s on main. The most any of the 870
+# distinct real reviews holds is 138, so a review whose text as written or
+# as rendered holds more than this is not parsed (fail closed).
+_REVIEW_MAX_SEVERITY_LINES = 1_000
 
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
@@ -1567,6 +1578,11 @@ class ReviewCountAnalysis:
     handed to the merge gate when ``verdict`` is ``REVIEW_VERDICT_OK``; any
     other verdict makes :func:`_count_findings_in_review_file` return None
     and the fail-closed ``block_on_missing`` gate fires.
+
+    ``heading_offsets`` (task 3149, R3143-01): the character offset and
+    severity of every finding heading the parser counted in the review as
+    written. Blank-line folding keeps offsets, so they index the normalised
+    review. The backstop credits these headings and nothing it re-derives.
     """
 
     verdict: str
@@ -1574,6 +1590,7 @@ class ReviewCountAnalysis:
     footer_counts: dict[str, int] | None = None
     header_counts: dict[str, int] | None = None
     detail: str = ""
+    heading_offsets: tuple[tuple[int, str], ...] = ()
 
     @property
     def trusted(self) -> bool:
@@ -1827,14 +1844,47 @@ def _matched_severity(match: re.Match[str]) -> str:
 
     A rule that captures two severities (a "HIGH/MEDIUM" range cell) reports
     the higher one (task 3130).
+
+    Task 3149 (R3143-05): case-insensitive rules match U+0130 (LATIN CAPITAL
+    LETTER I WITH DOT ABOVE) for "i", and its upper case is itself, so
+    "HİGH" raised KeyError. It is folded to "I" first (the only such code
+    point; see tests/test_review_gate_followups_3149.py).
     """
     return min(
-        (group.upper() for group in match.groups() if group),
+        (group.translate(_DOTTED_CAPITAL_I_FOLD).upper()
+         for group in match.groups() if group),
         key=_REVIEW_SEVERITIES.index,
     )
 
 
+_DOTTED_CAPITAL_I_FOLD = {0x0130: "I"}
+
+
 _NEWLINE_RE = re.compile("\n")
+
+# Task 3149 (tester timing rows): once a text holds one non-ASCII character,
+# str.translate reads every character through its table (about 0.1 us
+# each), which made the letter folds the largest cost of a 200 KB review
+# that is mostly ASCII. The fold tables map no ASCII character, so only the
+# runs of other characters need translating, unless there are so many that
+# one pass over the whole text is cheaper.
+_NON_ASCII_CHARACTERS_RE = re.compile(r"([^\x00-\x7f]+)")
+_SPARSE_TRANSLATE_SHARE = 16
+
+
+def _translate_non_ascii(text: str, table: dict[int, str]) -> str:
+    """``text.translate(table)`` for a ``table`` that maps no ASCII character
+    and maps no character to a line feed."""
+    if text.isascii():
+        return text
+    non_ascii = len(text) - len(text.encode("ascii", "ignore"))
+    if non_ascii * _SPARSE_TRANSLATE_SHARE > len(text):
+        return text.translate(table)
+    parts = _NON_ASCII_CHARACTERS_RE.split(text)
+    # The odd parts are the runs. None holds a line feed and none gains one,
+    # so the runs are translated in one call and split apart again.
+    parts[1::2] = "\n".join(parts[1::2]).translate(table).split("\n")
+    return "".join(parts)
 
 # Rules added by tasks 3122, 3130 and 3137. Unlike the older rules they
 # report a severity only on a line where no earlier rule saw it (see
@@ -2725,7 +2775,7 @@ def _rendered_review_text(text: str) -> str:
         # A decoded reference may itself be fullwidth or invisible.
         text = normalize_review_text(text)
     text = _strip_combining_marks(text)
-    text = text.translate(_CONFUSABLE_LETTERS)
+    text = _translate_non_ascii(text, _CONFUSABLE_LETTERS)
     text = _INTRAWORD_EMPHASIS_RE.sub("", text)
     # Removed code and comments can leave long runs of blank lines (task 3137).
     return _fold_blank_line_runs(_INTERIOR_BLANK_RUN_RE.sub(" ", text))
@@ -2743,16 +2793,33 @@ def _rendered_review_text(text: str) -> str:
 # finding's label. LOW and INFO never block a merge and are not read.
 
 BACKSTOP_REASON = "unaccounted severity token"
+# The severities whose count blocks a merge (dispatch._security_review_blocks
+# _merge and the defensive invariant: CRITICAL or HIGH above 0). An
+# unaccounted MEDIUM token is counted and logged under this reason instead
+# of untrusting the review (task 3149, R3143-06).
+MERGE_BLOCKING_SEVERITIES = ("CRITICAL", "HIGH")
+BACKSTOP_ADVISORY_REASON = "unaccounted MEDIUM token (advisory)"
+REVIEW_PARSE_ERROR_REASON = "review parse error"
+REVIEW_BIDI_REASON = "bidi control character"
 _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # The word must not touch a letter or digit. "_" is not a word character
 # here: "_HIGH_" renders as an emphasised HIGH. The character before the word
 # is checked in Python, so the scan starts at a word's first letter.
-_BACKSTOP_TOKEN_RE = re.compile(r"(?:CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+# Task 3149 (R3143-07): "l", "1" and "|" drawn for the I of an otherwise
+# UPPER-case word ("HlGH", "CR1T1CAL", "MED|UM") are read as that I.
+_BACKSTOP_TOKEN_RE = re.compile(
+    r"(?:CR[Il1|]T[Il1|]CAL|H[Il1|]GH|MED[Il1|]UM)(?![^\W_])",
+)
+_BACKSTOP_SEVERITY_BY_INITIAL = {"C": "CRITICAL", "H": "HIGH", "M": "MEDIUM"}
 # HTML5 character references, with or without the semicolon. html.unescape
 # decides what each means (legacy names such as "&amp" need no semicolon) and
-# leaves an unknown one as written.
+# leaves an unknown one as written. Task 3149 (R3143-04): leading zeros are
+# read in full ("&#000000072;" is H) but at most 8 decimal or 7 hex
+# significant digits, so int() never sees thousands of them; any longer
+# value is past U+10FFFF and decodes to U+FFFD whatever its digits.
 _BACKSTOP_REFERENCE_RE = re.compile(
-    r"&(?:#[0-9]+;?|#[xX][0-9A-Fa-f]+;?|[A-Za-z][A-Za-z0-9]{0,31};?)",
+    r"&(?:#(0*)([0-9]{1,8});?|#[xX](0*)([0-9A-Fa-f]{1,7});?"
+    r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
 )
 # Markup a browser does not show: start and end tags, "<!DOCTYPE ...>" and
 # the bogus comments "<!x>", "<?x>" and "</ x>". The body stops at the next
@@ -2764,25 +2831,42 @@ _BACKSTOP_LINE_BREAKS = str.maketrans(
     dict.fromkeys("\n\r\x0b\x0c\x1c\x1d\x1e\x85  ", " "),
 )
 _BACKSTOP_REPORTED_LINES = 20
-# Positions that cannot label a finding (task 3143, corpus item C). Each is
-# read in a window of at most _BACKSTOP_CONTEXT characters on the token's
-# own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a view are
-# read at all: any later token counts (a real review has far fewer).
+# Positions that cannot label a finding (task 3143, corpus item C). The words
+# before a token are read in a window of at most _BACKSTOP_CONTEXT characters
+# on its own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a
+# view are read at all: any later token counts (a real review has far fewer).
 #   * a tally: a bare count right before the word ("0 HIGH", "**2** MEDIUM")
 #     or after it and a ":", "=" or "|" ("HIGH: 0", "| MEDIUM | 2 |"). The
-#     count must end there ("HIGH: 2FA bypass" is a title), and it must not
-#     exceed what the review counts of that severity (footer or headings),
-#     so a tally never claims a finding the review did not count;
-#   * a negation or comparison: "no", "not", "nor", "zero", "without",
-#     "than" or "none at/of/reached" right before the word ("No CRITICAL or
-#     HIGH findings", "MEDIUM, not HIGH", "LOW rather than MEDIUM"), not
-#     followed by a ":" (so it cannot open a "HIGH: title" label);
+#     count must not exceed what the review counts of that severity (footer
+#     or headings), so a tally never claims a finding the review did not
+#     count;
+#   * a negation: "no", "not", "nor", "neither", "zero", "without",
+#     "rather/other/lower/less than", "below" or "none is/of/reached" right
+#     before the word ("No CRITICAL or HIGH findings", "LOW rather than
+#     MEDIUM"), also at the end of the line before when the token opens a
+#     soft-wrapped line of the same paragraph;
 #   * the next word of a list that opens with one of these ("0 CRITICAL/HIGH",
 #     "no CRITICAL, HIGH or MEDIUM issues"), which takes its count.
 #   * "Overall risk: MEDIUM" (also "LOW-MEDIUM"), which states one finding of
 #     that severity and so needs the footer to count at least one.
+# Task 3149 (R3143-02): an exempt word may never label a finding. What
+# follows it must be the end of the line, closing punctuation, the next word
+# of the list or a generic noun ("findings"); a ":", a dash or finding text
+# ("No HIGH SQL injection remains", "0 MEDIUM, CRITICAL - RCE") makes it a
+# token like any other. A list joined by a bare comma must go on ("no
+# CRITICAL, HIGH or MEDIUM"): "Severity: not MEDIUM, HIGH" ends on HIGH. A
+# "HIGH: 0" tally must end the item or be followed only by more tally items
+# and the words of _BACKSTOP_TALLY_TAIL_WORDS ("HIGH: 0 and CRITICAL: 0 from
+# semgrep."); "CRITICAL: 0 rate limiting on login" is a digit-led title.
 _BACKSTOP_CONTEXT = 40
 _BACKSTOP_CLASSIFY_LIMIT = 2000
+# What follows a token is read up to this many characters of its line, plus
+# the next line when that line continues the same paragraph (a soft wrap
+# renders as a space). Text cut at the limit ends in _BACKSTOP_CUT, which no
+# rule accepts, so a long line fails closed. The backstop views never hold
+# a NUL (Cc characters are deleted).
+_BACKSTOP_AFTER_LIMIT = 200
+_BACKSTOP_CUT = "\x00"
 _BACKSTOP_NUMBER_WORDS = {
     "one": 1, "single": 1, "two": 2, "both": 2, "three": 3, "four": 4,
     "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -2794,20 +2878,108 @@ _BACKSTOP_COUNT_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 _BACKSTOP_COUNT_AFTER_RE = re.compile(
-    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)",
+    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)"
+    r"[*_`]{0,3}",
 )
 _BACKSTOP_NEGATION_BEFORE_RE = re.compile(
-    r"(?:^|[^\w-])(?:no|not|nor|zero|without|than|nothing|neither|never|"
+    r"(?:^|[^\w-])(no|not|nor|zero|without|nothing|neither|never|below|"
+    r"(?:rather|other|lower|less)[ \t]+than|"
     r"none(?:[ \t]+(?:is|are|was|were|at|of|reach|reaches|reached|rated))?)"
     r"[*_` \t]{1,6}\Z",
     re.IGNORECASE,
+)
+# "Was it fixed? No HIGH, ..." answers a question: the "No" negates nothing.
+_BACKSTOP_ANSWER_END_RE = re.compile(r"[?!][*_` \t]*\Z")
+_BACKSTOP_SEVERITY_WORD = r"(?:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![^\W_])"
+# Closing emphasis, "HIGH+" and "HIGH-severity" may follow an exempt word.
+_BACKSTOP_AFTER_PREFIX = (
+    r"[*_`]{0,3}\+?"
+    r"(?:-(?:severity|level|risk|rated|impact|priority)(?![\w-])[*_`]{0,3})?"
+)
+# No two "[ \t]*" touch, so a line padded with spaces is read in linear time.
+# The next word may be negated again ("No CRITICAL and no HIGH findings"):
+# it is a token of its own, so its own negation and what follows it decide
+# ("No CRITICAL and no HIGH: SQL injection" still blocks on HIGH).
+_BACKSTOP_LIST_GOES_ON = (
+    r"[ \t]*(?:[/&+]|,(?:[ \t]*(?:or|and|nor|to)(?![\w-]))?"
+    r"|(?:or|and|nor|to)(?![\w-]))[ \t]*(?:[*_`]{1,3}[ \t]*)?"
+    r"(?:(?:no|not|zero)[*_` \t]{1,6})?"
+    r"(?:\d{1,4}[*_` \t]{1,6})?" + _BACKSTOP_SEVERITY_WORD
+)
+# A generic noun or verb, or a conjunction opening a reason ("rated LOW
+# rather than HIGH because ..."). Never finding text ("SQL injection").
+# Task 3149 (tester, cycle 2): the words run as far as they go (an atomic
+# group, so a shorter run is never tried) and must not end at a ":", "=" or
+# dash: "No HIGH issues: SQL injection ..." and "Not CRITICAL because: RCE"
+# keep the label in place.
+_BACKSTOP_LABEL_MARK = "[:=\\-\N{HYPHEN}-\N{HORIZONTAL BAR}\N{MINUS SIGN}]"
+_BACKSTOP_GENERIC_NOUN_AFTER = (
+    r"(?>(?:[ \t]+(?:findings?|issues?|results?|vulnerabilit(?:y|ies)|risks?|"
+    r"items?|problems?|bugs?|alerts?|hits?|concerns?|severity|severities|"
+    r"ones?|entries|flaws?|weakness(?:es)?|defects?|warnings?|"
+    r"(?:or|and)[ \t]+(?:above|higher|worse)|was|were|is|are|remains?|"
+    r"found|reported|identified|detected|flagged|exists?|"
+    r"because|since|as|given|but|though|although|while|unless|due)"
+    r"(?![\w-]))+)(?![*_` \t]*" + _BACKSTOP_LABEL_MARK + r")"
+)
+# End of the text, closing punctuation, or a comma before a lower-case word
+# ("not MEDIUM, as it needs ..."; "No HIGH, SQL injection ..." is a label,
+# and so is "not MEDIUM, as: RCE ...": the lower-case word ends at no label
+# mark).
+_BACKSTOP_SAFE_AFTER_RE = re.compile(
+    _BACKSTOP_AFTER_PREFIX + r"(?:" + _BACKSTOP_LIST_GOES_ON + r"|"
+    + _BACKSTOP_GENERIC_NOUN_AFTER
+    + r"|[ \t]*(?:\Z|[.;!?)\]|]|,[ \t]*(?=(?-i:[a-z])(?>\w*)"
+    r"(?![*_` \t]*" + _BACKSTOP_LABEL_MARK + r"))))",
+    re.IGNORECASE,
+)
+_BACKSTOP_LIST_CONTINUES_RE = re.compile(
+    _BACKSTOP_AFTER_PREFIX + r"(?:" + _BACKSTOP_LIST_GOES_ON + r"|"
+    + _BACKSTOP_GENERIC_NOUN_AFTER + r")",
+    re.IGNORECASE,
+)
+_BACKSTOP_TALLY_TAIL_WORDS = (
+    "and", "or", "from", "across", "in", "on", "at", "by", "for", "of", "the",
+    "a", "an", "this", "that", "these", "its", "all", "each", "per", "total",
+    "overall", "so", "far", "now", "after", "before", "review", "diff",
+    "change", "changes", "changed", "code", "file", "files", "scan", "scans",
+    "scanned", "scanner", "tool", "tools", "rule", "rules", "ruleset",
+    "rulesets", "semgrep", "bandit", "gitleaks", "trivy", "npm", "audit",
+    "pip-audit", "osv-scanner", "eslint", "codeql", "manual", "automated",
+    "finding", "findings", "issue", "issues", "result", "results", "hit",
+    "hits", "alert", "alerts", "reported", "found", "flagged", "detected",
+    "open", "new", "remaining", "branch", "repo", "repository", "project",
+    "dependency", "dependencies", "package", "packages", "check", "checks",
+)
+# The items repeat possessively (a failing tail is read once, never re-split;
+# tester, cycle 2: 0.7 s on 200 KB of "HIGH: 0 1 1 ... x"). So the first
+# alternative that matches must be the right one: "0 HIGH" is taken whole
+# unless a ":" or "=" follows, where "0" ends one item and "HIGH: 0" starts
+# the next.
+_BACKSTOP_TALLY_TAIL_RE = re.compile(
+    r"(?:[ \t]*(?:"
+    r"[*_`]{0,3}" + _BACKSTOP_SEVERITY_WORD
+    + r"[*_`]{0,3}[ \t]*[:=][ \t]*[*_`]{0,3}\d{1,4}(?![\w-])[*_`]{0,3}"
+    r"|[*_`]{0,3}\d{1,4}[*_` \t]{1,6}" + _BACKSTOP_SEVERITY_WORD
+    + r"[*_`]{0,3}(?![*_` \t]*[:=])"
+    r"|[|,;/&+]|\.(?![^\W_])|\d{1,6}(?![\w-])"
+    r"|(?i:" + "|".join(sorted(_BACKSTOP_TALLY_TAIL_WORDS, key=len,
+                               reverse=True)) + r")(?![\w-])"
+    r"))*+[ \t]*",
+)
+# A soft-wrapped paragraph line: the line before must hold text and must not
+# be a heading, a table row or a fence.
+_BACKSTOP_BLOCK_LINE_RE = re.compile(r"[ \t]{0,3}(?:#|\||```|~~~)")
+# A line that does not continue the paragraph before it: blank, or opening
+# a block of its own.
+_BACKSTOP_NEW_BLOCK_RE = re.compile(
+    r"[ \t]*(?:\Z|#|\||```|~~~|>|<|[-*+](?:[ \t]|\Z)|\d{1,9}[.)](?:[ \t]|\Z))",
 )
 _BACKSTOP_OVERALL_RISK_BEFORE_RE = re.compile(
     r"overall[ \t]+risk[*_` \t]*(?:[:=]|is)?[*_` \t]*"
     r"(?:(?:low|medium|high)[ \t]*(?:-|\N{EN DASH}|/|to)[ \t]*(?:to[ \t]+)?)?\Z",
     re.IGNORECASE,
 )
-_BACKSTOP_COLON_AFTER_RE = re.compile(r"[*_`]{0,3}[ \t]*:")
 _BACKSTOP_LIST_JOINER_RE = re.compile(
     r"[*_`]{0,3}[ \t]*(?:/|,|&|\+|and\b|or\b|nor\b|,[ \t]*(?:and|or)\b)"
     r"[ \t]*[*_`]{0,3}",
@@ -2820,11 +2992,28 @@ _BACKSTOP_SECTION_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,3}(?:[ \t]|$)",
 # fold, beyond the parser's table: the remaining Latin small capitals, Coptic
 # capitals, and the negative circled, negative squared and regional
 # indicator letters A-Z (which decompose to nothing).
+# Task 3149 (R3143-07) adds the shapes indep-3143 drew as these letters:
+# Cyrillic EN with descender, hook or tail (U+04A2, U+04C7, U+04C9) and
+# Latin H with stroke or descender (U+0126, U+2C67) for H; Greek SAN
+# (U+03FA) for M; Latin YR (U+01A6) for R; the Canadian syllabics
+# U+157C H, U+1587 R, U+15C5 and U+15E9 A, U+14AA L, U+15F0 M, U+15EA D,
+# U+144C U; Runic ISAZ (U+16C1), Tifinagh YAN (U+2D4F), NKo A (U+07CA), Old
+# Italic I (U+10309) and DIVIDES (U+2223) for I; Tifinagh YADD (U+2D39) for
+# E; DOWN TACK (U+22A4) and Carian D (U+102A2) for T; Cherokee YU (U+13F3)
+# for G; Armenian SEH (U+054D) for U.
 _BACKSTOP_EXTRA_LOOKALIKES = {
-    "A": (0x1D00, 0x2C80), "C": (0x1D04, 0x2CA4), "D": (0x1D05,),
-    "E": (0x1D07, 0x2C88), "H": (0x2C8E,), "I": (0xA7AE, 0x2C92),
-    "L": (0x029F,), "M": (0x1D0D, 0x2C98), "R": (0x0280,),
-    "T": (0x1D1B, 0x2CA6), "U": (0x1D1C,),
+    "A": (0x1D00, 0x2C80, 0x15C5, 0x15E9),
+    "C": (0x1D04, 0x2CA4),
+    "D": (0x1D05, 0x15EA),
+    "E": (0x1D07, 0x2C88, 0x2D39),
+    "G": (0x13F3,),
+    "H": (0x2C8E, 0x04A2, 0x04C7, 0x04C9, 0x0126, 0x2C67, 0x157C),
+    "I": (0xA7AE, 0x2C92, 0x16C1, 0x2D4F, 0x07CA, 0x10309, 0x2223),
+    "L": (0x029F, 0x14AA),
+    "M": (0x1D0D, 0x2C98, 0x03FA, 0x15F0),
+    "R": (0x0280, 0x01A6, 0x1587),
+    "T": (0x1D1B, 0x2CA6, 0x22A4, 0x102A2),
+    "U": (0x1D1C, 0x144C, 0x054D),
 }
 _BACKSTOP_LETTER_FOLDS = {
     **_CONFUSABLE_LETTERS,
@@ -2884,7 +3073,16 @@ _BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
 
 
 def _backstop_decoded_reference(match: re.Match[str]) -> str:
-    """One character reference as a browser shows it, on the same line."""
+    """One character reference as a browser shows it, on the same line.
+
+    A numeric reference is looked up without its leading zeros, so the
+    cached key and the text html.unescape parses stay short.
+    """
+    decimal, hexadecimal = match.group(2), match.group(4)
+    if decimal is not None:
+        return _BACKSTOP_REFERENCES[f"&#{int(decimal)};"]
+    if hexadecimal is not None:
+        return _BACKSTOP_REFERENCES[f"&#x{hexadecimal.lstrip('0') or '0'};"]
     return _BACKSTOP_REFERENCES[match.group(0)]
 
 
@@ -2900,11 +3098,22 @@ def _backstop_normalized(text: str) -> str:
     """
     if "&" in text:
         text = _BACKSTOP_REFERENCE_RE.sub(_backstop_decoded_reference, text)
-    text = text.translate(_BACKSTOP_CHARACTERS)
+    text = _backstop_translated(text)
     if text.isascii():
         return text
-    text = unicodedata.normalize("NFKD", text).translate(_BACKSTOP_CHARACTERS)
+    text = _backstop_translated(unicodedata.normalize("NFKD", text))
     return unicodedata.normalize("NFKC", text)
+
+
+# The ASCII characters _BACKSTOP_CHARACTERS deletes (controls other than tab
+# and line feed); it leaves every other ASCII character alone.
+_BACKSTOP_ASCII_CONTROLS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]+")
+
+
+def _backstop_translated(text: str) -> str:
+    """``text.translate(_BACKSTOP_CHARACTERS)``, fast on mostly-ASCII text."""
+    text = _translate_non_ascii(text, _BACKSTOP_CHARACTERS)
+    return _BACKSTOP_ASCII_CONTROLS_RE.sub("", text)
 
 
 def _backstop_line_origins(text: str, spans: list[tuple[int, int]]) -> list[int]:
@@ -2971,35 +3180,419 @@ def _backstop_without_markup(text: str) -> tuple[str, list[int] | None] | None:
     return without_tags, origins
 
 
+def _backstop_wrapped_negation(
+    view: str, newlines: list[int], line: int, line_start: int, start: int,
+) -> bool:
+    """True when a token opening a soft-wrapped line follows a negation.
+
+    "... there are no" / "CRITICAL/HIGH issues." is one paragraph: the
+    negation ends the line before. Only when nothing but emphasis comes
+    before the token on its line, and the line before holds text and is not
+    a heading, table row or fence (R3143-06).
+    """
+    if line == 0 or start - line_start > _BACKSTOP_CONTEXT:
+        return False
+    if view[line_start:start].strip(" \t*_`"):
+        return False
+    previous_start = newlines[line - 2] + 1 if line >= 2 else 0
+    previous_end = line_start - 1
+    if _BACKSTOP_BLOCK_LINE_RE.match(view, previous_start, previous_end):
+        return False
+    tail = view[max(previous_start, previous_end - _BACKSTOP_CONTEXT):
+                previous_end].rstrip(" \t")
+    return bool(tail) and _backstop_negates(tail + " ")
+
+
+def _backstop_negates(before: str) -> bool:
+    """True when ``before`` ends with a negation of the word after it.
+
+    A "No" that answers a question ("Was it fixed? No HIGH ...") is not one.
+    """
+    negation = _BACKSTOP_NEGATION_BEFORE_RE.search(before)
+    return negation is not None and _BACKSTOP_ANSWER_END_RE.search(
+        before, 0, negation.start(1)) is None
+
+
+def _backstop_after_text(
+    view: str, newlines: list[int], line: int, end: int,
+) -> str:
+    """What a reader sees after the token ending at ``end`` on ``line``.
+
+    The rest of the line, and when the next line continues the same
+    paragraph, a space and that line ("No HIGH" / "SQL injection remains"
+    renders as one sentence). Each part is cut at _BACKSTOP_AFTER_LIMIT
+    characters and then ends in _BACKSTOP_CUT.
+    """
+    line_end = newlines[line] if line < len(newlines) else len(view)
+    if line_end - end > _BACKSTOP_AFTER_LIMIT:
+        return view[end:end + _BACKSTOP_AFTER_LIMIT] + _BACKSTOP_CUT
+    after = view[end:line_end]
+    if line >= len(newlines):
+        return after
+    line_start = newlines[line - 1] + 1 if line else 0
+    next_start = line_end + 1
+    next_end = newlines[line + 1] if line + 1 < len(newlines) else len(view)
+    if (_BACKSTOP_BLOCK_LINE_RE.match(view, line_start, line_end)
+            or _BACKSTOP_NEW_BLOCK_RE.match(view, next_start, next_end)):
+        return after
+    if next_end - next_start > _BACKSTOP_AFTER_LIMIT:
+        return (after + " " + view[next_start:next_start + _BACKSTOP_AFTER_LIMIT]
+                + _BACKSTOP_CUT)
+    return after + " " + view[next_start:next_end]
+
+
+# Task 3149 (R3143-03): Markdown inline markup inside a word renders as one
+# word: "**H**IGH", "H`IGH`", "H*IG*H", "HI__G__H", "HI~~GH", "H\IGH",
+# "[HI](#x)GH", "[HI][r]GH", "HI![](x)GH". Links and images become their text
+# and emphasis, code, strike and backslash marks between two letters are
+# dropped. Both steps only join text (no line break is touched), so the view
+# can only add tokens.
+_BACKSTOP_INLINE_LINK_RE = re.compile(
+    r"!?\[([^\[\]\n]{0,200})\](?:\([^()\n]{0,500}\)|\[[^\[\]\n]{0,100}\])",
+)
+_BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
+# Task 3149 (tester, cycle 2; markdown-it fuzz): only the marks between the
+# letters of a severity word are dropped. Dropping every mark between two
+# letters also merged a word into its neighbour: "a_*HIGH" became "aHIGH",
+# no token, where a renderer shows "a_*" and a standalone HIGH.
+_BACKSTOP_SPLIT_WORD_RE = re.compile("|".join(
+    r"[*_~`\\]*+".join(letters) for letters in (
+        ("C", "R", "[Il1|]", "T", "[Il1|]", "C", "A", "L"),
+        ("H", "[Il1|]", "G", "H"),
+        ("M", "E", "D", "[Il1|]", "U", "M"),
+    )
+))
+_BACKSTOP_WORD_MARKS = str.maketrans("", "", "*_~`\\")
+
+
+def _backstop_split_words_joined(view: str) -> str:
+    """``view`` with the marks inside each severity word removed."""
+    return _BACKSTOP_SPLIT_WORD_RE.sub(
+        lambda word: word.group(0).translate(_BACKSTOP_WORD_MARKS), view,
+    )
+
+
+def _backstop_inline_joined(view: str) -> str | None:
+    """``view`` with Markdown inline markup inside words removed, or None
+    when that changes nothing."""
+    if not any(mark in view for mark in _BACKSTOP_INLINE_MARKS):
+        return None
+    joined = _backstop_split_words_joined(
+        _BACKSTOP_INLINE_LINK_RE.sub(r"\1", view),
+    )
+    return None if joined == view else joined
+
+
+# Task 3149 (R3143-07): TeX math draws no gap between the letters of a word.
+# "$\mathrm{H}\mathrm{I}\mathrm{G}\mathrm{H}$" renders as one upper-case
+# word, and so does "$H I G H$". Inside a "$...$" or "$$...$$" span on one
+# line, this view removes control sequences, braces and spaces. It only
+# joins text, so it can only add tokens. Each span stops at the next "$", so
+# no character is read twice. Display math over several lines is not joined.
+_BACKSTOP_MATH_SPAN_RE = re.compile(r"(\$\$?)([^$\n]{1,2000})\$")
+_BACKSTOP_TEX_GAP_RE = re.compile(r"\\[A-Za-z]{1,40}|\\[^A-Za-z\n]|[{} \t]")
+
+
+def _backstop_math_joined(view: str) -> str | None:
+    """``view`` with the gaps inside TeX math spans removed, or None when
+    that changes nothing."""
+    if "$" not in view:
+        return None
+    joined = _BACKSTOP_MATH_SPAN_RE.sub(
+        lambda span: (span.group(1)
+                      + _BACKSTOP_TEX_GAP_RE.sub("", span.group(2)) + "$"),
+        view,
+    )
+    return None if joined == view else joined
+
+
+# Task 3149 (tester, cycle 2): the bounded pattern above missed links a
+# CommonMark renderer still draws as their text: long link text, a long or
+# nested destination, an escaped parenthesis, a title holding parentheses, a
+# destination on the next line, shortcut and long-label reference links, an
+# image with a long alt text. This view reads a link's tail the way
+# markdown-it does, at any length: "(", white space with at most one line
+# break, a destination ("<...>" on one line, or a run without spaces or
+# controls whose parentheses balance and nest at most 32 deep), an optional
+# title ("...", '...' or (...)) after white space, white space, ")"; else a
+# "[label]" of at most 999 characters. Every tail found is removed, every
+# image is removed whole (its alt text is not drawn), and every bracket left
+# is removed. A reference whose definition is missing renders as written;
+# reading it as a link only joins more text (fail closed).
+#
+# Linear: the parentheses are paired once for the whole view, and a
+# destination is read by jumping from each top-level "(" to its partner, so
+# no character is read twice per destination (a 32-level regex read each
+# character up to 32 times, 0.3 s on 200 KB of "a[a](").
+_LINK_SPACE = r"[ \t]*+(?:\n[ \t]*+)?+"
+_LINK_TITLE = (
+    r"\"(?:\\[\s\S]|[^\"\\])*+\"|'(?:\\[\s\S]|[^'\\])*+'"
+    r"|\((?:\\[\s\S]|[^()\\])*+\)"
+)
+_LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
+_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*+>")
+_LINK_TAIL_END_RE = re.compile(
+    r"(?:(?:[ \t]++(?:\n[ \t]*+)?+|\n[ \t]*+)(?:" + _LINK_TITLE + r"))?+"
+    + _LINK_SPACE + r"\)",
+)
+_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}+\]")
+# A raw destination ends at a space or a control character.
+_LINK_DESTINATION_END_RE = re.compile(r"[\x00-\x20\x7f]")
+# Unescaped parentheses; "\(" and "\\" are read (and skipped) as pairs.
+_LINK_PARENTHESIS_RE = re.compile(r"\\[()\\]|[()]")
+_LINK_PARENTHESES_DEPTH = 32
+# An image from "![" to its "]", or a "]" a tail may follow (any "]" once
+# the review defines a reference, which a shortcut "[text]" may name). The
+# alt text stops at another "![" or a blank line, so a flood of unclosed
+# "![" is read once.
+_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*+\n))*+\]"
+_LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
+_LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
+# A link reference definition ("[label]: destination"), also inside a quote
+# or list item. Read loosely: a reading that trusts these is paired with one
+# that trusts none, since a "definition" inside a paragraph or code is text.
+_LINK_DEFINITION_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?)*+(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?+"
+    r"\[((?:\\[^\n]|[^\[\]\\]){1,999}+)\]:",
+    re.MULTILINE,
+)
+# Link markup a removal can join a word across: a letter or digit (or the
+# "|" drawn as I) right before "[" or "![", or right after "]" or ")",
+# emphasis marks and further brackets between.
+_BACKSTOP_LINK_JOIN_RE = re.compile(
+    r"(?:[^\W_]|\|)[*_~`\\]*+!?\[|[\])][*_~`\\!\[]*+(?:[^\W_]|\|)",
+)
+
+
+class _LinkTails:
+    """Where each Markdown link tail of one view ends (see above)."""
+
+    def __init__(self, view: str) -> None:
+        self.view = view
+        self._parentheses: list[int] | None = None
+        self._partners: list[int] = []
+        self._depths: list[int] = []
+        self._run = (0, 0)
+
+    def _pair_parentheses(self) -> list[int]:
+        """Positions of the unescaped parentheses, each paired with its
+        partner (index, or -1) and, for "(", how deep its group nests."""
+        if self._parentheses is not None:
+            return self._parentheses
+        positions: list[int] = []
+        partners: list[int] = []
+        depths: list[int] = []
+        open_indexes: list[int] = []
+        for match in _LINK_PARENTHESIS_RE.finditer(self.view):
+            if match.end() - match.start() == 2:
+                continue  # an escaped parenthesis or backslash
+            index = len(positions)
+            positions.append(match.start())
+            partners.append(-1)
+            depths.append(1)
+            if match.group(0) == "(":
+                open_indexes.append(index)
+            elif open_indexes:
+                opener = open_indexes.pop()
+                partners[opener] = index
+                partners[index] = opener
+                if open_indexes:
+                    parent = open_indexes[-1]
+                    depths[parent] = max(depths[parent], depths[opener] + 1)
+        self._parentheses = positions
+        self._partners = partners
+        self._depths = depths
+        return positions
+
+    def _run_end(self, position: int) -> int:
+        """Where the run of non-space characters at ``position`` ends."""
+        start, end = self._run
+        if start <= position < end:
+            return end
+        found = _LINK_DESTINATION_END_RE.search(self.view, position)
+        end = len(self.view) if found is None else found.start()
+        self._run = (position, end)
+        return end
+
+    def _destination_end(self, position: int) -> int | None:
+        """End of the destination at ``position`` (``position`` when it is
+        empty), or None when it is not one."""
+        view = self.view
+        if view.startswith("<", position):
+            pointy = _LINK_POINTY_DESTINATION_RE.match(view, position)
+            return None if pointy is None else pointy.end()
+        run_end = self._run_end(position)
+        parentheses = self._pair_parentheses()
+        index = bisect.bisect_left(parentheses, position)
+        while index < len(parentheses) and parentheses[index] < run_end:
+            if view[parentheses[index]] == ")":
+                return parentheses[index]
+            partner = self._partners[index]
+            if (partner < 0 or parentheses[partner] >= run_end
+                    or self._depths[index] > _LINK_PARENTHESES_DEPTH):
+                return None
+            index = partner + 1
+        return run_end
+
+    def end(self, position: int, text: str, labels: frozenset[str]) -> int | None:
+        """End of the tail after a "]" that ends before ``position``.
+
+        ``text`` is the link text and ``labels`` the defined references. An
+        inline tail first, then a "[label]" that is defined (an empty one
+        names ``text``), then a shortcut: ``position`` itself when ``text``
+        is defined. None when the brackets are not a link.
+        """
+        view = self.view
+        if view.startswith("(", position):
+            start = _LINK_TAIL_START_RE.match(view, position).end()
+            destination_end = self._destination_end(start)
+            if destination_end is not None:
+                close = _LINK_TAIL_END_RE.match(view, destination_end)
+                if close is not None:
+                    return close.end()
+        if not labels:
+            return None
+        if view.startswith("[", position):
+            label = _LINK_LABEL_RE.match(view, position)
+            if label is not None:
+                named = view[position + 1:label.end() - 1] or text
+                if _link_label_key(named) in labels:
+                    return label.end()
+        return position if _link_label_key(text) in labels else None
+
+
+def _link_label_key(label: str) -> str:
+    """A reference label as CommonMark matches it: case and runs of white
+    space do not matter."""
+    return " ".join(label.split()).casefold()
+
+
+def _backstop_link_reading(
+    view: str, tails: _LinkTails, labels: frozenset[str], drop_alt: bool,
+) -> tuple[str, list[int] | None, bool]:
+    """One reading of ``view`` with its Markdown links as their text.
+
+    A link keeps its text: its "[" (the nearest one since the last link)
+    and its "]" and tail go. An image goes whole when ``drop_alt`` is set,
+    else it shows its alt text. Brackets that form no link stay, as a
+    renderer shows them; the marks inside severity words go. Returns the
+    text, its line origins (None when no line was joined; a destination on
+    the next line joins two) and whether an image was read.
+    """
+    closes = _LINK_ANY_CLOSE_RE if labels else _LINK_CLOSE_RE
+    kept: list[str] = []
+    joined_spans: list[tuple[int, int]] = []
+    copied = searched = 0
+    saw_image = False
+    while (close := closes.search(view, searched)) is not None:
+        bracket = close.end() - 1
+        image = view.startswith("!", close.start())
+        opener = (close.start() + 1 if image
+                  else view.rfind("[", copied, bracket))
+        text = view[opener + 1:bracket] if opener >= 0 else ""
+        end = tails.end(close.end(), text, labels)
+        if end is None:
+            searched = close.end()
+            continue
+        if image:
+            saw_image = True
+            kept.append(view[copied:close.start()])
+            if not drop_alt:
+                kept.append(text)
+            deleted_from = close.start() if drop_alt else bracket
+        else:
+            if opener >= 0:
+                kept.append(view[copied:opener])
+                kept.append(text)
+            else:
+                kept.append(view[copied:bracket])
+            deleted_from = bracket
+        if view.count("\n", deleted_from, end):
+            joined_spans.append((deleted_from, end))
+        copied = searched = end
+    kept.append(view[copied:])
+    origins = (_backstop_line_origins(view, joined_spans)
+               if joined_spans else None)
+    return _backstop_split_words_joined("".join(kept)), origins, saw_image
+
+
+def _backstop_links_read(view: str) -> list[tuple[str, list[int] | None]]:
+    """Readings of ``view`` with its Markdown links as their text.
+
+    Images removed whole with references resolved against the definitions
+    the review holds; and, when the review has a definition or an image,
+    alt text shown with no reference resolved (a "definition" may be text
+    a renderer shows). Readings equal to ``view`` are left out; none when
+    no link markup touches a word.
+    """
+    if "]" not in view or _BACKSTOP_LINK_JOIN_RE.search(view) is None:
+        return []
+    tails = _LinkTails(view)
+    defined = frozenset(
+        _link_label_key(match.group(1))
+        for match in _LINK_DEFINITION_RE.finditer(view)
+    )
+    text, origins, saw_image = _backstop_link_reading(view, tails, defined,
+                                                      drop_alt=True)
+    readings = [(text, origins)] if text != view else []
+    if defined or saw_image:
+        text, origins, _ = _backstop_link_reading(view, tails, frozenset(),
+                                                  drop_alt=False)
+        if text != view and (text, origins) not in readings:
+            readings.append((text, origins))
+    return readings
+
+
 def _backstop_exempt_count(
-    view: str, start: int, end: int, previous: tuple[int, int] | None,
+    view: str, newlines: list[int], line: int, start: int, end: int,
+    previous: tuple[int, int, int] | None,
 ) -> int | None:
     """The count a token states when it sits in a tally, negation or list.
 
     0 for a negation, the tally's count for a tally, the count of the word
     before for the next word of such a list (``previous`` is that word's
-    end and count), None when the token may label a finding.
+    end, count and line), None when the token may label a finding. Every
+    exemption requires what follows the token to be safe (task 3149,
+    R3143-02; see ``_BACKSTOP_SAFE_AFTER_RE``).
     """
-    window_start = view.rfind("\n", max(0, start - _BACKSTOP_CONTEXT), start) + 1
-    before = view[max(window_start, start - _BACKSTOP_CONTEXT):start]
-    after_end = view.find("\n", end, end + _BACKSTOP_CONTEXT)
-    after = view[end:after_end if after_end != -1 else end + _BACKSTOP_CONTEXT]
-    tally = _BACKSTOP_COUNT_BEFORE_RE.search(before)
-    if tally is None:
-        tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
-    if tally is not None:
-        stated = tally.group(1)
-        return (int(stated) if stated.isdigit()
-                else _BACKSTOP_NUMBER_WORDS[stated.lower()])
-    if (_BACKSTOP_NEGATION_BEFORE_RE.search(before)
-            and not _BACKSTOP_COLON_AFTER_RE.match(after)):
+    line_start = newlines[line - 1] + 1 if line else 0
+    before = view[max(line_start, start - _BACKSTOP_CONTEXT):start]
+    after = _backstop_after_text(view, newlines, line, end)
+    tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
+    # A cut tail never matches (and would only cost backtracking to find out).
+    if (tally is not None and not after.endswith(_BACKSTOP_CUT)
+            and _BACKSTOP_TALLY_TAIL_RE.fullmatch(after, tally.end())):
+        return int(tally.group(1))
+    if _BACKSTOP_SAFE_AFTER_RE.match(after) is None:
+        return None
+    stated = _BACKSTOP_COUNT_BEFORE_RE.search(before)
+    if stated is not None:
+        word = stated.group(1)
+        return (int(word) if word.isdigit()
+                else _BACKSTOP_NUMBER_WORDS[word.lower()])
+    if (_backstop_negates(before)
+            or _backstop_wrapped_negation(view, newlines, line, line_start,
+                                          start)):
         return 0
     if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
         return 1
-    if (previous is not None and start - previous[0] <= _BACKSTOP_CONTEXT
-            and _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)):
+    if (previous is not None and previous[2] == line
+            and start - previous[0] <= _BACKSTOP_CONTEXT):
+        joiner = _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)
+        if joiner is None:
+            return None
+        # "not MEDIUM, HIGH" ends on HIGH: a bare comma must lead on to more
+        # of the list or to a noun, or HIGH is the finding's label.
+        if (joiner.group(0).strip(" \t*_`") == ","
+                and _BACKSTOP_LIST_CONTINUES_RE.match(after) is None):
+            return None
         return previous[1]
     return None
+
+
+def _backstop_severity(word: str) -> str:
+    """The severity a token spells ("HlGH" and "H1GH" are HIGH)."""
+    return _BACKSTOP_SEVERITY_BY_INITIAL[word[0]]
 
 
 def _backstop_tokens(
@@ -3012,24 +3605,25 @@ def _backstop_tokens(
     """
     found: dict[tuple[int, str], int] = {}
     newlines: list[int] | None = None
-    previous: tuple[int, int] | None = None
+    previous: tuple[int, int, int] | None = None
     classified = 0
     for match in _BACKSTOP_TOKEN_RE.finditer(view):
         start, end = match.span()
         if start and view[start - 1].isalnum():
             continue
-        severity = match.group(0)
-        stated = None
-        if classified < _BACKSTOP_CLASSIFY_LIMIT:
-            classified += 1
-            stated = _backstop_exempt_count(view, start, end, previous)
-        previous = None if stated is None else (end, stated)
-        if stated is not None and stated <= covered.get(severity, 0):
-            continue
         if newlines is None:
             newlines = [line_break.start()
                         for line_break in _NEWLINE_RE.finditer(view)]
+        severity = _backstop_severity(match.group(0))
         line = bisect.bisect_left(newlines, start)
+        stated = None
+        if classified < _BACKSTOP_CLASSIFY_LIMIT:
+            classified += 1
+            stated = _backstop_exempt_count(view, newlines, line, start, end,
+                                            previous)
+        previous = None if stated is None else (end, stated, line)
+        if stated is not None and stated <= covered.get(severity, 0):
+            continue
         if origins is not None:
             line = origins[line]
         key = (line, severity)
@@ -3037,22 +3631,62 @@ def _backstop_tokens(
     return found
 
 
-def _backstop_heading_lines(
-    view: str, origins: list[int] | None,
+def _counted_heading_lines(
+    text: str, heading_offsets: tuple[tuple[int, str], ...],
 ) -> set[tuple[int, str]]:
-    """(line, severity) of the finding headings the parser counts."""
-    headings: set[tuple[int, str]] = set()
+    """(line, severity) of the finding headings the parser counted.
+
+    Task 3149 (R3143-01): ``heading_offsets`` come from the parser itself
+    (:attr:`ReviewCountAnalysis.heading_offsets`), never from a rescan of the
+    backstop's decoded or tag-stripped views. "<p>### [S2] HIGH ...</p>" or
+    "&#35;## [S2] HIGH ..." is not a heading the parser counted, so it
+    credits nothing: not its own line, not a section, not an ID.
+    """
+    if not heading_offsets:
+        return set()
+    newlines = [match.start() for match in _NEWLINE_RE.finditer(text)]
+    return {
+        (bisect.bisect_left(newlines, offset), severity)
+        for offset, severity in heading_offsets
+        if severity in _BACKSTOP_SEVERITIES
+    }
+
+
+def _folded_heading_lines(
+    text: str, credited: set[tuple[int, str]],
+    header_counts: dict[str, int] | None,
+) -> set[tuple[int, str]]:
+    """Finding headings the parser counted only in its rendered view.
+
+    The rendered view folds lookalike letters ("### [S1] \\u0397IGH - x"
+    is a HIGH heading there, not in the text as written). ``text`` is the
+    backstop's own copy, lookalikes folded the same way. Its headings are
+    credited in order, but never more per severity than the parser counted
+    beyond ``credited``, so every credited heading is a counted one.
+    """
+    if not header_counts:
+        return set()
+    room = {
+        severity: header_counts.get(severity, 0)
+        - sum(1 for _, word in credited if word == severity)
+        for severity in _BACKSTOP_SEVERITIES
+    }
+    if all(left <= 0 for left in room.values()):
+        return set()
+    extra: set[tuple[int, str]] = set()
     newlines: list[int] | None = None
-    for match in _REVIEW_FINDING_HEADER_RE.finditer(view):
+    for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         severity = match.group(1)
-        if severity not in _BACKSTOP_SEVERITIES:
+        if room.get(severity, 0) <= 0:
             continue
         if newlines is None:
             newlines = [line_break.start()
-                        for line_break in _NEWLINE_RE.finditer(view)]
-        line = bisect.bisect_left(newlines, match.start())
-        headings.add((line if origins is None else origins[line], severity))
-    return headings
+                        for line_break in _NEWLINE_RE.finditer(text)]
+        key = (bisect.bisect_left(newlines, match.start()), severity)
+        if key not in credited and key not in extra:
+            extra.add(key)
+            room[severity] -= 1
+    return extra
 
 
 def _in_finding_section(
@@ -3115,7 +3749,8 @@ def _blank_like(match: re.Match[str]) -> str:
 
 
 def _backstop_masked(text: str) -> str:
-    """``text`` without the final footer's labels and the completion line.
+    """``text`` without the final footer's labels, the completion line and
+    the provenance line.
 
     The footer is the last one the parser's footer scan finds, with the
     gate's marker-comment lines read as blank (R3137-03). Only its CRITICAL,
@@ -3135,13 +3770,25 @@ def _backstop_masked(text: str) -> str:
     if ("EQUIPA-REVIEW-COMPLETE" in last_line
             and _STANDALONE_MARKER_COMMENT_RE.fullmatch(last_line)):
         text = text[:last_start] + " " * len(last_line) + text[len(body):]
+    # Task 3149 (timing): the provenance line on top is blanked the same
+    # way. It holds no word, and a review with no other HTML then needs no
+    # view with its markup removed (half the reading of every such review).
+    first_end = text.find("\n")
+    first_end = len(text) if first_end == -1 else first_end
+    if ("EQUIPA-REVIEWER-RUN" in text[:first_end]
+            and _STANDALONE_MARKER_COMMENT_RE.fullmatch(text, 0, first_end)):
+        text = " " * first_end + text[first_end:]
     return text
 
 
 def _severity_token_backstop(
-    text: str, analysis: ReviewCountAnalysis,
+    text: str, analysis: ReviewCountAnalysis, *,
+    heading_text: str | None = None,
 ) -> ReviewCountAnalysis:
     """Block a trusted review holding a severity word nothing counted.
+
+    ``heading_text`` is the string ``analysis.heading_offsets`` index (the
+    normalised review; default ``text``). It has the same lines as ``text``.
 
     ``text`` is the normalised review. The whole body is read in two views:
     as written and with HTML comments and tags removed (which can join a
@@ -3162,6 +3809,23 @@ def _severity_token_backstop(
     if without_markup is not None:
         views.append((_backstop_normalized(without_markup[0]),
                       without_markup[1]))
+    # R3143-03: each view (as written, and with HTML removed when there was
+    # any; a tag pattern looser than HTML's can remove text a renderer
+    # shows) is also read with its inline marks inside severity words
+    # removed, and with Markdown links of any shape as their text.
+    for base_view, base_origins in list(views):
+        joined = _backstop_inline_joined(base_view)
+        if joined is not None:
+            views.append((joined, base_origins))
+        math = _backstop_math_joined(base_view)
+        if math is not None:
+            views.append((math, base_origins))
+        for link_text, link_origins in _backstop_links_read(base_view):
+            if link_origins is None:
+                link_origins = base_origins
+            elif base_origins is not None:
+                link_origins = [base_origins[line] for line in link_origins]
+            views.append((link_text, link_origins))
     footer = analysis.footer_counts or {}
     # What the review counts per severity (footer, headings, resolved).
     covered = analysis.counts or footer
@@ -3172,9 +3836,11 @@ def _severity_token_backstop(
                 tokens[key] = count
     if not tokens:
         return analysis
-    headings: set[tuple[int, str]] = set()
-    for view, origins in views:
-        headings |= _backstop_heading_lines(view, origins)
+    headings = _counted_heading_lines(
+        text if heading_text is None else heading_text,
+        analysis.heading_offsets,
+    )
+    headings |= _folded_heading_lines(text, headings, analysis.header_counts)
     # A finding's section runs from its heading to the next heading of
     # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
     # "MEDIUM because ...") is that finding, not another one.
@@ -3188,7 +3854,8 @@ def _severity_token_backstop(
 
     parser_headings = analysis.header_counts or {}
     masked_lines = masked.split("\n") if headings else []
-    problems: list[str] = []
+    problems: list[tuple[str, str]] = []
+    reported: dict[str, int] = {}
     for severity in _BACKSTOP_SEVERITIES:
         heading_lines = sorted(line for line, word in headings
                                if word == severity)
@@ -3215,17 +3882,29 @@ def _severity_token_backstop(
             shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
             if len(lines) > _BACKSTOP_REPORTED_LINES:
                 shown += f" and {len(lines) - _BACKSTOP_REPORTED_LINES} more"
-            problems.append(
+            problems.append((severity,
                 f"{severity}={unaccounted} at line {shown} (footer "
                 f"{footer_count}, finding headings {counted})",
-            )
+            ))
+            reported[severity] = counted + unaccounted
     if not problems:
         return analysis
-    return replace(
-        analysis,
-        verdict=REVIEW_VERDICT_COUNT_MISMATCH,
-        detail=f"{BACKSTOP_REASON}: " + "; ".join(problems),
-    )
+    detail = "; ".join(problem for _, problem in problems)
+    if any(severity in MERGE_BLOCKING_SEVERITIES for severity, _ in problems):
+        return replace(
+            analysis,
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{BACKSTOP_REASON}: {detail}",
+        )
+    # Task 3149 (R3143-06): only MEDIUM tokens are unaccounted, and MEDIUM
+    # never blocks a merge. Untrusting the review for them blocked the merge
+    # anyway; now they are counted (the MEDIUM count includes them) and the
+    # detail is logged by the gate, and the review stays trusted.
+    counts = dict(analysis.counts or {})
+    for severity, total in reported.items():
+        counts[severity] = max(counts.get(severity, 0), total)
+    return replace(analysis, counts=counts,
+                   detail=f"{BACKSTOP_ADVISORY_REASON}: {detail}")
 
 
 def _stricter_analysis(
@@ -3236,19 +3915,21 @@ def _stricter_analysis(
     A view that does not trust the review wins, the text as written first
     (its verdict and detail are the ones earlier tasks produced). When both
     trust it, the rendered view is returned with the per-severity maximum of
-    the two views' merge counts.
+    the two views' merge counts. The heading offsets are always the text
+    as written's: the rendered view's offsets index another string.
     """
     if not as_written.trusted:
         return as_written
     if not rendered.trusted:
-        return rendered
+        return replace(rendered, heading_offsets=as_written.heading_offsets)
     written_counts = as_written.counts or {}
     rendered_counts = rendered.counts or {}
-    return replace(rendered, counts={
-        severity: max(written_counts.get(severity, 0),
-                      rendered_counts.get(severity, 0))
-        for severity in _REVIEW_SEVERITIES
-    })
+    return replace(rendered, heading_offsets=as_written.heading_offsets,
+                   counts={
+                       severity: max(written_counts.get(severity, 0),
+                                     rendered_counts.get(severity, 0))
+                       for severity in _REVIEW_SEVERITIES
+                   })
 
 
 def _analyze_review_file(
@@ -3296,6 +3977,17 @@ def _analyze_review_file(
         text = read_artifact_text(review_path)
         if text is None:
             return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
+    # Task 3149 (R3143-07): a bidi override or isolate reorders what the
+    # reader sees, and normalising strips it, so it is looked for first. The
+    # gate's own text was normalised by the provenance check, which rejects
+    # the same characters in the bytes as written.
+    bidi = find_bidi_control(text)
+    if bidi is not None:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{REVIEW_BIDI_REASON}: {bidi} (name the character, "
+                   f"never paste it)",
+        )
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised
@@ -3307,7 +3999,7 @@ def _analyze_review_file(
     folded_first = None
     if not text.isascii():
         folded_first = normalize_review_text(
-            text.translate(_BACKSTOP_LETTER_FOLDS),
+            _translate_non_ascii(text, _BACKSTOP_LETTER_FOLDS),
         )
     text = normalize_review_text(text)
 
@@ -3334,11 +4026,33 @@ def _analyze_review_file(
                         f"changed the line count"),
             )
         backstop_text = folded_first
-    return _severity_token_backstop(backstop_text, analysis)
+    return _severity_token_backstop(backstop_text, analysis, heading_text=text)
+
+
+def _too_many_severity_lines(
+    text: str, view: str,
+) -> ReviewCountAnalysis | None:
+    """An incomplete verdict when ``text`` holds more lines with a severity
+    word than any review the gate parses (_REVIEW_MAX_SEVERITY_LINES)."""
+    lines = 0
+    for _ in _SEVERITY_WORD_LINE_RE.finditer(text):
+        lines += 1
+        if lines > _REVIEW_MAX_SEVERITY_LINES:
+            return ReviewCountAnalysis(
+                verdict=REVIEW_VERDICT_INCOMPLETE,
+                detail=(f"review too dense to parse: more than "
+                        f"{_REVIEW_MAX_SEVERITY_LINES} lines {view} hold a "
+                        f"severity word"),
+            )
+    return None
 
 
 def _analyze_review_views(text: str) -> ReviewCountAnalysis:
     """The shape rules of :func:`_analyze_review_file`, on normalised text."""
+    if not text.isascii():
+        # R3143-05: every case-insensitive rule reads "HİGH" as HIGH, so it
+        # is spelled that way before any rule runs (one letter for one).
+        text = text.replace("\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}", "I")
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     text = _fold_blank_line_runs(text)
@@ -3352,14 +4066,21 @@ def _analyze_review_views(text: str) -> ReviewCountAnalysis:
             detail=(f"review too long to parse: {line_count} lines after "
                     f"folding blank runs (at most {_REVIEW_MAX_PARSED_LINES})"),
         )
+    too_dense = _too_many_severity_lines(text, "as written")
+    if too_dense is not None:
+        return too_dense
     # Task 3130: parse the text as written (what every earlier task parsed)
     # and as rendered (comments removed, references decoded, lookalike
     # letters folded, blank runs collapsed); the stricter result wins. The
     # rendered view catches "&#72;IGH" and "HI<!-- -->GH"; the text as
     # written keeps every block it produced before, including a finding
     # inside a multi-line comment.
-    as_written = _analyze_review_text(text, nonblank_lines)
     rendered = _rendered_review_text(text)
+    # Decoding and folding can spell a severity word on more lines.
+    too_dense = _too_many_severity_lines(rendered, "as rendered")
+    if too_dense is not None:
+        return too_dense
+    as_written = _analyze_review_text(text, nonblank_lines)
     if rendered == _without_edge_markers(text):
         # Only the provenance line on top and the completion line at the end
         # differ: nothing comes before the first or after the last line, so
@@ -3378,9 +4099,11 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     """
     header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     resolved_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    heading_offsets: list[tuple[int, str]] = []
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         line_end = text.find("\n", match.start())
         header_line = text[match.start():line_end if line_end != -1 else None]
+        heading_offsets.append((match.start(), match.group(1)))
         if _RESOLVED_FINDING_HEADER_RE.search(header_line):
             resolved_counts[match.group(1)] += 1
         else:
@@ -3455,6 +4178,7 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
             footer_counts=footer_counts,
             header_counts=header_counts,
             detail=detail,
+            heading_offsets=tuple(heading_offsets),
         )
 
     headers_total = sum(header_counts.values()) + sum(resolved_counts.values())
@@ -3571,9 +4295,33 @@ def _count_findings_in_review_file(
     Untrusted-but-present artifacts emit a ``[GATE-AUDIT]`` line
     (``event=count-mismatch`` or ``event=review-incomplete``) carrying both
     tallies, so the log records why a review that exists was not believed.
+
+    Task 3149 (R3143-04 / R3143-05): ANY exception from the parser is a
+    ``count-mismatch`` with detail ``review parse error: <type>``, logged like
+    every other untrusted review, and the merge blocks (fail closed with a
+    verdict line, never an exception out of the gate). A trusted review whose
+    MEDIUM count includes unaccounted MEDIUM tokens logs
+    ``event=backstop-advisory``.
     """
-    analysis = _analyze_review_file(review_path, text=text)
+    try:
+        analysis = _analyze_review_file(review_path, text=text)
+    except Exception as error:  # noqa: BLE001 - any parser failure blocks
+        logger.exception("[security-review] parsing %s failed", review_path)
+        analysis = ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{REVIEW_PARSE_ERROR_REASON}: {type(error).__name__}",
+        )
     if analysis.trusted:
+        if analysis.detail.startswith(BACKSTOP_ADVISORY_REASON):
+            _gate_audit_log(
+                f"task={task_id} event=backstop-advisory "
+                f"artifact={review_path.name} "
+                f"counts=[{format_counts(analysis.counts)}] "
+                f"detail={analysis.detail!r} action=count-only",
+                task_id=task_id,
+                event="backstop-advisory",
+                counts=analysis.counts,
+            )
         return analysis.counts
     if analysis.verdict in (
         REVIEW_VERDICT_COUNT_MISMATCH, REVIEW_VERDICT_INCOMPLETE,

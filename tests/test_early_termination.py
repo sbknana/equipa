@@ -1192,8 +1192,10 @@ def test_tester_prompt_bias_section_is_at_top():
 def test_security_reviewer_prompt_has_bias_for_action():
     """Test that security reviewer prompt contains the 'Bias for Action' section."""
     text = _read_prompt("security-reviewer")
-    assert "## CRITICAL: Bias for Action" in text, \
-        "security-reviewer prompt missing '## CRITICAL: Bias for Action' section"
+    # Task 3149 (R3143-06): the reviewer prompt writes severity words in
+    # lower case outside a finding label, so its heading is "Required".
+    assert "## Required: Bias for Action" in text, \
+        "security-reviewer prompt missing '## Required: Bias for Action' section"
     # Check reviewer-specific directives
     assert "first 5 tool calls" in text, \
         "security-reviewer prompt missing 'first 5 tool calls' directive"
@@ -1217,7 +1219,8 @@ def test_security_reviewer_prompt_has_few_shot_examples():
 def test_security_reviewer_prompt_bias_section_is_at_top():
     """Test that the Bias for Action section appears BEFORE the main agent identity."""
     text = _read_prompt("security-reviewer")
-    bias_pos = text.find("## CRITICAL: Bias for Action")
+    bias_pos = text.find("## Required: Bias for Action")
+    assert bias_pos != -1, "security-reviewer prompt lost its Bias for Action"
     identity_pos = text.find("# EQUIPA SecurityReviewer Agent")
     assert bias_pos < identity_pos, \
         f"Bias for Action (pos {bias_pos}) must appear before agent identity (pos {identity_pos})"

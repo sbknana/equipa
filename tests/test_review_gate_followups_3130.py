@@ -278,10 +278,13 @@ def test_severity_range_cell_counted_by_footer_merges():
     the count the footer states."""
     body = ["## Findings", "", "| ID | Issue | Rating |", "|---|---|---|",
             "| S1 | SQL injection | HIGH/MEDIUM |"]
-    blocked = assert_only_the_backstop_blocks(
-        review("1 finding.", body, ONE_HIGH, low_heading=False))
-    assert blocked.counts["HIGH"] == 1
-    assert "MEDIUM=1" in blocked.detail
+    # Task 3149 (R3143-06): the unaccounted MEDIUM is counted and logged as
+    # an advisory (MEDIUM never blocks a merge); the HIGH still holds it.
+    advisory = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
+    assert advisory.counts["HIGH"] == 1
+    assert advisory.counts["MEDIUM"] == 1, advisory.detail
+    assert "MEDIUM=1" in advisory.detail
+    assert "(advisory)" in advisory.detail
     body[-1] = "| S1 | SQL injection | HIGH/medium |"
     analysis = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
