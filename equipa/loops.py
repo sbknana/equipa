@@ -3238,8 +3238,26 @@ def _backstop_after_text(
 _BACKSTOP_INLINE_LINK_RE = re.compile(
     r"!?\[([^\[\]\n]{0,200})\](?:\([^()\n]{0,500}\)|\[[^\[\]\n]{0,100}\])",
 )
-_BACKSTOP_INLINE_SPLIT_RE = re.compile(r"(?<=[^\W_])[*_~`\\]+(?=[^\W_])")
 _BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
+# Task 3149 (tester, cycle 2; markdown-it fuzz): only the marks between the
+# letters of a severity word are dropped. Dropping every mark between two
+# letters also merged a word into its neighbour: "a_*HIGH" became "aHIGH",
+# no token, where a renderer shows "a_*" and a standalone HIGH.
+_BACKSTOP_SPLIT_WORD_RE = re.compile("|".join(
+    r"[*_~`\\]*+".join(letters) for letters in (
+        ("C", "R", "[Il1|]", "T", "[Il1|]", "C", "A", "L"),
+        ("H", "[Il1|]", "G", "H"),
+        ("M", "E", "D", "[Il1|]", "U", "M"),
+    )
+))
+_BACKSTOP_WORD_MARKS = str.maketrans("", "", "*_~`\\")
+
+
+def _backstop_split_words_joined(view: str) -> str:
+    """``view`` with the marks inside each severity word removed."""
+    return _BACKSTOP_SPLIT_WORD_RE.sub(
+        lambda word: word.group(0).translate(_BACKSTOP_WORD_MARKS), view,
+    )
 
 
 def _backstop_inline_joined(view: str) -> str | None:
@@ -3247,10 +3265,247 @@ def _backstop_inline_joined(view: str) -> str | None:
     when that changes nothing."""
     if not any(mark in view for mark in _BACKSTOP_INLINE_MARKS):
         return None
-    joined = _BACKSTOP_INLINE_SPLIT_RE.sub(
-        "", _BACKSTOP_INLINE_LINK_RE.sub(r"\1", view),
+    joined = _backstop_split_words_joined(
+        _BACKSTOP_INLINE_LINK_RE.sub(r"\1", view),
     )
     return None if joined == view else joined
+
+
+# Task 3149 (tester, cycle 2): the bounded pattern above missed links a
+# CommonMark renderer still draws as their text: long link text, a long or
+# nested destination, an escaped parenthesis, a title holding parentheses, a
+# destination on the next line, shortcut and long-label reference links, an
+# image with a long alt text. This view reads a link's tail the way
+# markdown-it does, at any length: "(", white space with at most one line
+# break, a destination ("<...>" on one line, or a run without spaces or
+# controls whose parentheses balance and nest at most 32 deep), an optional
+# title ("...", '...' or (...)) after white space, white space, ")"; else a
+# "[label]" of at most 999 characters. Every tail found is removed, every
+# image is removed whole (its alt text is not drawn), and every bracket left
+# is removed. A reference whose definition is missing renders as written;
+# reading it as a link only joins more text (fail closed).
+#
+# Linear: the parentheses are paired once for the whole view, and a
+# destination is read by jumping from each top-level "(" to its partner, so
+# no character is read twice per destination (a 32-level regex read each
+# character up to 32 times, 0.3 s on 200 KB of "a[a](").
+_LINK_SPACE = r"[ \t]*+(?:\n[ \t]*+)?+"
+_LINK_TITLE = (
+    r"\"(?:\\[\s\S]|[^\"\\])*+\"|'(?:\\[\s\S]|[^'\\])*+'"
+    r"|\((?:\\[\s\S]|[^()\\])*+\)"
+)
+_LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
+_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*+>")
+_LINK_TAIL_END_RE = re.compile(
+    r"(?:(?:[ \t]++(?:\n[ \t]*+)?+|\n[ \t]*+)(?:" + _LINK_TITLE + r"))?+"
+    + _LINK_SPACE + r"\)",
+)
+_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}+\]")
+# A raw destination ends at a space or a control character.
+_LINK_DESTINATION_END_RE = re.compile(r"[\x00-\x20\x7f]")
+# Unescaped parentheses; "\(" and "\\" are read (and skipped) as pairs.
+_LINK_PARENTHESIS_RE = re.compile(r"\\[()\\]|[()]")
+_LINK_PARENTHESES_DEPTH = 32
+# An image from "![" to its "]", or a "]" a tail may follow (any "]" once
+# the review defines a reference, which a shortcut "[text]" may name). The
+# alt text stops at another "![" or a blank line, so a flood of unclosed
+# "![" is read once.
+_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*+\n))*+\]"
+_LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
+_LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
+# A link reference definition ("[label]: destination"), also inside a quote
+# or list item. Read loosely: a reading that trusts these is paired with one
+# that trusts none, since a "definition" inside a paragraph or code is text.
+_LINK_DEFINITION_RE = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?)*+(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?+"
+    r"\[((?:\\[^\n]|[^\[\]\\]){1,999}+)\]:",
+    re.MULTILINE,
+)
+# Link markup a removal can join a word across: a letter or digit (or the
+# "|" drawn as I) right before "[" or "![", or right after "]" or ")",
+# emphasis marks and further brackets between.
+_BACKSTOP_LINK_JOIN_RE = re.compile(
+    r"(?:[^\W_]|\|)[*_~`\\]*+!?\[|[\])][*_~`\\!\[]*+(?:[^\W_]|\|)",
+)
+
+
+class _LinkTails:
+    """Where each Markdown link tail of one view ends (see above)."""
+
+    def __init__(self, view: str) -> None:
+        self.view = view
+        self._parentheses: list[int] | None = None
+        self._partners: list[int] = []
+        self._depths: list[int] = []
+        self._run = (0, 0)
+
+    def _pair_parentheses(self) -> list[int]:
+        """Positions of the unescaped parentheses, each paired with its
+        partner (index, or -1) and, for "(", how deep its group nests."""
+        if self._parentheses is not None:
+            return self._parentheses
+        positions: list[int] = []
+        partners: list[int] = []
+        depths: list[int] = []
+        open_indexes: list[int] = []
+        for match in _LINK_PARENTHESIS_RE.finditer(self.view):
+            if match.end() - match.start() == 2:
+                continue  # an escaped parenthesis or backslash
+            index = len(positions)
+            positions.append(match.start())
+            partners.append(-1)
+            depths.append(1)
+            if match.group(0) == "(":
+                open_indexes.append(index)
+            elif open_indexes:
+                opener = open_indexes.pop()
+                partners[opener] = index
+                partners[index] = opener
+                if open_indexes:
+                    parent = open_indexes[-1]
+                    depths[parent] = max(depths[parent], depths[opener] + 1)
+        self._parentheses = positions
+        self._partners = partners
+        self._depths = depths
+        return positions
+
+    def _run_end(self, position: int) -> int:
+        """Where the run of non-space characters at ``position`` ends."""
+        start, end = self._run
+        if start <= position < end:
+            return end
+        found = _LINK_DESTINATION_END_RE.search(self.view, position)
+        end = len(self.view) if found is None else found.start()
+        self._run = (position, end)
+        return end
+
+    def _destination_end(self, position: int) -> int | None:
+        """End of the destination at ``position`` (``position`` when it is
+        empty), or None when it is not one."""
+        view = self.view
+        if view.startswith("<", position):
+            pointy = _LINK_POINTY_DESTINATION_RE.match(view, position)
+            return None if pointy is None else pointy.end()
+        run_end = self._run_end(position)
+        parentheses = self._pair_parentheses()
+        index = bisect.bisect_left(parentheses, position)
+        while index < len(parentheses) and parentheses[index] < run_end:
+            if view[parentheses[index]] == ")":
+                return parentheses[index]
+            partner = self._partners[index]
+            if (partner < 0 or parentheses[partner] >= run_end
+                    or self._depths[index] > _LINK_PARENTHESES_DEPTH):
+                return None
+            index = partner + 1
+        return run_end
+
+    def end(self, position: int, text: str, labels: frozenset[str]) -> int | None:
+        """End of the tail after a "]" that ends before ``position``.
+
+        ``text`` is the link text and ``labels`` the defined references. An
+        inline tail first, then a "[label]" that is defined (an empty one
+        names ``text``), then a shortcut: ``position`` itself when ``text``
+        is defined. None when the brackets are not a link.
+        """
+        view = self.view
+        if view.startswith("(", position):
+            start = _LINK_TAIL_START_RE.match(view, position).end()
+            destination_end = self._destination_end(start)
+            if destination_end is not None:
+                close = _LINK_TAIL_END_RE.match(view, destination_end)
+                if close is not None:
+                    return close.end()
+        if not labels:
+            return None
+        if view.startswith("[", position):
+            label = _LINK_LABEL_RE.match(view, position)
+            if label is not None:
+                named = view[position + 1:label.end() - 1] or text
+                if _link_label_key(named) in labels:
+                    return label.end()
+        return position if _link_label_key(text) in labels else None
+
+
+def _link_label_key(label: str) -> str:
+    """A reference label as CommonMark matches it: case and runs of white
+    space do not matter."""
+    return " ".join(label.split()).casefold()
+
+
+def _backstop_link_reading(
+    view: str, tails: _LinkTails, labels: frozenset[str], drop_alt: bool,
+) -> tuple[str, list[int] | None, bool]:
+    """One reading of ``view`` with its Markdown links as their text.
+
+    A link keeps its text: its "[" (the nearest one since the last link)
+    and its "]" and tail go. An image goes whole when ``drop_alt`` is set,
+    else it shows its alt text. Brackets that form no link stay, as a
+    renderer shows them; the marks inside severity words go. Returns the
+    text, its line origins (None when no line was joined; a destination on
+    the next line joins two) and whether an image was read.
+    """
+    closes = _LINK_ANY_CLOSE_RE if labels else _LINK_CLOSE_RE
+    kept: list[str] = []
+    joined_spans: list[tuple[int, int]] = []
+    copied = searched = 0
+    saw_image = False
+    while (close := closes.search(view, searched)) is not None:
+        bracket = close.end() - 1
+        image = view.startswith("!", close.start())
+        opener = (close.start() + 1 if image
+                  else view.rfind("[", copied, bracket))
+        text = view[opener + 1:bracket] if opener >= 0 else ""
+        end = tails.end(close.end(), text, labels)
+        if end is None:
+            searched = close.end()
+            continue
+        if image:
+            saw_image = True
+            kept.append(view[copied:close.start()])
+            if not drop_alt:
+                kept.append(text)
+            deleted_from = close.start() if drop_alt else bracket
+        else:
+            if opener >= 0:
+                kept.append(view[copied:opener])
+                kept.append(text)
+            else:
+                kept.append(view[copied:bracket])
+            deleted_from = bracket
+        if view.count("\n", deleted_from, end):
+            joined_spans.append((deleted_from, end))
+        copied = searched = end
+    kept.append(view[copied:])
+    origins = (_backstop_line_origins(view, joined_spans)
+               if joined_spans else None)
+    return _backstop_split_words_joined("".join(kept)), origins, saw_image
+
+
+def _backstop_links_read(view: str) -> list[tuple[str, list[int] | None]]:
+    """Readings of ``view`` with its Markdown links as their text.
+
+    Images removed whole with references resolved against the definitions
+    the review holds; and, when the review has a definition or an image,
+    alt text shown with no reference resolved (a "definition" may be text
+    a renderer shows). Readings equal to ``view`` are left out; none when
+    no link markup touches a word.
+    """
+    if "]" not in view or _BACKSTOP_LINK_JOIN_RE.search(view) is None:
+        return []
+    tails = _LinkTails(view)
+    defined = frozenset(
+        _link_label_key(match.group(1))
+        for match in _LINK_DEFINITION_RE.finditer(view)
+    )
+    text, origins, saw_image = _backstop_link_reading(view, tails, defined,
+                                                      drop_alt=True)
+    readings = [(text, origins)] if text != view else []
+    if defined or saw_image:
+        text, origins, _ = _backstop_link_reading(view, tails, frozenset(),
+                                                  drop_alt=False)
+        if text != view and (text, origins) not in readings:
+            readings.append((text, origins))
+    return readings
 
 
 def _backstop_exempt_count(
@@ -3459,7 +3714,8 @@ def _blank_like(match: re.Match[str]) -> str:
 
 
 def _backstop_masked(text: str) -> str:
-    """``text`` without the final footer's labels and the completion line.
+    """``text`` without the final footer's labels, the completion line and
+    the provenance line.
 
     The footer is the last one the parser's footer scan finds, with the
     gate's marker-comment lines read as blank (R3137-03). Only its CRITICAL,
@@ -3479,6 +3735,14 @@ def _backstop_masked(text: str) -> str:
     if ("EQUIPA-REVIEW-COMPLETE" in last_line
             and _STANDALONE_MARKER_COMMENT_RE.fullmatch(last_line)):
         text = text[:last_start] + " " * len(last_line) + text[len(body):]
+    # Task 3149 (timing): the provenance line on top is blanked the same
+    # way. It holds no word, and a review with no other HTML then needs no
+    # view with its markup removed (half the reading of every such review).
+    first_end = text.find("\n")
+    first_end = len(text) if first_end == -1 else first_end
+    if ("EQUIPA-REVIEWER-RUN" in text[:first_end]
+            and _STANDALONE_MARKER_COMMENT_RE.fullmatch(text, 0, first_end)):
+        text = " " * first_end + text[first_end:]
     return text
 
 
@@ -3510,11 +3774,20 @@ def _severity_token_backstop(
     if without_markup is not None:
         views.append((_backstop_normalized(without_markup[0]),
                       without_markup[1]))
-    # R3143-03: the last view (HTML removed when there was any) with
-    # Markdown inline markup inside words removed too.
-    joined = _backstop_inline_joined(views[-1][0])
-    if joined is not None:
-        views.append((joined, views[-1][1]))
+    # R3143-03: each view (as written, and with HTML removed when there was
+    # any; a tag pattern looser than HTML's can remove text a renderer
+    # shows) is also read with its inline marks inside severity words
+    # removed, and with Markdown links of any shape as their text.
+    for base_view, base_origins in list(views):
+        joined = _backstop_inline_joined(base_view)
+        if joined is not None:
+            views.append((joined, base_origins))
+        for link_text, link_origins in _backstop_links_read(base_view):
+            if link_origins is None:
+                link_origins = base_origins
+            elif base_origins is not None:
+                link_origins = [base_origins[line] for line in link_origins]
+            views.append((link_text, link_origins))
     footer = analysis.footer_counts or {}
     # What the review counts per severity (footer, headings, resolved).
     covered = analysis.counts or footer

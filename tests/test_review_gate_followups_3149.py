@@ -382,6 +382,75 @@ def test_r3143_03_markup_between_words_adds_nothing():
     assert analysis.trusted and analysis.detail == "", analysis
 
 
+# Link shapes the bounded pattern missed (tester, cycle 2), and more of the
+# same grammar: any length, parentheses nested up to 32 deep, titles, a line
+# break, labels, images. Each renders one UPPER-case word in CommonMark
+# (checked with markdown-it-py while writing this test) except the last two
+# rows: "*HI*GH" (a renderer may leave the marks as text) and "H1GH" (the
+# "1" drawn as I, R3143-07), which the backstop reads as a word either way.
+R3143_03_LINK_BODIES = [
+    ["[" + "a " * 300 + "HI](#x)GH: SQL injection in login.py"],
+    ["[HI](#" + "a" * 5000 + ")GH: SQL injection in login.py"],
+    ["[HI](a(b(c(d(e)d)c)b)a)GH: SQL injection in login.py"],
+    ["[HI](" + "(" * 32 + "x" + ")" * 32 + ")GH: SQL injection in login.py"],
+    ["[HI](a\\)b\\(c)GH: SQL injection in login.py"],
+    ['[HI](#x "a)b")GH: SQL injection in login.py'],
+    ["[HI](#x 'a(b')GH: SQL injection in login.py"],
+    ["[HI](#x (title))GH: SQL injection in login.py"],
+    ["[HI](<a b(c>)GH: SQL injection in login.py"],
+    ["[HI](", "#x", '"title")GH: SQL injection in login.py'],
+    ["[HI]()GH: SQL injection in login.py"],
+    ["[HI]GH: SQL injection in login.py", "", "[HI]: #x"],
+    ["[HI][" + "r" * 900 + "]GH: SQL injection in login.py", "",
+     "[" + "r" * 900 + "]: #x"],
+    ["HI![" + "a" * 3000 + "](x)GH: SQL injection in login.py"],
+    ["HI![alt][ref]GH: SQL injection in login.py", "", "[ref]: x.png"],
+    ["[H](" + "a" * 600 + ")[I](" + "b" * 600 + ")GH: SQL injection"],
+    ["H[IGH](#" + "x" * 600 + "): SQL injection in login.py"],
+    ["The [CRIT](#" + "a" * 600 + ")ICAL RCE in upload.py."],
+    ["*[HI](#" + "x" * 600 + ")*GH: SQL injection in login.py"],
+    ["[H1](#" + "a" * 600 + ")GH: SQL injection in login.py"],
+]
+
+
+@pytest.mark.parametrize("body", R3143_03_LINK_BODIES)
+def test_r3143_03_links_of_any_shape_read_as_their_text(body):
+    assert_gate_blocks(body)
+
+
+@pytest.mark.parametrize("body", [
+    # Not links: 33 levels of parentheses, unbalanced, a blank line.
+    ["[HI](" + "(" * 33 + "x" + ")" * 33 + ")"],
+    ["[HI](a(b)GH: x"],
+    ["[HI](", "", "#x)GH: x"],
+])
+def test_r3143_03_link_reader_line_numbers_hold(body):
+    """Whatever the reader makes of a malformed tail, every token keeps a
+    real line number and the review gets a verdict."""
+    analysis = analyze(zero_review(body))
+    assert analysis.verdict in (loops.REVIEW_VERDICT_OK,
+                                loops.REVIEW_VERDICT_COUNT_MISMATCH), analysis
+
+
+def test_r3143_03_link_join_reports_the_line_of_the_link():
+    text = zero_review(["Intro.", "", "See [HI](", "#x)GH: SQL injection"])
+    analysis = analyze(text)
+    line = text.split("\n").index("See [HI](") + 1
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert f"HIGH=1 at line {line} " in analysis.detail, analysis.detail
+
+
+def test_r3143_03_ordinary_links_and_images_add_nothing():
+    analysis = analyze(one_low_review([
+        "See [the docs](https://example.org/a_(b)) and ![logo](x.png).",
+        "Refs: [RFC 9110][rfc], [CWE-89] and [a](<b c> 'title').",
+        "Code: `[x](y)`, a[0] = b[1] and f(x)(y).",
+        "",
+        "[rfc]: https://www.rfc-editor.org/rfc/rfc9110",
+    ]))
+    assert analysis.trusted and analysis.detail == "", analysis
+
+
 # --- R3143-07: lookalike letters and bidi controls --------------------------------
 
 def _spell(word, replacements):
