@@ -4,8 +4,8 @@ and report every text an older tree blocked that this tree lets merge.
 
 Usage:
     python3 scripts/review_gate_differential.py --tree NAME=PATH [...]
-        (--bodies | --corpus ROOT [ROOT ...]) [--write-fixture PATH]
-        [--sample N] [--seed S]
+        (--bodies | --families | --corpus ROOT [ROOT ...])
+        [--write-fixture PATH] [--sample N] [--seed S]
 
 Each ``--tree`` is the root of another checkout of this repository (for
 example a ``git archive`` copy of an older commit). It is run in a worker
@@ -21,6 +21,13 @@ zero-finding review and in a review with one counted LOW finding
 ``--write-fixture`` the bodies some older tree blocked are written as the
 fixture of tests/test_review_gate_stricter_3152.py.
 
+``--families`` (task 3157) builds the same two review texts from every body
+of the probe corpus of the independent 3154 review
+(scripts/review_gate_probe_corpus.py: the hand-written bodies, and the
+separator, tally and negation families for every severity word). With
+``--write-fixture`` each older tree's verdicts are written as the bitset
+fixture of tests/test_review_gate_followups_3157.py.
+
 ``--corpus`` reads every ``SECURITY-REVIEW-*.md`` below each ROOT
 (``node_modules`` skipped) once per distinct sha256. Files are only read.
 
@@ -35,6 +42,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
@@ -177,6 +185,76 @@ def harvested_bodies() -> list[tuple[str, list[str]]]:
     return found
 
 
+# --- the probe corpus of the 3154 review (task 3157) --------------------------------
+
+def probe_corpus_bodies() -> list[tuple[str, str, list[str]]]:
+    """(key, severity word, lines) of scripts/review_gate_probe_corpus.py."""
+    path = REPO / "scripts" / "review_gate_probe_corpus.py"
+    spec = importlib.util.spec_from_file_location("review_gate_probe_corpus",
+                                                  path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.probe_bodies()
+
+
+def family_texts(bodies, builder, contexts) -> list[str]:
+    """The review text of every body in every context, body by body."""
+    return [builder(lines, context) for _, _, lines in bodies
+            for context in contexts]
+
+
+def corpus_digest(texts: list[str]) -> str:
+    """sha256 of ``texts`` in order, each prefixed by its length."""
+    digest = hashlib.sha256()
+    for text in texts:
+        data = text.encode("utf-8", errors="surrogatepass")
+        digest.update(f"{len(data)}:".encode())
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def encode_bits(flags: list[bool]) -> str:
+    """``flags`` as a base64 bitset (bit i of byte i // 8 is flag i)."""
+    data = bytearray((len(flags) + 7) // 8)
+    for index, flag in enumerate(flags):
+        if flag:
+            data[index >> 3] |= 1 << (index & 7)
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def decode_bits(encoded: str, count: int) -> list[bool]:
+    """The ``count`` flags of an :func:`encode_bits` bitset."""
+    data = base64.b64decode(encoded)
+    return [bool(data[index >> 3] & (1 << (index & 7)))
+            for index in range(count)]
+
+
+def write_families_fixture(path: Path, body_count: int, contexts,
+                           texts: list[str], results: dict[str, list[dict]],
+                           trees: dict[str, Path]) -> None:
+    """Per older tree and context, which corpus bodies the tree blocked, as
+    a bitset over the bodies in order, with the digest of the texts."""
+    verdicts = {}
+    for name in sorted(trees):
+        verdicts[name] = {
+            context: encode_bits([
+                results[name][body * len(contexts) + offset]["blocked"]
+                for body in range(body_count)])
+            for offset, context in enumerate(contexts)
+        }
+    data = {
+        "generator": "scripts/review_gate_probe_corpus.py",
+        "bodies": body_count,
+        "contexts": list(contexts),
+        "corpus_sha256": corpus_digest(texts),
+        "blocked": verdicts,
+    }
+    path.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n",
+                    encoding="ascii")
+    print(f"wrote the verdicts of {len(trees)} trees on {body_count} bodies "
+          f"to {path}")
+
+
 # --- corpus ------------------------------------------------------------------------
 
 def corpus_reviews(roots: list[str]) -> list[tuple[str, str]]:
@@ -247,6 +325,8 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--bodies", action="store_true",
                         help="the probe bodies of the review-gate tests")
+    source.add_argument("--families", action="store_true",
+                        help="the probe corpus of the 3154 review")
     source.add_argument("--corpus", nargs="+", metavar="ROOT",
                         help="real SECURITY-REVIEW files below each ROOT")
     parser.add_argument("--write-fixture", metavar="PATH")
@@ -256,8 +336,8 @@ def main() -> int:
     if args.worker:
         run_worker(args.worker)
         return 0
-    if not (args.bodies or args.corpus):
-        parser.error("give --bodies or --corpus")
+    if not (args.bodies or args.families or args.corpus):
+        parser.error("give --bodies, --families or --corpus")
     trees: dict[str, Path] = {}
     for item in args.tree:
         name, separator, path = item.partition("=")
@@ -275,6 +355,17 @@ def main() -> int:
     sys.path.insert(0, str(REPO))
     builder = _load_test_module(BUILDER_MODULE).build_review
     contexts = _load_test_module(BUILDER_MODULE).CONTEXTS
+    if args.families:
+        bodies = probe_corpus_bodies()
+        texts = family_texts(bodies, builder, contexts)
+        labels = [f"{key} {context}" for key, _, _ in bodies
+                  for context in contexts]
+        results, regressions = compare(labels, texts, trees, args.sample,
+                                       args.seed)
+        if args.write_fixture:
+            write_families_fixture(Path(args.write_fixture), len(bodies),
+                                   contexts, texts, results, trees)
+        return 1 if regressions else 0
     entries = [(module, body, context) for module, body in harvested_bodies()
                for context in contexts]
     texts = [builder(body, context) for _, body, context in entries]
