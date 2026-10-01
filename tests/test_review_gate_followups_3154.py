@@ -315,8 +315,9 @@ def test_a_folded_symbol_next_to_the_word_does_not_glue_it(body, context):
 def _standalone_severities(line: str) -> set[str]:
     """The severities the backstop reads as standalone words on ``line``,
     through the same readings _analyze_review_file builds."""
+    # Task 3157: _analyze_review_file folds with _BACKSTOP_VIEW_FOLDS.
     folded = normalize_review_text(
-        loops._translate_non_ascii(line, loops._BACKSTOP_LETTER_FOLDS))
+        loops._translate_non_ascii(line, loops._BACKSTOP_VIEW_FOLDS))
     found = set()
     for view, origins in loops._backstop_views(folded):
         found |= {severity for _, severity in
