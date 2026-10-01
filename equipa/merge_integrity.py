@@ -54,7 +54,7 @@ from equipa.git_ops import (
     read_regular_file_bounded,
     verify_global_git_config_pin,
 )
-from equipa.security_gate import _gate_audit_log
+from equipa.security_gate import _gate_audit_log, escape_audit_text
 
 logger = logging.getLogger(__name__)
 
@@ -1381,13 +1381,18 @@ class DefaultBranchGuard:
         """
         if self.tripped:
             return
+        # R3146-02 (task #3151): ``detail`` embeds agent-chosen paths (a
+        # common dir reached through a planted symlink). The alert is printed,
+        # logged and handed on as a task's block reason, so it is escaped
+        # once here, like the audit line: a newline in a path must not start
+        # a forged ``[GATE-AUDIT]`` line in the operator's log.
         if detail is not None:
-            self.alert = (
+            self.alert = escape_audit_text(
                 f"repository of default branch '{self.default_branch}' changed "
                 f"(stage={stage}): {detail}"
             )
         else:
-            self.alert = (
+            self.alert = escape_audit_text(
                 f"default branch '{self.default_branch}' moved outside the "
                 f"orchestrator's merges (stage={stage}): expected "
                 f"{self.expected_sha} but found {actual or 'MISSING'}"
