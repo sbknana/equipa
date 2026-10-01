@@ -63,6 +63,8 @@ from equipa.git_ops import (
     PinnedRepositoryError,
     UntrustedDefaultBranchError,
     _is_git_repo,
+    check_pinned_directory,
+    fd_pinning_available,
     get_default_branch,
     get_trusted_default_branch,
     git_repositories_pinned,
@@ -87,6 +89,7 @@ from equipa.merge_integrity import (
     MergeAttempt,
     MergeIntegrityError,
     MergeOutcome,
+    RepositoryIdentity,
     find_repo_execution_hazards,
     is_ancestor,
     rebased_range_problem,
@@ -2930,6 +2933,8 @@ async def _pin_merge_repositories(
             f"the merge would run in {work_tree}, not in the work tree "
             f"{identity.work_tree} pinned at the snapshot"
         )
+    if not fd_pinning_available():
+        return await _pin_merge_repositories_by_path(identity, worktree_dir)
     pins = _MergePins([], [])
     try:
         common_fd = open_pinned_directory(identity.common_dir, identity.common_dir_id)
@@ -2966,19 +2971,49 @@ async def _pin_merge_repositories(
     return pins
 
 
+async def _pin_merge_repositories_by_path(
+    identity: RepositoryIdentity, worktree_dir: str | None,
+) -> _MergePins:
+    """:func:`_pin_merge_repositories` without ``/proc/self/fd``.
+
+    git is given the snapshot realpaths after an inode check. That is never
+    a fresh discovery, but a rename between the check and a git call still
+    redirects it; the descriptor pin is the rename-proof form.
+    """
+    check_pinned_directory(identity.common_dir, identity.common_dir_id)
+    check_pinned_directory(identity.git_dir, identity.git_dir_id)
+    _check_commondir_file(
+        None, identity.git_dir, identity.common_dir,
+        linked=identity.git_dir_id != identity.common_dir_id,
+    )
+    repositories = [PinnedGitRepository(
+        identity.work_tree, identity.git_dir, identity.common_dir,
+    )]
+    if worktree_dir is not None:
+        admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
+        admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
+        _check_commondir_file(None, admin_dir, identity.common_dir, linked=True)
+        repositories.append(PinnedGitRepository(
+            os.path.realpath(worktree_dir), admin_dir, identity.common_dir,
+        ))
+    return _MergePins(repositories, [])
+
+
 # git writes a worktree's commondir as a short relative path ("../..").
 _COMMONDIR_READ_LIMIT = 4096
 
 
 def _check_commondir_file(
-    git_dir_fd: int, git_dir: str, common_dir: str, *, linked: bool,
+    git_dir_fd: int | None, git_dir: str, common_dir: str, *, linked: bool,
 ) -> None:
     """Refuse a ``commondir`` file in the pinned git dir that does not name
     ``common_dir``. A repository's own git dir (``linked=False``) has none;
-    a linked worktree's names the common dir, usually relatively."""
+    a linked worktree's names the common dir, usually relatively. Read
+    through ``git_dir_fd`` when given, else by path."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    target = "commondir" if git_dir_fd is not None else os.path.join(git_dir, "commondir")
     try:
-        fd = os.open("commondir", flags, dir_fd=git_dir_fd)
+        fd = os.open(target, flags, dir_fd=git_dir_fd)
     except FileNotFoundError:
         if linked:
             raise PinnedRepositoryError(

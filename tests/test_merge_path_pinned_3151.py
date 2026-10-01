@@ -329,6 +329,44 @@ def test_merge_root_other_than_the_pinned_work_tree_is_refused(tmp_path: Path) -
         _run(dispatch_mod._pin_merge_repositories(guard, str(tmp_path), None))
 
 
+def test_without_proc_fd_the_merge_is_pinned_by_realpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where ``/proc/self/fd`` does not exist the pin names the snapshot
+    realpaths (after an inode check) instead of descriptors; the merge
+    still never discovers the repository and still lands."""
+    monkeypatch.setattr(git_ops_mod, "_FD_DIRECTORY", str(tmp_path / "no-proc-fd"))
+    real = _real_with_task_branch(tmp_path)
+    guard = _run(DefaultBranchGuard.snapshot(real))
+    seen: list[list[str]] = []
+    real_argv = git_ops_mod._hardened_git_argv
+
+    def recording_argv(args, env, pin=None):
+        argv = real_argv(args, env, pin)
+        if list(args[:1]) == ["merge"]:
+            seen.append(argv)
+        return argv
+
+    monkeypatch.setattr(git_ops_mod, "_hardened_git_argv", recording_argv)
+
+    assert _gate(real, guard) == "merged"
+    assert seen and f"--git-dir={os.path.realpath(real / '.git')}" in seen[0]
+
+
+def test_without_proc_fd_a_swapped_git_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(git_ops_mod, "_FD_DIRECTORY", str(tmp_path / "no-proc-fd"))
+    real = _real_with_task_branch(tmp_path)
+    guard = _run(DefaultBranchGuard.snapshot(real))
+    other = tmp_path / "other"
+    _clone_with_decoy_branch(real, other)
+    _swap_git_for_symlink(real, other / ".git")
+
+    with pytest.raises(PinnedRepositoryError, match="no longer the git directory pinned"):
+        _run(dispatch_mod._pin_merge_repositories(guard, str(real), None))
+
+
 def test_pins_never_leak_descriptors_control(tmp_path: Path) -> None:
     """Every descriptor opened for a pin is closed by ``close``."""
     real = _real_with_task_branch(tmp_path)

@@ -877,9 +877,33 @@ _pinned_repositories: contextvars.ContextVar[Mapping[str, PinnedGitRepository]] 
 )
 
 
+def fd_pinning_available() -> bool:
+    """True where git can be handed an open directory as ``/proc/self/fd/N``."""
+    return os.path.isdir(_FD_DIRECTORY)
+
+
 def _directory_id(fd: int) -> tuple[int, int]:
     info = os.fstat(fd)
     return info.st_dev, info.st_ino
+
+
+def check_pinned_directory(path: str, expected_id: tuple[int, int]) -> None:
+    """Refuse ``path`` unless it is the directory with ``expected_id``.
+
+    The check for systems without :func:`fd_pinning_available`, where git is
+    given the realpath itself. Raises :class:`PinnedRepositoryError`.
+    """
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the pinned git directory {path}: {exc.strerror}"
+        ) from exc
+    if (info.st_dev, info.st_ino) != tuple(expected_id):
+        raise PinnedRepositoryError(
+            f"{path} is no longer the git directory pinned at the snapshot "
+            f"(device/inode {tuple(expected_id)})"
+        )
 
 
 def open_pinned_directory(
@@ -922,7 +946,7 @@ def pinned_repository(
     ``git_dir`` / ``common_dir`` are the realpaths, used only where
     ``/proc/self/fd`` does not exist.
     """
-    if os.path.isdir(_FD_DIRECTORY):
+    if fd_pinning_available():
         return PinnedGitRepository(
             os.path.realpath(work_tree),
             f"{_FD_DIRECTORY}/{git_dir_fd}",
