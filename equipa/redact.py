@@ -98,7 +98,14 @@ _SECRET_KEY = (
 # The rest of one shell command after its command word: up to the next
 # newline, ``;``, ``&`` or ``|``, except inside quotes, which a password may
 # contain. It ends its pattern, so the greedy run never backtracks (RR-01).
-_COMMAND_REST = r"(?:[^\n;&|\"']+|\"[^\"]*\"?|'[^']*'?)*"
+# A quote that is never closed (truncated text) ends at the newline: it used
+# to run to the end of the text, so every later line belonged to this one
+# command, and a rule that redacts only its first match (htpasswd) leaked
+# the password of the next ``htpasswd -b`` line (RR3138-D). Only the last
+# quote of a kind in the text can be unclosed, so the failed search for its
+# closing quote happens once per pattern: still linear.
+_COMMAND_REST = (r"(?:[^\n;&|\"']+|\"[^\"]*\"|'[^']*'"
+                 r"|\"[^\"\n]*|'[^'\n]*)*")
 
 # A .pgpass line (``host:port:database:user:password``, IR-06): the port
 # field is ``*`` or a port number of three to five digits. Postgres never
@@ -274,10 +281,23 @@ _SECRET_NAME_HINTS = ("secret", "pass", "token", "_key", "_auth")
 _SECRET_KEY_HINTS = ("pass", "pwd", "secret", "key", "token")
 
 
+# The characters (?i) matches to an ASCII letter that casefold() does not
+# fold to that letter alone: the dotless i stays itself, and the capital I
+# with dot above becomes "i" plus a combining dot, which splits the hint
+# word (``AUTHOR\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}ZATION`` folded to
+# ``authori\N{COMBINING DOT ABOVE}zation``, so the Authorization pattern was
+# skipped while (?i) still matched; RR3138-D). Both become a plain "i"
+# before casefold(). The guard test checks every code point.
+_HINT_FOLD_FIXES = str.maketrans({
+    "\N{LATIN SMALL LETTER DOTLESS I}": "i",
+    "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}": "i",
+})
+
+
 def _fold_for_hints(text: str) -> str:
     """``text`` folded so every character (?i) matches to an ASCII letter
-    becomes that letter: casefold() does this for all but the dotless i."""
-    return text.casefold().replace("\N{LATIN SMALL LETTER DOTLESS I}", "i")
+    becomes exactly that letter, and every other character case-folds."""
+    return text.translate(_HINT_FOLD_FIXES).casefold()
 
 
 # (pattern, replacement, hints). Every match of a pattern contains one of its
