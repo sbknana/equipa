@@ -124,6 +124,103 @@ def test_r3143_01_heading_lines_come_from_the_parser():
                         "MEDIUM")}
 
 
+# --- R3143-02 / SR3143-02: no exemption may excuse a finding label ---------------
+
+# Every body of indep-3143's attack table and SECURITY-REVIEW-3143's SR3143-02,
+# then the same shapes with the other separators a label uses.
+R3143_02_BODIES = [
+    ["- Not MEDIUM, HIGH: SQL injection in login.py allows auth bypass"],
+    ["Downgraded: not CRITICAL, HIGH: SQL injection in login.py."],
+    ["Severity: not MEDIUM, HIGH"],
+    ["- Rated higher than MEDIUM, HIGH: SQL injection in login.py"],
+    [f"- Severity worse than HIGH {E} RCE in upload handler"],
+    [f"- Neither LOW nor MEDIUM, CRITICAL {E} RCE via upload"],
+    ["- 0 MEDIUM, CRITICAL: RCE via upload handler"],
+    ["0 CRITICAL / HIGH: SQL injection in login.py lets anyone in."],
+    ["CRITICAL: 0 rate limiting on login enables credential stuffing"],
+    ["HIGH: 0 auth checks on /admin let anyone delete users."],
+    ["Was it fixed? No HIGH SQL injection remains in login.py"],
+    ["- not exploitable remotely? No. HIGH \N{EM DASH} SQL injection in login.py"],
+    ["<!-- no --> HIGH: SQL injection in login.py"],
+    ["<span>no</span> HIGH: SQL injection in login.py"],
+    ["[x](no) HIGH: SQL injection in login.py"],
+    ['[x](y "no") HIGH: SQL injection in login.py'],
+    ["None of these are HIGH except: SQL injection in login.py (HIGH)"],
+    # Variants: dashes, closing emphasis, zero tallies, table cells.
+    ["No HIGH - SQL injection in login.py"],
+    ["No HIGH \N{EN DASH} SQL injection in login.py"],
+    ["No HIGH\N{EM DASH}SQL injection in login.py"],
+    ["**No HIGH**: SQL injection in login.py"],
+    ["- 0 HIGH: SQL injection in login.py"],
+    [f"- 0 HIGH {E} SQL injection in login.py"],
+    ["Zero CRITICAL: RCE via upload handler"],
+    ["Without HIGH (SQL injection in login.py)"],
+    ["Kept at LOW rather than HIGH: SQL injection in login.py"],
+    ["HIGH: 0 in login.py lets anyone in"],
+    ["HIGH = 0 auth checks on /admin"],
+    ["| HIGH | 0 auth checks on /admin |"],
+    ["| finding | HIGH: 0 rate limiting on login |"],
+    ["CRITICAL: 0-click RCE in upload"],
+    ["Severity: not MEDIUM, HIGH."],
+    ["not LOW, MEDIUM, HIGH"],
+    # A negation at the end of the line before (soft wrap) is no excuse
+    # either when the token labels a finding.
+    ["Was it fixed? No", "HIGH SQL injection remains in login.py"],
+    ["Was it fixed? No", "HIGH: SQL injection in login.py"],
+    ["# Was it fixed? No", "HIGH findings remain."],
+]
+
+
+@pytest.mark.parametrize("body", R3143_02_BODIES)
+def test_r3143_02_exemptions_never_excuse_a_label(body):
+    assert_gate_blocks(body)
+
+
+# Tallies and negations a reviewer writes, which still merge (none of these
+# leaves an unaccounted token, MEDIUM included).
+R3143_02_MERGES = [
+    ["Totals: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 1 LOW / 0 INFO."],
+    ["semgrep: CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 across the diff."],
+    ["| Severity | Count |", "|---|---|", "| HIGH | 0 |", "| CRITICAL | 0 |"],
+    ["**No CRITICAL or HIGH findings.**"],
+    ["There are no CRITICAL, HIGH or MEDIUM issues."],
+    ["There are no CRITICAL, HIGH, or MEDIUM findings."],
+    ["None is CRITICAL or HIGH."],
+    ["Rated LOW, not MEDIUM, as it needs a local account."],
+    ["Kept at LOW rather than MEDIUM."],
+    ["0 CRITICAL/HIGH results from semgrep."],
+    ["HIGH: 0 and CRITICAL: 0 from semgrep."],
+    ["| semgrep | HIGH: 0 |"],
+    ["No HIGH-severity issues."],
+    ["No HIGH or CRITICAL issues were found."],
+    ["Rated LOW rather than MEDIUM or HIGH."],
+]
+
+
+@pytest.mark.parametrize("body", R3143_02_MERGES)
+def test_r3143_02_plain_tallies_and_negations_still_merge(body):
+    analysis = analyze(one_low_review(body))
+    assert analysis.trusted and analysis.detail == "", (body, analysis)
+
+
+def test_r3143_06_soft_wrapped_negation_merges():
+    """The corpus shape: "No" ends the line, the list opens the next one."""
+    body = ["The diff touches only the parser, and the scan found no",
+            "CRITICAL/HIGH/MEDIUM issues. Remaining items are LOW/INFO."]
+    analysis = analyze(one_low_review(body))
+    assert analysis.trusted and analysis.detail == "", analysis
+
+
+@pytest.mark.parametrize("before", [
+    "## Findings: no",          # a heading is not a paragraph line
+    "| scan | no",              # neither is a table row
+    "",                         # a blank line ends the paragraph
+])
+def test_r3143_06_wrapped_negation_needs_a_paragraph_line(before):
+    body = [before, "CRITICAL issues in login.py."]
+    assert gate_blocks(one_low_review(body)), body
+
+
 # --- R3143-08: the invisible-character list uses escapes ------------------------
 
 def test_r3143_08_security_gate_source_holds_no_invisible_character():

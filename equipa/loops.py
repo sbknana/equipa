@@ -2753,12 +2753,21 @@ _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # The word must not touch a letter or digit. "_" is not a word character
 # here: "_HIGH_" renders as an emphasised HIGH. The character before the word
 # is checked in Python, so the scan starts at a word's first letter.
-_BACKSTOP_TOKEN_RE = re.compile(r"(?:CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+# Task 3149 (R3143-07): "l", "1" and "|" drawn for the I of an otherwise
+# UPPER-case word ("HlGH", "CR1T1CAL", "MED|UM") are read as that I.
+_BACKSTOP_TOKEN_RE = re.compile(
+    r"(?:CR[Il1|]T[Il1|]CAL|H[Il1|]GH|MED[Il1|]UM)(?![^\W_])",
+)
+_BACKSTOP_SEVERITY_BY_INITIAL = {"C": "CRITICAL", "H": "HIGH", "M": "MEDIUM"}
 # HTML5 character references, with or without the semicolon. html.unescape
 # decides what each means (legacy names such as "&amp" need no semicolon) and
-# leaves an unknown one as written.
+# leaves an unknown one as written. Task 3149 (R3143-04): leading zeros are
+# read in full ("&#000000072;" is H) but at most 8 decimal or 7 hex
+# significant digits, so int() never sees thousands of them; any longer
+# value is past U+10FFFF and decodes to U+FFFD whatever its digits.
 _BACKSTOP_REFERENCE_RE = re.compile(
-    r"&(?:#[0-9]+;?|#[xX][0-9A-Fa-f]+;?|[A-Za-z][A-Za-z0-9]{0,31};?)",
+    r"&(?:#(0*)([0-9]{1,8});?|#[xX](0*)([0-9A-Fa-f]{1,7});?"
+    r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
 )
 # Markup a browser does not show: start and end tags, "<!DOCTYPE ...>" and
 # the bogus comments "<!x>", "<?x>" and "</ x>". The body stops at the next
@@ -2770,25 +2779,42 @@ _BACKSTOP_LINE_BREAKS = str.maketrans(
     dict.fromkeys("\n\r\x0b\x0c\x1c\x1d\x1e\x85  ", " "),
 )
 _BACKSTOP_REPORTED_LINES = 20
-# Positions that cannot label a finding (task 3143, corpus item C). Each is
-# read in a window of at most _BACKSTOP_CONTEXT characters on the token's
-# own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a view are
-# read at all: any later token counts (a real review has far fewer).
+# Positions that cannot label a finding (task 3143, corpus item C). The words
+# before a token are read in a window of at most _BACKSTOP_CONTEXT characters
+# on its own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a
+# view are read at all: any later token counts (a real review has far fewer).
 #   * a tally: a bare count right before the word ("0 HIGH", "**2** MEDIUM")
 #     or after it and a ":", "=" or "|" ("HIGH: 0", "| MEDIUM | 2 |"). The
-#     count must end there ("HIGH: 2FA bypass" is a title), and it must not
-#     exceed what the review counts of that severity (footer or headings),
-#     so a tally never claims a finding the review did not count;
-#   * a negation or comparison: "no", "not", "nor", "zero", "without",
-#     "than" or "none at/of/reached" right before the word ("No CRITICAL or
-#     HIGH findings", "MEDIUM, not HIGH", "LOW rather than MEDIUM"), not
-#     followed by a ":" (so it cannot open a "HIGH: title" label);
+#     count must not exceed what the review counts of that severity (footer
+#     or headings), so a tally never claims a finding the review did not
+#     count;
+#   * a negation: "no", "not", "nor", "neither", "zero", "without",
+#     "rather/other/lower/less than", "below" or "none is/of/reached" right
+#     before the word ("No CRITICAL or HIGH findings", "LOW rather than
+#     MEDIUM"), also at the end of the line before when the token opens a
+#     soft-wrapped line of the same paragraph;
 #   * the next word of a list that opens with one of these ("0 CRITICAL/HIGH",
 #     "no CRITICAL, HIGH or MEDIUM issues"), which takes its count.
 #   * "Overall risk: MEDIUM" (also "LOW-MEDIUM"), which states one finding of
 #     that severity and so needs the footer to count at least one.
+# Task 3149 (R3143-02): an exempt word may never label a finding. What
+# follows it must be the end of the line, closing punctuation, the next word
+# of the list or a generic noun ("findings"); a ":", a dash or finding text
+# ("No HIGH SQL injection remains", "0 MEDIUM, CRITICAL - RCE") makes it a
+# token like any other. A list joined by a bare comma must go on ("no
+# CRITICAL, HIGH or MEDIUM"): "Severity: not MEDIUM, HIGH" ends on HIGH. A
+# "HIGH: 0" tally must end the item or be followed only by more tally items
+# and the words of _BACKSTOP_TALLY_TAIL_WORDS ("HIGH: 0 and CRITICAL: 0 from
+# semgrep."); "CRITICAL: 0 rate limiting on login" is a digit-led title.
 _BACKSTOP_CONTEXT = 40
 _BACKSTOP_CLASSIFY_LIMIT = 2000
+# What follows a token is read up to this many characters of its line, plus
+# the next line when that line continues the same paragraph (a soft wrap
+# renders as a space). Text cut at the limit ends in _BACKSTOP_CUT, which no
+# rule accepts, so a long line fails closed. The backstop views never hold
+# a NUL (Cc characters are deleted).
+_BACKSTOP_AFTER_LIMIT = 200
+_BACKSTOP_CUT = "\x00"
 _BACKSTOP_NUMBER_WORDS = {
     "one": 1, "single": 1, "two": 2, "both": 2, "three": 3, "four": 4,
     "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -2800,20 +2826,89 @@ _BACKSTOP_COUNT_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 _BACKSTOP_COUNT_AFTER_RE = re.compile(
-    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)",
+    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)"
+    r"[*_`]{0,3}",
 )
 _BACKSTOP_NEGATION_BEFORE_RE = re.compile(
-    r"(?:^|[^\w-])(?:no|not|nor|zero|without|than|nothing|neither|never|"
+    r"(?:^|[^\w-])(no|not|nor|zero|without|nothing|neither|never|below|"
+    r"(?:rather|other|lower|less)[ \t]+than|"
     r"none(?:[ \t]+(?:is|are|was|were|at|of|reach|reaches|reached|rated))?)"
     r"[*_` \t]{1,6}\Z",
     re.IGNORECASE,
+)
+# "Was it fixed? No HIGH, ..." answers a question: the "No" negates nothing.
+_BACKSTOP_ANSWER_END_RE = re.compile(r"[?!][*_` \t]*\Z")
+_BACKSTOP_SEVERITY_WORD = r"(?:CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![^\W_])"
+# Closing emphasis, "HIGH+" and "HIGH-severity" may follow an exempt word.
+_BACKSTOP_AFTER_PREFIX = (
+    r"[*_`]{0,3}\+?"
+    r"(?:-(?:severity|level|risk|rated|impact|priority)(?![\w-])[*_`]{0,3})?"
+)
+# No two "[ \t]*" touch, so a line padded with spaces is read in linear time.
+_BACKSTOP_LIST_GOES_ON = (
+    r"[ \t]*(?:[/&+]|,(?:[ \t]*(?:or|and|nor|to)(?![\w-]))?"
+    r"|(?:or|and|nor|to)(?![\w-]))[ \t]*(?:[*_`]{1,3}[ \t]*)?"
+    r"(?:\d{1,4}[*_` \t]{1,6})?" + _BACKSTOP_SEVERITY_WORD
+)
+# A generic noun or verb, or a conjunction opening a reason ("rated LOW
+# rather than HIGH because ..."). Never finding text ("SQL injection").
+_BACKSTOP_GENERIC_NOUN_AFTER = (
+    r"[ \t]+(?:findings?|issues?|results?|vulnerabilit(?:y|ies)|risks?|"
+    r"items?|problems?|bugs?|alerts?|hits?|concerns?|severity|severities|"
+    r"ones?|entries|flaws?|weakness(?:es)?|defects?|warnings?|"
+    r"(?:or|and)[ \t]+(?:above|higher|worse)|was|were|is|are|remains?|"
+    r"found|reported|identified|detected|flagged|exists?|"
+    r"because|since|as|given|but|though|although|while|unless|due)(?![\w-])"
+)
+# End of the text, closing punctuation, or a comma before a lower-case word
+# ("not MEDIUM, as it needs ..."; "No HIGH, SQL injection ..." is a label).
+_BACKSTOP_SAFE_AFTER_RE = re.compile(
+    _BACKSTOP_AFTER_PREFIX + r"(?:" + _BACKSTOP_LIST_GOES_ON + r"|"
+    + _BACKSTOP_GENERIC_NOUN_AFTER
+    + r"|[ \t]*(?:\Z|[.;!?)\]|]|,[ \t]*(?=(?-i:[a-z]))))",
+    re.IGNORECASE,
+)
+_BACKSTOP_LIST_CONTINUES_RE = re.compile(
+    _BACKSTOP_AFTER_PREFIX + r"(?:" + _BACKSTOP_LIST_GOES_ON + r"|"
+    + _BACKSTOP_GENERIC_NOUN_AFTER + r")",
+    re.IGNORECASE,
+)
+_BACKSTOP_TALLY_TAIL_WORDS = (
+    "and", "or", "from", "across", "in", "on", "at", "by", "for", "of", "the",
+    "a", "an", "this", "that", "these", "its", "all", "each", "per", "total",
+    "overall", "so", "far", "now", "after", "before", "review", "diff",
+    "change", "changes", "changed", "code", "file", "files", "scan", "scans",
+    "scanned", "scanner", "tool", "tools", "rule", "rules", "ruleset",
+    "rulesets", "semgrep", "bandit", "gitleaks", "trivy", "npm", "audit",
+    "pip-audit", "osv-scanner", "eslint", "codeql", "manual", "automated",
+    "finding", "findings", "issue", "issues", "result", "results", "hit",
+    "hits", "alert", "alerts", "reported", "found", "flagged", "detected",
+    "open", "new", "remaining", "branch", "repo", "repository", "project",
+    "dependency", "dependencies", "package", "packages", "check", "checks",
+)
+_BACKSTOP_TALLY_TAIL_RE = re.compile(
+    r"(?:[ \t]*(?:[|,;/&+]|\.(?![^\W_])|\d{1,6}(?![\w-])"
+    r"|[*_`]{0,3}" + _BACKSTOP_SEVERITY_WORD
+    + r"[*_`]{0,3}[ \t]*[:=][ \t]*[*_`]{0,3}\d{1,4}(?![\w-])[*_`]{0,3}"
+    r"|[*_`]{0,3}\d{1,4}[*_` \t]{1,6}" + _BACKSTOP_SEVERITY_WORD
+    + r"[*_`]{0,3}"
+    r"|(?i:" + "|".join(sorted(_BACKSTOP_TALLY_TAIL_WORDS, key=len,
+                               reverse=True)) + r")(?![\w-])"
+    r"))*[ \t]*",
+)
+# A soft-wrapped paragraph line: the line before must hold text and must not
+# be a heading, a table row or a fence.
+_BACKSTOP_BLOCK_LINE_RE = re.compile(r"[ \t]{0,3}(?:#|\||```|~~~)")
+# A line that does not continue the paragraph before it: blank, or opening
+# a block of its own.
+_BACKSTOP_NEW_BLOCK_RE = re.compile(
+    r"[ \t]*(?:\Z|#|\||```|~~~|>|<|[-*+](?:[ \t]|\Z)|\d{1,9}[.)](?:[ \t]|\Z))",
 )
 _BACKSTOP_OVERALL_RISK_BEFORE_RE = re.compile(
     r"overall[ \t]+risk[*_` \t]*(?:[:=]|is)?[*_` \t]*"
     r"(?:(?:low|medium|high)[ \t]*(?:-|\N{EN DASH}|/|to)[ \t]*(?:to[ \t]+)?)?\Z",
     re.IGNORECASE,
 )
-_BACKSTOP_COLON_AFTER_RE = re.compile(r"[*_`]{0,3}[ \t]*:")
 _BACKSTOP_LIST_JOINER_RE = re.compile(
     r"[*_`]{0,3}[ \t]*(?:/|,|&|\+|and\b|or\b|nor\b|,[ \t]*(?:and|or)\b)"
     r"[ \t]*[*_`]{0,3}",
@@ -2890,7 +2985,16 @@ _BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
 
 
 def _backstop_decoded_reference(match: re.Match[str]) -> str:
-    """One character reference as a browser shows it, on the same line."""
+    """One character reference as a browser shows it, on the same line.
+
+    A numeric reference is looked up without its leading zeros, so the
+    cached key and the text html.unescape parses stay short.
+    """
+    decimal, hexadecimal = match.group(2), match.group(4)
+    if decimal is not None:
+        return _BACKSTOP_REFERENCES[f"&#{int(decimal)};"]
+    if hexadecimal is not None:
+        return _BACKSTOP_REFERENCES[f"&#x{hexadecimal.lstrip('0') or '0'};"]
     return _BACKSTOP_REFERENCES[match.group(0)]
 
 
@@ -2977,35 +3081,117 @@ def _backstop_without_markup(text: str) -> tuple[str, list[int] | None] | None:
     return without_tags, origins
 
 
+def _backstop_wrapped_negation(
+    view: str, newlines: list[int], line: int, line_start: int, start: int,
+) -> bool:
+    """True when a token opening a soft-wrapped line follows a negation.
+
+    "... there are no" / "CRITICAL/HIGH issues." is one paragraph: the
+    negation ends the line before. Only when nothing but emphasis comes
+    before the token on its line, and the line before holds text and is not
+    a heading, table row or fence (R3143-06).
+    """
+    if line == 0 or start - line_start > _BACKSTOP_CONTEXT:
+        return False
+    if view[line_start:start].strip(" \t*_`"):
+        return False
+    previous_start = newlines[line - 2] + 1 if line >= 2 else 0
+    previous_end = line_start - 1
+    if _BACKSTOP_BLOCK_LINE_RE.match(view, previous_start, previous_end):
+        return False
+    tail = view[max(previous_start, previous_end - _BACKSTOP_CONTEXT):
+                previous_end].rstrip(" \t")
+    return bool(tail) and _backstop_negates(tail + " ")
+
+
+def _backstop_negates(before: str) -> bool:
+    """True when ``before`` ends with a negation of the word after it.
+
+    A "No" that answers a question ("Was it fixed? No HIGH ...") is not one.
+    """
+    negation = _BACKSTOP_NEGATION_BEFORE_RE.search(before)
+    return negation is not None and _BACKSTOP_ANSWER_END_RE.search(
+        before, 0, negation.start(1)) is None
+
+
+def _backstop_after_text(
+    view: str, newlines: list[int], line: int, end: int,
+) -> str:
+    """What a reader sees after the token ending at ``end`` on ``line``.
+
+    The rest of the line, and when the next line continues the same
+    paragraph, a space and that line ("No HIGH" / "SQL injection remains"
+    renders as one sentence). Each part is cut at _BACKSTOP_AFTER_LIMIT
+    characters and then ends in _BACKSTOP_CUT.
+    """
+    line_end = newlines[line] if line < len(newlines) else len(view)
+    if line_end - end > _BACKSTOP_AFTER_LIMIT:
+        return view[end:end + _BACKSTOP_AFTER_LIMIT] + _BACKSTOP_CUT
+    after = view[end:line_end]
+    if line >= len(newlines):
+        return after
+    line_start = newlines[line - 1] + 1 if line else 0
+    next_start = line_end + 1
+    next_end = newlines[line + 1] if line + 1 < len(newlines) else len(view)
+    if (_BACKSTOP_BLOCK_LINE_RE.match(view, line_start, line_end)
+            or _BACKSTOP_NEW_BLOCK_RE.match(view, next_start, next_end)):
+        return after
+    if next_end - next_start > _BACKSTOP_AFTER_LIMIT:
+        return (after + " " + view[next_start:next_start + _BACKSTOP_AFTER_LIMIT]
+                + _BACKSTOP_CUT)
+    return after + " " + view[next_start:next_end]
+
+
 def _backstop_exempt_count(
-    view: str, start: int, end: int, previous: tuple[int, int] | None,
+    view: str, newlines: list[int], line: int, start: int, end: int,
+    previous: tuple[int, int, int] | None,
 ) -> int | None:
     """The count a token states when it sits in a tally, negation or list.
 
     0 for a negation, the tally's count for a tally, the count of the word
     before for the next word of such a list (``previous`` is that word's
-    end and count), None when the token may label a finding.
+    end, count and line), None when the token may label a finding. Every
+    exemption requires what follows the token to be safe (task 3149,
+    R3143-02; see ``_BACKSTOP_SAFE_AFTER_RE``).
     """
-    window_start = view.rfind("\n", max(0, start - _BACKSTOP_CONTEXT), start) + 1
-    before = view[max(window_start, start - _BACKSTOP_CONTEXT):start]
-    after_end = view.find("\n", end, end + _BACKSTOP_CONTEXT)
-    after = view[end:after_end if after_end != -1 else end + _BACKSTOP_CONTEXT]
-    tally = _BACKSTOP_COUNT_BEFORE_RE.search(before)
-    if tally is None:
-        tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
-    if tally is not None:
-        stated = tally.group(1)
-        return (int(stated) if stated.isdigit()
-                else _BACKSTOP_NUMBER_WORDS[stated.lower()])
-    if (_BACKSTOP_NEGATION_BEFORE_RE.search(before)
-            and not _BACKSTOP_COLON_AFTER_RE.match(after)):
+    line_start = newlines[line - 1] + 1 if line else 0
+    before = view[max(line_start, start - _BACKSTOP_CONTEXT):start]
+    after = _backstop_after_text(view, newlines, line, end)
+    tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
+    # A cut tail never matches (and would only cost backtracking to find out).
+    if (tally is not None and not after.endswith(_BACKSTOP_CUT)
+            and _BACKSTOP_TALLY_TAIL_RE.fullmatch(after, tally.end())):
+        return int(tally.group(1))
+    if _BACKSTOP_SAFE_AFTER_RE.match(after) is None:
+        return None
+    stated = _BACKSTOP_COUNT_BEFORE_RE.search(before)
+    if stated is not None:
+        word = stated.group(1)
+        return (int(word) if word.isdigit()
+                else _BACKSTOP_NUMBER_WORDS[word.lower()])
+    if (_backstop_negates(before)
+            or _backstop_wrapped_negation(view, newlines, line, line_start,
+                                          start)):
         return 0
     if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
         return 1
-    if (previous is not None and start - previous[0] <= _BACKSTOP_CONTEXT
-            and _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)):
+    if (previous is not None and previous[2] == line
+            and start - previous[0] <= _BACKSTOP_CONTEXT):
+        joiner = _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)
+        if joiner is None:
+            return None
+        # "not MEDIUM, HIGH" ends on HIGH: a bare comma must lead on to more
+        # of the list or to a noun, or HIGH is the finding's label.
+        if (joiner.group(0).strip(" \t*_`") == ","
+                and _BACKSTOP_LIST_CONTINUES_RE.match(after) is None):
+            return None
         return previous[1]
     return None
+
+
+def _backstop_severity(word: str) -> str:
+    """The severity a token spells ("HlGH" and "H1GH" are HIGH)."""
+    return _BACKSTOP_SEVERITY_BY_INITIAL[word[0]]
 
 
 def _backstop_tokens(
@@ -3018,24 +3204,25 @@ def _backstop_tokens(
     """
     found: dict[tuple[int, str], int] = {}
     newlines: list[int] | None = None
-    previous: tuple[int, int] | None = None
+    previous: tuple[int, int, int] | None = None
     classified = 0
     for match in _BACKSTOP_TOKEN_RE.finditer(view):
         start, end = match.span()
         if start and view[start - 1].isalnum():
             continue
-        severity = match.group(0)
-        stated = None
-        if classified < _BACKSTOP_CLASSIFY_LIMIT:
-            classified += 1
-            stated = _backstop_exempt_count(view, start, end, previous)
-        previous = None if stated is None else (end, stated)
-        if stated is not None and stated <= covered.get(severity, 0):
-            continue
         if newlines is None:
             newlines = [line_break.start()
                         for line_break in _NEWLINE_RE.finditer(view)]
+        severity = _backstop_severity(match.group(0))
         line = bisect.bisect_left(newlines, start)
+        stated = None
+        if classified < _BACKSTOP_CLASSIFY_LIMIT:
+            classified += 1
+            stated = _backstop_exempt_count(view, newlines, line, start, end,
+                                            previous)
+        previous = None if stated is None else (end, stated, line)
+        if stated is not None and stated <= covered.get(severity, 0):
+            continue
         if origins is not None:
             line = origins[line]
         key = (line, severity)
@@ -3062,6 +3249,43 @@ def _counted_heading_lines(
         for offset, severity in heading_offsets
         if severity in _BACKSTOP_SEVERITIES
     }
+
+
+def _folded_heading_lines(
+    text: str, credited: set[tuple[int, str]],
+    header_counts: dict[str, int] | None,
+) -> set[tuple[int, str]]:
+    """Finding headings the parser counted only in its rendered view.
+
+    The rendered view folds lookalike letters ("### [S1] \\u0397IGH - x"
+    is a HIGH heading there, not in the text as written). ``text`` is the
+    backstop's own copy, lookalikes folded the same way. Its headings are
+    credited in order, but never more per severity than the parser counted
+    beyond ``credited``, so every credited heading is a counted one.
+    """
+    if not header_counts:
+        return set()
+    room = {
+        severity: header_counts.get(severity, 0)
+        - sum(1 for _, word in credited if word == severity)
+        for severity in _BACKSTOP_SEVERITIES
+    }
+    if all(left <= 0 for left in room.values()):
+        return set()
+    extra: set[tuple[int, str]] = set()
+    newlines: list[int] | None = None
+    for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
+        severity = match.group(1)
+        if room.get(severity, 0) <= 0:
+            continue
+        if newlines is None:
+            newlines = [line_break.start()
+                        for line_break in _NEWLINE_RE.finditer(text)]
+        key = (bisect.bisect_left(newlines, match.start()), severity)
+        if key not in credited and key not in extra:
+            extra.add(key)
+            room[severity] -= 1
+    return extra
 
 
 def _in_finding_section(
@@ -3189,6 +3413,7 @@ def _severity_token_backstop(
         text if heading_text is None else heading_text,
         analysis.heading_offsets,
     )
+    headings |= _folded_heading_lines(text, headings, analysis.header_counts)
     # A finding's section runs from its heading to the next heading of
     # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
     # "MEDIUM because ...") is that finding, not another one.
