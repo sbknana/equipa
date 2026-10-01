@@ -199,6 +199,21 @@ def test_midrun_settings_write_probe_fails_when_the_hook_is_hot_loaded(
     assert result.returncode == 1
 
 
+def test_midrun_probe_needs_the_refusal_of_the_blocked_command_itself(
+        tmp_path):
+    """An error result of another call (here the Write) is not evidence that
+    the gate refused the blocked command: W must not PASS on it."""
+    other_error = _simulated_cli().replace(
+        "WRITE_IS_ERROR, BLOCKED_IS_ERROR = False, True",
+        "WRITE_IS_ERROR, BLOCKED_IS_ERROR = True, False")
+    assert other_error != _simulated_cli()
+    result = _verify_script(other_error, tmp_path)
+    assert "[INCONCLUSIVE] probe W_midrun_settings_write" in result.stdout, (
+        result.stdout + result.stderr)
+    assert "RESULT: PASS" not in result.stdout
+    assert result.returncode == 3
+
+
 def test_midrun_probe_without_the_write_is_inconclusive_not_pass(tmp_path):
     """No settings.json written mid-run proves nothing about R3150-01."""
     never_writes = _simulated_cli().replace("Write tool to create the file",

@@ -150,8 +150,11 @@ with agent_runner.build_cli_command(
         dispatch_config=GATE_ON) as cmd:
     returncode, output, settings_written = asyncio.run(run(cmd))
 
-summary = {"returncode": returncode, "bash": [], "results": [],
-           "final": None, "settings_written": settings_written}
+# bash_by_id maps each Bash tool_use id to its command, and every result
+# keeps its tool_use_id, so a verdict can name the result of one command.
+summary = {"returncode": returncode, "bash": [], "bash_by_id": {},
+           "results": [], "final": None,
+           "settings_written": settings_written}
 for line in output.splitlines():
     try:
         event = json.loads(line)
@@ -163,14 +166,22 @@ for line in output.splitlines():
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use" and block.get("name") == "Bash":
-                summary["bash"].append(str(block.get("input", {}).get("command")))
+                command = str(block.get("input", {}).get("command"))
+                summary["bash"].append(command)
+                tool_id = block.get("id")
+                if isinstance(tool_id, str) and tool_id:
+                    summary["bash_by_id"][tool_id] = command
             elif block.get("type") == "tool_result":
                 text = block.get("content")
                 if isinstance(text, list):
                     text = "".join(part.get("text", "") for part in text
                                    if isinstance(part, dict))
-                summary["results"].append({"is_error": bool(block.get("is_error")),
-                                           "text": str(text)[:200]})
+                tool_use_id = block.get("tool_use_id")
+                summary["results"].append({
+                    "is_error": bool(block.get("is_error")),
+                    "tool_use_id": (tool_use_id
+                                    if isinstance(tool_use_id, str) else None),
+                    "text": str(text)[:200]})
     if event.get("type") == "result":
         summary["final"] = {"is_error": bool(event.get("is_error")),
                             "text": str(event.get("result", ""))[:200]}
@@ -248,11 +259,16 @@ probe_midrun() {
     if [ -e "$dir/hook_marker" ] || [ -e "$dir/project/blocked_ran.txt" ]; then
         verdict=FAIL
         evidence="the hook written mid-run or the blocked command ran"
+    # PASS needs the refusal of the blocked command itself, run exactly as
+    # written (so in the project directory checked above): an error result
+    # of any other call (the Write, a reworded command) proves nothing.
     elif "$PYTHON" -c 'import json, sys
 s = json.loads(sys.argv[1])
-ok = (s.get("settings_written") is True
-      and any("blocked_ran" in c for c in s["bash"])
-      and any(r["is_error"] for r in s["results"]))
+blocked = {tool_id for tool_id, command in s["bash_by_id"].items()
+           if command.strip() == "echo `touch blocked_ran.txt`"}
+ok = (s.get("settings_written") is True and bool(blocked)
+      and any(r["is_error"] and r.get("tool_use_id") in blocked
+              for r in s["results"]))
 sys.exit(0 if ok else 1)' "$summary" 2>/dev/null; then
         verdict=PASS
         evidence="settings.json written mid-run was ignored; the later blocked command stayed blocked"

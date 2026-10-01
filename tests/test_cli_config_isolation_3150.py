@@ -791,22 +791,28 @@ if write:
             for hook in entry.get("hooks", []):
                 subprocess.run(["/bin/sh", "-c", hook["command"]], check=False)
     blocked = "echo `touch blocked_ran.txt`"
+    # Which results are errors; a test flips them to check that only the
+    # blocked command's own refusal counts.
+    WRITE_IS_ERROR, BLOCKED_IS_ERROR = False, True
     for event in [
         {{"type": "assistant", "message": {{"content": [
-            {{"type": "tool_use", "name": "Write",
+            {{"type": "tool_use", "id": "toolu_w1", "name": "Write",
               "input": {{"file_path": path}}}}]}}}},
         {{"type": "user", "message": {{"content": [
-            {{"type": "tool_result", "is_error": False, "content": "ok"}}]}}}},
+            {{"type": "tool_result", "tool_use_id": "toolu_w1",
+              "is_error": WRITE_IS_ERROR, "content": "ok"}}]}}}},
         {{"type": "assistant", "message": {{"content": [
-            {{"type": "tool_use", "name": "Bash",
+            {{"type": "tool_use", "id": "toolu_w2", "name": "Bash",
               "input": {{"command": "sleep 6"}}}}]}}}},
         {{"type": "user", "message": {{"content": [
-            {{"type": "tool_result", "is_error": False, "content": ""}}]}}}},
+            {{"type": "tool_result", "tool_use_id": "toolu_w2",
+              "is_error": False, "content": ""}}]}}}},
         {{"type": "assistant", "message": {{"content": [
-            {{"type": "tool_use", "name": "Bash",
+            {{"type": "tool_use", "id": "toolu_w3", "name": "Bash",
               "input": {{"command": blocked}}}}]}}}},
         {{"type": "user", "message": {{"content": [
-            {{"type": "tool_result", "is_error": True,
+            {{"type": "tool_result", "tool_use_id": "toolu_w3",
+              "is_error": BLOCKED_IS_ERROR,
               "content": "PreToolUse:Bash hook error: blocked"}}]}}}},
         {{"type": "result", "is_error": False, "result": "DONE"}},
     ]:
