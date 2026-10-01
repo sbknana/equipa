@@ -447,6 +447,13 @@ PRETOOLUSE_HOOK_SCRIPT = (
 #   command; LD_* load libraries into every program;
 # * interpreter startup code: NODE_OPTIONS (--require), PYTHON*, PERL5*,
 #   RUBY*, JAVA_TOOL_OPTIONS;
+# * Python startup failures (RR3138-A): a bogus PYTHONHASHSEED, PYTHONMALLOC,
+#   PYTHONPLATLIBDIR, PYTHONIOENCODING, PYTHONUTF8, PYTHONINTMAXSTRDIGITS or
+#   PYTHONTRACEMALLOC makes a Python without -I exit 1 before any code runs.
+#   The gate hook runs with -I, which ignores them; emptying them as well
+#   covers it if -I is ever lost. The CLI has no per-hook env (its command
+#   hook schema is command/args/shell/timeout/...), so this block, which
+#   reaches every hook process, is where they are cleared;
 # * Claude CLI switches: CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE (bare
 #   mode) turn every non-managed hook off, which is the Bash gate;
 #   CLAUDE_CODE_SHELL_PREFIX wraps and CLAUDE_CODE_SHELL replaces the shell
@@ -462,11 +469,31 @@ SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
     "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
     "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
-    "PYTHONINSPECT", "PYTHONUSERBASE", "PERL5OPT", "PERL5LIB", "RUBYOPT",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONHASHSEED", "PYTHONMALLOC",
+    "PYTHONPLATLIBDIR", "PYTHONIOENCODING", "PYTHONUTF8",
+    "PYTHONINTMAXSTRDIGITS", "PYTHONTRACEMALLOC", "PERL5OPT", "PERL5LIB", "RUBYOPT",
     "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
     "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SHELL_PREFIX",
     "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
 )
+
+
+def _hook_interpreter() -> str | None:
+    """Absolute path of the interpreter that runs the Bash gate hook, or None.
+
+    Resolved when the settings file is written (RR3138-A): the orchestrator's
+    own ``sys.executable``, else ``python3`` on the orchestrator's PATH. A
+    bare ``python3`` in the hook command would be looked up on the agent's
+    PATH instead. None when neither is an executable file; the caller then
+    wires no gate, and the reactive check keeps killing on sight.
+    """
+    candidate = sys.executable or shutil.which("python3")
+    if not candidate:
+        return None
+    interpreter = os.path.abspath(candidate)
+    if not (os.path.isfile(interpreter) and os.access(interpreter, os.X_OK)):
+        return None
+    return interpreter
 
 
 def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
@@ -487,12 +514,30 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     ``env`` block empties SETTINGS_ENV_NEUTRALISED, including the two
     variables that turn hooks off.
 
+    The hook runs as ``<python> -I <hook>`` (RR3138-A). Without ``-I`` the
+    interpreter reads PYTHON* variables (``PYTHONHASHSEED=bogus`` or
+    ``PYTHONMALLOC=bogus`` from user-scope settings make it exit 1 at
+    startup) and the user site directory (a ``.pth`` file in the agent HOME
+    that calls ``os._exit(0)``). The CLI treats exit 1 as a non-blocking
+    error and exit 0 as allow, so either one ran the blocked command.
+    Isolated mode ignores both; the hook needs only the standard library.
+
     Args:
         hook_script: Absolute path to ``pretooluse_bash_gate.py``.
-        python_bin: Interpreter used to run the hook (normally the same
-            interpreter running the orchestrator, ``sys.executable``).
+        python_bin: Absolute path of the interpreter that runs the hook
+            (``_hook_interpreter()``, resolved when the settings file is
+            written).
+
+    Raises:
+        ValueError: ``python_bin`` or ``hook_script`` is not absolute; the
+            CLI would look a bare name up on the agent's PATH.
     """
-    command = f"{shlex.quote(str(python_bin))} {shlex.quote(str(hook_script))}"
+    if not os.path.isabs(str(python_bin)) or not os.path.isabs(str(hook_script)):
+        raise ValueError(
+            f"the gate hook needs an absolute interpreter and script, got "
+            f"{python_bin!r} and {str(hook_script)!r}")
+    command = (f"{shlex.quote(str(python_bin))} -I "
+               f"{shlex.quote(str(hook_script))}")
     return {
         "disableAllHooks": False,
         "env": {name: "" for name in SETTINGS_ENV_NEUTRALISED},
@@ -528,6 +573,9 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
     whole run). Anything unexpected returns None, and the reactive check then
     keeps the old kill-on-flag behaviour: fail closed.
     """
+    interpreter = _hook_interpreter()
+    if interpreter is None:
+        return None
     try:
         path = cmd[cmd.index("--settings") + 1]
         with open(path, encoding="utf-8") as fh:
@@ -538,7 +586,7 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
             for hook in entry.get("hooks", []):
                 command = hook.get("command", "")
                 expected = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3",
+                    PRETOOLUSE_HOOK_SCRIPT, interpreter,
                 )["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
                 if command == expected:
                     return command
@@ -1443,9 +1491,16 @@ def build_cli_command(
         # The reactive stream check in the streaming loop stays on regardless
         # (defense-in-depth / belt-and-braces).
         if is_feature_enabled(_dc, "bash_security_pretooluse"):
-            if PRETOOLUSE_HOOK_SCRIPT.is_file():
+            hook_python = _hook_interpreter()
+            if hook_python is None:
+                logger.warning(
+                    "bash_security_pretooluse enabled but no absolute Python "
+                    "interpreter was found for the hook; skipping "
+                    "pre-execution gate",
+                )
+            elif PRETOOLUSE_HOOK_SCRIPT.is_file():
                 settings_payload = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3"
+                    PRETOOLUSE_HOOK_SCRIPT, hook_python
                 )
                 settings_file = tempfile.NamedTemporaryFile(
                     mode="w", suffix=".json", prefix="equipa_settings_",
