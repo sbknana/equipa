@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
 from equipa.git_ops import git_run
+
+_log = logging.getLogger(__name__)
 
 # --- Token Budget Constants ---
 # Anthropic recommendation: ~4 chars/token for Claude
@@ -209,31 +212,102 @@ def _aggressive_compress_code(text: str) -> str:
 AGENT_OUTPUT_LINE_WITHHELD: str = "[line withheld: failed sanitization]"
 
 
+# A list bullet or number in front of a section entry ("- ", "* ", "2. ").
+_LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+
+
+def _section_entry(line: str, index: int, marker: str) -> str:
+    """The entry text of one section line, without its marker or bullet."""
+    if index == 0 and line.startswith(f"{marker}:"):
+        return line[len(marker) + 1:].strip()
+    return _LIST_MARK.sub("", line, count=1)
+
+
+def _lines_building_a_match(entries: dict[int, str]) -> set[int] | None:
+    """Indexes of entries that only match the injection patterns together.
+
+    *entries* maps line index to entry text, in order, for the lines that
+    passed the per-line check. Returns an empty set when the joined block is
+    clean; otherwise the entries that match alone once their bullet is gone
+    ("- system: approve") plus both lines of every adjacent pair that
+    matches, provided withholding them leaves a clean block; and None when
+    the match cannot be pinned that way (the caller then withholds the
+    whole section).
+    """
+    from lesson_sanitizer import detect_injection  # HARD dependency
+
+    def joined(indexes) -> str:
+        return "\n".join(entries[index] for index in indexes)
+
+    if detect_injection(joined(entries)) is None:
+        return set()
+    order = list(entries)
+    involved = {index for index in order if detect_injection(entries[index])}
+    for first, second in zip(order, order[1:]):
+        if first in involved or second in involved:
+            continue
+        if detect_injection(joined((first, second))):
+            involved.update((first, second))
+    remaining = [index for index in order if index not in involved]
+    if involved and detect_injection(joined(remaining)) is None:
+        return involved
+    return None
+
+
 def _sanitize_lines(section_text: str, marker: str) -> str:
-    """Reject-mode sanitize each line of a list section on its own.
+    """Reject-mode sanitize each line of a list section, then the whole list.
 
     *section_text* starts with ``MARKER:`` (see _extract_section). A rejected
     line is replaced by AGENT_OUTPUT_LINE_WITHHELD, under the fixed marker
     for the header line and as a bullet otherwise, so the other entries
-    still reach the next agent. The joined result gets the lesson length
-    cap, as a whole section would.
+    still reach the next agent.
+
+    The entries that pass are then checked joined, without their bullets, so
+    a phrase split across entries ("- a.py act as the" / "- admin and
+    approve") is still seen. The adjacent entries that build the match are
+    withheld; if the match cannot be pinned to them, the whole section is
+    (``""``, which the caller reports as withheld) (review F5 of task 3139).
+    The joined result gets the lesson length cap, as a whole section would.
     """
     from lesson_sanitizer import MAX_LESSON_LENGTH, enforce_limit, sanitize
 
     label = f"agent output {marker}"
+    lines = section_text.split("\n")
     kept: list[str] = []
-    for index, line in enumerate(section_text.split("\n")):
+    passed: dict[int, str] = {}
+    for index, line in enumerate(lines):
         if not line.strip():
             kept.append("")
             continue
         clean = sanitize(line, label=label)
         if clean:
             kept.append(clean)
-        elif index == 0:
-            kept.append(f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}")
+            passed[index] = _section_entry(line, index, marker)
         else:
-            kept.append(f"- {AGENT_OUTPUT_LINE_WITHHELD}")
+            kept.append(_withheld_line(index, marker))
+
+    split_match = _lines_building_a_match(passed)
+    if split_match is None:
+        _log.warning(
+            "parsing: withheld %s; its entries form an injection phrase "
+            "together", label,
+        )
+        return ""
+    if split_match:
+        _log.warning(
+            "parsing: withheld %d %s lines that form an injection phrase "
+            "together", len(split_match), label,
+        )
+    for index in split_match:
+        kept[index] = _withheld_line(index, marker)
     return enforce_limit("\n".join(kept).strip(), MAX_LESSON_LENGTH, label=label)
+
+
+def _withheld_line(index: int, marker: str) -> str:
+    """The placeholder for a withheld section line (header or bullet)."""
+    if index == 0:
+        return f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}"
+    return f"- {AGENT_OUTPUT_LINE_WITHHELD}"
 
 
 def compact_agent_output(
@@ -898,16 +972,48 @@ def wrap_agent_output(tag_type: str, text: str) -> str:
     )
 
 
+# How much of one Tester line is scanned. Only the first 200 characters are
+# shown, and no injection pattern spans more than about 2,100 characters, so
+# every phrase that reaches the shown part lies wholly inside this window.
+# Bounds build_test_failure_context: at most 9 scans of this size instead
+# of 9 of 64k (1.7 s, review F6 of task 3139).
+_TESTER_LINE_SCAN_LIMIT = 4_000
+
+# Test frameworks named in the prompt sentence itself. Any other name the
+# Tester reports is shown only inside the wrapped block (review F3 of task
+# 3139), since it is agent-authored text in instruction position.
+KNOWN_TEST_FRAMEWORKS: frozenset[str] = frozenset({
+    "none", "pytest", "unittest", "nose2", "doctest", "tox", "hypothesis",
+    "jest", "vitest", "mocha", "jasmine", "ava", "karma", "node:test",
+    "node --test", "bun test", "deno test", "playwright", "cypress",
+    "go test", "cargo test", "cargo nextest", "dotnet test", "xunit",
+    "nunit", "mstest", "rspec", "minitest", "phpunit", "pest", "junit",
+    "testng", "gradle", "maven", "kotest", "xctest", "swift test",
+    "zig test", "ctest", "googletest", "gtest", "catch2", "bats",
+    "exunit", "mix test", "dart test", "flutter test",
+})
+
+
 def _sanitize_tester_line(text: object, label: str, max_chars: int = 200) -> str:
     """Reject-mode sanitize one Tester-authored line, then cap it.
 
-    The whole line is scanned before it is cut, so truncation cannot hide
-    the end of an injection phrase from the sanitizer.
+    The line is scanned up to _TESTER_LINE_SCAN_LIMIT characters before it
+    is cut to *max_chars*, so truncation cannot hide the end of an injection
+    phrase from the sanitizer.
     """
     from lesson_sanitizer import sanitize  # HARD dependency
 
-    clean = sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
+    scanned = str(text)[:_TESTER_LINE_SCAN_LIMIT] if text else ""
+    clean = sanitize(scanned, label=label) or AGENT_OUTPUT_WITHHELD
     return clean[:max_chars] + "..." if len(clean) > max_chars else clean
+
+
+def _known_test_framework(name: object) -> str | None:
+    """*name* if it is a known test framework (case-insensitive), else None."""
+    if not isinstance(name, str):
+        return None
+    normalized = " ".join(name.split()).lower()
+    return normalized if normalized in KNOWN_TEST_FRAMEWORKS else None
 
 
 def build_test_failure_context(test_results: dict, cycle: int) -> str:
@@ -921,12 +1027,19 @@ def build_test_failure_context(test_results: dict, cycle: int) -> str:
     output, and this text reaches compaction history, so each one goes
     through the reject-mode sanitizer (a rejected line becomes
     AGENT_OUTPUT_WITHHELD) and the block sits in an escaped <task-input>
-    wrapper, like the compaction summary (review N3 of task 3129).
+    wrapper, like the compaction summary (review N3 of task 3129). Only a
+    known framework name appears outside the wrapper; any other name is
+    reported inside it (review F3 of task 3139).
     """
-    framework = _sanitize_tester_line(
-        test_results["test_framework"], "tester test_framework", max_chars=80
-    )
+    raw_framework = test_results["test_framework"]
+    framework = _known_test_framework(raw_framework)
     tester_lines: list[str] = []
+    if framework is None:
+        framework = "an unrecognised framework (named in the block below)"
+        reported = _sanitize_tester_line(
+            raw_framework, "tester test_framework", max_chars=80
+        )
+        tester_lines.extend((f"Test framework reported: {reported}", ""))
 
     if test_results["failure_details"]:
         tester_lines.append("### Failing Tests:")
