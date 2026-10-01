@@ -198,6 +198,75 @@ def test_global_ipv6_addresses_skip_unique_local_addresses(tmp_path):
     assert result.stdout.split() == ["2001:db8:1234::5", "2001:db8:abcd::7"]
 
 
+def _list_global_ipv6(tmp_path: Path, ip_body: str,
+                      if_inet6: Path) -> subprocess.CompletedProcess:
+    env = _fake_bin(tmp_path, {"ip": ip_body})
+    return subprocess.run(
+        ["bash", "-c",
+         'source "$1"; IF_INET6_FILE="$2"; global_ipv6_addresses',
+         "verify-test", str(VERIFY_SCRIPT), str(if_inet6)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, **env})
+
+
+def test_global_ipv6_addresses_fail_when_ip_fails_on_an_ipv6_host(tmp_path):
+    """A failing ``ip`` must not read as "no global IPv6 address"."""
+    if_inet6 = tmp_path / "if_inet6"
+    if_inet6.write_text("", encoding="utf-8")
+    result = _list_global_ipv6(tmp_path, "exit 1\n", if_inet6)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+
+
+def test_global_ipv6_addresses_are_none_without_an_ipv6_stack(tmp_path):
+    result = _list_global_ipv6(tmp_path, "exit 1\n",
+                               tmp_path / "no-if_inet6")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_an_empty_lan6_set_with_unlisted_ipv6_addresses_fails():
+    lines, failures = _call("check_firewall_rule", _runbook_table(), "",
+                            "unknown")
+    assert failures == 1, lines
+    assert lines[-1].startswith("FAIL WARNING: the LAN IPv6 prefix set "
+                                "lan6_prefixes is EMPTY and this host's "
+                                "IPv6 addresses could not be listed")
+
+
+def test_a_listed_lan6_set_does_not_need_the_host_addresses():
+    lines, failures = _call("check_firewall_rule",
+                            _with_lan6_elements(_runbook_table()), "",
+                            "unknown")
+    assert failures == 0, lines
+    assert lines[-1] == f"PASS the LAN IPv6 prefix set lists: {{ {LAN6_EXAMPLE} }}"
+
+
+def test_the_orchestrator_check_fails_when_ip_fails_on_an_ipv6_host(
+        tmp_path):
+    """End to end through check_loaded_firewall: the loaded table has the
+    shipped empty lan6_prefixes set and ``ip`` cannot list addresses."""
+    if_inet6 = tmp_path / "if_inet6"
+    if_inet6.write_text("", encoding="utf-8")
+    env = _fake_bin(tmp_path, {
+        "sudo": f"cat <<'EOF'\n{_runbook_table()}\nEOF\n",
+        "ip": "exit 1\n",
+    })
+    lines, failures = _call("check_loaded_firewall",
+                            prefix=f"IF_INET6_FILE={if_inet6}", env=env)
+    assert failures == 1, lines
+    assert "could not be listed" in lines[-1], lines
+
+
+def test_the_orchestrator_check_notes_an_unlistable_table(tmp_path):
+    env = _fake_bin(tmp_path, {"sudo": "exit 1\n", "ip": "exit 0\n"})
+    lines, failures = _call("check_loaded_firewall", env=env)
+    assert failures == 0, lines
+    assert lines == ["NOTE the nftables table could not be listed, so its "
+                     "rules were not checked (the table check below "
+                     "reports why)"]
+
+
 def test_the_script_fails_on_an_older_rule_even_when_the_probe_passes(
         tmp_path):
     """End to end on the orchestrator side: a fake sudo lists the older

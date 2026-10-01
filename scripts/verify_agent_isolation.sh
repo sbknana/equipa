@@ -466,18 +466,29 @@ has_statement() {
     return 1
 }
 
+# Present whenever the kernel has an IPv6 stack (absent with ipv6.disable=1).
+IF_INET6_FILE=/proc/net/if_inet6
+
 # The global IPv6 addresses of this host, space-separated. Unique local
 # addresses (fc00::/7) are left out: the rule rejects that range already.
+# Non-zero when `ip` cannot list them on a host with an IPv6 stack: an
+# empty answer then would read as "no global address" and pass the check.
 global_ipv6_addresses() {
-    ip -6 -o addr show scope global 2>/dev/null | awk '
+    local listing
+    if ! listing="$(ip -6 -o addr show scope global 2>/dev/null)"; then
+        [ -e "$IF_INET6_FILE" ] && return 1
+        return 0
+    fi
+    printf '%s\n' "$listing" | awk '
         { split($4, parts, "/"); address = tolower(parts[1])
           if (address !~ /^f[cd]/) printf "%s ", address }'
 }
 
 # $1: the listing of table inet equipa_agent; $2: the host's global IPv6
-# addresses (space-separated, empty when it has none).
+# addresses (space-separated, empty when it has none); $3: "unknown" when
+# they could not be listed.
 check_firewall_rule() {
-    local listing="$1" global_ipv6="$2"
+    local listing="$1" global_ipv6="$2" ipv6_known="${3:-known}"
     local chain first statement lan6
     chain="$(nft_block "$listing" "chain agent")"
     if [ -z "$chain" ]; then
@@ -506,9 +517,25 @@ check_firewall_rule() {
         pass "the LAN IPv6 prefix set lists: ${lan6#elements = }"
     elif [ -n "$global_ipv6" ]; then
         fail "WARNING: the LAN IPv6 prefix set lan6_prefixes is EMPTY on a host with global IPv6 address(es) (${global_ipv6% }): the agent can reach every NAS, router or database on the LAN through its global IPv6 address; list the LAN's prefix ('ip -6 route show proto kernel', 'ip -6 route show proto ra') in the set (docs/AGENT_ISOLATION.md step 4a)"
+    elif [ "$ipv6_known" = unknown ]; then
+        fail "WARNING: the LAN IPv6 prefix set lan6_prefixes is EMPTY and this host's IPv6 addresses could not be listed ('ip -6 addr show' failed), so a LAN IPv6 prefix left open cannot be ruled out; fix 'ip' or list the LAN's prefix in the set (docs/AGENT_ISOLATION.md step 4a)"
     else
         pass "no global IPv6 address on this host, so the empty lan6_prefixes set leaves no LAN IPv6 prefix open"
     fi
+}
+
+# Orchestrator side: list the loaded table and check its rules. Listing it
+# needs the sudoers rule of step 6; without it the table check of
+# equipa.isolation fails and says why.
+check_loaded_firewall() {
+    local listing global_ipv6 ipv6_known=known
+    if ! listing="$(sudo -n "$NFT_EXECUTABLE" list table inet equipa_agent 2>/dev/null)" \
+            || [ -z "$listing" ]; then
+        echo "NOTE the nftables table could not be listed, so its rules were not checked (the table check below reports why)"
+        return
+    fi
+    global_ipv6="$(global_ipv6_addresses)" || ipv6_known=unknown
+    check_firewall_rule "$listing" "$global_ipv6" "$ipv6_known"
 }
 
 inside() {
@@ -801,12 +828,7 @@ fi
 self="$(readlink -f -- "$0")"
 runtime="$(dirname -- "$(dirname -- "$self")")"
 cd -- "$runtime" || exit 2
-if firewall_listing="$(sudo -n "$NFT_EXECUTABLE" list table inet equipa_agent 2>/dev/null)" \
-        && [ -n "$firewall_listing" ]; then
-    check_firewall_rule "$firewall_listing" "$(global_ipv6_addresses)"
-else
-    echo "NOTE the nftables table could not be listed, so its rules were not checked (the table check below reports why)"
-fi
+check_loaded_firewall
 "${EQUIPA_PYTHON:-python3}" -m equipa.isolation --verify-probe "$self" "$@"
 status=$?
 if [ "$failures" -gt 0 ]; then
