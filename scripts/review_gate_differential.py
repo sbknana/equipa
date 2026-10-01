@@ -13,7 +13,9 @@ subprocess, so each tree imports its own ``equipa`` package.
 
 ``--bodies`` builds review texts from every probe body the review-gate test
 modules hold (parametrized values and upper-case module constants of the
-3130, 3137, 3143, 3149 and 3152 modules, timing floods left out), each in a
+3130, 3137, 3143, 3149, 3152 and 3154 modules, timing floods left out) and
+from the MEDIUM variant of each (every UPPER-case CRITICAL and HIGH word
+replaced by MEDIUM), each in a
 zero-finding review and in a review with one counted LOW finding
 (``build_review`` of tests/test_review_gate_no_exemptions_3152.py). With
 ``--write-fixture`` the bodies some older tree blocked are written as the
@@ -38,6 +40,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -50,7 +53,12 @@ HARVESTED_MODULES = (
     "test_review_gate_followups_3149.py",
     "test_review_gate_tester_3149.py",
     "test_review_gate_no_exemptions_3152.py",
+    "test_review_gate_followups_3154.py",
 )
+# Task 3154 (R3152-02): every body is also judged with MEDIUM in place of
+# each UPPER-case CRITICAL and HIGH word, so an exemption cannot hide behind
+# the severity a test happened to use.
+MERGE_BLOCKING_WORD_RE = re.compile(r"(?<![^\W_])(?:CRITICAL|HIGH)(?![^\W_])")
 BUILDER_MODULE = "test_review_gate_no_exemptions_3152.py"
 MAX_BODY_CHARACTERS = 4000
 CURRENT = "this tree"
@@ -142,19 +150,30 @@ def _module_bodies(module) -> list[list[str]]:
     return bodies
 
 
+def medium_variant(body: list[str]) -> list[str] | None:
+    """``body`` with MEDIUM for every UPPER-case CRITICAL and HIGH word, or
+    None when it holds neither."""
+    variant = [MERGE_BLOCKING_WORD_RE.sub("MEDIUM", line) for line in body]
+    return None if variant == body else variant
+
+
 def harvested_bodies() -> list[tuple[str, list[str]]]:
-    """(module, body) for every distinct short probe body, in order."""
+    """(module, body) for every distinct short probe body and its MEDIUM
+    variant, in order."""
     seen: set[tuple[str, ...]] = set()
     found: list[tuple[str, list[str]]] = []
     for name in HARVESTED_MODULES:
         for body in _module_bodies(_load_test_module(name)):
-            key = tuple(body)
-            if (key in seen or sum(map(len, body)) > MAX_BODY_CHARACTERS
+            if (sum(map(len, body)) > MAX_BODY_CHARACTERS
                     or not any(char.isalpha() for line in body
                                for char in line)):
                 continue
-            seen.add(key)
-            found.append((name, body))
+            for label, candidate in ((name, body),
+                                     (f"{name} [MEDIUM]", medium_variant(body))):
+                if candidate is None or tuple(candidate) in seen:
+                    continue
+                seen.add(tuple(candidate))
+                found.append((label, candidate))
     return found
 
 
