@@ -903,8 +903,9 @@ _ARGUMENT_EVALUATORS = frozenset({"[", "read", "printf", "test", "wait", "getopt
 # Top-level code characters that end a simple command.
 _COMMAND_SEPARATORS = frozenset(";&|()\n")
 # Unquoted characters that make a word expand to text the checker cannot
-# see: globs and braces (a file named `-v` or `a[$(id)]`) and tilde.
-_EXPANDING_CODE_CHARS = frozenset("*?[]{}~")
+# see: globs and braces (a file named `-v` or `a[$(id)]`) and tilde. A
+# bracket glob needs its `[`, so the `]` closing `[ -f x ]` is not one.
+_EXPANDING_CODE_CHARS = frozenset("*?[{}~")
 # An unquoted redirection operator at the start of a word, matched on the
 # raw word so that a quoted `'>'` stays an ordinary word.
 _REDIRECTION_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|>>|>\||<&|>&|&>>?|[<>])")
@@ -996,7 +997,8 @@ def _argument_evaluator(words: list[_ShellWord]) -> str | None:
             if _ASSIGNMENT_WORD_RE.match(word.text) or word.text in _COMMAND_PREFIX_WORDS:
                 continue
             at_command_name = False
-            if word.expands:
+            # A lone `[` is the test builtin, not a glob.
+            if word.expands and word.raw != "[":
                 return f"the expanded command name {word.text!r}"
         if word.text != "[" and not _ARGUMENT_EVALUATOR_RE.search(word.text):
             continue

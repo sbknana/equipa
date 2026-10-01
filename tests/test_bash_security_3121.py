@@ -471,6 +471,20 @@ FALSE_POSITIVE_TABLE = [
     ("awk '{print $(NF)}' data/in.txt", f"let 'a[$({PAYLOAD})]'"),
     ('echo "$((1 + 2))"', f"echo \"$(( '$({PAYLOAD})' ))\""),
     ("cd tests && ls > out.txt", "cd /etc; echo x > zz-fake"),
+    # Task 3146 (IV3133-01): searching for substitution text next to a
+    # builtin that only stores or tests text / the same builtin evaluating it.
+    ("grep -n 'foo\\[\\$(' f", f"x='a[$({PAYLOAD})]'; a[x]=1"),
+    ("[ -f f ] && grep -c '$(' f", f"[ -v 'a[$({PAYLOAD})]' ]"),
+    ("test -d docs && grep -n '`' docs/X.md", f"test -v 'a[`{PAYLOAD}`]'"),
+    (
+        "while read -r f; do grep -Hn '$(' \"$f\"; done < files.txt",
+        f"read RANDOM <<< 'a[$({PAYLOAD})]'",
+    ),
+    ("printf '%s\\n' '$(not run)'", f"printf -v 'a[$({PAYLOAD})]' x"),
+    (
+        "echo \"$((1+2))\" && grep -n '$(date)' docs/*.md",
+        f"x='a[$({PAYLOAD})]'; echo \"$((x))\"",
+    ),
 ]
 
 
