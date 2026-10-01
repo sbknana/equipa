@@ -61,30 +61,6 @@ def compute_keyword_overlap(text_a: str, text_b: str) -> float:
     return len(intersection) / len(union)
 
 
-def _compute_ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
-    """Compute n-gram Jaccard similarity between two texts.
-
-    Uses character n-grams for fuzzy matching (catches typos, variations).
-    Returns similarity score 0.0-1.0.
-    """
-    if not text_a or not text_b:
-        return 0.0
-
-    def ngrams(s: str, n: int) -> set[str]:
-        s_lower = s.lower()
-        return set(s_lower[i:i+n] for i in range(len(s_lower) - n + 1))
-
-    ngrams_a = ngrams(text_a, n)
-    ngrams_b = ngrams(text_b, n)
-
-    if not ngrams_a or not ngrams_b:
-        return 0.0
-
-    intersection = ngrams_a & ngrams_b
-    union = ngrams_a | ngrams_b
-    return len(intersection) / len(union)
-
-
 def deduplicate_lessons(lessons: list[dict]) -> list[dict]:
     """Remove semantically duplicate lessons based on 60%+ word overlap.
 
@@ -140,44 +116,45 @@ def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
     return "\n".join(lines[:max_lines]).strip()
 
 
-def _deduplicate_log_lines(lines: list[str], threshold: float = 0.85) -> list[str]:
-    """Deduplicate similar log lines using n-gram Jaccard similarity.
+_DIGIT_RUN = re.compile(r"\d+")
 
-    Groups identical or nearly-identical lines, showing count instead of repeating.
+
+def _log_line_key(line: str) -> str:
+    """Grouping key for a log line: case, spacing and numbers (timestamps,
+    counters, line numbers) do not make two log lines different."""
+    return _DIGIT_RUN.sub("#", " ".join(line.lower().split()))
+
+
+def _deduplicate_log_lines(lines: list[str]) -> list[str]:
+    """Group repeated log lines, showing a count instead of repeating them.
+
+    Lines are grouped by _log_line_key() in a dict, so the cost is linear in
+    the number of lines. The fuzzy n-gram comparison this replaced compared
+    every line with every earlier group (17 s on 1000 distinct lines) on the
+    compaction path of every checkpoint (review N5 of task 3129).
     Example: "Error: timeout\n" × 50 → "Error: timeout (×50)"
     """
     if not lines:
         return lines
 
     result: list[str] = []
-    line_groups: dict[str, int] = {}  # line → count
-    group_reps: list[str] = []  # first representative of each group
+    group_counts: dict[str, int] = {}  # key → count
+    group_reps: dict[str, str] = {}  # key → first line seen (insertion order)
 
     for line in lines:
         if not line.strip():
             result.append(line)
             continue
-
-        # Find matching group
-        matched_idx = -1
-        for idx, rep in enumerate(group_reps):
-            sim = _compute_ngram_jaccard(line, rep)
-            if sim >= threshold:
-                matched_idx = idx
-                break
-
-        if matched_idx >= 0:
-            # Increment existing group
-            rep = group_reps[matched_idx]
-            line_groups[rep] += 1
+        key = _log_line_key(line)
+        if key in group_counts:
+            group_counts[key] += 1
         else:
-            # New group
-            group_reps.append(line)
-            line_groups[line] = 1
+            group_counts[key] = 1
+            group_reps[key] = line
 
     # Emit deduplicated lines with counts
-    for rep in group_reps:
-        count = line_groups[rep]
+    for key, rep in group_reps.items():
+        count = group_counts[key]
         if count > 1:
             result.append(f"{rep.rstrip()} (×{count})")
         else:
@@ -227,6 +204,36 @@ def _aggressive_compress_code(text: str) -> str:
         compressed.append(stripped)
 
     return "\n".join(compressed)
+
+
+AGENT_OUTPUT_LINE_WITHHELD: str = "[line withheld: failed sanitization]"
+
+
+def _sanitize_lines(section_text: str, marker: str) -> str:
+    """Reject-mode sanitize each line of a list section on its own.
+
+    *section_text* starts with ``MARKER:`` (see _extract_section). A rejected
+    line is replaced by AGENT_OUTPUT_LINE_WITHHELD, under the fixed marker
+    for the header line and as a bullet otherwise, so the other entries
+    still reach the next agent. The joined result gets the lesson length
+    cap, as a whole section would.
+    """
+    from lesson_sanitizer import MAX_LESSON_LENGTH, enforce_limit, sanitize
+
+    label = f"agent output {marker}"
+    kept: list[str] = []
+    for index, line in enumerate(section_text.split("\n")):
+        if not line.strip():
+            kept.append("")
+            continue
+        clean = sanitize(line, label=label)
+        if clean:
+            kept.append(clean)
+        elif index == 0:
+            kept.append(f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}")
+        else:
+            kept.append(f"- {AGENT_OUTPUT_LINE_WITHHELD}")
+    return enforce_limit("\n".join(kept).strip(), MAX_LESSON_LENGTH, label=label)
 
 
 def compact_agent_output(
@@ -293,14 +300,20 @@ def compact_agent_output(
     # (PS-02). The sanitizer rejects rather than strips, so a rejected section
     # comes back empty and is recorded here: it must be reported as withheld,
     # never replaced by the raw text it was extracted from (review F1).
+    # FILES_CHANGED is a list of independent entries, so it is sanitized per
+    # line: one rejected path withholds that line, not the section (N4).
     rejected: list[str] = []
     for key, section_text in sections.items():
-        if section_text:
+        if not section_text:
+            continue
+        if key == "FILES_CHANGED":
+            sections[key] = _sanitize_lines(section_text, key)
+        else:
             sections[key] = sanitize_lesson_content(
                 section_text, label=f"agent output {key}"
             )
-            if not sections[key]:
-                rejected.append(key)
+        if not sections[key]:
+            rejected.append(key)
 
     parts: list[str] = []
     if sections["SUMMARY"]:
@@ -870,39 +883,84 @@ def build_compaction_summary(
     return summary
 
 
+def wrap_agent_output(tag_type: str, text: str) -> str:
+    """Confine agent-authored *text* to a ``<task-input>`` block.
+
+    Every wrapper token inside *text* is escaped first, so the text cannot
+    close the block and carry anything out into instruction position.
+    """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
+    return (
+        f'<task-input type="{tag_type}" trust="agent-output">\n'
+        f"{neutralize_boundaries(text)}\n"
+        f"</task-input>"
+    )
+
+
+def _sanitize_tester_line(text: object, label: str, max_chars: int = 200) -> str:
+    """Reject-mode sanitize one Tester-authored line, then cap it.
+
+    The whole line is scanned before it is cut, so truncation cannot hide
+    the end of an injection phrase from the sanitizer.
+    """
+    from lesson_sanitizer import sanitize  # HARD dependency
+
+    clean = sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
+    return clean[:max_chars] + "..." if len(clean) > max_chars else clean
+
+
 def build_test_failure_context(test_results: dict, cycle: int) -> str:
     """Format Tester failures + recommendations for the Developer's next attempt.
 
     Returns a string to append to the Developer's system prompt.
     Caps output to prevent unbounded context growth: max 5 failure details,
     each truncated to 200 chars; max 3 recommendations.
+
+    Failure details, recommendations and the framework name are Tester
+    output, and this text reaches compaction history, so each one goes
+    through the reject-mode sanitizer (a rejected line becomes
+    AGENT_OUTPUT_WITHHELD) and the block sits in an escaped <task-input>
+    wrapper, like the compaction summary (review N3 of task 3129).
     """
+    framework = _sanitize_tester_line(
+        test_results["test_framework"], "tester test_framework", max_chars=80
+    )
+    tester_lines: list[str] = []
+
+    if test_results["failure_details"]:
+        tester_lines.append("### Failing Tests:")
+        # Cap at 5 details, truncate each to 200 chars
+        for detail in test_results["failure_details"][:5]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(detail, 'tester failure detail')}"
+            )
+        remaining = len(test_results["failure_details"]) - 5
+        if remaining > 0:
+            tester_lines.append(f"- ...and {remaining} more failure(s)")
+        tester_lines.append("")
+
+    if test_results["recommendations"]:
+        tester_lines.append("### Tester Recommendations:")
+        # Cap at 3 recommendations
+        for rec in test_results["recommendations"][:3]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(rec, 'tester recommendation')}"
+            )
+        tester_lines.append("")
+
     lines = [
         f"## Test Failures from Cycle {cycle}",
         "",
         f"The Tester agent ran {test_results['tests_run']} tests "
-        f"using {test_results['test_framework']}.",
+        f"using {framework}.",
         f"**{test_results['tests_failed']} tests failed.**",
         "",
     ]
-
-    if test_results["failure_details"]:
-        lines.append("### Failing Tests:")
-        # Cap at 5 details, truncate each to 200 chars
-        for detail in test_results["failure_details"][:5]:
-            truncated = detail[:200] + "..." if len(detail) > 200 else detail
-            lines.append(f"- {truncated}")
-        remaining = len(test_results["failure_details"]) - 5
-        if remaining > 0:
-            lines.append(f"- ...and {remaining} more failure(s)")
-        lines.append("")
-
-    if test_results["recommendations"]:
-        lines.append("### Tester Recommendations:")
-        # Cap at 3 recommendations
-        for rec in test_results["recommendations"][:3]:
-            truncated = rec[:200] + "..." if len(rec) > 200 else rec
-            lines.append(f"- {truncated}")
+    if tester_lines:
+        lines.append(
+            wrap_agent_output("tester-failures", "\n".join(tester_lines).strip())
+        )
         lines.append("")
 
     lines.append("**Fix these test failures. Do NOT skip or delete failing tests.**")

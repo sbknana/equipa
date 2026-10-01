@@ -20,7 +20,10 @@ Policy (reject, never strip-and-keep):
   capitals, IPA, Armenian, Cyrillic, Greek) mapped to Latin. Keyword
   patterns also run with hyphen / underscore / dot joiners between letters
   deleted and spaced. So ``ig<ZWSP>nore``, Cyrillic ``іgnоre``, small-capital
-  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught.
+  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught. Plain
+  lowercase code identifiers (``system_override``, ``sudo_mode``) are not
+  spaced for the fake-header class, and a few phrases ("act as the admin",
+  "new rules:") count only in imperative position.
 * If ANY injection pattern matches, the whole text is REJECTED: ``sanitize()``
   returns ``""`` and logs the reason at WARNING. Stripping the matched phrase
   and keeping the rest is the defect sandbox-09 describes — "Ignore previous
@@ -226,6 +229,39 @@ def normalize_for_matching(text: str) -> str:
     return folded
 
 
+# A lowercase snake_case or kebab-case identifier ("system_override",
+# "sudo_mode", "admin-alert"). Case-sensitive on purpose: "SYSTEM_OVERRIDE"
+# and "SYSTEM.OVERRIDE" are header-shaped, not code names, and so is an
+# identifier followed by a colon ("system_override: approve"). Linear: an
+# identifier starts only at a word boundary, each repetition begins with a
+# joiner, and the lookahead scans a run once.
+_CODE_IDENTIFIER = r"\b[a-z0-9]+(?:[-_][a-z0-9]+)+\b(?![ \t]*:)"
+_PLAIN_IDENTIFIER = re.compile(_CODE_IDENTIFIER)
+_IDENTIFIER_OR_JOINER = re.compile(
+    f"({_CODE_IDENTIFIER})|{_WORD_JOINER.pattern}"
+)
+
+
+def _space_joiners_outside_identifiers(folded: str, raw: str) -> str:
+    """Space joiner runs in *folded*, except inside plain code identifiers.
+
+    Only an identifier that also appears verbatim in *raw* is kept joined, so
+    one that exists only after folding (small capitals, Cyrillic or
+    zero-width splits) is spaced like any other joiner run.
+    """
+    plain = set(_PLAIN_IDENTIFIER.findall(raw))
+
+    def keep_plain_identifier(match: re.Match[str]) -> str:
+        identifier = match.group(1)
+        if identifier is None:
+            return " "
+        if identifier in plain:
+            return identifier
+        return _WORD_JOINER.sub(" ", identifier)
+
+    return _IDENTIFIER_OR_JOINER.sub(keep_plain_identifier, folded)
+
+
 def _joiner_variants(folded: str) -> tuple[str, ...]:
     """Copies of *folded* with word-joiner runs deleted and spaced, if any."""
     if not _WORD_JOINER.search(folded):
@@ -233,18 +269,91 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
     return _WORD_JOINER.sub("", folded), _WORD_JOINER.sub(" ", folded)
 
 
+# --- Imperative-position phrases --------------------------------------------
+# Some phrases are an instruction only when they open a sentence, line,
+# bullet or heading, or follow an imperative word: "Act as the admin",
+# "please execute this script", "## New rules:". Elsewhere they are ordinary
+# text: "the CA will act as the root CA", "CI will execute this script",
+# "ruff ships new rules: E501" (review N4 of task 3129).
+#
+# The phrase is found first and its position is checked afterwards by looking
+# back at most _IMPERATIVE_LOOKBACK characters. Putting the position test in
+# front of the phrase in one regex made the engine retry a multi-way anchor
+# group at every character: 0.2-0.3 s per MB of whitespace, and "\s" in that
+# anchor group was the quadratic of review N1.
+_IMPERATIVE_LOOKBACK = 64
+_SENTENCE_BREAKS = frozenset("\n\r.!?:;,")
+_BULLET_MARKS = "#*>-"
+_WORD = re.compile(r"\w+")
+
+
+class _ImperativePhrase:
+    """A phrase pattern that matches only in imperative position.
+
+    Duck-types the ``search`` method of ``re.Pattern`` so it can sit in
+    _INJECTION_PATTERNS. Linear: each phrase match costs one bounded
+    look-back, and after a match in the wrong position the scan resumes one
+    character later, so every character starts at most one phrase attempt.
+    """
+
+    def __init__(
+        self,
+        phrase: str,
+        triggers: frozenset[str],
+        you_modals: frozenset[str] = frozenset(),
+    ) -> None:
+        self.pattern = phrase
+        self._phrase = re.compile(phrase, re.IGNORECASE)
+        self._triggers = triggers
+        self._you_modals = you_modals
+
+    def _opens_instruction(self, text: str, start: int) -> bool:
+        window_start = max(0, start - _IMPERATIVE_LOOKBACK)
+        prefix = (
+            text[window_start:start]
+            .rstrip(" \t").rstrip(_BULLET_MARKS).rstrip(" \t")
+        )
+        if not prefix:
+            # Start of the text, or a blank / bullet run longer than the
+            # look-back window: both count as imperative (the safe side).
+            return True
+        if prefix[-1] in _SENTENCE_BREAKS:
+            return True
+        words = [word.lower() for word in _WORD.findall(prefix[-24:])[-2:]]
+        if not words:
+            return False
+        if words[-1] in self._triggers:
+            return True
+        return (
+            len(words) == 2 and words[0] == "you" and words[1] in self._you_modals
+        )
+
+    def search(self, text: str) -> re.Match[str] | None:
+        position = 0
+        while True:
+            match = self._phrase.search(text, position)
+            if match is None or self._opens_instruction(text, match.start()):
+                return match
+            position = match.start() + 1
+
+
 # --- Injection patterns (any match => reject) -------------------------------
-# Each entry is (reason, compiled pattern). Patterns run against the output
-# of normalize_for_matching(). The reason is logged and returned by
-# detect_injection() so operators can see why content was refused.
+# Each entry is (reason, compiled pattern or _ImperativePhrase). Patterns run
+# against the output of normalize_for_matching(). The reason is logged and
+# returned by detect_injection() so operators can see why content was
+# refused; a reason may have more than one entry.
 #
 # Every pattern must stay linear in the input length: this text is agent-
 # writable and is scanned on every prompt build (review F2/F3 of task 3123).
 # Never put two unbounded quantifiers over overlapping characters next to
-# each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces), and
-# never follow an unbounded lazy run with another one. Bound runs with
-# {0,N} instead. tests/test_lesson_sanitizer_3129.py times every pattern.
-_INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+# each other (``<\s*/?\s*`` backtracks quadratically on "<" plus spaces, and
+# a "\n" start class followed by ``\s*`` does so on newline runs), and never
+# follow an unbounded lazy run with another one. Bound runs with {0,N}
+# instead. tests/test_lesson_sanitizer_3129.py times each pattern on the
+# inputs aimed at it, and tests/fixtures/sanitizer_timing_probe.py adds
+# whitespace-run families that tests/test_sanitizer_3139.py runs against
+# EVERY entry (under 0.2 s per MB each), including ones added later.
+_INJECTION_PATTERNS: list[tuple[str, re.Pattern[str] | _ImperativePhrase]] = [
     # Our own trust-boundary markers: an opening or closing <task-input> tag,
     # or anything shaped like the per-prompt untrusted-content delimiter.
     (
@@ -279,16 +388,19 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     # Fake privileged headers such as "## SYSTEM OVERRIDE" or "ADMIN NOTICE".
+    # The keyword alternations below share one leading \b: one boundary test
+    # per position instead of one per alternative keeps a 1 MB scan of a
+    # whitespace run well under 0.2 s (review N2 of task 3129).
     (
         "fake system header",
         re.compile(
-            r"\b(?:system|admin|administrator|root)\s+(?:override|directive|"
+            r"\b(?:(?:system|admin|administrator|root)\s+(?:override|directive|"
             r"instructions?|command|notice|alert)s?\b|"
-            r"\b(?:priority|emergency|urgent)\s+(?:override|directive|"
+            r"(?:priority|emergency|urgent)\s+(?:override|directive|"
             r"instructions?)\b|"
-            r"\boverride\s+(?:mode|code|protocol|activated|enabled|engaged)\b|"
-            r"\bBEGIN\s+(?:SYSTEM|ADMIN|NEW\s+INSTRUCTIONS)\b|"
-            r"\b(?:god|dan|jailbreak|unrestricted|sudo)\s+mode\b",
+            r"override\s+(?:mode|code|protocol|activated|enabled|engaged)\b|"
+            r"BEGIN\s+(?:SYSTEM|ADMIN|NEW\s+INSTRUCTIONS)\b|"
+            r"(?:god|dan|jailbreak|unrestricted|sudo)\s+mode\b)",
             re.IGNORECASE,
         ),
     ),
@@ -296,55 +408,86 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "role override",
         re.compile(
-            r"\byou\s+are\s+now\b|"
-            r"\bignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
+            r"\b(?:you\s+are\s+now\b|"
+            r"ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
             r"earlier|preceding|your|other|system)\s+(?:instructions?|prompts?|"
             r"rules?|guidelines?|context|directions?|messages?)|"
-            r"\bignore\s+(?:all|any|everything)\s+(?:instructions?|rules?|"
+            r"ignore\s+(?:all|any|everything)\s+(?:instructions?|rules?|"
             r"above|before)|"
-            r"\bdisregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
+            r"disregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|"
             r"earlier|preceding|your|instructions?|rules?)|"
-            r"\bforget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
+            r"forget\s+(?:everything|all\s+(?:previous|prior|your|the\s+above)|"
             r"(?:your|the|all)\s+(?:previous\s+)?(?:instructions?|rules?|"
             r"guidelines?|training))|"
-            # "Forget all of that", but not "don't forget all migrations".
-            r"\bforget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
-            r"context|you)\b|"
-            r"\bnew\s+(?:instructions?|system\s+prompt|directives?)\b|"
-            # "New rules: ...", but not "add new rules to the linter".
-            r"\bnew\s+(?:rules?|orders?)\s*:|"
-            r"\byour\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
-            r"\boverride\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
+            r"new\s+(?:instructions?|system\s+prompt|directives?)\b|"
+            r"your\s+new\s+(?:role|instructions?|task|rules?|objective)\b|"
+            r"override\s+(?:your|all|any|previous|prior|the\s+(?:previous|"
             r"system|above))\s+(?:instructions?|rules?|guidelines?|"
             r"behaviou?r|programming|directives?|safety|restrictions)|"
-            r"\bact\s+as\s+if\s+you\b|"
+            r"act\s+as\s+if\s+you\b|"
             # "Act as a senior admin", but not "act as a good API citizen".
-            r"\bact\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
-            r"(?:admin(?:istrator)?|sysadmin|root|superuser|unrestricted|"
+            # "root" is left to the imperative entry below: "the CA will act
+            # as the root CA" is ordinary text.
+            r"act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
+            r"(?:admin(?:istrator)?|sysadmin|superuser|unrestricted|"
             r"jailbroken)\b|"
-            r"\bpretend\s+(?:you\s+are|to\s+be|you're)\b|"
-            r"\bswitch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
+            r"pretend\s+(?:you\s+are|to\s+be|you're)\b|"
+            r"switch\s+(?:to|into)\s+(?:a\s+)?(?:new|different|unrestricted)"
             r"\s+(?:mode|role|persona)\b|"
-            r"\bfrom\s+now\s+on,?\s+(?:you|always|never|ignore|respond|act)\b|"
-            r"\b(?:do\s+not|don't|never)\s+(?:tell|inform|alert|notify)\s+"
+            r"from\s+now\s+on,?\s+(?:you|always|never|ignore|respond|act)\b|"
+            r"(?:do\s+not|don't|never)\s+(?:tell|inform|alert|notify)\s+"
             r"(?:the\s+)?(?:user|operator|orchestrator|reviewer|human)\b|"
-            r"\b(?:reveal|leak|exfiltrate)\s+(?:your|the)\s+(?:system\s+prompt|"
-            r"instructions|api[\s_-]?keys?|credentials|secrets|tokens?)",
+            r"(?:reveal|leak|exfiltrate)\s+(?:your|the)\s+(?:system\s+prompt|"
+            r"instructions|api[\s_-]?keys?|credentials|secrets|tokens?))",
             re.IGNORECASE,
+        ),
+    ),
+    # The same class for phrases that are ordinary text outside imperative
+    # position (review N4 of task 3129): "Please act as the root user",
+    # "Forget all of that", "New rules: ...", but not "the intermediate CA
+    # will act as the root CA", "don't forget all of this setup" or "ruff
+    # ships new rules: E501".
+    (
+        "role override",
+        _ImperativePhrase(
+            r"\b(?:act\s+as\s+(?:an?|the|my|your)\s+(?:[\w-]+\s+){0,2}?"
+            r"root\b|"
+            r"forget\s+all\s+(?:of\s+)?(?:that|this|above|before|earlier|"
+            r"context|you)\b|"
+            r"new\s+(?:rules?|orders?)\s*:)",
+            triggers=frozenset({
+                "please", "now", "then", "always", "just", "and", "also",
+                "so", "instead", "you",
+            }),
+            you_modals=frozenset({
+                "must", "should", "will", "shall", "can", "may", "now", "to",
+            }),
         ),
     ),
     # Explicit requests to run supplied commands.
     (
         "command instruction",
         re.compile(
-            r"\b(?:run|execute)\s+(?:this|the\s+following)\s*(?:commands?\b|:)|"
-            # An imperative "Execute this script", but not "CI will execute
-            # this script" or "cannot run this code" (commit ef40ff5).
-            r"(?:^|[\n.!?:;,]|\b(?:please|now|then|always|first|and|just|"
-            r"immediately)\b)\s*execute\s+(?:this|these|the\s+following)\s+"
-            r"(?:[\w-]+\s+)?(?:scripts?|code|snippets?|payloads?|programs?)\b|"
-            r"\bpipe\s+(?:this|the\s+output)\s+to\b",
+            r"\b(?:(?:run|execute)\s+(?:this|the\s+following)\s*"
+            r"(?:commands?\b|:)|pipe\s+(?:this|the\s+output)\s+to\b)",
             re.IGNORECASE,
+        ),
+    ),
+    # An imperative "Execute this script", but not "CI will execute this
+    # script" or "cannot run this code" (commit ef40ff5). This was one regex
+    # with the position test in front, and "\s*" there overlapped its "\n"
+    # start class: every newline in a run started an attempt that ate the
+    # rest of the run and backtracked (23 s on 60k newlines, review N1 of
+    # task 3129).
+    (
+        "command instruction",
+        _ImperativePhrase(
+            r"\bexecute\s+(?:this|these|the\s+following)\s+(?:[\w-]+\s+)?"
+            r"(?:scripts?|code|snippets?|payloads?|programs?)\b",
+            triggers=frozenset({
+                "please", "now", "then", "always", "first", "and", "just",
+                "immediately",
+            }),
         ),
     ),
     # Shell payload signatures: download-and-execute, destructive deletes of
@@ -352,22 +495,20 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "dangerous command",
         re.compile(
-            r"\b(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
-            r"(?:ba|z|da|k)?sh\b|"
-            r"\b(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
-            r"(?:python[23]?|perl|ruby|node)\b|"
-            r"\brm\s+-[a-z]{0,10}(?:rf|fr)[a-z]{0,10}\s+(?:--no-preserve-root\s+)?"
+            r"\b(?:(?:curl|wget)\b[^\n|;]{0,200}\|\s*(?:sudo\s+)?"
+            r"(?:(?:ba|z|da|k)?sh|python[23]?|perl|ruby|node)\b|"
+            r"rm\s+-[a-z]{0,10}(?:rf|fr)[a-z]{0,10}\s+(?:--no-preserve-root\s+)?"
             r"(?:/(?=\s|$|\*)|~|\$HOME|\$\{HOME\}|\*|\.{1,2}(?=\s|$|/\s|/$))|"
-            r"/dev/(?:tcp|udp)/|"
-            r"\bnc(?:at)?\b[^\n]{0,40}\s-[a-z]*e\s|"
-            r"\bbase64\s+(?:-d|--decode)\b[^\n]{0,100}\|\s*(?:ba)?sh\b|"
-            r"\beval\s+[\"']?\$\(|"
-            r"\bpython[23]?\s+-c\s+[\"'][^\"']{0,2000}(?:import\s+os|subprocess|"
+            r"nc(?:at)?\b[^\n]{0,40}\s-[a-z]*e\s|"
+            r"base64\s+(?:-d|--decode)\b[^\n]{0,100}\|\s*(?:ba)?sh\b|"
+            r"eval\s+[\"']?\$\(|"
+            r"python[23]?\s+-c\s+[\"'][^\"']{0,2000}(?:import\s+os|subprocess|"
             r"socket|__import__)|"
-            r"\b(?:cat|cp|scp|curl|tar)\b[^\n]{0,60}(?:~|\$HOME)/\."
+            r"(?:cat|cp|scp|curl|tar)\b[^\n]{0,60}(?:~|\$HOME)/\."
             r"(?:ssh|aws|gnupg|netrc|claude|config/gh)\b|"
-            r"\b(?:env|printenv)\s*\|\s*(?:curl|nc|wget)\b|"
-            r"\bInvoke-Expression\b|\biex\s*\(",
+            r"(?:env|printenv)\s*\|\s*(?:curl|nc|wget)\b|"
+            r"Invoke-Expression\b|iex\s*\()|"
+            r"/dev/(?:tcp|udp)/",
             re.IGNORECASE,
         ),
     ),
@@ -407,6 +548,13 @@ _JOINER_AWARE_REASONS = frozenset({
     "command instruction",
 })
 
+# Joiner-aware classes whose phrases are two-word names that code uses all
+# the time ("system_override" flag, "admin_alert()", "sudo_mode" setting).
+# Their spaced variant keeps lowercase snake_case / kebab-case identifiers
+# joined (review N4 of task 3129). Sentence-shaped classes do not get this:
+# "ignore_previous_instructions" and "you_are_now" must stay rejected.
+_IDENTIFIER_SAFE_REASONS = frozenset({"fake system header"})
+
 
 def detect_injection(text) -> str | None:
     """Return the reason *text* looks like a prompt injection, else None.
@@ -428,21 +576,33 @@ def detect_injection(text) -> str | None:
     if folded is None:
         return "abnormal unicode decomposition"
     variants = _joiner_variants(folded)
+    identifier_safe_variants: tuple[str, ...] = ()
+    if variants:
+        identifier_safe_variants = (
+            variants[0], _space_joiners_outside_identifiers(folded, raw),
+        )
     for reason, pattern in _INJECTION_PATTERNS:
         if pattern.search(folded):
             return reason
-        if reason in _JOINER_AWARE_REASONS and any(
-            pattern.search(variant) for variant in variants
-        ):
+        if reason not in _JOINER_AWARE_REASONS:
+            continue
+        if reason in _IDENTIFIER_SAFE_REASONS:
+            reason_variants = identifier_safe_variants
+        else:
+            reason_variants = variants
+        if any(pattern.search(variant) for variant in reason_variants):
             return reason
     return None
 
 
-# "<" and ">" plus the fullwidth and small-form variants NFKD folds onto them.
+# "<" and ">" plus every code point whose NFKD decomposition contains one:
+# the fullwidth and small forms, and NOT LESS-THAN / NOT GREATER-THAN, which
+# decompose to "<" / ">" plus a combining solidus (review N7 of task 3129).
 _ANGLE_BRACKET_ESCAPES = str.maketrans({
     "<": "&lt;", ">": "&gt;",
     "＜": "&lt;", "＞": "&gt;",
     "﹤": "&lt;", "﹥": "&gt;",
+    "≮": "&lt;", "≯": "&gt;",
 })
 
 
@@ -670,9 +830,11 @@ _VALID_LESSON_PATTERNS = [
     ),
     # Numbered steps: "(1)", "1.", "Step 1"
     re.compile(r'(?:\(\d\)|\d\.\s|step\s+\d)', re.IGNORECASE),
-    # Cause-effect: "because", "since", "when", "if ... then"
+    # Cause-effect: "because", "since", "when", "if ... then". The gap after
+    # "if" is bounded: ".*" ran to the end of the line from every "if" and
+    # backtracked, so "if a " repeated took 7.8 s on 60k chars (task 3139).
     re.compile(
-        r'(?:because|since|when\s+\w+|if\s+\w+.*(?:then|,)|'
+        r'(?:because|since|when\s+\w+|if\s+\w+[^\n]{0,200}?(?:then|,)|'
         r'results?\s+in|leads?\s+to|causes?|prevents?)',
         re.IGNORECASE,
     ),
