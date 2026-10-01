@@ -1697,9 +1697,12 @@ def _table_candidate_severities(visible_text: str) -> list[tuple[int, str]]:
     risk" row is exempt, as the heading form is.
     """
     severities: list[tuple[int, str]] = []
+    if "|" not in visible_text:
+        return severities  # no table row (task 3137: skip the line loop)
     severity_columns: dict[int, str] | None = None
     for line_number, line in enumerate(visible_text.split("\n")):
-        cells = _table_cells(line)
+        # A line without a pipe is not a row (_table_cells returns None).
+        cells = _table_cells(line) if "|" in line else None
         if cells is None:
             severity_columns = None
             continue
@@ -2516,8 +2519,11 @@ def _decode_character_reference(match: re.Match[str]) -> str:
 # (an enclosing circle) render as HIGH with a mark on or around a letter.
 # Marks (Unicode categories Mn and Me) are dropped after canonical
 # decomposition, so the letters under them are read. Only non-ASCII runs are
-# touched.
-_NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f]+")
+# touched. U+FFFD, which the rendered view writes for every backtick shown as
+# text, has no decomposition and starts a new character (combining class 0),
+# so leaving it out changes nothing but the cost: a flood of unpaired
+# backticks no longer costs one callback each.
+_NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f\N{REPLACEMENT CHARACTER}]+")
 
 
 def _without_combining_marks(run: re.Match[str]) -> str:
