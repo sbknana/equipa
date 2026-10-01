@@ -128,6 +128,13 @@ _BIDI_CONTROL_RE = re.compile(
     "[\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
     "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
 )
+# A numeric character reference to one of them ("&#x202E;", "&#8238", with
+# or without ";" and leading zeros) decodes to the control when the review
+# is rendered, so it is rejected the same way. HTML5 names none of them.
+_BIDI_CONTROL_REFERENCE_RE = re.compile(
+    r"&#(?:[xX]0*(202[A-Ea-e]|206[6-9])(?![0-9A-Fa-f])"
+    r"|0*(823[4-8]|829[4-7])(?![0-9]))"
+)
 REVIEW_BIDI_CONTROL_REASON = "review-bidi-control"
 # Every line break normalize_review_text maps to "\n", and "\n" itself.
 _ANY_LINE_BREAK_RE = re.compile(
@@ -140,9 +147,20 @@ def find_bidi_control(text: str) -> str | None:
     """``"U+202E at line 3"`` for the first bidi control in ``text``, else None.
 
     ``text`` is read as written (before :func:`normalize_review_text`, which
-    strips these characters); every line-break form counts as one break.
+    strips these characters); every line-break form counts as one break. A
+    character reference to a control is reported as
+    ``"U+202E reference at line 3"``, whichever comes first.
     """
     match = _BIDI_CONTROL_RE.search(text)
+    reference = (_BIDI_CONTROL_REFERENCE_RE.search(text)
+                 if "&#" in text else None)
+    if reference is not None and (match is None
+                                  or reference.start() < match.start()):
+        hexadecimal, decimal = reference.group(1), reference.group(2)
+        code_point = (int(hexadecimal, 16) if hexadecimal is not None
+                      else int(decimal))
+        line = len(_ANY_LINE_BREAK_RE.findall(text, 0, reference.start())) + 1
+        return f"U+{code_point:04X} reference at line {line}"
     if match is None:
         return None
     line = len(_ANY_LINE_BREAK_RE.findall(text, 0, match.start())) + 1

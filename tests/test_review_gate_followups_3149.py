@@ -454,6 +454,39 @@ def test_r3143_07_provenance_rejects_bidi_in_the_bytes(tmp_path):
     assert verdict.audit_event == "artifact-provenance-rejected"
 
 
+@pytest.mark.parametrize("reference, code_point", [
+    ("&#x202E;", "U+202E"),
+    ("&#X0202e", "U+202E"),
+    ("&#8238;", "U+202E"),
+    ("&#0008294", "U+2066"),
+    ("&#x2069;", "U+2069"),
+])
+def test_r3143_07_character_reference_to_a_bidi_control_is_rejected(
+    tmp_path, reference, code_point,
+):
+    """A reference renders as the control itself (tester, cycle 2)."""
+    text = one_low_review([f"{reference}HGIH: SQL injection in login.py"])
+    found = security_gate.find_bidi_control(text)
+    assert found is not None and found.startswith(f"{code_point} reference"), (
+        found)
+    assert analyze(text).verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    path = tmp_path / "SECURITY-REVIEW-12.md"
+    path.write_text(text, encoding="utf-8")
+    verdict = security_gate.verify_reviewer_provenance(12, path)
+    assert verdict.trusted is False
+    assert verdict.reason.startswith(
+        f"review-bidi-control-{code_point}-reference-at-line-"), verdict.reason
+
+
+@pytest.mark.parametrize("text", [
+    "&#x202EA; and &#82380; and &#x2066F are other characters",
+    "&#x202; &#823; &#x2065; &#8293; &#8239;",
+    "&amp;#x202E; is written out, not decoded",
+])
+def test_r3143_07_other_references_are_not_bidi_controls(text):
+    assert security_gate.find_bidi_control(text) is None
+
+
 def test_r3143_07_left_to_right_and_arabic_marks_are_not_rejected():
     """LRM/RLM/ALM cannot reorder Latin letters; they are stripped as before."""
     text = one_low_review(["Notes \N{LEFT-TO-RIGHT MARK}x\N{RIGHT-TO-LEFT MARK}"
