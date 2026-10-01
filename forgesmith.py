@@ -28,7 +28,11 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    RunConfigDirError,
+    claude_cli_run_env,
+)
 from equipa.config import (
     APPROVED_MODEL_UPGRADES_KEY,
     get_configured_model,
@@ -2221,10 +2225,16 @@ def dispatch_ghost_scout(prompt: str) -> str | None:
         return None
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=GHOST_SCOUT_TIMEOUT,
-        )
+        # RR3144-A: a fresh, empty CLAUDE_CONFIG_DIR, never the
+        # agent-writable ~/.claude (equipa/cli_isolation.py).
+        with claude_cli_run_env() as cli_env:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=GHOST_SCOUT_TIMEOUT, env=cli_env,
+            )
+    except RunConfigDirError as exc:
+        log(f"  [GHOST] {exc}")
+        return None
     except subprocess.TimeoutExpired:
         log("  [GHOST] Scout timed out")
         return None
@@ -2722,9 +2732,15 @@ def call_claude_for_proposals(prompt, cfg):
         return None
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
+        # RR3144-A: same per-run config directory as the GHOST scout.
+        with claude_cli_run_env() as cli_env:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                env=cli_env,
+            )
+    except RunConfigDirError as exc:
+        log(f"  [OPRO] {exc}")
+        return None
     except subprocess.TimeoutExpired:
         log("  [OPRO] Claude call timed out")
         return None

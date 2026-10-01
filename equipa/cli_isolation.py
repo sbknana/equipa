@@ -328,3 +328,34 @@ def claude_cli_env(env: Mapping[str, str], config_dir: str,
     else:
         cli_env[CLAUDE_CODE_SHELL_VAR] = pinned_shell
     return cli_env
+
+
+@contextlib.contextmanager
+def claude_cli_run_env(env: Mapping[str, str] | None = None,
+                       parent: str | None = None) -> Iterator[dict[str, str]]:
+    """The environment for one ``claude`` run started with subprocess.run.
+
+    For the callers that do not go through the agent runner (ForgeSmith
+    GHOST/OPRO, SIMBA, the autoresearch mutation): ``env`` (default: this
+    process's environment) through :func:`claude_cli_env` with a fresh
+    per-run config directory that exists only inside the ``with`` block.
+
+    Raises:
+        RunConfigDirError: the per-run directory could not be created.
+    """
+    with fresh_claude_config_dir(parent) as config_dir:
+        yield claude_cli_env(os.environ if env is None else env, config_dir)
+
+
+# The same per-run directory and shell pin for a ``claude`` command run as a
+# shell command on another host (the autoresearch SSH path). mktemp -d makes
+# a new 0700 directory, the EXIT trap removes it, and env -u drops the shell
+# startup names before the CLI starts. Prepend it to the claude command; a
+# trailing ``< file`` still binds to the claude command.
+REMOTE_RUN_CONFIG_DIR_PREFIX = (
+    'cfg=$(mktemp -d -t ' + RUN_CONFIG_DIR_PREFIX + 'XXXXXXXXXX) || exit 1; '
+    'trap \'rm -rf -- "$cfg"\' EXIT; '
+    'test -x /bin/bash || exit 1; '
+    'env -u BASH_ENV -u ENV -u PROMPT_COMMAND -u SHELLOPTS -u BASHOPTS '
+    '-u PS4 CLAUDE_CONFIG_DIR="$cfg" CLAUDE_CODE_SHELL=/bin/bash '
+)

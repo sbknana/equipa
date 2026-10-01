@@ -478,6 +478,162 @@ def test_rlm_claude_calls_get_a_fresh_config_dir(
     assert not os.path.lexists(seen["config_dir"])
 
 
+# --- the standalone claude -p calls (ForgeSmith, SIMBA, autoresearch) ---------
+
+def _load_script(name: str, filename: str, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "scripts" / filename)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _standalone_call(name: str, monkeypatch):
+    """Load the caller, make its spawn refusal pass, return a function that
+    makes its claude call."""
+    if name == "forgesmith-ghost" or name == "forgesmith-opro":
+        monkeypatch.syspath_prepend(str(REPO_ROOT))
+        import forgesmith as module
+        if name == "forgesmith-ghost":
+            def call():
+                module.dispatch_ghost_scout("p")
+        else:
+            def call():
+                module.call_claude_for_proposals("p", {"opro": {"model": None}})
+    elif name == "simba":
+        module = _load_script("forgesmith_simba_3150", "forgesmith_simba.py",
+                              monkeypatch)
+        monkeypatch.setattr(module, "resolve_claude_model",
+                            lambda *_a, **_k: "fake-model")
+
+        def call():
+            module.call_claude_for_rules("p", {})
+    else:
+        module = _load_script("autoresearch_loop_3150", "autoresearch_loop.py",
+                              monkeypatch)
+        monkeypatch.setattr(module, "is_on_claudinator", lambda: True)
+
+        def call():
+            module.mutate_prompt("developer", "old", "none",
+                                 {"success_rate": 50})
+    monkeypatch.setattr(module, "unisolated_spawn_refusal",
+                        lambda *args, **kwargs: None)
+    return module, call
+
+
+@pytest.mark.parametrize("caller", [
+    "forgesmith-ghost", "forgesmith-opro", "simba", "autoresearch-local"])
+def test_standalone_claude_calls_get_a_fresh_config_dir(
+        caller, operator_config_dir, monkeypatch):
+    """On base these calls inherited the operator's environment, so the CLI
+    read the agent-writable ~/.claude user scope."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(operator_config_dir))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASH_FUNC_ls%%", "() { id; }")
+    monkeypatch.setenv("BASH_ENV", str(operator_config_dir / "planted.sh"))
+    module, call = _standalone_call(caller, monkeypatch)
+    seen: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        env = kwargs.get("env")
+        assert env is not None, "the CLI must not inherit the environment"
+        config_dir = env["CLAUDE_CONFIG_DIR"]
+        seen.append({"env": env, "config_dir": config_dir,
+                     "entries": os.listdir(config_dir),
+                     "mode": stat.S_IMODE(os.lstat(config_dir).st_mode)})
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "{}"}), stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    call()
+
+    assert len(seen) == 1
+    run = seen[0]
+    assert run["config_dir"] != str(operator_config_dir)
+    assert run["entries"] == [] and run["mode"] == 0o700
+    assert run["env"]["CLAUDE_CODE_SHELL"] == trusted_bash()
+    assert "BASH_FUNC_ls%%" not in run["env"]
+    assert "BASH_ENV" not in run["env"]
+    assert run["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == FAKE_TOKEN
+    assert not os.path.lexists(run["config_dir"])
+
+
+@pytest.mark.parametrize("caller", ["forgesmith-ghost", "simba"])
+def test_standalone_call_without_a_config_dir_does_not_run(caller, monkeypatch):
+    module, call = _standalone_call(caller, monkeypatch)
+
+    def refuse(*_args, **_kwargs):
+        raise cli_isolation.RunConfigDirError("no per-run directory")
+
+    def fake_run(cmd, **kwargs):
+        raise AssertionError("the CLI ran without its own config directory")
+
+    monkeypatch.setattr(module, "claude_cli_run_env", refuse)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    call()
+
+
+def test_autoresearch_ssh_command_gets_a_fresh_config_dir(monkeypatch):
+    """The remote shell command creates, uses and removes its own directory
+    and pins the shell; on base it ran ``claude ... < file`` as is."""
+    module, call = _standalone_call("autoresearch-ssh", monkeypatch)
+    monkeypatch.setattr(module, "is_on_claudinator", lambda: False)
+    commands: list[str] = []
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "ssh":
+            commands.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, stdout="NEW PROMPT",
+                                           stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    call()
+
+    assert len(commands) == 1
+    prefix = cli_isolation.REMOTE_RUN_CONFIG_DIR_PREFIX
+    assert commands[0].startswith(prefix + module.CLAUDE_MUTATE_COMMAND)
+    for part in ('mktemp -d', 'trap \'rm -rf -- "$cfg"\' EXIT',
+                 'CLAUDE_CONFIG_DIR="$cfg"', "CLAUDE_CODE_SHELL=/bin/bash",
+                 "-u BASH_ENV", "-u ENV", "-u PROMPT_COMMAND"):
+        assert part in prefix
+
+
+def test_remote_prefix_runs_claude_in_a_private_dir_and_removes_it(tmp_path):
+    """Run the real prefix with bash and a fake ``claude`` on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    report = tmp_path / "report.txt"
+    fake = bin_dir / "claude"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'stat -c "%a" "$CLAUDE_CONFIG_DIR" > "{report}"\n'
+        f'echo "$CLAUDE_CONFIG_DIR $CLAUDE_CODE_SHELL ${{BASH_ENV-unset}}" '
+        f'>> "{report}"\n'
+        "cat\n"
+        "exit 7\n", encoding="utf-8")
+    fake.chmod(0o755)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("hello prompt\n", encoding="utf-8")
+    command = (cli_isolation.REMOTE_RUN_CONFIG_DIR_PREFIX
+               + f'claude --print < "{prompt}"')
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "TMPDIR": str(tmp_path),
+           "BASH_ENV": str(tmp_path / "planted.sh")}
+
+    result = subprocess.run(["bash", "-c", command], env=env,
+                            capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 7, "the claude exit status is kept"
+    assert result.stdout == "hello prompt\n", "the prompt reaches claude"
+    mode, details = report.read_text(encoding="utf-8").splitlines()
+    config_dir, shell, bash_env = details.split()
+    assert mode == "700"
+    assert config_dir.startswith(str(tmp_path / cli_isolation.RUN_CONFIG_DIR_PREFIX))
+    assert shell == "/bin/bash" and bash_env == "unset"
+    assert not os.path.lexists(config_dir), "removed when the shell exits"
+
+
 # --- the operator's live probe script -----------------------------------------
 
 def test_verify_script_exists_and_is_executable():

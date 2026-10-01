@@ -58,10 +58,21 @@ except ImportError:
 # Claude CLI. The fallback repeats equipa.cli_isolation's flags for a
 # standalone run where equipa cannot be imported.
 try:
-    from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+    from equipa.cli_isolation import (
+        CLAUDE_CLI_ISOLATION_ARGS,
+        RunConfigDirError,
+        claude_cli_run_env,
+    )
 except ImportError:
     CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
                                  "--strict-mcp-config")
+    RunConfigDirError = RuntimeError
+
+    def claude_cli_run_env(env=None, parent=None):
+        """Standalone fallback: never reached, because the spawn refusal
+        below fails closed when equipa cannot be imported."""
+        raise RunConfigDirError(
+            "equipa is not importable: no per-run Claude config directory")
 
 # ISO-06: `claude -p` on agent-derived lessons runs as the orchestrator's
 # user; with agent_isolation on it refuses. Standalone, the flag cannot be
@@ -404,9 +415,16 @@ def call_claude_for_rules(prompt, cfg=None):
         return None
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
+        # RR3144-A: a fresh, empty CLAUDE_CONFIG_DIR, never the
+        # agent-writable ~/.claude (equipa/cli_isolation.py).
+        with claude_cli_run_env() as cli_env:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                env=cli_env,
+            )
+    except RunConfigDirError as exc:
+        log(str(exc))
+        return None
     except subprocess.TimeoutExpired:
         log("Claude call timed out")
         return None
