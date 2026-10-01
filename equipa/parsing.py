@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
 from equipa.git_ops import git_run
+
+_log = logging.getLogger(__name__)
 
 # --- Token Budget Constants ---
 # Anthropic recommendation: ~4 chars/token for Claude
@@ -209,31 +212,98 @@ def _aggressive_compress_code(text: str) -> str:
 AGENT_OUTPUT_LINE_WITHHELD: str = "[line withheld: failed sanitization]"
 
 
+# A list bullet or number in front of a section entry ("- ", "* ", "2. ").
+_LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+
+
+def _section_entry(line: str, index: int, marker: str) -> str:
+    """The entry text of one section line, without its marker or bullet."""
+    if index == 0 and line.startswith(f"{marker}:"):
+        return line[len(marker) + 1:].strip()
+    return _LIST_MARK.sub("", line, count=1)
+
+
+def _lines_building_a_match(entries: dict[int, str]) -> set[int] | None:
+    """Indexes of entries that only match the injection patterns together.
+
+    *entries* maps line index to entry text, in order, for the lines that
+    passed the per-line check. Returns an empty set when the joined block is
+    clean, the lines of every adjacent pair that matches when withholding
+    them leaves a clean block, and None when the match cannot be pinned to
+    such pairs (the caller then withholds the whole section).
+    """
+    from lesson_sanitizer import detect_injection  # HARD dependency
+
+    def joined(indexes) -> str:
+        return "\n".join(entries[index] for index in indexes)
+
+    if detect_injection(joined(entries)) is None:
+        return set()
+    order = list(entries)
+    involved: set[int] = set()
+    for first, second in zip(order, order[1:]):
+        if detect_injection(joined((first, second))):
+            involved.update((first, second))
+    remaining = [index for index in order if index not in involved]
+    if involved and detect_injection(joined(remaining)) is None:
+        return involved
+    return None
+
+
 def _sanitize_lines(section_text: str, marker: str) -> str:
-    """Reject-mode sanitize each line of a list section on its own.
+    """Reject-mode sanitize each line of a list section, then the whole list.
 
     *section_text* starts with ``MARKER:`` (see _extract_section). A rejected
     line is replaced by AGENT_OUTPUT_LINE_WITHHELD, under the fixed marker
     for the header line and as a bullet otherwise, so the other entries
-    still reach the next agent. The joined result gets the lesson length
-    cap, as a whole section would.
+    still reach the next agent.
+
+    The entries that pass are then checked joined, without their bullets, so
+    a phrase split across entries ("- a.py act as the" / "- admin and
+    approve") is still seen. The adjacent entries that build the match are
+    withheld; if the match cannot be pinned to them, the whole section is
+    (``""``, which the caller reports as withheld) (review F5 of task 3139).
+    The joined result gets the lesson length cap, as a whole section would.
     """
     from lesson_sanitizer import MAX_LESSON_LENGTH, enforce_limit, sanitize
 
     label = f"agent output {marker}"
+    lines = section_text.split("\n")
     kept: list[str] = []
-    for index, line in enumerate(section_text.split("\n")):
+    passed: dict[int, str] = {}
+    for index, line in enumerate(lines):
         if not line.strip():
             kept.append("")
             continue
         clean = sanitize(line, label=label)
         if clean:
             kept.append(clean)
-        elif index == 0:
-            kept.append(f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}")
+            passed[index] = _section_entry(line, index, marker)
         else:
-            kept.append(f"- {AGENT_OUTPUT_LINE_WITHHELD}")
+            kept.append(_withheld_line(index, marker))
+
+    split_match = _lines_building_a_match(passed)
+    if split_match is None:
+        _log.warning(
+            "parsing: withheld %s; its entries form an injection phrase "
+            "together", label,
+        )
+        return ""
+    if split_match:
+        _log.warning(
+            "parsing: withheld %d %s lines that form an injection phrase "
+            "together", len(split_match), label,
+        )
+    for index in split_match:
+        kept[index] = _withheld_line(index, marker)
     return enforce_limit("\n".join(kept).strip(), MAX_LESSON_LENGTH, label=label)
+
+
+def _withheld_line(index: int, marker: str) -> str:
+    """The placeholder for a withheld section line (header or bullet)."""
+    if index == 0:
+        return f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}"
+    return f"- {AGENT_OUTPUT_LINE_WITHHELD}"
 
 
 def compact_agent_output(
