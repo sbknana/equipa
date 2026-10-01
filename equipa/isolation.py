@@ -130,6 +130,13 @@ _SUDOERS_UNSAFE = frozenset(' \t\n,:=\\"#!*?[]()')
 ARTIFACTS_DIR = ".equipa-artifacts"
 _SYMLINK_MODE = b"120000"
 _MAX_CHANGED_SYMLINKS = 1000
+# Symbolic links in one exported tree; more refuses the export unread.
+_MAX_TREE_SYMLINKS = 10_000
+# Longest link target an export may carry: the kernel refuses to create a
+# longer one (PATH_MAX - 1), and it bounds the walk below (review R3140-01).
+_MAX_LINK_TARGET_BYTES = 4095
+# Path components one import check may walk over all links of a commit.
+_MAX_LINK_WALK_STEPS = 1_000_000
 # Symbolic links followed while resolving one imported link (MAXSYMLINKS).
 _MAX_LINK_HOPS = 40
 # How the commits of an export (state, parents) are named in refusals.
@@ -915,67 +922,188 @@ def copy_untrusted_file(source: str, destination: Path, max_bytes: int) -> None:
                 out.write(chunk)
 
 
-def _tree_symlinks(worktree_path: str, treeish: str) -> dict[str, str]:
-    """{path: blob id} of every symbolic link in ``treeish``."""
-    result = git_run(["ls-tree", "-r", "-z", "--full-tree", treeish],
+@dataclass(frozen=True)
+class _TreeLink:
+    """A symbolic link of a tree: its target blob and the target's size."""
+
+    blob: str
+    size: int
+
+
+def _tree_symlinks(worktree_path: str, treeish: str,
+                   where: str = "") -> dict[str, _TreeLink]:
+    """{path: link} of every symbolic link in ``treeish``.
+
+    Refuses a tree with more than ``_MAX_TREE_SYMLINKS`` links; the target
+    sizes come from the listing, so no blob is read here (review R3140-01).
+    """
+    result = git_run(["ls-tree", "-r", "-z", "-l", "--full-tree", treeish],
                      cwd=worktree_path, timeout=_BUNDLE_TIMEOUT_SECONDS,
                      text=False)
     if result.returncode != 0:
         raise AgentIsolationError(
             f"git ls-tree failed in {worktree_path}: "
             f"{result.stderr.decode('utf-8', 'replace').strip()[-500:]}")
-    links: dict[str, str] = {}
+    links: dict[str, _TreeLink] = {}
     for record in result.stdout.split(b"\0"):
         meta, _tab, path = record.partition(b"\t")
-        fields = meta.split(b" ")
-        if len(fields) == 3 and fields[0] == _SYMLINK_MODE:
-            links[path.decode("utf-8", "surrogateescape")] = fields[2].decode()
+        # <mode> SP <type> SP <object> SP+ <size>; the size is padded.
+        fields = meta.split()
+        if len(fields) != 4 or fields[0] != _SYMLINK_MODE:
+            continue
+        if len(links) >= _MAX_TREE_SYMLINKS:
+            raise AgentIsolationError(
+                f"the agent's export{where} holds more than "
+                f"{_MAX_TREE_SYMLINKS} symbolic links")
+        try:
+            size = int(fields[3])
+        except ValueError as exc:
+            raise AgentIsolationError(
+                f"unreadable git ls-tree record in {worktree_path}") from exc
+        links[path.decode("utf-8", "surrogateescape")] = _TreeLink(
+            blob=fields[2].decode("ascii", "replace"), size=size)
     return links
 
 
+class _LinkTrie:
+    """The symbolic links of a tree as a trie of path components.
+
+    Walking a target looks each component up in its directory's node, so a
+    walk costs one dict access per component. Joining the directory path
+    for every lookup made it quadratic in the target length (R3140-01).
+    """
+
+    __slots__ = ("children", "link")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _LinkTrie] = {}
+        self.link: str | None = None  # the link's path, on a link's node
+
+    @classmethod
+    def build(cls, paths: Iterable[str]) -> _LinkTrie:
+        root = cls()
+        for path in paths:
+            node = root
+            for part in path.split("/"):
+                child = node.children.get(part)
+                if child is None:
+                    child = node.children[part] = cls()
+                node = child
+            node.link = path
+        return root
+
+
+class _WalkBudget:
+    """Path components the link walks of one import check may still take."""
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, steps: int | None = None) -> None:
+        self.remaining = _MAX_LINK_WALK_STEPS if steps is None else steps
+
+
+def _target_too_long(target: str) -> bool:
+    return (len(target) > _MAX_LINK_TARGET_BYTES
+            or len(target.encode("utf-8", "surrogateescape"))
+            > _MAX_LINK_TARGET_BYTES)
+
+
 def _link_escapes(path: str, target: str,
-                  link_target: Callable[[str], str | None] | None = None) -> bool:
+                  link_target: Callable[[str], str | None] | None = None,
+                  *, links: _LinkTrie | None = None,
+                  budget: _WalkBudget | None = None) -> bool:
     """True for an absolute target or one that leaves the working tree.
 
     ``link_target(p)`` returns the target of the tree's own link at ``p``
     (None when ``p`` is no link). Each such component is followed, as the
     kernel would, so ``a/..`` through a link ``a`` resolves where the link
-    points rather than lexically (review R3136-05). Too many hops count as
-    an escape. Without ``link_target`` the walk is purely lexical.
+    points rather than lexically (review R3136-05). Too many hops, or a
+    target longer than the kernel accepts, count as an escape. Without
+    ``link_target`` the walk is purely lexical.
+
+    With ``links`` (the tree's links as a :class:`_LinkTrie`) a component
+    is looked up in its directory's node and ``link_target`` is asked only
+    for real links, so the walk is linear in the components it visits
+    (R3140-01); :func:`check_imported_links` always passes it. Without
+    ``links`` the lookups join the directory path, which only the target
+    cap bounds. ``budget`` caps the components over several calls; past
+    it the check is refused.
     """
-    if target.startswith("/"):
+    if target.startswith("/") or _target_too_long(target):
         return True
-    directory = [part for part in posixpath.dirname(path).split("/") if part]
+    use_trie = links is not None and link_target is not None
+    by_path = links is None and link_target is not None
+    # One entry per level of the current directory: its trie node (None
+    # when no link lies below it), its path (``by_path``), or None.
+    levels: list[Any] = []
+
+    def descend(part: str) -> Any:
+        if use_trie:
+            parent = levels[-1] if levels else links
+            return None if parent is None else parent.children.get(part)
+        if by_path:
+            return part if not levels else f"{levels[-1]}/{part}"
+        return None
+
+    def target_of(level: Any) -> str | None:
+        if level is None or link_target is None:
+            return None
+        if use_trie:
+            return None if level.link is None else link_target(level.link)
+        return link_target(level)
+
+    for part in posixpath.dirname(path).split("/"):
+        if part:
+            levels.append(descend(part))
     pending = collections.deque(target.split("/"))
     hops = 0
     while pending:
         part = pending.popleft()
+        if budget is not None:
+            budget.remaining -= 1
+            if budget.remaining < 0:
+                raise AgentIsolationError(
+                    f"the links of the agent's export take more than "
+                    f"{_MAX_LINK_WALK_STEPS} path components to check")
         if part in ("", "."):
             continue
         if part == "..":
-            if not directory:
+            if not levels:
                 return True
-            directory.pop()
+            levels.pop()
             continue
-        inner = (None if link_target is None
-                 else link_target("/".join((*directory, part))))
+        level = descend(part)
+        inner = target_of(level)
         if inner is None:
-            directory.append(part)
+            levels.append(level)
             continue
         hops += 1
-        if hops > _MAX_LINK_HOPS or inner.startswith("/"):
+        if hops > _MAX_LINK_HOPS or inner.startswith("/") \
+                or _target_too_long(inner):
             return True
         # The inner target is relative to the link's directory, which is
-        # ``directory`` itself.
+        # the current directory itself.
         pending.extendleft(reversed(inner.split("/")))
     return False
 
 
-def _read_link_target(worktree_path: str, path: str, blob: str) -> str:
-    result = git_run(["cat-file", "blob", blob], cwd=worktree_path, text=False)
+def _read_link_target(worktree_path: str, path: str, link: _TreeLink,
+                      where: str = "") -> str:
+    """The target of an exported link, refused unread when it is longer
+    than any target the kernel would create."""
+    if link.size > _MAX_LINK_TARGET_BYTES:
+        raise AgentIsolationError(
+            f"the agent's export{where} has a symbolic link {path} whose "
+            f"target is {link.size} bytes (limit {_MAX_LINK_TARGET_BYTES})")
+    result = git_run(["cat-file", "blob", link.blob], cwd=worktree_path,
+                     text=False)
     if result.returncode != 0:
         raise AgentIsolationError(f"cannot read the link {path} in the "
                                   f"agent's export")
+    if len(result.stdout) > _MAX_LINK_TARGET_BYTES:
+        raise AgentIsolationError(
+            f"the agent's export{where} has a symbolic link {path} whose "
+            f"target is longer than {_MAX_LINK_TARGET_BYTES} bytes")
     return result.stdout.decode("utf-8", "surrogateescape")
 
 
@@ -996,10 +1124,10 @@ def check_imported_links(worktree: WorktreeInfo, state: str,
     """
     protected = [path.strip("/") for path in
                  dict.fromkeys((ARTIFACTS_DIR, *carry_paths))]
-    state_links = _tree_symlinks(worktree.path, state)
+    state_links = _tree_symlinks(worktree.path, state, where)
     base_links = _tree_symlinks(worktree.path, worktree.base_sha)
     changed: list[str] = []
-    for path, blob in state_links.items():
+    for path, link in state_links.items():
         for carried in protected:
             if (path == carried or carried.startswith(path + "/")
                     or path.startswith(carried + "/")):
@@ -1007,28 +1135,39 @@ def check_imported_links(worktree: WorktreeInfo, state: str,
                     f"the agent's export{where} makes {path} a symbolic link; "
                     f"the orchestrator writes into {carried}, so this is "
                     f"refused")
-        if base_links.get(path) != blob:
+        base_link = base_links.get(path)
+        if base_link is None or base_link.blob != link.blob:
             changed.append(path)
     if len(changed) > _MAX_CHANGED_SYMLINKS:
         raise AgentIsolationError(
             f"the agent's export{where} adds or changes {len(changed)} "
             f"symbolic links (limit {_MAX_CHANGED_SYMLINKS})")
-    targets: dict[str, str] = {}
+    # Every changed target is size-checked before any is read or walked.
+    for path in changed:
+        if state_links[path].size > _MAX_LINK_TARGET_BYTES:
+            raise AgentIsolationError(
+                f"the agent's export{where} has a symbolic link {path} whose "
+                f"target is {state_links[path].size} bytes (limit "
+                f"{_MAX_LINK_TARGET_BYTES})")
+    targets: dict[str, str] = {}  # by blob: links may share one target
 
     def link_target(path: str) -> str | None:
-        blob = state_links.get(path)
-        if blob is None:
+        link = state_links.get(path)
+        if link is None:
             return None
-        if path not in targets:
-            targets[path] = _read_link_target(worktree.path, path, blob)
-        return targets[path]
+        if link.blob not in targets:
+            targets[link.blob] = _read_link_target(worktree.path, path, link,
+                                                   where)
+        return targets[link.blob]
 
+    trie = _LinkTrie.build(state_links)
+    budget = _WalkBudget()
     for path in changed:
         target = link_target(path) or ""
-        if _link_escapes(path, target, link_target):
+        if _link_escapes(path, target, link_target, links=trie, budget=budget):
             raise AgentIsolationError(
                 f"the agent's export{where} adds a symbolic link {path} -> "
-                f"{target} that points outside the worktree")
+                f"{target[:200]} that points outside the worktree")
 
 
 def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
