@@ -43,6 +43,23 @@ import pytest  # noqa: E402  (sys.path must be set before any equipa import)
 # real TheForge DB, and an inherited production path is exactly how the
 # damage happened. _assert_db_isolated() then checks every loaded module's
 # binding and stops the run before any test executes if one escaped.
+#
+# --- Per-session temp directory (R3150-08) ---
+#
+# Every Claude CLI run gets a per-run CLAUDE_CONFIG_DIR (equipa-claude-config-*)
+# in the temp directory, and the orchestrator scripts some tests SIGKILL never
+# remove theirs. So everything this session puts in the temp directory, in
+# this process and in every subprocess (they inherit TMPDIR), goes into one
+# private directory that pytest_unconfigure removes. Leftovers are never swept
+# from the shared temp directory instead: agents run this suite while the
+# orchestrator dispatches, and a live run's directory looks the same as a
+# leaked one. Set before the test DB below, so it lives inside it too and
+# _is_safe_test_db() judges against the same temp root.
+_ORIGINAL_TMP = tempfile.gettempdir()
+SESSION_TMP = Path(tempfile.mkdtemp(prefix="eqt-", dir=_ORIGINAL_TMP))
+os.environ["TMPDIR"] = str(SESSION_TMP)
+tempfile.tempdir = str(SESSION_TMP)
+
 _TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="equipa-test-db-"))
 TEST_DB_PATH = _TEST_DB_DIR / "theforge-test.db"
 os.environ["THEFORGE_DB"] = str(TEST_DB_PATH)
@@ -283,6 +300,36 @@ def pytest_collection_modifyitems(session, config, items):
             setup_modules.add(module)
 
 
+def _remove_session_tmp() -> None:
+    """Remove SESSION_TMP, every per-run config directory in it included.
+
+    Tests leave read-only directories behind (permission probes), so an
+    entry that cannot be removed gets its parent made writable once and is
+    retried. Whatever still remains is reported, never silently kept.
+    """
+    def _retry_writable(func, path, _exc):
+        parent = os.path.dirname(path)
+        try:
+            os.chmod(parent, 0o700)
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.chmod(path, 0o700)
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                func(path)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(SESSION_TMP, onexc=_retry_writable)
+    else:
+        shutil.rmtree(SESSION_TMP, onerror=_retry_writable)
+    if SESSION_TMP.exists():
+        print(f"  [conftest] WARNING: could not fully remove the session temp "
+              f"directory {SESSION_TMP}", file=sys.stderr)
+
+
 def pytest_unconfigure(config):
-    """Remove this run's throwaway DB directory."""
+    """Remove this run's throwaway DB directory and the session temp
+    directory (with every per-run Claude config directory in it)."""
     shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+    _remove_session_tmp()
