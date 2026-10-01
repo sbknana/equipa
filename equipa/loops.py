@@ -3845,18 +3845,25 @@ def _backstop_exempt_count(
     line_start = newlines[line - 1] + 1 if line else 0
     before = view[max(line_start, start - _BACKSTOP_CONTEXT):start]
     after = _backstop_after_text(view, newlines, line, end)
+    stated = _BACKSTOP_COUNT_BEFORE_RE.search(before)
+    count_before = None
+    if stated is not None:
+        word = stated.group(1)
+        count_before = (int(word) if word.isdigit()
+                        else _BACKSTOP_NUMBER_WORDS[word.lower()])
     tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
     # A cut tail never matches (and would only cost backtracking to find out).
     if (tally is not None and not after.endswith(_BACKSTOP_CUT)
             and _BACKSTOP_TALLY_TAIL_RE.fullmatch(after, tally.end())):
-        return int(tally.group(1))
+        # Task 3157 (R3154-02): a count before the word is the word's count,
+        # as on ba6065a, which read it first: "Found 2 MEDIUM: 0 open." states
+        # two. The larger of the two counts is used, so neither order of
+        # reading can excuse a word the other counts.
+        return max(int(tally.group(1)), count_before or 0)
     if _BACKSTOP_SAFE_AFTER_RE.match(after) is None:
         return None
-    stated = _BACKSTOP_COUNT_BEFORE_RE.search(before)
-    if stated is not None:
-        word = stated.group(1)
-        return (int(word) if word.isdigit()
-                else _BACKSTOP_NUMBER_WORDS[word.lower()])
+    if count_before is not None:
+        return count_before
     if _backstop_negates(before):
         return 0
     if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
