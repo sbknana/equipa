@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import shutil
 import stat
@@ -319,31 +320,54 @@ def remove_run_config_dir(path: str) -> list[str]:
 # exits with a run pending: neither _terminate_agent nor the finalizer or
 # atexit hook runs (R3150-08). The first per-run directory a process creates
 # in a parent directory therefore sweeps that parent once: EQUIPA-prefixed,
-# real directories (never symlinks) owned by this user whose newest
-# top-level entry is older than this. No CLI run lasts anywhere near a day,
-# so a live run's directory is never taken.
+# real directories (never symlinks) owned by this user whose newest entry,
+# anywhere in the tree, is older than this. No CLI run lasts anywhere near
+# a day, so a live run's directory is never taken.
 STALE_RUN_CONFIG_DIR_SECONDS = 24 * 3600
+# _newest_mtime() looks at no more than this many entries, and this many
+# levels, below a directory. A bigger tree is never judged stale: it stays
+# rather than risk taking a live run's directory.
+STALE_SCAN_MAX_ENTRIES = 10_000
+STALE_SCAN_MAX_DEPTH = 16
 _swept_parents: set[str] = set()
 _sweep_lock = threading.Lock()
 
 
 def _newest_mtime(path: str, top: os.stat_result) -> float:
-    """The newest mtime of ``path`` and its direct entries (not followed).
+    """The newest mtime of ``path`` and of everything below it (symlinks
+    are not followed).
 
-    The CLI writes into subdirectories of a live run's directory, which
-    does not touch the directory's own mtime.
+    The CLI writes into nested subdirectories of a live run's directory
+    (``projects/<cwd>/<session>.jsonl``), which changes neither the
+    directory's mtime nor those of its direct entries, so another process
+    judging only the top level could sweep a live run (F-8 of the 3153
+    review). The walk is bounded by STALE_SCAN_MAX_ENTRIES and
+    STALE_SCAN_MAX_DEPTH; past either bound this returns ``math.inf`` and
+    the directory is kept. A subdirectory that cannot be listed counts with
+    its own mtime only.
     """
     newest = top.st_mtime
-    try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                try:
-                    newest = max(newest,
-                                 entry.stat(follow_symlinks=False).st_mtime)
-                except OSError:
-                    continue
-    except OSError:
-        pass
+    pending = [(path, 0)]
+    seen = 0
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > STALE_SCAN_MAX_ENTRIES:
+                        return math.inf
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    newest = max(newest, info.st_mtime)
+                    if stat.S_ISDIR(info.st_mode):
+                        if depth + 1 >= STALE_SCAN_MAX_DEPTH:
+                            return math.inf
+                        pending.append((entry.path, depth + 1))
+        except OSError:
+            continue
     return newest
 
 
@@ -356,7 +380,7 @@ def sweep_stale_run_config_dirs(
     Looks only at entries of ``parent`` (default: the temp directory) whose
     name starts with :data:`RUN_CONFIG_DIR_PREFIX`, that are real
     directories (``lstat``: a symlink is never followed or removed), owned by
-    this process's user, and whose newest top-level entry is older than
+    this process's user, and whose newest entry anywhere below is older than
     ``max_age_seconds``. Everything else, including another user's
     directory and a fresh one, is left alone. Entries that cannot be removed
     are logged and skipped.
