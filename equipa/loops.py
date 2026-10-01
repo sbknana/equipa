@@ -2215,6 +2215,8 @@ _BACKTICK_RUN_RE = re.compile(r"`+")
 # The tag form is looser than CommonMark's, so it can only keep a backtick
 # from opening code (more text shown, fail closed).
 _INLINE_OPENER_RE = re.compile(r"`+|<!--|<[A-Za-z/?!][^<>\n]{0,500}>")
+# "\`" pairs right after an escaped lone backtick, each backtick alone.
+_ESCAPED_BACKTICK_RUN_RE = re.compile(r"(?:\\`(?!`))*")
 # A line the per-line _blank_code would take for a fence. In the rendered
 # text every real fence is already blanked, so what is left is text.
 _TILDE_FENCE_LINE_RE = re.compile(r"^([ \t]{0,3})(~{3,})", re.MULTILINE)
@@ -2542,6 +2544,20 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
 
     while (token := _INLINE_OPENER_RE.search(text, position)) is not None:
         start = token.start()
+        if (token.end() - start == 1 and text[start] == "`" and start
+                and text[start - 1] == "\\" and _is_escaped(text, start, 0)):
+            # Task 3143 (timing): a lone escaped backtick is text and opens
+            # nothing (it may still close an earlier span, as a closer
+            # candidate above), so the block lookups below are skipped; a
+            # 200 KB flood of "\`" took 0.46 s. A backslash run never
+            # crosses a line break, so the floor of 0 reads the same run.
+            # Every "\`" straight after it is one too (its backslash follows
+            # a backtick, so it is a run of one) and is read in one step.
+            run_end = _ESCAPED_BACKTICK_RUN_RE.match(text, token.end()).end()
+            emit(text[position:start] + _LITERAL_CODE_MARK
+                 + text[token.end():run_end].replace("`", _LITERAL_CODE_MARK))
+            position = run_end
+            continue
         line = bisect.bisect_right(line_starts, start) - 1
         line_start = line_starts[line]
         if line in blocks.table_rows:
@@ -2603,9 +2619,40 @@ def _render_code_and_comments(blocks: _RenderedBlocks) -> str:
     return _TILDE_FENCE_LINE_RE.sub(_neutralize_tilde_fence, "".join(pieces))
 
 
+class _ReferenceTable(dict):
+    """Decoded text per character reference, filled per reference seen.
+
+    Task 3143 (timing): a 200 KB flood of one reference ("&#10;" 40,000
+    times) decoded each one with ``html.unescape`` and took 0.2 s per view;
+    repeats are now one dict lookup. Only references of at most
+    ``_CACHED_REFERENCE_LENGTH`` characters and at most
+    ``_REFERENCE_TABLE_LIMIT`` of them are kept, so memory stays bounded
+    however many digits or distinct references a review holds.
+    """
+
+    def __init__(self, decode: Callable[[str], str]) -> None:
+        super().__init__()
+        self._decode = decode
+
+    def __missing__(self, reference: str) -> str:
+        value = self._decode(reference)
+        if (len(reference) <= _CACHED_REFERENCE_LENGTH
+                and len(self) < _REFERENCE_TABLE_LIMIT):
+            self[reference] = value
+        return value
+
+
+_CACHED_REFERENCE_LENGTH = 40
+_REFERENCE_TABLE_LIMIT = 65536
+
+
 def _decode_character_reference(match: re.Match[str]) -> str:
     """One character reference as the text the parser should see."""
-    reference = match.group(0)
+    return _RENDERED_REFERENCES[match.group(0)]
+
+
+def _decoded_reference_text(reference: str) -> str:
+    """``reference`` ("&#72;", "&Eta;") as the text the parser should see."""
     decoded = html.unescape(reference)
     if decoded == reference:
         return reference  # unknown name: the renderer shows it literally
@@ -2626,6 +2673,9 @@ def _decode_character_reference(match: re.Match[str]) -> str:
            for char in decoded):
         return _REFERENCE_BLANK
     return _UNSAFE_REFERENCE_CHAR
+
+
+_RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
 
 
 # Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
@@ -2825,9 +2875,17 @@ class _BackstopCharacterTable(dict):
 _BACKSTOP_CHARACTERS = _BackstopCharacterTable()
 
 
+def _backstop_reference_text(reference: str) -> str:
+    """``reference`` as a browser shows it, on the same line."""
+    return html.unescape(reference).translate(_BACKSTOP_LINE_BREAKS)
+
+
+_BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
+
+
 def _backstop_decoded_reference(match: re.Match[str]) -> str:
     """One character reference as a browser shows it, on the same line."""
-    return html.unescape(match.group(0)).translate(_BACKSTOP_LINE_BREAKS)
+    return _BACKSTOP_REFERENCES[match.group(0)]
 
 
 def _backstop_normalized(text: str) -> str:
