@@ -1211,6 +1211,17 @@ def import_agent_export(worktree: WorktreeInfo, unit: str, export_path: str,
             for commit, where in zip(commits, _EXPORT_COMMIT_NAMES):
                 check_imported_links(worktree, commit, carry_paths,
                                      where=where)
+            # update-ref compares only the old value: without this a tip
+            # that is not a descendant (an ancestor of the base, or an
+            # unrelated commit) would rewind or replace the task branch
+            # and drop history an earlier review saw (review F5).
+            ancestry = git_run(["merge-base", "--is-ancestor",
+                                worktree.base_sha, tip], cwd=worktree.path)
+            if ancestry.returncode != 0:
+                raise AgentIsolationError(
+                    f"the agent's task-branch tip {tip} does not descend "
+                    f"from the dispatch base {worktree.base_sha}; refused "
+                    f"(a rewound or replaced branch)")
             _git(["update-ref", "-m", "equipa isolation: import agent work",
                   worktree.branch_ref, tip, worktree.base_sha], worktree.path)
             _git(["read-tree", "-u", "--reset", state], worktree.path)

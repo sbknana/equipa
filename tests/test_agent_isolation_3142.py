@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from equipa import isolation
+from equipa import agent_launcher, isolation
 
 _GIT = shutil.which("git") or "/usr/bin/git"
 
@@ -72,6 +72,44 @@ def _commit_with_links(worktree: Path, tmp_path: Path,
     tree = _git("write-tree", cwd=worktree, env=env)
     index.unlink()
     return _git("commit-tree", tree, "-p", "HEAD", "-m", "links", cwd=worktree)
+
+
+UNIT = "equipa-agent-1-1-0123456789abcdef"
+
+
+def _settings(tmp_path: Path, **overrides) -> isolation.IsolationSettings:
+    exchange = tmp_path / "exchange"
+    exchange.mkdir(exist_ok=True)
+    section = {"exchange_dir": str(exchange), "git_executable": _GIT,
+               "python": sys.executable, **overrides}
+    return isolation.load_isolation_settings({"agent_isolation": section})
+
+
+def _export_clone(repo: dict[str, Path], tmp_path: Path, prepare) -> tuple:
+    """Build the agent's clone as the launcher does, let ``prepare(clone)``
+    change it, export it, and return what the import needs."""
+    settings = _settings(tmp_path)
+    info = isolation.describe_worktree(str(repo["worktree"]))
+    bundle = tmp_path / "handoff.bundle"
+    handoff = isolation.build_handoff(
+        ["claude", "-p", "x"], str(repo["worktree"]),
+        {"PATH": os.environ["PATH"]}, settings, UNIT, info, "tok", bundle)
+    handoff.header["cgroup"]["path"] = f"/app.slice/{UNIT}.scope"
+    session = agent_launcher._IsolatedSession(handoff.header)
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    session.home = str(home)
+    with open(bundle, "rb") as source:
+        session.receive_workspace(source.fileno(), bundle.stat().st_size)
+    prepare(Path(session.repo_dir))
+    session.export()
+    session.discard()
+    return info, handoff, settings
+
+
+def _import(info, handoff, settings) -> str:
+    return isolation.import_agent_export(
+        info, UNIT, handoff.export_path, settings.max_export_bytes)
 
 
 def _check(worktree: Path, state: str) -> None:
@@ -220,3 +258,65 @@ def test_trie_walk_agrees_with_the_path_walk() -> None:
     for path, target in cases:
         assert isolation._link_escapes(path, target, links.get, links=trie) \
             == isolation._link_escapes(path, target, links.get), (path, target)
+
+
+# --- F5: the imported tip must descend from the dispatch base ----------------------------
+
+
+def _second_base_commit(repo: dict[str, Path]) -> str:
+    """Give the task branch a second commit before dispatch; returns it."""
+    worktree = repo["worktree"]
+    (worktree / "progress.txt").write_text("earlier attempt\n")
+    _git("add", "progress.txt", cwd=worktree)
+    _git("commit", "-q", "-m", "earlier attempt", cwd=worktree)
+    return _git("rev-parse", "HEAD", cwd=worktree)
+
+
+def test_import_refuses_a_rewound_task_branch(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    base = _second_base_commit(repo)
+
+    def rewind(clone: Path) -> None:
+        _git("reset", "-q", "--hard", "HEAD~1", cwd=clone)
+
+    exported = _export_clone(repo, tmp_path, rewind)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="does not descend from the dispatch base"):
+        _import(*exported)
+    assert _git("rev-parse", "forge-task-1", cwd=repo["main"]) == base
+
+
+def test_import_refuses_an_unrelated_task_branch_tip(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    base = _git("rev-parse", "forge-task-1", cwd=repo["main"])
+
+    def replace(clone: Path) -> None:
+        tree = _git("write-tree", cwd=clone)
+        orphan = _git("commit-tree", tree, "-m", "unrelated history", cwd=clone)
+        _git("reset", "-q", "--soft", orphan, cwd=clone)
+
+    exported = _export_clone(repo, tmp_path, replace)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="does not descend from the dispatch base"):
+        _import(*exported)
+    assert _git("rev-parse", "forge-task-1", cwd=repo["main"]) == base
+
+
+def test_import_accepts_a_tip_that_descends_from_the_base(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    base = _second_base_commit(repo)
+
+    def commit(clone: Path) -> None:
+        (clone / "new.txt").write_text("agent work\n")
+        _git("add", "new.txt", cwd=clone)
+        _git("commit", "-q", "-m", "agent work", cwd=clone)
+
+    tip = _import(*_export_clone(repo, tmp_path, commit))
+    assert tip != base
+    assert _git("rev-parse", f"{tip}~1", cwd=repo["main"]) == base
+
+
+def test_import_accepts_an_unchanged_tip(repo: dict[str, Path],
+                                         tmp_path: Path) -> None:
+    base = _git("rev-parse", "forge-task-1", cwd=repo["main"])
+    assert _import(*_export_clone(repo, tmp_path, lambda clone: None)) == base
