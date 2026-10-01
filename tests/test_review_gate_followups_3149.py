@@ -221,6 +221,100 @@ def test_r3143_06_wrapped_negation_needs_a_paragraph_line(before):
     assert gate_blocks(one_low_review(body)), body
 
 
+# --- R3143-04 / SR3143-04, R3143-05: no input raises -----------------------------
+
+@pytest.mark.parametrize("reference", [
+    "&#" + "9" * 5000,
+    "&#" + "9" * 5000 + ";",
+    "&#" + "1" * 4301,
+    "&#x" + "F" * 5000 + ";",
+    "&#" + "0" * 5000 + "72;",
+])
+def test_r3143_04_long_numeric_reference_returns_a_verdict(reference):
+    text = one_low_review([f"See {reference} in the log."])
+    analysis = analyze(text)   # raised ValueError before task 3149
+    assert analysis.verdict in (loops.REVIEW_VERDICT_OK,
+                                loops.REVIEW_VERDICT_COUNT_MISMATCH)
+
+
+def test_r3143_04_leading_zeros_still_decode_to_a_letter():
+    """A browser reads every leading zero: "&#000000072;" is H."""
+    assert_gate_blocks(["&#" + "0" * 40 + "72;IGH: SQL injection in login.py"])
+
+
+@pytest.mark.parametrize("line", [
+    "- H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}GH: SQL injection in login.py",
+    "### [S2] H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}GH \N{EM DASH} SQLi",
+    "| SQL injection | H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}GH |",
+])
+def test_r3143_05_dotted_capital_i_blocks_instead_of_raising(line):
+    assert_gate_blocks(["## Findings", "", line])
+
+
+def test_parse_error_becomes_a_logged_block(monkeypatch, tmp_path):
+    """ANY parser exception is a count-mismatch with a logged reason."""
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    logged = []
+    monkeypatch.setattr(loops, "_analyze_review_file", explode)
+    monkeypatch.setattr(loops, "_gate_audit_log",
+                        lambda message, **fields: logged.append((message, fields)))
+    path = tmp_path / "SECURITY-REVIEW-7.md"
+    counts = loops._count_findings_in_review_file(
+        path, task_id=7, text=one_low_review([]))
+    assert counts is None
+    assert len(logged) == 1, logged
+    message, fields = logged[0]
+    assert fields["event"] == "count-mismatch"
+    assert "review parse error: RuntimeError" in message
+    assert "action=treat-as-missing" in message
+
+
+def test_r3143_04_old_crash_input_blocks_with_a_logged_verdict(monkeypatch, tmp_path):
+    """The R3143-04 input end to end through the gate's counting call."""
+    logged = []
+    monkeypatch.setattr(loops, "_gate_audit_log",
+                        lambda message, **fields: logged.append(message))
+    text = one_low_review(["HIGH &#" + "9" * 5000])
+    assert loops._count_findings_in_review_file(
+        tmp_path / "SECURITY-REVIEW-8.md", task_id=8, text=text) is None
+    assert any("unaccounted severity token" in message for message in logged)
+
+
+# --- R3143-06: MEDIUM-only tokens are counted, never a block ---------------------
+
+def test_r3143_06_medium_only_tokens_are_counted_and_logged(monkeypatch,
+                                                           tmp_path):
+    logged = []
+    monkeypatch.setattr(loops, "_gate_audit_log",
+                        lambda message, **fields: logged.append((message, fields)))
+    text = one_low_review(["The cache has a MEDIUM issue: stale entries."])
+    counts = loops._count_findings_in_review_file(
+        tmp_path / "SECURITY-REVIEW-9.md", task_id=9, text=text)
+    assert counts is not None, "MEDIUM never blocks a merge"
+    assert counts["MEDIUM"] == 1 and counts["HIGH"] == counts["CRITICAL"] == 0
+    events = [fields["event"] for _, fields in logged]
+    assert events == ["backstop-advisory"], logged
+    assert "MEDIUM=1 at line" in logged[0][0]
+
+
+def test_r3143_06_medium_with_high_still_blocks_and_names_both():
+    text = one_low_review(["A MEDIUM issue and a HIGH one: SQL injection."])
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + ":")
+    assert "HIGH=1" in analysis.detail and "MEDIUM=1" in analysis.detail
+
+
+def test_merge_blocking_severities_match_the_gate_policy():
+    """The advisory rule rests on the gate blocking on CRITICAL/HIGH only."""
+    source = (REPO / "equipa" / "dispatch.py").read_text(encoding="utf-8")
+    assert ('blocks = counts.get("CRITICAL", 0) > 0 or '
+            'counts.get("HIGH", 0) > 0') in source
+    assert loops.MERGE_BLOCKING_SEVERITIES == ("CRITICAL", "HIGH")
+
+
 # --- R3143-08: the invisible-character list uses escapes ------------------------
 
 def test_r3143_08_security_gate_source_holds_no_invisible_character():

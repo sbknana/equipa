@@ -13,6 +13,7 @@ import asyncio
 import bisect
 import html
 import json
+import logging
 import os
 import re
 import subprocess
@@ -134,6 +135,7 @@ from equipa.roles import (
 from equipa import sessions
 from equipa.tasks import _get_task_status, get_task_complexity
 
+logger = logging.getLogger(__name__)
 
 # Task 2476: review-agent output artifacts (SECURITY-REVIEW-{id}.md,
 # CODE-REVIEW-{id}.md, PLAN-{id}.md, RETRY-IMPLEMENTATION-{id}.md, etc.)
@@ -1833,11 +1835,20 @@ def _matched_severity(match: re.Match[str]) -> str:
 
     A rule that captures two severities (a "HIGH/MEDIUM" range cell) reports
     the higher one (task 3130).
+
+    Task 3149 (R3143-05): case-insensitive rules match U+0130 (LATIN CAPITAL
+    LETTER I WITH DOT ABOVE) for "i", and its upper case is itself, so
+    "HİGH" raised KeyError. It is folded to "I" first (the only such code
+    point; see tests/test_review_gate_followups_3149.py).
     """
     return min(
-        (group.upper() for group in match.groups() if group),
+        (group.translate(_DOTTED_CAPITAL_I_FOLD).upper()
+         for group in match.groups() if group),
         key=_REVIEW_SEVERITIES.index,
     )
+
+
+_DOTTED_CAPITAL_I_FOLD = {0x0130: "I"}
 
 
 _NEWLINE_RE = re.compile("\n")
@@ -2749,6 +2760,13 @@ def _rendered_review_text(text: str) -> str:
 # finding's label. LOW and INFO never block a merge and are not read.
 
 BACKSTOP_REASON = "unaccounted severity token"
+# The severities whose count blocks a merge (dispatch._security_review_blocks
+# _merge and the defensive invariant: CRITICAL or HIGH above 0). An
+# unaccounted MEDIUM token is counted and logged under this reason instead
+# of untrusting the review (task 3149, R3143-06).
+MERGE_BLOCKING_SEVERITIES = ("CRITICAL", "HIGH")
+BACKSTOP_ADVISORY_REASON = "unaccounted MEDIUM token (advisory)"
+REVIEW_PARSE_ERROR_REASON = "review parse error"
 _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # The word must not touch a letter or digit. "_" is not a word character
 # here: "_HIGH_" renders as an emphasised HIGH. The character before the word
@@ -3427,7 +3445,8 @@ def _severity_token_backstop(
 
     parser_headings = analysis.header_counts or {}
     masked_lines = masked.split("\n") if headings else []
-    problems: list[str] = []
+    problems: list[tuple[str, str]] = []
+    reported: dict[str, int] = {}
     for severity in _BACKSTOP_SEVERITIES:
         heading_lines = sorted(line for line, word in headings
                                if word == severity)
@@ -3454,17 +3473,29 @@ def _severity_token_backstop(
             shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
             if len(lines) > _BACKSTOP_REPORTED_LINES:
                 shown += f" and {len(lines) - _BACKSTOP_REPORTED_LINES} more"
-            problems.append(
+            problems.append((severity,
                 f"{severity}={unaccounted} at line {shown} (footer "
                 f"{footer_count}, finding headings {counted})",
-            )
+            ))
+            reported[severity] = counted + unaccounted
     if not problems:
         return analysis
-    return replace(
-        analysis,
-        verdict=REVIEW_VERDICT_COUNT_MISMATCH,
-        detail=f"{BACKSTOP_REASON}: " + "; ".join(problems),
-    )
+    detail = "; ".join(problem for _, problem in problems)
+    if any(severity in MERGE_BLOCKING_SEVERITIES for severity, _ in problems):
+        return replace(
+            analysis,
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{BACKSTOP_REASON}: {detail}",
+        )
+    # Task 3149 (R3143-06): only MEDIUM tokens are unaccounted, and MEDIUM
+    # never blocks a merge. Untrusting the review for them blocked the merge
+    # anyway; now they are counted (the MEDIUM count includes them) and the
+    # detail is logged by the gate, and the review stays trusted.
+    counts = dict(analysis.counts or {})
+    for severity, total in reported.items():
+        counts[severity] = max(counts.get(severity, 0), total)
+    return replace(analysis, counts=counts,
+                   detail=f"{BACKSTOP_ADVISORY_REASON}: {detail}")
 
 
 def _stricter_analysis(
@@ -3580,6 +3611,10 @@ def _analyze_review_file(
 
 def _analyze_review_views(text: str) -> ReviewCountAnalysis:
     """The shape rules of :func:`_analyze_review_file`, on normalised text."""
+    if not text.isascii():
+        # R3143-05: every case-insensitive rule reads "HİGH" as HIGH, so it
+        # is spelled that way before any rule runs (one letter for one).
+        text = text.translate(_DOTTED_CAPITAL_I_FOLD)
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     text = _fold_blank_line_runs(text)
@@ -3815,9 +3850,33 @@ def _count_findings_in_review_file(
     Untrusted-but-present artifacts emit a ``[GATE-AUDIT]`` line
     (``event=count-mismatch`` or ``event=review-incomplete``) carrying both
     tallies, so the log records why a review that exists was not believed.
+
+    Task 3149 (R3143-04 / R3143-05): ANY exception from the parser is a
+    ``count-mismatch`` with detail ``review parse error: <type>``, logged like
+    every other untrusted review, and the merge blocks (fail closed with a
+    verdict line, never an exception out of the gate). A trusted review whose
+    MEDIUM count includes unaccounted MEDIUM tokens logs
+    ``event=backstop-advisory``.
     """
-    analysis = _analyze_review_file(review_path, text=text)
+    try:
+        analysis = _analyze_review_file(review_path, text=text)
+    except Exception as error:  # noqa: BLE001 - any parser failure blocks
+        logger.exception("[security-review] parsing %s failed", review_path)
+        analysis = ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{REVIEW_PARSE_ERROR_REASON}: {type(error).__name__}",
+        )
     if analysis.trusted:
+        if analysis.detail.startswith(BACKSTOP_ADVISORY_REASON):
+            _gate_audit_log(
+                f"task={task_id} event=backstop-advisory "
+                f"artifact={review_path.name} "
+                f"counts=[{format_counts(analysis.counts)}] "
+                f"detail={analysis.detail!r} action=count-only",
+                task_id=task_id,
+                event="backstop-advisory",
+                counts=analysis.counts,
+            )
         return analysis.counts
     if analysis.verdict in (
         REVIEW_VERDICT_COUNT_MISMATCH, REVIEW_VERDICT_INCOMPLETE,

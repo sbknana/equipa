@@ -217,25 +217,50 @@ def test_another_severity_inside_a_counted_section_blocks():
     assert blocked_by_backstop(text), analyze(text).detail
 
 
+ONE_HIGH = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+
+
+def assert_medium_counted(text, medium):
+    """Task 3149 (R3143-06): unaccounted MEDIUM tokens alone never untrust a
+    review (MEDIUM never blocks a merge); they are counted and named."""
+    analysis = analyze(text)
+    assert analysis.trusted, analysis.detail
+    assert analysis.detail.startswith(loops.BACKSTOP_ADVISORY_REASON), (
+        analysis.detail)
+    assert analysis.counts["MEDIUM"] == medium, analysis.counts
+    assert analysis.counts["CRITICAL"] == analysis.counts["HIGH"] == 0
+
+
 def test_a_severity_word_after_the_section_blocks():
-    """The section ends at the next heading; a later MEDIUM is another one."""
-    text = review("1 finding.", [
-        "## Findings", "",
-        f"### [S1] MEDIUM {E} Missing rate limit",
-        "Details.", "",
-        "## Notes",
-        "A MEDIUM issue in the cache was also seen.",
-    ], ONE_MEDIUM)
-    assert blocked_by_backstop(text), analyze(text).detail
+    """The section ends at the next heading; a later token is another one.
+
+    With HIGH the review blocks; with MEDIUM it is counted (task 3149).
+    """
+    for severity, footer in (("HIGH", ONE_HIGH), ("MEDIUM", ONE_MEDIUM)):
+        text = review("1 finding.", [
+            "## Findings", "",
+            f"### [S1] {severity} {E} Missing rate limit",
+            "Details.", "",
+            "## Notes",
+            f"A {severity} issue in the cache was also seen.",
+        ], footer)
+        if severity == "HIGH":
+            assert blocked_by_backstop(text), analyze(text).detail
+        else:
+            assert_medium_counted(text, 2)
 
 
 def test_more_tokens_than_the_footer_counts_blocks():
-    """Footer MEDIUM: 1 with one heading and one more MEDIUM elsewhere."""
-    text = review("1 finding.", [
-        f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
-        "Separately, MEDIUM: verbose stack traces in the API.",
-    ], ONE_MEDIUM)
-    assert blocked_by_backstop(text)
+    """Footer at 1 with one heading and one more token elsewhere."""
+    for severity, footer in (("HIGH", ONE_HIGH), ("MEDIUM", ONE_MEDIUM)):
+        text = review("1 finding.", [
+            f"### [S1] {severity} {E} Missing rate limit", "", "## Notes",
+            f"Separately, {severity}: verbose stack traces in the API.",
+        ], footer)
+        if severity == "HIGH":
+            assert blocked_by_backstop(text)
+        else:
+            assert_medium_counted(text, 2)
 
 
 def test_footer_covering_heading_less_findings_merges():
@@ -269,10 +294,15 @@ def test_tallies_and_negations_merge(body):
     ["semgrep: HIGH: 2 across the diff."],
     ["No HIGH: SQL injection in login."],    # a negation word before a label
     ["Two MEDIUM issues remain in the cache."],
+    ["Two HIGH issues remain in the cache."],
     ["Overall risk: HIGH."],
 ])
 def test_tallies_beyond_the_counts_block(body):
-    assert blocked_by_backstop(zero_review(body)), body
+    """MEDIUM-only rows are counted instead (task 3149, R3143-06)."""
+    if "MEDIUM" in body[0]:
+        assert_medium_counted(zero_review(body), 1)  # one token, counted once
+    else:
+        assert blocked_by_backstop(zero_review(body)), body
 
 
 def test_one_medium_tally_with_one_counted_medium_merges():
