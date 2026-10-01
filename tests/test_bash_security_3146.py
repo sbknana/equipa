@@ -227,3 +227,22 @@ def test_long_literal_arithmetic_stays_linear():
     many = "(( " * 5000
     assert bash_security._evaluating_construct(many) is not None
     assert time.perf_counter() - start < 1.0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "read " * 3200 + "'$(x)'",
+        ("read " + "x " * 10) * 640 + "'$(x)'",
+        "read > x " * 1777 + "'$(x)'",
+        "[ " * 8000 + "'$(x)'",
+    ],
+)
+def test_builtin_argument_scan_is_linear(command: str):
+    """Each builtin used to rescan every later word: 0.9 s at 16 KB."""
+    import time
+
+    bash_security._scan_shell.cache_clear()
+    start = time.perf_counter()
+    bash_security._evaluating_construct(command)
+    assert time.perf_counter() - start < 0.4

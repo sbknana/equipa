@@ -999,6 +999,12 @@ def _argument_evaluator(words: list[_ShellWord]) -> str | None:
     command name that expands, since it may become any builtin.
     """
     words = _without_redirections(words)
+    # unsafe_from[i]: a word at i or later expands or names a subscript. One
+    # backward pass keeps `read read read ...` linear.
+    unsafe_from = [False] * (len(words) + 1)
+    for index in range(len(words) - 1, -1, -1):
+        word = words[index]
+        unsafe_from[index] = unsafe_from[index + 1] or word.expands or "[" in word.text
     at_command_name = True
     for index, word in enumerate(words):
         if at_command_name:
@@ -1012,13 +1018,13 @@ def _argument_evaluator(words: list[_ShellWord]) -> str | None:
             continue
         if word.text not in _ARGUMENT_EVALUATORS:
             return repr(word.text)
-        arguments = words[index + 1:]
         if word.text == "printf":
             # Only -v names a variable, and it must come first.
-            if arguments and (arguments[0].expands or arguments[0].text.startswith("-")):
+            first = words[index + 1] if index + 1 < len(words) else None
+            if first is not None and (first.expands or first.text.startswith("-")):
                 return "'printf -v'"
             continue
-        if any(argument.expands or "[" in argument.text for argument in arguments):
+        if unsafe_from[index + 1]:
             return f"{word.text!r} with a subscript or expanded argument"
     return None
 
