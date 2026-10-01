@@ -148,9 +148,16 @@ The generator is code from the merged tree, which agents can write, so:
   re-read from the checkout. The generator runs only if its blob at that
   pinned SHA is identical on the task branch and in the merged tree, and only
   if the merge started from the pinned SHA and HEAD is still there. If the
-  default branch moved, nothing runs: the merge is aborted and the guard
-  raises the alarm. A branch that changed the generator ends `merge_failed`
-  with "the task branch changed the generator"; it is never run. A generator
+  default branch moved before those checks, nothing runs: the merge is
+  aborted and the guard raises the alarm. The resolution commit is built
+  with `git commit-tree` from the verified tree and the pinned parents, and
+  the default branch is moved only by a compare-and-swap
+  `git update-ref <branch> <resolution> <pinned SHA>`. If the branch moved
+  after the checks (at any point up to that update), the swap is refused,
+  nothing is committed on top of the moved branch, the branch is left where
+  it was, and the guard raises the alarm. A branch that changed the
+  generator ends `merge_failed` with "the task branch changed the
+  generator"; it is never run. A generator
   updated on the default branch after the task branched is not run either,
   and the reason says "the default branch changed the generator";
 - it runs as `python -I` in a private export of its declared `inputs` (and

@@ -2385,7 +2385,7 @@ async def _merge_task_branch(
         if shutdown_requested() is None and pinned_default_sha:
             resolution = await _resolve_generated_conflict(
                 project_dir, task_id, branch_name, pre_head, target_sha,
-                pinned_default_sha,
+                pinned_default_sha, default_branch,
             )
             if resolution.resolved:
                 record.merged_sha = target_sha
@@ -2537,6 +2537,7 @@ async def _resolve_generated_conflict(
     pre_head: str,
     target_sha: str,
     pinned_sha: str,
+    default_branch: str | None = None,
 ) -> ConflictResolution:
     """Try the task #3131 generated-file resolution of a conflicted merge.
 
@@ -2560,6 +2561,7 @@ async def _resolve_generated_conflict(
                 f"Conflict in generated file(s) resolved by regenerating them "
                 f"from the merged tree (task #3131)."
             ),
+            default_branch=default_branch,
         )
     except (subprocess.SubprocessError, OSError) as exc:
         resolution = ConflictResolution(

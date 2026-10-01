@@ -546,6 +546,7 @@ async def resolve_generated_conflicts(
     theirs: str,
     head_before_merge: str,
     message: str,
+    default_branch: str | None = None,
 ) -> ConflictResolution:
     """Complete the in-progress conflicted merge of ``theirs`` into ``ours``.
 
@@ -561,6 +562,12 @@ async def resolve_generated_conflicts(
     Task #3141 (I-01): the generator is trusted only as the blob at the
     pinned ``ours``. A merge that did not start from ``ours``, or a HEAD that
     moved away from it, is refused before anything runs.
+
+    Task #3146 (N-02): the resolution is built with ``commit-tree`` and the
+    branch HEAD names (``default_branch`` when given) is moved by a
+    compare-and-swap ``update-ref`` whose old value is ``ours``. A branch
+    that moved after the checks is never committed on; it is left untouched
+    and the resolution is refused.
     """
     repo = os.fspath(repo)
     conflicts = await unmerged_entries(repo)
@@ -647,17 +654,25 @@ async def resolve_generated_conflicts(
     )
     if problem:
         return refuse(problem)
-    committed = await git_run_async(
-        ["commit", "--no-verify", "--quiet", "-m", message], repo, timeout=60,
+    branch_ref = await _checkout_branch_ref(repo, default_branch)
+    if branch_ref is None:
+        return refuse(
+            "the checkout's HEAD is not the default branch, so the resolution "
+            "is not committed"
+        )
+    # N-02 (task #3146): the resolution commit is built from the verified
+    # tree with the exact parents, and the branch moves only by a
+    # compare-and-swap from the pinned SHA. If the default branch moved at
+    # any point after the HEAD check, nothing is committed on top of it and
+    # it is left exactly where it is.
+    built = await git_run_async(
+        ["commit-tree", staged_tree, "-p", ours, "-p", theirs, "-F", "-"],
+        repo, timeout=60, input=message.encode("utf-8"),
     )
-    if committed.returncode != 0:
-        return refuse(f"git commit failed: {committed.stderr.strip()[:200]}")
-    head = await resolve_commit(repo, "HEAD")
-    if head is None or head == ours:
-        return refuse("git commit did not advance the default branch")
-    # I-03: a commit that is not exactly the verified resolution is refused,
-    # never reported as merged. It has already landed, so the caller's
-    # DefaultBranchGuard.verify after the failed merge raises the alarm.
+    head = built.stdout.strip()
+    if built.returncode != 0 or not head:
+        return refuse(f"git commit-tree failed: {built.stderr.strip()[:200]}")
+    # I-03: the commit must be exactly the verified resolution.
     if await commit_parents(repo, head) != [ours, theirs]:
         return refuse(
             f"resolution commit {head[:12]} is not a merge of the pinned "
@@ -668,4 +683,56 @@ async def resolve_generated_conflicts(
             f"resolution commit {head[:12]} is not the verified tree "
             f"{staged_tree[:12]}"
         )
+    # The checkout must match what lands, or a later commit there would
+    # carry whatever was swapped into the index.
+    rewritten = await git_run_async(["write-tree"], repo, timeout=_GIT_TIMEOUT)
+    if rewritten.returncode != 0 or rewritten.stdout.strip() != staged_tree:
+        # Put the verified tree back so the caller's ``merge --abort`` can
+        # return the checkout to the default branch: it refuses while an
+        # index entry differs from both HEAD and the work tree.
+        await git_run_async(["read-tree", staged_tree], repo, timeout=_GIT_TIMEOUT)
+        await git_run_async(
+            ["update-index", "-q", "--refresh"], repo, timeout=_GIT_TIMEOUT,
+        )
+        return refuse(
+            f"the checkout's index is not the verified tree {staged_tree[:12]} "
+            f"any more"
+        )
+    swapped = await git_run_async(
+        ["update-ref", "-m", f"merge (regenerated): {message.splitlines()[0]}",
+         branch_ref, head, ours],
+        repo, timeout=_GIT_TIMEOUT,
+    )
+    if swapped.returncode != 0:
+        return refuse(
+            f"{branch_ref} is no longer the pinned default-branch SHA "
+            f"{ours[:12]} (compare-and-swap refused): the default branch "
+            f"moved, so the resolution {head[:12]} is not committed"
+        )
+    # HEAD, index and work tree now agree; only the merge state is left.
+    quit_merge = await git_run_async(
+        ["merge", "--quit"], repo, timeout=_GIT_TIMEOUT,
+    )
+    if quit_merge.returncode != 0:
+        logger.warning(
+            "[Generated-Files] merge --quit after the resolution failed: %s",
+            quit_merge.stderr.strip()[:200],
+        )
     return ConflictResolution(True, paths, head, "regenerated", blobs)
+
+
+async def _checkout_branch_ref(repo: str, default_branch: str | None) -> str | None:
+    """The branch ref HEAD names, or None when HEAD is not that branch.
+
+    ``default_branch`` (when given) must be the branch HEAD is on; a
+    detached HEAD or any ref outside ``refs/heads/`` is refused.
+    """
+    symbolic = await git_run_async(
+        ["symbolic-ref", "-q", "HEAD"], repo, timeout=_GIT_TIMEOUT,
+    )
+    ref = symbolic.stdout.strip()
+    if symbolic.returncode != 0 or not ref.startswith("refs/heads/"):
+        return None
+    if default_branch is not None and ref != f"refs/heads/{default_branch}":
+        return None
+    return ref

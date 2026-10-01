@@ -523,14 +523,18 @@ def test_index_swapped_before_the_commit_is_refused_not_merged(
     repo, monkeypatch, capsys,
 ):
     """A same-UID writer swaps the report in the index between write-tree
-    and commit. The commit is not the verified tree: refused, and the guard
-    raises the alarm on the moved branch instead of recording it."""
-    worktree, branch_sha, _main_sha = _diverge_with_report_conflict(repo)
+    and commit. The commit is not the verified tree: refused, never recorded.
+    Since task #3146 (N-02) the commit is built from the verified tree and
+    the branch moves only by compare-and-swap, so the refusal also leaves the
+    default branch exactly where it was."""
+    worktree, branch_sha, main_sha = _diverge_with_report_conflict(repo)
     evil = _blob_of(repo, "EVIL CONTENT\n", write=True)
     real_git = generated_files_mod.git_run_async
+    swaps = []
 
     async def swap_index_before_commit(args, cwd, *rest, **kwargs):
-        if args and args[0] == "commit":
+        if args and args[0] in ("commit", "commit-tree"):
+            swaps.append(args[0])
             _git(repo, "update-index", "--cacheinfo", f"100644,{evil},{REPORT}")
         return await real_git(args, cwd, *rest, **kwargs)
 
@@ -538,9 +542,11 @@ def test_index_swapped_before_the_commit_is_refused_not_merged(
 
     status, guard = _gate(repo, worktree)
 
-    assert status == "blocked"
-    assert guard.tripped and guard.outcomes[TASK].merged_sha is None
-    assert _sha(repo, BRANCH) == branch_sha
+    assert swaps, "the index swap was not injected"
+    assert status == "merge_failed"
+    assert guard.outcomes[TASK].merged_sha is None
+    _assert_failed_cleanly(repo, guard, main_sha, branch_sha)
+    assert evil not in _git(repo, "ls-tree", "-r", "main")
     assert "is not the verified tree" in capsys.readouterr().err
 
 
