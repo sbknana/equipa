@@ -99,8 +99,8 @@ REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
 # the regex ``^``/``$`` anchors and splitlines() see the same lines. A CR-only
 # or U+2028 review otherwise hid a finding heading from the MULTILINE regexes
 # while splitlines() still split it.
-_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
-# gate-06: invisible characters that split a severity word ("HI​GH") so
+_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# gate-06: invisible characters that split a severity word ("HI<U+200B>GH") so
 # no regex sees it, while the operator reading the rendered file does.
 # Task 3143 (I-04): every Default_Ignorable_Code_Point and every Unicode Cf
 # (format) character, not a hand-picked subset. The musical beam controls
@@ -109,10 +109,10 @@ _LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
 # Escapes, not literal characters, so the list can be read and reviewed.
 _INVISIBLE_CHARS_RE = re.compile(
     "["
-    "­͏؀-؅؜۝܏࢐࢑࣢"
-    "ᅟᅠ឴឵᠋-᠏"
-    "​-‏‪-‮⁠-⁯ㅤ"
-    "︀-️﻿ﾠ￰-￻"
+    "\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2"
+    "\u115f\u1160\u17b4\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164"
+    "\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb"
     "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff"
     "]"
