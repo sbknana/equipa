@@ -996,15 +996,68 @@ _REVIEW_FINDING_HEADER_RE = re.compile(
 # a stale all-zero footer behind; preferring it merged an unfinished review
 # with MEDIUM/LOW headers as clean. Both tallies are now computed and must
 # agree (see _analyze_review_file).
-_REVIEW_COUNTS_FOOTER_RE = re.compile(
-    r"^##\s+Counts\s*\n[^\n]*?"
-    r"CRITICAL\s*:\s*(\d+)[^\n]*?"
-    r"HIGH\s*:\s*(\d+)[^\n]*?"
-    r"MEDIUM\s*:\s*(\d+)[^\n]*?"
-    r"LOW\s*:\s*(\d+)[^\n]*?"
-    r"INFO\s*:\s*(\d+)",
-    re.MULTILINE | re.IGNORECASE,
+#
+# Task 3143: the footer used to be one regex, "^##\s+Counts\s*\n" and then
+# "[^\n]*?CRITICAL\s*:\s*(\d+)" and so on for each severity. Its five nested
+# lazy runs retried every later field for every earlier occurrence, so one
+# 200 KB tally line of "CRITICAL: 0 " took 30 s. The same footers are now
+# found field by field: each field is the first "SEVERITY: N" whose label
+# starts on the line where the previous field ended (a later occurrence can
+# never succeed where the first one failed), which is the match the regex
+# returned, in linear time.
+_COUNTS_HEADING_RE = re.compile(r"^##\s+Counts\s*\n",
+                                re.MULTILINE | re.IGNORECASE)
+_COUNTS_FIELD_RES = tuple(
+    (re.compile(severity, re.IGNORECASE),
+     re.compile(severity + r"\s*:\s*(\d+)", re.IGNORECASE))
+    for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 )
+
+
+@dataclass(frozen=True)
+class _CountsFooter:
+    """One "## Counts" footer: its span, counts and severity label offsets."""
+
+    start: int
+    end: int
+    counts: tuple[int, ...]
+    label_starts: tuple[int, ...]
+
+
+def _counts_footer_at(text: str, heading: re.Match[str]) -> _CountsFooter | None:
+    """The footer whose "## Counts" heading is ``heading``, or None."""
+    position = heading.end()
+    counts: list[int] = []
+    label_starts: list[int] = []
+    for label_re, field_re in _COUNTS_FIELD_RES:
+        line_end = text.find("\n", position)
+        line_end = len(text) if line_end == -1 else line_end
+        field = None
+        for label in label_re.finditer(text, position, line_end):
+            field = field_re.match(text, label.start())
+            if field is not None:
+                break
+        if field is None:
+            return None
+        counts.append(int(field.group(1)))
+        label_starts.append(field.start())
+        position = field.end()
+    return _CountsFooter(heading.start(), position, tuple(counts),
+                         tuple(label_starts))
+
+
+def _counts_footers(text: str) -> list[_CountsFooter]:
+    """Every "## Counts" footer in ``text``, in order, never overlapping."""
+    footers: list[_CountsFooter] = []
+    position = 0
+    while (heading := _COUNTS_HEADING_RE.search(text, position)) is not None:
+        footer = _counts_footer_at(text, heading)
+        if footer is None:
+            position = heading.start() + 1
+            continue
+        footers.append(footer)
+        position = footer.end
+    return footers
 
 # Sentinel marker written into orchestrator-saved fallback dumps when the
 # reviewer agent failed to write a structured SECURITY-REVIEW artifact.
@@ -1494,6 +1547,9 @@ _SETEXT_NON_TEXT_RE = re.compile(
 # prose, footer) must still pass; the Summary markers and the header/footer
 # agreement check are the primary signals.
 _REVIEW_MIN_NONBLANK_LINES = 4
+# Task 3143: the longest of the ~870 distinct real reviews has about 1,000
+# lines; ten times that is the most the gate parses.
+_REVIEW_MAX_PARSED_LINES = 10_000
 
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
@@ -2187,6 +2243,11 @@ def _closes_fence(stripped: str, fence: str) -> bool:
     return run >= len(fence) and not stripped[run:].strip(" \t")
 
 
+# Either closer, whichever comes first: one scan that stops at the first
+# "-->" or "--!>", so a flood of "<!-- a --!>" is not searched to the end.
+_COMMENT_CLOSER_RE = re.compile(r"--!?>")
+
+
 def _comment_end(text: str, start: int, limit: int) -> int:
     """Offset just past the HTML comment that opens at ``start``, or -1.
 
@@ -2200,11 +2261,8 @@ def _comment_end(text: str, start: int, limit: int) -> int:
         return start + 5
     if text.startswith("<!--->", start):
         return start + 6
-    close = text.find("-->", start + 4, limit)
-    bang_close = text.find("--!>", start + 4, limit if close == -1 else close)
-    if bang_close != -1:
-        return bang_close + 4
-    return -1 if close == -1 else close + 3
+    close = _COMMENT_CLOSER_RE.search(text, start + 4, limit)
+    return -1 if close is None else close.end()
 
 
 def _neutralize_backticks(line: str) -> str:
@@ -2651,18 +2709,10 @@ _BACKSTOP_REFERENCE_RE = re.compile(
 # "<", so a flood of unclosed "<a" is scanned once.
 _BACKSTOP_TAG_RE = re.compile(r"<[A-Za-z/!?][^<>]*>")
 _BACKSTOP_MULTILINE_TAG_RE = re.compile(r"<[A-Za-z/!?][^<>\n]*\n[^<>]*>")
-_BACKSTOP_COUNTS_HEADING_RE = re.compile(r"^##[ \t]+Counts[ \t]*$", re.MULTILINE)
-_BACKSTOP_BLANK_RUN_RE = re.compile(r"[ \t\n]*")
 # A decoded reference never starts a new line ("HI&#10;GH" is "HI GH").
 _BACKSTOP_LINE_BREAKS = str.maketrans(
     dict.fromkeys("\n\r\x0b\x0c\x1c\x1d\x1e\x85  ", " "),
 )
-# The footer search is bounded so it stays linear: a real tally line is
-# about 55 characters. A footer the backstop does not find is not exempt, so
-# its labels count as tokens (fail closed).
-_BACKSTOP_FOOTER_ATTEMPTS = 3
-_BACKSTOP_MAX_TALLY_LINE = 300
-_BACKSTOP_MAX_FOOTER_SPAN = 4096
 _BACKSTOP_REPORTED_LINES = 20
 # Positions that cannot label a finding (task 3143, corpus item C). Each is
 # read in a window of at most _BACKSTOP_CONTEXT characters on the token's
@@ -3009,35 +3059,18 @@ def _blank_like(match: re.Match[str]) -> str:
 def _backstop_masked(text: str) -> str:
     """``text`` without the final footer's labels and the completion line.
 
-    The footer is the last "## Counts" heading (of the last three) followed,
-    after blank or marker-comment lines, by a tally the parser's footer
-    pattern reads. Only its CRITICAL, HIGH and MEDIUM labels are lowered;
-    anything else on the tally line is still read.
+    The footer is the last one the parser's footer scan finds, with the
+    gate's marker-comment lines read as blank (R3137-03). Only its CRITICAL,
+    HIGH and MEDIUM labels are lowered, each where it is written in UPPER
+    case; anything else on the tally line is still read.
     """
-    search = _STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text)
-    headings = list(_BACKSTOP_COUNTS_HEADING_RE.finditer(search))
-    for heading in reversed(headings[-_BACKSTOP_FOOTER_ATTEMPTS:]):
-        tally_start = _BACKSTOP_BLANK_RUN_RE.match(search, heading.end()).end()
-        line_start = search.rfind("\n", 0, tally_start) + 1
-        tally_end = search.find("\n", tally_start)
-        tally_end = len(search) if tally_end == -1 else tally_end
-        if (tally_end - line_start > _BACKSTOP_MAX_TALLY_LINE
-                or tally_end - heading.start() > _BACKSTOP_MAX_FOOTER_SPAN):
-            continue
-        footer = _REVIEW_COUNTS_FOOTER_RE.match(search, heading.start(), tally_end)
-        if footer is None:
-            continue
-        for index, severity in enumerate(_BACKSTOP_SEVERITIES, start=1):
-            label_end = footer.start(index)
-            while label_end > line_start and (
-                search[label_end - 1].isspace() or search[label_end - 1] == ":"
-            ):
-                label_end -= 1
-            label_start = label_end - len(severity)
+    footers = _counts_footers(_STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text))
+    if footers:
+        for severity, label_start in zip(_BACKSTOP_SEVERITIES,
+                                         footers[-1].label_starts):
+            label_end = label_start + len(severity)
             if text[label_start:label_end] == severity:
-                text = (text[:label_start] + severity.lower()
-                        + text[label_end:])
-        break
+                text = text[:label_start] + severity.lower() + text[label_end:]
     body = text.rstrip(" \t\n")
     last_start = body.rfind("\n") + 1
     last_line = body[last_start:]
@@ -3206,6 +3239,15 @@ def _analyze_review_file(
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised
     # passes through unchanged.
+    # Task 3143: NFKC turns some lookalikes into a letter of another shape
+    # (GREEK CAPITAL LUNATE SIGMA SYMBOL, drawn as a C, becomes a Sigma), so
+    # the backstop reads a copy whose lookalikes were folded BEFORE NFKC.
+    # Each fold is one letter for one letter, so no line moves.
+    folded_first = None
+    if not text.isascii():
+        folded_first = normalize_review_text(
+            text.translate(_BACKSTOP_LETTER_FOLDS),
+        )
     text = normalize_review_text(text)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
@@ -3217,7 +3259,21 @@ def _analyze_review_file(
         return ReviewCountAnalysis(verdict=REVIEW_VERDICT_FALLBACK)
     # Task 3143: the shape rules first, then the fail-closed backstop over
     # every UPPER-case severity word they did not count.
-    return _severity_token_backstop(text, _analyze_review_views(text))
+    analysis = _analyze_review_views(text)
+    backstop_text = text
+    if folded_first is not None and folded_first != text:
+        if folded_first.count("\n") != text.count("\n"):
+            # Not expected (see above); the line numbers would not hold.
+            if not analysis.trusted:
+                return analysis
+            return replace(
+                analysis,
+                verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+                detail=(f"{BACKSTOP_REASON}: folding lookalike letters "
+                        f"changed the line count"),
+            )
+        backstop_text = folded_first
+    return _severity_token_backstop(backstop_text, analysis)
 
 
 def _analyze_review_views(text: str) -> ReviewCountAnalysis:
@@ -3225,6 +3281,16 @@ def _analyze_review_views(text: str) -> ReviewCountAnalysis:
     # Comments count toward the near-empty check, as they always have.
     nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
     text = _fold_blank_line_runs(text)
+    # Task 3143 (timing, R3137-06): every rule pays a few microseconds per
+    # line, so a 200 KB flood of one-character lines ("-", ">", "`") took
+    # 0.6 s. A review longer than any real one is not parsed (fail closed).
+    line_count = text.count("\n") + 1
+    if line_count > _REVIEW_MAX_PARSED_LINES:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_INCOMPLETE,
+            detail=(f"review too long to parse: {line_count} lines after "
+                    f"folding blank runs (at most {_REVIEW_MAX_PARSED_LINES})"),
+        )
     # Task 3130: parse the text as written (what every earlier task parsed)
     # and as rendered (comments removed, references decoded, lookalike
     # letters folded, blank runs collapsed); the stricter result wins. The
@@ -3296,15 +3362,13 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     # cannot mask the final tally, and a later quoted all-zero footer cannot
     # mask an earlier correct one. The LAST footer is still the one that
     # must close the review.
-    footer_matches = list(_REVIEW_COUNTS_FOOTER_RE.finditer(visible_text))
+    footer_matches = _counts_footers(visible_text)
     footer = footer_matches[-1] if footer_matches else None
     footer_counts: dict[str, int] | None = None
     if footer_matches:
         footer_counts = {
-            severity: max(
-                int(match.group(index)) for match in footer_matches
-            )
-            for index, severity in enumerate(_REVIEW_SEVERITIES, start=1)
+            severity: max(match.counts[index] for match in footer_matches)
+            for index, severity in enumerate(_REVIEW_SEVERITIES)
         }
 
     # S3033-01: resolved headings are never subtracted from the merge
@@ -3374,7 +3438,7 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     # S3033-04: the footer closes the review. A heading or finding after it
     # means the footer was written first (a skeleton) and never updated.
     if footer is not None:
-        trailing = visible_text[footer.end():]
+        trailing = visible_text[footer.end:]
         if (
             _ANY_MARKDOWN_HEADING_RE.search(trailing)
             or _FINDING_CANDIDATE_RE.search(trailing)
