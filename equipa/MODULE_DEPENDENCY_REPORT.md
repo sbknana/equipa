@@ -8,17 +8,17 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **53,892 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **54,071 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
 | Module | Lines | Layer | Imports (equipa) | Late Imports | Exports |
 |---|---:|:---:|---|---|---:|
 | `abort_controller.py` | 218 | L0 | — | — | 3 |
-| `agent_launcher.py` | 1373 | L0 | — | — | 25 |
+| `agent_launcher.py` | 1425 | L0 | — | — | 26 |
 | `bash_security.py` | 4152 | L0 | — | — | 5 |
 | `classifier.py` | 167 | L0 | — | — | 3 |
-| `cli_isolation.py` | 379 | L0 | — | — | 28 |
+| `cli_isolation.py` | 506 | L0 | — | — | 30 |
 | `constants.py` | 337 | L0 | — | — | 67 |
 | `env_loader.py` | 315 | L0 | — | `config.py` | 8 |
 | `heartbeat.py` | 855 | L0 | — | `config.py`, `config_versions.py`, `db.py`, `sessions.py` | 18 |
@@ -75,7 +75,7 @@ The `equipa/` package contains **60 Python modules** totaling **53,892 lines** o
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 53,892 lines | 959 public exports
+**Total:** 54,071 lines | 962 public exports
 
 ## Modules by Layer
 
