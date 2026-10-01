@@ -736,6 +736,10 @@ The recipe runs in its own `bash` with `set -euo pipefail`, so a `FAILED`
 from `sha256sum -c`, a finding from the scanner or any other failing step
 stops it before anything is installed (review SR3147-04); pasting the
 lines into an interactive shell one by one would carry on past them.
+`bash` reads the recipe from its standard input, so every `pip` call runs
+with `--no-input`: a prompt (index credentials, for example) would
+otherwise read, and swallow, the rest of the recipe (F-6 of the 3153
+review).
 
 ```bash
 bash <<'RECIPE'
@@ -745,7 +749,7 @@ install -d -m 0700 /root/equipa-mcp-wheels && cd /root/equipa-mcp-wheels
 # 1. Download, install nothing. mcp is pinned too: mcp-server-sqlite
 #    2025.4.25 asks for mcp>=1.6.0 and crashes at startup on mcp 2.x
 #    ("'Server' object has no attribute 'list_resources'").
-/opt/equipa-mcp/bin/pip download --only-binary=:all: --dest . \
+/opt/equipa-mcp/bin/pip download --no-input --only-binary=:all: --dest . \
     'mcp-server-sqlite==2025.4.25' 'mcp[cli]==1.30.0'
 # 2. The pinned wheels are the published ones (sha256 from PyPI):
 sha256sum -c - <<'EOF'
@@ -762,9 +766,9 @@ done > requirements.lock
 pip-audit --disable-pip --require-hashes -r requirements.lock
 #    (or osv-scanner on requirements.lock). Stop on any finding.
 # 5. Install exactly the scanned files, offline, every hash enforced:
-/opt/equipa-mcp/bin/pip install --no-index --find-links . \
+/opt/equipa-mcp/bin/pip install --no-input --no-index --find-links . \
     --require-hashes --no-deps -r requirements.lock
-/opt/equipa-mcp/bin/pip check
+/opt/equipa-mcp/bin/pip check --no-input
 install -m 0644 requirements.lock /opt/equipa-mcp/requirements.lock
 chmod -R go-w /opt/equipa-mcp && chmod -R o+rX /opt/equipa-mcp
 RECIPE
@@ -1147,7 +1151,12 @@ the host fail-closed even without the `fib` line. `reject` rather than
 
 The verify script (step 8) proves the rule from both sides: as `<orch>` it
 checks that the table is loaded (`sudo -n /usr/sbin/nft list table inet
-equipa_agent`; listing needs CAP_NET_ADMIN, see step 6), and as the agent
+equipa_agent`; listing needs CAP_NET_ADMIN, see step 6) and reads that
+listing: the `agent` chain must hold `ct status dnat reject` as its first
+statement plus both broadcast rejects (an older rule file fails), and on a
+host with a global IPv6 address an empty `lan6_prefixes` set fails with a
+WARNING (review R3153-02). It does not check that the listed prefixes are
+the right ones; the IPv6 `--lan-target` probe does that. As the agent
 it fails if it can connect to a listener of its own on **any** address of
 the host, to any listening port at `127.0.0.1` or at any host address, or to
 any `--lan-target`. The launcher's own check (its listeners on `127.0.0.1`

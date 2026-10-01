@@ -43,8 +43,11 @@
 #     outlive the unit).
 # As the orchestrator it also checks that the narrow sudoers rule is
 # installed, by its content (an ALL rule does not count), that the agent
-# user's nftables table (inet equipa_agent) is loaded, and that every
-# --lan-target answers the orchestrator (else its probe proves nothing).
+# user's nftables table (inet equipa_agent) is loaded with the step 4a
+# rules (ct status dnat reject first, the broadcast rejects, and a
+# non-empty lan6_prefixes set on a host with a global IPv6 address), and
+# that every --lan-target answers the orchestrator (else its probe proves
+# nothing).
 # Every check prints PASS or FAIL (a NOTE names what was not probed); the
 # last line is RESULT: PASS|FAIL.
 # Exit status: 0 all checks passed, 1 a check failed, 2 isolation could not
@@ -423,6 +426,91 @@ check_network() {
 
 count_words() { echo "$#"; }
 
+# --- orchestrator side: the content of the loaded nftables rule ------------
+# The table check (equipa.isolation) only proves the table is loaded. A host
+# still running an older rule file passes it, and the agent-side probes need
+# a published Docker port or a global IPv6 LAN target to notice what is
+# missing (R3153-02, F-4 of the 3153 review). These read the listing
+# instead: `sudo -n /usr/sbin/nft list table inet equipa_agent`, the one
+# nft command the runbook lets the orchestrator run (step 6).
+NFT_EXECUTABLE=/usr/sbin/nft
+# Statements of the step 4a "agent" chain this check requires; the first
+# must also come first in the chain (IR3147-A: before any accept).
+REQUIRED_AGENT_CHAIN_STATEMENTS=(
+    "ct status dnat reject"
+    "fib daddr type broadcast reject"
+    "ip daddr 255.255.255.255 reject"
+)
+
+# The body of the block "$2 {" in the nft listing "$1", one trimmed
+# statement per line, comments and blank lines dropped; nothing when the
+# block is missing.
+nft_block() {
+    printf '%s\n' "$1" | awk -v header="$2 {" '
+        { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line) }
+        !inside { if (line == header) { inside = 1; depth = 1 }; next }
+        {
+            depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+            if (depth <= 0) exit
+            if (line != "" && substr(line, 1, 1) != "#") print line
+        }'
+}
+
+# 0 when the statement lines "$1" hold "$2" as a whole statement (nft may
+# list a reject with its default type: "... reject with icmpx ...").
+has_statement() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in "$2"|"$2 with "*) return 0 ;; esac
+    done <<< "$1"
+    return 1
+}
+
+# The global IPv6 addresses of this host, space-separated. Unique local
+# addresses (fc00::/7) are left out: the rule rejects that range already.
+global_ipv6_addresses() {
+    ip -6 -o addr show scope global 2>/dev/null | awk '
+        { split($4, parts, "/"); address = tolower(parts[1])
+          if (address !~ /^f[cd]/) printf "%s ", address }'
+}
+
+# $1: the listing of table inet equipa_agent; $2: the host's global IPv6
+# addresses (space-separated, empty when it has none).
+check_firewall_rule() {
+    local listing="$1" global_ipv6="$2"
+    local chain first statement lan6
+    chain="$(nft_block "$listing" "chain agent")"
+    if [ -z "$chain" ]; then
+        fail "the loaded nftables table inet equipa_agent has no 'agent' chain (reload the rule file of docs/AGENT_ISOLATION.md step 4a)"
+        return
+    fi
+    for statement in "${REQUIRED_AGENT_CHAIN_STATEMENTS[@]}"; do
+        if has_statement "$chain" "$statement"; then
+            pass "the loaded agent chain has '$statement'"
+        else
+            fail "the loaded agent chain lacks '$statement' (an older rule file is loaded; reload the rule file of docs/AGENT_ISOLATION.md step 4a)"
+        fi
+    done
+    first="$(head -n 1 <<< "$chain")"
+    statement="${REQUIRED_AGENT_CHAIN_STATEMENTS[0]}"
+    if has_statement "$chain" "$statement" \
+            && ! has_statement "$first" "$statement"; then
+        fail "'$statement' is not the first statement of the loaded agent chain (it is '$first'; a DNATed connection must be rejected before any accept)"
+    fi
+    if ! printf '%s\n' "$listing" | grep -Eq '^[[:space:]]*set lan6_prefixes \{[[:space:]]*$'; then
+        fail "the loaded table has no lan6_prefixes set (an older rule file is loaded; reload the rule file of docs/AGENT_ISOLATION.md step 4a)"
+        return
+    fi
+    lan6="$(nft_block "$listing" "set lan6_prefixes" | grep -E '^elements = ')"
+    if [ -n "$lan6" ]; then
+        pass "the LAN IPv6 prefix set lists: ${lan6#elements = }"
+    elif [ -n "$global_ipv6" ]; then
+        fail "WARNING: the LAN IPv6 prefix set lan6_prefixes is EMPTY on a host with global IPv6 address(es) (${global_ipv6% }): the agent can reach every NAS, router or database on the LAN through its global IPv6 address; list the LAN's prefix ('ip -6 route show proto kernel', 'ip -6 route show proto ra') in the set (docs/AGENT_ISOLATION.md step 4a)"
+    else
+        pass "no global IPv6 address on this host, so the empty lan6_prefixes set leaves no LAN IPv6 prefix open"
+    fi
+}
+
 inside() {
     local orchestrator_pid="" orchestrator_home="" database="" runtime=""
     local launcher="" pids_expected="" view_db="" mcp_config=""
@@ -713,4 +801,16 @@ fi
 self="$(readlink -f -- "$0")"
 runtime="$(dirname -- "$(dirname -- "$self")")"
 cd -- "$runtime" || exit 2
-exec "${EQUIPA_PYTHON:-python3}" -m equipa.isolation --verify-probe "$self" "$@"
+if firewall_listing="$(sudo -n "$NFT_EXECUTABLE" list table inet equipa_agent 2>/dev/null)" \
+        && [ -n "$firewall_listing" ]; then
+    check_firewall_rule "$firewall_listing" "$(global_ipv6_addresses)"
+else
+    echo "NOTE the nftables table could not be listed, so its rules were not checked (the table check below reports why)"
+fi
+"${EQUIPA_PYTHON:-python3}" -m equipa.isolation --verify-probe "$self" "$@"
+status=$?
+if [ "$failures" -gt 0 ]; then
+    echo "RESULT: FAIL ($failures orchestrator-side firewall rule check(s) failed)"
+    [ "$status" -eq 0 ] && status=1
+fi
+exit "$status"
