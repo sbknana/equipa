@@ -773,6 +773,81 @@ def test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal() -> None:
             "run_parallel_tasks"} <= set(gated)
 
 
+_UID_POOL = {"isolation_uid_pool": ["equipa-agent-1", "equipa-agent-2"]}
+
+
+@pytest.mark.parametrize("config,refused", [
+    ({"features": {"agent_isolation": True}, **_UID_POOL}, True),
+    ({"features": {"agent_isolation": True}, "isolation_uid_pool": []}, True),
+    ({"features": {"agent_isolation": True}}, False),
+    ({"features": {"agent_isolation": False}, **_UID_POOL}, False),
+])
+def test_a_uid_pool_is_refused_while_isolation_is_on(
+        host, config, refused) -> None:
+    """The pool is not implemented, so naming one must never read as leave
+    to run isolated agents side by side (review F4)."""
+    refusal = isolation.uid_pool_refusal(config)
+    assert (refusal is not None) is refused
+    if refused:
+        assert "isolation_uid_pool is set" in refusal
+        assert "not implemented" in refusal
+        assert "set max_concurrent to 1" in refusal
+
+
+def test_isolation_settings_and_spawn_refuse_a_uid_pool(
+        host, monkeypatch) -> None:
+    """Every isolated launch loads its settings, so the pool is refused at
+    the spawn as well, whatever max_concurrent says."""
+    config = {"features": {"agent_isolation": True},
+              "agent_isolation": _SECTION, "max_concurrent": 1, **_UID_POOL}
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="isolation_uid_pool is set"):
+        isolation.load_isolation_settings(config)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="isolation_uid_pool is set"):
+        asyncio.run(isolation.spawn_isolated_agent(["claude"], None, {},
+                                                   config))
+
+
+def test_concurrency_refusal_names_the_unimplemented_uid_pool(
+        monkeypatch) -> None:
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: True)
+    refusal = isolation.concurrency_refusal(2)
+    assert refusal is not None and "isolation_uid_pool" in refusal
+
+
+def test_cli_refuses_a_uid_pool_before_any_mode_runs() -> None:
+    """async_main refuses a config naming a UID pool with the same refusal
+    as a config that turns required isolation off (calls, not comments)."""
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "equipa" / "cli.py").read_text(
+        encoding="utf-8"))
+    main = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "async_main")
+    # The refusal assigned to isolation_refusal includes the pool check.
+    assigned = [node for node in ast.walk(main)
+                if isinstance(node, ast.Assign)
+                and [ast.unparse(t) for t in node.targets]
+                == ["isolation_refusal"]
+                and "uid_pool_refusal(args.dispatch_config)"
+                in ast.unparse(node.value)]
+    calls: dict[str, list[ast.Call]] = {}
+    for node in ast.walk(main):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(
+                node.func, "attr", None)
+            calls.setdefault(name, []).append(node)
+    refused = [call for call in calls.get("refuse_dispatch", [])
+               if ast.unparse(call) == "refuse_dispatch(isolation_refusal)"]
+    handler = calls["_select_mode_handler"]
+    assert assigned and refused and handler
+    assert assigned[0].lineno < refused[0].lineno < handler[0].lineno
+
+
 # --- F2: no loopback or LAN access from the agent unit ----------------------------------
 
 

@@ -307,6 +307,8 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
     raw: Any = {}
     if isinstance(dispatch_config, Mapping):
         raw = dispatch_config.get(CONFIG_KEY) or {}
+        if UID_POOL_KEY in dispatch_config:
+            raise AgentIsolationError(_uid_pool_message())
     if not isinstance(raw, Mapping):
         raise AgentIsolationError(f"{CONFIG_KEY} must be a JSON object")
     unknown = sorted(key for key in raw
@@ -1800,7 +1802,41 @@ def concurrency_refusal(max_concurrent: object,
     return (f"{source} {max_concurrent} refused: agent_isolation is on and "
             f"every agent runs as the one agent user, so only one isolated "
             f"agent may run at a time (review F4); set max_concurrent to 1 "
-            f"(per-unit agent UIDs are not implemented)")
+            f"(per-unit agent UIDs, {UID_POOL_KEY}, are not implemented)")
+
+
+# Dispatch-config key of a pool of per-unit agent UIDs, the only thing that
+# could let isolated units run side by side (review F4). The pool is not
+# implemented, so a config that sets the key is refused while isolation is
+# on: it must never read as permission to raise max_concurrent.
+UID_POOL_KEY = "isolation_uid_pool"
+
+
+def uid_pool_refusal(dispatch_config: Mapping[str, Any] | None = None
+                     ) -> str | None:
+    """Why a dispatch config that sets ``isolation_uid_pool`` is refused,
+    or None (also None while isolation is off, where the key means nothing).
+    """
+    if dispatch_config is None:
+        try:
+            dispatch_config = get_active_dispatch_config()
+        except (OSError, ValueError, TypeError, AttributeError):
+            # isolation_enabled() reads the same failure as ON and refuses.
+            return None
+    if not isinstance(dispatch_config, Mapping) \
+            or UID_POOL_KEY not in dispatch_config \
+            or not isolation_enabled(dispatch_config):
+        return None
+    return _uid_pool_message()
+
+
+def _uid_pool_message() -> str:
+    return (f"{UID_POOL_KEY} is set, but per-unit agent UIDs are not "
+            f"implemented: every isolated agent runs as "
+            f"{CONFIG_KEY}.agent_user, one at a time (review F4); remove "
+            f"{UID_POOL_KEY} and set max_concurrent to 1")
+
+
 _UNIT_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "equipa_isolation_unit_role", default=None)
 _TURNSTILE_LOCK_NAME = "equipa-isolation-turnstile.lock"

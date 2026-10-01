@@ -90,6 +90,7 @@ from equipa.security_gate import (
 from equipa.isolation import (
     describe_isolation_state,
     isolation_requirement_refusal,
+    uid_pool_refusal,
 )
 from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
@@ -2292,7 +2293,10 @@ async def async_main() -> None:
     set_active_dispatch_config(args.dispatch_config)
     # Review F1 (task 3142): when the host requires agent isolation, a config
     # that turns it off refuses the run instead of dispatching unisolated.
-    isolation_refusal = isolation_requirement_refusal(args.dispatch_config)
+    # Review F4: a UID pool would let isolated agents run side by side; it
+    # is not implemented, so a config that names one is refused.
+    isolation_refusal = (isolation_requirement_refusal(args.dispatch_config)
+                         or uid_pool_refusal(args.dispatch_config))
     if isolation_refusal:
         refuse_dispatch(isolation_refusal)
     print(describe_isolation_state(args.dispatch_config))
