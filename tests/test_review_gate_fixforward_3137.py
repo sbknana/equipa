@@ -356,6 +356,99 @@ def test_prompt_no_longer_claims_what_the_gate_does_not_count():
     assert "starts with a severity and a separator" in rule
 
 
+# Every place the rule names, in every nested position and spelling it says
+# still counts ("Those line and list-item shapes also count inside nested
+# lists and quotes ..., in a list item's later paragraphs and after a
+# footnote label", "All of these count when written in one-line HTML ...").
+PROMPT_SPELLINGS_OF_HIGH = {
+    "plain": "HIGH",
+    "decimal-reference": "&#72;IGH",
+    "hex-reference": "&#x48;IGH",
+    "named-reference": "&Eta;IGH",
+    "combining-mark": "H\N{COMBINING LOW LINE}IGH",
+    "comment-split": "HI<!-- x -->GH",
+    "greek": "\N{GREEK CAPITAL LETTER ETA}\N{GREEK CAPITAL LETTER IOTA}GH",
+    "cyrillic": "\N{CYRILLIC CAPITAL LETTER EN}"
+                "\N{CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I}GH",
+    "cherokee": "\N{CHEROKEE LETTER MI}IGH",
+    "lisu": "\N{LISU LETTER XA}\N{LISU LETTER I}\N{LISU LETTER GA}H",
+    "small-capitals": "\N{LATIN LETTER SMALL CAPITAL H}"
+                      "\N{LATIN LETTER SMALL CAPITAL I}"
+                      "\N{LATIN LETTER SMALL CAPITAL G}"
+                      "\N{LATIN LETTER SMALL CAPITAL H}",
+}
+PROMPT_LINE_SHAPES = [
+    "SQL injection in login, severity {S}, auth.py",
+    "Open redirect, severity {S} in auth.py", "The severity is {S}.",
+    "SQL injection, rated {S}.", "Risk: {S}", "Sev: {S}", "Impact: {S}",
+    "Priority: {S}", "Rating: {S}", "SQL injection in login. Risk: {S}.",
+    "{S}: SQL injection", "S1: {S}", "[{S}] SQL injection",
+    "[S1] {S} SQL injection", "{S} SQL injection in login handler",
+]
+PROMPT_LIST_ITEM_SHAPES = [
+    "- {S}: SQL injection", "- Risk: {S}", "- SQL injection - {S}",
+    "- SQL injection: {S}", "- SQL injection, {S}", "- SQL injection ({S})",
+    "- SQL injection [{S}]",
+]
+PROMPT_OTHER_SHAPES = [
+    ["#### {S} SQL injection"], ["#### {S}-severity SQL injection"],
+    ["{S} SQL injection", "==="], ["{S} SQL injection", "---"],
+    ["<h4>{S} SQL injection</h4>"], ["**{S}** SQL injection"],
+    ["| ID | Severity |", "|---|---|", "| S1 | {S} |"],
+    ["| ID | Severity |", "|---|---|", "| S1 | {S}/MEDIUM |"],
+    ["| ID | Finding |", "|---|---|", "| S1 | {S}: SQLi |"],
+    ["| ID | Finding |", "|---|---|", "| S1 | Severity: {S} |"],
+    ["| ID | Finding |", "|---|---|", "| S1 | Risk: {S} |"],
+    ["<table><tr><td>S1</td><td>{S}</td></tr></table>"],
+    ["<details><summary>{S}: SQL injection</summary></details>"],
+    ["<b>{S}</b> SQL injection"],
+]
+
+
+def _prompt_positions(line: str, is_list_item: bool) -> list[list[str]]:
+    item = line[2:] if is_list_item else line
+    return [
+        [line],
+        ["- " + line] if is_list_item else ["- 1. " + item],
+        ["> > > > > " + line],
+        ["- Finding 1", "", "    " + line],
+        ["[^1]: " + line],
+        ["<ul><li>" + item + "</li></ul>"],
+        ["<ol><li>1. " + item + "</li></ol>"],
+        ["Finding 1<br>" + line],
+    ]
+
+
+def _counts_as_high(body: list[str]) -> bool:
+    analysis = analyze(review("No findings.", ["## Findings", ""] + body, ZERO,
+                              low_heading=False))
+    return analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+
+
+@pytest.mark.parametrize("spelling", sorted(PROMPT_SPELLINGS_OF_HIGH))
+def test_every_place_the_prompt_names_counts_in_every_spelling_it_names(
+        spelling):
+    word = PROMPT_SPELLINGS_OF_HIGH[spelling]
+    bodies = [[line.replace("{S}", word) for line in shape]
+              for shape in PROMPT_OTHER_SHAPES]
+    for shapes, is_list_item in ((PROMPT_LINE_SHAPES, False),
+                                 (PROMPT_LIST_ITEM_SHAPES, True)):
+        for shape in shapes:
+            bodies += _prompt_positions(shape.replace("{S}", word), is_list_item)
+    missed = [body for body in bodies if not _counts_as_high(body)]
+    assert not missed, missed
+
+
+@pytest.mark.parametrize("body", [
+    ["#### High-severity SQL injection"],
+    ["<h3>High-severity SQL injection</h3>"],
+    ["| ID | Note |", "|---|---|", "| S1 | High risk |"],
+    ["| ID | Note |", "|---|---|", "| S1 | Critical impact |"],
+])
+def test_title_case_places_the_prompt_names_count(body):
+    assert _counts_as_high(body), body
+
+
 # --- N3: line-break floods --------------------------------------------------------
 
 REVIEW_BYTES = 200 * 1024
