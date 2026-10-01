@@ -1542,6 +1542,9 @@ def test_spawn_refuses_a_scope_whose_limits_are_wrong(
                             bundle_path=None, export_path=None))
     monkeypatch.setattr(isolation, "read_proc_cgroup",
                         lambda pid: f"/app.slice/{UNIT}.scope")
+    # A registry of this test's own: should the spawn wrongly succeed, the
+    # atexit cleanup must not wait on the fake scope and stall the run.
+    monkeypatch.setattr(isolation, "_LIVE_ISOLATED_AGENTS", set())
     cgroup = _scope(tmp_path, monkeypatch, **{"pids.max": "max"})
     assert cgroup == f"/app.slice/{UNIT}.scope"
     process = _ReadyProcess()
