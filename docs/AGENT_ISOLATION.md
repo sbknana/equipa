@@ -1012,6 +1012,7 @@ ExecReload=/usr/sbin/nft -f /etc/nftables.d/equipa-agent.nft
 [Install]
 WantedBy=multi-user.target
 EOF
+nft -c -f /etc/nftables.d/equipa-agent.nft   # syntax check only, loads nothing
 systemctl daemon-reload
 systemctl enable --now equipa-agent-firewall.service
 nft list table inet equipa_agent           # the rule, once
