@@ -159,7 +159,10 @@ def test_the_reason_names_every_line():
                                            if severity in line
                                            and "|" not in line)) + 1
                 for severity in ("HIGH", "MEDIUM", "CRITICAL")}
-    assert analysis.detail.startswith("unaccounted severity token: ")
+    # Task 3152: the reason leads with the CRITICAL/HIGH lines.
+    assert analysis.detail.startswith(
+        f"unaccounted CRITICAL/HIGH token at line {expected['HIGH']}, "
+        f"{expected['CRITICAL']}: "), analysis.detail
     for severity, line in expected.items():
         assert f"{severity}=1 at line {line} " in analysis.detail, (
             severity, analysis.detail)
@@ -172,7 +175,8 @@ def test_the_reason_is_logged_by_the_gate(monkeypatch, tmp_path):
     path = tmp_path / "SECURITY-REVIEW-1.md"
     text = zero_review(["The HIGH one."])
     assert loops._count_findings_in_review_file(path, text=text) is None
-    assert any("unaccounted severity token: HIGH=1 at line" in message
+    assert any("unaccounted CRITICAL/HIGH token at line" in message
+               and "HIGH=1 at line" in message
                for message in logged), logged
 
 
@@ -275,18 +279,32 @@ def test_footer_covering_heading_less_findings_merges():
 
 
 @pytest.mark.parametrize("body", [
+    ["Rated LOW, not MEDIUM, as it needs a local account."],
+    ["Kept at LOW rather than MEDIUM."],
+])
+def test_tallies_and_negations_merge(body):
+    """MEDIUM keeps its tally and negation exemptions (it never blocks)."""
+    assert_merges(body)
+
+
+@pytest.mark.parametrize("body", [
     ["Totals: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 1 LOW / 0 INFO."],
     ["semgrep: CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 across the diff."],
     ["| Severity | Count |", "|---|---|", "| HIGH | 0 |", "| CRITICAL | 0 |"],
     ["**No CRITICAL or HIGH findings.**"],
     ["There are no CRITICAL, HIGH or MEDIUM issues."],
     ["None is CRITICAL or HIGH."],
-    ["Rated LOW, not MEDIUM, as it needs a local account."],
-    ["Kept at LOW rather than MEDIUM."],
     ["0 CRITICAL/HIGH results from semgrep."],
 ])
-def test_tallies_and_negations_merge(body):
-    assert_merges(body)
+def test_critical_high_tallies_and_negations_block(body):
+    """Task 3152: these merged under the 3143 exemptions. CRITICAL and HIGH
+    now have none, so each blocks; the lower-case prose merges."""
+    analysis = analyze(review("1 finding.", ["## Notes", ""] + body, ONE_LOW,
+                              heading=f"### [E1] LOW {E} verbose error"))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert_merges([line.replace("CRITICAL", "critical").replace("HIGH", "high")
+                   for line in body])
 
 
 @pytest.mark.parametrize("body", [
