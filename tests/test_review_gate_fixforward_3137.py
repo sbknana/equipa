@@ -244,10 +244,19 @@ def test_parsing_once_gives_the_verdict_of_both_views():
     ["See the note.[^1]", "", "[^1]: HIGH: SQL injection"],
     ["[^note]: - SQL injection in login - HIGH"],
     ["[^rce]: CRITICAL - RCE in upload"],
+    # A footnote's later paragraph (GFM: indented 4), and a footnote inside a
+    # quote or list item.
+    ["[^1]: Finding 1", "", "    HIGH: SQL injection"],
+    ["> [^1]: HIGH: SQL injection"],
+    ["> > [^note]: - SQL injection in login - HIGH"],
     # (g) combining marks, typed, as a reference, and precomposed.
     ["H̲IGH: SQL injection"],
     ["H&#818;IGH: SQL injection"],
     ["H\N{LATIN CAPITAL LETTER I WITH ACUTE}GH: SQL injection"],
+    # An enclosing mark (category Me) draws around the letter, typed and as
+    # a reference.
+    ["H\N{COMBINING ENCLOSING CIRCLE}IGH: SQL injection"],
+    ["H&#8413;IGH: SQL injection"],
     # Same family: an escaped backtick, a table cell, an HTML block.
     ["SQL injection in login \\` severity: HIGH `x`"],
     ["| ID | Severity | Note |", "|---|---|---|", "| S1 | `x | HIGH | y` |"],
@@ -282,6 +291,10 @@ def test_markdown_the_renderer_shows_as_text_fails_closed(body):
     ["- - Coverage of the parser is high."],
     ["> > > > > The fix is sound."],
     ["See the advisory.[^1]", "", "[^1]: Upstream advisory, fixed in 2.1."],
+    ["[^1]: Upstream advisory.", "", "    Fixed in 2.1, see the changelog."],
+    # Indented 8 under a footnote is indented code inside it.
+    ["[^1]: Example output:", "", "        HIGH: example finding"],
+    ["> [^1]: Upstream advisory, fixed in 2.1."],
     ["Café menu parsing is unchanged."],
     ["A `<!--` quoted in code opens nothing.", "Plain prose.",
      "A `-->` quoted in code closes nothing."],

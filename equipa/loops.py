@@ -1994,6 +1994,9 @@ def _fold_blank_line_runs(text: str) -> str:
     return _BLANK_LINE_RUN_RE.sub(
         lambda run: "\n" + " " * (len(run.group(0)) - 2) + "\n", text,
     )
+# Unicode categories of the combining marks a renderer draws on or around the
+# letter before them (nonspacing and enclosing): the rendered view drops them.
+_COMBINING_MARK_CATEGORIES = ("Mn", "Me")
 # CommonMark character references: the semicolon is required.
 _CHARACTER_REFERENCE_RE = re.compile(
     r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});",
@@ -2169,7 +2172,9 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
     innermost one (_innermost_container_line). A line inside a list item is
     re-indented relative to the item's content column, so a paragraph that
     continues the item after a blank line is text, not indented code. A
-    footnote definition loses its label. Backticks in indented code, in an
+    footnote definition loses its label, also inside a quote or list item,
+    and its later paragraphs (indented 4) are read the same way as a list
+    item's. Backticks in indented code, in an
     HTML block and on the line an HTML comment block closes on are text.
     Closed fences, the lines that open blocks and table rows are recorded for
     :func:`_render_code_and_comments`. A fence that never closes (or whose
@@ -2278,6 +2283,9 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             footnote = _FOOTNOTE_DEFINITION_RE.match(content)
             if footnote is not None:
                 content = content[footnote.end():]
+                # GFM: a footnote's later paragraphs are indented 4 columns,
+                # like a list item's ("[^1]: x" / "" / "    HIGH: SQLi").
+                item_columns.append(base + 4)
         position = markers = 0
         quoted = False
         while (marker := _CONTAINER_MARKER_RE.match(content, position)) is not None:
@@ -2288,6 +2296,14 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
             elif not quoted and footnote is None:
                 item_columns.append(base + relative + position)
         rest = content[position:]
+        if footnote is None and rest.startswith("[^"):
+            # A footnote inside a quote or list item ("> [^1]: HIGH: SQLi")
+            # renders its text as well.
+            inner_footnote = _FOOTNOTE_DEFINITION_RE.match(rest)
+            if inner_footnote is not None:
+                rest = rest[inner_footnote.end():]
+                content = content[:position] + rest
+                lines[index] = line[:len(line) - len(stripped)] + content
         opener = (_FENCE_OPENER_RE.match(rest)
                   if not quoted and rest[:1] in ("`", "~") else None)
         if opener is not None:
@@ -2308,7 +2324,7 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                 _innermost_container_line(content) if markers > 1 else content
             )
         elif markers > 1:
-            lines[index] = _innermost_container_line(line)
+            lines[index] = _innermost_container_line(lines[index])
     if fence:
         lines[fence_start] = _neutralize_fence(lines[fence_start])
     return blocks
@@ -2484,7 +2500,8 @@ def _decode_character_reference(match: re.Match[str]) -> str:
         return ""
     # Task 3137 (N2): a combining mark ("H&#818;IGH") draws on the letter
     # before it, so it joins the word like an invisible character.
-    if all(unicodedata.category(char) == "Mn" for char in decoded):
+    if all(unicodedata.category(char) in _COMBINING_MARK_CATEGORIES
+           for char in decoded):
         return ""
     if all(char.isalnum() or char in _SAFE_REFERENCE_PUNCTUATION
            for char in decoded):
@@ -2495,17 +2512,18 @@ def _decode_character_reference(match: re.Match[str]) -> str:
     return _UNSAFE_REFERENCE_CHAR
 
 
-# Task 3137 (N2): "H̲IGH" (H with a combining low line) and "HÍGH" render
-# as HIGH with a mark on a letter. Marks (Unicode category Mn) are dropped
-# after canonical decomposition, so the letters under them are read. Only
-# non-ASCII runs are touched.
+# Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
+# (an enclosing circle) render as HIGH with a mark on or around a letter.
+# Marks (Unicode categories Mn and Me) are dropped after canonical
+# decomposition, so the letters under them are read. Only non-ASCII runs are
+# touched.
 _NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f]+")
 
 
 def _without_combining_marks(run: re.Match[str]) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFD", run.group(0))
-        if unicodedata.category(char) != "Mn"
+        if unicodedata.category(char) not in _COMBINING_MARK_CATEGORIES
     )
 
 
