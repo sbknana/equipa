@@ -195,23 +195,29 @@ checkout for the same reason.
 ### Project-scope Claude configuration is ignored
 
 Every Claude CLI run EQUIPA starts (agents, reviewers, reflexion, the RLM
-`claude -p` calls, forgesmith) passes `--setting-sources user` and
+`claude -p` calls, forgesmith) passes `--setting-sources ""` (the empty
+value as its own argument: no settings file at all) and
 `--strict-mcp-config` (`equipa/cli_isolation.py`, IR-01). The CLI runs in the
 agent-writable project directory, and by default it loads project-scope
 configuration from there: one `{"disableAllHooks": true}` in
 `.claude/settings.json` switched off the PreToolUse Bash gate for every later
 run in that project, an `env` block reached the agent's tools, `CLAUDE.md` was
 read as standing instructions for later tester and reviewer runs, and
-`.mcp.json` could add servers. With the two flags the CLI reads user settings,
-the `--settings` file EQUIPA passes and only the servers in EQUIPA's own
+`.mcp.json` could add servers. With the two flags the CLI reads no user,
+project or local settings file, only the `--settings` file EQUIPA passes (a
+flag source, which `--setting-sources ""` does not switch off, so the
+PreToolUse gate still applies) and only the servers in EQUIPA's own
 `--mcp-config`. A project `CLAUDE.md` is therefore no longer seen by agents;
-put anything agents must know into the task or role prompt.
+put anything agents must know into the task or role prompt. A claude argv that
+asks for any settings source (`user`, `project`, `local`) or gives the flag no
+value is refused, not rewritten.
 
 ### User-scope Claude configuration is not loaded either
 
-`--setting-sources user` still loads the USER scope, and without agent
-isolation that was the operator's `~/.claude`, which agents running as the
-orchestrator's user can write. The independent review (RR3144-A) showed four
+Until task 3153 the CLI was started with `--setting-sources user`, which
+loads the USER scope. Without agent isolation that was the operator's
+`~/.claude`, which agents running as the orchestrator's user can write. The
+independent review (RR3144-A) showed four
 ways that switched the Bash gate off with the real CLI: a user-scope
 `env.SHELL` naming a planted shell, a user-scope `env.BASH_FUNC_ls%%`, a user
 PreToolUse hook answering `updatedInput` (the CLI runs the rewritten command,
@@ -233,7 +239,19 @@ appears in a function that uses none of these:
   authenticates from `CLAUDE_CODE_OAUTH_TOKEN` in its environment, which
   needs nothing in the directory;
 - removed when the run ends (`_terminate_agent`, every exit path; a
-  finalizer covers a process object that is never terminated).
+  finalizer covers a process object that is never terminated). A process
+  that is SIGKILLed or OOM-killed runs none of these, so the first per-run
+  directory any EQUIPA process creates also removes the `equipa-claude-config-*`
+  directories in the same temp directory that are owned by its user, are real
+  directories (never symlinks) and have not changed for 24 hours
+  (`sweep_stale_run_config_dirs`, R3150-08).
+
+The directory is still writable by the run itself: the CLI writes its state
+there, and an agent running as the same user can write there too. The CLI
+re-reads a `settings.json` in its config directory while it runs, so a hook
+written there mid-run used to run outside the gate (R3150-01). With
+`--setting-sources ""` the CLI reads no settings file from the directory at
+any time.
 
 The CLI environment also pins `CLAUDE_CODE_SHELL` to an absolute,
 root-owned bash (`/bin/bash`, verified at run time), which the CLI prefers
@@ -253,7 +271,8 @@ accepts the credentials file as a login and does not yet say this.
 
 With `bash_security_pretooluse` on, the `--settings` file EQUIPA generates
 is the second layer. It pins `"disableAllHooks": false` (flag-scope
-settings outrank user scope; RR-03), pins `CLAUDE_CODE_SHELL` to the same
+settings outrank every file scope, should one ever be loaded again; RR-03),
+pins `CLAUDE_CODE_SHELL` to the same
 absolute bash, and sets to empty the variables an `env` block could use to
 turn hooks off (`CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`) or to run code
 around every command (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `LD_PRELOAD`,
@@ -264,12 +283,16 @@ no `--settings` file is passed; the per-run config directory and the CLI
 environment above still apply.
 
 **Live check:** `scripts/verify_gate_config_isolation.sh` (run by the
-operator with `CLAUDE_CODE_OAUTH_TOKEN` exported; four short CLI runs) plants
+operator with `CLAUDE_CODE_OAUTH_TOKEN` exported; five short CLI runs) plants
 each of the review's four vectors in a throwaway HOME and runs the real CLI
 through EQUIPA's own `build_cli_command` and `_spawn_agent_process` with the
-gate on. It reports PASS, FAIL or INCONCLUSIVE per probe. The three
-user-scope probes must PASS; the `~/.bashrc` probe is expected to FAIL until
-agent isolation (see the limitations below).
+gate on. A fifth probe (W) has the agent's first tool call write a
+`settings.json` with a PreToolUse hook into the run's own config directory
+after the CLI has started, and then checks that a later command the gate
+blocks is still blocked and the planted hook never ran. It reports PASS, FAIL
+or INCONCLUSIVE per probe. The three user-scope probes and W must PASS; the
+`~/.bashrc` probe is expected to FAIL until agent isolation (see the
+limitations below). No probe covers the shell snapshot (next section).
 
 ### Bash gate limitations without agent isolation
 
@@ -292,12 +315,19 @@ boundary, for these reasons:
   run. `-I` on the hook's interpreter does not address this. The deploy must
   make the runtime tree read-only to the agent user, which agent isolation
   provides; until then, treat both files as part of the deploy checklist.
-- **The run's own config directory is writable by the run.** The CLI needs
-  to write to it, and the agent shares its user, so an agent can add a
-  `settings.json` there while it runs. That directory is never read by a
-  later run (each run gets a new one and it is removed afterwards), so the
-  effect is limited to the run itself. Concurrent runs share the user too;
-  isolation closes both.
+- **The run's own config directory is writable by the run, with or without
+  isolation.** The CLI needs to write to it, and the agent shares its user;
+  under agent isolation the unit's directory (`<unit home>/.claude`) is
+  created by and owned by the agent user. A `settings.json` written there is
+  ignored (`--setting-sources ""`; the isolated launcher refuses a claude
+  argv without it). Other files the CLI both writes there and later reads are
+  not protected: a function appended to the shell snapshot in
+  `shell-snapshots/` mid-run replaces a command the gate allowed (R3150-07),
+  in an isolated unit as well. For an unattended agent the rest of its own
+  run is the whole window the gate exists for, so the gate stays a guard rail
+  even under isolation while the CLI's config directory is writable by the
+  agent's user. Without isolation, concurrent runs also share the user, so
+  one agent can write into another run's live directory.
 
 ## Agent isolation: what is and is not covered
 
@@ -320,8 +350,8 @@ in depth for that shared UID:
 
 None of this stops a same-UID process from reading files the orchestrator's
 user can read (`~/.pgpass`, `~/.config/gh`, `~/.claude`, `.env`), or from
-writing `~/.claude/settings.json`, which every EQUIPA CLI run still loads as
-its user scope (so it too could switch hooks off). Nor does it
+writing into another run's live per-run config directory (its shell snapshot
+replaces commands the gate allowed). Nor does it
 cover short-lived orchestrator helpers that exec with the full environment
 (git, docker): after exec they are dumpable again, so their
 `/proc/<pid>/environ` is readable while they run. **The
