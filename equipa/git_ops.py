@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -856,12 +856,24 @@ class PinnedGitRepository:
     ``git_dir`` and ``common_dir`` are what git is given: descriptor paths
     under ``/proc/self/fd`` for the open ``fds``, or plain realpaths on a
     system without that directory (not rename-proof there).
+
+    ``path`` is the directory as the merge path names it, the key a git
+    call's ``cwd`` must equal (absolute, symlinks NOT resolved; defaults to
+    ``work_tree``). ``work_tree_id`` is that directory's (device, inode)
+    when it was pinned; :func:`git_repositories_pinned` records it when the
+    pin does not.
     """
 
     work_tree: str
     git_dir: str
     common_dir: str
     fds: tuple[int, ...] = ()
+    path: str = ""
+    work_tree_id: tuple[int, int] | None = None
+
+    @property
+    def key(self) -> str:
+        return _pin_key(self.path or self.work_tree)
 
     def argv(self) -> list[str]:
         return [f"--git-dir={self.git_dir}", f"--work-tree={self.work_tree}"]
@@ -943,29 +955,75 @@ def pinned_repository(
 ) -> PinnedGitRepository:
     """A :class:`PinnedGitRepository` for open directory descriptors.
 
-    ``git_dir`` / ``common_dir`` are the realpaths, used only where
-    ``/proc/self/fd`` does not exist.
+    ``work_tree`` is the directory as the merge path names it: the pin is
+    keyed by that path and records its (device, inode) now. ``git_dir`` /
+    ``common_dir`` are the realpaths, used only where ``/proc/self/fd``
+    does not exist.
     """
+    path = _pin_key(work_tree)
+    work_tree_id = _work_tree_id(path)
     if fd_pinning_available():
         return PinnedGitRepository(
             os.path.realpath(work_tree),
             f"{_FD_DIRECTORY}/{git_dir_fd}",
             f"{_FD_DIRECTORY}/{common_dir_fd}",
             tuple(sorted({git_dir_fd, common_dir_fd})),
+            path=path,
+            work_tree_id=work_tree_id,
         )
-    return PinnedGitRepository(os.path.realpath(work_tree), git_dir, common_dir)
+    return PinnedGitRepository(
+        os.path.realpath(work_tree), git_dir, common_dir,
+        path=path, work_tree_id=work_tree_id,
+    )
+
+
+# R3151-01 / F2 (task #3155): the pin used to be looked up by the realpath of
+# a git call's ``cwd``, and a ``cwd`` that matched no pin ran unpinned. An
+# agent that renamed the main checkout (or the task worktree) away and put a
+# symlink to its own clone at that path therefore sent every later merge-path
+# call through a fresh discovery into the clone, whose config and filter
+# drivers then ran inside the orchestrator. Now the pin is found by the path
+# exactly as the caller passes it, the directory there must still be the one
+# pinned (device and inode, so a real directory moved into place is refused
+# too), and inside a pinned block a ``cwd`` that names no pin is refused
+# instead of discovered. Each refusal is a PinnedRepositoryError, which the
+# merge path turns into a tripped guard.
+
+
+def _pin_key(path: str | os.PathLike) -> str:
+    """The lookup key of a work tree: absolute, symlinks NOT resolved."""
+    return os.path.abspath(os.fspath(path))
+
+
+def _work_tree_id(path: str) -> tuple[int, int]:
+    """(device, inode) of the directory at ``path``, following symlinks the
+    way git's ``chdir`` into it would. Raises :class:`PinnedRepositoryError`."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the pinned work tree {path}: {exc.strerror}"
+        ) from exc
+    return info.st_dev, info.st_ino
 
 
 @contextlib.contextmanager
 def git_repositories_pinned(*repositories: PinnedGitRepository) -> Iterator[None]:
-    """Inside the block, every :func:`git_run` / :func:`git_run_async` whose
-    ``cwd`` is one of the pinned work trees (exactly, by realpath) runs on
-    that pinned repository instead of discovering one. Context-local, so a
-    concurrent merge in another task is unaffected. The caller keeps the
-    descriptors open for the whole block and closes them afterwards.
+    """Inside the block, every :func:`git_run` / :func:`git_run_async` runs
+    on a pinned repository: its ``cwd`` must be exactly the path of a pinned
+    work tree (as the caller names it, not its realpath) and still be that
+    directory, or :class:`PinnedRepositoryError` is raised; git never
+    discovers a repository here. Context-local, so a concurrent merge in
+    another task is unaffected. The caller keeps the descriptors open for
+    the whole block and closes them afterwards.
     """
     pins = dict(_pinned_repositories.get())
-    pins.update({repository.work_tree: repository for repository in repositories})
+    for repository in repositories:
+        if repository.work_tree_id is None:
+            repository = dataclass_replace(
+                repository, work_tree_id=_work_tree_id(repository.key),
+            )
+        pins[repository.key] = repository
     token = _pinned_repositories.set(MappingProxyType(pins))
     try:
         yield
@@ -974,10 +1032,27 @@ def git_repositories_pinned(*repositories: PinnedGitRepository) -> Iterator[None
 
 
 def _pinned_repository_for(cwd: str | Path) -> PinnedGitRepository | None:
+    """The pin a git call in ``cwd`` must use; None outside a pinned block.
+
+    Raises :class:`PinnedRepositoryError` inside one when ``cwd`` names no
+    pinned work tree, or names one whose directory has been swapped.
+    """
     pins = _pinned_repositories.get()
     if not pins:
         return None
-    return pins.get(os.path.realpath(cwd))
+    key = _pin_key(cwd)
+    pin = pins.get(key)
+    if pin is None:
+        raise PinnedRepositoryError(
+            f"git would run in {key}, which is not a work tree pinned for "
+            f"this merge; a pinned merge never discovers a repository"
+        )
+    if _work_tree_id(key) != pin.work_tree_id:
+        raise PinnedRepositoryError(
+            f"{key} is no longer the work tree pinned for this merge "
+            f"(device/inode {pin.work_tree_id}); it was swapped after the pin"
+        )
+    return pin
 
 
 # IR-04 (task #3132): agents share the orchestrator's UID, so any agent shell
