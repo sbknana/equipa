@@ -1590,6 +1590,52 @@ class AgentWorktreeGit:
             _hardened_git_argv(command, env), cwd, env, timeout, pass_fds=pass_fds,
         )
 
+    async def run_in_repository(
+        self, args: list[str], *, timeout: int,
+    ) -> subprocess.CompletedProcess:
+        """``git <args>`` on the main repository's git dir (refs, objects;
+        no work tree, so nothing that reads or writes file content)."""
+        return await _run_in_main_repository(self.common_dir, args, timeout)
+
+    async def current_head(self) -> tuple[str, str | None]:
+        """``(commit, branch)`` the worktree's own git dir names now."""
+        return await _worktree_head(self.common_dir, self.git_dir)
+
+    async def publish_reset(self, branch: str, new: str, old: str) -> None:
+        """After ``reset --hard`` here: move ``refs/heads/<branch>`` from
+        ``old`` to ``new`` in the repository (with a reflog entry; refused
+        if the branch moved meanwhile) and install the private index as
+        the worktree's index, timestamps kept."""
+        moved = await self.run_in_repository(
+            ["update-ref", "--create-reflog", "-m", f"reset: moving to {new}",
+             f"refs/heads/{branch}", new, old],
+            timeout=15,
+        )
+        if moved.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"could not move {branch} to {new[:12]} "
+                f"(rc={moved.returncode}: {(moved.stderr or '').strip()[:200]})"
+            )
+        # A fresh name created here (never through a planted symlink), then
+        # renamed over the index in one step.
+        staged = os.path.join(self.git_dir, f"index.equipa-{os.getpid()}-{time.monotonic_ns()}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(staged, flags, 0o644)
+            with os.fdopen(fd, "wb") as writer, open(
+                os.path.join(self.private_dir, "index"), "rb",
+            ) as reader:
+                shutil.copyfileobj(reader, writer)
+                info = os.fstat(reader.fileno())
+            os.utime(staged, ns=(info.st_atime_ns, info.st_mtime_ns))
+            os.replace(staged, os.path.join(self.git_dir, "index"))
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(staged)
+            raise AgentWorktreeGitError(
+                f"could not install the reset index in {self.git_dir}: {exc}"
+            ) from exc
+
     async def store_stash(self) -> str:
         """Copy the private ``refs/stash`` to the repository's, with the
         stash's own message; returns the stash commit."""

@@ -83,6 +83,7 @@ from equipa.git_ops import (
     open_work_tree,
     pinned_repository,
     pinned_repository_by_path,
+    read_regular_file_bounded,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -445,6 +446,65 @@ async def _is_linked_worktree(cwd: str) -> bool:
     return Path(lines[0]).resolve() != Path(lines[1]).resolve()
 
 
+_WORKTREE_BASE_DIRNAME = ".forge-worktrees"
+_GITFILE_LIMIT = 4096
+
+
+def _in_task_worktree_location(path: str) -> bool:
+    """True when ``path`` lies in ``<project>/.forge-worktrees/<name>``."""
+    return _WORKTREE_BASE_DIRNAME in Path(os.path.realpath(path)).parts[:-1]
+
+
+def _common_dir_named_by_gitfile(root: Path) -> Path | None:
+    """The common dir that ``root/.git`` (a ``gitdir:`` file) and the
+    ``commondir`` file of the git dir it names point at, read as data."""
+    try:
+        gitfile = read_regular_file_bounded(root / ".git", _GITFILE_LIMIT)
+        text = gitfile.decode("utf-8", "replace").strip()
+        if not text.startswith("gitdir:"):
+            return None
+        git_dir = Path(os.path.normpath(root / text[len("gitdir:"):].strip()))
+        named = read_regular_file_bounded(git_dir / "commondir", _GITFILE_LIMIT)
+    except OSError:
+        return None
+    return Path(os.path.realpath(git_dir / named.decode("utf-8", "replace").strip()))
+
+
+async def _task_worktree_location(agent_dir: str) -> tuple[str, str] | None:
+    """``(work-tree root, git common dir)`` of the task worktree holding
+    ``agent_dir``; None unless that repository registers the worktree.
+
+    R3155-01 (task #3158): found without running git through the worktree's
+    ``.git``. The root is the ``.forge-worktrees/<name>`` directory on the
+    path, else the nearest directory with a ``.git`` entry. The repository
+    is the project the orchestrator registered the worktree for (or the one
+    holding ``.forge-worktrees``); for any other layout the ``.git`` file is
+    read as data. Whichever it is, git on the worktree then reads neither its
+    config nor its attributes (:func:`equipa.git_ops.agent_worktree_git`).
+    """
+    from equipa.role_resolver import stable_project_root
+
+    resolved = Path(os.path.realpath(agent_dir))
+    parts = resolved.parts
+    if _WORKTREE_BASE_DIRNAME in parts[:-1]:
+        root: Path | None = Path(*parts[:parts.index(_WORKTREE_BASE_DIRNAME) + 2])
+    else:
+        root = next(
+            (p for p in (resolved, *resolved.parents) if os.path.lexists(p / ".git")),
+            None,
+        )
+    if root is None:
+        return None
+    project_root = stable_project_root(root)
+    if project_root != root:
+        common_dir = await _git_common_dir(project_root)
+    else:
+        common_dir = _common_dir_named_by_gitfile(root)
+    if common_dir is None or find_worktree_git_dir(str(common_dir), str(root)) is None:
+        return None
+    return str(root), str(common_dir)
+
+
 async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
     """Paths of every worktree (main checkout included) on ``branch_name``."""
     listing = await _git_checked(
@@ -461,24 +521,67 @@ async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
     return holders
 
 
+def _checked_output(
+    result: subprocess.CompletedProcess, action: str, cwd: str,
+) -> str:
+    """Stripped stdout of ``result``; :class:`AttemptCleanupError` unless it
+    succeeded (the message shape of :func:`_git_checked`)."""
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise AttemptCleanupError(
+            f"{action} in {cwd} failed (rc={result.returncode}): {detail}"
+        )
+    return (result.stdout or "").strip()
+
+
 async def _reset_task_worktree(
     worktree_dir: str,
     branch_name: str,
     base_sha: str | None,
     emit: Callable[[str], None],
+    *,
+    common_dir: str,
 ) -> None:
     """Discard a failed attempt inside its own worktree, staying on its branch.
 
     The worktree never leaves ``branch_name``: checking out the default
     branch here would let the next attempt commit straight onto it, and the
     branch cannot be deleted while this worktree holds it (dispatch-02).
+
+    R3155-01 (task #3158): ``reset --hard`` and ``clean`` write and read file
+    content, so they run on a private git dir
+    (:func:`equipa.git_ops.agent_worktree_git`) where no agent-planted driver
+    is defined; the branch of ``common_dir``'s repository is then moved and
+    the resulting index installed for the worktree.
     """
-    current = await _current_branch(worktree_dir)
-    if current != branch_name:
+    try:
+        async with agent_worktree_git(common_dir, worktree_dir) as worktree_git:
+            await _reset_in_private_git_dir(
+                worktree_git, worktree_dir, branch_name, base_sha, emit,
+            )
+    except AgentWorktreeGitError as exc:
         raise AttemptCleanupError(
-            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"cannot reset {branch_name} in {worktree_dir}: {exc}"
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"reset {branch_name} in {worktree_dir}: {exc}") from exc
+
+
+async def _reset_in_private_git_dir(
+    worktree_git: AgentWorktreeGit,
+    worktree_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """The steps of :func:`_reset_task_worktree` on ``worktree_git``."""
+    if worktree_git.branch != branch_name:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on "
+            f"{worktree_git.branch or 'a detached HEAD'!r}, "
             f"not {branch_name!r}; refusing to reset it"
         )
+    failed_head = worktree_git.head
     if not base_sha:
         # No recorded base: fall back to the fork point from the operator's
         # default branch, never the checked-out HEAD or origin/HEAD.
@@ -486,28 +589,22 @@ async def _reset_task_worktree(
             default_branch = get_trusted_default_branch(worktree_dir)
         except UntrustedDefaultBranchError as exc:
             raise AttemptCleanupError(str(exc)) from exc
-        base_sha = await _git_checked(
-            ["merge-base", "HEAD", f"refs/heads/{default_branch}"],
-            worktree_dir, timeout=10,
-            action=f"find the fork point of {branch_name} from {default_branch}",
+        base_sha = _checked_output(
+            await worktree_git.run_in_repository(
+                ["merge-base", failed_head, f"refs/heads/{default_branch}"], timeout=10,
+            ),
+            f"find the fork point of {branch_name} from {default_branch}", worktree_dir,
         )
-    failed_head = await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action="read the failed attempt's HEAD",
+    _checked_output(
+        await worktree_git.run(["reset", "--hard", base_sha], timeout=60),
+        f"reset {branch_name} to {base_sha[:12]}", worktree_dir,
     )
-    await _git_checked(
-        ["reset", "--hard", base_sha], worktree_dir, timeout=60,
-        action=f"reset {branch_name} to {base_sha[:12]}",
+    _checked_output(
+        await worktree_git.run(["clean", "-fd"], timeout=60),
+        f"clean untracked files from {branch_name}", worktree_dir,
     )
-    await _git_checked(
-        ["clean", "-fd"], worktree_dir, timeout=60,
-        action=f"clean untracked files from {branch_name}",
-    )
-    after_branch = await _current_branch(worktree_dir)
-    after_head = await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action="read HEAD after the reset",
-    )
+    await worktree_git.publish_reset(branch_name, base_sha, failed_head)
+    after_head, after_branch = await worktree_git.current_head()
     if after_branch != branch_name or after_head != base_sha:
         raise AttemptCleanupError(
             f"worktree {worktree_dir} ended on {after_branch!r}@{after_head[:12]} "
@@ -622,17 +719,21 @@ async def cleanup_failed_attempt(
     except GitRepositoryUnreadableError as exc:
         raise AttemptCleanupError(str(exc)) from exc
     if is_git:
-        if await _is_linked_worktree(project_dir):
+        # R3155-01 (task #3158): a path in a task worktree location is reset
+        # as one, whatever its (agent-writable) .git claims.
+        if _in_task_worktree_location(project_dir) or await _is_linked_worktree(project_dir):
             # R3119-07 (task #3126): a nested project's attempt ran in a
             # sub-directory of its worktree; ``git clean`` there would leave
             # the rest of the worktree dirty for the next attempt.
-            worktree_root = await git_toplevel_async(project_dir)
-            if worktree_root is None:
+            location = await _task_worktree_location(project_dir)
+            if location is None:
                 raise AttemptCleanupError(
-                    f"no work-tree root for {project_dir}; not resetting"
+                    f"{project_dir} is not in a worktree its repository "
+                    f"registers; not resetting"
                 )
+            worktree_root, common_dir = location
             await _reset_task_worktree(
-                str(worktree_root), branch_name, base_sha, emit,
+                worktree_root, branch_name, base_sha, emit, common_dir=common_dir,
             )
         else:
             await _delete_task_branch_in_main_checkout(
