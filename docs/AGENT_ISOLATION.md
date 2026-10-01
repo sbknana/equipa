@@ -254,7 +254,10 @@ With the flag on, a `max_concurrent` above 1 is **refused** at dispatch
 tasks could not run side by side anyway, and would only queue for the unit
 slot until `unit_wait_timeout_sec` refused them. Set `"max_concurrent": 1`.
 A per-unit UID pool would lift both; it is not implemented, so there is no
-setting for it (an unknown `agent_isolation` key is refused). Once a pool
+setting for it (an unknown `agent_isolation` key is refused), and a dispatch
+config that sets `isolation_uid_pool` is refused at startup and at every
+isolated spawn rather than read as leave to raise `max_concurrent`
+(`isolation.uid_pool_refusal`). Once a pool
 exists, only `security-reviewer` and `code-reviewer` units
 (`EXCLUSIVE_ROLES`) keep running alone.
 
@@ -545,8 +548,8 @@ unless named otherwise:
 |---|---|---|
 | F1 MEDIUM: a per-run, missing or mistyped dispatch config turns isolation off silently | FIXED: the host marker `/etc/equipa/require-agent-isolation` makes it required (refused at startup and at spawn when the config turns it off); a per-run config carries the host config's isolation and may only turn it on; startup prints the state | `test_marker_turns_isolation_on_whatever_the_config_says`, `test_a_marker_that_cannot_be_checked_counts_as_present`, `test_required_isolation_refuses_a_config_that_turns_it_off`, `test_spawn_refuses_when_required_and_the_config_turns_it_off`, `test_agent_runner_never_spawns_unisolated_while_required`, `test_per_run_config_without_the_key_keeps_host_isolation`, `test_per_run_config_cannot_turn_host_isolation_off`, `test_a_missing_per_run_config_does_not_turn_isolation_off`, `test_an_unreadable_host_config_keeps_isolation_on`, `test_carrying_isolation_keeps_other_gates_fail_closed`, `test_cli_refuses_before_any_mode_runs`, `test_startup_line_names_the_isolation_state` |
 | F2 MEDIUM: localhost and LAN services reachable from the agent UID | FIXED: `IPAddressDeny=` on every unit; since a user manager cannot apply it, the launcher refuses unless its own loopback and LAN listeners are unreachable (nftables rule, step 4a); the verify script probes every listening loopback port and every `--loopback-port` | `test_unit_denies_loopback_link_local_multicast_and_private_ranges`, `test_extra_denied_ranges_add_to_the_defaults`, `test_handoff_names_the_denied_ranges`, `test_launcher_refuses_while_loopback_is_reachable`, `test_launcher_verify_runs_the_network_check`, `test_launcher_refuses_a_deny_list_without_loopback`, `test_local_addresses_include_the_hosts_own_lan_address`, `test_listening_loopback_ports_are_read_from_proc`, `test_probe_command_lists_operator_and_listening_ports`, `test_verify_script_fails_when_a_loopback_service_is_reachable`, `test_verify_script_passes_an_unreachable_port` |
-| F3 MEDIUM / R3140-01: the link walk is quadratic in the target length | FIXED: linear trie walk; targets over 4095 bytes refused unread, at most 10,000 links per tree and 1,000,000 walked components per commit; targets read once per blob | `test_a_one_megabyte_link_target_is_refused_in_under_0_2_seconds`, `test_a_link_target_longer_than_path_max_is_refused`, `test_a_target_of_exactly_the_limit_is_walked`, `test_a_tree_with_too_many_links_is_refused`, `test_many_long_links_are_checked_quickly`, `test_walk_budget_spans_every_link_of_the_check`, `test_trie_walk_is_linear_in_the_directory_depth`, `test_trie_walk_agrees_with_the_path_walk` |
-| F4 MEDIUM: concurrent units of other tasks can replace an export or forge a tester verdict | FIXED until a UID pool exists: every isolated unit runs alone (host-wide lock), and `max_concurrent` above 1 is refused at dispatch | `test_two_ordinary_units_never_overlap`, `test_units_of_another_process_are_waited_for`, `test_every_role_runs_alone_until_units_have_their_own_uid`, `test_concurrency_above_one_is_refused_with_isolation_on`, `test_parallel_tasks_refuse_a_cap_above_one_with_isolation_on`, `test_auto_run_and_parallel_goals_refuse_a_cap_above_one`, `test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal` |
+| F3 MEDIUM / R3140-01: the link walk is quadratic in the target length | FIXED: linear trie walk; targets over 4095 bytes refused unread, at most 10,000 links per tree and 1,000,000 walked components per commit; targets read once per blob | `test_a_one_megabyte_link_target_is_refused_in_under_0_2_seconds`, `test_a_link_target_longer_than_path_max_is_refused`, `test_a_target_of_exactly_the_limit_is_walked`, `test_a_tree_with_too_many_links_is_refused`, `test_many_long_links_are_checked_quickly`, `test_walk_budget_spans_every_link_of_the_check`, `test_trie_walk_is_linear_in_the_directory_depth`, `test_trie_walk_agrees_with_the_path_walk`, `test_import_check_walks_every_link_through_the_trie` |
+| F4 MEDIUM: concurrent units of other tasks can replace an export or forge a tester verdict | FIXED until a UID pool exists: every isolated unit runs alone (host-wide lock), `max_concurrent` above 1 is refused at dispatch, and a config that sets `isolation_uid_pool` (not implemented) is refused at startup and at spawn | `test_two_ordinary_units_never_overlap`, `test_units_of_another_process_are_waited_for`, `test_every_role_runs_alone_until_units_have_their_own_uid`, `test_concurrency_above_one_is_refused_with_isolation_on`, `test_parallel_tasks_refuse_a_cap_above_one_with_isolation_on`, `test_auto_run_and_parallel_goals_refuse_a_cap_above_one`, `test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal`, `test_a_uid_pool_is_refused_while_isolation_is_on`, `test_isolation_settings_and_spawn_refuse_a_uid_pool`, `test_concurrency_refusal_names_the_unimplemented_uid_pool`, `test_cli_refuses_a_uid_pool_before_any_mode_runs` |
 | F5 LOW: the imported tip need not descend from the base | FIXED: `merge-base --is-ancestor` before `update-ref` | `test_import_refuses_a_rewound_task_branch`, `test_import_refuses_an_unrelated_task_branch_tip`, `test_import_accepts_a_tip_that_descends_from_the_base`, `test_import_accepts_an_unchanged_tip` |
 | F6 LOW: external lifecycle hooks not refused with the flag on | NOT FIXED: outside this task's scope (`equipa/hooks`); still latent (no production caller of `load_hooks_config`), see residual risks | none |
 | F7 LOW: the agent user's sudo is not checked at dispatch | FIXED: `sudo -n -l -U <agent>` must report "not allowed" (fail closed otherwise); root-equivalent groups are a floor `privileged_groups` cannot remove, supplementary groups included; the verify script checks the groups | `test_agent_without_sudo_rights_passes`, `test_agent_sudo_rights_or_an_unclear_answer_refuse`, `test_a_missing_sudo_refuses`, `test_dispatch_refuses_an_agent_user_with_sudo_rights`, `test_root_equivalent_groups_cannot_be_configured_away`, `test_dispatch_refuses_a_supplementary_privileged_group`, `test_verify_script_checks_the_root_equivalent_groups` |
@@ -734,8 +737,11 @@ chmod 0700 <backup-dir>                      # each backup directory, likewise
 find <db-dir> <backup-dir> -xdev -type f \( -name '*.db' -o -name '*.db[-._]*' \
      -o -name '*.sqlite*' \) -exec chmod 0600 {} +   # every copy owner-only
 # Stray copies anywhere, old or new (backups are usually OLDER than <db>, so
-# no -newer): move each into <backup-dir>, or chmod 0600 it.
-find / -xdev -type f \( -name '*.db*' -o -name '*.sqlite*' \) -perm -o=r 2>/dev/null
+# no -newer), on EVERY mounted filesystem (no -xdev: a projects share or a
+# backup disk is often a mount of its own), compressed ones included
+# (*.db.gz matches *.db*): move each into <backup-dir>, or chmod 0600 it.
+find / \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune \
+     -o -type f \( -name '*.db*' -o -name '*.sqlite*' \) -perm -o=r -print 2>/dev/null
 
 chmod 0600 <runtime>/mcp_config.json <runtime>/.env 2>/dev/null
 chmod -R go-w <runtime>                      # runtime read-only to others
@@ -926,7 +932,9 @@ refused. `privileged_groups` adds to the built-in root-equivalent groups.
 
 `max_concurrent` must be 1 while the flag is on (dispatch refuses a higher
 value, from the config or `--max-concurrent`): every isolated unit runs
-alone until per-unit agent UIDs exist ("Every unit runs alone").
+alone until per-unit agent UIDs exist ("Every unit runs alone"). Do not set
+`isolation_uid_pool`: the pool is not implemented, and a config that names
+one is refused.
 
 Once `scripts/verify_agent_isolation.sh` prints `RESULT: PASS` (step 8),
 make the setting stick, as root:
