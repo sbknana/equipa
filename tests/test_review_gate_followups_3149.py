@@ -168,6 +168,18 @@ R3143_02_BODIES = [
     ["Was it fixed? No", "HIGH SQL injection remains in login.py"],
     ["Was it fixed? No", "HIGH: SQL injection in login.py"],
     ["# Was it fixed? No", "HIGH findings remain."],
+    # A generic noun, verb or conjunction run between the token and the
+    # label mark leaves the label in place (tester, cycle 2).
+    ["No HIGH issues: SQL injection in login.py"],
+    ["No HIGH severity issues: SQL injection in login.py"],
+    ["No HIGH issues remain: SQL injection in login.py"],
+    ["No HIGH issues were found - SQL injection in login.py"],
+    [f"0 CRITICAL findings {E} RCE in upload.py"],
+    ["No HIGH findings \N{EN DASH} RCE in upload.py"],
+    ["No HIGH findings **:** RCE in upload.py"],
+    ["Not CRITICAL because: RCE via upload handler in upload.py."],
+    ["None is HIGH or CRITICAL, as: RCE in upload.py"],
+    ["No HIGH issues = RCE in upload.py"],
 ]
 
 
@@ -194,6 +206,9 @@ R3143_02_MERGES = [
     ["No HIGH-severity issues."],
     ["No HIGH or CRITICAL issues were found."],
     ["Rated LOW rather than MEDIUM or HIGH."],
+    ["No HIGH issues remain in this diff."],
+    ["No HIGH findings were reported by semgrep, and none by bandit."],
+    ["Rated LOW rather than HIGH because the endpoint needs an admin token."],
 ]
 
 

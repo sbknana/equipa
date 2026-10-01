@@ -2872,20 +2872,29 @@ _BACKSTOP_LIST_GOES_ON = (
 )
 # A generic noun or verb, or a conjunction opening a reason ("rated LOW
 # rather than HIGH because ..."). Never finding text ("SQL injection").
+# Task 3149 (tester, cycle 2): the words run as far as they go (an atomic
+# group, so a shorter run is never tried) and must not end at a ":", "=" or
+# dash: "No HIGH issues: SQL injection ..." and "Not CRITICAL because: RCE"
+# keep the label in place.
+_BACKSTOP_LABEL_MARK = "[:=\\-\N{HYPHEN}-\N{HORIZONTAL BAR}\N{MINUS SIGN}]"
 _BACKSTOP_GENERIC_NOUN_AFTER = (
-    r"[ \t]+(?:findings?|issues?|results?|vulnerabilit(?:y|ies)|risks?|"
+    r"(?>(?:[ \t]+(?:findings?|issues?|results?|vulnerabilit(?:y|ies)|risks?|"
     r"items?|problems?|bugs?|alerts?|hits?|concerns?|severity|severities|"
     r"ones?|entries|flaws?|weakness(?:es)?|defects?|warnings?|"
     r"(?:or|and)[ \t]+(?:above|higher|worse)|was|were|is|are|remains?|"
     r"found|reported|identified|detected|flagged|exists?|"
-    r"because|since|as|given|but|though|although|while|unless|due)(?![\w-])"
+    r"because|since|as|given|but|though|although|while|unless|due)"
+    r"(?![\w-]))+)(?![*_` \t]*" + _BACKSTOP_LABEL_MARK + r")"
 )
 # End of the text, closing punctuation, or a comma before a lower-case word
-# ("not MEDIUM, as it needs ..."; "No HIGH, SQL injection ..." is a label).
+# ("not MEDIUM, as it needs ..."; "No HIGH, SQL injection ..." is a label,
+# and so is "not MEDIUM, as: RCE ...": the lower-case word ends at no label
+# mark).
 _BACKSTOP_SAFE_AFTER_RE = re.compile(
     _BACKSTOP_AFTER_PREFIX + r"(?:" + _BACKSTOP_LIST_GOES_ON + r"|"
     + _BACKSTOP_GENERIC_NOUN_AFTER
-    + r"|[ \t]*(?:\Z|[.;!?)\]|]|,[ \t]*(?=(?-i:[a-z]))))",
+    + r"|[ \t]*(?:\Z|[.;!?)\]|]|,[ \t]*(?=(?-i:[a-z])(?>\w*)"
+    r"(?![*_` \t]*" + _BACKSTOP_LABEL_MARK + r"))))",
     re.IGNORECASE,
 )
 _BACKSTOP_LIST_CONTINUES_RE = re.compile(
