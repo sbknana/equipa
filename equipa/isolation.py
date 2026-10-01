@@ -92,9 +92,10 @@ DEFAULT_PRIVILEGED_GROUPS: tuple[str, ...] = (
 # unspecified addresses (a connect to them reaches loopback), link-local,
 # multicast and the private ranges. Everything else stays reachable: the
 # agent needs the public Anthropic API. ``ip_address_deny_extra`` may add
-# ranges (a tailnet's 100.64.0.0/10, say), never remove these. systemd-run
-# of systemd 255 does not parse the symbolic names (localhost, link-local,
-# multicast), so they are spelled out.
+# ranges (a tailnet's 100.64.0.0/10, say), never remove these. The ranges
+# are spelled out rather than given as systemd's symbolic names (localhost,
+# link-local, multicast): the same list goes to the launcher in the handoff,
+# which parses each entry with ``ipaddress`` and knows no such names.
 DEFAULT_IP_ADDRESS_DENY: tuple[str, ...] = (
     "127.0.0.0/8", "::1/128", "0.0.0.0/8", "::/128",
     "169.254.0.0/16", "fe80::/10", "224.0.0.0/4", "ff00::/8",
@@ -237,7 +238,10 @@ _DEFAULTS: dict[str, Any] = {
     "ip_address_deny_extra": [],
     # IOWeight= of the unit (1-10000; the orchestrator keeps the default
     # 100), verified in the scope's io.weight; null leaves IO unweighted
-    # (review F8). Needs the io controller delegated to the user manager.
+    # (review F8). Needs the io controller delegated to the user manager,
+    # and only has an effect with the BFQ scheduler or iocost: on a host
+    # without io delegation, or with the none/mq-deadline scheduler and no
+    # io.cost.qos, null is the honest setting (review N3).
     "io_weight": 50,
 }
 
@@ -558,9 +562,11 @@ def build_launch_command(settings: IsolationSettings, unit: str) -> list[str]:
     ``IPAddressDeny=`` keeps the agent off loopback and the LAN (review F2).
     A user manager accepts it but cannot apply it unprivileged ("unit
     configures an IP firewall, but not running as root"), so the launcher
-    proves from inside the unit that the denied ranges are unreachable and
-    refuses otherwise; on such a host an nftables rule for the agent user
-    does the blocking (docs/AGENT_ISOLATION.md). ``MemorySwapMax=0`` and
+    proves from inside the unit that loopback and this host's own addresses
+    in the denied ranges are unreachable and refuses otherwise; on such a
+    host an nftables rule for the agent user does the blocking
+    (docs/AGENT_ISOLATION.md step 4a), and the verify script probes every
+    host address and the operator's LAN targets. ``MemorySwapMax=0`` and
     ``IOWeight=`` are checked in the scope (:func:`verify_scope_cgroup`).
     """
     io_weight = ([f"--property=IOWeight={settings.io_weight}"]
