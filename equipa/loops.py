@@ -1553,6 +1553,14 @@ _REVIEW_MIN_NONBLANK_LINES = 4
 # Task 3143: the longest of the ~870 distinct real reviews has about 1,000
 # lines; ten times that is the most the gate parses.
 _REVIEW_MAX_PARSED_LINES = 10_000
+# Task 3149 (timing): every line holding a severity word in any case
+# (_SEVERITY_WORD_LINE_RE, which also reads "below" and "information") costs
+# about 40 microseconds: the shape rules read it as written, rewritten from
+# HTML and rendered, and the backstop reads it in up to four views. A 200 KB
+# review of 7,500 such lines took 0.6 s on main. The most any of the 870
+# distinct real reviews holds is 138, so a review whose text as written or
+# as rendered holds more than this is not parsed (fail closed).
+_REVIEW_MAX_SEVERITY_LINES = 1_000
 
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
@@ -3991,6 +3999,24 @@ def _analyze_review_file(
     return _severity_token_backstop(backstop_text, analysis, heading_text=text)
 
 
+def _too_many_severity_lines(
+    text: str, view: str,
+) -> ReviewCountAnalysis | None:
+    """An incomplete verdict when ``text`` holds more lines with a severity
+    word than any review the gate parses (_REVIEW_MAX_SEVERITY_LINES)."""
+    lines = 0
+    for _ in _SEVERITY_WORD_LINE_RE.finditer(text):
+        lines += 1
+        if lines > _REVIEW_MAX_SEVERITY_LINES:
+            return ReviewCountAnalysis(
+                verdict=REVIEW_VERDICT_INCOMPLETE,
+                detail=(f"review too dense to parse: more than "
+                        f"{_REVIEW_MAX_SEVERITY_LINES} lines {view} hold a "
+                        f"severity word"),
+            )
+    return None
+
+
 def _analyze_review_views(text: str) -> ReviewCountAnalysis:
     """The shape rules of :func:`_analyze_review_file`, on normalised text."""
     if not text.isascii():
@@ -4010,14 +4036,21 @@ def _analyze_review_views(text: str) -> ReviewCountAnalysis:
             detail=(f"review too long to parse: {line_count} lines after "
                     f"folding blank runs (at most {_REVIEW_MAX_PARSED_LINES})"),
         )
+    too_dense = _too_many_severity_lines(text, "as written")
+    if too_dense is not None:
+        return too_dense
     # Task 3130: parse the text as written (what every earlier task parsed)
     # and as rendered (comments removed, references decoded, lookalike
     # letters folded, blank runs collapsed); the stricter result wins. The
     # rendered view catches "&#72;IGH" and "HI<!-- -->GH"; the text as
     # written keeps every block it produced before, including a finding
     # inside a multi-line comment.
-    as_written = _analyze_review_text(text, nonblank_lines)
     rendered = _rendered_review_text(text)
+    # Decoding and folding can spell a severity word on more lines.
+    too_dense = _too_many_severity_lines(rendered, "as rendered")
+    if too_dense is not None:
+        return too_dense
+    as_written = _analyze_review_text(text, nonblank_lines)
     if rendered == _without_edge_markers(text):
         # Only the provenance line on top and the completion line at the end
         # differ: nothing comes before the first or after the last line, so
