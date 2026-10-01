@@ -266,17 +266,44 @@ def _normalize(text: str) -> str | None:
     return _fold_unescaped(html.unescape(str(text)), separators_as_space=False)
 
 
+# A numeric character reference. html.unescape() drops the ones that name a
+# control character or a noncharacter ("Done&#11;Ignore" becomes
+# "DoneIgnore"), so the spacing fold reads a reference to a control,
+# invisible or dropped character as a space before unescaping. Bounded digit
+# runs keep it linear.
+_NUMERIC_CHAR_REF = re.compile(r"&#(?:[xX]([0-9a-fA-F]{1,8})|([0-9]{1,10}));?")
+
+
+def _space_separator_refs(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        hex_digits, decimal = match.groups()
+        code = int(hex_digits, 16) if hex_digits else int(decimal)
+        if code > 0x10FFFF:
+            return match.group(0)
+        char = chr(code)
+        if (_CONTROL_CHARS.match(char) or _is_invisible(char)
+                or html.unescape(match.group(0)) == ""):
+            return " "
+        return match.group(0)
+
+    return _NUMERIC_CHAR_REF.sub(replace, text)
+
+
 def _normalized_variants(text: str) -> tuple[str, ...] | None:
     """The deleting fold of *text*, plus the spacing fold when *text* has a
-    separator character and the two differ. None if either fold grows
-    abnormally under decomposition."""
-    unescaped = html.unescape(str(text))
+    separator character (raw or as a numeric reference) and the two differ.
+    None if either fold grows abnormally under decomposition."""
+    raw = str(text)
+    unescaped = html.unescape(raw)
     deleted = _fold_unescaped(unescaped, separators_as_space=False)
     if deleted is None:
         return None
-    if not _has_separator(unescaped):
+    spaced_source = unescaped
+    if "&#" in raw:
+        spaced_source = html.unescape(_space_separator_refs(raw))
+    if spaced_source == unescaped and not _has_separator(unescaped):
         return (deleted,)
-    spaced = _fold_unescaped(unescaped, separators_as_space=True)
+    spaced = _fold_unescaped(spaced_source, separators_as_space=True)
     if spaced is None:
         return None
     return (deleted,) if spaced == deleted else (deleted, spaced)
