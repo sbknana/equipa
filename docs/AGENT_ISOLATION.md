@@ -616,7 +616,21 @@ tests are in `tests/test_agent_isolation_3147.py`:
 | N2 LOW: the CLI startup refusal and the verify script's group check are pinned only by source text | FIXED: `async_main` is run with the marker and an isolation-off config; the group check is called with fake group lists | `test_cli_refuses_an_isolation_off_config_before_any_mode_runs`, `test_verify_group_check_fails_on_each_privileged_group`, `test_verify_inside_checks_the_groups_id_reports` |
 | N3 INFO: IO weight is inert without BFQ or iocost; a misleading systemd 255 comment | FIXED in the runbook (`"io_weight": null` on such hosts, steps 4 and 7) and the comments | `test_runbook_recommends_a_null_io_weight_where_weights_do_nothing` |
 | N4 INFO: unpinned MCP server install | FIXED in the runbook (step 0): pinned versions, published hashes, a hash-locked offline install after a scan; `mcp` is pinned below 2 because the server crashes on `mcp` 2.x | `test_runbook_pins_the_mcp_server_with_hashes` |
-| F8 / R3142-04 LOW: the agent can fill `/` through `/tmp` and `/var/tmp` | FIXED in the verify script (the unit's TMPDIR must be its own and off `/`; a writable `/tmp` or `/var/tmp` on `/` fails) and the runbook (step 1: a tmpfiles.d ACL closes both to the agent user) | `test_a_writable_shared_tmp_on_the_root_filesystem_fails`, `test_unit_tmpdir_on_the_root_filesystem_fails`, `test_unit_tmpdir_off_the_root_filesystem_passes` |
+| F8 / R3142-04 LOW: the agent can fill `/` through `/tmp` and `/var/tmp` | FIXED in the verify script (the unit's TMPDIR must be its own and off `/`; a writable `/tmp` or `/var/tmp` on `/` fails) and the runbook (step 1: a tmpfiles.d ACL closes both to the agent user); the ACL was not recursive, see SR3147-01 below | `test_a_writable_shared_tmp_on_the_root_filesystem_fails`, `test_unit_tmpdir_on_the_root_filesystem_fails`, `test_unit_tmpdir_off_the_root_filesystem_passes` |
+
+Reviews of task 3147 (SECURITY-REVIEW-3147 and the independent review),
+task 3153. Tests are in `tests/test_agent_isolation_3153.py`; the CLI
+settings items of the task 3150 reviews are in
+`tests/test_cli_setting_sources_3153.py`:
+
+| Finding | Status (flag on) | Test |
+|---|---|---|
+| SR3147-01 LOW: 1777 directories below `/tmp`, `/var/crash` and `/dev/shm` stay writable; the verify script reports PASS | FIXED in the runbook (step 1: `u:equipa-agent:---` on `/tmp`, `/var/tmp`, `/var/crash`, `/dev/shm` and every other world-writable directory on `/`; a per-user `/dev/shm` quota of at most 256 MiB as the alternative) and the verify script (a real file create in every world-writable directory on `/` that `find -xdev -perm -0002` reports as the agent, plus the well-known names below `/tmp`; `/dev/shm` writes must stop by the cap). NOT FIXED as a per-unit private `/tmp`: the unit is a user scope, which cannot take `PrivateTmp=`, `PrivateDevices=` or `InaccessiblePaths=` | `test_a_writable_world_writable_dir_on_the_root_filesystem_fails`, `test_a_dir_hidden_below_an_unlistable_parent_is_probed_by_name`, `test_an_uncapped_shared_memory_dir_fails`, `test_writes_stopped_by_the_cap_pass`, `test_writes_stopped_only_beyond_the_cap_fail`, `test_the_runbook_closes_every_shared_directory_completely`, `test_the_inside_run_calls_the_new_checks` |
+| SR3147-02 LOW: the limited broadcast `255.255.255.255` is not rejected | FIXED in the rule (`fib daddr type broadcast reject`, `ip daddr 255.255.255.255 reject`) and the verify script (one UDP datagram with `SO_BROADCAST` must be refused). `DEFAULT_IP_ADDRESS_DENY` (the unit's `IPAddressDeny=`, which a user manager does not apply) is unchanged | `test_the_rule_rejects_broadcast`, `test_a_sent_broadcast_fails`, `test_a_rejected_broadcast_passes` |
+| SR3147-03 LOW: global IPv6 addresses of LAN peers are reachable | FIXED in the rule: operator-filled `lan6_prefixes` / `lan4_prefixes` sets are rejected (step 4a); the verify script probes an IPv6 `--lan-target` | `test_operator_lan_prefixes_are_rejected`, `test_the_prefix_sets_are_declared_with_documentation_examples` |
+| IR3147-A INFO: a DNATed connection to a published container port is judged by the container's address | FIXED in the rule: `ct status dnat reject` first in the agent chain. The verify script does not probe a published port (the agent user has no Docker access to find one) | `test_a_dnated_connection_is_rejected_whatever_its_new_address`, `test_the_rule_keeps_its_earlier_verdicts` |
+| SR3147-04 LOW: the MCP install recipe continues past a failed hash check | FIXED: the recipe runs in its own `bash` with `set -euo pipefail` (step 0). NOT FIXED: the transitive wheels are still locked by the hash of the day's download | `test_the_mcp_recipe_stops_at_a_failed_hash_check`, `test_the_mcp_recipe_runs_through_when_the_hashes_match` |
+| R3150-07 LOW: the unit's config directory is agent-writable | FIXED for settings: every CLI run passes `--setting-sources ""`, and the launcher refuses a claude argv without it inside the unit. NOT FIXED: the CLI's shell snapshot in that directory (documented in ORCHESTRATOR.md) | `test_unit_refuses_a_claude_argv_that_loads_settings_files`, `test_unit_starts_the_argv_the_orchestrator_builds` |
 
 ## Residual risks and limitations
 
@@ -664,7 +678,10 @@ tests are in `tests/test_agent_isolation_3147.py`:
   `peer` or `scram-sha-256`, never `trust`).
 * A unit's clone, HOME, TMPDIR and exports have no quota of their own; the
   runbook puts the agent state root on a size-capped filesystem of its own
-  and closes or caps the shared `/tmp` and `/var/tmp` (F8).
+  and closes the shared world-writable directories (`/tmp`, `/var/tmp`,
+  `/var/crash`, `/dev/shm`) to the agent user or caps them (F8,
+  SR3147-01). These are host settings, not per-unit ones: the unit is a
+  user scope, which cannot take `PrivateTmp=` or `InaccessiblePaths=`.
 * In-tree `.gitattributes` of the agent's commits still apply to the
   orchestrator's git (for example `-diff` or `merge=union`). Drivers must be
   defined in config, which agents can no longer write.
