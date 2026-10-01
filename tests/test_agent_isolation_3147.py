@@ -582,3 +582,141 @@ def test_a_tmpdir_that_is_not_the_units_own_fails(value: str) -> None:
                                             env={"TMPDIR": value})
     assert (lines, failures) == (
         [f"FAIL agent TMPDIR '{value}' is not the unit's own"], 1)
+
+
+# --- N1, N3, N4: the runbook (documentation fences) ---------------------------------------
+
+
+def _runbook() -> str:
+    return RUNBOOK.read_text(encoding="utf-8")
+
+
+def _heredoc(target: str) -> str:
+    """The body of the runbook's ``cat > target <<'EOF'`` block."""
+    text = _runbook()
+    opening = f"cat > {target} <<'EOF'\n"
+    start = text.index(opening) + len(opening)
+    return text[start:text.index("\nEOF\n", start)]
+
+
+def _statements(body: str) -> list[str]:
+    """Non-empty lines of an nft body, comments dropped, a set continued
+    over several lines joined into one statement."""
+    statements: list[str] = []
+    for raw in body.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if statements and statements[-1].count("{") > statements[-1].count("}") \
+                and not statements[-1].endswith("{"):
+            statements[-1] += " " + line
+        else:
+            statements.append(line)
+    return statements
+
+
+def _chain(statements: list[str], name: str) -> list[str]:
+    start = statements.index(f"chain {name} {{") + 1
+    return statements[start:statements.index("}", start)]
+
+
+RULE_FILE = "/etc/nftables.d/equipa-agent.nft"
+UNIT_FILE = "/etc/systemd/system/equipa-agent-firewall.service"
+
+
+def test_runbook_rule_file_replaces_only_its_own_table() -> None:
+    """Declare, delete, define: loading the file twice leaves one copy of
+    the table, and nothing outside it is touched (no flush ruleset)."""
+    statements = _statements(_heredoc(RULE_FILE))
+    table = " ".join(isolation.NFT_TABLE)
+    assert statements[:3] == [f"table {table}", f"delete table {table}",
+                              f"table {table} {{"]
+    assert not any("flush" in statement for statement in statements)
+    assert sum(statement.startswith("delete ") for statement in statements) == 1
+    assert "install -d -o root -g root -m 0755 /etc/nftables.d" in _runbook()
+
+
+def test_runbook_loads_the_rule_with_its_own_unit() -> None:
+    unit = _heredoc(UNIT_FILE).splitlines()
+    assert "Type=oneshot" in unit
+    assert "RemainAfterExit=yes" in unit
+    assert f"ExecStart={isolation.NFT_EXECUTABLE} -f {RULE_FILE}" in unit
+    assert "WantedBy=multi-user.target" in unit
+    assert not any(line.startswith("ExecStop") for line in unit)
+    after = next(line for line in unit if line.startswith("After="))
+    assert {"docker.service", "tailscaled.service"} <= set(after[6:].split())
+    text = _runbook()
+    assert "systemctl enable --now equipa-agent-firewall.service" in text
+    # The stock service's config flushes the whole ruleset (N1).
+    assert "systemctl enable nftables" not in text
+    assert 'include "/etc/nftables.d' not in text
+
+
+def test_runbook_rule_filters_only_the_agent_users_sockets() -> None:
+    """A positive match: packets without an owning socket (kernel RSTs,
+    ICMP errors, neighbour discovery) never reach the reject rules."""
+    statements = _statements(_heredoc(RULE_FILE))
+    assert _chain(statements, "output") == [
+        "type filter hook output priority 0; policy accept;",
+        'meta skuid "equipa-agent" jump agent']
+    assert not any("skuid !=" in statement for statement in statements)
+
+
+def test_runbook_rule_rejects_every_host_address_and_the_denied_ranges() -> None:
+    import ipaddress
+
+    agent = _chain(_statements(_heredoc(RULE_FILE)), "agent")
+    dns = [index for index, statement in enumerate(agent)
+           if statement.endswith("dport 53 accept")]
+    local = agent.index("fib daddr type local reject")
+    ranges = [index for index, statement in enumerate(agent)
+              if re.match(r"ip6? daddr \{", statement)]
+    assert dns and ranges and max(dns) < local < min(ranges)
+    assert all(statement.endswith(" reject") for statement in agent[local:])
+    networks = {ipaddress.ip_network(cidr.strip())
+                for index in ranges
+                for cidr in agent[index].split("{", 1)[1].split("}")[0].split(",")}
+    expected = {ipaddress.ip_network(cidr) for cidr in
+                (*isolation.DEFAULT_IP_ADDRESS_DENY, "100.64.0.0/10")}
+    assert networks == expected
+
+
+def _step7_config() -> dict:
+    import json
+
+    text = _runbook()
+    start = text.index('"features": { "agent_isolation": true },')
+    return json.loads("{" + text[start:text.index("\n```", start)] + "}")
+
+
+def test_runbook_recommends_a_null_io_weight_where_weights_do_nothing(
+        tmp_path: Path) -> None:
+    text = _runbook()
+    words = " ".join(text.split())
+    for phrase in ("BFQ", "iocost", '"io_weight": null', "[mq-deadline]",
+                   "leave `io` out of `Delegate=`"):
+        assert phrase in words, phrase
+    section = {**_step7_config()["agent_isolation"],
+               "exchange_dir": str(tmp_path)}
+    settings = isolation.load_isolation_settings({"agent_isolation": section})
+    assert settings.io_weight is None
+    assert "100.64.0.0/10" in settings.ip_address_deny
+    # N3: systemd-run of systemd 255 takes the symbolic names; the ranges
+    # are spelled out for the launcher, which parses each one.
+    source = (REPO_ROOT / "equipa" / "isolation.py").read_text(encoding="utf-8")
+    assert "does not parse the symbolic names" not in source
+    assert "rejects the symbolic names" not in text
+
+
+def test_runbook_pins_the_mcp_server_with_hashes() -> None:
+    text = _runbook()
+    assert "'mcp-server-sqlite==2025.4.25' 'mcp[cli]==1.30.0'" in text
+    hashes = dict(re.findall(r"^([0-9a-f]{64})  (\S+\.whl)$", text, re.MULTILINE))
+    assert set(hashes.values()) == {
+        "mcp_server_sqlite-2025.4.25-py3-none-any.whl",
+        "mcp-1.30.0-py3-none-any.whl"}
+    assert "--require-hashes --no-deps -r requirements.lock" in text
+    assert "--no-index --find-links ." in text
+    assert "pip-audit --disable-pip --require-hashes -r requirements.lock" in text
+    assert text.index("pip-audit") < text.index("--no-index --find-links .")
+    assert "pip install mcp-server-sqlite" not in text
