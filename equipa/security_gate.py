@@ -119,6 +119,36 @@ _INVISIBLE_CHARS_RE = re.compile(
 )
 
 
+# Task 3149 (R3143-07): the bidi embeddings, overrides and isolates (LRE, RLE,
+# PDF, LRO, RLO, LRI, RLI, FSI, PDI). An override reverses what the reader
+# sees ("<RLO>HGIH<PDF>" shows as HIGH) while every parser reads the logical
+# order with the controls stripped, so a review holding one is rejected
+# outright instead of read. A review names such a character ("U+202E").
+_BIDI_CONTROL_RE = re.compile(
+    "[\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
+    "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
+)
+REVIEW_BIDI_CONTROL_REASON = "review-bidi-control"
+# Every line break normalize_review_text maps to "\n", and "\n" itself.
+_ANY_LINE_BREAK_RE = re.compile(
+    "\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85"
+    "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]"
+)
+
+
+def find_bidi_control(text: str) -> str | None:
+    """``"U+202E at line 3"`` for the first bidi control in ``text``, else None.
+
+    ``text`` is read as written (before :func:`normalize_review_text`, which
+    strips these characters); every line-break form counts as one break.
+    """
+    match = _BIDI_CONTROL_RE.search(text)
+    if match is None:
+        return None
+    line = len(_ANY_LINE_BREAK_RE.findall(text, 0, match.start())) + 1
+    return f"U+{ord(match.group(0)):04X} at line {line}"
+
+
 def normalize_review_text(text: str) -> str:
     """Canonical form of a review artifact for the nonce checks and parser.
 
@@ -479,6 +509,8 @@ def verify_reviewer_provenance(
         run's ``<!-- EQUIPA-REVIEW-COMPLETE <nonce> -->`` sentinel, so the
         review was never finished (gate-07);
       * ``artifact-changed-after-review`` — edited after the reviewer ended.
+      * ``review-bidi-control-U+XXXX-at-line-N`` — the bytes hold a bidi
+        embedding, override or isolate (task 3149, R3143-07), checked first.
 
       * ``reviewer-record-missing`` — no reviewer run was recorded for the
         task in this process (SR41-03, task #3063). Both production gate
@@ -507,6 +539,12 @@ def verify_reviewer_provenance(
             trusted, reason, fingerprint, text=text, record=record,
         )
 
+    # Task 3149 (R3143-07): the normalised text has lost its bidi controls,
+    # so they are looked for in the bytes as written, before anything else.
+    bidi = find_bidi_control(raw_text) if raw_text is not None else None
+    if bidi is not None:
+        return verdict(False, f"{REVIEW_BIDI_CONTROL_REASON}-"
+                              + bidi.replace(" ", "-"))
     if record is None:
         if unrecorded_reviewer_runs_permitted():
             return verdict(True, "no-reviewer-run-recorded")
@@ -825,9 +863,31 @@ def decide_merge_gate(
             reason="doc-only-diff",
             changed_files=list(changed_files),
         )
-    blocks, counts = security_review_blocks_merge(
-        project_dir, task_id, block_on_missing=block_on_missing,
-    )
+    try:
+        blocks, counts = security_review_blocks_merge(
+            project_dir, task_id, block_on_missing=block_on_missing,
+        )
+    except Exception as error:  # noqa: BLE001 - any failure blocks the merge
+        # Task 3149 (R3143-04): an exception while reading or parsing the
+        # review is a logged block with a verdict, never an exception that
+        # ends the task with no GATE-AUDIT line.
+        logger.exception("[security-gate] review check for task %s failed",
+                         task_id)
+        reason = f"review parse error: {type(error).__name__}"
+        _gate_audit_log(
+            f"task={task_id} event=review-parse-error reason={reason!r} "
+            f"action=block",
+            task_id=task_id,
+            event="review-parse-error",
+        )
+        return GateDecision(
+            blocks_merge=True,
+            doc_only=False,
+            expect_artifact=True,
+            counts=None,
+            reason=reason,
+            changed_files=list(changed_files),
+        )
     reason = "security-review-blocked" if blocks else "clean"
     return GateDecision(
         blocks_merge=blocks,

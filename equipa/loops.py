@@ -97,6 +97,7 @@ from equipa.security_gate import (
     ReviewerRunRecord,
     _gate_audit_log,
     audit_reviewer_run,
+    find_bidi_control,
     fingerprint_artifact,
     format_counts,
     new_reviewer_nonce,
@@ -2767,6 +2768,7 @@ BACKSTOP_REASON = "unaccounted severity token"
 MERGE_BLOCKING_SEVERITIES = ("CRITICAL", "HIGH")
 BACKSTOP_ADVISORY_REASON = "unaccounted MEDIUM token (advisory)"
 REVIEW_PARSE_ERROR_REASON = "review parse error"
+REVIEW_BIDI_REASON = "bidi control character"
 _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # The word must not touch a letter or digit. "_" is not a word character
 # here: "_HIGH_" renders as an emphasised HIGH. The character before the word
@@ -2939,11 +2941,28 @@ _BACKSTOP_SECTION_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,3}(?:[ \t]|$)",
 # fold, beyond the parser's table: the remaining Latin small capitals, Coptic
 # capitals, and the negative circled, negative squared and regional
 # indicator letters A-Z (which decompose to nothing).
+# Task 3149 (R3143-07) adds the shapes indep-3143 drew as these letters:
+# Cyrillic EN with descender, hook or tail (U+04A2, U+04C7, U+04C9) and
+# Latin H with stroke or descender (U+0126, U+2C67) for H; Greek SAN
+# (U+03FA) for M; Latin YR (U+01A6) for R; the Canadian syllabics
+# U+157C H, U+1587 R, U+15C5 and U+15E9 A, U+14AA L, U+15F0 M, U+15EA D,
+# U+144C U; Runic ISAZ (U+16C1), Tifinagh YAN (U+2D4F), NKo A (U+07CA), Old
+# Italic I (U+10309) and DIVIDES (U+2223) for I; Tifinagh YADD (U+2D39) for
+# E; DOWN TACK (U+22A4) and Carian D (U+102A2) for T; Cherokee YU (U+13F3)
+# for G; Armenian SEH (U+054D) for U.
 _BACKSTOP_EXTRA_LOOKALIKES = {
-    "A": (0x1D00, 0x2C80), "C": (0x1D04, 0x2CA4), "D": (0x1D05,),
-    "E": (0x1D07, 0x2C88), "H": (0x2C8E,), "I": (0xA7AE, 0x2C92),
-    "L": (0x029F,), "M": (0x1D0D, 0x2C98), "R": (0x0280,),
-    "T": (0x1D1B, 0x2CA6), "U": (0x1D1C,),
+    "A": (0x1D00, 0x2C80, 0x15C5, 0x15E9),
+    "C": (0x1D04, 0x2CA4),
+    "D": (0x1D05, 0x15EA),
+    "E": (0x1D07, 0x2C88, 0x2D39),
+    "G": (0x13F3,),
+    "H": (0x2C8E, 0x04A2, 0x04C7, 0x04C9, 0x0126, 0x2C67, 0x157C),
+    "I": (0xA7AE, 0x2C92, 0x16C1, 0x2D4F, 0x07CA, 0x10309, 0x2223),
+    "L": (0x029F, 0x14AA),
+    "M": (0x1D0D, 0x2C98, 0x03FA, 0x15F0),
+    "R": (0x0280, 0x01A6, 0x1587),
+    "T": (0x1D1B, 0x2CA6, 0x22A4, 0x102A2),
+    "U": (0x1D1C, 0x144C, 0x054D),
 }
 _BACKSTOP_LETTER_FOLDS = {
     **_CONFUSABLE_LETTERS,
@@ -3158,6 +3177,30 @@ def _backstop_after_text(
         return (after + " " + view[next_start:next_start + _BACKSTOP_AFTER_LIMIT]
                 + _BACKSTOP_CUT)
     return after + " " + view[next_start:next_end]
+
+
+# Task 3149 (R3143-03): Markdown inline markup inside a word renders as one
+# word: "**H**IGH", "H`IGH`", "H*IG*H", "HI__G__H", "HI~~GH", "H\IGH",
+# "[HI](#x)GH", "[HI][r]GH", "HI![](x)GH". Links and images become their text
+# and emphasis, code, strike and backslash marks between two letters are
+# dropped. Both steps only join text (no line break is touched), so the view
+# can only add tokens.
+_BACKSTOP_INLINE_LINK_RE = re.compile(
+    r"!?\[([^\[\]\n]{0,200})\](?:\([^()\n]{0,500}\)|\[[^\[\]\n]{0,100}\])",
+)
+_BACKSTOP_INLINE_SPLIT_RE = re.compile(r"(?<=[^\W_])[*_~`\\]+(?=[^\W_])")
+_BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
+
+
+def _backstop_inline_joined(view: str) -> str | None:
+    """``view`` with Markdown inline markup inside words removed, or None
+    when that changes nothing."""
+    if not any(mark in view for mark in _BACKSTOP_INLINE_MARKS):
+        return None
+    joined = _BACKSTOP_INLINE_SPLIT_RE.sub(
+        "", _BACKSTOP_INLINE_LINK_RE.sub(r"\1", view),
+    )
+    return None if joined == view else joined
 
 
 def _backstop_exempt_count(
@@ -3417,6 +3460,11 @@ def _severity_token_backstop(
     if without_markup is not None:
         views.append((_backstop_normalized(without_markup[0]),
                       without_markup[1]))
+    # R3143-03: the last view (HTML removed when there was any) with
+    # Markdown inline markup inside words removed too.
+    joined = _backstop_inline_joined(views[-1][0])
+    if joined is not None:
+        views.append((joined, views[-1][1]))
     footer = analysis.footer_counts or {}
     # What the review counts per severity (footer, headings, resolved).
     covered = analysis.counts or footer
@@ -3568,6 +3616,17 @@ def _analyze_review_file(
         text = read_artifact_text(review_path)
         if text is None:
             return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
+    # Task 3149 (R3143-07): a bidi override or isolate reorders what the
+    # reader sees, and normalising strips it, so it is looked for first. The
+    # gate's own text was normalised by the provenance check, which rejects
+    # the same characters in the bytes as written.
+    bidi = find_bidi_control(text)
+    if bidi is not None:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=f"{REVIEW_BIDI_REASON}: {bidi} (name the character, "
+                   f"never paste it)",
+        )
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised

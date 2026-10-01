@@ -315,6 +315,153 @@ def test_merge_blocking_severities_match_the_gate_policy():
     assert loops.MERGE_BLOCKING_SEVERITIES == ("CRITICAL", "HIGH")
 
 
+def test_decide_merge_gate_turns_a_raising_review_check_into_a_block(
+        monkeypatch):
+    logged = []
+    monkeypatch.setattr(security_gate, "_gate_audit_log",
+                        lambda message, **fields: logged.append((message, fields)))
+
+    def raising_check(project_dir, task_id, *, block_on_missing):
+        raise ValueError("Exceeds the limit (4300 digits)")
+
+    decision = security_gate.decide_merge_gate(
+        ["app.py"], security_review_blocks_merge=raising_check,
+        project_dir="/nonexistent", task_id=11)
+    assert decision.blocks_merge is True
+    assert decision.reason == "review parse error: ValueError"
+    assert decision.expect_artifact is True and decision.counts is None
+    assert [fields["event"] for _, fields in logged] == ["review-parse-error"]
+    assert logged[0][1]["task_id"] == 11
+
+
+# --- R3143-03 / SR3143-03: Markdown inline markup inside a word -------------------
+
+R3143_03_BODIES = [
+    ["The **H**IGH SQL injection in login.py lets anyone log in."],
+    ["H`IGH`: SQL injection in login.py"],
+    ["The H`IGH` SQL injection in login.py lets anyone in."],
+    ["H*IG*H: SQL injection in login.py"],
+    ["HI__G__H: SQL injection in login.py"],
+    ["HI~~~~GH: SQL injection in login.py"],
+    ["HI~~GH: SQL injection in login.py"],
+    ["HI![](x)GH: SQL injection in login.py"],
+    ["[HI](#x)GH: SQL injection in login.py"],
+    ["[HI][r]GH: SQL injection in login.py"],
+    ["H\\IGH: SQL injection in login.py"],
+    ["CRI`TI`CAL: RCE via upload"],
+    ["The [CRIT](#a)ICAL RCE in upload.py."],
+]
+
+
+@pytest.mark.parametrize("body", R3143_03_BODIES)
+def test_r3143_03_inline_markup_inside_a_word_blocks(body):
+    assert_gate_blocks(body)
+
+
+def test_r3143_03_markup_between_words_adds_nothing():
+    """Joining only touches marks between two letters or link text."""
+    analysis = analyze(one_low_review([
+        "See [the docs](https://example.org/a) and `code` with *emphasis*.",
+        "A [high](#x) bar, ~~struck~~ text and a\\_b escape.",
+    ]))
+    assert analysis.trusted and analysis.detail == "", analysis
+
+
+# --- R3143-07: lookalike letters and bidi controls --------------------------------
+
+def _spell(word, replacements):
+    return "".join(replacements.get(index, letter)
+                   for index, letter in enumerate(word))
+
+
+R3143_07_WORDS = [
+    "HlGH", "H1GH", "H|GH", "CRlTlCAL", "CR1T1CAL", "MEDlUM",
+    _spell("HIGH", {0: "\N{CYRILLIC CAPITAL LETTER EN WITH DESCENDER}"}),
+    _spell("MEDIUM", {0: "\N{GREEK CAPITAL LETTER SAN}"}),
+    _spell("HIGH", {0: "\N{LATIN CAPITAL LETTER H WITH STROKE}"}),
+    _spell("CRITICAL", {1: "\N{LATIN LETTER YR}"}),
+    _spell("HIGH", {0: "\N{CANADIAN SYLLABICS NUNAVUT H}"}),
+    _spell("CRITICAL", {1: "\N{CANADIAN SYLLABICS TLHI}",
+                        6: "\N{CANADIAN SYLLABICS CARRIER GHO}",
+                        7: "\N{CANADIAN SYLLABICS MA}"}),
+    _spell("MEDIUM", {0: "\N{CANADIAN SYLLABICS CARRIER GO}",
+                      2: "\N{CANADIAN SYLLABICS CARRIER PE}",
+                      4: "\N{CANADIAN SYLLABICS TE}"}),
+    _spell("HIGH", {1: "\N{RUNIC LETTER ISAZ IS ISS I}"}),
+    _spell("HIGH", {1: "\N{TIFINAGH LETTER YAN}"}),
+    _spell("MEDIUM", {1: "\N{TIFINAGH LETTER YADD}"}),
+    _spell("HIGH", {1: "\N{NKO LETTER A}"}),
+    _spell("HIGH", {1: "\N{OLD ITALIC LETTER I}"}),
+    _spell("HIGH", {1: "\N{DIVIDES}"}),
+    _spell("CRITICAL", {3: "\N{DOWN TACK}"}),
+    _spell("CRITICAL", {3: "\N{CARIAN LETTER D}"}),
+    _spell("HIGH", {2: "\N{CHEROKEE LETTER YU}"}),
+    _spell("MEDIUM", {4: "\N{ARMENIAN CAPITAL LETTER SEH}"}),
+]
+
+
+@pytest.mark.parametrize("word", R3143_07_WORDS)
+def test_r3143_07_lookalike_severity_word_is_read(word):
+    """CRITICAL and HIGH block; MEDIUM is counted (it never blocks)."""
+    body = [f"Notes: the {word} issue is SQL injection in login."]
+    if len(word) == 6:   # MEDIUM
+        analysis = analyze(one_low_review(body))
+        assert analysis.trusted and analysis.counts["MEDIUM"] == 1, analysis
+        assert analysis.detail.startswith(loops.BACKSTOP_ADVISORY_REASON)
+    else:
+        assert_gate_blocks(body)
+
+
+BIDI_CONTROLS = [
+    "\N{LEFT-TO-RIGHT EMBEDDING}", "\N{RIGHT-TO-LEFT EMBEDDING}",
+    "\N{POP DIRECTIONAL FORMATTING}", "\N{LEFT-TO-RIGHT OVERRIDE}",
+    "\N{RIGHT-TO-LEFT OVERRIDE}", "\N{LEFT-TO-RIGHT ISOLATE}",
+    "\N{RIGHT-TO-LEFT ISOLATE}", "\N{FIRST STRONG ISOLATE}",
+    "\N{POP DIRECTIONAL ISOLATE}",
+]
+
+
+@pytest.mark.parametrize("control", BIDI_CONTROLS)
+def test_r3143_07_bidi_control_rejects_the_review(control):
+    text = one_low_review([f"Notes: the {control}HGIH issue is in the cache."])
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    line = text.split("\n").index(
+        f"Notes: the {control}HGIH issue is in the cache.") + 1
+    assert analysis.detail.startswith(
+        f"bidi control character: U+{ord(control):04X} at line {line}"), (
+        analysis.detail)
+
+
+def test_r3143_07_reversed_word_renders_as_a_severity():
+    """The probe of indep-3143: RLO + HGIH + PDF shows HIGH to a reader."""
+    body = ["\N{RIGHT-TO-LEFT OVERRIDE}HGIH\N{POP DIRECTIONAL FORMATTING}"
+            ": SQL injection in login.py"]
+    assert_gate_blocks(body)
+
+
+def test_r3143_07_provenance_rejects_bidi_in_the_bytes(tmp_path):
+    """The gate parses normalised text (controls stripped), so provenance
+    looks at the bytes as written, before any other check."""
+    path = tmp_path / "SECURITY-REVIEW-12.md"
+    path.write_text(one_low_review(
+        ["Line \N{RIGHT-TO-LEFT ISOLATE}x\N{POP DIRECTIONAL ISOLATE}"]),
+        encoding="utf-8")
+    verdict = security_gate.verify_reviewer_provenance(12, path)
+    assert verdict.trusted is False
+    assert verdict.reason.startswith("review-bidi-control-U+2067-at-line-"), (
+        verdict.reason)
+    assert verdict.audit_event == "artifact-provenance-rejected"
+
+
+def test_r3143_07_left_to_right_and_arabic_marks_are_not_rejected():
+    """LRM/RLM/ALM cannot reorder Latin letters; they are stripped as before."""
+    text = one_low_review(["Notes \N{LEFT-TO-RIGHT MARK}x\N{RIGHT-TO-LEFT MARK}"
+                           "y\N{ARABIC LETTER MARK}z."])
+    assert security_gate.find_bidi_control(text) is None
+    assert analyze(text).trusted
+
+
 # --- R3143-08: the invisible-character list uses escapes ------------------------
 
 def test_r3143_08_security_gate_source_holds_no_invisible_character():
