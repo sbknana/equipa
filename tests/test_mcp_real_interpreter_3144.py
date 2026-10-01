@@ -174,6 +174,15 @@ def test_shipped_example_comment_names_the_rule_and_the_residual_risk():
         assert needle in comment, needle
 
 
+def test_check_mcp_servers_docstring_describes_the_allowlist():
+    """RR3138-G: the docstring described the generic arm as a denylist."""
+    doc = " ".join((agent_runner._check_mcp_servers.__doc__ or "").split())
+    assert "any other absolute executable file that is not a wrapper" not in doc
+    for needle in ("allowlist", "mcp_trusted_executables", "uvx",
+                   "real program", "UV_*"):
+        assert needle in doc, needle
+
+
 def test_is_real_interpreter_direct():
     assert agent_runner._is_real_interpreter(PY, "python")
     assert agent_runner._is_real_interpreter(sys.executable, "python")

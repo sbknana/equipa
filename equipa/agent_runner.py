@@ -730,20 +730,26 @@ def _check_mcp_servers(
     loads code from its cwd runs agent-planted code holding the server's
     credentials, such as the EQUIPA_MCP_TOKEN (P2A-02). A denylist of such
     launchers kept missing some (``timeout python3 -m``, ``uv run``, ``node
-    -r``; IR-03), so only these shapes are accepted (see _check_mcp_launch):
+    -r``; IR-03), so this is an allowlist: only these shapes are accepted
+    (see _check_mcp_launch), and the command must exist:
 
     * an absolute python with ``-I`` running an absolute script, or ``-I
       -m`` with an absolute cwd outside every project directory;
     * an absolute node running an absolute script, with no preload, loader
       or eval option;
-    * any other absolute executable file that is not a wrapper, shell,
-      language runtime or package runner.
+    * an absolute uvx running a package, with its own options read from
+      uvx's option table (RR3138-B);
+    * an executable whose absolute path the operator listed under
+      ``mcp_trusted_executables`` (RR-02). Anything else is refused, and a
+      wrapper, shell or loader is refused even when listed.
 
-    Nothing may live inside a project directory (``project_dirs`` plus every
+    The python, node and uvx commands must be the real program, not a
+    renamed copy of another one (RR3138-C, _is_real_interpreter). Nothing
+    may live inside a project directory (``project_dirs`` plus every
     configured PROJECT_DIRS entry), and the server env may not set a
-    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, ...). Fail
-    closed rather than guess. A missing config is left to the CLI, which
-    reports it itself.
+    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, UV_*, ...).
+    Fail closed rather than guess. A missing config is left to the CLI,
+    which reports it itself.
 
     Raises:
         AgentDispatchRefused: a server off the allowlist, or an unreadable
