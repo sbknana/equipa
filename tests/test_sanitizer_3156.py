@@ -63,6 +63,8 @@ GENUINE_ROWS = [
     "ruff's parser handles new orders: buy and sell",
     "Supply processes new orders: one per minute.",
     "The assembly handles new orders: one per batch.",
+    "So Emily actually adds new orders: one per day.",
+    "Okay, the assembly really handles new orders: one per batch.",
     "ruff ships new rules: E501 and W605",
     "ESLint will add new rules: no-var and prefer-const",
     "Release 2.1 introduced new rules: see the changelog.",

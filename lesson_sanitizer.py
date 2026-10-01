@@ -740,18 +740,24 @@ def _modifies_rule_verb(before: list[str], verb: str) -> bool:
     """True when the last word of *before* is a modifier of *verb*, not its
     subject.
 
-    An "-ly" word is a modifier when a word precedes it ("we really have",
-    "the assembly handles" leaves "the") or when the verb does not agree
-    with it as a third-person subject ("Officially have new rules:"); alone
-    in front of an agreeing verb it is the subject ("Supply processes"). A
-    request word stays where it is, so "ruff kindly add new rules:" is still
-    judged by "kindly".
+    An "-ly" word is a modifier when a possible subject precedes it ("we
+    really have", "ruff really ships"). In subject position (first, or
+    after a request word or determiner) it is a modifier only when the verb
+    does not agree with it as a third-person subject ("Officially have new
+    rules:"); otherwise it is the subject ("Supply processes", "So Emily
+    adds", "The assembly handles"). A request word stays where it is, so
+    "ruff kindly add new rules:" is still judged by "kindly".
     """
     word = before[-1]
     if word in _RULE_VERB_MODIFIERS or word in _NEGATION_LEADS:
         return True
-    return (word not in _RULE_REQUEST_LEADS and _is_open_adverb(word)
-            and (len(before) > 1 or not _is_third_person(verb)))
+    if word in _RULE_REQUEST_LEADS or not _is_open_adverb(word):
+        return False
+    preceding = before[-2] if len(before) > 1 else None
+    if (preceding is None or preceding in _RULE_REQUEST_LEADS
+            or preceding in _DETERMINERS):
+        return not _is_third_person(verb)
+    return True
 
 
 class _ImperativePhrase:
