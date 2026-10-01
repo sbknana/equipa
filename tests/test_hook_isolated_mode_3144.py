@@ -37,6 +37,7 @@ from equipa.agent_runner import (
     _pretooluse_settings_payload,
     build_cli_command,
 )
+from equipa.cli_isolation import trusted_bash
 
 GATE_ON = {"features": {"bash_security_pretooluse": True}}
 BLOCKED_COMMAND = "echo ran > hk.txt; echo `id`"  # check 8 (command substitution)
@@ -123,6 +124,10 @@ def test_generated_settings_keep_the_pin_and_the_env_block(generated_settings):
     assert generated_settings["disableAllHooks"] is False
     env = generated_settings["env"]
     assert set(env) == set(SETTINGS_ENV_NEUTRALISED)
+    # Task 3150 (RR3144-A): CLAUDE_CODE_SHELL is pinned to the trusted
+    # absolute bash; every other name is still emptied.
+    shell = env.pop("CLAUDE_CODE_SHELL")
+    assert shell == trusted_bash() and os.path.isabs(shell)
     assert set(env.values()) == {""}
 
 

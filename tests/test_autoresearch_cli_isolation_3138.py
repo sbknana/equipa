@@ -40,8 +40,20 @@ def autoresearch() -> ModuleType:
 
 
 def _claude_words(shell_command: str) -> list[str]:
-    """The claude argv inside ``<claude argv> < "<file>"``."""
+    """The claude argv inside ``[<config-dir prefix>]<claude argv> < "<file>"``.
+
+    The SSH path starts with the per-run config directory prefix (task 3150,
+    RR3144-A); its presence is asserted in test_cli_config_isolation_3150.
+    """
+    prefix = autoresearch_prefix()
+    if prefix and shell_command.startswith(prefix):
+        shell_command = shell_command[len(prefix):]
     return shlex.split(shell_command.split(" < ", 1)[0])
+
+
+def autoresearch_prefix() -> str:
+    from equipa.cli_isolation import REMOTE_RUN_CONFIG_DIR_PREFIX
+    return REMOTE_RUN_CONFIG_DIR_PREFIX
 
 
 def test_mutate_command_carries_the_isolation_flags(autoresearch):

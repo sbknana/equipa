@@ -23,7 +23,11 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    claude_cli_env,
+    fresh_claude_config_dir,
+)
 from equipa.config import get_configured_model
 # The claude -p calls below embed project files in their prompt, so they get
 # the allowlisted agent env like every other agent CLI (P2A-07).
@@ -279,14 +283,17 @@ def _run_sub_query(
     if refusal:
         return f"[sub_query error: {refusal}]"
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=SUB_QUERY_TIMEOUT,
-            cwd=project_dir,
-            env=active_agent_env(),
-        )
+        # RR3144-A: a fresh, empty CLAUDE_CONFIG_DIR per call, never the
+        # agent-writable user scope (see equipa/cli_isolation.py).
+        with fresh_claude_config_dir() as config_dir:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=SUB_QUERY_TIMEOUT,
+                cwd=project_dir,
+                env=claude_cli_env(active_agent_env(), config_dir),
+            )
         if result.returncode == 0:
             try:
                 data = __import__("json").loads(result.stdout)
@@ -616,14 +623,16 @@ def _call_outer_agent(
     if refusal:
         return f"[agent error: {refusal}]"
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=project_dir,
-            env=active_agent_env(),
-        )
+        # RR3144-A: same per-call config directory as _run_sub_query.
+        with fresh_claude_config_dir() as config_dir:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=project_dir,
+                env=claude_cli_env(active_agent_env(), config_dir),
+            )
         if result.returncode == 0:
             return result.stdout
         if _is_overloaded_cli_failure(result.stderr, result.stdout):

@@ -43,11 +43,23 @@ for _root in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
     if (_root / "equipa" / "__init__.py").is_file() and str(_root) not in sys.path:
         sys.path.append(str(_root))
 try:
-    from equipa.cli_isolation import CLAUDE_CLI_ISOLATION_ARGS
+    from equipa.cli_isolation import (
+        CLAUDE_CLI_ISOLATION_ARGS,
+        REMOTE_RUN_CONFIG_DIR_PREFIX,
+        claude_cli_run_env,
+    )
     from equipa.isolation import unisolated_spawn_refusal
 except ImportError:
     CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
                                  "--strict-mcp-config")
+    # Never reached: unisolated_spawn_refusal below refuses every call when
+    # equipa cannot be imported. Both fail closed if that ever changes.
+    REMOTE_RUN_CONFIG_DIR_PREFIX = "exit 1; "
+
+    def claude_cli_run_env(env=None, parent=None):
+        """Standalone fallback: no per-run Claude config directory."""
+        raise RuntimeError(
+            "equipa is not importable: no per-run Claude config directory")
 
     def unisolated_spawn_refusal(purpose, remedy=""):
         """Standalone fallback: agent_isolation cannot be checked; refuse."""
@@ -400,13 +412,15 @@ Output the raw prompt text only."""
     try:
         if is_on_claudinator():
             # The argv runs directly (no shell) with the prompt on stdin, and
-            # never loads project settings or MCP servers (IR-01).
-            with open(tmp_path, encoding="utf-8") as prompt_input:
+            # never loads project settings or MCP servers (IR-01) or the
+            # agent-writable ~/.claude (RR3144-A: fresh CLAUDE_CONFIG_DIR).
+            with open(tmp_path, encoding="utf-8") as prompt_input, \
+                    claude_cli_run_env() as cli_env:
                 result = subprocess.run(
                     ["claude", "--print", "--model", "opus",
                      *CLAUDE_CLI_ISOLATION_ARGS],
                     stdin=prompt_input, capture_output=True, text=True,
-                    timeout=300,
+                    timeout=300, env=cli_env,
                 )
         else:
             # Running on Windows — SCP the prompt file, then SSH to run claude
@@ -417,7 +431,8 @@ Output the raw prompt text only."""
             )
             result = subprocess.run(
                 ["ssh", "-i", SSH_KEY, CLAUDINATOR,
-                 f'{CLAUDE_MUTATE_COMMAND} < "{remote_tmp}"'],
+                 f'{REMOTE_RUN_CONFIG_DIR_PREFIX}{CLAUDE_MUTATE_COMMAND} '
+                 f'< "{remote_tmp}"'],
                 capture_output=True, text=True, timeout=300
             )
 

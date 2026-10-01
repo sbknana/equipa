@@ -160,6 +160,7 @@ The classifier is not a bash interpreter and does not claim to be. These gaps ar
 - **Redirect targets are textual.** Symlinks are not resolved (even one created earlier in the same command), writers that are not redirects (`tee -a`, `cp`, `dd of=`) are not checked, and a directory change the text does not spell as `cd`, `pushd` or `popd` (an ANSI-C escape, a command name built at run time) is not detected.
 - **The pattern operators of a double-quoted `${...}`** (`"${x#'...'}"`, `"${x/'...'/y}"`) treat apostrophes as quotes in bash, but the checker reads them like the `:-` default word, so a substitution look-alike there is refused although bash would not run it. Refusing is the fail-closed direction.
 - **Pre-execution coverage has an open exception** (BS3121-04, above): when the hook cannot be wired, the agent runs without it.
+- **Without agent isolation the gate is a guard rail, not a boundary.** A function planted in `~/.bashrc` replaces the command the gate allowed, and the hook and `equipa/bash_security.py` sit in a tree the agent's user can write (RR3144-A (4), RR3144-B). User-scope Claude settings are no longer loaded (each CLI run gets its own empty `CLAUDE_CONFIG_DIR`). See "Bash gate limitations without agent isolation" in [ORCHESTRATOR.md](ORCHESTRATOR.md); `scripts/verify_gate_config_isolation.sh` checks the user-scope vectors live.
 
 ## What to do if you trip a check anyway
 
