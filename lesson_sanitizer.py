@@ -712,13 +712,20 @@ def _is_rule_header_lead(words: list[str]) -> bool:
     authority subject reports only with an agreeing processing verb ("The
     manager queues new orders: FIFO", F-2 of the 3153 review).
     """
-    lead = _split_contractions(list(words))
+    lead = list(words)
     had_determiner = False
     while lead and lead[-1] in _DETERMINERS:
         lead.pop()
         had_determiner = True
     if not lead:
         return True
+    # A "'s" word in verb position is "is" or a possessive, never the list
+    # verb "has": "It's the new rules:", "ruff's new rules:". It stays whole,
+    # so it is not a list verb and the phrase is a header, as on main.
+    if lead[-1].endswith("'s"):
+        lead = _split_contractions(lead[:-1]) + lead[-1:]
+    else:
+        lead = _split_contractions(lead)
     verb = lead[-1]
     if verb in _NEGATION_LEADS:
         return False
