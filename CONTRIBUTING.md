@@ -143,24 +143,42 @@ preserved), and a project without the declared file or generator is unaffected.
 
 The generator is code from the merged tree, which agents can write, so:
 
-- it runs only if its blob is identical on the pinned default branch, on the
-  task branch and in the merged tree. A branch that changed the generator ends
-  `merge_failed` with "the task branch changed the generator"; it is never run.
-  A generator updated on the default branch after the task branched is not run
-  either, and the reason says "the default branch changed the generator";
-- it runs as `python -I` in a private `git archive` export of the merged tree
-  (never in the main checkout or the orchestrator's process), with the scrubbed
-  agent environment minus the Claude CLI credential, and a timeout that kills
-  its whole process group. It must print the file's new content to stdout; a
-  failure, empty output or timeout ends `merge_failed` with a clean checkout;
-- the recorded `merged_sha` is the resolution commit. The merge-integrity
-  check (task #3116) accepts it only when its tree equals
+- the trust anchor is the default-branch SHA the run's merge guard pinned
+  (`DefaultBranchGuard.expected_sha`), passed down to the resolution and never
+  re-read from the checkout. The generator runs only if its blob at that
+  pinned SHA is identical on the task branch and in the merged tree, and only
+  if the merge started from the pinned SHA and HEAD is still there. If the
+  default branch moved, nothing runs: the merge is aborted and the guard
+  raises the alarm. A branch that changed the generator ends `merge_failed`
+  with "the task branch changed the generator"; it is never run. A generator
+  updated on the default branch after the task branched is not run either,
+  and the reason says "the default branch changed the generator";
+- it runs as `python -I` in a private export of its declared `inputs` (and
+  itself) from the merged tree, never in the main checkout or the
+  orchestrator's process. The export is written straight from git objects
+  (`ls-tree` + `cat-file`) and every file is re-hashed against its blob, so
+  attributes such as `export-ignore` (in `.gitattributes` or
+  `.git/info/attributes`) cannot hide an input, and no archive is unpacked.
+  Symlinks or submodules among the inputs, or inputs over the size cap, are
+  refused. The generator gets the scrubbed agent environment minus the Claude
+  CLI credential, and a timeout that kills its whole process group. It must
+  print the file's new content to stdout. Its stdout and stderr are capped
+  while they stream: past the cap it is killed at once. A failure, empty
+  output, oversized output or timeout ends `merge_failed` with a clean checkout;
+- the recorded `merged_sha` is the resolution commit. The resolution is
+  refused when the commit is not exactly the tree that was verified or does
+  not have the parents (pinned default branch, approved commit). The
+  merge-integrity check (task #3116) then accepts it only when its tree equals
   `git merge-tree --write-tree <default> <approved>` everywhere except the
-  regenerated paths, which must be exactly that merge's conflicted paths and
-  regular files. A resolution touching any other path trips the guard.
+  regenerated paths, which must be exactly that merge's conflicted paths,
+  regular files, and the exact blobs of the verified generator output. A
+  resolution touching any other path, or carrying any other content, trips
+  the guard.
 
-To declare another generated file, add a `GeneratedFile(path, generator, args)`
-entry; the generator must accept a repository root and print to stdout.
+To declare another generated file, add a
+`GeneratedFile(path, generator, args, inputs)` entry; the generator must accept
+a repository root and print to stdout, and `inputs` lists every path it reads
+(empty exports the whole tree).
 
 ## 8. Skill manifest integrity
 
