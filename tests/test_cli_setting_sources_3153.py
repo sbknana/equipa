@@ -390,6 +390,96 @@ def test_the_suite_keeps_its_temp_files_in_a_session_directory():
         cli_isolation.remove_run_config_dir(config_dir)
 
 
+# Runs the real conftest module body in a fresh interpreter (TMPDIR is the
+# test's own directory), plants a per-run config directory in the session
+# directory, has a forked child die of SIGTERM, then sends SIGTERM to itself:
+# what `timeout` does to a slow suite, which skips pytest_unconfigure.
+_SIGTERMED_SESSION = r'''
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location("conftest_sigterm_probe",
+                                              sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+session = module.SESSION_TMP
+(session / "equipa-claude-config-probe").mkdir()
+child = os.fork()
+if child == 0:
+    os.kill(os.getpid(), signal.SIGTERM)
+    os._exit(0)
+_, status = os.waitpid(child, 0)
+child_died_of_sigterm = (os.WIFSIGNALED(status)
+                         and os.WTERMSIG(status) == signal.SIGTERM)
+print(session, child_died_of_sigterm, session.is_dir(), flush=True)
+os.kill(os.getpid(), signal.SIGTERM)
+signal.pause()
+'''
+
+
+def test_a_sigtermed_session_removes_its_temp_dir(tmp_path):
+    """SIGTERM removes the session directory with the per-run config
+    directories in it; a forked child's SIGTERM removes nothing; and a
+    day-old session directory a SIGKILLed run left is swept at import."""
+    stale = tmp_path / "eqt-sigkilled"
+    (stale / "equipa-claude-config-leaked").mkdir(parents=True)
+    _age(stale / "equipa-claude-config-leaked", DAY + 60)
+    _age(stale, DAY + 60)
+    env = {**os.environ, "TMPDIR": str(tmp_path)}
+
+    result = subprocess.run(
+        [sys.executable, "-c", _SIGTERMED_SESSION,
+         str(REPO_ROOT / "tests" / "conftest.py")],
+        capture_output=True, text=True, env=env, timeout=60)
+
+    assert result.returncode == -15, result.stdout + result.stderr
+    session, child_died_of_sigterm, kept_after_child = (
+        result.stdout.split())
+    assert Path(session).parent == tmp_path
+    assert child_died_of_sigterm == "True"
+    assert kept_after_child == "True", "a forked child removed the session dir"
+    assert not os.path.lexists(session), "SIGTERM left the session directory"
+    assert not stale.exists(), "the day-old session directory was not swept"
+    assert sorted(path.name for path in tmp_path.iterdir()) == []
+
+
+def test_only_day_old_session_dirs_of_this_user_are_swept(tmp_path,
+                                                          monkeypatch):
+    import conftest
+
+    old = tmp_path / "eqt-old"
+    old.mkdir()
+    _age(old, DAY + 60)
+    fresh = tmp_path / "eqt-fresh"
+    fresh.mkdir()
+    still_written = tmp_path / "eqt-still-written"
+    (still_written / "theforge-test.db").parent.mkdir()
+    (still_written / "theforge-test.db").write_text("x")
+    _age(still_written, DAY + 60)
+    other_prefix = tmp_path / "equipa-claude-config-old"
+    other_prefix.mkdir()
+    _age(other_prefix, DAY + 60)
+    old_file = tmp_path / "eqt-file"
+    old_file.write_text("x")
+    _age(old_file, DAY + 60)
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep")
+    link = tmp_path / "eqt-link"
+    link.symlink_to(target)
+    _age(link, DAY + 60)
+
+    assert conftest._sweep_stale_session_dirs(str(tmp_path)) == [str(old)]
+    for kept in (fresh, still_written, other_prefix, old_file, link):
+        assert os.path.lexists(kept), kept
+    assert (target / "keep.txt").read_text() == "keep"
+
+    foreign = tmp_path / "eqt-foreign"
+    foreign.mkdir()
+    _age(foreign, DAY + 60)
+    monkeypatch.setattr(conftest.os, "getuid", lambda: os.geteuid() + 1)
+    assert conftest._sweep_stale_session_dirs(str(tmp_path)) == []
+    assert foreign.exists()
+
+
 def test_no_test_imports_conftest_under_a_second_module_name():
     """A second copy of conftest re-runs its module body mid-session: a new
     session temp directory and a new THEFORGE_DB for every later test."""

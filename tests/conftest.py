@@ -10,9 +10,12 @@ Copyright 2026 Forgeborn
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Add parent directory (repo root) to path for imports
@@ -50,13 +53,65 @@ import pytest  # noqa: E402  (sys.path must be set before any equipa import)
 # in the temp directory, and the orchestrator scripts some tests SIGKILL never
 # remove theirs. So everything this session puts in the temp directory, in
 # this process and in every subprocess (they inherit TMPDIR), goes into one
-# private directory that pytest_unconfigure removes. Leftovers are never swept
-# from the shared temp directory instead: agents run this suite while the
-# orchestrator dispatches, and a live run's directory looks the same as a
-# leaked one. Set before the test DB below, so it lives inside it too and
-# _is_safe_test_db() judges against the same temp root.
+# private directory that pytest_unconfigure removes. Per-run config
+# directories are never swept from the shared temp directory instead: agents
+# run this suite while the orchestrator dispatches, and a live run's directory
+# looks the same as a leaked one. Set before the test DB below, so it lives
+# inside it too and _is_safe_test_db() judges against the same temp root.
+#
+# pytest_unconfigure never runs when the session is killed. The tester runs
+# the suite under `timeout`, whose SIGTERM is therefore handled below and
+# removes the session directory first. A SIGKILLed session's directory is
+# removed by the next session once it is a day old (only "eqt-" directories
+# of this user: no session lasts that long, so a live one is never taken).
 _ORIGINAL_TMP = tempfile.gettempdir()
-SESSION_TMP = Path(tempfile.mkdtemp(prefix="eqt-", dir=_ORIGINAL_TMP))
+_SESSION_TMP_PREFIX = "eqt-"
+STALE_SESSION_TMP_SECONDS = 24 * 3600
+
+
+def _sweep_stale_session_dirs(root: str,
+                              max_age_seconds: float = STALE_SESSION_TMP_SECONDS,
+                              now: float | None = None) -> list[str]:
+    """Remove the session temp directories killed sessions left in *root*.
+
+    Only real directories (never symlinks) named ``eqt-*``, owned by this
+    user, whose own mtime and every direct entry's mtime are older than
+    *max_age_seconds*. Returns the paths that were removed.
+    """
+    cutoff = (time.time() if now is None else now) - max_age_seconds
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(_SESSION_TMP_PREFIX):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            continue
+        newest = info.st_mtime
+        try:
+            with os.scandir(entry.path) as children:
+                for child in children:
+                    newest = max(newest,
+                                 child.stat(follow_symlinks=False).st_mtime)
+        except OSError:
+            continue
+        if newest > cutoff:
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+        if not os.path.lexists(entry.path):
+            removed.append(entry.path)
+    return removed
+
+
+_sweep_stale_session_dirs(_ORIGINAL_TMP)
+SESSION_TMP = Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX,
+                                    dir=_ORIGINAL_TMP))
 os.environ["TMPDIR"] = str(SESSION_TMP)
 tempfile.tempdir = str(SESSION_TMP)
 
@@ -326,6 +381,27 @@ def _remove_session_tmp() -> None:
     if SESSION_TMP.exists():
         print(f"  [conftest] WARNING: could not fully remove the session temp "
               f"directory {SESSION_TMP}", file=sys.stderr)
+
+
+# The process that owns SESSION_TMP. A child forked by a test inherits the
+# handler below but must never remove the session's directory.
+_SESSION_PID = os.getpid()
+
+
+def _remove_session_tmp_on_sigterm(signum, _frame) -> None:
+    """Remove SESSION_TMP, then die of the signal as if it were unhandled.
+
+    `timeout` stops a slow suite with SIGTERM, which skips
+    pytest_unconfigure, so the session directory (with the per-run Claude
+    config directories of the tests that ran) would stay behind.
+    """
+    if os.getpid() == _SESSION_PID:
+        _remove_session_tmp()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+signal.signal(signal.SIGTERM, _remove_session_tmp_on_sigterm)
 
 
 def pytest_unconfigure(config):
