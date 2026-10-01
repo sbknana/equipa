@@ -948,6 +948,8 @@ async def git_run_async(
     timeout: int = GIT_DEFAULT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     input: bytes | None = None,
+    *,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
     """Async equivalent of ``git_run`` — does NOT block the event loop.
 
@@ -958,6 +960,8 @@ async def git_run_async(
     ``git_run`` so call sites can be migrated incrementally. Applies the
     same hardening and ``env`` merging as ``git_run``. ``input``, when
     given, is written to git's stdin (e.g. for ``git patch-id``).
+    ``text=False`` returns ``stdout`` and ``stderr`` as the exact bytes git
+    wrote (e.g. blob content from ``git cat-file --batch``).
 
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
@@ -983,9 +987,14 @@ async def git_run_async(
         except ProcessLookupError:
             pass
         raise subprocess.TimeoutExpired(argv, timeout) from e
+    returncode = proc.returncode if proc.returncode is not None else -1
+    if not text:
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout_b, stderr=stderr_b,
+        )
     return subprocess.CompletedProcess(
         args=argv,
-        returncode=proc.returncode if proc.returncode is not None else -1,
+        returncode=returncode,
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
     )

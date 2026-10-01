@@ -146,6 +146,8 @@ class MergeAttempt:
     ``merged_sha`` is then still the approved commit (the merge's second
     parent) and ``post_head`` the resolution commit, which is what the gate
     records as merged: the regenerated content is part of what landed.
+    ``regenerated_blobs`` (task #3141) maps each of those paths to the blob
+    SHA of the verified generator output the resolution committed.
     """
 
     merged_sha: str | None = None
@@ -153,6 +155,7 @@ class MergeAttempt:
     post_head: str | None = None
     reason: str = ""
     regenerated_paths: tuple[str, ...] = ()
+    regenerated_blobs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -348,6 +351,7 @@ async def regenerated_resolution_problem(
     merged: MergedTree,
     resolved_tree: str,
     regenerated: frozenset[str],
+    expected_blobs: Mapping[str, str],
 ) -> str | None:
     """Why ``resolved_tree`` is not ``merged`` with only ``regenerated`` redone.
 
@@ -355,11 +359,20 @@ async def regenerated_resolution_problem(
     completed by regenerating them. The resolution may differ from the
     ``git merge-tree`` result in exactly those paths — every one of them a
     conflicted path and a regular file afterwards — and nowhere else.
+
+    Task #3141 (I-03): the content is bound too. ``expected_blobs`` maps each
+    regenerated path to the blob SHA of the verified generator output, and
+    the resolution must carry exactly that blob, not merely some regular file.
     """
     if not regenerated or merged.conflicted != regenerated:
         return (
             f"conflicted paths {sorted(merged.conflicted)} are not the "
             f"regenerated paths {sorted(regenerated)}"
+        )
+    if set(expected_blobs) != regenerated:
+        return (
+            f"verified content is known for {sorted(expected_blobs)}, not for "
+            f"the regenerated paths {sorted(regenerated)}"
         )
     differing = await changed_paths(repo, merged.tree, resolved_tree)
     if differing is None:
@@ -372,9 +385,20 @@ async def regenerated_resolution_problem(
             ["ls-tree", "-z", "--full-tree", resolved_tree, "--", path],
             repo, timeout=_GIT_TIMEOUT,
         )
-        mode_and_type = entry.stdout.split(" ", 2)[:2]
-        if entry.returncode != 0 or mode_and_type != ["100644", "blob"]:
+        meta, _, listed = entry.stdout.rstrip("\0").partition("\t")
+        fields = meta.split()
+        if (
+            entry.returncode != 0
+            or listed != path
+            or len(fields) != 3
+            or fields[:2] != ["100644", "blob"]
+        ):
             return f"regenerated {path} is not a regular file in the resolution"
+        if fields[2] != expected_blobs[path]:
+            return (
+                f"regenerated {path} is blob {_short(fields[2])}, not the "
+                f"verified generator output {_short(expected_blobs[path])}"
+            )
     return None
 
 
@@ -998,6 +1022,7 @@ class DefaultBranchGuard:
         *,
         post_head: str | None,
         regenerated_paths: tuple[str, ...] = (),
+        regenerated_blobs: Mapping[str, str] | None = None,
     ) -> bool:
         """Advance the chain after the orchestrator merged ``merged_sha``.
 
@@ -1016,7 +1041,10 @@ class DefaultBranchGuard:
         permitted difference from the ``merge-tree`` result is then those
         paths — which must be exactly its conflicted paths and regular files
         — see :func:`regenerated_resolution_problem`. A fast-forward never
-        carries regenerated files.
+        carries regenerated files. ``regenerated_blobs`` (task #3141, I-03)
+        maps each regenerated path to the blob SHA of the verified generator
+        output; the landed commit must carry exactly those blobs, and
+        regenerated paths without it are refused.
 
         Anything else means another writer moved the branch around the
         merge, and trips the guard.
@@ -1038,6 +1066,7 @@ class DefaultBranchGuard:
                     parents == [previous, merged_sha]
                     and await self._tree_is_merge_of(
                         current, previous, merged_sha, regenerated,
+                        regenerated_blobs,
                     )
                 )
         if not legitimate:
@@ -1064,6 +1093,7 @@ class DefaultBranchGuard:
         ours: str,
         theirs: str,
         regenerated: frozenset[str] = frozenset(),
+        regenerated_blobs: Mapping[str, str] | None = None,
     ) -> bool:
         """True when ``commit``'s tree is the merge of ``ours`` and ``theirs``.
 
@@ -1073,7 +1103,8 @@ class DefaultBranchGuard:
         clean and the trees identical: a conflicted or failed recomputation is
         not a match, the orchestrator's merge would not have succeeded. With
         ``regenerated`` (task #3131) the merge must conflict in exactly those
-        paths and ``commit`` may differ from the recomputed tree only there.
+        paths and ``commit`` may differ from the recomputed tree only there,
+        each holding the verified blob in ``regenerated_blobs`` (task #3141).
         """
         merged = await merged_tree(self.project_dir, ours, theirs)
         actual = await resolve_tree(self.project_dir, commit)
@@ -1082,6 +1113,7 @@ class DefaultBranchGuard:
         if regenerated:
             problem = await regenerated_resolution_problem(
                 self.project_dir, merged, actual, regenerated,
+                regenerated_blobs or {},
             )
             if problem:
                 logger.error(
