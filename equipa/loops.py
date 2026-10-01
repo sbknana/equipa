@@ -3893,7 +3893,8 @@ def _backstop_masked(
 
     The footer is the last one the parser's footer scan finds, with the
     gate's marker-comment lines read as blank (R3137-03). Its MEDIUM label
-    is lowered whatever its shape (MEDIUM never blocks a merge).
+    is lowered whatever its shape: it is the MEDIUM count the backstop
+    compares the other MEDIUM words with, and MEDIUM keeps its exemptions.
     """
     blanked = _STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text)
     labels = [(offset, severity) for offset, severity in label_offsets

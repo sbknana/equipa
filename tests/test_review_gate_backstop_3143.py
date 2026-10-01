@@ -286,7 +286,7 @@ def test_footer_covering_heading_less_findings_merges():
     ["Kept at LOW rather than MEDIUM."],
 ])
 def test_tallies_and_negations_merge(body):
-    """MEDIUM keeps its tally and negation exemptions (it never blocks)."""
+    """MEDIUM keeps its tally and negation exemptions (task 3152)."""
     assert_merges(body)
 
 
