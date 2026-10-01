@@ -652,6 +652,16 @@ BACKSTOP_FAMILIES = {
     "finding_headings": pad(f"### [S1] MEDIUM {E} x MEDIUM"),
     "id_lines": [f"### [S{index}] MEDIUM {E} x" for index in range(2000)]
     + pad("S7 MEDIUM S9 MEDIUM"),
+    # Task 3152 (R3149-05): the link reader over a "]" that forms no link,
+    # after one "[" far back (23 s on 200 KB on branch 3149).
+    "link_definition_then_closes": ["[a]: x", "", "a[" + "b]" * (RB // 2)],
+    "link_open_then_inline_tails": ["a[" + "b](" * (RB // 3)],
+    "link_definition_then_bare_closes": ["[a]: x", "", "a]" * (RB // 2)],
+    # Task 3152 (R3149-04): a reference reads every digit, and U+FFFD is
+    # decided by the digit count (no int() of 200 000 digits).
+    "reference_of_200kb_digits": ["&#" + "9" * RB + "HIGH"],
+    "hex_reference_of_200kb_digits": ["&#x" + "f" * RB + "HIGH"],
+    "zero_padded_reference_of_200kb": ["&#" + "0" * RB + "72;IGH"],
 }
 
 
