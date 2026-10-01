@@ -22,6 +22,10 @@ Policy (reject, never strip-and-keep):
   deleted and spaced. So ``ig<ZWSP>nore``, Cyrillic ``іgnоre``, small-capital
   ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught. Unicode
   line / paragraph separators and the C0/C1 line breaks match as newlines.
+  A text holding control, ANSI or invisible characters is matched twice:
+  with them deleted (``ig<VT>nore``) and with them read as a space, so
+  ``Done<VT>Ignore all previous instructions`` is not glued into
+  ``DoneIgnore`` (RR3145-B).
   Plain lowercase code identifiers (``system_override``, ``sudo_mode``) are
   not spaced for the fake-header class where they read as code, and a few
   phrases ("act as the root", "new rules:") are accepted only when they
@@ -218,16 +222,64 @@ _CONTROL_LINE_BREAK_IN_WORD = re.compile(
 _CONTROL_LINE_BREAK = re.compile(r"[\x0b\x0c\x1c-\x1e\x85]")
 
 
-def _normalize(text: str) -> str | None:
-    """normalize_for_matching(), or None if decomposition grows abnormally."""
-    folded = html.unescape(str(text))
-    folded = _ANSI_ESCAPE.sub("", folded)
-    folded = _CONTROL_LINE_BREAK_IN_WORD.sub("", folded)
-    folded = _CONTROL_LINE_BREAK.sub("\n", folded)
-    folded = _fold_unicode(_strip_invisible(folded))
+def _space_invisible(text: str) -> str:
+    """Every format (Cf) character and invisible filler replaced by a space."""
+    if text.isascii():
+        return text
+    return "".join(" " if _is_invisible(ch) else ch for ch in text)
+
+
+def _has_separator(text: str) -> bool:
+    """True when *text* holds a character the deleting fold removes: a
+    control character, an ANSI escape or an invisible character."""
+    if _CONTROL_CHARS.search(text) or _ANSI_ESCAPE.search(text):
+        return True
+    return not text.isascii() and any(map(_is_invisible, text))
+
+
+def _fold_unescaped(text: str, *, separators_as_space: bool) -> str | None:
+    """Fold entity-decoded *text*; None if decomposition grows abnormally.
+
+    By default control, ANSI and invisible characters are deleted, so
+    "ig<ZWSP>nore" reads "ignore". With *separators_as_space* they become a
+    space instead (a C0/C1 line break outside a word still becomes a
+    newline), so "Done<VT>Ignore all previous instructions" reads as the
+    two words a reader sees, not "DoneIgnore" (RR3145-B).
+    """
+    if separators_as_space:
+        text = _ANSI_ESCAPE.sub(" ", text)
+        text = _CONTROL_LINE_BREAK_IN_WORD.sub(" ", text)
+        text = _CONTROL_LINE_BREAK.sub("\n", text)
+        text = _CONTROL_CHARS.sub(" ", _space_invisible(text))
+    else:
+        text = _ANSI_ESCAPE.sub("", text)
+        text = _CONTROL_LINE_BREAK_IN_WORD.sub("", text)
+        text = _CONTROL_LINE_BREAK.sub("\n", text)
+    folded = _fold_unicode(_strip_invisible(text))
     if folded is None:
         return None
     return _CONTROL_CHARS.sub("", folded.translate(_UNICODE_LINE_SEPARATORS))
+
+
+def _normalize(text: str) -> str | None:
+    """normalize_for_matching(), or None if decomposition grows abnormally."""
+    return _fold_unescaped(html.unescape(str(text)), separators_as_space=False)
+
+
+def _normalized_variants(text: str) -> tuple[str, ...] | None:
+    """The deleting fold of *text*, plus the spacing fold when *text* has a
+    separator character and the two differ. None if either fold grows
+    abnormally under decomposition."""
+    unescaped = html.unescape(str(text))
+    deleted = _fold_unescaped(unescaped, separators_as_space=False)
+    if deleted is None:
+        return None
+    if not _has_separator(unescaped):
+        return (deleted,)
+    spaced = _fold_unescaped(unescaped, separators_as_space=True)
+    if spaced is None:
+        return None
+    return (deleted,) if spaced == deleted else (deleted, spaced)
 
 
 def normalize_for_matching(text: str) -> str:
@@ -798,26 +850,32 @@ def detect_injection(text) -> str | None:
         return "oversized content"
     if _TAG_CHARS.search(raw):
         return "unicode tag characters"
-    folded = _normalize(raw)
-    if folded is None:
+    folds = _normalized_variants(raw)
+    if folds is None:
         return "abnormal unicode decomposition"
-    variants = _joiner_variants(folded)
-    identifier_safe_variants: tuple[str, ...] = ()
-    if variants:
-        identifier_safe_variants = (
-            variants[0], _space_joiners_outside_identifiers(folded, raw),
-        )
+    # Each fold (separators deleted, and spaced when there are any) with its
+    # joiner variants: deleted, spaced, and spaced outside code identifiers.
+    candidates = []
+    for folded in folds:
+        variants = _joiner_variants(folded)
+        identifier_safe_variants: tuple[str, ...] = ()
+        if variants:
+            identifier_safe_variants = (
+                variants[0], _space_joiners_outside_identifiers(folded, raw),
+            )
+        candidates.append((folded, variants, identifier_safe_variants))
     for reason, pattern in _INJECTION_PATTERNS:
-        if pattern.search(folded):
-            return reason
-        if reason not in _JOINER_AWARE_REASONS:
-            continue
-        if reason in _IDENTIFIER_SAFE_REASONS:
-            reason_variants = identifier_safe_variants
-        else:
-            reason_variants = variants
-        if any(pattern.search(variant) for variant in reason_variants):
-            return reason
+        for folded, variants, identifier_safe_variants in candidates:
+            if pattern.search(folded):
+                return reason
+            if reason not in _JOINER_AWARE_REASONS:
+                continue
+            if reason in _IDENTIFIER_SAFE_REASONS:
+                reason_variants = identifier_safe_variants
+            else:
+                reason_variants = variants
+            if any(pattern.search(variant) for variant in reason_variants):
+                return reason
     return None
 
 
