@@ -876,14 +876,19 @@ _SUBSTITUTION_LOOKALIKE_RE = re.compile(
 # Each was checked against bash 5.2 (IND3128-03, IV3133-01). Matched on the
 # command with quotes and backslashes deleted (`l'e't` is `let`); a spurious
 # match only means a quoted look-alike is no longer trusted. The integer
-# specials are every assignable integer variable of a fresh bash: BASHPID
-# ignores a plain assignment but evaluates `BASHPID+=` (R3146-03), and
-# tests/test_bash_tokenizer_3128.py reads the list from `declare -p` in the
-# bash running the suite, so a missing or newly added name fails there.
+# specials are every assignable integer variable of a fresh bash, script or
+# interactive: BASHPID ignores a plain assignment but evaluates `BASHPID+=`
+# (R3146-03), SECONDS turns integer the first time it is computed, so
+# `SECONDS+=` evaluates even in a fresh bash, and an interactive bash makes
+# MAILCHECK integer (F1, task 3155). tests/test_bash_tokenizer_3128.py reads
+# the names with `compgen -v` and `declare -p NAME` from both kinds of bash
+# running the suite, and runs every assignment form on every variable in a
+# fresh bash, so a missing or newly added name fails there.
 _EVALUATES_TEXT_RE = re.compile(
     r"=\(|\$\[|\$\{!|\$\{#?(?:\w+|[@*])(?:\[|:(?![-=?+])|@P)"
     r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|readarray"
-    r"|mapfile|BASHPID|HISTCMD|OPTIND|S?RANDOM|PS[0-4]|PROMPT_COMMAND)(?![\w.-])"
+    r"|mapfile|BASHPID|HISTCMD|OPTIND|S?RANDOM|SECONDS|MAILCHECK|PS[0-4]"
+    r"|PROMPT_COMMAND)(?![\w.-])"
 )
 
 # Builtins that evaluate a subscript only in a variable NAME they are given:

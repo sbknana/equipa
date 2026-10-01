@@ -689,7 +689,8 @@ SUBSTITUTION_PRELUDE = (
 # integer attribute makes bash evaluate the value as arithmetic, which
 # expands an array subscript in it again. Check 26 names those variables by
 # hand; these statements put every integer variable of the bash running the
-# tests (read from `declare -p`, below) in each assignment position, so bash
+# tests (read with `compgen -v` and `declare -p NAME` from a non-interactive
+# and an interactive bash, below) in each assignment position, so bash
 # decides which of them run the marker. NAME is replaced by the variable.
 INTEGER_NAME = "\x03"
 INTEGER_ASSIGNMENT_LINES = 200
@@ -705,46 +706,117 @@ INTEGER_ASSIGNMENTS = [
     f"xa='a[{OPENER}$({MARKER})]'; (( {INTEGER_NAME} += xa ))",
     f"read {INTEGER_NAME} <<< 'a[{OPENER}$({MARKER})]'",
     f"printf -v {INTEGER_NAME} '%s' 'a[{OPENER}$({MARKER})]'",
+    # Task 3155 (F1): the loop variable is assigned like any other.
+    f"for {INTEGER_NAME} in 'a[{OPENER}$({MARKER})]'; do :; done",
 ]
 
-# `declare -p` prints one `declare -<attributes> NAME[=value]` line per
-# variable; `--` means no attributes. The values in a fresh bash are one line.
+# `declare -p NAME` prints `declare -<attributes> NAME[=value]`; `--` means no
+# attributes. A value may span lines (IFS holds a newline), so only line
+# starts that name the variable asked about count.
 _DECLARE_LINE_RE = re.compile(r"declare -(\S+) ([A-Za-z_]\w*)(?==|$)")
+
+# What an interactive bash without a terminal prints on startup; nothing else
+# on stderr is expected from it.
+_INTERACTIVE_STARTUP_NOISE = (
+    "bash: cannot set terminal process group",
+    "bash: no job control in this shell",
+)
 
 
 @dataclass(frozen=True)
 class IntegerVariables:
-    """The integer variables of a fresh bash, by whether they are readonly."""
+    """The variables of a fresh bash: every name `compgen -v` lists, and the
+    integer ones by whether they are readonly."""
     assignable: tuple[str, ...]
     readonly: tuple[str, ...]
+    names: tuple[str, ...] = ()
+
+    def __or__(self, other: "IntegerVariables") -> "IntegerVariables":
+        return IntegerVariables(
+            tuple(sorted(set(self.assignable) | set(other.assignable))),
+            tuple(sorted(set(self.readonly) | set(other.readonly))),
+            tuple(sorted(set(self.names) | set(other.names))),
+        )
 
 
-def _bash_integer_variables(directory: Path) -> IntegerVariables:
-    """Read the integer variables of the bash that runs the tests.
-
-    Only `declare -p` runs, with nothing on PATH, in a scratch directory.
-    """
-    bash = _require_bash()
-    script = directory / "declare.sh"
-    script.write_text("declare -p\n", encoding="utf-8")
-    proc = subprocess.run(
-        [bash, "--norc", "--noprofile", str(script)],
+def _sentinel_bash(
+    directory: Path, script: Path, interactive: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run *script* in a fresh bash: nothing on PATH, cwd and HOME (where an
+    interactive bash keeps its history file) in the scratch *directory*."""
+    argv = [_require_bash(), "--norc", "--noprofile"]
+    if interactive:
+        argv.append("-i")
+    return subprocess.run(
+        [*argv, str(script)],
         capture_output=True, timeout=20, cwd=directory,
-        env={"PATH": "/nonexistent", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL,
+        env={"PATH": "/nonexistent", "LC_ALL": "C", "HOME": str(directory)},
     )
-    assert proc.returncode == 0 and proc.stderr == b"", proc.stderr[:500]
-    assignable, readonly = [], []
+
+
+def _unexpected_stderr(proc: subprocess.CompletedProcess, interactive: bool) -> list[str]:
+    lines = proc.stderr.decode("utf-8", errors="replace").splitlines()
+    if interactive:
+        lines = [
+            line for line in lines
+            if not line.startswith(_INTERACTIVE_STARTUP_NOISE)
+        ]
+    return lines
+
+
+def _bash_integer_variables(directory: Path, interactive: bool = False) -> IntegerVariables:
+    """Read the variables of the bash that runs the tests.
+
+    The names come from `compgen -v`; the attributes from `declare -p NAME`,
+    one name at a time. A bare `declare -p` is not enough: it prints dynamic
+    variables without computing them, and SECONDS gets its integer attribute
+    only when computed (`declare -- SECONDS`, but `declare -i SECONDS="0"`).
+    Only the two builtins run, with nothing on PATH, in a scratch directory.
+    """
+    script = directory / "names.sh"
+    script.write_text("compgen -v\n", encoding="utf-8")
+    proc = _sentinel_bash(directory, script, interactive)
+    assert proc.returncode == 0, proc.stderr[:500]
+    assert _unexpected_stderr(proc, interactive) == [], proc.stderr[:500]
+    names = proc.stdout.decode("utf-8", errors="replace").split()
+    assert all(re.fullmatch(r"[A-Za-z_]\w*", name) for name in names), names
+
+    script.write_text("".join(f"declare -p {name}\n" for name in names), encoding="utf-8")
+    proc = _sentinel_bash(directory, script, interactive)
+    assert proc.returncode == 0, proc.stderr[:500]
+    assert _unexpected_stderr(proc, interactive) == [], proc.stderr[:500]
+    assignable, readonly = set(), set()
     for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
         found = _DECLARE_LINE_RE.match(line)
-        if found is None or "i" not in found.group(1):
+        if found is None or found.group(2) not in names or "i" not in found.group(1):
             continue
-        (readonly if "r" in found.group(1) else assignable).append(found.group(2))
-    return IntegerVariables(tuple(sorted(assignable)), tuple(sorted(readonly)))
+        (readonly if "r" in found.group(1) else assignable).add(found.group(2))
+    return IntegerVariables(
+        tuple(sorted(assignable)), tuple(sorted(readonly)), tuple(sorted(names)),
+    )
 
 
 @pytest.fixture(scope="module")
-def bash_integer_variables(tmp_path_factory: pytest.TempPathFactory) -> IntegerVariables:
-    return _bash_integer_variables(tmp_path_factory.mktemp("bash-integers"))
+def bash_shell_variables(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[bool, IntegerVariables]:
+    """The variables of a non-interactive (False) and an interactive (True)
+    bash; an interactive one adds MAILCHECK and the history variables."""
+    return {
+        interactive: _bash_integer_variables(
+            tmp_path_factory.mktemp("bash-integers"), interactive,
+        )
+        for interactive in (False, True)
+    }
+
+
+@pytest.fixture(scope="module")
+def bash_integer_variables(
+    bash_shell_variables: dict[bool, IntegerVariables],
+) -> IntegerVariables:
+    """Every variable of either kind of bash."""
+    return bash_shell_variables[False] | bash_shell_variables[True]
 
 
 def _integer_assignment_statements(names: tuple[str, ...]) -> list[str]:
@@ -821,24 +893,39 @@ def _lookalikes_by_original_index(line: str) -> dict[int, "bash_security._Lookal
     }
 
 
-def _run_substitution_lines(directory: Path, lines: list[str]) -> set[int]:
+def _run_substitution_lines(
+    directory: Path, lines: list[str], interactive: bool = False,
+) -> set[int]:
     """Run *lines* after the sentinel prelude; return the markers bash ran."""
-    bash = _require_bash()
     script = directory / "substitutions.sh"
     script.write_text(
         SUBSTITUTION_PRELUDE + "".join(line + "\n" for line in lines),
         encoding="utf-8",
     )
-    proc = subprocess.run(
-        [bash, "--norc", "--noprofile", str(script)],
-        capture_output=True, timeout=20, cwd=directory,
-        env={"PATH": "/nonexistent", "LC_ALL": "C"},
-    )
+    proc = _sentinel_bash(directory, script, interactive)
     # Arithmetic on literal apostrophes is an expansion error in bash; it
     # aborts only that line. Anything else on stderr is a generator bug.
-    for message in proc.stderr.decode(errors="replace").splitlines():
+    for message in _unexpected_stderr(proc, interactive):
         assert "syntax error" in message and "error token" in message, message
     return {int(n) for n in (directory / "marks.txt").read_text().split()}
+
+
+def _run_lines_in_fresh_bashes(
+    directory: Path, lines: list[str], interactive: bool,
+) -> set[int]:
+    """Run each of *lines* after the sentinel prelude in a bash of its own, so
+    no line sees what an earlier one did to a variable (SECONDS is integer
+    only once computed); return the markers bash ran. The lines assign every
+    variable bash has, so errors such as `readonly variable` or a refused
+    locale are expected; a parse error means a generator bug."""
+    script = directory / "line.sh"
+    for line in lines:
+        script.write_text(SUBSTITUTION_PRELUDE + line + "\n", encoding="utf-8")
+        proc = _sentinel_bash(directory, script, interactive)
+        for message in _unexpected_stderr(proc, interactive):
+            assert "unexpected" not in message, (line, message)
+    marks = directory / "marks.txt"
+    return {int(n) for n in marks.read_text().split()} if marks.exists() else set()
 
 
 def _assert_ran_markers_are_refused(
@@ -866,47 +953,83 @@ def test_substitutions_bash_runs_are_never_proven_inert(
 ):
     corpus = _substitution_corpus(seed)
     # Task 3151 (R3146-03): integer-variable assignments mixed with the word
-    # templates, appended so the corpus above stays exactly as it was.
-    corpus += _substitution_corpus(
+    # templates, appended so the corpus above stays exactly as it was. Task
+    # 3155 (F1): the names are those of both kinds of bash (SECONDS, and
+    # MAILCHECK of an interactive one), and the lines run in both.
+    integer_corpus = _substitution_corpus(
         seed + 3151,
         _integer_assignment_statements(bash_integer_variables.assignable),
         lines=INTEGER_ASSIGNMENT_LINES,
         first_marker=sum(len(markers) + 1 for _, markers in corpus) + 1,
     )
+    corpus += integer_corpus
     start = time.perf_counter()
     ran = _run_substitution_lines(tmp_path, [line for line, _ in corpus])
+    interactive_directory = tmp_path / "interactive"
+    interactive_directory.mkdir()
+    ran_interactive = _run_substitution_lines(
+        interactive_directory, [line for line, _ in integer_corpus], interactive=True,
+    )
 
     ran_seen, inert_seen = _assert_ran_markers_are_refused(corpus, ran)
+    ran_seen_interactive, _ = _assert_ran_markers_are_refused(
+        integer_corpus, ran_interactive,
+    )
     # The corpus exercises both sides of the property.
     assert ran_seen >= 150, ran_seen
     assert inert_seen >= 40, inert_seen
+    assert ran_seen_interactive >= 40, ran_seen_interactive
     assert time.perf_counter() - start < 20
 
 
+@pytest.mark.parametrize("interactive", [False, True], ids=["script", "interactive"])
 def test_bash_integer_variables_are_read_from_bash(
-    bash_integer_variables: IntegerVariables,
+    bash_shell_variables: dict[bool, IntegerVariables], interactive: bool,
 ):
-    """The `declare -p` parse finds the integer variables bash has had since
-    4.x, so an empty or broken parse cannot make the next test vacuous."""
-    assert {"OPTIND", "RANDOM"} <= set(bash_integer_variables.assignable)
-    assert "UID" in bash_integer_variables.readonly
+    """The `compgen -v` + `declare -p NAME` parse finds the integer variables
+    bash has had since 4.x, so an empty or broken parse cannot make the next
+    tests vacuous. SECONDS is integer only once computed, which a bare
+    `declare -p` never does (F1); MAILCHECK is integer in an interactive
+    bash only."""
+    variables = bash_shell_variables[interactive]
+    assert {"OPTIND", "RANDOM", "SECONDS"} <= set(variables.assignable)
+    assert "UID" in variables.readonly
+    assert {"PATH", "IFS", "SECONDS", "UID"} <= set(variables.names)
+    assert ("MAILCHECK" in variables.assignable) == interactive
+    assert set(variables.assignable) | set(variables.readonly) <= set(variables.names)
 
 
+@pytest.mark.parametrize("interactive", [False, True], ids=["script", "interactive"])
 def test_check_26_names_every_assignable_integer_variable_of_this_bash(
-    bash_integer_variables: IntegerVariables,
+    bash_shell_variables: dict[bool, IntegerVariables], interactive: bool,
 ):
-    """R3146-03: the hand-kept list in _EVALUATES_TEXT_RE must cover every
-    integer variable the running bash lets a command assign (BASHPID was
+    """R3146-03, F1: the hand-kept list in _EVALUATES_TEXT_RE must cover every
+    integer variable the running bash lets a command assign, in a script and
+    in an interactive shell (BASHPID, then SECONDS and MAILCHECK were
     missing); a newer bash that adds one fails here, not in production."""
     missing = [
-        name for name in bash_integer_variables.assignable
+        name for name in bash_shell_variables[interactive].assignable
         if bash_security._evaluating_construct(f"{name}+=1") != repr(name)
     ]
     assert missing == [], f"check 26 does not count assignments to {missing}"
 
 
+def test_check_26_names_the_integer_specials_bash_computes():
+    """F1: the dynamic integer variables that a bare `declare -p` shows
+    without the integer attribute, and the interactive-only MAILCHECK, are
+    on the list whatever the bash running the suite reports."""
+    for name in ("SECONDS", "MAILCHECK", "BASHPID", "HISTCMD", "OPTIND",
+                 "RANDOM", "SRANDOM"):
+        for command in (f"{name}+='a[$(id)]'", f"{name}='a[$(id)]' p",
+                        f"for {name} in 'a[$(id)]'; do :; done"):
+            assert bash_security._evaluating_construct(command) == repr(name), command
+            assert not check_bash_command(command).safe, command
+
+
+@pytest.mark.parametrize("interactive", [False, True], ids=["script", "interactive"])
 def test_integer_variable_assignments_bash_runs_are_never_proven_inert(
-    tmp_path: Path, bash_integer_variables: IntegerVariables,
+    tmp_path: Path, bash_shell_variables: dict[bool, IntegerVariables],
+    interactive: bool,
 ):
     """R3146-03, exhaustively: every assignment form on every integer
     variable of this bash, one per line, with a top-level single-quoted
@@ -915,11 +1038,12 @@ def test_integer_variable_assignments_bash_runs_are_never_proven_inert(
     proven inert and its line is refused. Readonly variables are run too
     (their `readonly variable` errors silenced), so a bash that evaluated
     before refusing the assignment would fail here."""
+    variables = bash_shell_variables[interactive]
     corpus: list[tuple[str, list[tuple[int, int]]]] = []
     marker = 1
     for names, readonly in (
-        (bash_integer_variables.assignable, False),
-        (bash_integer_variables.readonly, True),
+        (variables.assignable, False),
+        (variables.readonly, True),
     ):
         for statement in _integer_assignment_statements(names):
             prefix = "{ " if readonly else ""
@@ -927,12 +1051,53 @@ def test_integer_variable_assignments_bash_runs_are_never_proven_inert(
             line = prefix + text + ("; } 2>/dev/null" if readonly else "") + "; p"
             corpus.append((line, [(marker, opener)]))
             marker += 1
-    ran = _run_substitution_lines(tmp_path, [line for line, _ in corpus])
+    ran = _run_substitution_lines(tmp_path, [line for line, _ in corpus], interactive)
 
     ran_seen, _inert_seen = _assert_ran_markers_are_refused(corpus, ran)
     # `NAME+=` evaluates for every assignable integer variable, so the
     # corpus does exercise the property.
-    assert ran_seen >= len(bash_integer_variables.assignable), ran_seen
+    assert ran_seen >= len(variables.assignable), ran_seen
+
+
+@pytest.mark.parametrize("interactive", [False, True], ids=["script", "interactive"])
+def test_every_variable_assignment_bash_runs_in_a_fresh_bash_is_refused(
+    tmp_path: Path, bash_shell_variables: dict[bool, IntegerVariables],
+    interactive: bool,
+):
+    """F1, without trusting the attribute parse: every assignment form on
+    EVERY variable `compgen -v` lists, each line in a bash of its own, as an
+    agent's command would run. In a fresh bash `SECONDS+='a[$(m 1)]'` runs
+    the marker while `declare -p` alone shows no integer attribute; any
+    special variable whose assignment evaluates its value, integer or not,
+    must make check 26 refuse the line."""
+    variables = bash_shell_variables[interactive]
+    corpus: list[tuple[str, list[tuple[int, int]]]] = []
+    # The marker of each line whose form evaluates only through the variable
+    # (not `declare -i`, `let` or `((`, which evaluate whatever the name).
+    name_of_marker: dict[int, str] = {}
+    marker = 1
+    for name in variables.names:
+        for template in INTEGER_ASSIGNMENTS:
+            text, opener = _fill(template.replace(INTEGER_NAME, name), "", marker)
+            corpus.append((text + "; p", [(marker, opener)]))
+            if not template.startswith(("declare -i", "let", "xa=")):
+                name_of_marker[marker] = name
+            marker += 1
+    start = time.perf_counter()
+    ran = _run_lines_in_fresh_bashes(tmp_path, [line for line, _ in corpus], interactive)
+
+    _assert_ran_markers_are_refused(corpus, ran)
+    names_that_ran = {name_of_marker[m] for m in ran if m in name_of_marker}
+    unlisted = sorted(
+        name for name in names_that_ran
+        if bash_security._evaluating_construct(f"{name}+=1") != repr(name)
+    )
+    assert unlisted == [], f"bash evaluates assignments to {unlisted}, check 26 does not count them"
+    # SECONDS evaluates in a fresh bash of either kind, MAILCHECK in an
+    # interactive one; the run is not vacuous.
+    assert "SECONDS" in names_that_ran, sorted(names_that_ran)
+    assert ("MAILCHECK" in names_that_ran) == interactive, sorted(names_that_ran)
+    assert time.perf_counter() - start < 60
 
 
 def test_substitution_corpus_exercises_every_template():
