@@ -3227,7 +3227,7 @@ def _backstop_translated(text: str) -> str:
     return _BACKSTOP_ASCII_CONTROLS_RE.sub("", text)
 
 
-# --- Task 3154: the separated reading (I3152-01, I3152-02) ----------------------
+# --- Task 3154: the separated reading (I3152-01, I3152-02) ---------------
 
 def _backstop_same_letter(folded: str, letter: str) -> bool:
     """True when the other views' fold ``folded`` reads as ``letter``."""
@@ -3346,10 +3346,9 @@ def _backstop_separated_text(text: str) -> str | None:
 
 
 def _backstop_is_fold_mark(char: str) -> bool:
-    code_point = ord(char)
-    return (_BACKSTOP_FOLD_MARK + 0x41 <= code_point <= _BACKSTOP_FOLD_MARK + 0x7A
-            or _BACKSTOP_NEW_FOLD_MARK + 0x41 <= code_point
-            <= _BACKSTOP_NEW_FOLD_MARK + 0x7A)
+    """True for a FOLD or NEW_FOLD mark (an ASCII letter's offset)."""
+    offset = ord(char) - _BACKSTOP_FOLD_MARK
+    return 0x41 <= offset % 0x100 <= 0x7A and offset // 0x100 in (0, 1)
 
 
 def _backstop_mark_separates(view: str, index: int, step: int) -> bool:
@@ -3377,8 +3376,8 @@ def _backstop_separated_counts(word: str, view: str, start: int,
     mark separates it from a neighbour, or a lookalike only this reading
     folds spells it. A word that is standalone anyway (a counted label
     next to a zero-width space) is the other views' to count."""
-    if any(_BACKSTOP_NEW_FOLD_MARK <= ord(char) <= _BACKSTOP_NEW_FOLD_MARK + 0xFF
-           for char in word):
+    new_folds = range(_BACKSTOP_NEW_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK + 0x100)
+    if any(ord(char) in new_folds for char in word):
         return True
     return (_backstop_mark_separates(view, start - 1, -1)
             or _backstop_mark_separates(view, end, 1))
@@ -3895,7 +3894,8 @@ def _backstop_tokens(
     newlines: list[int] | None = None
     previous: tuple[int, int, int] | None = None
     classified = 0
-    token_re = _BACKSTOP_SEPARATED_TOKEN_RE if separated else _BACKSTOP_TOKEN_RE
+    token_re = (_BACKSTOP_SEPARATED_TOKEN_RE if separated
+                else _BACKSTOP_TOKEN_RE)
     for match in token_re.finditer(view):
         start, end = match.span()
         if start and view[start - 1] in _BACKSTOP_ASCII_ALNUM:
