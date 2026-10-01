@@ -371,12 +371,21 @@ def _joiner_variants(folded: str) -> tuple[str, ...]:
 # group at every character: 0.2-0.3 s per MB of whitespace, and "\s" in that
 # anchor group was the quadratic of review N1.
 _IMPERATIVE_LOOKBACK = 64
-# A clause starts after a line break or sentence punctuation. Unicode line
-# separators are already newlines here (see _normalize).
-_CLAUSE_BREAKS = "\n\r.!?:;,"
-# A word, keeping contractions whole: "don't", "here's".
-_LEAD_WORD = re.compile(r"\w+(?:'\w+)*")
-_APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'"})
+# A clause starts after a line break or sentence punctuation. The table maps
+# each of those to "\n" (Unicode line separators are already newlines after
+# _normalize, but search() may also see raw text) and typographic
+# apostrophes to "'", so "don’t" reads as "don't". One translate plus
+# str.split() per look-back: a regex tokenizer cost twice as much.
+_CLAUSE_TABLE = str.maketrans({
+    **dict.fromkeys(".!?:;,\r  ", "\n"),
+    "’": "'",
+    "ʼ": "'",
+})
+# Marks around a word that are not part of it: quotes, brackets, emphasis,
+# list and heading marks ("1)", "**Okay**", "(the").
+_WORD_EDGE_MARKS = "\"'`()[]{}<>*#_~|=+/\\-"
+# _is_instruction_lead() looks at most this many words back.
+_LEAD_WORDS = 4
 
 # "the CA will act as the root CA", "how to act as the root of trust". After
 # "you" (up to two words back) they are an order: "you must act as root",
@@ -472,10 +481,12 @@ class _ImperativePhrase:
     @staticmethod
     def _opens_instruction(text: str, start: int) -> bool:
         window = text[max(0, start - _IMPERATIVE_LOOKBACK):start]
-        clause_start = max(window.rfind(mark) for mark in _CLAUSE_BREAKS) + 1
-        clause = window[clause_start:].translate(_APOSTROPHES)
-        words = [word.lower() for word in _LEAD_WORD.findall(clause)]
-        return _is_instruction_lead(words)
+        clause = window.translate(_CLAUSE_TABLE).rpartition("\n")[2].lower()
+        tokens = (
+            token.strip(_WORD_EDGE_MARKS)
+            for token in clause.split()[-_LEAD_WORDS:]
+        )
+        return _is_instruction_lead([word for word in tokens if word])
 
     def search(self, text: str) -> re.Match[str] | None:
         position = 0
