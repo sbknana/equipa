@@ -715,7 +715,14 @@ installs nothing yet, checks the two pinned wheels against the hashes PyPI
 publishes, writes a lock file that holds every file's hash, scans that,
 and only then installs exactly the scanned files, offline:
 
+The recipe runs in its own `bash` with `set -euo pipefail`, so a `FAILED`
+from `sha256sum -c`, a finding from the scanner or any other failing step
+stops it before anything is installed (review SR3147-04); pasting the
+lines into an interactive shell one by one would carry on past them.
+
 ```bash
+bash <<'RECIPE'
+set -euo pipefail
 python3 -m venv /opt/equipa-mcp
 install -d -m 0700 /root/equipa-mcp-wheels && cd /root/equipa-mcp-wheels
 # 1. Download, install nothing. mcp is pinned too: mcp-server-sqlite
@@ -743,6 +750,7 @@ pip-audit --disable-pip --require-hashes -r requirements.lock
 /opt/equipa-mcp/bin/pip check
 install -m 0644 requirements.lock /opt/equipa-mcp/requirements.lock
 chmod -R go-w /opt/equipa-mcp && chmod -R o+rX /opt/equipa-mcp
+RECIPE
 ```
 
 To upgrade, change the pins, repeat every step, and keep the new
@@ -804,32 +812,69 @@ partition, or a fixed-size image mounted there, for example a 20 GiB ext4
 image) so a unit cannot fill `/` and break the orchestrator or TheForge.
 
 Each unit's TMPDIR is its own (`.../<unit>/tmp`, mode 0700) and lies on
-that filesystem. A scope cannot take systemd's `PrivateTmp=`, so the shared
-`/tmp` and `/var/tmp` stay writable to every user, and an agent that writes
-`/var/tmp/x` instead of `$TMPDIR/x` fills `/`. Close them to the agent user
-(it has its TMPDIR) with a tmpfiles.d ACL, which also survives the tmpfs
-`/tmp` being re-created at boot:
+that filesystem. **The unit is a `systemd-run --user --scope`, and a scope
+cannot take systemd's `PrivateTmp=`, `PrivateDevices=`, a `TemporaryFileSystem=`
+for `/dev/shm` or `InaccessiblePaths=`** (they are execution settings of a
+service; the launch path would have to become a system service started as
+the agent user, which the narrow sudoers rule of step 5 does not allow). So
+the shared world-writable directories stay writable to every user, and an
+agent that writes `/var/tmp/x` instead of `$TMPDIR/x` fills `/`. Close them
+to the agent user on the host instead (review SR3147-01).
+
+The ACL of `/tmp` is not recursive: with search permission left on `/tmp`,
+the agent could still write the 1777 directories below it that systemd
+re-creates at every boot (`/tmp/.X11-unix`, `/tmp/.ICE-unix`,
+`/tmp/.XIM-unix`, `/tmp/.font-unix`), all of them on `/`. So give the agent
+user **no** permission at all on `/tmp`, `/var/tmp` and `/var/crash`
+(another 1777 directory on `/`): nothing below them is reachable then,
+whatever its name. A tmpfiles.d ACL also survives the tmpfs `/tmp` being
+re-created at boot:
 
 ```bash
-printf '%s\n' 'a+ /tmp     - - - - u:equipa-agent:--x' \
-              'a+ /var/tmp - - - - u:equipa-agent:--x' \
+printf '%s\n' 'a+ /tmp       - - - - u:equipa-agent:---' \
+              'a+ /var/tmp   - - - - u:equipa-agent:---' \
+              'a+ /var/crash - - - - u:equipa-agent:---' \
+              'a+ /dev/shm   - - - - u:equipa-agent:---' \
     > /etc/tmpfiles.d/equipa-agent-tmp.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/equipa-agent-tmp.conf
-getfacl /tmp /var/tmp | grep equipa-agent   # user:equipa-agent:--x on both
+getfacl /tmp /var/tmp /var/crash /dev/shm | grep equipa-agent
+                                   # user:equipa-agent:--- on each
+# Every other world-writable directory on / (the list differs per host):
+find / -xdev -type d -perm -0002 -not -path '/tmp/*' -not -path '/var/tmp/*'
+# add an 'a+ <dir> - - - - u:equipa-agent:---' line for each one listed.
 ```
 
-The named-user ACL entry takes precedence over the world bits, so the
-agent may still enter `/tmp` (paths other programs hand it) but not create
-files there. Tools inside the unit that honour `TMPDIR` (the CLI, git,
-python's `tempfile`, `mktemp`, bash) are unaffected; a command that
-hard-codes `/tmp/...` fails instead of filling `/`. If agents need a shared
+The named-user ACL entry takes precedence over the world bits, so the agent
+can neither enter nor list these directories, let alone create files there.
+Tools inside the unit that honour `TMPDIR` (the CLI, git, python's
+`tempfile`, `mktemp`, bash) are unaffected; a command that hard-codes
+`/tmp/...` fails instead of filling `/`.
+
+`/dev/shm` is a host-wide tmpfs (half the RAM by default), and its files
+outlive the unit: units run one after another could pile them up until the
+host runs out of memory, even though each stays under its own `MemoryMax`.
+The ACL line above closes it, at a cost: POSIX shared memory and named
+semaphores (`shm_open`, `sem_open`) fail for the agent, so a project whose
+tests use python's `multiprocessing` locks or queues fails inside the unit.
+If agents need it, drop that line and cap the agent user instead with a
+per-user tmpfs quota on `/dev/shm` (`usrquota`, kernel 6.6 or later; quota
+options can only be set when the tmpfs is mounted, not on a remount) of at
+most **256 MiB**, the cap the verify script enforces (`AGENT_SHM_CAP_MB` in
+`scripts/verify_agent_isolation.sh`).
+
+If agents need a shared
 `/tmp`, make it a size-capped tmpfs instead (`systemctl enable tmp.mount`
 with `size=` in its `Options=`), knowing that an agent can then fill it for
 every other user, the orchestrator's own `/tmp` files included, and keep
 `/var/tmp` closed by the ACL or on a filesystem of its own. The verify
 script fails while the agent can write a
-`/tmp` or `/var/tmp` that lies on `/`, or while the unit's TMPDIR lies on
-`/`.
+`/tmp` or `/var/tmp` that lies on `/`, any other world-writable directory
+on `/` (it runs `find / -xdev -type d -perm -0002` as the agent and creates
+a file in each candidate, plus the well-known names below `/tmp`), more
+than 256 MiB into `/dev/shm`, or while the unit's TMPDIR lies on `/`. It
+prints a NOTE while the agent may still enter `/tmp` or `/var/tmp` without
+listing them (the `--x` entry of earlier versions of this step), because
+only well-known names below them can be probed then.
 
 No global git configuration is needed, and none is read: the launcher
 copies `user.name`/`user.email` from the task worktree into each clone and
@@ -969,6 +1014,25 @@ The rule rejects, for the agent user only:
   them);
 * the denied ranges (see "Network"), **plus `100.64.0.0/10`**, the CGNAT
   range Tailscale uses for every tailnet peer;
+* **the IPv4 limited broadcast `255.255.255.255` and every broadcast
+  address** (`fib daddr type broadcast`): neither is a local address nor in
+  a denied range, and any unprivileged socket may set `SO_BROADCAST`, so
+  without these lines the agent could talk UDP request/response with every
+  broadcast-answering service on the LAN segment (review SR3147-02);
+* **the LAN's own prefixes that are not private ranges**, from two sets the
+  operator fills in (`lan6_prefixes`, `lan4_prefixes`): on a dual-stack LAN
+  every NAS, router or database server also has a global IPv6 address from
+  the delegated prefix, and some LANs use a publicly routed IPv4 subnet
+  (review SR3147-03). List the prefix (`ip -6 route show proto kernel`,
+  `ip -6 route show proto ra`) in `elements = { ... }`, and give the verify
+  script an IPv6 `--lan-target` on such a LAN;
+* **every connection whose destination was rewritten by DNAT** (`ct status
+  dnat`, first in the chain). Docker publishes container ports through a
+  DNAT in the `nat` output hook, which runs before this filter: a connect to
+  a published port at a host address reaches this chain with the
+  container's address, which `fib daddr type local` no longer matches, and
+  which is rejected only while the container subnet happens to lie in a
+  denied range (review IR3147-A);
 
 except DNS to the local resolver (`127.0.0.53` on Ubuntu, where
 `/etc/resolv.conf` names it; the agent must resolve the API's name). If
@@ -988,14 +1052,33 @@ cat > /etc/nftables.d/equipa-agent.nft <<'EOF'
 table inet equipa_agent
 delete table inet equipa_agent
 table inet equipa_agent {
+    # The LAN's own prefixes where they are not private ranges: the global
+    # IPv6 prefix of a dual-stack LAN, a publicly routed IPv4 LAN subnet.
+    # Edit the elements line for this host; the sets may stay empty.
+    set lan6_prefixes {
+        type ipv6_addr; flags interval;
+        # elements = { 2001:db8:1234::/48 }
+    }
+    set lan4_prefixes {
+        type ipv4_addr; flags interval;
+        # elements = { 198.51.100.0/24 }
+    }
     chain agent {
+        # A destination rewritten by DNAT (Docker's published ports at a
+        # host address, nat output hook) is never what the rules below see
+        # it was: reject every DNATed connection first.
+        ct status dnat reject
         ip daddr 127.0.0.53 udp dport 53 accept
         ip daddr 127.0.0.53 tcp dport 53 accept
         fib daddr type local reject
+        fib daddr type broadcast reject
+        ip daddr 255.255.255.255 reject
         ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
                    169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
                    224.0.0.0/4 } reject
         ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } reject
+        ip daddr @lan4_prefixes reject
+        ip6 daddr @lan6_prefixes reject
     }
     chain output {
         type filter hook output priority 0; policy accept;
