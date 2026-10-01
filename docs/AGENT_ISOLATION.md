@@ -365,24 +365,41 @@ IPAddressDeny=127.0.0.0/8 ::1/128 0.0.0.0/8 ::/128 169.254.0.0/16 fe80::/10
 
 (loopback, the unspecified addresses, which a connect turns into loopback,
 link-local, multicast and the private ranges), plus any
-`ip_address_deny_extra` (for example a tailnet's `100.64.0.0/10`). The list
-can only grow. Everything else stays reachable: the agent needs the public
-Anthropic API. The ranges are spelled out because `systemd-run` of systemd
-255 rejects the symbolic names (`localhost`, `link-local`, `multicast`).
+`ip_address_deny_extra`. The list can only grow. Everything else stays
+reachable: the agent needs the public Anthropic API. **On a host running
+Tailscale (or any other CGNAT overlay), add `"ip_address_deny_extra":
+["100.64.0.0/10"]`** (step 7): a tailnet address of the host and every
+tailnet peer lie in that range, outside the private ranges, and only a
+listed range is probed by the launcher. The ranges are spelled out rather
+than given as systemd's symbolic names (`localhost`, `link-local`,
+`multicast`) because the same list goes to the launcher, which parses each
+entry as an address range.
 
-**A user manager accepts the property but cannot apply it.** BPF firewalling
-needs privileges the orchestrator's user manager does not have; systemd
-logs "unit configures an IP firewall, but not running as root" and starts
-the unit without it (observed on systemd 255). The property alone therefore
-proves nothing, so the launcher checks from inside the unit, as the agent
-user, before the CLI starts: it binds a listener on `127.0.0.1` and on each
-of this host's own addresses that falls in a denied range (from
-`/proc/net/fib_trie`, and `/proc/net/if_inet6` when IPv6 is enabled),
-connects to each, and **refuses the run if any connection is established**
-within 2 s. On such a host the blocking is done by an nftables rule for the
-agent user (runbook step 4a); the launcher's check accepts either mechanism.
-The verify script additionally connects, as the agent, to every port that
-listens on loopback and every `--loopback-port` the operator lists.
+**On many hosts `IPAddressDeny=` does nothing, and the nftables rule is the
+real control.** A user manager accepts the property but cannot apply it:
+BPF firewalling needs privileges the orchestrator's user manager does not
+have, so systemd logs "unit configures an IP firewall, but not running as
+root" (or nothing) and starts the unit without it (observed on systemd 255:
+inside such a scope `127.0.0.1:22`, a local database port and the host's
+own LAN address were all reachable). The property alone therefore proves
+nothing. The blocking is done by an nftables rule for the agent user's UID
+(runbook step 4a), which also rejects **every address of the host,
+whatever its range** (`fib daddr type local reject`): a service bound to
+`0.0.0.0` answers on a tailnet, public or global IPv6 address of the host
+too, and those lie outside every private range.
+
+The launcher checks from inside the unit, as the agent user, before the CLI
+starts: it binds a listener on `127.0.0.1` and on each of this host's own
+addresses that falls in a denied range (from `/proc/net/fib_trie`, and
+`/proc/net/if_inet6` when IPv6 is enabled), connects to each, and **refuses
+the run if any connection is established** within 2 s. So until the
+nftables rule exists, every dispatch is refused: the check fails closed,
+and it accepts either mechanism. The verify script (step 8) goes further,
+as the agent: it connects to a listener of its own on **every** address of
+the host (loopback, LAN, tailnet, public), to every port that listens on
+loopback or on every address and every `--loopback-port` at `127.0.0.1` and
+at each host address, and to each `--lan-target` the operator lists (other
+LAN machines, which no listener of the host's own can stand in for).
 
 ### Resources: memory without swap, IO weight, export size
 
@@ -391,17 +408,31 @@ Besides `TasksMax`, `MemoryMax` and `CPUWeight` (review F8):
 * `MemorySwapMax=0`: `MemoryMax` alone lets a unit spill into swap. The
   orchestrator refuses a scope whose `memory.swap.max` is not `0`;
 * `IOWeight=<io_weight>` (default 50 against the default 100 of everything
-  else, so the orchestrator and TheForge keep priority). The orchestrator
-  refuses a scope whose `io.weight` does not start with `default
-  <io_weight>`; that needs the io controller delegated to the user manager
-  (step 4). `"io_weight": null` leaves IO unweighted instead;
+  else). The orchestrator refuses a scope whose `io.weight` does not start
+  with `default <io_weight>`; that needs the io controller delegated to the
+  user manager (step 4). **A weight only has an effect with the BFQ
+  scheduler or iocost** (`io.cost.qos` configured); the `none` and
+  `mq-deadline` schedulers ignore it. On a host without io delegation, or
+  whose disks use `none`/`mq-deadline` with no iocost, set `"io_weight":
+  null` (IO unweighted, nothing verified) rather than delegating io for a
+  weight nothing applies (step 4);
 * the export: the launcher writes the bundle with `RLIMIT_FSIZE` set to
   `max_export_bytes` on the git process (SIGXFSZ ignored, so the write
   fails with EFBIG) and checks the size before it publishes the file, so an
   oversized export never lands in the shared exchange directory; the
-  orchestrator still refuses to copy a larger one. A unit's clone, HOME and
-  TMPDIR are not capped by EQUIPA: put the agent user's state root on a
-  filesystem of its own (step 1) so a unit cannot fill `/`.
+  orchestrator still refuses to copy a larger one. This caps the
+  launcher's own export, not a hostile agent: the agent user owns the
+  exchange directory and can write there directly;
+* disk: EQUIPA does not cap a unit's clone, HOME, TMPDIR or the exchange
+  directory. Each unit gets a **TMPDIR of its own**
+  (`<state root>/.equipa-agent/<unit>/tmp`, mode 0700, removed with the
+  unit), and all of them live on the agent state root, which must be a
+  size-capped filesystem of its own (step 1) so a unit cannot fill `/`.
+  A private TMPDIR does not stop an agent writing `/tmp/x` or `/var/tmp/x`
+  directly, and a scope cannot take systemd's `PrivateTmp=`, so step 1
+  also closes the shared `/tmp` and `/var/tmp` to the agent user or caps
+  them. The verify script fails while the unit's TMPDIR, or a shared
+  `/tmp` or `/var/tmp` the agent can write, lies on the root filesystem.
 
 ### Fail closed
 
@@ -594,12 +625,19 @@ unless named otherwise:
   store. `read-tree -u` still refuses `.git` and `..` paths.
 * Teardown still fails open (ISO-08): a failed import is logged at ERROR but
   does not mark the run failed.
-* Loopback and the LAN are closed (F2), the public internet is not. An
-  agent can still exfiltrate what it legitimately holds: its OAuth token and
-  the code it works on. On a user manager the blocking depends on the
-  operator's nftables rule; the launcher refuses while it is missing.
-* A unit's clone, HOME and TMPDIR have no disk quota of their own; the
-  runbook puts the agent state root on a filesystem of its own (F8).
+* Loopback, the LAN and every address of the host are closed (F2), the
+  public internet is not. An agent can still exfiltrate what it
+  legitimately holds: its OAuth token and the code it works on. On a user
+  manager the blocking depends on the operator's nftables rule; the
+  launcher refuses while it is missing, and the verify script fails.
+* Unix-domain sockets are not IP traffic: neither `IPAddressDeny=` nor the
+  nftables rule covers them. A world-writable socket of a local service
+  (a database, a container or VPN daemon's API) is reachable by the agent;
+  make sure each one authenticates the agent user (PostgreSQL `local` lines
+  `peer` or `scram-sha-256`, never `trust`).
+* A unit's clone, HOME, TMPDIR and exports have no quota of their own; the
+  runbook puts the agent state root on a size-capped filesystem of its own
+  and closes or caps the shared `/tmp` and `/var/tmp` (F8).
 * In-tree `.gitattributes` of the agent's commits still apply to the
   orchestrator's git (for example `-diff` or `merge=union`). Drivers must be
   defined in config, which agents can no longer write.
@@ -611,7 +649,9 @@ unless named otherwise:
   dispatch.
 * Roles that run in the main checkout (goal planner/evaluator) are refused;
   they need worktree isolation first.
-* `/tmp` is still shared. The agent gets a private `TMPDIR`.
+* `/tmp` and `/var/tmp` stay visible (a scope has no private mount
+  namespace); the agent gets a private `TMPDIR`, and step 1 closes or caps
+  the shared ones.
 * The orchestrator's own sudo is untouched. With isolation it is no longer
   reachable from agents, but narrowing it is still good hygiene.
 
