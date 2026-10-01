@@ -19,9 +19,11 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import random
+import re
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -683,6 +685,75 @@ SUBSTITUTION_PRELUDE = (
     "w=set\n"
 )
 
+# Task 3151 (R3146-03): an assignment of any kind to a variable with the
+# integer attribute makes bash evaluate the value as arithmetic, which
+# expands an array subscript in it again. Check 26 names those variables by
+# hand; these statements put every integer variable of the bash running the
+# tests (read from `declare -p`, below) in each assignment position, so bash
+# decides which of them run the marker. NAME is replaced by the variable.
+INTEGER_NAME = "\x03"
+INTEGER_ASSIGNMENT_LINES = 200
+INTEGER_ASSIGNMENTS = [
+    f"{INTEGER_NAME}='a[{OPENER}$({MARKER})]'",
+    f"{INTEGER_NAME}+='a[{OPENER}$({MARKER})]'",
+    f"{INTEGER_NAME}+='a[{OPENER}$({MARKER})]' p",   # prefix of a command
+    f"{INTEGER_NAME}='a[{OPENER}$({MARKER})]' p",
+    f"declare -i {INTEGER_NAME}='a[{OPENER}$({MARKER})]'",
+    f"declare {INTEGER_NAME}+='a[{OPENER}$({MARKER})]'",
+    f"let {INTEGER_NAME}='a[{OPENER}$({MARKER})]'",
+    f"xa='a[{OPENER}$({MARKER})]'; (( {INTEGER_NAME} = xa ))",
+    f"xa='a[{OPENER}$({MARKER})]'; (( {INTEGER_NAME} += xa ))",
+    f"read {INTEGER_NAME} <<< 'a[{OPENER}$({MARKER})]'",
+    f"printf -v {INTEGER_NAME} '%s' 'a[{OPENER}$({MARKER})]'",
+]
+
+# `declare -p` prints one `declare -<attributes> NAME[=value]` line per
+# variable; `--` means no attributes. The values in a fresh bash are one line.
+_DECLARE_LINE_RE = re.compile(r"declare -(\S+) ([A-Za-z_]\w*)(?==|$)")
+
+
+@dataclass(frozen=True)
+class IntegerVariables:
+    """The integer variables of a fresh bash, by whether they are readonly."""
+    assignable: tuple[str, ...]
+    readonly: tuple[str, ...]
+
+
+def _bash_integer_variables(directory: Path) -> IntegerVariables:
+    """Read the integer variables of the bash that runs the tests.
+
+    Only `declare -p` runs, with nothing on PATH, in a scratch directory.
+    """
+    bash = _require_bash()
+    script = directory / "declare.sh"
+    script.write_text("declare -p\n", encoding="utf-8")
+    proc = subprocess.run(
+        [bash, "--norc", "--noprofile", str(script)],
+        capture_output=True, timeout=20, cwd=directory,
+        env={"PATH": "/nonexistent", "LC_ALL": "C"},
+    )
+    assert proc.returncode == 0 and proc.stderr == b"", proc.stderr[:500]
+    assignable, readonly = [], []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        found = _DECLARE_LINE_RE.match(line)
+        if found is None or "i" not in found.group(1):
+            continue
+        (readonly if "r" in found.group(1) else assignable).append(found.group(2))
+    return IntegerVariables(tuple(sorted(assignable)), tuple(sorted(readonly)))
+
+
+@pytest.fixture(scope="module")
+def bash_integer_variables(tmp_path_factory: pytest.TempPathFactory) -> IntegerVariables:
+    return _bash_integer_variables(tmp_path_factory.mktemp("bash-integers"))
+
+
+def _integer_assignment_statements(names: tuple[str, ...]) -> list[str]:
+    return [
+        template.replace(INTEGER_NAME, name)
+        for name in names
+        for template in INTEGER_ASSIGNMENTS
+    ]
+
 
 def _fill(template: str, prefix: str, marker: int) -> tuple[str, int]:
     """Return (text, opener index in prefix + text) for one template."""
@@ -691,7 +762,11 @@ def _fill(template: str, prefix: str, marker: int) -> tuple[str, int]:
     return text, len(prefix) + opener
 
 
-def _substitution_line(rng: random.Random, first_marker: int) -> tuple[str, list[tuple[int, int]]]:
+def _substitution_line(
+    rng: random.Random,
+    first_marker: int,
+    statements: list[str] = SUBSTITUTION_STATEMENTS,
+) -> tuple[str, list[tuple[int, int]]]:
     """One generated line and its (marker, opener index) pairs."""
     markers: list[tuple[int, int]] = []
     marker = first_marker
@@ -700,7 +775,7 @@ def _substitution_line(rng: random.Random, first_marker: int) -> tuple[str, list
         return text, [(marker, opener)]
     line = ""
     if rng.random() < 0.25:
-        text, opener = _fill(rng.choice(SUBSTITUTION_STATEMENTS), line, marker)
+        text, opener = _fill(rng.choice(statements), line, marker)
         markers.append((marker, opener))
         marker += 1
         line += text + "; "
@@ -721,12 +796,17 @@ def _substitution_line(rng: random.Random, first_marker: int) -> tuple[str, list
     return line, markers
 
 
-def _substitution_corpus(seed: int = SEED + 5) -> list[tuple[str, list[tuple[int, int]]]]:
+def _substitution_corpus(
+    seed: int = SEED + 5,
+    statements: list[str] = SUBSTITUTION_STATEMENTS,
+    lines: int = SUBSTITUTION_LINES,
+    first_marker: int = 1,
+) -> list[tuple[str, list[tuple[int, int]]]]:
     rng = random.Random(seed)
     corpus = []
-    next_marker = 1
-    for _ in range(SUBSTITUTION_LINES):
-        line, markers = _substitution_line(rng, next_marker)
+    next_marker = first_marker
+    for _ in range(lines):
+        line, markers = _substitution_line(rng, next_marker, statements)
         next_marker += len(markers) + 1
         corpus.append((line, markers))
     return corpus
@@ -741,27 +821,30 @@ def _lookalikes_by_original_index(line: str) -> dict[int, "bash_security._Lookal
     }
 
 
-@pytest.mark.parametrize("seed", [SEED + 5, 1, 2, 3, 4, 5])
-def test_substitutions_bash_runs_are_never_proven_inert(tmp_path: Path, seed: int):
+def _run_substitution_lines(directory: Path, lines: list[str]) -> set[int]:
+    """Run *lines* after the sentinel prelude; return the markers bash ran."""
     bash = _require_bash()
-    corpus = _substitution_corpus(seed)
-    script = tmp_path / "substitutions.sh"
+    script = directory / "substitutions.sh"
     script.write_text(
-        SUBSTITUTION_PRELUDE + "".join(line + "\n" for line, _ in corpus),
+        SUBSTITUTION_PRELUDE + "".join(line + "\n" for line in lines),
         encoding="utf-8",
     )
-    start = time.perf_counter()
     proc = subprocess.run(
         [bash, "--norc", "--noprofile", str(script)],
-        capture_output=True, timeout=20, cwd=tmp_path,
+        capture_output=True, timeout=20, cwd=directory,
         env={"PATH": "/nonexistent", "LC_ALL": "C"},
     )
     # Arithmetic on literal apostrophes is an expansion error in bash; it
     # aborts only that line. Anything else on stderr is a generator bug.
     for message in proc.stderr.decode(errors="replace").splitlines():
         assert "syntax error" in message and "error token" in message, message
-    ran = {int(n) for n in (tmp_path / "marks.txt").read_text().split()}
+    return {int(n) for n in (directory / "marks.txt").read_text().split()}
 
+
+def _assert_ran_markers_are_refused(
+    corpus: list[tuple[str, list[tuple[int, int]]]], ran: set[int],
+) -> tuple[int, int]:
+    """The fail-closed property over *corpus*; returns (ran, inert) counts."""
     inert_seen = ran_seen = 0
     for line, markers in corpus:
         lookalikes = _lookalikes_by_original_index(line)
@@ -774,10 +857,82 @@ def test_substitutions_bash_runs_are_never_proven_inert(tmp_path: Path, seed: in
             inert_seen += lookalike.inert
         if any(marker in ran for marker, _ in markers):
             assert not check_bash_command(line).safe, f"allowed, but bash ran: {line!r}"
+    return ran_seen, inert_seen
+
+
+@pytest.mark.parametrize("seed", [SEED + 5, 1, 2, 3, 4, 5])
+def test_substitutions_bash_runs_are_never_proven_inert(
+    tmp_path: Path, seed: int, bash_integer_variables: IntegerVariables,
+):
+    corpus = _substitution_corpus(seed)
+    # Task 3151 (R3146-03): integer-variable assignments mixed with the word
+    # templates, appended so the corpus above stays exactly as it was.
+    corpus += _substitution_corpus(
+        seed + 3151,
+        _integer_assignment_statements(bash_integer_variables.assignable),
+        lines=INTEGER_ASSIGNMENT_LINES,
+        first_marker=sum(len(markers) + 1 for _, markers in corpus) + 1,
+    )
+    start = time.perf_counter()
+    ran = _run_substitution_lines(tmp_path, [line for line, _ in corpus])
+
+    ran_seen, inert_seen = _assert_ran_markers_are_refused(corpus, ran)
     # The corpus exercises both sides of the property.
     assert ran_seen >= 150, ran_seen
     assert inert_seen >= 40, inert_seen
     assert time.perf_counter() - start < 20
+
+
+def test_bash_integer_variables_are_read_from_bash(
+    bash_integer_variables: IntegerVariables,
+):
+    """The `declare -p` parse finds the integer variables bash has had since
+    4.x, so an empty or broken parse cannot make the next test vacuous."""
+    assert {"OPTIND", "RANDOM"} <= set(bash_integer_variables.assignable)
+    assert "UID" in bash_integer_variables.readonly
+
+
+def test_check_26_names_every_assignable_integer_variable_of_this_bash(
+    bash_integer_variables: IntegerVariables,
+):
+    """R3146-03: the hand-kept list in _EVALUATES_TEXT_RE must cover every
+    integer variable the running bash lets a command assign (BASHPID was
+    missing); a newer bash that adds one fails here, not in production."""
+    missing = [
+        name for name in bash_integer_variables.assignable
+        if bash_security._evaluating_construct(f"{name}+=1") != repr(name)
+    ]
+    assert missing == [], f"check 26 does not count assignments to {missing}"
+
+
+def test_integer_variable_assignments_bash_runs_are_never_proven_inert(
+    tmp_path: Path, bash_integer_variables: IntegerVariables,
+):
+    """R3146-03, exhaustively: every assignment form on every integer
+    variable of this bash, one per line, with a top-level single-quoted
+    look-alike that bash evaluates only through the integer attribute
+    (`BASHPID+='a[$(m 1)]'` runs the marker). A marker bash ran is never
+    proven inert and its line is refused. Readonly variables are run too
+    (their `readonly variable` errors silenced), so a bash that evaluated
+    before refusing the assignment would fail here."""
+    corpus: list[tuple[str, list[tuple[int, int]]]] = []
+    marker = 1
+    for names, readonly in (
+        (bash_integer_variables.assignable, False),
+        (bash_integer_variables.readonly, True),
+    ):
+        for statement in _integer_assignment_statements(names):
+            prefix = "{ " if readonly else ""
+            text, opener = _fill(statement, prefix, marker)
+            line = prefix + text + ("; } 2>/dev/null" if readonly else "") + "; p"
+            corpus.append((line, [(marker, opener)]))
+            marker += 1
+    ran = _run_substitution_lines(tmp_path, [line for line, _ in corpus])
+
+    ran_seen, _inert_seen = _assert_ran_markers_are_refused(corpus, ran)
+    # `NAME+=` evaluates for every assignable integer variable, so the
+    # corpus does exercise the property.
+    assert ran_seen >= len(bash_integer_variables.assignable), ran_seen
 
 
 def test_substitution_corpus_exercises_every_template():

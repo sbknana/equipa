@@ -875,11 +875,15 @@ _SUBSTITUTION_LOOKALIKE_RE = re.compile(
 # callback (`mapfile -C`) and prompt expansion (`${x@P}`, PS4 with set -x).
 # Each was checked against bash 5.2 (IND3128-03, IV3133-01). Matched on the
 # command with quotes and backslashes deleted (`l'e't` is `let`); a spurious
-# match only means a quoted look-alike is no longer trusted.
+# match only means a quoted look-alike is no longer trusted. The integer
+# specials are every assignable integer variable of a fresh bash: BASHPID
+# ignores a plain assignment but evaluates `BASHPID+=` (R3146-03), and
+# tests/test_bash_tokenizer_3128.py reads the list from `declare -p` in the
+# bash running the suite, so a missing or newly added name fails there.
 _EVALUATES_TEXT_RE = re.compile(
     r"=\(|\$\[|\$\{!|\$\{#?(?:\w+|[@*])(?:\[|:(?![-=?+])|@P)"
     r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|readarray"
-    r"|mapfile|HISTCMD|OPTIND|S?RANDOM|PS[0-4]|PROMPT_COMMAND)(?![\w.-])"
+    r"|mapfile|BASHPID|HISTCMD|OPTIND|S?RANDOM|PS[0-4]|PROMPT_COMMAND)(?![\w.-])"
 )
 
 # Builtins that evaluate a subscript only in a variable NAME they are given:
