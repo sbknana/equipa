@@ -2266,6 +2266,17 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     return run_mode_task
 
 
+def warn_missing_dispatch_config(dispatch_config_arg: str | None) -> str | None:
+    """The warning for a ``--dispatch-config`` path that does not exist
+    (printed by async_main), or None. Such a run uses the defaults; agent
+    isolation stays as the host config and marker have it (review F1)."""
+    if dispatch_config_arg is None or Path(dispatch_config_arg).exists():
+        return None
+    return (f"WARNING: --dispatch-config '{dispatch_config_arg}' does not "
+            f"exist; using the defaults (agent isolation stays as the host "
+            f"config and marker have it).")
+
+
 async def async_main() -> None:
     """Main entry point — parses args, validates, then dispatches to a mode handler."""
     parser = _build_arg_parser()
@@ -2286,6 +2297,9 @@ async def async_main() -> None:
               f"Loop uses Developer + Tester automatically.")
 
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
+    missing_config = warn_missing_dispatch_config(args.dispatch_config)
+    if missing_config:
+        print(missing_config)
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
     # Auxiliary model resolution (reflexion, RLM, ForgeSmith helpers) must use
     # THIS config — the one role resolution uses — never a CWD-relative file

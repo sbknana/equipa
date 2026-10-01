@@ -301,7 +301,7 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
     if filepath is None:
         return _read_dispatch_config(default_dispatch_config_path())
     filepath = Path(filepath)
-    config = _read_dispatch_config(filepath, per_run=True)
+    config = _read_dispatch_config(filepath)
     _carry_host_isolation(config, filepath)
     return config
 
@@ -338,16 +338,18 @@ def _carry_host_isolation(config: dict, per_run_path: Path) -> None:
             json.dumps(host[AGENT_ISOLATION_KEY]))
 
 
-def _read_dispatch_config(filepath: Path, *, per_run: bool = False) -> dict:
-    """``filepath`` merged over the defaults (see load_dispatch_config)."""
+def _read_dispatch_config(filepath: Path) -> dict:
+    """``filepath`` merged over the defaults (see load_dispatch_config).
+
+    A missing file quietly yields the defaults: this runs on every
+    get_active_dispatch_config() call without a registered config (the
+    repo-root file is usually absent), and stdout is the MCP server's
+    JSON-RPC channel. The CLI warns about a ``--dispatch-config`` path that
+    does not exist (equipa.cli.warn_missing_dispatch_config).
+    """
     config = dict(DEFAULT_DISPATCH_CONFIG)
 
     if not filepath.exists():
-        if per_run:
-            logger.error("Dispatch config '%s' does not exist; using defaults",
-                         filepath)
-            print(f"WARNING: dispatch config '{filepath}' does not exist; "
-                  f"using defaults.")
         return config
 
     try:

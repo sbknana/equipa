@@ -511,15 +511,51 @@ def test_per_run_config_cannot_turn_host_isolation_off(
 
 
 def test_a_missing_per_run_config_does_not_turn_isolation_off(
-        host, tmp_path: Path, capsys) -> None:
+        host, tmp_path: Path) -> None:
+    from equipa.cli import warn_missing_dispatch_config
     from equipa.config import is_feature_enabled, load_dispatch_config
 
     _write_json(host.config, {"features": {"agent_isolation": True},
                               "agent_isolation": _SECTION})
-    config = load_dispatch_config(tmp_path / "mistyped.json")
+    mistyped = tmp_path / "mistyped.json"
+    config = load_dispatch_config(mistyped)
     assert is_feature_enabled(config, "agent_isolation") is True
     assert config["agent_isolation"] == _SECTION
-    assert "does not exist" in capsys.readouterr().out
+    # The CLI names the missing path; an absent or existing one is quiet.
+    warning = warn_missing_dispatch_config(str(mistyped))
+    assert warning is not None and "does not exist" in warning
+    assert str(mistyped) in warning
+    assert warn_missing_dispatch_config(None) is None
+    assert warn_missing_dispatch_config(str(host.config)) is None
+
+
+def test_loading_a_missing_config_writes_nothing_to_stdout(
+        host, tmp_path: Path, capsys) -> None:
+    """stdout is the MCP server's JSON-RPC channel, and every
+    get_active_dispatch_config() without a registered config loads the
+    usually absent repo-root file: nothing may be printed there."""
+    from equipa import config
+
+    config.load_dispatch_config(tmp_path / "absent.json")
+    config.set_active_dispatch_config(None)
+    config.get_active_dispatch_config()
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_warns_about_a_missing_dispatch_config_before_loading_it() -> None:
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "equipa" / "cli.py").read_text(
+        encoding="utf-8"))
+    main = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "async_main")
+    lines = {ast.unparse(node): node.lineno for node in ast.walk(main)
+             if isinstance(node, ast.Call)}
+    warned = lines["warn_missing_dispatch_config(args.dispatch_config)"]
+    printed = lines["print(missing_config)"]
+    loaded = lines["load_dispatch_config(args.dispatch_config)"]
+    assert warned < printed < loaded
 
 
 def test_per_run_config_keeps_its_own_isolation_section(
