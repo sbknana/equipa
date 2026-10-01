@@ -16,8 +16,10 @@ The reviewer's probes, on real git:
 * single-task ``--task --dev-test`` mode, where the agent plants after the
   guard snapshot and the gate runs on the redirected repository.
 
-On the task #3141 code each of these ends ``merged`` into the clone (or, in
-single-task mode, without a repository-identity alarm).
+On the task #3141 code each of these ends ``merged`` into the clone. In
+single-task mode a clone left on ``master`` is already stopped by the
+worktree branch check (only the identity alarm is new); a clone left on the
+task branch passes that check and merges into the clone.
 
 Copyright 2026 Forgeborn
 """
