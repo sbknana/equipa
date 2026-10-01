@@ -182,6 +182,27 @@ def normalize_review_text(text: str) -> str:
     return _LINE_BREAK_RE.sub("\n", text)
 
 
+def separated_review_text(text: str, separator: str) -> str:
+    """:func:`normalize_review_text`, with ``separator`` for each invisible
+    character instead of nothing.
+
+    Task 3154 (I3152-01): deleting a character can join two words. The
+    Hangul fillers draw a blank and many of the other characters draw
+    nothing or a box, so "Rated<U+3164>HIGH" shows two words while the
+    normalised text reads "RatedHIGH". The review gate reads the review
+    this way too, so a word is standalone when a deleted character separates
+    it. ``separator`` must be one character that NFKC keeps and that is no
+    line break, so every line keeps its number.
+    """
+    if (len(separator) != 1 or _ANY_LINE_BREAK_RE.match(separator)
+            or unicodedata.normalize("NFKC", separator) != separator):
+        raise ValueError(f"unusable separator {separator!r}")
+    text = _INVISIBLE_CHARS_RE.sub(separator, text)
+    text = unicodedata.normalize("NFKC", text)
+    text = _INVISIBLE_CHARS_RE.sub(separator, text)
+    return _LINE_BREAK_RE.sub("\n", text)
+
+
 @dataclass(frozen=True)
 class ArtifactFingerprint:
     """What a review artifact looked like at one instant."""

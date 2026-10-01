@@ -108,8 +108,10 @@ from equipa.security_gate import (
     review_complete_line,
     reviewer_nonce_line,
     reviewer_prompt_sha256,
+    separated_review_text,
     verify_reviewer_provenance,
 )
+from equipa.severity_confusables import SEVERITY_LETTER_CONFUSABLES
 from equipa.parsing import (
     build_compaction_summary,
     build_test_failure_context,
@@ -2829,10 +2831,66 @@ _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # is checked in Python, so the scan starts at a word's first letter.
 # Task 3149 (R3143-07): "l", "1" and "|" drawn for the I of an otherwise
 # UPPER-case word ("HlGH", "CR1T1CAL", "MED|UM") are read as that I.
+# Task 3154 (R3152-01): only an ASCII letter or digit next to the word glues
+# it to a neighbour. The views are folded (lookalikes, fullwidth and
+# mathematical letters are ASCII by now), so any other neighbour is drawn
+# as something else: U+01C3 is drawn as "!", U+02BC as an apostrophe,
+# U+0640 as a stroke, so "<U+02BC>HIGH<U+02BC>" shows a quoted HIGH.
 _BACKSTOP_TOKEN_RE = re.compile(
-    r"(?:CR[Il1|]T[Il1|]CAL|H[Il1|]GH|MED[Il1|]UM)(?![^\W_])",
+    r"(?:CR[Il1|]T[Il1|]CAL|H[Il1|]GH|MED[Il1|]UM)(?![A-Za-z0-9])",
 )
+_BACKSTOP_ASCII_ALNUM = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 _BACKSTOP_SEVERITY_BY_INITIAL = {"C": "CRITICAL", "H": "HIGH", "M": "MEDIUM"}
+# Task 3154 (I3152-01, I3152-02): the separated reading of a review (see
+# _backstop_separated_text) marks, in private-use code points:
+#   * GONE: a character the other views delete (Hangul fillers, format,
+#     control, mark and unassigned characters). It may sit inside a word
+#     ("HI<U+3164>GH"), and it separates the words around it;
+#   * GLUE: a character the other views fold to an ASCII letter or digit
+#     though it is no letter of a word: superscript, subscript, fraction,
+#     circled, fullwidth and other non-ASCII digits, Roman numerals,
+#     ordinal indicators, modifier letters ("HIGH<U+00B9>" shows HIGH and a
+#     footnote marker, the other views read "HIGH1");
+#   * a lookalike of a letter, FOLD + the letter (folded by the other views
+#     too) or NEW_FOLD + the letter (folded only here: a symbol or
+#     punctuation mark the Unicode confusables data draws as the letter).
+#     Either may be a letter of a word, and either separates it from the
+#     words around it ("<U+2223>HIGH" shows "|HIGH").
+_BACKSTOP_GONE_MARK = ""
+_BACKSTOP_GLUE_MARK = ""
+_BACKSTOP_FOLD_MARK = 0xE000
+_BACKSTOP_NEW_FOLD_MARK = 0xE100
+# A private-use character as written becomes another one, so no mark is
+# ever read from the review itself.
+_BACKSTOP_FOREIGN_MARK = ""
+_BACKSTOP_MARK_RE = re.compile("[-]")
+# A run of GONE marks longer than this next to a word counts as separating
+# it, so the run is never walked further (a flood costs O(1) per word).
+_BACKSTOP_SEPARATOR_RUN_LIMIT = 64
+
+
+def _backstop_separated_letter(letters: str) -> str:
+    """A character class: ``letters`` and their FOLD and NEW_FOLD marks."""
+    marks = "".join(chr(base + ord(letter))
+                    for base in (_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK)
+                    for letter in letters if letter.isalpha())
+    return "[" + re.escape(letters) + marks + "]"
+
+
+def _backstop_separated_word(word: str) -> str:
+    """``word`` with lookalike marks for its letters and GONE marks between
+    them (l, 1 and | are read as I, as in _BACKSTOP_TOKEN_RE)."""
+    return (re.escape(_BACKSTOP_GONE_MARK) + "*").join(
+        _backstop_separated_letter("Il1|" if letter == "I" else letter)
+        for letter in word)
+
+
+_BACKSTOP_SEPARATED_TOKEN_RE = re.compile(
+    "(?:" + "|".join(_backstop_separated_word(word)
+                     for word in ("CRITICAL", "HIGH", "MEDIUM"))
+    + ")(?![A-Za-z0-9])",
+)
 # HTML5 character references, with or without the semicolon. html.unescape
 # decides what each means (legacy names such as "&amp" need no semicolon) and
 # leaves an unknown one as written. Task 3149 (R3143-04): leading zeros are
@@ -3035,7 +3093,9 @@ _BACKSTOP_SECTION_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,3}(?:[ \t]|$)",
 # for G; Armenian SEH (U+054D) for U.
 _BACKSTOP_EXTRA_LOOKALIKES = {
     "A": (0x1D00, 0x2C80, 0x15C5, 0x15E9),
-    "C": (0x1D04, 0x2CA4),
+    # Task 3154 (R3152-04): U+1455 CANADIAN SYLLABICS TA, drawn as a C; the
+    # Unicode confusables data does not list it.
+    "C": (0x1D04, 0x2CA4, 0x1455),
     "D": (0x1D05, 0x15EA),
     "E": (0x1D07, 0x2C88, 0x2D39),
     "G": (0x13F3,),
@@ -3047,7 +3107,21 @@ _BACKSTOP_EXTRA_LOOKALIKES = {
     "T": (0x1D1B, 0x2CA6, 0x22A4, 0x102A2),
     "U": (0x1D1C, 0x144C, 0x054D),
 }
+# Task 3154 (I3152-03, R3152-04): every confusable of the letters of the
+# three words in the Unicode confusables data (equipa/severity_confusables.py,
+# generated). A letter or digit is folded in every view: it glued the word
+# to a neighbour before too, so folding it hides no word. A symbol or
+# punctuation mark is folded in the separated reading only, where it is
+# also a separator (folding "<U+2502>HIGH" here would read "IHIGH").
+_BACKSTOP_CONFUSABLES = {
+    code_point: letter
+    for letter, code_points in SEVERITY_LETTER_CONFUSABLES.items()
+    for code_point in code_points
+}
 _BACKSTOP_LETTER_FOLDS = {
+    **{code_point: letter
+       for code_point, letter in _BACKSTOP_CONFUSABLES.items()
+       if chr(code_point).isalnum()},
     **_CONFUSABLE_LETTERS,
     **{
         code_point: letter
@@ -3151,6 +3225,144 @@ def _backstop_translated(text: str) -> str:
     """``text.translate(_BACKSTOP_CHARACTERS)``, fast on mostly-ASCII text."""
     text = _translate_non_ascii(text, _BACKSTOP_CHARACTERS)
     return _BACKSTOP_ASCII_CONTROLS_RE.sub("", text)
+
+
+# --- Task 3154: the separated reading (I3152-01, I3152-02) ----------------------
+
+# Lookalikes only the separated reading folds (see _BACKSTOP_CONFUSABLES).
+_BACKSTOP_NEW_FOLDS = {
+    code_point: letter
+    for code_point, letter in _BACKSTOP_CONFUSABLES.items()
+    if code_point not in _BACKSTOP_LETTER_FOLDS
+}
+_BACKSTOP_WORD_LETTER_CATEGORIES = frozenset(("Lu", "Ll", "Lt", "Lo"))
+_BACKSTOP_ORDINAL_INDICATORS = "\N{FEMININE ORDINAL INDICATOR}" \
+    "\N{MASCULINE ORDINAL INDICATOR}"
+# The line breaks normalize_review_text maps to "\n" are kept as written.
+_BACKSTOP_KEPT_BREAKS = "\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
+# The ASCII controls the other views delete; tab, CR, LF and the controls
+# normalize_review_text reads as line breaks (VT, FF, FS, GS, RS) are kept.
+_BACKSTOP_SEPARATED_CONTROLS_RE = re.compile(r"[\x00-\x08\x0e-\x1b\x1f\x7f]")
+
+
+def _backstop_separator_mark(code_point: int) -> str:
+    """What the separated reading reads a non-ASCII character as written as:
+    a mark (see _BACKSTOP_GONE_MARK) or the character itself."""
+    char = chr(code_point)
+    # ASCII is read by _BACKSTOP_SEPARATED_CONTROLS_RE (_translate_non_ascii
+    # also looks the line feed up).
+    if code_point < 0x80 or char in _BACKSTOP_KEPT_BREAKS:
+        return char
+    if 0xE000 <= code_point <= 0xE1FF:
+        return _BACKSTOP_FOREIGN_MARK
+    if code_point in _BACKSTOP_LETTER_FOLDS:
+        return chr(_BACKSTOP_FOLD_MARK + ord(_BACKSTOP_LETTER_FOLDS[code_point]))
+    if code_point in _BACKSTOP_NEW_FOLDS:
+        return chr(_BACKSTOP_NEW_FOLD_MARK + ord(_BACKSTOP_NEW_FOLDS[code_point]))
+    category = unicodedata.category(char)
+    if (code_point in _BACKSTOP_DELETED_FILLERS
+            or category in _BACKSTOP_DELETED_CATEGORIES):
+        return _BACKSTOP_GONE_MARK
+    if (category in _BACKSTOP_WORD_LETTER_CATEGORIES
+            and char not in _BACKSTOP_ORDINAL_INDICATORS):
+        return char  # a letter, read as the other views read it
+    if any(part in _BACKSTOP_ASCII_ALNUM or ord(part) in _BACKSTOP_LETTER_FOLDS
+           for part in unicodedata.normalize("NFKD", char)):
+        return _BACKSTOP_GLUE_MARK
+    return char
+
+
+class _BackstopSeparatorTable(dict):
+    """``str.translate`` table of the separated reading, filled per code
+    point seen (at most ``_BACKSTOP_TABLE_LIMIT`` entries)."""
+
+    def __missing__(self, code_point: int) -> str:
+        value = _backstop_separator_mark(code_point)
+        if len(self) < _BACKSTOP_TABLE_LIMIT:
+            self[code_point] = value
+        return value
+
+
+_BACKSTOP_SEPARATORS = _BackstopSeparatorTable()
+
+
+def _backstop_separated_reference(match: re.Match[str]) -> str:
+    """A character reference to a character the separated reading marks, as
+    that mark ("Rated&#x3164;HIGH" separates the words); any other reference
+    is left for _backstop_normalized to decode."""
+    decoded = _backstop_decoded_reference(match)
+    if len(decoded) != 1:
+        return match.group(0)
+    if _BACKSTOP_SEPARATED_CONTROLS_RE.match(decoded):
+        return _BACKSTOP_GONE_MARK
+    if decoded.isascii():
+        return match.group(0)
+    marked = _BACKSTOP_SEPARATORS[ord(decoded)]
+    return match.group(0) if marked == decoded else marked
+
+
+def _backstop_separated_text(text: str) -> str | None:
+    """The review ``text`` as written, normalised with its separators kept.
+
+    Every other view of the backstop reads the review after
+    normalize_review_text, which deletes invisible characters and folds
+    compatibility characters, so "Rated<U+3164>HIGH" and "HIGH<U+00B9>" read
+    as the glued "RatedHIGH" and "HIGH1". Here each such character, also as
+    a character reference, is a mark (see _BACKSTOP_GONE_MARK) decided on
+    the text as written, and survives normalisation. Only the lines holding
+    a mark are kept (the others are blank, so line numbers hold); None when
+    there is none.
+    """
+    # Characters as written first: a private-use character the review holds
+    # becomes _BACKSTOP_FOREIGN_MARK before any mark is written.
+    text = _translate_non_ascii(text, _BACKSTOP_SEPARATORS)
+    text = _BACKSTOP_SEPARATED_CONTROLS_RE.sub(_BACKSTOP_GONE_MARK, text)
+    if "&" in text:
+        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_separated_reference, text)
+    if _BACKSTOP_MARK_RE.search(text) is None:
+        return None
+    text = separated_review_text(text, _BACKSTOP_GONE_MARK)
+    return "\n".join(line if _BACKSTOP_MARK_RE.search(line) else ""
+                     for line in text.split("\n"))
+
+
+def _backstop_is_fold_mark(char: str) -> bool:
+    code_point = ord(char)
+    return (_BACKSTOP_FOLD_MARK + 0x41 <= code_point <= _BACKSTOP_FOLD_MARK + 0x7A
+            or _BACKSTOP_NEW_FOLD_MARK + 0x41 <= code_point
+            <= _BACKSTOP_NEW_FOLD_MARK + 0x7A)
+
+
+def _backstop_mark_separates(view: str, index: int, step: int) -> bool:
+    """True when the marks from ``index`` on (``step`` is 1 or -1) make the
+    word next to them a word of its own that the other views read as glued:
+    a GLUE or lookalike mark, or GONE marks with an ASCII letter or digit
+    behind them."""
+    gone = 0
+    while 0 <= index < len(view) and view[index] == _BACKSTOP_GONE_MARK:
+        gone += 1
+        if gone > _BACKSTOP_SEPARATOR_RUN_LIMIT:
+            return True
+        index += step
+    if not 0 <= index < len(view):
+        return False
+    char = view[index]
+    if char == _BACKSTOP_GLUE_MARK or _backstop_is_fold_mark(char):
+        return True
+    return gone > 0 and char in _BACKSTOP_ASCII_ALNUM
+
+
+def _backstop_separated_counts(word: str, view: str, start: int,
+                               end: int) -> bool:
+    """True when a word of the separated reading adds to the other views: a
+    mark separates it from a neighbour, or a lookalike only this reading
+    folds spells it. A word that is standalone anyway (a counted label
+    next to a zero-width space) is the other views' to count."""
+    if any(_BACKSTOP_NEW_FOLD_MARK <= ord(char) <= _BACKSTOP_NEW_FOLD_MARK + 0xFF
+           for char in word):
+        return True
+    return (_backstop_mark_separates(view, start - 1, -1)
+            or _backstop_mark_separates(view, end, 1))
 
 
 def _backstop_line_origins(text: str, spans: list[tuple[int, int]]) -> list[int]:
@@ -3638,27 +3850,39 @@ def _backstop_exempt_count(
 
 
 def _backstop_severity(word: str) -> str:
-    """The severity a token spells ("HlGH" and "H1GH" are HIGH)."""
-    return _BACKSTOP_SEVERITY_BY_INITIAL[word[0]]
+    """The severity a token spells ("HlGH" and "H1GH" are HIGH; in the
+    separated reading the initial may be a lookalike mark)."""
+    initial = ord(word[0])
+    if initial >= _BACKSTOP_FOLD_MARK:
+        initial = (initial - _BACKSTOP_FOLD_MARK) % 0x100
+    return _BACKSTOP_SEVERITY_BY_INITIAL[chr(initial)]
 
 
 def _backstop_tokens(
-    view: str, origins: list[int] | None, covered: dict[str, int],
+    view: str, origins: list[int] | None, covered: dict[str, int], *,
+    separated: bool = False,
 ) -> dict[tuple[int, str], int]:
     """(line, severity) -> number of standalone UPPER-case severity words.
 
     Every CRITICAL and HIGH word is counted (task 3152: no exemptions for
     the severities that block a merge). A MEDIUM word in a tally whose count
     the review covers, in a negation, or in a list one of those opens is
-    left out (see ``_BACKSTOP_CONTEXT``).
+    left out (see ``_BACKSTOP_CONTEXT``). With ``separated`` the view is one
+    of the separated reading (_backstop_separated_text), whose marks may sit
+    inside a word, and only the words it adds are counted
+    (_backstop_separated_counts).
     """
     found: dict[tuple[int, str], int] = {}
     newlines: list[int] | None = None
     previous: tuple[int, int, int] | None = None
     classified = 0
-    for match in _BACKSTOP_TOKEN_RE.finditer(view):
+    token_re = _BACKSTOP_SEPARATED_TOKEN_RE if separated else _BACKSTOP_TOKEN_RE
+    for match in token_re.finditer(view):
         start, end = match.span()
-        if start and view[start - 1].isalnum():
+        if start and view[start - 1] in _BACKSTOP_ASCII_ALNUM:
+            continue
+        if separated and not _backstop_separated_counts(match.group(0), view,
+                                                        start, end):
             continue
         if newlines is None:
             newlines = [line_break.start()
@@ -3920,37 +4144,13 @@ def _shown_lines(lines: list[int]) -> str:
     return shown
 
 
-def _severity_token_backstop(
-    text: str, analysis: ReviewCountAnalysis, *,
-    heading_text: str | None = None,
-) -> ReviewCountAnalysis:
-    """Block a trusted review holding a severity word nothing counted.
-
-    ``heading_text`` is the string ``analysis.heading_offsets`` index (the
-    normalised review; default ``text``). It has the same lines as ``text``.
-
-    ``text`` is the normalised review. The whole body is read in two views:
-    as written and with HTML comments and tags removed (which can join a
-    word); per line and severity the larger count is used.
-
-    Task 3152: the CRITICAL and HIGH labels the parser counted, at their
-    exact offsets, and those of a strict final footer are lowered first
-    (:func:`_backstop_masked`). Any CRITICAL or HIGH word left in any view
-    is unaccounted, and the review blocks (count-mismatch, reason
-    ``BACKSTOP_REASON`` with the 1-based line numbers) whatever the footer
-    counts. A MEDIUM word on a counted MEDIUM heading or in its section is
-    that finding's; other MEDIUM words block (reason
-    ``BACKSTOP_MEDIUM_REASON``) when the footer counts fewer MEDIUM findings
-    than the headings plus them, as on main. An untrusted analysis is
-    returned unchanged.
-    """
-    if not analysis.trusted:
-        return analysis
-    masked = _backstop_masked(text, analysis.heading_offsets)
+def _backstop_views(text: str) -> list[tuple[str, list[int] | None]]:
+    """The views the backstop reads ``text`` in, each with its line origins
+    (None: the lines of ``text``)."""
     views: list[tuple[str, list[int] | None]] = [
-        (_backstop_normalized(masked), None),
+        (_backstop_normalized(text), None),
     ]
-    without_markup = _backstop_without_markup(masked)
+    without_markup = _backstop_without_markup(text)
     if without_markup is not None:
         views.append((_backstop_normalized(without_markup[0]),
                       without_markup[1]))
@@ -3971,14 +4171,56 @@ def _severity_token_backstop(
             elif base_origins is not None:
                 link_origins = [base_origins[line] for line in link_origins]
             views.append((link_text, link_origins))
+    return views
+
+
+def _severity_token_backstop(
+    text: str, analysis: ReviewCountAnalysis, *,
+    heading_text: str | None = None,
+    separated_text: str | None = None,
+) -> ReviewCountAnalysis:
+    """Block a trusted review holding a severity word nothing counted.
+
+    ``heading_text`` is the string ``analysis.heading_offsets`` index (the
+    normalised review; default ``text``). It has the same lines as ``text``.
+    ``separated_text`` is the separated reading of the review as written
+    (:func:`_backstop_separated_text`), with the same lines; its words that
+    a separator makes standalone are counted too (task 3154).
+
+    ``text`` is the normalised review. The whole body is read in two views:
+    as written and with HTML comments and tags removed (which can join a
+    word); per line and severity the larger count is used.
+
+    Task 3152: the CRITICAL and HIGH labels the parser counted, at their
+    exact offsets, and those of a strict final footer are lowered first
+    (:func:`_backstop_masked`). Any CRITICAL or HIGH word left in any view
+    is unaccounted, and the review blocks (count-mismatch, reason
+    ``BACKSTOP_REASON`` with the 1-based line numbers) whatever the footer
+    counts. A MEDIUM word on a counted MEDIUM heading or in its section is
+    that finding's; other MEDIUM words block (reason
+    ``BACKSTOP_MEDIUM_REASON``) when the footer counts fewer MEDIUM findings
+    than the headings plus them, as on main. An untrusted analysis is
+    returned unchanged.
+    """
+    if not analysis.trusted:
+        return analysis
+    masked = _backstop_masked(text, analysis.heading_offsets)
     footer = analysis.footer_counts or {}
     # What the review counts per severity (footer, headings, resolved).
     covered = analysis.counts or footer
     tokens: dict[tuple[int, str], int] = {}
-    for view, origins in views:
+    for view, origins in _backstop_views(masked):
         for key, count in _backstop_tokens(view, origins, covered).items():
             if count > tokens.get(key, 0):
                 tokens[key] = count
+    # Task 3154 (I3152-01, I3152-02): the separated reading only adds words,
+    # so it can never trust a review the other views block.
+    if separated_text is not None:
+        for view, origins in _backstop_views(separated_text):
+            for key, count in _backstop_tokens(view, origins, covered,
+                                               separated=True).items():
+                if count > tokens.get(key, 0):
+                    tokens[key] = count
     if not tokens:
         return analysis
     # Headings, sections and finding IDs excuse MEDIUM words only.
@@ -4143,6 +4385,10 @@ def _analyze_review_file(
         folded_first = normalize_review_text(
             _translate_non_ascii(text, _BACKSTOP_LETTER_FOLDS),
         )
+    # Task 3154 (I3152-01, I3152-02): whether a word stands alone is also
+    # decided on the text as written, before any character is deleted or
+    # folded (see _backstop_separated_text).
+    separated_text = _backstop_separated_text(text)
     text = normalize_review_text(text)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
@@ -4168,7 +4414,19 @@ def _analyze_review_file(
                         f"changed the line count"),
             )
         backstop_text = folded_first
-    return _severity_token_backstop(backstop_text, analysis, heading_text=text)
+    if (separated_text is not None
+            and separated_text.count("\n") != text.count("\n")):
+        # Not expected: every mark replaces one character on its own line.
+        if not analysis.trusted:
+            return analysis
+        return replace(
+            analysis,
+            verdict=REVIEW_VERDICT_COUNT_MISMATCH,
+            detail=(f"{BACKSTOP_REASON}: reading the separators changed "
+                    f"the line count"),
+        )
+    return _severity_token_backstop(backstop_text, analysis, heading_text=text,
+                                    separated_text=separated_text)
 
 
 def _too_many_severity_lines(
