@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
+import contextvars
 import hashlib
 import logging
 import os
@@ -22,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -773,9 +775,10 @@ def _operator_program_pins(env: Mapping[str, str]) -> tuple[str, ...]:
 def _hardened_git_env(
     extra_env: Mapping[str, str] | None = None,
     args: Sequence[str] = (),
+    repository: PinnedGitRepository | None = None,
 ) -> dict[str, str]:
     """Allowlisted env, push credentials for a push ``args``, the caller's
-    ``extra_env``, then the hardening.
+    ``extra_env``, then the hardening and the pinned ``repository``.
 
     The hardening is applied last so no caller can switch it back off.
     """
@@ -787,6 +790,8 @@ def _hardened_git_env(
     pin = _global_config_pin
     if pin is not None:
         env["GIT_CONFIG_GLOBAL"] = str(pin.path)
+    if repository is not None:
+        env.update(repository.env())
     return env
 
 
@@ -804,17 +809,151 @@ def _git_subcommand_index(args: Sequence[str]) -> int | None:
     return None
 
 
-def _hardened_git_argv(args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+def _hardened_git_argv(
+    args: Sequence[str],
+    env: Mapping[str, str],
+    pin: PinnedGitRepository | None = None,
+) -> list[str]:
     """Full argv for ``git <args>`` with the hardening flags in front.
 
     Diff-family subcommands also get ``_DIFF_DRIVER_OFF_ARGS`` directly after
-    the subcommand name, ahead of any ``--`` the caller passes.
+    the subcommand name, ahead of any ``--`` the caller passes. A ``pin``
+    adds its ``--git-dir`` / ``--work-tree`` options.
     """
     command = list(args)
     subcommand = _git_subcommand_index(command)
     if subcommand is not None and command[subcommand] in _DIFF_DRIVER_SUBCOMMANDS:
         command[subcommand + 1:subcommand + 1] = _DIFF_DRIVER_OFF_ARGS
-    return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *command]
+    pin_args = pin.argv() if pin is not None else []
+    return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *pin_args, *command]
+
+
+# --- Pinned repositories (R3146-01, task #3151) --------------------------------
+#
+# git finds a repository through the ``.git`` entry it meets in its working
+# directory, and agents share the orchestrator's UID: between the guard's
+# identity check and ``git merge``, an agent can rename ``.git`` away and put a
+# symlink or ``gitdir:`` file to a clone of its own in its place. The merge then
+# runs in the clone, including the clone's filter drivers, inside the
+# orchestrator. A realpath does not help, since the same path now leads to the
+# clone. The merge path therefore opens the pinned git directories once, checks
+# their inodes against the snapshot and hands git the open descriptors
+# (``--git-dir=/proc/self/fd/N`` plus ``GIT_COMMON_DIR``). git keeps that path
+# as its git dir, so every later lookup goes through the descriptor, wherever
+# the directory has been renamed to and whatever now sits at ``.git``.
+
+_FD_DIRECTORY = "/proc/self/fd"
+
+
+class PinnedRepositoryError(Exception):
+    """A pinned git directory is not the one recorded at the snapshot."""
+
+
+@dataclass(frozen=True)
+class PinnedGitRepository:
+    """The repository every git call run in ``work_tree`` must use.
+
+    ``git_dir`` and ``common_dir`` are what git is given: descriptor paths
+    under ``/proc/self/fd`` for the open ``fds``, or plain realpaths on a
+    system without that directory (not rename-proof there).
+    """
+
+    work_tree: str
+    git_dir: str
+    common_dir: str
+    fds: tuple[int, ...] = ()
+
+    def argv(self) -> list[str]:
+        return [f"--git-dir={self.git_dir}", f"--work-tree={self.work_tree}"]
+
+    def env(self) -> dict[str, str]:
+        # Overrides the git dir's ``commondir`` file, which an agent can
+        # rewrite to point at another repository.
+        return {"GIT_COMMON_DIR": self.common_dir}
+
+
+_pinned_repositories: contextvars.ContextVar[Mapping[str, PinnedGitRepository]] = (
+    contextvars.ContextVar("equipa_pinned_git_repositories", default=MappingProxyType({}))
+)
+
+
+def _directory_id(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def open_pinned_directory(
+    path: str,
+    expected_id: tuple[int, int] | None,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    """Open the directory ``path`` (relative to ``dir_fd`` when given).
+
+    With ``expected_id`` the opened directory's (device, inode) must match,
+    so a directory renamed or swapped in after the snapshot is refused
+    before it is used. With ``dir_fd`` the last component must not be a
+    symlink. Raises :class:`PinnedRepositoryError`; the caller owns the fd.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if dir_fd is not None:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot open the pinned git directory {path}: {exc.strerror}"
+        ) from exc
+    if expected_id is not None and _directory_id(fd) != tuple(expected_id):
+        os.close(fd)
+        raise PinnedRepositoryError(
+            f"{path} is no longer the git directory pinned at the snapshot "
+            f"(device/inode {tuple(expected_id)})"
+        )
+    return fd
+
+
+def pinned_repository(
+    work_tree: str, git_dir_fd: int, common_dir_fd: int,
+    *, git_dir: str, common_dir: str,
+) -> PinnedGitRepository:
+    """A :class:`PinnedGitRepository` for open directory descriptors.
+
+    ``git_dir`` / ``common_dir`` are the realpaths, used only where
+    ``/proc/self/fd`` does not exist.
+    """
+    if os.path.isdir(_FD_DIRECTORY):
+        return PinnedGitRepository(
+            os.path.realpath(work_tree),
+            f"{_FD_DIRECTORY}/{git_dir_fd}",
+            f"{_FD_DIRECTORY}/{common_dir_fd}",
+            tuple(sorted({git_dir_fd, common_dir_fd})),
+        )
+    return PinnedGitRepository(os.path.realpath(work_tree), git_dir, common_dir)
+
+
+@contextlib.contextmanager
+def git_repositories_pinned(*repositories: PinnedGitRepository) -> Iterator[None]:
+    """Inside the block, every :func:`git_run` / :func:`git_run_async` whose
+    ``cwd`` is one of the pinned work trees (exactly, by realpath) runs on
+    that pinned repository instead of discovering one. Context-local, so a
+    concurrent merge in another task is unaffected. The caller keeps the
+    descriptors open for the whole block and closes them afterwards.
+    """
+    pins = dict(_pinned_repositories.get())
+    pins.update({repository.work_tree: repository for repository in repositories})
+    token = _pinned_repositories.set(MappingProxyType(pins))
+    try:
+        yield
+    finally:
+        _pinned_repositories.reset(token)
+
+
+def _pinned_repository_for(cwd: str | Path) -> PinnedGitRepository | None:
+    pins = _pinned_repositories.get()
+    if not pins:
+        return None
+    return pins.get(os.path.realpath(cwd))
 
 
 # IR-04 (task #3132): agents share the orchestrator's UID, so any agent shell
@@ -904,15 +1043,18 @@ def _run_with_env(
     env: Mapping[str, str] | None = None,
     *,
     text: bool = True,
+    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess:
     """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only.
 
     ``env`` replaces the default :func:`_get_repo_env` environment when given.
+    ``pass_fds`` are kept open, at the same numbers, in the child.
     """
     return subprocess.run(
         args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
         env=dict(env) if env is not None else _get_repo_env(),
+        pass_fds=tuple(pass_fds),
     )
 
 
@@ -938,10 +1080,14 @@ def git_run(
     hardening variables are applied last and cannot be overridden.
     ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
+    Inside :func:`git_repositories_pinned`, a ``cwd`` that is a pinned work
+    tree runs on the pinned repository (R3146-01, task #3151).
     """
-    run_env = _hardened_git_env(env, args)
+    pin = _pinned_repository_for(cwd)
+    run_env = _hardened_git_env(env, args, pin)
     return _run_with_env(
-        _hardened_git_argv(args, run_env), cwd, timeout, run_env, text=text,
+        _hardened_git_argv(args, run_env, pin), cwd, timeout, run_env, text=text,
+        pass_fds=pin.fds if pin is not None else (),
     )
 
 
@@ -969,8 +1115,9 @@ async def git_run_async(
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
-    run_env = _hardened_git_env(env, args)
-    argv = _hardened_git_argv(args, run_env)
+    pin = _pinned_repository_for(cwd)
+    run_env = _hardened_git_env(env, args, pin)
+    argv = _hardened_git_argv(args, run_env, pin)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
@@ -978,6 +1125,7 @@ async def git_run_async(
         stdin=asyncio.subprocess.PIPE if input is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        pass_fds=pin.fds if pin is not None else (),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(

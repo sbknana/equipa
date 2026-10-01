@@ -59,14 +59,19 @@ from equipa.db import (
 from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import (
     GitRepositoryUnreadableError,
+    PinnedGitRepository,
+    PinnedRepositoryError,
     UntrustedDefaultBranchError,
     _is_git_repo,
     get_default_branch,
     get_trusted_default_branch,
+    git_repositories_pinned,
     git_run,
     git_run_async,
     git_toplevel,
     git_toplevel_async,
+    open_pinned_directory,
+    pinned_repository,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -2881,6 +2886,139 @@ async def _common_dir_mismatch(
     return None
 
 
+@dataclass
+class _MergePins:
+    """Pinned repositories for one merge and the descriptors they hold."""
+    repositories: list[PinnedGitRepository]
+    fds: list[int]
+
+    def close(self) -> None:
+        for fd in self.fds:
+            os.close(fd)
+        self.fds.clear()
+
+
+async def _pin_merge_repositories(
+    guard: DefaultBranchGuard, work_tree: str, worktree_dir: str | None,
+) -> _MergePins:
+    """Open the repositories the merge must use, as recorded at the snapshot.
+
+    R3146-01 (task #3151): ``guard.verify`` proved the identity a moment ago,
+    but git would discover the repository again on every call, so a ``.git``
+    swapped in between redirected the merge (and its filter drivers) into
+    another repository. The main checkout's git dir and common dir are
+    opened by their snapshot realpaths and must have their snapshot inodes.
+    The task worktree's git dir is opened INSIDE the pinned common dir (its
+    ``worktrees/<name>`` entry, no symlink), so it cannot be elsewhere; the
+    merge then checks its branch and HEAD through that pin.
+
+    git's files ref backend reads refs through the ``commondir`` file of the
+    git dir, whatever ``GIT_COMMON_DIR`` says (git 2.43); config, objects and
+    so every driver do follow the pin. A ``commondir`` that does not name the
+    pinned common dir is refused here. One planted during the merge can move
+    only refs, never run another repository's drivers, and the post-merge
+    identity check (``record_merge``) trips on it.
+
+    A hand-built guard without an identity pins nothing (hermetic tests).
+    Raises :class:`PinnedRepositoryError` when anything does not match.
+    """
+    identity = guard.identity
+    if identity is None:
+        return _MergePins([], [])
+    if os.path.realpath(work_tree) != identity.work_tree:
+        raise PinnedRepositoryError(
+            f"the merge would run in {work_tree}, not in the work tree "
+            f"{identity.work_tree} pinned at the snapshot"
+        )
+    pins = _MergePins([], [])
+    try:
+        common_fd = open_pinned_directory(identity.common_dir, identity.common_dir_id)
+        pins.fds.append(common_fd)
+        git_dir_fd = common_fd
+        if identity.git_dir_id != identity.common_dir_id:
+            git_dir_fd = open_pinned_directory(identity.git_dir, identity.git_dir_id)
+            pins.fds.append(git_dir_fd)
+        _check_commondir_file(
+            git_dir_fd, identity.git_dir, identity.common_dir,
+            linked=git_dir_fd != common_fd,
+        )
+        pins.repositories.append(pinned_repository(
+            identity.work_tree, git_dir_fd, common_fd,
+            git_dir=identity.git_dir, common_dir=identity.common_dir,
+        ))
+        if worktree_dir is not None:
+            admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
+            worktrees_fd = open_pinned_directory("worktrees", None, dir_fd=common_fd)
+            try:
+                admin_fd = open_pinned_directory(admin, None, dir_fd=worktrees_fd)
+            finally:
+                os.close(worktrees_fd)
+            pins.fds.append(admin_fd)
+            admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
+            _check_commondir_file(admin_fd, admin_dir, identity.common_dir, linked=True)
+            pins.repositories.append(pinned_repository(
+                worktree_dir, admin_fd, common_fd,
+                git_dir=admin_dir, common_dir=identity.common_dir,
+            ))
+    except BaseException:
+        pins.close()
+        raise
+    return pins
+
+
+# git writes a worktree's commondir as a short relative path ("../..").
+_COMMONDIR_READ_LIMIT = 4096
+
+
+def _check_commondir_file(
+    git_dir_fd: int, git_dir: str, common_dir: str, *, linked: bool,
+) -> None:
+    """Refuse a ``commondir`` file in the pinned git dir that does not name
+    ``common_dir``. A repository's own git dir (``linked=False``) has none;
+    a linked worktree's names the common dir, usually relatively."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open("commondir", flags, dir_fd=git_dir_fd)
+    except FileNotFoundError:
+        if linked:
+            raise PinnedRepositoryError(
+                f"the worktree git dir {git_dir} has no commondir file"
+            ) from None
+        return
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read {git_dir}/commondir: {exc.strerror}"
+        ) from exc
+    with os.fdopen(fd, "rb") as handle:
+        named = handle.read(_COMMONDIR_READ_LIMIT).decode("utf-8", "replace").rstrip("\r\n")
+    if not linked or os.path.normpath(os.path.join(git_dir, named)) != common_dir:
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir names {named[:200]!r}, not the pinned git "
+            f"common dir {common_dir}"
+        )
+
+
+async def _worktree_admin_name(worktree_dir: str, common_dir: str) -> str:
+    """Name of ``worktree_dir``'s git dir under ``<common_dir>/worktrees``."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--absolute-git-dir"], worktree_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the git dir of the task worktree {worktree_dir}: {exc}"
+        ) from exc
+    printed = (result.stdout or "").strip()
+    admin = os.path.realpath(printed) if result.returncode == 0 and printed else ""
+    if os.path.dirname(admin) != os.path.join(common_dir, "worktrees"):
+        raise PinnedRepositoryError(
+            f"the task worktree {worktree_dir} uses the git dir "
+            f"{admin or 'none'}, not one of the worktrees of the pinned "
+            f"repository {common_dir}"
+        )
+    return os.path.basename(admin)
+
+
 async def _gated_merge_task(
     *,
     repo: str | os.PathLike,
@@ -3181,6 +3319,17 @@ async def _gated_merge_task(
             event="merge-skipped",
         )
         return finish("merge_failed", reason)
+    # R3146-01 (task #3151): from here on git never discovers the repository.
+    # The pinned git dirs are opened and inode-checked now; every merge-path
+    # git call in the main checkout or the task worktree runs on them.
+    try:
+        pins = await _pin_merge_repositories(guard, git_dir, git_worktree_dir)
+    except PinnedRepositoryError as exc:
+        guard.trip(
+            f"pre-merge task={task_id}", await guard.current_sha(),
+            task_id=task_id, detail=str(exc),
+        )
+        return finish("blocked", guard.alert or str(exc))
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
         f"sha={merge_sha or 'MISSING'} doc_only={decision.doc_only} "
@@ -3195,16 +3344,17 @@ async def _gated_merge_task(
         # the artifact requirement; everything else demands it fail-closed.
         # dispatch-06: SIGTERM/SIGINT are deferred for the merge, so it
         # finishes or is aborted before the orchestrator acts on them.
-        async with MergeSignalShield(git_dir, context=f"merge of {branch}"):
-            merged = await _merge_task_branch(
-                git_dir, task_id, branch,
-                expect_artifact=decision.expect_artifact,
-                merge_sha=merge_sha,
-                worktree_dir=git_worktree_dir,
-                merge_record=attempt,
-                artifact_dir=project_dir,
-                pinned_default_sha=guard.expected_sha,
-            )
+        with git_repositories_pinned(*pins.repositories):
+            async with MergeSignalShield(git_dir, context=f"merge of {branch}"):
+                merged = await _merge_task_branch(
+                    git_dir, task_id, branch,
+                    expect_artifact=decision.expect_artifact,
+                    merge_sha=merge_sha,
+                    worktree_dir=git_worktree_dir,
+                    merge_record=attempt,
+                    artifact_dir=project_dir,
+                    pinned_default_sha=guard.expected_sha,
+                )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-blocked detail={exc}",
@@ -3212,6 +3362,8 @@ async def _gated_merge_task(
             event="defensive-invariant-blocked",
         )
         return finish("blocked", f"defensive invariant: {exc}")
+    finally:
+        pins.close()
     if merged:
         landed_sha = attempt.merged_sha or merge_sha
         if landed_sha is None or not await guard.record_merge(

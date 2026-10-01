@@ -1000,7 +1000,12 @@ class RepositoryIdentity:
       ``symlink``, ``other`` or ``absent`` for a nested project) and its
       device and inode;
     * ``default_head``: the default branch's commit read through the pinned
-      common dir itself, never through discovery from the project directory.
+      common dir itself, never through discovery from the project directory;
+    * ``git_dir`` / ``git_dir_id`` and ``work_tree`` (task #3151, R3146-01):
+      realpath and device/inode of the checkout's own git dir (the common
+      dir, unless the checkout is a linked worktree) and of its work-tree
+      root. The merge runs git on exactly these, opened by descriptor and
+      inode-checked, never on whatever ``.git`` says at merge time.
     """
 
     common_dir: str
@@ -1008,6 +1013,9 @@ class RepositoryIdentity:
     git_entry: str
     git_entry_id: tuple[int, int] | None
     default_head: str
+    git_dir: str
+    git_dir_id: tuple[int, int]
+    work_tree: str
 
     def describe(self) -> str:
         return (
@@ -1069,10 +1077,37 @@ async def repository_identity(
             f"default branch '{default_branch}' does not resolve in the git "
             f"common dir {common}"
         )
+    git_dir = await _absolute_git_dir(directory)
+    if git_dir is None:
+        return f"git cannot locate the git dir of {os.fspath(directory)}"
+    try:
+        git_dir_info = os.stat(git_dir)
+    except OSError as exc:
+        return f"the git dir {git_dir} is unreadable: {exc.strerror}"
+    # Empty when git names no work tree containing ``directory``: snapshot()
+    # refuses that, and a later check reports the first changed field.
+    work_tree = await git_toplevel_async(directory)
     kind, entry_id = _git_entry(directory)
     return RepositoryIdentity(
         common, (common_info.st_dev, common_info.st_ino), kind, entry_id, head,
+        git_dir, (git_dir_info.st_dev, git_dir_info.st_ino),
+        os.path.realpath(work_tree) if work_tree is not None else "",
     )
+
+
+async def _absolute_git_dir(directory: str | os.PathLike) -> str | None:
+    """Realpath of the git dir git finds from ``directory``, or None."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--absolute-git-dir"], directory, timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[Merge-Integrity] no git dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    return os.path.realpath(printed)
 
 
 @dataclass
@@ -1128,6 +1163,8 @@ class DefaultBranchGuard:
         identity = await repository_identity(repo, default_branch)
         if isinstance(identity, str):
             raise MergeIntegrityError(identity)
+        if not identity.work_tree:
+            raise MergeIntegrityError(f"no readable git work tree contains {repo}")
         if identity.default_head != sha:
             raise MergeIntegrityError(
                 f"default branch '{default_branch}' is {_short(sha)} in {repo} "
@@ -1201,7 +1238,10 @@ class DefaultBranchGuard:
         current = await repository_identity(self.project_dir, self.default_branch)
         if isinstance(current, str):
             return current
-        for name in ("common_dir", "common_dir_id", "git_entry", "git_entry_id"):
+        for name in (
+            "common_dir", "common_dir_id", "git_entry", "git_entry_id",
+            "git_dir", "git_dir_id", "work_tree",
+        ):
             if getattr(current, name) != getattr(pinned, name):
                 return (
                     f"repository identity of {self.project_dir} changed: {name} "
