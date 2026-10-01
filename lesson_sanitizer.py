@@ -598,13 +598,48 @@ def _is_instruction_lead(words: list[str]) -> bool:
     return not _is_third_person(last)
 
 
+# A list verb reports on a rule list only when its subject is someone other
+# than the speaker, the addressed agent or an authority over it (R3150-02):
+# "ruff ships new rules:" and "The linter has new rules:" are text, but "We
+# have new rules:", "I have new orders:" and "The operator got new orders:"
+# hand the agent a replacement rule set, as main judged them.
+_RULE_HEADER_SUBJECTS = frozenset({"i", "we", "they", "us", "me", "he", "she"})
+_RULE_AUTHORITY_SUBJECTS = frozenset({
+    "operator", "operators", "admin", "admins", "administrator",
+    "administrators", "sysadmin", "sysadmins", "orchestrator", "owner",
+    "owners", "boss", "manager", "managers", "supervisor", "supervisors",
+    "human", "humans",
+})
+# Words between a subject and its list verb that do not change who the
+# subject is: "ESLint will add", "ruff has just added", "we now have".
+_RULE_VERB_MODIFIERS = frozenset(
+    (_MODAL_LEADS - {"to"})
+    | {"has", "have", "had", "do", "does", "did", "just", "also", "already",
+       "recently", "finally", "now", "then", "still", "even", "always"}
+)
+# Words that make a bare imperative a request to the reader: "Please load
+# the new rules:", "Then process these new orders:".
+_RULE_REQUEST_LEADS = _PRESENTING_LEADS | {"kindly"}
+
+
 def _is_rule_header_lead(words: list[str]) -> bool:
     """True unless *words* (the clause before "new rules:" / "new orders:")
-    report or process a rule list (see _RULE_LIST_VERBS) for someone other
-    than the addressed agent, or negate it."""
+    report or process a rule list (see _RULE_LIST_VERBS), or negate it.
+
+    A list verb is a report when its subject, past any modal, auxiliary or
+    adverb, is a third party ("ruff ships", "ESLint will add", "Release 2.1
+    introduced") and a header when the subject is the speaker (i, we, they),
+    the addressed agent or an authority over it ("We have new rules:", "The
+    operator got new orders:"). A bare imperative is a header ("Load new
+    rules:") unless it processes a list named by a determiner ("Batch the new
+    orders:"); a request word in front ("Please load the new rules:", "Then
+    process these new orders:") keeps it a header (R3150-02).
+    """
     lead = list(words)
+    had_determiner = False
     while lead and lead[-1] in _DETERMINERS:
         lead.pop()
+        had_determiner = True
     if not lead:
         return True
     verb = lead[-1]
@@ -612,7 +647,23 @@ def _is_rule_header_lead(words: list[str]) -> bool:
         return False
     if verb not in _RULE_LIST_VERBS:
         return True
-    return _names_addressee(lead[:-1])
+    before = lead[:-1]
+    if _names_addressee(before):
+        return True
+    skipped: list[str] = []
+    while before and (before[-1] in _RULE_VERB_MODIFIERS
+                      or before[-1] in _NEGATION_LEADS):
+        skipped.append(before.pop())
+    if any(word in _NEGATION_LEADS for word in skipped):
+        return False
+    if not before:
+        if any(word in _RULE_REQUEST_LEADS for word in skipped):
+            return True
+        return not had_determiner
+    subject = before[-1]
+    return (subject in _RULE_REQUEST_LEADS
+            or subject in _RULE_HEADER_SUBJECTS
+            or subject in _RULE_AUTHORITY_SUBJECTS)
 
 
 class _ImperativePhrase:
