@@ -355,7 +355,10 @@ def test_the_suite_keeps_its_temp_files_in_a_session_directory():
     """conftest points TMPDIR (subprocesses) and tempfile (this process) at
     a private directory it removes at the end, so the config directories of
     SIGKILLed test orchestrators never reach the shared temp directory."""
-    from tests import conftest
+    # The module pytest loaded (tests/ is not a package). "from tests import
+    # conftest" would execute the file a second time: a new session temp
+    # directory and a new THEFORGE_DB for the rest of the run.
+    import conftest
 
     session_tmp = str(conftest.SESSION_TMP)
     assert Path(session_tmp).name.startswith("eqt-")
@@ -370,3 +373,17 @@ def test_the_suite_keeps_its_temp_files_in_a_session_directory():
         assert os.path.dirname(config_dir) == session_tmp
     finally:
         cli_isolation.remove_run_config_dir(config_dir)
+
+
+def test_no_test_imports_conftest_under_a_second_module_name():
+    """A second copy of conftest re-runs its module body mid-session: a new
+    session temp directory and a new THEFORGE_DB for every later test."""
+    second_copy = ("from tests import conftest", "import tests.conftest",
+                   "from tests.conftest import")
+    offenders = [
+        path.name for path in sorted((REPO_ROOT / "tests").glob("*.py"))
+        if any(line.strip().startswith(second_copy)
+               for line in path.read_text(encoding="utf-8").splitlines())
+    ]
+    assert offenders == []
+    assert "tests.conftest" not in sys.modules
