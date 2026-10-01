@@ -462,6 +462,12 @@ def _tokenizer_words(command: str) -> list[str]:
                 assert all(k == bash_security._K_COMMENT for k in rest), command
                 break
             continue
+        if (kind == bash_security._K_ESCAPE and command[index + 1:index + 2] == "\n") or (
+            kind == bash_security._K_ESCAPED and ch == "\n"
+        ):
+            # A line continuation: bash deletes it before splitting words, so
+            # it neither opens a word nor ends one (`p a \<nl>#x` is [a]).
+            continue
         if current is None:
             current = []
         if kind in (bash_security._K_ANSI, bash_security._K_DQ):
@@ -473,8 +479,6 @@ def _tokenizer_words(command: str) -> list[str]:
         flush_run()
         if kind in (bash_security._K_SQ_DELIM, bash_security._K_DQ_DELIM,
                     bash_security._K_ANSI_DELIM, bash_security._K_ESCAPE):
-            continue
-        if kind == bash_security._K_ESCAPED and ch == "\n":
             continue
         assert kind in (bash_security._K_CODE, bash_security._K_ESCAPED,
                         bash_security._K_SQ), (command, index, kind)
@@ -518,9 +522,27 @@ PRELUDE = (
 )
 
 
-def test_tokenizer_agrees_with_bash_on_generated_commands(tmp_path: Path):
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # IV3133-02: a continuation before a comment opens no word.
+        ("p a \\\n#x", ["a"]),
+        ("p a \\\n\\\n#x", ["a"]),
+        ("p \\\n#x", []),
+        ("p a\\\nb", ["ab"]),
+        ("p 'a'\\\n\"b\"", ["ab"]),
+    ],
+)
+def test_tokenizer_words_helper_follows_bash_continuations(command: str, expected: list[str]):
+    assert _tokenizer_words(command) == expected
+
+
+# Seeds 1-5 found the continuation artifact above at scale (IV3133-02); every
+# seed now runs in the suite, not only the original one.
+@pytest.mark.parametrize("seed", [SEED, 1, 2, 3, 4, 5])
+def test_tokenizer_agrees_with_bash_on_generated_commands(tmp_path: Path, seed: int):
     bash = _require_bash()
-    rng = random.Random(SEED)
+    rng = random.Random(seed)
     cases: list[tuple[str, str, bool, bool]] = []
     for _ in range(WORD_COMMANDS):
         cases.append(("words", _word_command(rng), False, False))
