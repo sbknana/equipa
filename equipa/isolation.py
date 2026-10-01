@@ -2630,6 +2630,7 @@ def _outer_checks(settings: IsolationSettings) -> list[str]:
                         + "; ".join(problems or ["the command is refused"])
                         + "); install:\n"
                         + sudoers_snippet(settings, orchestrator_user))
+    failures += firewall_table_failures(settings)
     database = Path(THEFORGE_DB)
     if database.exists() and database.stat().st_mode & stat.S_IROTH:
         failures.append(f"{database} is world-readable (chmod o-r)")
@@ -2651,6 +2652,119 @@ def _outer_checks(settings: IsolationSettings) -> list[str]:
         failures.append(f"more than {_MAX_DATABASE_COPIES} database files "
                         f"below secret_scan_roots; the search stopped there")
     return failures
+
+
+# The agent user's nftables table (runbook step 4a). On a host whose user
+# manager cannot apply IPAddressDeny= it is the network boundary.
+NFT_EXECUTABLE = "/usr/sbin/nft"
+NFT_TABLE: tuple[str, str] = ("inet", "equipa_agent")
+
+
+def firewall_table_failures(settings: IsolationSettings) -> list[str]:
+    """The agent user's nftables table is loaded (review N1).
+
+    Listing a table needs CAP_NET_ADMIN, so the orchestrator asks through
+    ``sudo -n`` (the runbook allows it that one command). The probes inside
+    the unit then show from the agent's side that the rule works."""
+    command = [settings.sudo, "-n", NFT_EXECUTABLE, "list", "table",
+               *NFT_TABLE]
+    status = _exit_status(command)
+    if status == 0:
+        return []
+    return [f"the nftables table {' '.join(NFT_TABLE)} is not loaded, or the "
+            f"orchestrator may not list it ('{' '.join(command)}' exited "
+            f"{status}); load it with equipa-agent-firewall.service and allow "
+            f"the orchestrator exactly that command (docs/AGENT_ISOLATION.md "
+            f"step 4a)"]
+
+
+# How long the orchestrator's own connect to a --lan-target may take.
+_LAN_CONTROL_SECONDS = 3.0
+
+
+def tcp_reachable(targets: Sequence[tuple[str, int]],
+                  timeout: float = _LAN_CONTROL_SECONDS
+                  ) -> set[tuple[str, int]]:
+    """The ``(address, port)`` targets this process can connect to. Every
+    connect runs side by side and all of them share one ``timeout``; a
+    target whose socket cannot even be created counts as unreachable."""
+    import errno
+    import ipaddress
+    import select
+    import socket
+
+    clients: dict[socket.socket, tuple[str, int]] = {}
+    pending: list[socket.socket] = []
+    reached: set[tuple[str, int]] = set()
+    try:
+        for address, port in targets:
+            family = (socket.AF_INET6
+                      if ipaddress.ip_address(address).version == 6
+                      else socket.AF_INET)
+            try:
+                client = socket.socket(family, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            clients[client] = (address, port)
+            client.setblocking(False)
+            code = client.connect_ex((address, port))
+            if code == 0:
+                reached.add((address, port))
+            elif code in (errno.EINPROGRESS, errno.EALREADY, errno.EAGAIN):
+                pending.append(client)
+        deadline = time.monotonic() + timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _readable, writable, _error = select.select([], pending, [],
+                                                        remaining)
+            for client in writable:
+                pending.remove(client)
+                if client.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    reached.add(clients[client])
+    finally:
+        for client in clients:
+            client.close()
+    return reached
+
+
+def lan_target_control_failures(targets: Sequence[tuple[str, int]]
+                                ) -> list[str]:
+    """A ``--lan-target`` the orchestrator itself cannot reach proves
+    nothing when the agent cannot reach it either, so it fails the check
+    instead of passing it (review R3142-02)."""
+    reached = tcp_reachable(targets)
+    return [f"the LAN target {format_lan_target(address, port)} does not "
+            f"answer the orchestrator either, so the agent's probe of it "
+            f"proves nothing; list a LAN service the orchestrator can reach"
+            for address, port in dict.fromkeys(targets)
+            if (address, port) not in reached]
+
+
+def format_lan_target(address: str, port: int) -> str:
+    """``ADDRESS:PORT``, the IPv6 address in brackets."""
+    return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+
+def _lan_target(text: str) -> tuple[str, int]:
+    """``ADDRESS:PORT`` or ``[IPV6]:PORT`` of ``--lan-target``. IP literals
+    only: a name would probe whatever the resolver answers that day."""
+    import argparse
+    import ipaddress
+
+    host, _colon, port_text = text.rpartition(":")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    elif ":" in host:
+        raise argparse.ArgumentTypeError(
+            f"write an IPv6 LAN target as [ADDRESS]:PORT, got {text!r}")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"not ADDRESS:PORT with an IP address: {text!r}") from exc
+    return str(address), _port_number(port_text)
 
 
 def _exit_status(argv: Sequence[str]) -> int:
@@ -2762,6 +2876,12 @@ def build_probe_command(probe: str, settings: IsolationSettings,
         command += ["--db-copy", path]
     for port in sorted({*loopback_ports, *listening_loopback_ports()}):
         command += ["--deny-port", str(port)]
+    # Review N1 / R3142-01: every address of this host, whatever its range
+    # (a tailnet's 100.64/10 or a public one included). The agent connects
+    # to its own listener on each and to every --deny-port there. The
+    # launcher's own reader, so both checks see the same addresses.
+    for address in agent_launcher._local_addresses():
+        command += ["--host-address", address]
     return command
 
 
@@ -2809,6 +2929,11 @@ def verification_main(argv: Sequence[str] | None = None) -> int:
                         help="port of a local service the agent must not "
                              "reach at 127.0.0.1 (repeatable); every port "
                              "listening on loopback is probed as well")
+    parser.add_argument("--lan-target", action="append", default=[],
+                        type=_lan_target, metavar="ADDRESS:PORT",
+                        help="a LAN service the agent must not reach "
+                             "(repeatable, [IPV6]:PORT for IPv6); the "
+                             "orchestrator must reach it itself")
     args = parser.parse_args(argv)
     if os.geteuid() == 0:
         print("FAIL run this as the orchestrator user, not root")
@@ -2823,11 +2948,14 @@ def verification_main(argv: Sequence[str] | None = None) -> int:
         print(f"FAIL {exc}")
         return 2
     failures = _outer_checks(settings)
+    failures += lan_target_control_failures(args.lan_target)
     for failure in failures:
         print(f"FAIL {failure}")
     command = build_probe_command(args.verify_probe, settings, args.repo,
                                   pwd.getpwuid(os.getuid()).pw_dir,
                                   args.loopback_port)
+    for address, port in dict.fromkeys(args.lan_target):
+        command += ["--lan-target", format_lan_target(address, port)]
     try:
         output = asyncio.run(_run_probe(command, dispatch_config))
     except AgentIsolationError as exc:
