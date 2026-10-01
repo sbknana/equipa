@@ -211,8 +211,9 @@ def test_another_severity_inside_a_counted_section_blocks():
     text = review("1 finding.", [
         "## Findings", "",
         f"### [S1] MEDIUM {E} Missing rate limit",
-        "HIGH: SQL injection in login, found while checking S1.",
+        "Also a HIGH risk here: SQL injection in login, found while checking.",
     ], ONE_MEDIUM)
+    assert rules_only(text).trusted
     assert blocked_by_backstop(text), analyze(text).detail
 
 
@@ -255,7 +256,7 @@ def test_footer_covering_heading_less_findings_merges():
     ["**No CRITICAL or HIGH findings.**"],
     ["There are no CRITICAL, HIGH or MEDIUM issues."],
     ["None is CRITICAL or HIGH."],
-    ["Rated LOW, not MEDIUM: it needs a local account."],
+    ["Rated LOW, not MEDIUM, as it needs a local account."],
     ["Kept at LOW rather than MEDIUM."],
     ["0 CRITICAL/HIGH results from semgrep."],
 ])
@@ -379,7 +380,7 @@ def test_r3137_03_marker_as_the_only_summary_line_is_parsed_rendered():
     finally:
         loops._analyze_review_text = real
     assert len(calls) == 2, "a mid-document marker must not take the shortcut"
-    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis.detail
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
 
 
 def test_edge_marker_lines_still_parse_once(monkeypatch):
@@ -555,7 +556,7 @@ REVIEWER_FAMILIES = {
     "pipe_hi_rows": ["| a | b |", "|---|---|"]
     + pad("| HIGH to | MEDIUM or | HIGH |"),
     "comb_flood": ["H" + "\N{COMBINING LOW LINE}" * (RB // 2)],
-    "comb_mixed": ["\N{LATIN SMALL LETTER A WITH ACUTE}" * (RB // 3)],
+    "comb_mixed": ["a\N{COMBINING ACUTE ACCENT}" * (RB // 3)],
     "amp_flood": ["&#72;" * (RB // 5)],
     "amp_bad": ["&#x" * (RB // 3)],
     "nbsp_runs": ["Severity:" + "\N{NO-BREAK SPACE}" * (RB // 2) + "HIGH"],
@@ -587,8 +588,12 @@ BACKSTOP_FAMILIES = {
     "small_caps": ["ʜɪɢʜ " * (RB // 9)],
     "negative_squared": ["\U0001F177\U0001F178\U0001F176\U0001F177 "
                          * (RB // 17)],
-    "distinct_code_points": ["".join(chr(code_point) for code_point
-                                     in range(0x4E00, 0x4E00 + RB // 3))],
+    # More distinct code points than the backstop's translate table keeps,
+    # surrogates skipped (they cannot be written as UTF-8).
+    "distinct_code_points": ["".join(
+        chr(code_point) for code_point in range(0x4E00, 0x4E00 + RB // 3 + 2048)
+        if not 0xD800 <= code_point <= 0xDFFF
+    )],
     "format_chars": ["H​I­G\U0001D173H " * (RB // 14)],
     "counts_headings": pad("## Counts"),
     "counts_tally_long": ["## Counts", "CRITICAL: 0 " * (RB // 12)],
