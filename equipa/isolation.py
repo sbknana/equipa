@@ -1617,27 +1617,62 @@ def encode_handoff_preamble(header_bytes: bytes, bundle_size: int) -> bytes:
             f"{len(header_bytes)} {bundle_size}\n").encode("ascii")
 
 
-# --- Reviewers run alone (review R3136-03) ------------------------------------------
+# --- Units run alone (reviews R3136-03, F4) -------------------------------------------
 #
 # Every isolated unit runs as the same agent UID, so a unit running beside a
 # security reviewer can read the reviewer's handed-over prompt (with its
-# nonces) and write into its clone. Until each unit (or at least each
-# reviewer) gets its own UID, reviewer units never overlap any other
-# isolated unit: a reader-writer lock over two flock files in the
-# orchestrator user's private runtime directory (/run/user/<uid>, never
-# taken from XDG_RUNTIME_DIR), so it holds across every dispatch mode and
-# every orchestrator process of this user.
+# nonces) and write into its clone, and a unit of one task can replace
+# another task's export or edit its tester's clone (F4). Until each unit
+# gets its own UID, a unit that runs alone (:func:`unit_runs_alone`: every
+# unit, for now) never overlaps any other isolated unit: a reader-writer
+# lock over two flock files in the orchestrator user's private runtime
+# directory (/run/user/<uid>, never taken from XDG_RUNTIME_DIR), so it
+# holds across every dispatch mode and every orchestrator process of this
+# user.
 #
-# * Any other unit takes the turnstile shared for an instant, then the units
-#   lock shared for its whole life.
-# * A reviewer takes the turnstile exclusively (no new unit may start) and
-#   then the units lock exclusively (every running unit has ended), and
-#   keeps both until it ends. It also waits until no agent scope of this
-#   user is populated, which covers a unit that survived cgroup.kill and
-#   units of an orchestrator that predates the lock.
+# * A shared unit (only once units have UIDs of their own) takes the
+#   turnstile shared for an instant, then the units lock shared for its
+#   whole life.
+# * A unit that runs alone takes the turnstile exclusively (no new unit may
+#   start) and then the units lock exclusively (every running unit has
+#   ended), and keeps both until it ends. It also waits until no agent
+#   scope of this user is populated, which covers a unit that survived
+#   cgroup.kill and units of an orchestrator that predates the lock.
 
-# Roles whose units run alone.
+# Roles whose units run alone even once units get their own UIDs.
 EXCLUSIVE_ROLES = frozenset({"security-reviewer", "code-reviewer"})
+# Whether each unit runs as a UID of its own (a UID pool). Not implemented:
+# every unit shares ``agent_user``, so every unit runs alone (review F4).
+PER_UNIT_UIDS = False
+
+
+def unit_runs_alone(role: str | None) -> bool:
+    """Whether a unit of ``role`` must run with no other isolated unit.
+
+    Reviewers always do (R3136-03). While every unit shares one agent UID,
+    every other unit does too (review F4): a developer unit of task B
+    could otherwise replace task A's export in the shared exchange
+    directory, or edit A's tester clone and so forge A's verdict.
+    """
+    return role in EXCLUSIVE_ROLES or not PER_UNIT_UIDS
+
+
+def concurrency_refusal(max_concurrent: object,
+                        source: str = "max_concurrent") -> str | None:
+    """Why running ``max_concurrent`` tasks at once is refused, or None.
+
+    With isolation on and no UID pool, units run one at a time anyway
+    (:func:`unit_runs_alone`); a higher cap would only make tasks queue for
+    the unit slot until ``unit_wait_timeout_sec`` refuses them. Refusing it
+    up front makes the operator set ``max_concurrent`` to 1 (review F4).
+    """
+    if (isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int)
+            or max_concurrent <= 1 or not isolation_enabled()):
+        return None
+    return (f"{source} {max_concurrent} refused: agent_isolation is on and "
+            f"every agent runs as the one agent user, so only one isolated "
+            f"agent may run at a time (review F4); set max_concurrent to 1 "
+            f"(per-unit agent UIDs are not implemented)")
 _UNIT_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "equipa_isolation_unit_role", default=None)
 _TURNSTILE_LOCK_NAME = "equipa-isolation-turnstile.lock"
@@ -1799,10 +1834,11 @@ async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
         handles.append(_open_lock_file(directory, _UNITS_LOCK_NAME))
         turnstile, units = handles
         if exclusive:
-            wait = _SlotWait(label, "a reviewer runs alone while every agent "
-                             "shares one UID (review R3136-03)", timeout)
+            wait = _SlotWait(label, "an isolated agent runs alone while every "
+                             "agent shares one UID (reviews R3136-03, F4)",
+                             timeout)
             await _flock_when_free(turnstile, fcntl.LOCK_EX, wait,
-                                   "the reviewer before it")
+                                   "the isolated agent before it")
             await _flock_when_free(units, fcntl.LOCK_EX, wait,
                                    "the running isolated agents to end")
             while True:
@@ -1813,8 +1849,8 @@ async def acquire_unit_slot(label: str, *, exclusive: bool, timeout: float,
                     break
                 await wait.pause(f"agent scopes {', '.join(sorted(scopes))}")
             logger.warning("[Isolation] %s runs alone: new isolated agents "
-                           "wait until it ends (shared agent UID, review "
-                           "R3136-03)", label)
+                           "wait until it ends (shared agent UID, reviews "
+                           "R3136-03, F4)", label)
             return UnitSlot(label, True, handles)
         wait = _SlotWait(label, "a reviewer runs or waits to run alone "
                          "(review R3136-03)", timeout)
@@ -2124,11 +2160,12 @@ async def spawn_isolated_agent(
     """Start the agent CLI isolated (see the module docstring).
 
     Returns the process whose stdout/stderr carry the CLI's output (the
-    launcher's status line is already consumed) and its handle. A reviewer
-    unit (:data:`EXCLUSIVE_ROLES`, see :func:`unit_role`) first waits until
-    no other isolated unit runs, and any unit waits while a reviewer runs or
-    waits (:func:`acquire_unit_slot`); the handle holds that slot until it
-    is released.
+    launcher's status line is already consumed) and its handle. A unit that
+    runs alone (:func:`unit_runs_alone`: while units share one UID, every
+    unit; see :func:`unit_role`) first waits until no other isolated unit
+    runs, and any unit waits while such a unit runs or waits
+    (:func:`acquire_unit_slot`); the handle holds that slot until it is
+    released.
 
     Raises:
         AgentIsolationError: isolation could not be established or verified;
@@ -2148,7 +2185,7 @@ async def spawn_isolated_agent(
     unit = make_unit_name()
     role = current_unit_role()
     slot = await acquire_unit_slot(
-        f"{role or 'agent'} unit {unit}", exclusive=role in EXCLUSIVE_ROLES,
+        f"{role or 'agent'} unit {unit}", exclusive=unit_runs_alone(role),
         timeout=settings.unit_wait_timeout_sec)
     try:
         return await _spawn_in_slot(cmd, cwd, env, settings, unit, slot, limit)

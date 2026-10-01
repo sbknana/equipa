@@ -571,3 +571,201 @@ def test_cli_refuses_before_any_mode_runs() -> None:
     refused = body.index("refuse_dispatch(isolation_refusal)")
     handler = body.index("_select_mode_handler(args)")
     assert loaded < checked < refused < handler
+
+
+# --- F4: with one shared agent UID, isolated units run one at a time --------------------
+
+
+@pytest.fixture
+def lock_dir(tmp_path: Path, monkeypatch) -> Path:
+    """spawn_isolated_agent with its setup faked, a private lock directory,
+    fast polling and no live agent scopes (never the real /run/user)."""
+    directory = tmp_path / "run"
+    directory.mkdir(mode=0o700)
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation, "load_isolation_settings",
+                        lambda config: settings)
+    monkeypatch.setattr(isolation, "resolve_agent_identity", lambda s: None)
+    monkeypatch.setattr(isolation, "check_host", lambda s, i: None)
+    monkeypatch.setattr(isolation, "_runtime_dir", lambda: str(directory))
+    monkeypatch.setattr(isolation, "_unit_lock_dir", lambda: str(directory),
+                        raising=False)
+    monkeypatch.setattr(isolation, "_SLOT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(isolation, "live_agent_scopes",
+                        lambda app_slice=None: [])
+    monkeypatch.setattr(isolation, "sweep_stale_scopes",
+                        lambda app_slice=None: [])
+
+    class _Process:
+        pid = os.getpid()
+        stdin = None
+        returncode = 0
+
+    async def fake_spawn(cmd, cwd, env, settings, unit, slot, limit):
+        agent = isolation.IsolatedAgent(_Process(), unit, settings, None,
+                                        None, slot)
+        return agent.process, agent
+
+    monkeypatch.setattr(isolation, "_spawn_in_slot", fake_spawn)
+    return directory
+
+
+async def _spawn_as(role: str | None):
+    with isolation.unit_role(role):
+        return await isolation.spawn_isolated_agent(["claude"], None, {}, {})
+
+
+async def _started_within(awaitable, seconds: float = 0.3):
+    task = asyncio.ensure_future(awaitable)
+    await asyncio.sleep(seconds)
+    return task
+
+
+@pytest.mark.parametrize("first,second", [
+    ("developer", "developer"),
+    ("developer", "tester"),
+    ("tester", "integration-tester"),
+    ("evaluator", None),
+])
+def test_two_ordinary_units_never_overlap(lock_dir, first, second) -> None:
+    """Task B's developer may not start while task A's developer or tester
+    runs: it could replace A's export or edit A's tester clone."""
+    async def scenario() -> bool:
+        _process, running = await _spawn_as(first)
+        waiting = await _started_within(_spawn_as(second))
+        overlapped = waiting.done()
+        running.release()
+        _process, later = await asyncio.wait_for(waiting, 2)
+        later.release()
+        return overlapped
+
+    assert asyncio.run(scenario()) is False, \
+        f"a {second or 'helper'} unit ran beside a {first} unit"
+
+
+def test_units_of_another_process_are_waited_for(lock_dir) -> None:
+    """The units lock is per user: a unit another orchestrator process
+    holds (shared, as the old code took it) delays every unit here."""
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl, os, sys\n"
+         "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+         "fcntl.flock(fd, fcntl.LOCK_SH)\n"
+         "print('held', flush=True)\n"
+         "sys.stdin.read()\n",
+         str(lock_dir / isolation._UNITS_LOCK_NAME)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+
+        async def scenario() -> bool:
+            waiting = await _started_within(_spawn_as("developer"))
+            overlapped = waiting.done()
+            holder.stdin.close()
+            _process, agent = await asyncio.wait_for(waiting, 5)
+            agent.release()
+            return overlapped
+
+        assert asyncio.run(scenario()) is False
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_every_role_runs_alone_until_units_have_their_own_uid(
+        monkeypatch) -> None:
+    roles = ["developer", "tester", "integration-tester", "evaluator",
+             "debugger", None, "security-reviewer", "code-reviewer"]
+    assert all(isolation.unit_runs_alone(role) for role in roles)
+    # Once a UID pool exists, only the reviewers keep running alone.
+    monkeypatch.setattr(isolation, "PER_UNIT_UIDS", True)
+    assert [role for role in roles if isolation.unit_runs_alone(role)] == \
+        ["security-reviewer", "code-reviewer"]
+
+
+@pytest.mark.parametrize("value,enabled,refused", [
+    (2, True, True), (8, True, True), (1, True, False),
+    (4, False, False), (True, True, False), ("4", True, False),
+])
+def test_concurrency_above_one_is_refused_with_isolation_on(
+        monkeypatch, value, enabled, refused) -> None:
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: enabled)
+    refusal = isolation.concurrency_refusal(value, "--max-concurrent")
+    assert (refusal is not None) is refused
+    if refused:
+        assert f"--max-concurrent {value} refused" in refusal
+        assert "set max_concurrent to 1" in refusal
+
+
+@pytest.mark.parametrize("cli_value,config_value", [
+    (4, None), (None, 2), (None, None),
+])
+def test_parallel_tasks_refuse_a_cap_above_one_with_isolation_on(
+        monkeypatch, cli_value, config_value) -> None:
+    from equipa import dispatch
+
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: True)
+    config = {} if config_value is None else {"max_concurrent": config_value}
+    args = SimpleNamespace(max_concurrent=cli_value, dispatch_config=config)
+    with pytest.raises(dispatch.DispatchRefused) as refused:
+        dispatch.resolve_max_concurrent(args)
+    assert "set max_concurrent to 1" in refused.value.message
+
+
+def test_parallel_tasks_accept_one_with_isolation_on(monkeypatch) -> None:
+    from equipa import dispatch
+
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: True)
+    args = SimpleNamespace(max_concurrent=None,
+                           dispatch_config={"max_concurrent": 1})
+    assert dispatch.resolve_max_concurrent(args) == 1
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: False)
+    args = SimpleNamespace(max_concurrent=4, dispatch_config={})
+    assert dispatch.resolve_max_concurrent(args) == 4
+
+
+def test_auto_run_and_parallel_goals_refuse_a_cap_above_one(
+        monkeypatch) -> None:
+    from equipa import dispatch
+
+    monkeypatch.setattr(isolation, "isolation_enabled",
+                        lambda config=None: True)
+    with pytest.raises(dispatch.DispatchRefused):
+        asyncio.run(dispatch.run_auto_dispatch(
+            [], {"max_concurrent": 3}, SimpleNamespace()))
+    with pytest.raises(dispatch.DispatchRefused):
+        asyncio.run(dispatch.run_parallel_goals(
+            [], {"max_concurrent": 3}, SimpleNamespace(max_concurrent=None)))
+
+
+def test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal() -> None:
+    """Each place that runs tasks side by side checks the cap first."""
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "equipa" / "dispatch.py").read_text(
+        encoding="utf-8"))
+    gated = []
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = [node for node in ast.walk(function)
+                 if isinstance(node, ast.Call)]
+        names = {(getattr(call.func, "attr", None)
+                  or getattr(call.func, "id", None)): call.lineno
+                 for call in calls}
+        if "Semaphore" in names:
+            refusal_line = min((call.lineno for call in calls
+                                if getattr(call.func, "id", None)
+                                in ("concurrency_refusal",
+                                    "resolve_max_concurrent")),
+                               default=None)
+            assert refusal_line is not None \
+                and refusal_line < names["Semaphore"], function.name
+            gated.append(function.name)
+    assert {"run_auto_dispatch", "run_parallel_goals",
+            "run_parallel_tasks"} <= set(gated)

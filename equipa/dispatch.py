@@ -69,6 +69,7 @@ from equipa.git_ops import (
     git_toplevel_async,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
+from equipa.isolation import concurrency_refusal
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
     MergeSignalShield,
@@ -1398,6 +1399,9 @@ async def run_auto_dispatch(scored: list[dict], config: dict, args) -> list:
     :func:`collect_refusals`.
     """
     max_concurrent = config.get("max_concurrent", 4)
+    refusal = concurrency_refusal(max_concurrent)
+    if refusal:
+        refuse_dispatch(refusal)
     semaphore = asyncio.Semaphore(max_concurrent)
 
     print(f"\nDispatching {len(scored)} projects "
@@ -1628,6 +1632,9 @@ async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -
     raised); their ``refusals`` feed :func:`collect_refusals`.
     """
     max_concurrent = args.max_concurrent or defaults["max_concurrent"]
+    refusal = concurrency_refusal(max_concurrent)
+    if refusal:
+        refuse_dispatch(refusal)
     semaphore = asyncio.Semaphore(max_concurrent)
 
     print(f"\nStarting {len(resolved_goals)} parallel goals "
@@ -3859,6 +3866,9 @@ def resolve_max_concurrent(args) -> int:
         source = "dispatch config max_concurrent"
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         refuse_dispatch(f"{source} must be a positive integer, got {value!r}")
+    refusal = concurrency_refusal(value, source)
+    if refusal:
+        refuse_dispatch(refusal)
     return value
 
 
