@@ -12,9 +12,11 @@ SECURITY-REVIEW-3140 (R3140-01). Each test fails on main before the fix:
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -769,3 +771,687 @@ def test_every_dispatch_semaphore_is_gated_by_the_concurrency_refusal() -> None:
             gated.append(function.name)
     assert {"run_auto_dispatch", "run_parallel_goals",
             "run_parallel_tasks"} <= set(gated)
+
+
+# --- F2: no loopback or LAN access from the agent unit ----------------------------------
+
+
+_DENIED = ("127.0.0.0/8 ::1/128 0.0.0.0/8 ::/128 169.254.0.0/16 fe80::/10 "
+           "224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 "
+           "fc00::/7")
+
+
+def _property(command: list[str], name: str) -> str | None:
+    prefix = f"--property={name}="
+    values = [arg[len(prefix):] for arg in command if arg.startswith(prefix)]
+    assert len(values) <= 1, values
+    return values[0] if values else None
+
+
+def test_unit_denies_loopback_link_local_multicast_and_private_ranges(
+        tmp_path: Path) -> None:
+    command = isolation.build_launch_command(_settings(tmp_path), UNIT)
+    assert _property(command, "IPAddressDeny") == _DENIED
+    # systemd-run of systemd 255 refuses the symbolic names.
+    for symbolic in ("localhost", "link-local", "multicast", "any"):
+        assert symbolic not in _property(command, "IPAddressDeny").split()
+    # Everything else stays reachable: the agent needs the public API.
+    assert _property(command, "IPAddressAllow") is None
+    # The properties go to systemd-run, before the command it runs.
+    assert command.index(f"--property=IPAddressDeny={_DENIED}") \
+        < command.index("--")
+
+
+def test_extra_denied_ranges_add_to_the_defaults(tmp_path: Path) -> None:
+    settings = _settings(tmp_path,
+                         ip_address_deny_extra=["100.64.0.0/10", "10.1.0.0/16"])
+    command = isolation.build_launch_command(settings, UNIT)
+    assert _property(command, "IPAddressDeny") == \
+        f"{_DENIED} 100.64.0.0/10 10.1.0.0/16"
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="invalid network 'localhost'"):
+        _settings(tmp_path, ip_address_deny_extra=["localhost"])
+    with pytest.raises(isolation.AgentIsolationError, match="unknown"):
+        _settings(tmp_path, ip_address_deny=["10.0.0.0/8"])
+
+
+def test_handoff_names_the_denied_ranges(repo: dict[str, Path],
+                                         tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    info = isolation.describe_worktree(str(repo["worktree"]))
+    handoff = isolation.build_handoff(
+        ["claude", "-p", "x"], str(repo["worktree"]),
+        {"PATH": os.environ["PATH"]}, settings, UNIT, info, "tok",
+        tmp_path / "handoff.bundle")
+    assert handoff.header["network"] == {"deny": _DENIED.split()}
+    handoff.header["cgroup"]["path"] = f"/app.slice/{UNIT}.scope"
+    session = agent_launcher._IsolatedSession(handoff.header)
+    assert [str(net) for net in session.network_deny] == _DENIED.split()
+
+
+def _launcher_header(tmp_path: Path, **overrides) -> dict:
+    header = {
+        "unit": UNIT, "argv": ["claude", "-p", "x"],
+        "executable": sys.executable, "env": {"PATH": os.environ["PATH"]},
+        "files": [], "workdir_sources": [],
+        "identity": {"user": "equipa-agent", "orchestrator_uid": os.getuid(),
+                     "privileged_groups": []},
+        "cgroup": {"path": f"/app.slice/{UNIT}.scope", "pids_max": 64,
+                   "memory_max": 256 * 1024 ** 2, "cpu_weight": 100},
+        "deny_read": [], "deny_write": [], "must_execute": [], "must_read": [],
+        "git": {"executable": _GIT, "hardening_args": [], "hardening_env": {}},
+        "workspace": None, "grace": 1.0,
+        "network": {"deny": _DENIED.split()},
+    }
+    header.update(overrides)
+    return header
+
+
+def test_launcher_refuses_while_loopback_is_reachable(tmp_path: Path) -> None:
+    """Here, as on a user manager that cannot apply IPAddressDeny=, the
+    launcher's own loopback listener is reachable: the run is refused."""
+    session = agent_launcher._IsolatedSession(_launcher_header(tmp_path))
+    with pytest.raises(agent_launcher.IsolationRefused,
+                       match=r"can connect to 127\.0\.0\.1.*IPAddressDeny"):
+        session._verify_denied_access()
+
+
+def test_launcher_verify_runs_the_network_check(tmp_path: Path,
+                                                monkeypatch) -> None:
+    session = agent_launcher._IsolatedSession(_launcher_header(tmp_path))
+    for name in ("_verify_identity", "_verify_cgroup", "_verify_no_scheduler",
+                 "_verify_required_access"):
+        monkeypatch.setattr(session, name, lambda: None)
+    with pytest.raises(agent_launcher.IsolationRefused, match="IPAddressDeny"):
+        session.verify()
+
+
+def test_launcher_accepts_when_nothing_denied_is_reachable(
+        tmp_path: Path, monkeypatch) -> None:
+    probed: list = []
+
+    def unreachable(networks, addresses=None, timeout=2.0):
+        probed.append([str(net) for net in networks])
+        return []
+
+    monkeypatch.setattr(agent_launcher, "reachable_denied_addresses",
+                        unreachable)
+    session = agent_launcher._IsolatedSession(_launcher_header(tmp_path))
+    session._verify_denied_access()
+    assert probed == [_DENIED.split()]
+
+
+def test_launcher_refuses_a_deny_list_without_loopback(tmp_path: Path) -> None:
+    session = agent_launcher._IsolatedSession(
+        _launcher_header(tmp_path, network={"deny": ["10.0.0.0/8"]}))
+    with pytest.raises(agent_launcher.IsolationRefused,
+                       match="does not deny loopback"):
+        session._verify_denied_access()
+
+
+@pytest.mark.parametrize("network", [
+    {"deny": ["not-a-network"]}, {"deny": "127.0.0.0/8"}, ["127.0.0.0/8"]])
+def test_launcher_rejects_a_malformed_network_field(tmp_path: Path,
+                                                    network) -> None:
+    with pytest.raises(agent_launcher.IsolationRefused):
+        agent_launcher._IsolatedSession(_launcher_header(tmp_path,
+                                                         network=network))
+
+
+def test_probe_finds_a_reachable_listener_quickly() -> None:
+    import ipaddress
+
+    loopback = [ipaddress.ip_network("127.0.0.0/8")]
+    started = time.perf_counter()
+    assert agent_launcher.reachable_denied_addresses(
+        loopback, ["127.0.0.1"]) == ["127.0.0.1"]
+    assert time.perf_counter() - started < 1.0
+    # An address outside the denied ranges is not probed at all, and one
+    # this host does not have is skipped.
+    assert agent_launcher.reachable_denied_addresses(
+        loopback, ["192.0.2.10"]) == []
+    private = [ipaddress.ip_network("10.0.0.0/8")]
+    assert agent_launcher.reachable_denied_addresses(
+        private, ["10.255.255.254"], timeout=0.5) == []
+
+
+def test_probe_reports_an_address_that_never_answers_as_unreachable(
+        monkeypatch) -> None:
+    """A dropped SYN (an nftables drop rule) leaves the connect pending:
+    after the timeout the address counts as unreachable."""
+    import ipaddress
+    import select
+
+    class _Silent(socket.socket):
+        def connect_ex(self, address):
+            return errno.EINPROGRESS
+
+    monkeypatch.setattr(agent_launcher.socket, "socket", _Silent)
+    monkeypatch.setattr(select, "select",
+                        lambda read, write, error, timeout: ([], [], []))
+    started = time.perf_counter()
+    assert agent_launcher.reachable_denied_addresses(
+        [ipaddress.ip_network("127.0.0.0/8")], ["127.0.0.1"],
+        timeout=0.3) == []
+    assert time.perf_counter() - started < 1.0
+
+
+def test_local_addresses_include_the_hosts_own_lan_address(
+        tmp_path: Path, monkeypatch) -> None:
+    fib = tmp_path / "fib_trie"
+    fib.write_text(
+        "Main:\n  +-- 0.0.0.0/0 3 0 5\n"
+        "     |-- 127.0.0.1\n        /32 host LOCAL\n"
+        "     |-- 192.168.7.20\n        /24 link UNICAST\n"
+        "     |-- 192.168.7.21\n        /32 host LOCAL\n"
+        "     |-- 10.9.8.7\n        /32 host LOCAL\n")
+    inet6 = tmp_path / "if_inet6"
+    inet6.write_text(
+        "00000000000000000000000000000001 01 80 10 80       lo\n"
+        "fe800000000000000000000000000001 02 40 20 80     eth0\n"
+        "fd000000000000000000000000000005 02 40 00 80     eth0\n")
+    monkeypatch.setattr(agent_launcher, "_FIB_TRIE", str(fib))
+    monkeypatch.setattr(agent_launcher, "_IF_INET6", str(inet6))
+    assert agent_launcher._local_addresses() == [
+        "127.0.0.1", "192.168.7.21", "10.9.8.7", "::1", "fd00::5"]
+
+
+def test_listening_loopback_ports_are_read_from_proc(
+        tmp_path: Path, monkeypatch) -> None:
+    tcp = tmp_path / "tcp"
+    tcp.write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue\n"
+        "   0: 0100007F:1538 00000000:0000 0A 00000000:00000000\n"   # 127.0.0.1:5432
+        "   1: 00000000:18EB 00000000:0000 0A 00000000:00000000\n"   # 0.0.0.0:6379
+        "   2: 1501A8C0:0050 00000000:0000 0A 00000000:00000000\n"   # 192.168.1.21:80
+        "   3: 0100007F:2328 0100007F:A1B2 01 00000000:00000000\n")  # established
+    tcp6 = tmp_path / "tcp6"
+    tcp6.write_text(
+        "  sl  local_address                         remote_address  st\n"
+        "   0: 00000000000000000000000001000000:1F90 "
+        "00000000000000000000000000000000:0000 0A\n"                # ::1:8080
+        "   1: 0000000000000000FFFF00000100007F:2382 "
+        "00000000000000000000000000000000:0000 0A\n")               # ::ffff:127.0.0.1:9090
+    monkeypatch.setattr(isolation, "_PROC_NET_TCP", (str(tcp), str(tcp6)))
+    assert isolation.listening_loopback_ports() == [5432, 6379, 8080, 9090]
+
+
+def test_probe_command_lists_operator_and_listening_ports(
+        tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(isolation, "listening_loopback_ports", lambda: [6379])
+    settings = _settings(tmp_path)
+    command = isolation.build_probe_command(
+        str(VERIFY_SCRIPT), settings, [], str(tmp_path), [5432, 6379])
+    ports = [command[index + 1] for index, arg in enumerate(command)
+             if arg == "--deny-port"]
+    assert ports == ["5432", "6379"]
+    assert "--deny-port)" in VERIFY_SCRIPT.read_text()
+
+
+def test_verification_main_takes_loopback_ports(tmp_path: Path,
+                                                monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(isolation, "get_active_dispatch_config", lambda: {
+        "agent_isolation": {"exchange_dir": str(tmp_path)}})
+    monkeypatch.setattr(isolation, "_outer_checks", lambda settings: [])
+
+    def probe_command(probe, settings, repos, home, loopback_ports=()):
+        seen["ports"] = list(loopback_ports)
+        return ["claude", "--inside"]
+
+    async def fake_probe(command, config):
+        return "RESULT: PASS\n"
+
+    monkeypatch.setattr(isolation, "build_probe_command", probe_command)
+    monkeypatch.setattr(isolation, "_run_probe", fake_probe)
+    assert isolation.verification_main(
+        ["--verify-probe", str(VERIFY_SCRIPT), "--loopback-port", "5432",
+         "--loopback-port", "6379"]) == 0
+    assert seen["ports"] == [5432, 6379]
+    with pytest.raises(SystemExit):
+        isolation.verification_main(["--verify-probe", str(VERIFY_SCRIPT),
+                                     "--loopback-port", "70000"])
+
+
+VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_agent_isolation.sh"
+
+
+def _run_inside(tmp_path: Path, *args: str) -> list[str]:
+    """The verify script's inside checks as this (unisolated) user."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    for tool, body in (("sudo", "exit 1"),
+                       ("crontab", "echo 'not allowed' >&2; exit 1"),
+                       ("at", "echo 'not allowed' >&2; exit 1"),
+                       ("loginctl", "echo no")):
+        script = fake_bin / tool
+        script.write_text(f"#!/bin/sh\n{body}\n")
+        script.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(VERIFY_SCRIPT), "--inside", *args],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    return result.stdout.splitlines()
+
+
+def test_verify_script_fails_when_a_loopback_service_is_reachable(
+        tmp_path: Path) -> None:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+    try:
+        lines = _run_inside(tmp_path, "--deny-port", str(port))
+    finally:
+        listener.close()
+    assert any(line.startswith("FAIL agent can connect to 127.0.0.1 on "
+                               f"port(s) {port}") for line in lines), lines
+    assert lines[-1].startswith("RESULT: FAIL")
+
+
+def test_verify_script_passes_an_unreachable_port(tmp_path: Path) -> None:
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()                                   # nothing listens there
+    lines = _run_inside(tmp_path, "--deny-port", str(port))
+    assert ("PASS agent cannot connect to 127.0.0.1 on any of 1 local "
+            "service port(s)") in lines
+
+
+# --- F7: the agent user has no sudo rights and no root-equivalent group -------------------
+
+
+def _fake_sudo(tmp_path: Path, output: str, status: int) -> str:
+    sudo = tmp_path / "fake-sudo"
+    (tmp_path / "sudo-output").write_text(output)
+    sudo.write_text(f"#!/bin/sh\ncat {tmp_path / 'sudo-output'}\n"
+                    f"printf '%s\\n' \"$@\" > {tmp_path / 'sudo-args'}\n"
+                    f"exit {status}\n")
+    sudo.chmod(0o755)
+    return str(sudo)
+
+
+def test_agent_without_sudo_rights_passes(tmp_path: Path) -> None:
+    sudo = _fake_sudo(tmp_path, "User equipa-agent is not allowed to run "
+                                "sudo on host.\n", 0)
+    isolation.check_agent_has_no_sudo(_settings(tmp_path, sudo=sudo))
+    assert (tmp_path / "sudo-args").read_text().split() == \
+        ["-n", "-l", "-U", "equipa-agent"]
+
+
+@pytest.mark.parametrize("output, status, message", [
+    ("User equipa-agent may run the following commands on host:\n"
+     "    (ALL) NOPASSWD: /usr/bin/apt\n", 0, "has sudo rights"),
+    ("sudo: a password is required\n", 1, "cannot verify"),
+    ("Sorry, user orchestrator may not run sudo on host.\n", 1,
+     "cannot verify"),
+    ("", 0, "cannot verify"),
+])
+def test_agent_sudo_rights_or_an_unclear_answer_refuse(
+        tmp_path: Path, output: str, status: int, message: str) -> None:
+    sudo = _fake_sudo(tmp_path, output, status)
+    with pytest.raises(isolation.AgentIsolationError, match=message):
+        isolation.check_agent_has_no_sudo(_settings(tmp_path, sudo=sudo))
+
+
+def test_a_missing_sudo_refuses(tmp_path: Path) -> None:
+    with pytest.raises(isolation.AgentIsolationError, match="cannot verify"):
+        isolation.check_agent_has_no_sudo(
+            _settings(tmp_path, sudo=str(tmp_path / "no-sudo")))
+
+
+class _Passwd:
+    def __init__(self, uid: int, gid: int = 4242, home: str = "/home/agent"):
+        self.pw_uid, self.pw_gid, self.pw_dir = uid, gid, home
+
+
+def test_dispatch_refuses_an_agent_user_with_sudo_rights(
+        tmp_path: Path, monkeypatch) -> None:
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: _Passwd(os.getuid() + 1))
+    sudo = _fake_sudo(tmp_path, "User equipa-agent may run the following "
+                                "commands on host:\n    (ALL) ALL\n", 0)
+    with pytest.raises(isolation.AgentIsolationError, match="has sudo rights"):
+        isolation.resolve_agent_identity(_settings(tmp_path, sudo=sudo))
+    sudo = _fake_sudo(tmp_path, "User equipa-agent is not allowed to run "
+                                "sudo on host.\n", 0)
+    identity = isolation.resolve_agent_identity(_settings(tmp_path, sudo=sudo))
+    assert identity.uid == os.getuid() + 1
+
+
+@pytest.mark.parametrize("group", ["docker", "lxd", "sudo", "adm", "root"])
+def test_root_equivalent_groups_cannot_be_configured_away(
+        tmp_path: Path, group: str) -> None:
+    settings = _settings(tmp_path, privileged_groups=[])
+    assert group in settings.privileged_groups
+    assert group in _settings(tmp_path, privileged_groups=["games"]
+                              ).privileged_groups
+
+
+def test_dispatch_refuses_a_supplementary_privileged_group(
+        tmp_path: Path, monkeypatch) -> None:
+    """Membership that only the group database's NSS view shows (not the
+    group file's member list) still refuses: os.getgrouplist is asked."""
+    import grp
+    import pwd
+
+    group = grp.getgrgid(os.getgid())
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: _Passwd(os.getuid() + 1))
+    monkeypatch.setattr(os, "getgrouplist",
+                        lambda name, gid: [4242, group.gr_gid])
+    sudo = _fake_sudo(tmp_path, "User equipa-agent is not allowed to run "
+                                "sudo on host.\n", 0)
+    settings = _settings(tmp_path, privileged_groups=[group.gr_name], sudo=sudo)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match=f"privileged group '{group.gr_name}'"):
+        isolation.resolve_agent_identity(settings)
+
+
+def test_verify_script_checks_the_root_equivalent_groups() -> None:
+    text = VERIFY_SCRIPT.read_text()
+    for group in ("docker", "lxd", "sudo", "adm"):
+        assert f" {group} " in text.split("for group in", 1)[1].split(";")[0]
+
+
+# --- I1: the sudoers rule is checked by content -------------------------------------------
+
+
+def _listing(settings, *, runas: str | None = None, command: str | None = None,
+             options: str = "!authenticate",
+             defaults: str = "!use_pty, !pam_session, env_reset, !log_output",
+             extra_all: bool = True) -> str:
+    command = command or f"{settings.python} -I {settings.launcher} --isolated"
+    text = ("Matching Defaults entries for orchestrator on host:\n"
+            "    env_reset, use_pty\n\n"
+            "Runas and Command-specific defaults for orchestrator:\n"
+            f"    Defaults!EQUIPA_AGENT_LAUNCH {defaults}\n\n"
+            "User orchestrator may run the following commands on host:\n\n")
+    if extra_all:
+        text += ("Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n"
+                 "    Options: !authenticate\n    Commands:\n\tALL\n\n")
+    text += ("Sudoers entry: /etc/sudoers.d/equipa-agent\n"
+             f"    RunAsUsers: {runas or settings.agent_user}\n"
+             f"    Options: {options}\n    Commands:\n\t{command}\n")
+    return text
+
+
+def test_narrow_rule_is_recognised_by_content(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert isolation.narrow_sudoers_rule_problems(
+        settings, _listing(settings)) == []
+    # Alias shown unexpanded is accepted too.
+    assert isolation.narrow_sudoers_rule_problems(
+        settings, _listing(settings, command="EQUIPA_AGENT_LAUNCH")) == []
+
+
+@pytest.mark.parametrize("change, problem", [
+    ({"runas": "ALL"}, "no sudoers rule"),
+    ({"command": "ALL"}, "no sudoers rule"),
+    ({"command": "/usr/bin/python3 -I /x/agent_launcher.py *"},
+     "no sudoers rule"),
+    ({"options": ""}, "not NOPASSWD"),
+    ({"defaults": "!use_pty, env_reset"}, "lack !pam_session"),
+    ({"defaults": "!pam_session"}, "lack !use_pty"),
+])
+def test_an_incomplete_rule_is_reported(tmp_path: Path, change: dict,
+                                        problem: str) -> None:
+    settings = _settings(tmp_path)
+    problems = isolation.narrow_sudoers_rule_problems(
+        settings, _listing(settings, **change))
+    assert any(problem in item for item in problems), problems
+
+
+def test_an_all_rule_alone_does_not_pass_the_outer_check(
+        tmp_path: Path, monkeypatch) -> None:
+    """I1: with (ALL) NOPASSWD: ALL, sudo -l -u agent <launcher> succeeds
+    without the narrow rule; the outer check must still fail."""
+    settings = _settings(tmp_path, secret_scan_roots=[str(tmp_path)])
+    monkeypatch.setattr(isolation, "THEFORGE_DB", tmp_path / "missing.db")
+    monkeypatch.setattr(isolation, "MCP_CONFIG", tmp_path / "no-mcp.json")
+    monkeypatch.setattr(isolation, "_exit_status", lambda argv: 0)
+    only_all = ("User orchestrator may run the following commands on host:\n\n"
+                "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n"
+                "    Options: !authenticate\n    Commands:\n\tALL\n")
+    monkeypatch.setattr(isolation, "sudoers_listing",
+                        lambda settings: (only_all, 0))
+    failures = "\n".join(isolation._outer_checks(settings))
+    assert "the sudoers rule is missing or incomplete" in failures
+    assert "an ALL rule does not count" in failures
+    monkeypatch.setattr(isolation, "sudoers_listing",
+                        lambda settings: (_listing(settings), 0))
+    assert isolation._outer_checks(settings) == []
+
+
+# --- F8: swap off, IO weight, export size cap ---------------------------------------------
+
+
+def test_unit_has_no_swap_and_a_lower_io_weight(tmp_path: Path) -> None:
+    command = isolation.build_launch_command(_settings(tmp_path), UNIT)
+    assert _property(command, "MemorySwapMax") == "0"
+    assert _property(command, "IOWeight") == "50"
+    command = isolation.build_launch_command(
+        _settings(tmp_path, io_weight=None), UNIT)
+    assert _property(command, "IOWeight") is None
+    with pytest.raises(isolation.AgentIsolationError, match="io_weight"):
+        _settings(tmp_path, io_weight=0)
+
+
+def _scope(tmp_path: Path, monkeypatch, **files: str) -> str:
+    monkeypatch.setattr(isolation, "CGROUP_ROOT", tmp_path / "cgroup")
+    scope = tmp_path / "cgroup" / "app.slice" / f"{UNIT}.scope"
+    scope.mkdir(parents=True, exist_ok=True)
+    values = {"pids.max": "512", "memory.max": str(4 * 1024 ** 3),
+              "memory.swap.max": "0", "cpu.weight": "100",
+              "io.weight": "default 50\n8:0 200", "cgroup.kill": ""}
+    values.update(files)
+    for name, value in values.items():
+        target = scope / name
+        if value is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.write_text(f"{value}\n")
+    return f"/app.slice/{UNIT}.scope"
+
+
+def test_scope_with_swap_is_refused(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    isolation.verify_scope_cgroup(_scope(tmp_path, monkeypatch), settings)
+    with pytest.raises(isolation.AgentIsolationError, match="memory.swap.max"):
+        isolation.verify_scope_cgroup(
+            _scope(tmp_path, monkeypatch, **{"memory.swap.max": "max"}),
+            settings)
+
+
+def test_scope_io_weight_is_verified_when_set(tmp_path: Path,
+                                              monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    with pytest.raises(isolation.AgentIsolationError, match="io.weight"):
+        isolation.verify_scope_cgroup(
+            _scope(tmp_path, monkeypatch, **{"io.weight": "default 100"}),
+            settings)
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="io controller delegated"):
+        isolation.verify_scope_cgroup(
+            _scope(tmp_path, monkeypatch, **{"io.weight": None}), settings)
+    isolation.verify_scope_cgroup(
+        _scope(tmp_path, monkeypatch, **{"io.weight": None}),
+        _settings(tmp_path, io_weight=None))
+
+
+def test_handoff_tells_the_launcher_the_export_cap(repo: dict[str, Path],
+                                                   tmp_path: Path) -> None:
+    settings = _settings(tmp_path, max_export_bytes=5 * 1024 ** 2)
+    info = isolation.describe_worktree(str(repo["worktree"]))
+    handoff = isolation.build_handoff(
+        ["claude", "-p", "x"], str(repo["worktree"]),
+        {"PATH": os.environ["PATH"]}, settings, UNIT, info, "tok",
+        tmp_path / "handoff.bundle")
+    assert handoff.header["workspace"]["max_export_bytes"] == 5 * 1024 ** 2
+
+
+def test_launcher_never_publishes_an_export_over_the_cap(
+        repo: dict[str, Path], tmp_path: Path, monkeypatch) -> None:
+    import resource
+
+    before = resource.getrlimit(resource.RLIMIT_FSIZE)
+    settings = _settings(tmp_path)
+    info = isolation.describe_worktree(str(repo["worktree"]))
+    bundle = tmp_path / "handoff.bundle"
+    handoff = isolation.build_handoff(
+        ["claude", "-p", "x"], str(repo["worktree"]),
+        {"PATH": os.environ["PATH"]}, settings, UNIT, info, "tok", bundle)
+    handoff.header["workspace"]["max_export_bytes"] = 64 * 1024
+    handoff.header["cgroup"]["path"] = f"/app.slice/{UNIT}.scope"
+    session = agent_launcher._IsolatedSession(handoff.header)
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    session.home = str(home)
+    with open(bundle, "rb") as source:
+        session.receive_workspace(source.fileno(), bundle.stat().st_size)
+    clone = Path(session.repo_dir)
+    (clone / "blob.bin").write_bytes(os.urandom(512 * 1024))  # incompressible
+    with pytest.raises(agent_launcher.IsolationRefused,
+                       match="bundle failed|more than max_export_bytes"):
+        session.export()
+    exchange = Path(handoff.header["workspace"]["export_path"]).parent
+    assert list(exchange.iterdir()) == []                # no export, no partial
+    # Only the git child was limited, never this process.
+    assert resource.getrlimit(resource.RLIMIT_FSIZE) == before
+    session.discard()
+
+
+def test_launcher_publishes_an_export_within_the_cap(
+        repo: dict[str, Path], tmp_path: Path) -> None:
+    def change(clone: Path) -> None:
+        (clone / "small.txt").write_text("agent work\n")
+
+    info, handoff, settings = _export_clone(repo, tmp_path, change)
+    assert Path(handoff.export_path).is_file()
+    assert handoff.header["workspace"]["max_export_bytes"] == \
+        settings.max_export_bytes
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, "1024"])
+def test_launcher_rejects_an_invalid_export_cap(tmp_path: Path, cap) -> None:
+    workspace = {"handoff_ref": "refs/equipa/x", "branch_ref": "refs/heads/x",
+                 "base_sha": "0" * 40, "export_path": "/x.bundle",
+                 "carry_paths": [], "max_export_bytes": cap}
+    with pytest.raises(agent_launcher.IsolationRefused, match="max_export"):
+        agent_launcher._IsolatedSession(_launcher_header(tmp_path,
+                                                         workspace=workspace))
+
+
+# --- F9: the cgroup-path check and the scope-limit check at spawn are pinned --------------
+
+
+def test_launcher_refuses_another_cgroup_even_with_the_right_limits(
+        tmp_path: Path, monkeypatch) -> None:
+    """M19: only the path is wrong; the limits all match, so nothing but
+    the path check can refuse."""
+    session = agent_launcher._IsolatedSession(_launcher_header(tmp_path))
+    monkeypatch.setattr(agent_launcher, "_own_cgroup",
+                        lambda: "/user.slice/session-1.scope")
+    limits = {"pids.max": "64", "memory.max": str(256 * 1024 ** 2),
+              "cpu.weight": "100"}
+    monkeypatch.setattr(agent_launcher, "_read_cgroup_value",
+                        lambda cgroup, name: limits[name])
+    with pytest.raises(agent_launcher.IsolationRefused) as refused:
+        session._verify_cgroup()
+    assert str(refused.value) == (
+        "running in cgroup '/user.slice/session-1.scope', expected "
+        f"'/app.slice/{UNIT}.scope'")
+    monkeypatch.setattr(agent_launcher, "_own_cgroup",
+                        lambda: f"/app.slice/{UNIT}.scope")
+    session._verify_cgroup()
+
+
+class _Writer:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.data += data
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Reader:
+    def __init__(self, line: bytes) -> None:
+        self.line = line
+
+    async def readline(self) -> bytes:
+        return self.line
+
+    async def read(self, size: int = -1) -> bytes:
+        return b""
+
+
+class _ReadyProcess:
+    """A launcher stand-in that would report "ready" at once."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.returncode = None
+        self.stdin = _Writer()
+        self.stdout = _Reader(json.dumps(
+            {"type": agent_launcher.HANDSHAKE_TYPE, "status": "ready"}
+        ).encode() + b"\n")
+        self.stderr = _Reader(b"")
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        return self.returncode or 0
+
+
+def test_spawn_refuses_a_scope_whose_limits_are_wrong(
+        tmp_path: Path, monkeypatch) -> None:
+    """M22: the launcher would report ready, so only the orchestrator's own
+    check of the scope's limits at spawn can refuse it."""
+    lock_dir = tmp_path / "run"
+    lock_dir.mkdir(mode=0o700)
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation, "load_isolation_settings",
+                        lambda config: settings)
+    monkeypatch.setattr(isolation, "resolve_agent_identity", lambda s: None)
+    monkeypatch.setattr(isolation, "check_host", lambda s, i: None)
+    monkeypatch.setattr(isolation, "_unit_lock_dir", lambda: str(lock_dir))
+    monkeypatch.setattr(isolation, "_SLOT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(isolation, "live_agent_scopes",
+                        lambda app_slice=None: [])
+    monkeypatch.setattr(isolation, "sweep_stale_scopes",
+                        lambda app_slice=None: [])
+    monkeypatch.setattr(isolation, "make_unit_name", lambda: UNIT)
+    monkeypatch.setattr(isolation, "resolve_oauth_token", lambda s: "tok")
+    monkeypatch.setattr(isolation, "build_handoff",
+                        lambda *args: isolation.Handoff(
+                            header={"cgroup": {"path": None}},
+                            bundle_path=None, export_path=None))
+    monkeypatch.setattr(isolation, "read_proc_cgroup",
+                        lambda pid: f"/app.slice/{UNIT}.scope")
+    cgroup = _scope(tmp_path, monkeypatch, **{"pids.max": "max"})
+    assert cgroup == f"/app.slice/{UNIT}.scope"
+    process = _ReadyProcess()
+
+    async def fake_exec(*argv, **kwargs):
+        return process
+
+    monkeypatch.setattr(isolation.asyncio, "create_subprocess_exec", fake_exec)
+
+    async def spawn():
+        return await isolation.spawn_isolated_agent(["claude"], None, {}, {})
+
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="pids.max is 'max', expected 512"):
+        asyncio.run(spawn())
+    assert not process.stdin.data, "the handoff was sent to an unchecked scope"
+    assert not isolation._LIVE_ISOLATED_AGENTS
