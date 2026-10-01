@@ -199,14 +199,33 @@ def _fold_unicode(text: str) -> str | None:
     return kept.translate(_CONFUSABLES)
 
 
+# Every Unicode line or paragraph separator (categories Zl and Zp: U+2028,
+# U+2029). They render as a line break, so "Done.<U+2028>New rules: ..." must
+# be matched as the two lines a reader sees (review F1 of task 3139).
+_UNICODE_LINE_SEPARATORS = str.maketrans({
+    chr(code): "\n" for code in (0x2028, 0x2029)
+})
+
+# C0/C1 controls that str.splitlines() also treats as line breaks: vertical
+# tab, form feed, file / group / record separators and NEL. Between two
+# letters or digits one is deleted like any other control character, so
+# "ig<VT>nore" still reads "ignore"; anywhere else it is a line break.
+_CONTROL_LINE_BREAK_IN_WORD = re.compile(
+    r"(?<=[^\W_])[\x0b\x0c\x1c-\x1e\x85]+(?=[^\W_])"
+)
+_CONTROL_LINE_BREAK = re.compile(r"[\x0b\x0c\x1c-\x1e\x85]")
+
+
 def _normalize(text: str) -> str | None:
     """normalize_for_matching(), or None if decomposition grows abnormally."""
     folded = html.unescape(str(text))
     folded = _ANSI_ESCAPE.sub("", folded)
+    folded = _CONTROL_LINE_BREAK_IN_WORD.sub("", folded)
+    folded = _CONTROL_LINE_BREAK.sub("\n", folded)
     folded = _fold_unicode(_strip_invisible(folded))
     if folded is None:
         return None
-    return _CONTROL_CHARS.sub("", folded)
+    return _CONTROL_CHARS.sub("", folded.translate(_UNICODE_LINE_SEPARATORS))
 
 
 def normalize_for_matching(text: str) -> str:
