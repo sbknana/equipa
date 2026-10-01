@@ -7,7 +7,8 @@ each left or opened a shape that renders as a finding and is not counted, so
 the gate now ends with a backstop that models no shape: every standalone
 UPPER-case CRITICAL, HIGH or MEDIUM anywhere in the review (code and quotes
 included) must be a counted finding, or the review blocks with the reason
-"unaccounted severity token" and the line numbers.
+"unaccounted severity token" (task 3152: "unaccounted CRITICAL/HIGH token")
+and the line numbers.
 
 Also covered, each with rows that fail before this task:
 
@@ -159,7 +160,10 @@ def test_the_reason_names_every_line():
                                            if severity in line
                                            and "|" not in line)) + 1
                 for severity in ("HIGH", "MEDIUM", "CRITICAL")}
-    assert analysis.detail.startswith("unaccounted severity token: ")
+    # Task 3152: the reason leads with the CRITICAL/HIGH lines.
+    assert analysis.detail.startswith(
+        f"unaccounted CRITICAL/HIGH token at line {expected['HIGH']}, "
+        f"{expected['CRITICAL']}: "), analysis.detail
     for severity, line in expected.items():
         assert f"{severity}=1 at line {line} " in analysis.detail, (
             severity, analysis.detail)
@@ -172,7 +176,8 @@ def test_the_reason_is_logged_by_the_gate(monkeypatch, tmp_path):
     path = tmp_path / "SECURITY-REVIEW-1.md"
     text = zero_review(["The HIGH one."])
     assert loops._count_findings_in_review_file(path, text=text) is None
-    assert any("unaccounted severity token: HIGH=1 at line" in message
+    assert any("unaccounted CRITICAL/HIGH token at line" in message
+               and "HIGH=1 at line" in message
                for message in logged), logged
 
 
@@ -217,25 +222,52 @@ def test_another_severity_inside_a_counted_section_blocks():
     assert blocked_by_backstop(text), analyze(text).detail
 
 
+ONE_HIGH = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+
+
+def assert_medium_blocks(text, unaccounted):
+    """Task 3152: an unaccounted MEDIUM token blocks, as it did on main.
+
+    Task 3149 (R3143-06) kept such a review trusted and counted the token
+    as an advisory, which let reviews main blocks merge."""
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
+        analysis.detail)
+    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON + ": "), (
+        analysis.detail)
+    assert f"MEDIUM={unaccounted} at line" in analysis.detail, analysis.detail
+
+
 def test_a_severity_word_after_the_section_blocks():
-    """The section ends at the next heading; a later MEDIUM is another one."""
-    text = review("1 finding.", [
-        "## Findings", "",
-        f"### [S1] MEDIUM {E} Missing rate limit",
-        "Details.", "",
-        "## Notes",
-        "A MEDIUM issue in the cache was also seen.",
-    ], ONE_MEDIUM)
-    assert blocked_by_backstop(text), analyze(text).detail
+    """The section ends at the next heading; a later token is another one.
+
+    Both block (task 3152: MEDIUM blocks again, as on main).
+    """
+    for severity, footer in (("HIGH", ONE_HIGH), ("MEDIUM", ONE_MEDIUM)):
+        text = review("1 finding.", [
+            "## Findings", "",
+            f"### [S1] {severity} {E} Missing rate limit",
+            "Details.", "",
+            "## Notes",
+            f"A {severity} issue in the cache was also seen.",
+        ], footer)
+        if severity == "HIGH":
+            assert blocked_by_backstop(text), analyze(text).detail
+        else:
+            assert_medium_blocks(text, 1)
 
 
 def test_more_tokens_than_the_footer_counts_blocks():
-    """Footer MEDIUM: 1 with one heading and one more MEDIUM elsewhere."""
-    text = review("1 finding.", [
-        f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
-        "Separately, MEDIUM: verbose stack traces in the API.",
-    ], ONE_MEDIUM)
-    assert blocked_by_backstop(text)
+    """Footer at 1 with one heading and one more token elsewhere."""
+    for severity, footer in (("HIGH", ONE_HIGH), ("MEDIUM", ONE_MEDIUM)):
+        text = review("1 finding.", [
+            f"### [S1] {severity} {E} Missing rate limit", "", "## Notes",
+            f"Separately, {severity}: verbose stack traces in the API.",
+        ], footer)
+        if severity == "HIGH":
+            assert blocked_by_backstop(text)
+        else:
+            assert_medium_blocks(text, 1)
 
 
 def test_footer_covering_heading_less_findings_merges():
@@ -250,18 +282,34 @@ def test_footer_covering_heading_less_findings_merges():
 
 
 @pytest.mark.parametrize("body", [
+    ["Rated LOW, not MEDIUM, as it needs a local account."],
+    ["Kept at LOW rather than MEDIUM."],
+])
+def test_tallies_and_negations_merge(body):
+    """MEDIUM keeps its tally and negation exemptions (task 3152)."""
+    assert_merges(body)
+
+
+@pytest.mark.parametrize("body", [
     ["Totals: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 1 LOW / 0 INFO."],
     ["semgrep: CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 across the diff."],
     ["| Severity | Count |", "|---|---|", "| HIGH | 0 |", "| CRITICAL | 0 |"],
     ["**No CRITICAL or HIGH findings.**"],
     ["There are no CRITICAL, HIGH or MEDIUM issues."],
     ["None is CRITICAL or HIGH."],
-    ["Rated LOW, not MEDIUM, as it needs a local account."],
-    ["Kept at LOW rather than MEDIUM."],
     ["0 CRITICAL/HIGH results from semgrep."],
 ])
-def test_tallies_and_negations_merge(body):
-    assert_merges(body)
+def test_critical_high_tallies_and_negations_block(body):
+    """Task 3152: these merged under the 3143 exemptions. CRITICAL and HIGH
+    now have none, so each blocks; the lower-case prose merges."""
+    analysis = analyze(review("1 finding.", ["## Notes", ""] + body, ONE_LOW,
+                              heading=f"### [E1] LOW {E} verbose error"))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    # MEDIUM is lowered too: "no critical, high or MEDIUM" leaves MEDIUM
+    # outside the negation's list, and main blocks it as well.
+    assert_merges([line.replace("CRITICAL", "critical").replace("HIGH", "high")
+                   .replace("MEDIUM", "medium") for line in body])
 
 
 @pytest.mark.parametrize("body", [
@@ -269,18 +317,29 @@ def test_tallies_and_negations_merge(body):
     ["semgrep: HIGH: 2 across the diff."],
     ["No HIGH: SQL injection in login."],    # a negation word before a label
     ["Two MEDIUM issues remain in the cache."],
+    ["Two HIGH issues remain in the cache."],
     ["Overall risk: HIGH."],
 ])
 def test_tallies_beyond_the_counts_block(body):
-    assert blocked_by_backstop(zero_review(body)), body
+    """MEDIUM-only rows block too (task 3152; task 3149 counted them)."""
+    if "MEDIUM" in body[0]:
+        assert_medium_blocks(zero_review(body), 1)
+    else:
+        assert blocked_by_backstop(zero_review(body)), body
 
 
-def test_one_medium_tally_with_one_counted_medium_merges():
-    text = review("1 finding.", [
-        f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
-        "Overall risk: MEDIUM; the one MEDIUM has a one-line fix.",
-    ], ONE_MEDIUM)
-    assert analyze(text).verdict == loops.REVIEW_VERDICT_OK, analyze(text).detail
+def test_one_medium_tally_with_one_counted_medium_blocks():
+    """Task 3152: "the one MEDIUM has a one-line fix" is no tally since task
+    3149 (R3143-02: the words after it are not a safe tail), and the MEDIUM
+    advisory that kept the review trusted is gone, so it blocks. In lower
+    case (reviewer prompt) the review merges with its one counted MEDIUM."""
+    body = [f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
+            "Overall risk: MEDIUM; the one MEDIUM has a one-line fix."]
+    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 1)
+    body[-1] = "Overall risk: MEDIUM; the one medium has a one-line fix."
+    analysis = analyze(review("1 finding.", body, ONE_MEDIUM))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.counts["MEDIUM"] == 1
 
 
 def test_an_untrusted_review_is_returned_unchanged():
@@ -603,6 +662,16 @@ BACKSTOP_FAMILIES = {
     "finding_headings": pad(f"### [S1] MEDIUM {E} x MEDIUM"),
     "id_lines": [f"### [S{index}] MEDIUM {E} x" for index in range(2000)]
     + pad("S7 MEDIUM S9 MEDIUM"),
+    # Task 3152 (R3149-05): the link reader over a "]" that forms no link,
+    # after one "[" far back (23 s on 200 KB on branch 3149).
+    "link_definition_then_closes": ["[a]: x", "", "a[" + "b]" * (RB // 2)],
+    "link_open_then_inline_tails": ["a[" + "b](" * (RB // 3)],
+    "link_definition_then_bare_closes": ["[a]: x", "", "a]" * (RB // 2)],
+    # Task 3152 (R3149-04): a reference reads every digit, and U+FFFD is
+    # decided by the digit count (no int() of 200 000 digits).
+    "reference_of_200kb_digits": ["&#" + "9" * RB + "HIGH"],
+    "hex_reference_of_200kb_digits": ["&#x" + "f" * RB + "HIGH"],
+    "zero_padded_reference_of_200kb": ["&#" + "0" * RB + "72;IGH"],
 }
 
 

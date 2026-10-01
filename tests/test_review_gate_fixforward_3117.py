@@ -41,11 +41,10 @@ def verdict(text: str) -> str:
 
 # Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
 SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
-EXEMPT_AS_WRITTEN = {
-    "E1 was rated LOW rather than HIGH because the path is admin-only.",
-    "No HIGH or CRITICAL issues were found.",
-    "semgrep: 0 CRITICAL/HIGH results across the diff.",
-}
+# Task 3152: "E1 was rated LOW rather than HIGH because ...", "No HIGH or
+# CRITICAL issues were found." and "semgrep: 0 CRITICAL/HIGH results ..."
+# merged as written under the 3143 comparison, negation and tally
+# exemptions. CRITICAL and HIGH have no exemption now: they block as written.
 
 
 def lowercase_severity_words(text: str) -> str:
@@ -57,7 +56,7 @@ def assert_only_the_backstop_blocks(text: str) -> None:
     severity-token backstop blocked it."""
     analysis = loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
 
 
@@ -101,11 +100,7 @@ def test_prose_mentions_still_merge(line):
                   ONE_LOW, low_heading=True)
     assert verdict(text) == loops.REVIEW_VERDICT_OK, line
     written = review("1 finding.", ["## Notes", line], ONE_LOW, low_heading=True)
-    if line in EXEMPT_AS_WRITTEN:
-        # A negation or zero tally cannot label a finding; the backstop
-        # exempts it, so it merges as written, as before task 3143.
-        assert verdict(written) == loops.REVIEW_VERDICT_OK, line
-    elif SEVERITY_TOKEN.search(line):
+    if SEVERITY_TOKEN.search(line):
         assert_only_the_backstop_blocks(written)
 
 

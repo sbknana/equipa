@@ -128,9 +128,11 @@ def test_parser_handles_zero_findings_approve_review(tmp_path: Path) -> None:
         "### [S2] INFO — Documentation nit\n"
         "### [S3] INFO — Test coverage observation\n"
     )
-    # Task 3143: "No CRITICAL, HIGH, MEDIUM, or LOW findings" is a negation,
-    # which the severity-token backstop exempts, so it is counted as written.
-    path = _write(tmp_path, 2310, review)
+    # Task 3152: the backstop has no negation exemption for CRITICAL and
+    # HIGH any more, so the UPPER-case negation blocks; the prompt has it
+    # written in lower case, and that review is counted as before.
+    assert _count_findings_in_review_file(_write(tmp_path, 2310, review)) is None
+    path = _write(tmp_path, 2310, _lowercase_prose_severities(review))
     assert _count_findings_in_review_file(path) == {
         "CRITICAL": 0,
         "HIGH": 0,
@@ -425,11 +427,14 @@ def test_security_review_prompt_uses_task_scoped_filename() -> None:
 
 
 def test_zero_findings_reports_zero(tmp_path: Path) -> None:
+    # Task 3152: an UPPER-case "0 CRITICAL, 0 HIGH" tally in prose blocks
+    # (no tally exemption for the merge-blocking severities); the compliant
+    # lower-case tally reports zero.
     _write(
         tmp_path,
         4245,
         "# Security Review\n"
-        "**APPROVE.** 0 CRITICAL, 0 HIGH, 0 MEDIUM, 0 LOW, 0 INFO.\n"
+        "**APPROVE.** 0 critical, 0 high, 0 medium, 0 LOW, 0 INFO.\n"
         "## Findings\n"
         "_No findings._\n",
     )
@@ -441,3 +446,12 @@ def test_zero_findings_reports_zero(tmp_path: Path) -> None:
     assert any("No critical or high severity findings" in ln for ln in lines)
     assert not any("WARNING: Found" in ln for ln in lines)
     assert not any("artifact missing" in ln for ln in lines)
+    upper_case_tally = _write(
+        tmp_path,
+        4246,
+        "# Security Review\n"
+        "**APPROVE.** 0 CRITICAL, 0 HIGH, 0 MEDIUM, 0 LOW, 0 INFO.\n"
+        "## Findings\n"
+        "_No findings._\n",
+    )
+    assert _count_findings_in_review_file(upper_case_tally) is None

@@ -56,7 +56,7 @@ def _assert_only_the_backstop_blocks(path: Path) -> None:
     UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
 
 
@@ -95,11 +95,9 @@ def test_uncounted_finding_form_blocks_under_zero_footer(
     assert "HIGH=1" in analysis.detail
 
 
-# Prose tallies within the counts and negations cannot label a finding.
-_PROSE_TALLY_LINES = {
-    "**7 findings: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW / 0 INFO.**",
-    "**No CRITICAL or HIGH findings.** The change is security-positive.",
-}
+# Task 3152: "**7 findings: 0 CRITICAL / 0 HIGH / ...**" and "**No CRITICAL
+# or HIGH findings.** ..." merged as written under the 3143 tally and
+# negation exemptions. CRITICAL and HIGH have none now: they block as written.
 
 
 @pytest.mark.parametrize(
@@ -117,13 +115,17 @@ def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
     tmp_path: Path, prose_line: str,
 ) -> None:
     # Task 3143: in UPPER case the severity word labels no finding, so the
-    # backstop blocks; in lower case (reviewer prompt) it is prose. A prose
-    # tally within the counts ("0 CRITICAL / 0 HIGH") is exempt and merges
-    # as written.
-    if prose_line in _PROSE_TALLY_LINES:
-        assert _analyze_review_file(_write_review(
+    # backstop blocks; in lower case (reviewer prompt) it is prose.
+    if ("MEDIUM" in prose_line and "HIGH" not in prose_line
+          and "CRITICAL" not in prose_line):
+        # Task 3152: a MEDIUM-only unaccounted token blocks, as on main
+        # (task 3149, R3143-06, had counted it as a logged advisory).
+        blocked = _analyze_review_file(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
-        )).verdict == REVIEW_VERDICT_OK
+        ))
+        assert blocked.verdict == REVIEW_VERDICT_COUNT_MISMATCH, blocked
+        assert blocked.detail.startswith(
+            "unaccounted MEDIUM token: MEDIUM=1 at line "), blocked.detail
     elif _SEVERITY_TOKEN_RE.search(prose_line):
         _assert_only_the_backstop_blocks(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
@@ -196,15 +198,23 @@ def test_title_exemption_covers_only_the_first_heading(tmp_path: Path) -> None:
 
 
 def test_counted_untagged_bold_finding_is_trusted(tmp_path: Path) -> None:
+    """Task 3152: an UPPER-case HIGH that is no counted heading's label
+    blocks whatever the footer counts (it blocked the merge before as well,
+    by HIGH=1). Written in title case the footer counts it as before."""
+    footer = "\n## Counts\nCRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+    _assert_only_the_backstop_blocks(_write_review(
+        tmp_path,
+        TITLE + BODY
+        + "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**\n" + footer,
+    ))
     review = _write_review(
         tmp_path,
         TITLE + BODY
-        + "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**\n"
-        + "\n## Counts\nCRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n",
+        + "**High — AES-GCM nonce (fixed at zero) allows forgery**\n" + footer,
     )
 
     analysis = _analyze_review_file(review)
 
-    assert analysis.verdict == REVIEW_VERDICT_OK
+    assert analysis.verdict == REVIEW_VERDICT_OK, analysis
     assert analysis.counts is not None
     assert analysis.counts["HIGH"] == 1

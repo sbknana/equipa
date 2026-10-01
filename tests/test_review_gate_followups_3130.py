@@ -83,7 +83,7 @@ def assert_only_the_backstop_blocks(text: str) -> loops.ReviewCountAnalysis:
     severity-token backstop blocked it."""
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
     return analysis
 
@@ -278,11 +278,15 @@ def test_severity_range_cell_counted_by_footer_merges():
     the count the footer states."""
     body = ["## Findings", "", "| ID | Issue | Rating |", "|---|---|---|",
             "| S1 | SQL injection | HIGH/MEDIUM |"]
-    blocked = assert_only_the_backstop_blocks(
-        review("1 finding.", body, ONE_HIGH, low_heading=False))
-    assert blocked.counts["HIGH"] == 1
-    assert "MEDIUM=1" in blocked.detail
-    body[-1] = "| S1 | SQL injection | HIGH/medium |"
+    # Task 3152: the UPPER-case HIGH in a table cell is no counted heading's
+    # label, so the review blocks whatever the footer counts (the merge was
+    # blocked before as well, by HIGH=1). Task 3149 kept it trusted with the
+    # MEDIUM counted as an advisory.
+    blocked = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
+    assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
+    assert blocked.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert "HIGH=1" in blocked.detail and "MEDIUM=1" in blocked.detail
+    body[-1] = "| S1 | SQL injection | High/medium |"
     analysis = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["HIGH"] == 1
@@ -314,11 +318,19 @@ def test_confusable_letters_fail_closed(line):
 
 
 def test_confusable_heading_is_a_strict_finding_heading():
+    """The rendered view counts the lookalike heading as a HIGH finding.
+
+    Task 3152: the backstop credits a label only at the offset the parser
+    attributed in the review as written, where this one is not counted, so
+    its folded HIGH is unaccounted and the review blocks (it blocked the
+    merge before as well, by HIGH=1).
+    """
     analysis = analyze(review(
         "1 finding.", ["## Findings", "", f"### [S1] {ETA}IGH — SQL injection"],
         ONE_HIGH, low_heading=False))
-    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.header_counts["HIGH"] == 1
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
 
 
 @pytest.mark.parametrize("line", [

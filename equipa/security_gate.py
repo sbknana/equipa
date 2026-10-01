@@ -99,8 +99,8 @@ REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
 # the regex ``^``/``$`` anchors and splitlines() see the same lines. A CR-only
 # or U+2028 review otherwise hid a finding heading from the MULTILINE regexes
 # while splitlines() still split it.
-_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
-# gate-06: invisible characters that split a severity word ("HI​GH") so
+_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# gate-06: invisible characters that split a severity word ("HI<U+200B>GH") so
 # no regex sees it, while the operator reading the rendered file does.
 # Task 3143 (I-04): every Default_Ignorable_Code_Point and every Unicode Cf
 # (format) character, not a hand-picked subset. The musical beam controls
@@ -109,14 +109,62 @@ _LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
 # Escapes, not literal characters, so the list can be read and reviewed.
 _INVISIBLE_CHARS_RE = re.compile(
     "["
-    "­͏؀-؅؜۝܏࢐࢑࣢"
-    "ᅟᅠ឴឵᠋-᠏"
-    "​-‏‪-‮⁠-⁯ㅤ"
-    "︀-️﻿ﾠ￰-￻"
+    "\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2"
+    "\u115f\u1160\u17b4\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164"
+    "\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb"
     "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff"
     "]"
 )
+
+
+# Task 3149 (R3143-07): the bidi embeddings, overrides and isolates (LRE, RLE,
+# PDF, LRO, RLO, LRI, RLI, FSI, PDI). An override reverses what the reader
+# sees ("<RLO>HGIH<PDF>" shows as HIGH) while every parser reads the logical
+# order with the controls stripped, so a review holding one is rejected
+# outright instead of read. A review names such a character ("U+202E").
+_BIDI_CONTROL_RE = re.compile(
+    "[\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
+    "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
+)
+# A numeric character reference to one of them ("&#x202E;", "&#8238", with
+# or without ";" and leading zeros) decodes to the control when the review
+# is rendered, so it is rejected the same way. HTML5 names none of them.
+_BIDI_CONTROL_REFERENCE_RE = re.compile(
+    r"&#(?:[xX]0*(202[A-Ea-e]|206[6-9])(?![0-9A-Fa-f])"
+    r"|0*(823[4-8]|829[4-7])(?![0-9]))"
+)
+REVIEW_BIDI_CONTROL_REASON = "review-bidi-control"
+# Every line break normalize_review_text maps to "\n", and "\n" itself.
+_ANY_LINE_BREAK_RE = re.compile(
+    "\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85"
+    "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]"
+)
+
+
+def find_bidi_control(text: str) -> str | None:
+    """``"U+202E at line 3"`` for the first bidi control in ``text``, else None.
+
+    ``text`` is read as written (before :func:`normalize_review_text`, which
+    strips these characters); every line-break form counts as one break. A
+    character reference to a control is reported as
+    ``"U+202E reference at line 3"``, whichever comes first.
+    """
+    match = _BIDI_CONTROL_RE.search(text)
+    reference = (_BIDI_CONTROL_REFERENCE_RE.search(text)
+                 if "&#" in text else None)
+    if reference is not None and (match is None
+                                  or reference.start() < match.start()):
+        hexadecimal, decimal = reference.group(1), reference.group(2)
+        code_point = (int(hexadecimal, 16) if hexadecimal is not None
+                      else int(decimal))
+        line = len(_ANY_LINE_BREAK_RE.findall(text, 0, reference.start())) + 1
+        return f"U+{code_point:04X} reference at line {line}"
+    if match is None:
+        return None
+    line = len(_ANY_LINE_BREAK_RE.findall(text, 0, match.start())) + 1
+    return f"U+{ord(match.group(0)):04X} at line {line}"
 
 
 def normalize_review_text(text: str) -> str:
@@ -479,6 +527,8 @@ def verify_reviewer_provenance(
         run's ``<!-- EQUIPA-REVIEW-COMPLETE <nonce> -->`` sentinel, so the
         review was never finished (gate-07);
       * ``artifact-changed-after-review`` — edited after the reviewer ended.
+      * ``review-bidi-control-U+XXXX-at-line-N`` — the bytes hold a bidi
+        embedding, override or isolate (task 3149, R3143-07), checked first.
 
       * ``reviewer-record-missing`` — no reviewer run was recorded for the
         task in this process (SR41-03, task #3063). Both production gate
@@ -507,6 +557,12 @@ def verify_reviewer_provenance(
             trusted, reason, fingerprint, text=text, record=record,
         )
 
+    # Task 3149 (R3143-07): the normalised text has lost its bidi controls,
+    # so they are looked for in the bytes as written, before anything else.
+    bidi = find_bidi_control(raw_text) if raw_text is not None else None
+    if bidi is not None:
+        return verdict(False, f"{REVIEW_BIDI_CONTROL_REASON}-"
+                              + bidi.replace(" ", "-"))
     if record is None:
         if unrecorded_reviewer_runs_permitted():
             return verdict(True, "no-reviewer-run-recorded")
@@ -825,9 +881,31 @@ def decide_merge_gate(
             reason="doc-only-diff",
             changed_files=list(changed_files),
         )
-    blocks, counts = security_review_blocks_merge(
-        project_dir, task_id, block_on_missing=block_on_missing,
-    )
+    try:
+        blocks, counts = security_review_blocks_merge(
+            project_dir, task_id, block_on_missing=block_on_missing,
+        )
+    except Exception as error:  # noqa: BLE001 - any failure blocks the merge
+        # Task 3149 (R3143-04): an exception while reading or parsing the
+        # review is a logged block with a verdict, never an exception that
+        # ends the task with no GATE-AUDIT line.
+        logger.exception("[security-gate] review check for task %s failed",
+                         task_id)
+        reason = f"review parse error: {type(error).__name__}"
+        _gate_audit_log(
+            f"task={task_id} event=review-parse-error reason={reason!r} "
+            f"action=block",
+            task_id=task_id,
+            event="review-parse-error",
+        )
+        return GateDecision(
+            blocks_merge=True,
+            doc_only=False,
+            expect_artifact=True,
+            counts=None,
+            reason=reason,
+            changed_files=list(changed_files),
+        )
     reason = "security-review-blocked" if blocks else "clean"
     return GateDecision(
         blocks_merge=blocks,

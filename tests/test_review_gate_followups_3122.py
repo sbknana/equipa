@@ -57,12 +57,9 @@ def assert_prose_merges(body: list[str]) -> None:
 
 # Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
 SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
-# A zero tally ("HIGH: 0") cannot label a finding; the backstop exempts it,
-# so these lines merge as written, as they did before task 3143.
-EXEMPT_AS_WRITTEN = {
-    "HIGH: 0 and CRITICAL: 0 from semgrep.",
-    "| semgrep | HIGH: 0 |",
-}
+# Task 3152: "HIGH: 0 and CRITICAL: 0 from semgrep." and "| semgrep | HIGH: 0
+# |" merged as written under the 3143 tally exemption. CRITICAL and HIGH have
+# no exemption now, so they block as written like every other prose row.
 
 
 def assert_compliant_prose_merges(body: list[str]) -> None:
@@ -74,12 +71,10 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), line)
         for line in body
     ])
-    if any(line in EXEMPT_AS_WRITTEN for line in body):
-        assert_prose_merges(body)
-    elif any(SEVERITY_TOKEN.search(line) for line in body):
+    if any(SEVERITY_TOKEN.search(line) for line in body):
         analysis = analyze(review("1 finding.", body, ONE_LOW, low_heading=True))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith("unaccounted severity token:"), (
+        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
             body, analysis.detail)
 
 
@@ -290,9 +285,19 @@ COUNTED_SHAPES = [
 
 @pytest.mark.parametrize("line", COUNTED_SHAPES)
 def test_shape_counted_by_the_footer_merges_with_that_count(line):
-    """A candidate only fails closed when the footer does not count it."""
+    """A candidate only fails closed when the footer does not count it.
+
+    Task 3152: an UPPER-case HIGH that is not the label of a counted finding
+    heading blocks whatever the footer counts (no footer-count exemption).
+    Those rows blocked the merge before too, by HIGH=1; now the review is
+    not trusted. Title-case shapes are still counted by the footer.
+    """
     analysis = analyze(review("1 finding.", ["## Findings", "", line],
                              ONE_HIGH, low_heading=False))
+    if SEVERITY_TOKEN.search(line):
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, line
+        assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+        return
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (line, analysis.detail)
     assert analysis.counts["HIGH"] == 1
 

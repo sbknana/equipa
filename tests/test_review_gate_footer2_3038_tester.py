@@ -23,13 +23,32 @@ from pathlib import Path
 import pytest
 
 from equipa.loops import (
+    BACKSTOP_REASON,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_INCOMPLETE,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    _analyze_review_views,
     _blank_code,
     _count_findings_in_review_file,
 )
+from equipa.security_gate import normalize_review_text
+
+
+def _rules_analysis(path: Path):
+    """The shape rules alone, without the severity-token backstop."""
+    return _analyze_review_views(
+        normalize_review_text(path.read_text(encoding="utf-8")))
+
+
+def _assert_backstop_blocks(path: Path) -> None:
+    """Task 3152: an UPPER-case HIGH outside a counted heading's label and
+    the final strict footer blocks whatever the counts (each review here
+    blocked the merge before as well, by HIGH=1)."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert _count_findings_in_review_file(path) is None
 
 BODY = "# Security Review\n\n## Summary\nReviewed the diff.\n\n## Findings\n\n"
 
@@ -74,7 +93,7 @@ def _assert_only_the_backstop_blocks(path: Path) -> None:
     UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
 
 
@@ -208,10 +227,13 @@ def test_fixed_inside_bold_span_resolves_bullet_recap(tmp_path: Path) -> None:
         + _footer(),
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
+    rules = _rules_analysis(path)
+    assert rules.verdict == REVIEW_VERDICT_OK
     # Task #3038 fix-forward (IR38-01): resolved, so the zero footer may
     # omit it, but it is ADDED to the merge counts and blocks (HIGH=1).
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert rules.counts == _counts(high=1)
+    # Task 3152: the recap's HIGH is no counted heading's label.
+    _assert_backstop_blocks(path)
 
 
 def test_candidate_in_inline_code_is_ignored(tmp_path: Path) -> None:
@@ -283,11 +305,14 @@ def test_later_footer_after_real_one_is_the_one_used(tmp_path: Path) -> None:
         + _footer(high=1) + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = _rules_analysis(path)
 
     assert analysis.footer_counts == _counts(high=1)
     assert analysis.verdict == REVIEW_VERDICT_OK
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert analysis.counts == _counts(high=1)
+    # Task 3152: only the final footer's labels are credited; the first
+    # footer's CRITICAL and HIGH are unaccounted.
+    _assert_backstop_blocks(path)
 
 
 def test_trailing_level_one_heading_after_footer_is_incomplete(
