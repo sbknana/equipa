@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from types import MappingProxyType
@@ -862,6 +862,13 @@ class PinnedGitRepository:
     ``work_tree``). ``work_tree_id`` is that directory's (device, inode)
     when it was pinned; :func:`git_repositories_pinned` records it when the
     pin does not.
+
+    ``work_tree_fd`` (R3155-02, task #3158) is the work tree opened when it
+    was pinned. git then starts inside that directory
+    (``/proc/self/fd/N``) and is told the directory it stands in is the
+    work tree, so the inode checked is the inode git uses, not whatever a
+    rename put at ``path`` between the check and git's start. ``fds``
+    includes it.
     """
 
     work_tree: str
@@ -870,13 +877,21 @@ class PinnedGitRepository:
     fds: tuple[int, ...] = ()
     path: str = ""
     work_tree_id: tuple[int, int] | None = None
+    work_tree_fd: int | None = None
 
     @property
     def key(self) -> str:
         return _pin_key(self.path or self.work_tree)
 
     def argv(self) -> list[str]:
-        return [f"--git-dir={self.git_dir}", f"--work-tree={self.work_tree}"]
+        work_tree = "." if self.work_tree_fd is not None else self.work_tree
+        return [f"--git-dir={self.git_dir}", f"--work-tree={work_tree}"]
+
+    def run_cwd(self, cwd: str | Path) -> str:
+        """Where git starts for a call whose ``cwd`` named this work tree."""
+        if self.work_tree_fd is None:
+            return str(cwd)
+        return f"{_FD_DIRECTORY}/{self.work_tree_fd}"
 
     def env(self) -> dict[str, str]:
         # Overrides the git dir's ``commondir`` file, which an agent can
@@ -949,27 +964,61 @@ def open_pinned_directory(
     return fd
 
 
+def open_work_tree(path: str) -> int:
+    """Open the work-tree directory ``path`` the way git's ``chdir`` into it
+    would (symlinks followed). Raises :class:`PinnedRepositoryError`; the
+    caller owns the fd.
+    """
+    try:
+        return os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot open the work tree {path}: {exc.strerror}"
+        ) from exc
+
+
+def descriptor_path(fd: int) -> str:
+    """The path the open directory ``fd`` has now (its ``/proc/self/fd``
+    link). Raises :class:`PinnedRepositoryError`."""
+    try:
+        return os.readlink(f"{_FD_DIRECTORY}/{fd}")
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the path of descriptor {fd}: {exc.strerror}"
+        ) from exc
+
+
 def pinned_repository(
     work_tree: str, git_dir_fd: int, common_dir_fd: int,
-    *, git_dir: str, common_dir: str,
+    *, git_dir: str, common_dir: str, work_tree_fd: int | None = None,
 ) -> PinnedGitRepository:
     """A :class:`PinnedGitRepository` for open directory descriptors.
 
     ``work_tree`` is the directory as the merge path names it: the pin is
-    keyed by that path and records its (device, inode) now. ``git_dir`` /
+    keyed by that path. With ``work_tree_fd`` (from :func:`open_work_tree`)
+    the pin records that directory's (device, inode) and git starts in it;
+    without, the directory at ``work_tree`` now. ``git_dir`` /
     ``common_dir`` are the realpaths, used only where ``/proc/self/fd``
     does not exist.
     """
     if not fd_pinning_available():
         return pinned_repository_by_path(work_tree, git_dir=git_dir, common_dir=common_dir)
     path = _pin_key(work_tree)
+    fds = {git_dir_fd, common_dir_fd}
+    if work_tree_fd is None:
+        real_work_tree, work_tree_id = os.path.realpath(work_tree), _work_tree_id(path)
+    else:
+        real_work_tree = descriptor_path(work_tree_fd)
+        work_tree_id = _directory_id(work_tree_fd)
+        fds.add(work_tree_fd)
     return PinnedGitRepository(
-        os.path.realpath(work_tree),
+        real_work_tree,
         f"{_FD_DIRECTORY}/{git_dir_fd}",
         f"{_FD_DIRECTORY}/{common_dir_fd}",
-        tuple(sorted({git_dir_fd, common_dir_fd})),
+        tuple(sorted(fds)),
         path=path,
-        work_tree_id=_work_tree_id(path),
+        work_tree_id=work_tree_id,
+        work_tree_fd=work_tree_fd,
     )
 
 
@@ -1063,6 +1112,20 @@ def _pinned_repository_for(cwd: str | Path) -> PinnedGitRepository | None:
             f"(device/inode {pin.work_tree_id}); it was swapped after the pin"
         )
     return pin
+
+
+def _check_work_tree_after_call(pin: PinnedGitRepository | None) -> None:
+    """R3155-02 (task #3158): the pinned work tree must still be at its path
+    once git has run. A swap made while git ran (and still in place) is
+    raised, so the merge path trips the guard instead of carrying on.
+    """
+    if pin is None:
+        return
+    if _work_tree_id(pin.key) != pin.work_tree_id:
+        raise PinnedRepositoryError(
+            f"{pin.key} is no longer the work tree pinned for this merge "
+            f"(device/inode {pin.work_tree_id}); it was swapped while git ran"
+        )
 
 
 # IR-04 (task #3132): agents share the orchestrator's UID, so any agent shell
@@ -1197,10 +1260,13 @@ def git_run(
     # Only a descriptor pin hands anything down; other calls keep the plain
     # runner signature.
     inherited = {"pass_fds": pin.fds} if pin is not None and pin.fds else {}
-    return _run_with_env(
-        _hardened_git_argv(args, run_env, pin), cwd, timeout, run_env, text=text,
-        **inherited,
+    result = _run_with_env(
+        _hardened_git_argv(args, run_env, pin),
+        pin.run_cwd(cwd) if pin is not None else cwd,
+        timeout, run_env, text=text, **inherited,
     )
+    _check_work_tree_after_call(pin)
+    return result
 
 
 async def git_run_async(
@@ -1229,15 +1295,40 @@ async def git_run_async(
     """
     pin = _pinned_repository_for(cwd)
     run_env = _hardened_git_env(env, args, pin)
-    argv = _hardened_git_argv(args, run_env, pin)
+    result = await _run_git_process_async(
+        _hardened_git_argv(args, run_env, pin),
+        pin.run_cwd(cwd) if pin is not None else str(cwd),
+        run_env, timeout, input=input, text=text,
+        pass_fds=pin.fds if pin is not None else (),
+    )
+    _check_work_tree_after_call(pin)
+    return result
+
+
+async def _run_git_process_async(
+    argv: list[str],
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: int,
+    *,
+    input: bytes | None = None,
+    text: bool = True,
+    pass_fds: Sequence[int] = (),
+) -> subprocess.CompletedProcess:
+    """Run the full git ``argv`` without blocking the event loop.
+
+    The process half of :func:`git_run_async`, for callers that build their
+    own hardened argv and environment. Raises ``subprocess.TimeoutExpired``
+    (the child killed first) after ``timeout`` seconds.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        cwd=str(cwd),
-        env=run_env,
+        cwd=cwd,
+        env=dict(env),
         stdin=asyncio.subprocess.PIPE if input is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        pass_fds=pin.fds if pin is not None else (),
+        pass_fds=tuple(pass_fds),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -1261,6 +1352,325 @@ async def git_run_async(
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
     )
+
+
+# --- git in an agent's task worktree (R3155-01, task #3158) --------------------
+#
+# Cleanup runs git in a task worktree after the agent stopped: is there
+# uncommitted work, and if so, stash it on the branch before the worktree is
+# removed. Run there by discovery, that git used whatever repository the
+# worktree's ``.git`` named, with that repository's config, and every command
+# that hashes or writes file content (``status`` on a stat-dirty file,
+# ``stash``) ran the filter driver the agent's attributes selected, inside the
+# orchestrator. Those commands now run on a private git dir the orchestrator
+# writes for the one sequence of calls:
+#
+# * its config is the only config git reads: no system config, no global
+#   config, neither the repository's config nor its ``config.worktree``. No
+#   filter, merge or diff driver, fsmonitor or hook is defined anywhere git
+#   looks, so none can run;
+# * attributes come from the empty tree (``GIT_ATTR_SOURCE``), the private
+#   dir's absent ``info/attributes`` and no global or system file, so the
+#   work tree's ``.gitattributes`` select nothing either;
+# * objects are the repository's own (``GIT_OBJECT_DIRECTORY``), HEAD is the
+#   commit the worktree's git dir names, and the index is a copy of the
+#   worktree's index;
+# * that git dir is the ``worktrees/<name>`` entry of the main repository
+#   whose ``gitdir`` file names this work tree, never what its ``.git`` says,
+#   and git starts inside the opened work-tree directory.
+#
+# A stash made there is copied to the repository's ``refs/stash``.
+
+
+class AgentWorktreeGitError(RuntimeError):
+    """The task worktree cannot be inspected without trusting agent files."""
+
+
+# The empty tree of each object format git supports.
+_EMPTY_TREES: Mapping[str, str] = MappingProxyType({
+    "sha1": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+})
+# A HEAD or gitdir file is one short line.
+_GIT_LINE_FILE_LIMIT = 4096
+# A worktree index can be large, but not unbounded.
+_INDEX_COPY_LIMIT = 1024 * 1024 * 1024
+# The only settings taken from the pinned global config: who commits the
+# stash and which files the operator ignores. None of them names a program.
+_PRIVATE_SETTINGS_FROM_GLOBAL = r"^(user\.name|user\.email|core\.excludesfile)$"
+# Used when neither the environment nor the global config names a committer.
+_FALLBACK_IDENTITY = (("user.name", "EQUIPA orchestrator"), ("user.email", "equipa@localhost"))
+# A branch the private HEAD may name as a plain file under refs/heads.
+_PLAIN_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
+_HEX_OBJECT_NAME_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def find_worktree_git_dir(common_dir: str, work_tree: str) -> str | None:
+    """The ``worktrees/<name>`` git dir of ``common_dir`` registered for the
+    work tree whose realpath is ``work_tree``; None unless exactly one is.
+
+    Read from the main repository, never through the work tree's ``.git``:
+    a git dir counts when its ``gitdir`` file names ``<work_tree>/.git``.
+    """
+    expected = os.path.join(work_tree, ".git")
+    matches: list[str] = []
+    try:
+        with os.scandir(os.path.join(common_dir, "worktrees")) as entries:
+            candidates = [
+                entry.path for entry in entries if entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            named = read_regular_file_bounded(
+                os.path.join(candidate, "gitdir"), _GIT_LINE_FILE_LIMIT,
+            ).decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        # git writes an absolute path; a relative one is relative to the entry.
+        if named and os.path.normpath(os.path.join(candidate, named)) == expected:
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _open_agent_work_tree(work_tree: str | os.PathLike) -> tuple[int | None, str]:
+    """``(fd, realpath)`` of the task work tree, whose last component must
+    not be a symlink. The fd is None where git cannot start in it."""
+    path = os.path.abspath(os.fspath(work_tree))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AgentWorktreeGitError(
+            f"cannot open the task worktree {path}: {exc.strerror}"
+        ) from exc
+    if not fd_pinning_available():
+        os.close(fd)
+        return None, os.path.realpath(path)
+    try:
+        return fd, os.readlink(f"{_FD_DIRECTORY}/{fd}")
+    except OSError as exc:
+        os.close(fd)
+        raise AgentWorktreeGitError(
+            f"cannot read the path of the task worktree {path}: {exc.strerror}"
+        ) from exc
+
+
+def _copy_regular_file(source: str, destination: str, limit: int) -> bool:
+    """Copy the regular file ``source`` (never a symlink or FIFO); False
+    when it does not exist. Raises :class:`AgentWorktreeGitError`."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(source, flags)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentWorktreeGitError(f"cannot open {source}: {exc.strerror}") from exc
+    with os.fdopen(fd, "rb") as reader:
+        info = os.fstat(reader.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise AgentWorktreeGitError(
+                f"{source} is not a regular file of at most {limit} bytes"
+            )
+        with open(destination, "wb") as writer:
+            copied = 0
+            while chunk := reader.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > limit:
+                    raise AgentWorktreeGitError(f"{source} grew past {limit} bytes")
+                writer.write(chunk)
+    return True
+
+
+async def _run_in_main_repository(
+    common_dir: str, args: list[str], timeout: int,
+) -> subprocess.CompletedProcess:
+    """Hardened git on the main repository's git dir, named explicitly."""
+    return await git_run_async([f"--git-dir={common_dir}", *args], common_dir, timeout=timeout)
+
+
+async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None]:
+    """``(commit, branch)`` the worktree git dir's HEAD names (branch None
+    when detached), resolved in the main repository."""
+    try:
+        head = read_regular_file_bounded(
+            os.path.join(git_dir, "HEAD"), _GIT_LINE_FILE_LIMIT,
+        ).decode("utf-8", "replace").strip()
+    except OSError as exc:
+        raise AgentWorktreeGitError(f"cannot read {git_dir}/HEAD: {exc}") from exc
+    branch: str | None = None
+    if head.startswith("ref: refs/heads/"):
+        branch = head[len("ref: refs/heads/"):]
+        revision = f"refs/heads/{branch}"
+    elif _HEX_OBJECT_NAME_RE.fullmatch(head):
+        revision = head
+    else:
+        raise AgentWorktreeGitError(f"{git_dir}/HEAD names {head[:200]!r}")
+    resolved = await _run_in_main_repository(
+        common_dir, ["rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], 10,
+    )
+    commit = (resolved.stdout or "").strip()
+    if resolved.returncode != 0 or not _HEX_OBJECT_NAME_RE.fullmatch(commit):
+        raise AgentWorktreeGitError(f"HEAD of {git_dir} ({revision}) is not a commit")
+    return commit, branch
+
+
+async def _operator_settings() -> list[tuple[str, str | None]]:
+    """The :data:`_PRIVATE_SETTINGS_FROM_GLOBAL` entries of the pinned
+    global config; none while it is not pinned or no longer verifies."""
+    pin = _global_config_pin
+    if pin is None or verify_global_git_config_pin() is not None:
+        return []
+    listing = await git_run_async(
+        ["config", "--file", str(pin.path), "-z", "--get-regexp",
+         _PRIVATE_SETTINGS_FROM_GLOBAL],
+        pin.path.parent, timeout=10,
+    )
+    return parse_config_list_z(listing.stdout) if listing.returncode == 0 else []
+
+
+@dataclass(frozen=True)
+class AgentWorktreeGit:
+    """git on one task worktree that reads nothing the agent can write but
+    the work tree's own files (see the section comment); made by
+    :func:`agent_worktree_git`."""
+
+    work_tree: str
+    common_dir: str
+    git_dir: str
+    head: str
+    branch: str | None
+    private_dir: str
+    empty_tree: str
+    work_tree_fd: int | None
+
+    def _env(self) -> dict[str, str]:
+        env = _hardened_git_env()
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),
+            "GIT_INDEX_FILE": os.path.join(self.private_dir, "index"),
+            "GIT_ATTR_SOURCE": self.empty_tree,
+        })
+        return env
+
+    async def run(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+        """``git <args>`` on the private git dir, inside the work tree."""
+        env = self._env()
+        command = [
+            "-c", f"core.attributesFile={os.devnull}",
+            f"--git-dir={self.private_dir}", "--work-tree=.", *args,
+        ]
+        if self.work_tree_fd is None:
+            cwd, pass_fds = self.work_tree, ()
+        else:
+            cwd = f"{_FD_DIRECTORY}/{self.work_tree_fd}"
+            pass_fds = (self.work_tree_fd,)
+        return await _run_git_process_async(
+            _hardened_git_argv(command, env), cwd, env, timeout, pass_fds=pass_fds,
+        )
+
+    async def store_stash(self) -> str:
+        """Copy the private ``refs/stash`` to the repository's, with the
+        stash's own message; returns the stash commit."""
+        top = await self.run(["log", "-1", "--format=%H%n%s", "refs/stash"], timeout=15)
+        commit, _, subject = (top.stdout or "").strip().partition("\n")
+        if top.returncode != 0 or not _HEX_OBJECT_NAME_RE.fullmatch(commit):
+            raise AgentWorktreeGitError(
+                f"no stash was made in the private git dir (rc={top.returncode})"
+            )
+        stored = await _run_in_main_repository(
+            self.common_dir,
+            ["update-ref", "--create-reflog", "-m", subject, "refs/stash", commit], 15,
+        )
+        if stored.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"could not record stash {commit[:12]} in {self.common_dir} "
+                f"(rc={stored.returncode}: {(stored.stderr or '').strip()[:200]})"
+            )
+        return commit
+
+
+async def _write_private_git_dir(
+    private_dir: str, git_dir: str, head: str, branch: str | None, object_format: str,
+) -> bool:
+    """Lay out the private git dir; True when the worktree index was copied."""
+    for directory in ("refs/heads", "objects"):
+        os.makedirs(os.path.join(private_dir, directory))
+    if branch is not None and _PLAIN_BRANCH_RE.fullmatch(branch):
+        Path(private_dir, "refs", "heads", branch).write_text(f"{head}\n", encoding="ascii")
+        Path(private_dir, "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="ascii")
+    else:
+        Path(private_dir, "HEAD").write_text(f"{head}\n", encoding="ascii")
+    settings: list[tuple[str, str | None]] = [
+        ("core.repositoryformatversion", "0" if object_format == "sha1" else "1"),
+        ("core.bare", "false"),
+    ]
+    if object_format != "sha1":
+        settings.append(("extensions.objectformat", object_format))
+    operator = await _operator_settings()
+    settings.extend(operator)
+    named = {key for key, _ in operator}
+    settings.extend(entry for entry in _FALLBACK_IDENTITY if entry[0] not in named)
+    Path(private_dir, "config").write_text(serialize_git_config(settings), encoding="utf-8")
+    return _copy_regular_file(
+        os.path.join(git_dir, "index"), os.path.join(private_dir, "index"),
+        _INDEX_COPY_LIMIT,
+    )
+
+
+@contextlib.asynccontextmanager
+async def agent_worktree_git(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike,
+) -> AsyncIterator[AgentWorktreeGit]:
+    """An :class:`AgentWorktreeGit` for the task worktree ``work_tree`` of
+    the repository whose git common dir is ``common_dir``.
+
+    Raises :class:`AgentWorktreeGitError` when the work tree is a symlink,
+    is not a registered worktree of that repository, or its HEAD or index
+    cannot be read; the private git dir is removed on the way out.
+    """
+    common = os.path.realpath(os.fspath(common_dir))
+    fd, real_work_tree = _open_agent_work_tree(work_tree)
+    private_dir: str | None = None
+    try:
+        git_dir = find_worktree_git_dir(common, real_work_tree)
+        if git_dir is None:
+            raise AgentWorktreeGitError(
+                f"{real_work_tree} is not a registered worktree of {common}"
+            )
+        formats = await _run_in_main_repository(
+            common, ["rev-parse", "--show-object-format"], 10,
+        )
+        object_format = (formats.stdout or "").strip()
+        if formats.returncode != 0 or object_format not in _EMPTY_TREES:
+            raise AgentWorktreeGitError(
+                f"cannot read the object format of {common} (rc={formats.returncode})"
+            )
+        head, branch = await _worktree_head(common, git_dir)
+        private_dir = tempfile.mkdtemp(prefix="equipa-worktree-git-")
+        index_copied = await _write_private_git_dir(
+            private_dir, git_dir, head, branch, object_format,
+        )
+        worktree_git = AgentWorktreeGit(
+            real_work_tree, common, git_dir, head, branch, private_dir,
+            _EMPTY_TREES[object_format], fd,
+        )
+        if not index_copied:
+            # No index: start from HEAD's tree, which leaves the files alone.
+            read_tree = await worktree_git.run(["read-tree", head], timeout=30)
+            if read_tree.returncode != 0:
+                raise AgentWorktreeGitError(
+                    f"cannot build an index for {real_work_tree} "
+                    f"(rc={read_tree.returncode})"
+                )
+        yield worktree_git
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if private_dir is not None:
+            shutil.rmtree(private_dir, ignore_errors=True)
 
 
 # --- Pinned global git config (task #3116, MI-04) -----------------------------

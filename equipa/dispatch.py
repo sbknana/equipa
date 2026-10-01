@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ import signal
 import stat
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -59,13 +60,18 @@ from equipa.db import (
 )
 from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import (
+    AgentWorktreeGit,
+    AgentWorktreeGitError,
     GitRepositoryUnreadableError,
     PinnedGitRepository,
     PinnedRepositoryError,
     UntrustedDefaultBranchError,
     _is_git_repo,
+    agent_worktree_git,
     check_pinned_directory,
+    descriptor_path,
     fd_pinning_available,
+    find_worktree_git_dir,
     get_default_branch,
     get_trusted_default_branch,
     git_repositories_pinned,
@@ -74,6 +80,7 @@ from equipa.git_ops import (
     git_toplevel,
     git_toplevel_async,
     open_pinned_directory,
+    open_work_tree,
     pinned_repository,
     pinned_repository_by_path,
 )
@@ -125,6 +132,7 @@ from equipa.security_gate import (
     SecurityGateBypassError,
     _gate_audit_log,
     decide_merge_gate,
+    escape_audit_text,
     describe_submodule_pointer_changes,
     format_counts,
     get_changed_files_for_branch,
@@ -2029,42 +2037,40 @@ async def _retire_leftover_worktree(
     """Remove a leftover task worktree without losing uncommitted work.
 
     Uncommitted changes (untracked files included) are stashed first. The
-    worktree is force-removed only once ``git status`` reads clean.
+    worktree is force-removed only once nothing uncommitted is left in it.
+
+    R3155-01 (task #3158): whether it is a worktree of this repository is
+    read from the repository's own ``worktrees/`` entries, not by running
+    git through the directory's (agent-writable) ``.git``.
 
     Returns:
         None once the worktree is gone, otherwise the reason it was kept.
     """
     wt = str(wt_path)
-    toplevel = await git_run_async(["rev-parse", "--show-toplevel"], wt, timeout=10)
-    toplevel_path = (toplevel.stdout or "").strip()
-    if toplevel.returncode != 0 or Path(toplevel_path).resolve() != wt_path.resolve():
-        # Not a worktree of its own: git run there would act on the
-        # enclosing checkout, so neither stash nor remove it.
-        if wt_path.is_dir() and not any(wt_path.iterdir()):
+    common_dir = await _git_common_dir(project_dir)
+    registered = (
+        common_dir is not None
+        and not wt_path.is_symlink()
+        and find_worktree_git_dir(str(common_dir), os.path.realpath(wt)) is not None
+    )
+    if not registered:
+        # Not a worktree of its own: git run there would act on whatever
+        # its .git names, so neither stash nor remove it.
+        if wt_path.is_dir() and not wt_path.is_symlink() and not any(wt_path.iterdir()):
             wt_path.rmdir()
             return None
         return (
             f"leftover {wt} is not a registered worktree; preserved, "
             f"resolve by hand"
         )
-    status = await git_run_async(
-        ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
+    problem = await _stash_uncommitted_in_worktree(
+        wt, task_id, branch_name, project_dir=project_dir,
     )
-    if status.returncode != 0:
+    if problem is not None:
         return (
-            f"could not read the status of leftover worktree {wt}; "
-            f"preserved, resolve by hand"
+            f"leftover worktree {wt} has uncommitted work that could not "
+            f"be stashed ({problem}); preserved, resolve by hand"
         )
-    if status.stdout.strip():
-        await _stash_uncommitted_in_worktree(wt, task_id, branch_name)
-        recheck = await git_run_async(
-            ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
-        )
-        if recheck.returncode != 0 or recheck.stdout.strip():
-            return (
-                f"leftover worktree {wt} has uncommitted work that could not "
-                f"be stashed; preserved, resolve by hand"
-            )
     remove = await git_run_async(
         ["worktree", "remove", "--force", wt], project_dir, timeout=30,
     )
@@ -2394,10 +2400,21 @@ async def _merge_task_branch(
         # Task #3141 (I-01): only against the guard's pinned SHA, never the
         # re-read pre_head — without one, no generator is trusted.
         if shutdown_requested() is None and pinned_default_sha:
-            resolution = await _resolve_generated_conflict(
-                project_dir, task_id, branch_name, pre_head, target_sha,
-                pinned_default_sha, default_branch,
-            )
+            try:
+                resolution = await _resolve_generated_conflict(
+                    project_dir, task_id, branch_name, pre_head, target_sha,
+                    pinned_default_sha, default_branch,
+                )
+            except PinnedRepositoryError:
+                # R3155-03 (task #3158): a swap seen while resolving is the
+                # merge's alarm. The checkout is mid-merge, so abort it (while
+                # the swap is still in place the abort is refused as well),
+                # then let _gated_merge_task trip the guard.
+                with contextlib.suppress(
+                    subprocess.SubprocessError, OSError, PinnedRepositoryError,
+                ):
+                    await git_run_async(["merge", "--abort"], project_dir, timeout=15)
+                raise
             if resolution.resolved:
                 record.merged_sha = target_sha
                 record.post_head = resolution.commit
@@ -2560,6 +2577,9 @@ async def _resolve_generated_conflict(
     ``pinned_sha`` is the default-branch SHA the run's guard pinned: every
     generator blob comparison uses it, and the resolution is refused unless
     ``pre_head`` (and HEAD mid-merge) equal it (task #3141, I-01).
+
+    A :class:`PinnedRepositoryError` (a pinned work tree swapped while
+    resolving) is raised, not turned into a refusal (R3155-03, task #3158).
     """
     try:
         resolution = await resolve_generated_conflicts(
@@ -2574,6 +2594,8 @@ async def _resolve_generated_conflict(
             ),
             default_branch=default_branch,
         )
+    except PinnedRepositoryError:
+        raise
     except (subprocess.SubprocessError, OSError) as exc:
         resolution = ConflictResolution(
             True, (), None, f"generated-file resolution errored: {exc}",
@@ -2635,45 +2657,86 @@ def _git_output(result: subprocess.CompletedProcess, limit: int = 400) -> str:
     return combined[:limit]
 
 
+@contextlib.asynccontextmanager
+async def _task_worktree_git(
+    project_dir: str, worktree_dir: str,
+) -> AsyncIterator[AgentWorktreeGit]:
+    """:func:`agent_worktree_git` for a task worktree of the repository
+    ``project_dir`` is checked out from. Raises :class:`AgentWorktreeGitError`.
+    """
+    common_dir = await _git_common_dir(project_dir)
+    if common_dir is None:
+        raise AgentWorktreeGitError(
+            f"could not locate the git common dir of {project_dir}"
+        )
+    async with agent_worktree_git(common_dir, worktree_dir) as worktree_git:
+        yield worktree_git
+
+
 async def _stash_uncommitted_in_worktree(
     wt_path: str,
     task_id: int,
     branch_name: str,
-) -> None:
+    *,
+    project_dir: str,
+) -> str | None:
     """Stash any uncommitted changes inside ``wt_path`` onto its branch.
 
-    Runs inside the worktree itself so the stash lands on ``branch_name``'s
-    HEAD. Includes untracked files (``-u``) so newly-created agent files
-    are preserved. Stash message is tagged so it can be located later by
+    The stash lands on the worktree's HEAD (``branch_name``'s, normally).
+    Includes untracked files (``-u``) so newly-created agent files are
+    preserved. Stash message is tagged so it can be located later by
     rescue tooling: ``equipa-early-term task-<id>``.
 
-    Silent failure paths (missing git, no changes, locked index) are
-    logged but never raised — cleanup must continue even if the stash
-    cannot be saved.
+    R3155-01 (task #3158): git never runs on what the worktree's ``.git``
+    names, nor with any config, attributes file or driver the agent could
+    plant (:func:`equipa.git_ops.agent_worktree_git`). A worktree that cannot
+    be inspected that way is not stashed; that is logged and written to the
+    GATE-AUDIT log.
+
+    Returns None when nothing uncommitted is left to lose (clean, or
+    stashed), otherwise why the work could not be saved. Never raises:
+    cleanup must continue even if the stash cannot be saved.
     """
     if not Path(wt_path).exists():
-        return
+        return None
+    stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
     try:
-        status = await git_run_async(
-            ["status", "--porcelain", "--ignore-submodules=all"], wt_path, timeout=15,
-        )
-        if status.returncode != 0 or not status.stdout.strip():
-            return
-        stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
-        result = await git_run_async(
-            ["stash", "push", "-u", "-m", stash_msg],
-            wt_path, timeout=30,
-        )
-        if result.returncode == 0 and "No local changes" not in result.stdout:
-            print(
-                f"  [Isolation] Task #{task_id}: stashed uncommitted work "
-                f"on '{branch_name}' as '{stash_msg}'"
+        async with _task_worktree_git(project_dir, wt_path) as worktree_git:
+            status = await worktree_git.run(
+                ["status", "--porcelain", "--ignore-submodules=all"], timeout=15,
             )
-    except (subprocess.SubprocessError, OSError) as e:
-        print(
-            f"  [Isolation] Could not stash uncommitted work for task "
-            f"#{task_id} on '{branch_name}': {e}"
+            if status.returncode != 0:
+                problem = f"git status failed: {_git_output(status)}"
+            elif not status.stdout.strip():
+                return None
+            else:
+                result = await worktree_git.run(
+                    ["stash", "push", "-u", "-m", stash_msg], timeout=30,
+                )
+                if result.returncode != 0 or "No local changes" in result.stdout:
+                    problem = f"git stash saved nothing: {_git_output(result)}"
+                else:
+                    commit = await worktree_git.store_stash()
+                    print(
+                        f"  [Isolation] Task #{task_id}: stashed uncommitted work "
+                        f"on '{branch_name}' as '{stash_msg}' ({commit[:12]})"
+                    )
+                    return None
+    except AgentWorktreeGitError as exc:
+        problem = str(exc)
+        _gate_audit_log(
+            f"task={task_id} event=worktree-stash-skipped branch={branch_name} "
+            f"reason={escape_audit_text(problem)}",
+            task_id=task_id,
+            event="worktree-stash-skipped",
         )
+    except (subprocess.SubprocessError, OSError) as exc:
+        problem = str(exc)
+    print(
+        f"  [Isolation] Could not stash uncommitted work for task "
+        f"#{task_id} on '{branch_name}': {problem}"
+    )
+    return problem
 
 
 async def _cleanup_worktrees(
@@ -2705,7 +2768,7 @@ async def _cleanup_worktrees(
             # running `git stash pop`.
             if task_id not in merged_tasks:
                 await _stash_uncommitted_in_worktree(
-                    wt_path, task_id, branch_name,
+                    wt_path, task_id, branch_name, project_dir=project_dir,
                 )
             await git_run_async(
                 ["worktree", "remove", "--force", wt_path],
@@ -2924,21 +2987,27 @@ async def _pin_merge_repositories(
     only refs, never run another repository's drivers, and the post-merge
     identity check (``record_merge``) trips on it.
 
+    R3155-02 (task #3158): both work trees are opened once. The main
+    checkout's path is read from its descriptor, and the pins record each
+    descriptor's inode and start git in it, so the directory checked is the
+    directory pinned and the one git uses.
+
     A guard without an identity (hand-built or a test double) pins nothing.
     Raises :class:`PinnedRepositoryError` when anything does not match.
     """
     identity = getattr(guard, "identity", None)
     if identity is None:
         return _MergePins([], [])
-    if os.path.realpath(work_tree) != identity.work_tree:
-        raise PinnedRepositoryError(
-            f"the merge would run in {work_tree}, not in the work tree "
-            f"{identity.work_tree} pinned at the snapshot"
-        )
     if not fd_pinning_available():
+        if os.path.realpath(work_tree) != identity.work_tree:
+            raise _merge_work_tree_mismatch(work_tree, identity)
         return await _pin_merge_repositories_by_path(identity, work_tree, worktree_dir)
     pins = _MergePins([], [])
     try:
+        work_tree_fd = open_work_tree(work_tree)
+        pins.fds.append(work_tree_fd)
+        if descriptor_path(work_tree_fd) != identity.work_tree:
+            raise _merge_work_tree_mismatch(work_tree, identity)
         common_fd = open_pinned_directory(identity.common_dir, identity.common_dir_id)
         pins.fds.append(common_fd)
         git_dir_fd = common_fd
@@ -2949,11 +3018,12 @@ async def _pin_merge_repositories(
             git_dir_fd, identity.git_dir, identity.common_dir,
             linked=git_dir_fd != common_fd,
         )
-        # Keyed by the path the merge passes (F2, task #3155); its realpath
-        # was checked against the snapshot above.
+        # Keyed by the path the merge passes (F2, task #3155); the path of
+        # its descriptor was checked against the snapshot above.
         pins.repositories.append(pinned_repository(
             work_tree, git_dir_fd, common_fd,
             git_dir=identity.git_dir, common_dir=identity.common_dir,
+            work_tree_fd=work_tree_fd,
         ))
         if worktree_dir is not None:
             admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
@@ -2965,14 +3035,26 @@ async def _pin_merge_repositories(
             pins.fds.append(admin_fd)
             admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
             _check_commondir_file(admin_fd, admin_dir, identity.common_dir, linked=True)
+            task_tree_fd = open_work_tree(worktree_dir)
+            pins.fds.append(task_tree_fd)
             pins.repositories.append(pinned_repository(
                 worktree_dir, admin_fd, common_fd,
                 git_dir=admin_dir, common_dir=identity.common_dir,
+                work_tree_fd=task_tree_fd,
             ))
     except BaseException:
         pins.close()
         raise
     return pins
+
+
+def _merge_work_tree_mismatch(
+    work_tree: str, identity: RepositoryIdentity,
+) -> PinnedRepositoryError:
+    return PinnedRepositoryError(
+        f"the merge would run in {work_tree}, not in the work tree "
+        f"{identity.work_tree} pinned at the snapshot"
+    )
 
 
 async def _pin_merge_repositories_by_path(
@@ -3513,7 +3595,7 @@ async def _no_changes_claim_problem(
         return f"{task_branch} could not be resolved"
     if trusted_sha is None or not await is_ancestor(project_dir, tip, trusted_sha):
         return f"{task_branch} has commits that are not on the default branch"
-    dirty = await _worktree_dirty_reason(worktree_dir)
+    dirty = await _worktree_dirty_reason(worktree_dir, project_dir=project_dir)
     if dirty is not None:
         return f"the worktree has uncommitted work ({dirty})"
     return None
@@ -3682,18 +3764,26 @@ def _empty_run_result() -> dict:
     return {"cost": 0.0, "duration": 0.0}
 
 
-async def _worktree_dirty_reason(worktree_dir: str) -> str | None:
-    """Uncommitted work (untracked files included) left in a task worktree.
+async def _worktree_dirty_reason(worktree_dir: str, *, project_dir: str) -> str | None:
+    """Uncommitted work (untracked files included) left in a task worktree
+    of ``project_dir``'s repository.
 
     ``.forge-state.json`` is agent scratch state, not work; it is removed
-    first, as :func:`_cleanup_worktrees` would remove it anyway.
+    first, as :func:`_cleanup_worktrees` would remove it anyway. R3155-01
+    (task #3158): ``git status`` runs without anything the agent could
+    plant (:func:`equipa.git_ops.agent_worktree_git`); a worktree that
+    cannot be inspected that way counts as dirty, so nothing is lost.
     """
     state_file = Path(worktree_dir) / ".forge-state.json"
     if state_file.is_file():
         state_file.unlink()
-    status = await git_run_async(
-        ["status", "--porcelain", "--ignore-submodules=all"], worktree_dir, timeout=30,
-    )
+    try:
+        async with _task_worktree_git(project_dir, worktree_dir) as worktree_git:
+            status = await worktree_git.run(
+                ["status", "--porcelain", "--ignore-submodules=all"], timeout=30,
+            )
+    except AgentWorktreeGitError as exc:
+        return f"the worktree could not be inspected safely: {exc}"
     if status.returncode != 0:
         return f"git status failed (rc={status.returncode})"
     dirty = [line for line in status.stdout.splitlines() if line.strip()]
@@ -3858,7 +3948,7 @@ async def run_task_in_isolation(
             log(f"[Task #{task_id}] {reason}", output)
             _audit_task_abort(task_id, "no-changes-claim-contradicted", reason, output)
         elif outcome in MERGE_ELIGIBLE_OUTCOMES and nothing_to_merge:
-            dirty = await _worktree_dirty_reason(worktree_dir)
+            dirty = await _worktree_dirty_reason(worktree_dir, project_dir=project_dir)
             if dirty:
                 guard.outcomes[task_id] = MergeOutcome(
                     "merge_failed",
@@ -3942,7 +4032,9 @@ async def run_task_in_isolation(
                 delete_branch = (
                     tip is not None
                     and await is_ancestor(project_dir, tip, guard.expected_sha)
-                    and await _worktree_dirty_reason(worktree_dir) is None
+                    and await _worktree_dirty_reason(
+                        worktree_dir, project_dir=project_dir,
+                    ) is None
                 )
         return IsolatedTaskRun(
             outcome, result, cycles, merged_sha=merged_sha,
