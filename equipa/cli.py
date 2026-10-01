@@ -87,6 +87,10 @@ from equipa.security_gate import (
     record_reviewer_skipped_doc_only,
     reviewer_run_failure,
 )
+from equipa.isolation import (
+    describe_isolation_state,
+    isolation_requirement_refusal,
+)
 from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
@@ -2286,6 +2290,12 @@ async def async_main() -> None:
     # THIS config — the one role resolution uses — never a CWD-relative file
     # (task #2994 S2).
     set_active_dispatch_config(args.dispatch_config)
+    # Review F1 (task 3142): when the host requires agent isolation, a config
+    # that turns it off refuses the run instead of dispatching unisolated.
+    isolation_refusal = isolation_requirement_refusal(args.dispatch_config)
+    if isolation_refusal:
+        refuse_dispatch(isolation_refusal)
+    print(describe_isolation_state(args.dispatch_config))
 
     # --- Auth availability check (Max subscription OR API key) ---
     # Warn only when neither auth source is present. The Claude CLI accepts

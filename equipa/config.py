@@ -264,24 +264,90 @@ def is_security_review_enabled(args, dispatch_config: dict | None = None) -> boo
     return bool(enabled)
 
 
+# Feature flag and settings section of agent isolation (equipa.isolation,
+# which imports this module, so the name is repeated here).
+AGENT_ISOLATION_KEY = "agent_isolation"
+
+
+def default_dispatch_config_path() -> Path:
+    """The dispatch_config.json a run without --dispatch-config loads."""
+    # Default location: alongside the TheForge DB (where the orchestrator
+    # script lives). Fall back to CWD-relative if that does not exist.
+    filepath = Path(THEFORGE_DB).parent / "dispatch_config.json"
+    if not filepath.exists():
+        filepath = Path("dispatch_config.json")
+    return filepath
+
+
+def host_dispatch_config_path() -> Path:
+    """The host's own dispatch config, whose agent isolation a per-run
+    config cannot switch off (see :func:`load_dispatch_config`)."""
+    return default_dispatch_config_path()
+
+
 def load_dispatch_config(filepath: str | Path | None) -> dict:
     """Load dispatch_config.json preferences.
 
     Returns a config dict with defaults for any missing keys.
     Falls back to defaults entirely if file not found.
+
+    A per-run ``filepath`` (``--dispatch-config``) is merged over the
+    defaults, not over the host's config, except for agent isolation: when
+    the host config (:func:`host_dispatch_config_path`) has it on, it stays
+    on, with the host's ``agent_isolation`` section unless the per-run file
+    has its own. A per-run config may turn isolation on, never off, and a
+    missing per-run file does not turn it off either (review F1).
     """
+    if filepath is None:
+        return _read_dispatch_config(default_dispatch_config_path())
+    filepath = Path(filepath)
+    config = _read_dispatch_config(filepath, per_run=True)
+    _carry_host_isolation(config, filepath)
+    return config
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return first.resolve() == second.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: a link loop
+        return False
+
+
+def _carry_host_isolation(config: dict, per_run_path: Path) -> None:
+    """Keep the host config's agent isolation in a per-run config."""
+    host_path = host_dispatch_config_path()
+    if _same_file(host_path, per_run_path) or not host_path.exists():
+        return
+    host = _read_dispatch_config(host_path)
+    if not is_feature_enabled(host, AGENT_ISOLATION_KEY):
+        return
+    features = config.get("features")
+    # Features that are not an object already read every fail-closed flag
+    # as ON; replacing them would switch the other gates off.
+    if isinstance(features, dict):
+        if not is_feature_enabled(config, AGENT_ISOLATION_KEY):
+            logger.warning(
+                "dispatch config '%s' turns %s off, but the host config '%s' "
+                "has it on; a per-run config cannot turn agent isolation off",
+                per_run_path, AGENT_ISOLATION_KEY, host_path,
+            )
+        # A new dict: config["features"] may be the shared default flags.
+        config["features"] = {**features, AGENT_ISOLATION_KEY: True}
+    if AGENT_ISOLATION_KEY not in config and AGENT_ISOLATION_KEY in host:
+        config[AGENT_ISOLATION_KEY] = json.loads(
+            json.dumps(host[AGENT_ISOLATION_KEY]))
+
+
+def _read_dispatch_config(filepath: Path, *, per_run: bool = False) -> dict:
+    """``filepath`` merged over the defaults (see load_dispatch_config)."""
     config = dict(DEFAULT_DISPATCH_CONFIG)
 
-    if filepath is None:
-        # Default location: alongside the TheForge DB (where the orchestrator
-        # script lives). Fall back to CWD-relative if that does not exist.
-        filepath = Path(THEFORGE_DB).parent / "dispatch_config.json"
-        if not filepath.exists():
-            filepath = Path("dispatch_config.json")
-    else:
-        filepath = Path(filepath)
-
     if not filepath.exists():
+        if per_run:
+            logger.error("Dispatch config '%s' does not exist; using defaults",
+                         filepath)
+            print(f"WARNING: dispatch config '{filepath}' does not exist; "
+                  f"using defaults.")
         return config
 
     try:

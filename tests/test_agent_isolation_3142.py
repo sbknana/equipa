@@ -11,6 +11,8 @@ SECURITY-REVIEW-3140 (R3140-01). Each test fails on main before the fix:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -18,11 +20,13 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from equipa import agent_launcher, isolation
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 _GIT = shutil.which("git") or "/usr/bin/git"
 
 
@@ -320,3 +324,250 @@ def test_import_accepts_an_unchanged_tip(repo: dict[str, Path],
                                          tmp_path: Path) -> None:
     base = _git("rev-parse", "forge-task-1", cwd=repo["main"])
     assert _import(*_export_clone(repo, tmp_path, lambda clone: None)) == base
+
+
+# --- F1: isolation is sticky once the operator enables it -------------------------------
+
+
+@pytest.fixture
+def host(tmp_path: Path, monkeypatch) -> SimpleNamespace:
+    """The host-level state: the operator's marker (absent until a test
+    creates it) and the host dispatch config (absent until written)."""
+    from equipa import config
+
+    state = SimpleNamespace(marker=tmp_path / "etc" / "require-agent-isolation",
+                            config=tmp_path / "host" / "dispatch_config.json")
+    state.marker.parent.mkdir()
+    state.config.parent.mkdir()
+    monkeypatch.setattr(isolation, "REQUIRED_MARKER", state.marker,
+                        raising=False)
+    monkeypatch.setattr(config, "host_dispatch_config_path",
+                        lambda: state.config, raising=False)
+    # Nothing may fall back to a dispatch config the test runner happens
+    # to have in its working directory.
+    monkeypatch.chdir(tmp_path)
+    return state
+
+
+_SECTION = {"exchange_dir": "/var/lib/equipa-agent/exchange",
+            "agent_user": "equipa-agent"}
+
+
+def _write_json(path: Path, data) -> Path:
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_marker_turns_isolation_on_whatever_the_config_says(host) -> None:
+    off = {"features": {"agent_isolation": False}}
+    assert isolation.isolation_enabled(off) is False
+    host.marker.write_text("")
+    assert isolation.isolation_enabled(off) is True
+    assert isolation.isolation_enabled({}) is True
+    assert isolation.unisolated_spawn_refusal("RLM") is not None
+    assert isolation.worktree_execution_refusal("npm install") is not None
+
+
+def test_a_marker_that_cannot_be_checked_counts_as_present(
+        host, tmp_path: Path, monkeypatch) -> None:
+    closed = tmp_path / "closed"
+    closed.mkdir(mode=0o000)
+    try:
+        monkeypatch.setattr(isolation, "REQUIRED_MARKER", closed / "marker",
+                            raising=False)
+        if os.access(closed, os.X_OK):  # root ignores the mode
+            pytest.fail("cannot build an unsearchable directory as this user")
+        assert isolation.isolation_required() is True
+    finally:
+        closed.chmod(0o700)
+
+
+@pytest.mark.parametrize("config", [
+    {},
+    {"features": {}},
+    {"features": {"agent_isolation": False}},
+    {"features": {"agent_isolation": "false"}, "agent_isolation": _SECTION},
+])
+def test_required_isolation_refuses_a_config_that_turns_it_off(
+        host, config) -> None:
+    assert isolation.isolation_requirement_refusal(config) is None
+    host.marker.write_text("")
+    refusal = isolation.isolation_requirement_refusal(config)
+    assert refusal is not None
+    assert "required on this host" in refusal
+    assert str(host.marker) in refusal
+
+
+def test_required_isolation_accepts_a_config_that_turns_it_on(host) -> None:
+    host.marker.write_text("")
+    config = {"features": {"agent_isolation": True}, "agent_isolation": _SECTION}
+    assert isolation.isolation_requirement_refusal(config) is None
+    # An unreadable config reads the flag ON (fail-closed); its missing
+    # settings refuse the spawn instead.
+    assert isolation.isolation_requirement_refusal(
+        {"_config_load_error": "x: truncated"}) is None
+
+
+def test_spawn_refuses_when_required_and_the_config_turns_it_off(
+        host, monkeypatch) -> None:
+    host.marker.write_text("")
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    with pytest.raises(isolation.AgentIsolationError,
+                       match="required on this host"):
+        asyncio.run(isolation.spawn_isolated_agent(
+            ["claude"], None, {},
+            {"features": {"agent_isolation": False},
+             "agent_isolation": _SECTION}))
+
+
+def test_agent_runner_never_spawns_unisolated_while_required(
+        host, monkeypatch, tmp_path: Path) -> None:
+    """The real spawn path: with the marker and a config that turns the
+    flag off, the dispatch is refused and no process is started."""
+    from equipa import agent_runner
+    from equipa import config as equipa_config
+
+    host.marker.write_text("")
+    equipa_config.set_active_dispatch_config(
+        {"features": {"agent_isolation": False}})
+    started: list = []
+
+    async def no_exec(*args, **kwargs):
+        started.append(args)
+        raise AssertionError("an agent process was started")
+
+    monkeypatch.setattr(agent_runner.asyncio, "create_subprocess_exec", no_exec)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    try:
+        with pytest.raises(agent_runner.AgentDispatchRefused,
+                           match="required on this host"):
+            asyncio.run(agent_runner._spawn_agent_process(
+                ["claude", "-p", "x"], str(tmp_path)))
+    finally:
+        equipa_config.set_active_dispatch_config(None)
+    assert started == []
+
+
+def test_per_run_config_without_the_key_keeps_host_isolation(
+        host, tmp_path: Path) -> None:
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    per_run = _write_json(tmp_path / "retry.json", {"max_retries": 2})
+    config = load_dispatch_config(per_run)
+    assert config["max_retries"] == 2
+    assert is_feature_enabled(config, "agent_isolation") is True
+    assert config["agent_isolation"] == _SECTION
+    # Other flags are still the per-run file's (here: the defaults).
+    assert is_feature_enabled(config, "hooks") is False
+
+
+def test_per_run_config_cannot_turn_host_isolation_off(
+        host, tmp_path: Path, caplog) -> None:
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    per_run = _write_json(tmp_path / "off.json",
+                          {"features": {"agent_isolation": False,
+                                        "hooks": True}})
+    with caplog.at_level("WARNING", logger="equipa.config"):
+        config = load_dispatch_config(per_run)
+    assert is_feature_enabled(config, "agent_isolation") is True
+    assert is_feature_enabled(config, "hooks") is True
+    assert "cannot turn agent isolation off" in caplog.text
+
+
+def test_a_missing_per_run_config_does_not_turn_isolation_off(
+        host, tmp_path: Path, capsys) -> None:
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    config = load_dispatch_config(tmp_path / "mistyped.json")
+    assert is_feature_enabled(config, "agent_isolation") is True
+    assert config["agent_isolation"] == _SECTION
+    assert "does not exist" in capsys.readouterr().out
+
+
+def test_per_run_config_keeps_its_own_isolation_section(
+        host, tmp_path: Path) -> None:
+    from equipa.config import load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    own = {**_SECTION, "pids_max": 256}
+    per_run = _write_json(tmp_path / "own.json", {"agent_isolation": own})
+    assert load_dispatch_config(per_run)["agent_isolation"] == own
+
+
+def test_per_run_config_may_turn_isolation_on(host, tmp_path: Path) -> None:
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": False}})
+    per_run = _write_json(tmp_path / "on.json",
+                          {"features": {"agent_isolation": True}})
+    assert is_feature_enabled(load_dispatch_config(per_run),
+                              "agent_isolation") is True
+    plain = _write_json(tmp_path / "plain.json", {"max_retries": 2})
+    assert is_feature_enabled(load_dispatch_config(plain),
+                              "agent_isolation") is False
+
+
+def test_an_unreadable_host_config_keeps_isolation_on(
+        host, tmp_path: Path) -> None:
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    host.config.write_text('{"features": {"agent_isolation": tr',
+                           encoding="utf-8")
+    per_run = _write_json(tmp_path / "retry.json", {"max_retries": 2})
+    assert is_feature_enabled(load_dispatch_config(per_run),
+                              "agent_isolation") is True
+
+
+def test_carrying_isolation_keeps_other_gates_fail_closed(
+        host, tmp_path: Path) -> None:
+    """A per-run ``features`` that is not an object reads every fail-closed
+    gate as ON; carrying isolation must not replace it with a dict that
+    turns the others off."""
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    per_run = _write_json(tmp_path / "odd.json", {"features": ["hooks"]})
+    config = load_dispatch_config(per_run)
+    assert is_feature_enabled(config, "bash_security_pretooluse") is True
+    assert is_feature_enabled(config, "agent_isolation") is True
+
+
+def test_carry_does_not_touch_the_shared_default_flags(
+        host, tmp_path: Path) -> None:
+    from equipa.config import DEFAULT_DISPATCH_CONFIG, load_dispatch_config
+
+    _write_json(host.config, {"features": {"agent_isolation": True},
+                              "agent_isolation": _SECTION})
+    load_dispatch_config(_write_json(tmp_path / "x.json", {"max_retries": 1}))
+    assert DEFAULT_DISPATCH_CONFIG["features"]["agent_isolation"] is False
+
+
+def test_startup_line_names_the_isolation_state(host) -> None:
+    assert isolation.describe_isolation_state({}) == "agent_isolation: OFF"
+    assert isolation.describe_isolation_state(
+        {"features": {"agent_isolation": True}}) == "agent_isolation: ON"
+    host.marker.write_text("")
+    assert isolation.describe_isolation_state({}).startswith(
+        "agent_isolation: ON (required by ")
+
+
+def test_cli_refuses_before_any_mode_runs() -> None:
+    """async_main checks the requirement right after loading the config and
+    before it selects a mode handler."""
+    source = (REPO_ROOT / "equipa" / "cli.py").read_text(encoding="utf-8")
+    body = source[source.index("async def async_main"):]
+    body = body[:body.index("\ndef ")]
+    loaded = body.index("args.dispatch_config = load_dispatch_config(")
+    checked = body.index("isolation_requirement_refusal(args.dispatch_config)")
+    refused = body.index("refuse_dispatch(isolation_refusal)")
+    handler = body.index("_select_mode_handler(args)")
+    assert loaded < checked < refused < handler

@@ -142,6 +142,28 @@ def _restore_db_bindings():
         os.environ["THEFORGE_DB"] = saved_env
 
 
+@pytest.fixture(scope="session")
+def _absent_host_path(tmp_path_factory) -> Path:
+    """A directory that does not exist, for host-state paths in tests."""
+    return tmp_path_factory.mktemp("no-host-isolation") / "absent"
+
+
+@pytest.fixture(autouse=True)
+def _no_host_agent_isolation_state(_absent_host_path, monkeypatch):
+    """Task 3142 (review F1): the host's isolation marker and dispatch
+    config make agent isolation sticky. On a host where the operator has
+    enabled it, every test would otherwise see isolation required; tests
+    of that state set both paths themselves."""
+    from equipa import config as equipa_config
+    from equipa import isolation as equipa_isolation
+
+    absent = _absent_host_path
+    monkeypatch.setattr(equipa_isolation, "REQUIRED_MARKER", absent / "marker")
+    monkeypatch.setattr(equipa_config, "host_dispatch_config_path",
+                        lambda: absent / "dispatch_config.json")
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _isolate_reviewer_run_registry():
     """Task #3041: reviewer-run provenance is process-global; a run recorded

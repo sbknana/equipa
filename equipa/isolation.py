@@ -352,19 +352,78 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
     )
 
 
+# While this file exists, agent isolation is REQUIRED on this host (review
+# F1). The operator creates it as root, outside every repository and every
+# dispatch config, so neither a per-run config, a mistyped config path nor
+# an agent can switch isolation off. Its content is ignored.
+REQUIRED_MARKER = Path("/etc/equipa/require-agent-isolation")
+
+
+def isolation_required() -> bool:
+    """True while the operator's :data:`REQUIRED_MARKER` exists.
+
+    A marker that cannot be checked (a directory the orchestrator may not
+    search) counts as present: the check fails closed.
+    """
+    try:
+        os.lstat(REQUIRED_MARKER)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        logger.error("[Isolation] cannot check %s (%s); agent isolation is "
+                     "treated as required", REQUIRED_MARKER, exc)
+    return True
+
+
 def isolation_enabled(dispatch_config: Mapping[str, Any] | None = None) -> bool:
     """Is ``features.agent_isolation`` on for the active dispatch config?
 
     The flag is fail-closed (config.FAIL_CLOSED_FEATURE_FLAGS): an
     unreadable config or an invalid value turns it ON, and the dispatch is
-    then refused unless isolation is actually configured.
+    then refused unless isolation is actually configured. While the host
+    requires isolation (:func:`isolation_required`) it is on whatever the
+    config says; :func:`isolation_requirement_refusal` then refuses a
+    config that turns it off.
     """
+    if isolation_required():
+        return True
     if dispatch_config is None:
         try:
             dispatch_config = get_active_dispatch_config()
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             dispatch_config = {CONFIG_LOAD_ERROR_KEY: f"{type(exc).__name__}: {exc}"}
     return is_feature_enabled(dispatch_config, FEATURE_FLAG)  # type: ignore[arg-type]
+
+
+def isolation_requirement_refusal(
+        dispatch_config: Mapping[str, Any] | None) -> str | None:
+    """Why a dispatch with ``dispatch_config`` must not run, or None.
+
+    While the host requires isolation, a config whose own
+    ``features.agent_isolation`` is off (left out, false, or a config file
+    that does not exist) is refused with this message rather than run with
+    some other notion of the flag (review F1). A config that could not be
+    read reads the flag as ON (fail-closed), so it is not refused here; its
+    missing settings refuse the spawn instead.
+    """
+    if not isolation_required():
+        return None
+    if isinstance(dispatch_config, Mapping) and is_feature_enabled(
+            dict(dispatch_config), FEATURE_FLAG):
+        return None
+    return (f"agent isolation is required on this host ({REQUIRED_MARKER} "
+            f"exists) but the dispatch config turns features.{FEATURE_FLAG} "
+            f"off; set it to true with its {CONFIG_KEY} section, or remove "
+            f"the marker as root (docs/AGENT_ISOLATION.md)")
+
+
+def describe_isolation_state(dispatch_config: Mapping[str, Any] | None) -> str:
+    """One line for the orchestrator's startup log (review F1)."""
+    if isolation_required():
+        return f"agent_isolation: ON (required by {REQUIRED_MARKER})"
+    if isolation_enabled(dispatch_config):
+        return "agent_isolation: ON"
+    return "agent_isolation: OFF"
 
 
 def unisolated_spawn_refusal(
@@ -2079,6 +2138,9 @@ async def spawn_isolated_agent(
         raise AgentIsolationError("agent_isolation is Linux-only")
     if dispatch_config is None:
         dispatch_config = get_active_dispatch_config()
+    refusal = isolation_requirement_refusal(dispatch_config)
+    if refusal is not None:
+        raise AgentIsolationError(refusal)
     settings = load_isolation_settings(dispatch_config)
     identity = resolve_agent_identity(settings)
     check_host(settings, identity)
