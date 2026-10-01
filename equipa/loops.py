@@ -2699,8 +2699,11 @@ class _ReferenceTable(dict):
 
     def __missing__(self, reference: str) -> str:
         value = self._decode(reference)
-        if (len(reference) <= _CACHED_REFERENCE_LENGTH
-                and len(self) < _REFERENCE_TABLE_LIMIT):
+        if len(reference) <= _CACHED_REFERENCE_LENGTH:
+            # Task 3157 (R3154-05): a full table starts over, so one review
+            # cannot leave it full of its own references for every later one.
+            if len(self) >= _REFERENCE_TABLE_LIMIT:
+                self.clear()
             self[reference] = value
         return value
 
@@ -2836,9 +2839,9 @@ _BACKSTOP_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
 # mathematical letters are ASCII by now), so any other neighbour is drawn
 # as something else: U+01C3 is drawn as "!", U+02BC as an apostrophe,
 # U+0640 as a stroke, so "<U+02BC>HIGH<U+02BC>" shows a quoted HIGH.
-_BACKSTOP_TOKEN_RE = re.compile(
-    r"(?:CR[Il1|]T[Il1|]CAL|H[Il1|]GH|MED[Il1|]UM)(?![A-Za-z0-9])",
-)
+# Task 3157 (R3154-03): a lookalike letter is a FOLD mark in these views too
+# (see _BACKSTOP_VIEW_FOLDS), read as its letter inside a severity word only;
+# _BACKSTOP_TOKEN_RE is defined with the marks below.
 _BACKSTOP_ASCII_ALNUM = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 _BACKSTOP_SEVERITY_BY_INITIAL = {"C": "CRITICAL", "H": "HIGH", "M": "MEDIUM"}
@@ -2890,6 +2893,28 @@ _BACKSTOP_SEPARATED_TOKEN_RE = re.compile(
     "(?:" + "|".join(_backstop_separated_word(word)
                      for word in ("CRITICAL", "HIGH", "MEDIUM"))
     + ")(?![A-Za-z0-9])",
+)
+
+
+def _backstop_marked_word(word: str, between: str = "") -> str:
+    """``word`` with FOLD and NEW_FOLD marks for its letters (l, 1 and | are
+    read as I), ``between`` (a pattern) between the letters."""
+    return between.join(
+        _backstop_separated_letter("Il1|" if letter == "I" else letter)
+        for letter in word)
+
+
+# The FOLD and NEW_FOLD marks of the ASCII letters, as a character class
+# body. In the views other than the separated reading such a mark is a
+# lookalike letter, so it glues a severity word next to it as the letter
+# did (task 3157).
+_BACKSTOP_FOLD_MARK_CLASS = "".join(
+    f"{chr(base + ord('A'))}-{chr(base + ord('z'))}"
+    for base in (_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK))
+_BACKSTOP_TOKEN_RE = re.compile(
+    "(?:" + "|".join(_backstop_marked_word(word)
+                     for word in ("CRITICAL", "HIGH", "MEDIUM"))
+    + ")(?![A-Za-z0-9" + _BACKSTOP_FOLD_MARK_CLASS + "])",
 )
 # HTML5 character references, with or without the semicolon. html.unescape
 # decides what each means (legacy names such as "&amp" need no semicolon) and
@@ -3128,12 +3153,64 @@ _BACKSTOP_LETTER_FOLDS = {
         for letter, code_points in _BACKSTOP_EXTRA_LOOKALIKES.items()
         for code_point in code_points
     },
+    # Task 3157 (I3154-01): the parenthesised capitals U+1F110-U+1F129 too
+    # (NFKC reads them as "(H)").
     **{
         first + offset: chr(ord("A") + offset)
-        for first in (0x1F150, 0x1F170, 0x1F1E6)
+        for first in (0x1F110, 0x1F150, 0x1F170, 0x1F1E6)
         for offset in range(26)
     },
 }
+
+
+def _backstop_view_fold(code_point: int, letter: str) -> str:
+    """What the views other than the separated reading read the lookalike
+    ``code_point`` of ``letter`` as.
+
+    Task 3157 (R3154-03): a lookalike is read as its letter inside a
+    severity word only, never in a negation, count, list or noun next to
+    one. Folding U+2113 (a script small l) to I made "ne<U+2113>ther" the
+    case-insensitive negation "neither", and CJK U+4E05 to T made "no<T>"
+    "not". So a lookalike that NFKC reads as another character is the FOLD
+    mark of its letter, which only the severity-word patterns read as that
+    letter. One NFKC reads as the letter itself (mathematical and fullwidth
+    capitals) is that letter. A small l drawn for I is a mark too: read as
+    "l" it would make "<U+2113>ower than" a negation task 3154 did not take.
+    """
+    read = unicodedata.normalize("NFKC", chr(code_point))
+    if read == letter:
+        return letter
+    if letter.isascii() and letter.isalpha():
+        return chr(_BACKSTOP_FOLD_MARK + ord(letter))
+    return letter
+
+
+# The fold table of the views other than the separated reading: the
+# lookalikes as _backstop_view_fold reads them, and a private-use character
+# the review holds where a mark would be, as _BACKSTOP_FOREIGN_MARK (no mark
+# is ever read from the review itself).
+_BACKSTOP_VIEW_FOLDS = {
+    **dict.fromkeys(range(_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK + 0x100),
+                    _BACKSTOP_FOREIGN_MARK),
+    **{code_point: _backstop_view_fold(code_point, letter)
+       for code_point, letter in _BACKSTOP_LETTER_FOLDS.items()},
+}
+# FOLD and NEW_FOLD marks back to their letters, for the checks that compare
+# a word the parser counted with the backstop's copy of it.
+_BACKSTOP_UNMARK = {
+    base + code_point: chr(code_point)
+    for base in (_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK)
+    for code_point in range(ord("A"), ord("z") + 1) if chr(code_point).isalpha()
+}
+
+
+def _backstop_unmarked(text: str) -> str:
+    """``text`` with each FOLD and NEW_FOLD mark as its letter."""
+    if _BACKSTOP_MARK_RE.search(text) is None:
+        return text
+    return text.translate(_BACKSTOP_UNMARK)
+
+
 # Marks draw on the letter before them; format, control and unassigned
 # characters (zero-width joiners, soft hyphens, U+1D173-1D17A, U+1BCA0-1BCA3)
 # and the Hangul fillers render as nothing. All of them join the word.
@@ -3142,13 +3219,29 @@ _BACKSTOP_DELETED_FILLERS = frozenset((0x115F, 0x1160, 0x3164, 0xFFA0))
 _BACKSTOP_TABLE_LIMIT = 65536
 
 
-class _BackstopCharacterTable(dict):
+class _BoundedTable(dict):
+    """A lookup table filled per key seen, holding at most
+    ``_BACKSTOP_TABLE_LIMIT`` entries.
+
+    Task 3157 (R3154-05): a full table starts over. It used to stop caching,
+    so one review of 61,000 distinct code points left the process-wide table
+    full and every later review recomputed each character it held (a 200 KB
+    review then took 0.57 s instead of 0.34 s). Starting over bounds memory
+    the same way and lets the next review cache its own characters.
+    """
+
+    def _remember(self, key: object, value: str) -> str:
+        if len(self) >= _BACKSTOP_TABLE_LIMIT:
+            self.clear()
+        self[key] = value
+        return value
+
+
+class _BackstopCharacterTable(_BoundedTable):
     """``str.translate`` table of the backstop, filled per code point seen.
 
-    Deletes the characters that join a word, folds lookalike letters to
-    Latin, keeps line breaks, tabs and everything else. At most
-    ``_BACKSTOP_TABLE_LIMIT`` entries are kept, so a review of many distinct
-    code points cannot grow it without bound.
+    Deletes the characters that join a word, folds lookalike letters as
+    _BACKSTOP_VIEW_FOLDS does, keeps line breaks, tabs and everything else.
     """
 
     def __missing__(self, code_point: int) -> str:
@@ -3156,23 +3249,31 @@ class _BackstopCharacterTable(dict):
         if char in "\n\t":
             value = char
         elif code_point in _BACKSTOP_LETTER_FOLDS:
-            value = _BACKSTOP_LETTER_FOLDS[code_point]
+            value = _BACKSTOP_VIEW_FOLDS[code_point]
         elif (code_point in _BACKSTOP_DELETED_FILLERS
               or unicodedata.category(char) in _BACKSTOP_DELETED_CATEGORIES):
             value = ""
         else:
             value = char
-        if len(self) < _BACKSTOP_TABLE_LIMIT:
-            self[code_point] = value
-        return value
+        return self._remember(code_point, value)
 
 
 _BACKSTOP_CHARACTERS = _BackstopCharacterTable()
 
 
+# A decoded reference stays on its line, and a reference to a private-use
+# character where a mark would be is _BACKSTOP_FOREIGN_MARK (task 3157: the
+# views read FOLD marks as letters).
+_BACKSTOP_REFERENCE_TRANSLATION = {
+    **_BACKSTOP_LINE_BREAKS,
+    **dict.fromkeys(range(_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK + 0x100),
+                    _BACKSTOP_FOREIGN_MARK),
+}
+
+
 def _backstop_reference_text(reference: str) -> str:
     """``reference`` as a browser shows it, on the same line."""
-    return html.unescape(reference).translate(_BACKSTOP_LINE_BREAKS)
+    return html.unescape(reference).translate(_BACKSTOP_REFERENCE_TRANSLATION)
 
 
 _BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
@@ -3286,24 +3387,34 @@ def _backstop_separator_mark(code_point: int) -> str:
         part in _BACKSTOP_ASCII_ALNUM or ord(part) in _BACKSTOP_LETTER_FOLDS
         for part in decomposed)
     # A cased letter ("E" with an accent, fullwidth and mathematical letters)
-    # is read as the other views read it. Any other character that they read
-    # as an ASCII letter or digit is no letter of the word: a number form, a
-    # modifier letter, an ordinal indicator, or a letter of another script
-    # that decomposes to a lookalike (U+FB35, a Hebrew VAV with a dot).
+    # is read as the other views read it.
     if category in ("Lu", "Ll", "Lt") or not folds_to_a_word_letter:
         return char
+    # Task 3157 (R3154-01): any other character drawn as one ASCII letter
+    # (NFKD gives that letter alone) is that letter: the circled capitals
+    # U+24B6-U+24CF, the squared capitals U+1F130-U+1F149 and the modifier
+    # capitals U+1D2C-U+1D3E. As GLUE they were no letter of a word, so
+    # "Rated<U+3164>" + circled HIGH read no word in any view. Like any
+    # lookalike mark, the letter also separates a word next to it.
+    letters = [part for part in decomposed
+               if ord(part) not in _BACKSTOP_DELETED_FILLERS
+               and unicodedata.category(part) not in _BACKSTOP_DELETED_CATEGORIES]
+    if (len(letters) == 1 and letters[0].isascii()
+            and letters[0].isalpha()):
+        return chr(_BACKSTOP_FOLD_MARK + ord(letters[0]))
+    # Any other character the other views read as an ASCII letter or digit
+    # is no letter of the word: a number form (digits, fractions, Roman
+    # numerals of more than one letter), or a letter of another script that
+    # decomposes to a lookalike (U+FB35, a Hebrew VAV with a dot).
     return _BACKSTOP_GLUE_MARK
 
 
-class _BackstopSeparatorTable(dict):
+class _BackstopSeparatorTable(_BoundedTable):
     """``str.translate`` table of the separated reading, filled per code
-    point seen (at most ``_BACKSTOP_TABLE_LIMIT`` entries)."""
+    point seen."""
 
     def __missing__(self, code_point: int) -> str:
-        value = _backstop_separator_mark(code_point)
-        if len(self) < _BACKSTOP_TABLE_LIMIT:
-            self[code_point] = value
-        return value
+        return self._remember(code_point, _backstop_separator_mark(code_point))
 
 
 _BACKSTOP_SEPARATORS = _BackstopSeparatorTable()
@@ -3508,11 +3619,8 @@ _BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
 # letters also merged a word into its neighbour: "a_*HIGH" became "aHIGH",
 # no token, where a renderer shows "a_*" and a standalone HIGH.
 _BACKSTOP_SPLIT_WORD_RE = re.compile("|".join(
-    r"[*_~`\\]*+".join(letters) for letters in (
-        ("C", "R", "[Il1|]", "T", "[Il1|]", "C", "A", "L"),
-        ("H", "[Il1|]", "G", "H"),
-        ("M", "E", "D", "[Il1|]", "U", "M"),
-    )
+    _backstop_marked_word(word, r"[*_~`\\]*+")
+    for word in ("CRITICAL", "HIGH", "MEDIUM")
 ))
 _BACKSTOP_WORD_MARKS = str.maketrans("", "", "*_~`\\")
 
@@ -3612,10 +3720,11 @@ _LINK_DEFINITION_RE = re.compile(
     re.MULTILINE,
 )
 # Link markup a removal can join a word across: a letter or digit (or the
-# "|" drawn as I) right before "[" or "![", or right after "]" or ")",
-# emphasis marks and further brackets between.
+# "|" drawn as I, or a lookalike's FOLD mark) right before "[" or "![", or
+# right after "]" or ")", emphasis marks and further brackets between.
 _BACKSTOP_LINK_JOIN_RE = re.compile(
-    r"(?:[^\W_]|\|)[*_~`\\]*+!?\[|[\])][*_~`\\!\[]*+(?:[^\W_]|\|)",
+    r"(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])[*_~`\\]*+!?\["
+    r"|[\])][*_~`\\!\[]*+(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])",
 )
 
 
@@ -3913,7 +4022,11 @@ def _backstop_tokens(
                 else _BACKSTOP_TOKEN_RE)
     for match in token_re.finditer(view):
         start, end = match.span()
-        if start and view[start - 1] in _BACKSTOP_ASCII_ALNUM:
+        # A lookalike's FOLD mark before the word glues it as the letter
+        # did; in the separated reading a mark separates (task 3157).
+        if start and (view[start - 1] in _BACKSTOP_ASCII_ALNUM
+                      or (not separated
+                          and _backstop_is_fold_mark(view[start - 1]))):
             continue
         if separated and not _backstop_separated_counts(match.group(0), view,
                                                         start, end):
@@ -3983,6 +4096,8 @@ def _folded_heading_lines(
         return set()
     extra: set[tuple[int, str]] = set()
     newlines: list[int] | None = None
+    # A heading label spelled with lookalikes holds their FOLD marks here.
+    text = _backstop_unmarked(text)
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         severity = match.group(1)
         if room.get(severity, 0) <= 0:
@@ -4111,7 +4226,8 @@ def _lowered_at(text: str, labels: list[tuple[int, str]]) -> str:
     copied = 0
     for offset, severity in sorted(set(labels)):
         end = offset + len(severity)
-        if offset < copied or text[offset:end] != severity:
+        # The backstop's copy may spell a counted label with FOLD marks.
+        if offset < copied or _backstop_unmarked(text[offset:end]) != severity:
             continue
         pieces.append(text[copied:offset])
         pieces.append(severity.lower())
@@ -4419,11 +4535,13 @@ def _analyze_review_file(
     # Task 3143: NFKC turns some lookalikes into a letter of another shape
     # (GREEK CAPITAL LUNATE SIGMA SYMBOL, drawn as a C, becomes a Sigma), so
     # the backstop reads a copy whose lookalikes were folded BEFORE NFKC.
-    # Each fold is one letter for one letter, so no line moves.
+    # Each fold is one letter for one letter, so no line moves. Task 3157
+    # (R3154-03): a lookalike NFKC does not read as its letter becomes a
+    # FOLD mark, a letter to the severity words only (_BACKSTOP_VIEW_FOLDS).
     folded_first = None
     if not text.isascii():
         folded_first = normalize_review_text(
-            _translate_non_ascii(text, _BACKSTOP_LETTER_FOLDS),
+            _translate_non_ascii(text, _BACKSTOP_VIEW_FOLDS),
         )
     # Task 3154 (I3152-01, I3152-02): whether a word stands alone is also
     # decided on the text as written, before any character is deleted or
