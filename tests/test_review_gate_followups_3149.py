@@ -197,9 +197,24 @@ def test_r3143_02_exemptions_never_excuse_a_label(body):
     assert_gate_blocks(body)
 
 
-# Tallies and negations a reviewer writes, which still merge (none of these
-# leaves an unaccounted token, MEDIUM included).
+# Tallies and negations of MEDIUM a reviewer writes, which still merge (none
+# of these leaves an unaccounted token).
 R3143_02_MERGES = [
+    ["Rated LOW, not MEDIUM, as it needs a local account."],
+    ["Kept at LOW rather than MEDIUM."],
+]
+
+
+@pytest.mark.parametrize("body", R3143_02_MERGES)
+def test_r3143_02_plain_tallies_and_negations_still_merge(body):
+    analysis = analyze(one_low_review(body))
+    assert analysis.trusted and analysis.detail == "", (body, analysis)
+
+
+# Task 3152: these merged under the 3143/3149 exemptions. CRITICAL and HIGH
+# now have no exemption at all, so every one blocks with the new reason; the
+# same prose in lower case (what the prompt asks for) merges.
+R3143_02_CRITICAL_HIGH_PROSE = [
     ["Totals: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 1 LOW / 0 INFO."],
     ["semgrep: CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 across the diff."],
     ["| Severity | Count |", "|---|---|", "| HIGH | 0 |", "| CRITICAL | 0 |"],
@@ -207,8 +222,6 @@ R3143_02_MERGES = [
     ["There are no CRITICAL, HIGH or MEDIUM issues."],
     ["There are no CRITICAL, HIGH, or MEDIUM findings."],
     ["None is CRITICAL or HIGH."],
-    ["Rated LOW, not MEDIUM, as it needs a local account."],
-    ["Kept at LOW rather than MEDIUM."],
     ["0 CRITICAL/HIGH results from semgrep."],
     ["HIGH: 0 and CRITICAL: 0 from semgrep."],
     ["| semgrep | HIGH: 0 |"],
@@ -227,18 +240,37 @@ R3143_02_MERGES = [
 ]
 
 
-@pytest.mark.parametrize("body", R3143_02_MERGES)
-def test_r3143_02_plain_tallies_and_negations_still_merge(body):
+def _lower_case_critical_high(body):
+    return [line.replace("CRITICAL", "critical").replace("HIGH", "high")
+            for line in body]
+
+
+@pytest.mark.parametrize("body", R3143_02_CRITICAL_HIGH_PROSE)
+def test_r3143_02_critical_high_tallies_and_negations_block(body):
     analysis = analyze(one_low_review(body))
-    assert analysis.trusted and analysis.detail == "", (body, analysis)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line "), (
+        analysis.detail)
+    assert_gate_blocks(body)
+    lower = analyze(one_low_review(_lower_case_critical_high(body)))
+    assert lower.trusted and not gate_blocks(one_low_review(
+        _lower_case_critical_high(body))), (body, lower)
 
 
-def test_r3143_06_soft_wrapped_negation_merges():
-    """The corpus shape: "No" ends the line, the list opens the next one."""
+def test_r3143_06_soft_wrapped_negation_blocks():
+    """The corpus shape: "No" ends the line, the list opens the next one.
+
+    Task 3152: merged under the 3149 soft-wrap exemption; blocks now. The
+    same sentence with critical/high in lower case merges (its MEDIUM is
+    only counted).
+    """
     body = ["The diff touches only the parser, and the scan found no",
             "CRITICAL/HIGH/MEDIUM issues. Remaining items are LOW/INFO."]
     analysis = analyze(one_low_review(body))
-    assert analysis.trusted and analysis.detail == "", analysis
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    lower = analyze(one_low_review(_lower_case_critical_high(body)))
+    assert lower.trusted, lower
 
 
 @pytest.mark.parametrize("before", [
@@ -309,7 +341,7 @@ def test_r3143_04_old_crash_input_blocks_with_a_logged_verdict(monkeypatch, tmp_
     text = one_low_review(["HIGH &#" + "9" * 5000])
     assert loops._count_findings_in_review_file(
         tmp_path / "SECURITY-REVIEW-8.md", task_id=8, text=text) is None
-    assert any("unaccounted severity token" in message for message in logged)
+    assert any("unaccounted CRITICAL/HIGH token at line" in message for message in logged)
 
 
 # --- R3143-06: MEDIUM-only tokens are counted, never a block ---------------------
@@ -333,7 +365,7 @@ def test_r3143_06_medium_with_high_still_blocks_and_names_both():
     text = one_low_review(["A MEDIUM issue and a HIGH one: SQL injection."])
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + ":")
+    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
     assert "HIGH=1" in analysis.detail and "MEDIUM=1" in analysis.detail
 
 

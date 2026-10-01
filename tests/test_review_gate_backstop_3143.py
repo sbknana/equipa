@@ -7,7 +7,8 @@ each left or opened a shape that renders as a finding and is not counted, so
 the gate now ends with a backstop that models no shape: every standalone
 UPPER-case CRITICAL, HIGH or MEDIUM anywhere in the review (code and quotes
 included) must be a counted finding, or the review blocks with the reason
-"unaccounted severity token" and the line numbers.
+"unaccounted severity token" (task 3152: "unaccounted CRITICAL/HIGH token")
+and the line numbers.
 
 Also covered, each with rows that fail before this task:
 

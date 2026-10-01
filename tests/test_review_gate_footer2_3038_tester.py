@@ -74,7 +74,7 @@ def _assert_only_the_backstop_blocks(path: Path) -> None:
     UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
 
 

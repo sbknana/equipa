@@ -87,7 +87,7 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         analysis = analyze(review("1 finding.", ["## Notes", ""] + body,
                                   ONE_LOW, low_heading=True))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith("unaccounted severity token:"), (
+        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
             body, analysis.detail)
 
 

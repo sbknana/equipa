@@ -83,7 +83,7 @@ def assert_only_the_backstop_blocks(text: str) -> loops.ReviewCountAnalysis:
     severity-token backstop blocked it."""
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
     return analysis
 

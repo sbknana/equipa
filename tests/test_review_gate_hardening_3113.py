@@ -126,7 +126,7 @@ def assert_only_the_backstop_blocks(text: str) -> None:
     analysis = loops._analyze_review_file(
         Path("SECURITY-REVIEW-94300.md"), text=text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted severity token:"), (
+    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
         analysis.detail)
 
 
@@ -427,7 +427,7 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
         # only; the rules still read the padded line as prose.
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-        assert analysis.detail.startswith("unaccounted severity token:")
+        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line ")
         text = lowercase_severity_words(text)
         start = time.perf_counter()
         analysis = loops._analyze_review_file(path, text=text)
