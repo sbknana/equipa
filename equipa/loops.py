@@ -1567,6 +1567,11 @@ class ReviewCountAnalysis:
     handed to the merge gate when ``verdict`` is ``REVIEW_VERDICT_OK``; any
     other verdict makes :func:`_count_findings_in_review_file` return None
     and the fail-closed ``block_on_missing`` gate fires.
+
+    ``heading_offsets`` (task 3149, R3143-01): the character offset and
+    severity of every finding heading the parser counted in the review as
+    written. Blank-line folding keeps offsets, so they index the normalised
+    review. The backstop credits these headings and nothing it re-derives.
     """
 
     verdict: str
@@ -1574,6 +1579,7 @@ class ReviewCountAnalysis:
     footer_counts: dict[str, int] | None = None
     header_counts: dict[str, int] | None = None
     detail: str = ""
+    heading_offsets: tuple[tuple[int, str], ...] = ()
 
     @property
     def trusted(self) -> bool:
@@ -3037,22 +3043,25 @@ def _backstop_tokens(
     return found
 
 
-def _backstop_heading_lines(
-    view: str, origins: list[int] | None,
+def _counted_heading_lines(
+    text: str, heading_offsets: tuple[tuple[int, str], ...],
 ) -> set[tuple[int, str]]:
-    """(line, severity) of the finding headings the parser counts."""
-    headings: set[tuple[int, str]] = set()
-    newlines: list[int] | None = None
-    for match in _REVIEW_FINDING_HEADER_RE.finditer(view):
-        severity = match.group(1)
-        if severity not in _BACKSTOP_SEVERITIES:
-            continue
-        if newlines is None:
-            newlines = [line_break.start()
-                        for line_break in _NEWLINE_RE.finditer(view)]
-        line = bisect.bisect_left(newlines, match.start())
-        headings.add((line if origins is None else origins[line], severity))
-    return headings
+    """(line, severity) of the finding headings the parser counted.
+
+    Task 3149 (R3143-01): ``heading_offsets`` come from the parser itself
+    (:attr:`ReviewCountAnalysis.heading_offsets`), never from a rescan of the
+    backstop's decoded or tag-stripped views. "<p>### [S2] HIGH ...</p>" or
+    "&#35;## [S2] HIGH ..." is not a heading the parser counted, so it
+    credits nothing: not its own line, not a section, not an ID.
+    """
+    if not heading_offsets:
+        return set()
+    newlines = [match.start() for match in _NEWLINE_RE.finditer(text)]
+    return {
+        (bisect.bisect_left(newlines, offset), severity)
+        for offset, severity in heading_offsets
+        if severity in _BACKSTOP_SEVERITIES
+    }
 
 
 def _in_finding_section(
@@ -3139,9 +3148,13 @@ def _backstop_masked(text: str) -> str:
 
 
 def _severity_token_backstop(
-    text: str, analysis: ReviewCountAnalysis,
+    text: str, analysis: ReviewCountAnalysis, *,
+    heading_text: str | None = None,
 ) -> ReviewCountAnalysis:
     """Block a trusted review holding a severity word nothing counted.
+
+    ``heading_text`` is the string ``analysis.heading_offsets`` index (the
+    normalised review; default ``text``). It has the same lines as ``text``.
 
     ``text`` is the normalised review. The whole body is read in two views:
     as written and with HTML comments and tags removed (which can join a
@@ -3172,9 +3185,10 @@ def _severity_token_backstop(
                 tokens[key] = count
     if not tokens:
         return analysis
-    headings: set[tuple[int, str]] = set()
-    for view, origins in views:
-        headings |= _backstop_heading_lines(view, origins)
+    headings = _counted_heading_lines(
+        text if heading_text is None else heading_text,
+        analysis.heading_offsets,
+    )
     # A finding's section runs from its heading to the next heading of
     # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
     # "MEDIUM because ...") is that finding, not another one.
@@ -3236,19 +3250,21 @@ def _stricter_analysis(
     A view that does not trust the review wins, the text as written first
     (its verdict and detail are the ones earlier tasks produced). When both
     trust it, the rendered view is returned with the per-severity maximum of
-    the two views' merge counts.
+    the two views' merge counts. The heading offsets are always the text
+    as written's: the rendered view's offsets index another string.
     """
     if not as_written.trusted:
         return as_written
     if not rendered.trusted:
-        return rendered
+        return replace(rendered, heading_offsets=as_written.heading_offsets)
     written_counts = as_written.counts or {}
     rendered_counts = rendered.counts or {}
-    return replace(rendered, counts={
-        severity: max(written_counts.get(severity, 0),
-                      rendered_counts.get(severity, 0))
-        for severity in _REVIEW_SEVERITIES
-    })
+    return replace(rendered, heading_offsets=as_written.heading_offsets,
+                   counts={
+                       severity: max(written_counts.get(severity, 0),
+                                     rendered_counts.get(severity, 0))
+                       for severity in _REVIEW_SEVERITIES
+                   })
 
 
 def _analyze_review_file(
@@ -3334,7 +3350,7 @@ def _analyze_review_file(
                         f"changed the line count"),
             )
         backstop_text = folded_first
-    return _severity_token_backstop(backstop_text, analysis)
+    return _severity_token_backstop(backstop_text, analysis, heading_text=text)
 
 
 def _analyze_review_views(text: str) -> ReviewCountAnalysis:
@@ -3378,9 +3394,11 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     """
     header_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
     resolved_counts = dict.fromkeys(_REVIEW_SEVERITIES, 0)
+    heading_offsets: list[tuple[int, str]] = []
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         line_end = text.find("\n", match.start())
         header_line = text[match.start():line_end if line_end != -1 else None]
+        heading_offsets.append((match.start(), match.group(1)))
         if _RESOLVED_FINDING_HEADER_RE.search(header_line):
             resolved_counts[match.group(1)] += 1
         else:
@@ -3455,6 +3473,7 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
             footer_counts=footer_counts,
             header_counts=header_counts,
             detail=detail,
+            heading_offsets=tuple(heading_offsets),
         )
 
     headers_total = sum(header_counts.values()) + sum(resolved_counts.values())
