@@ -225,21 +225,23 @@ def test_another_severity_inside_a_counted_section_blocks():
 ONE_HIGH = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 
 
-def assert_medium_counted(text, medium):
-    """Task 3149 (R3143-06): unaccounted MEDIUM tokens alone never untrust a
-    review (MEDIUM never blocks a merge); they are counted and named."""
+def assert_medium_blocks(text, unaccounted):
+    """Task 3152: an unaccounted MEDIUM token blocks, as it did on main.
+
+    Task 3149 (R3143-06) kept such a review trusted and counted the token
+    as an advisory, which let reviews main blocks merge."""
     analysis = analyze(text)
-    assert analysis.trusted, analysis.detail
-    assert analysis.detail.startswith(loops.BACKSTOP_ADVISORY_REASON), (
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         analysis.detail)
-    assert analysis.counts["MEDIUM"] == medium, analysis.counts
-    assert analysis.counts["CRITICAL"] == analysis.counts["HIGH"] == 0
+    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON + ": "), (
+        analysis.detail)
+    assert f"MEDIUM={unaccounted} at line" in analysis.detail, analysis.detail
 
 
 def test_a_severity_word_after_the_section_blocks():
     """The section ends at the next heading; a later token is another one.
 
-    With HIGH the review blocks; with MEDIUM it is counted (task 3149).
+    Both block (task 3152: MEDIUM blocks again, as on main).
     """
     for severity, footer in (("HIGH", ONE_HIGH), ("MEDIUM", ONE_MEDIUM)):
         text = review("1 finding.", [
@@ -252,7 +254,7 @@ def test_a_severity_word_after_the_section_blocks():
         if severity == "HIGH":
             assert blocked_by_backstop(text), analyze(text).detail
         else:
-            assert_medium_counted(text, 2)
+            assert_medium_blocks(text, 1)
 
 
 def test_more_tokens_than_the_footer_counts_blocks():
@@ -265,7 +267,7 @@ def test_more_tokens_than_the_footer_counts_blocks():
         if severity == "HIGH":
             assert blocked_by_backstop(text)
         else:
-            assert_medium_counted(text, 2)
+            assert_medium_blocks(text, 1)
 
 
 def test_footer_covering_heading_less_findings_merges():
@@ -304,8 +306,10 @@ def test_critical_high_tallies_and_negations_block(body):
                               heading=f"### [E1] LOW {E} verbose error"))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
     assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    # MEDIUM is lowered too: "no critical, high or MEDIUM" leaves MEDIUM
+    # outside the negation's list, and main blocks it as well.
     assert_merges([line.replace("CRITICAL", "critical").replace("HIGH", "high")
-                   for line in body])
+                   .replace("MEDIUM", "medium") for line in body])
 
 
 @pytest.mark.parametrize("body", [
@@ -317,19 +321,25 @@ def test_critical_high_tallies_and_negations_block(body):
     ["Overall risk: HIGH."],
 ])
 def test_tallies_beyond_the_counts_block(body):
-    """MEDIUM-only rows are counted instead (task 3149, R3143-06)."""
+    """MEDIUM-only rows block too (task 3152; task 3149 counted them)."""
     if "MEDIUM" in body[0]:
-        assert_medium_counted(zero_review(body), 1)  # one token, counted once
+        assert_medium_blocks(zero_review(body), 1)
     else:
         assert blocked_by_backstop(zero_review(body)), body
 
 
-def test_one_medium_tally_with_one_counted_medium_merges():
-    text = review("1 finding.", [
-        f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
-        "Overall risk: MEDIUM; the one MEDIUM has a one-line fix.",
-    ], ONE_MEDIUM)
-    assert analyze(text).verdict == loops.REVIEW_VERDICT_OK, analyze(text).detail
+def test_one_medium_tally_with_one_counted_medium_blocks():
+    """Task 3152: "the one MEDIUM has a one-line fix" is no tally since task
+    3149 (R3143-02: the words after it are not a safe tail), and the MEDIUM
+    advisory that kept the review trusted is gone, so it blocks. In lower
+    case (reviewer prompt) the review merges with its one counted MEDIUM."""
+    body = [f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
+            "Overall risk: MEDIUM; the one MEDIUM has a one-line fix."]
+    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 1)
+    body[-1] = "Overall risk: MEDIUM; the one medium has a one-line fix."
+    analysis = analyze(review("1 finding.", body, ONE_MEDIUM))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert analysis.counts["MEDIUM"] == 1
 
 
 def test_an_untrusted_review_is_returned_unchanged():
