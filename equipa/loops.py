@@ -2288,24 +2288,15 @@ _HTML_BLOCK_TYPE7_RE = re.compile(
 # Inside an HTML block a browser decodes a numeric character reference
 # without its ";" ("<p>&#72igh: ...</p>" shows "High: ..."), taking every
 # digit that follows. Markdown text needs the ";" (task 3157, R3154-04).
-_UNTERMINATED_NUMERIC_REFERENCE_RE = re.compile(
-    r"&#(?:0*+([0-9]++)|[xX]0*+([0-9A-Fa-f]++))(?!;)",
+# Each is given its ";" by a template (no callback per reference); one with
+# more significant digits than any code point is U+FFFD, as in a browser.
+_OVERLONG_NUMERIC_REFERENCE_RE = re.compile(
+    r"&#(?:0*+[0-9]{8,}+|[xX]0*+[0-9A-Fa-f]{7,}+)(?!;)",
 )
-_MAX_REFERENCE_DECIMAL_DIGITS = 7
-_MAX_REFERENCE_HEX_DIGITS = 6
-
-
-def _terminated_reference(match: re.Match[str]) -> str:
-    """One numeric reference with its ";" (U+FFFD when it names no code
-    point a reference can spell)."""
-    decimal, hexadecimal = match.group(1), match.group(2)
-    if decimal is not None:
-        if len(decimal) > _MAX_REFERENCE_DECIMAL_DIGITS:
-            return "&#65533;"
-        return f"&#{decimal};"
-    if len(hexadecimal) > _MAX_REFERENCE_HEX_DIGITS:
-        return "&#65533;"
-    return f"&#x{hexadecimal};"
+_UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(r"&#0*+([0-9]{1,7}+)(?![0-9;])")
+_UNTERMINATED_HEX_REFERENCE_RE = re.compile(
+    r"&#([xX])0*+([0-9A-Fa-f]{1,6}+)(?![0-9A-Fa-f;])",
+)
 
 
 def _html_block_line(line: str) -> str:
@@ -2314,8 +2305,9 @@ def _html_block_line(line: str) -> str:
     if "`" in line:
         line = _neutralize_backticks(line)
     if "&#" in line:
-        line = _UNTERMINATED_NUMERIC_REFERENCE_RE.sub(_terminated_reference,
-                                                      line)
+        line = _OVERLONG_NUMERIC_REFERENCE_RE.sub("&#65533;", line)
+        line = _UNTERMINATED_DECIMAL_REFERENCE_RE.sub(r"&#\1;", line)
+        line = _UNTERMINATED_HEX_REFERENCE_RE.sub(r"&#\1\2;", line)
     return line
 
 
@@ -3331,7 +3323,7 @@ def _backstop_reference_text(reference: str) -> str:
 _BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
 
 
-def _backstop_decoded_reference(match: re.Match[str]) -> str:
+def _backstop_decoded_spelling(match: re.Match[str]) -> str:
     """One character reference as a browser shows it, on the same line.
 
     A numeric reference is looked up without its leading zeros, so the
@@ -3348,6 +3340,32 @@ def _backstop_decoded_reference(match: re.Match[str]) -> str:
             return "\N{REPLACEMENT CHARACTER}"
         return _BACKSTOP_REFERENCES[f"&#x{hexadecimal};"]
     return _BACKSTOP_REFERENCES[match.group(0)]
+
+
+class _BackstopSpellingTable(_BoundedTable):
+    """Decoded text per reference as written (at most
+    ``_CACHED_REFERENCE_LENGTH`` characters), filled per spelling seen."""
+
+    def __missing__(self, reference: str) -> str:
+        return self._remember(reference, _backstop_decoded_spelling(
+            _BACKSTOP_REFERENCE_RE.fullmatch(reference)))
+
+
+_BACKSTOP_SPELLINGS = _BackstopSpellingTable()
+
+
+def _backstop_decoded_reference(match: re.Match[str]) -> str:
+    """One character reference as a browser shows it, on the same line.
+
+    Task 3157 (timing): every view decodes every reference, so a flood of
+    one ("&#1" 68,000 times in an HTML block) cost a 200 KB review 0.3 s in
+    group lookups and key building alone. A short reference is looked up as
+    written first; only a new spelling is parsed.
+    """
+    reference = match.group(0)
+    if len(reference) <= _CACHED_REFERENCE_LENGTH:
+        return _BACKSTOP_SPELLINGS[reference]
+    return _backstop_decoded_spelling(match)
 
 
 def _backstop_normalized(text: str) -> str:
