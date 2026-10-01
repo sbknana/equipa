@@ -462,6 +462,94 @@ def test_verify_script_runs_each_of_the_four_probes(probe, marker):
     assert "PASS" in text and "FAIL" in text
 
 
+# A stand-in for the real CLI that behaves like it where the review showed
+# the bypasses: it loads <CLAUDE_CONFIG_DIR>/settings.json and lets a user
+# env.SHELL, env.BASH_FUNC_* or PreToolUse hook run planted code, and it
+# sources $HOME/.bashrc for its shell snapshot. Otherwise it "runs" ls and
+# prints the stream-json events the script parses. No network.
+SIMULATED_CLI = r'''#!{python}
+import json, os, re, sys
+config = os.environ.get("CLAUDE_CONFIG_DIR", "")
+settings = {{}}
+try:
+    with open(os.path.join(config, "settings.json"), encoding="utf-8") as fh:
+        settings = json.load(fh)
+except (OSError, ValueError):
+    pass
+env = settings.get("env", {{}})
+bypassed = bool(settings.get("hooks")) or any(
+    name == "SHELL" or name.startswith("BASH_FUNC_") for name in env)
+try:
+    with open(os.path.join(os.environ["HOME"], ".bashrc"), encoding="utf-8") as fh:
+        bypassed = bypassed or bool(re.search(r"^ls\(\)", fh.read(), re.M))
+except OSError:
+    pass
+if bypassed:
+    with open("hk.txt", "w", encoding="utf-8") as fh:
+        fh.write("ran\n")
+events = [
+    {{"type": "assistant", "message": {{"content": [
+        {{"type": "tool_use", "name": "Bash", "input": {{"command": "ls"}}}}]}}}},
+    {{"type": "user", "message": {{"content": [
+        {{"type": "tool_result", "is_error": False, "content": "hk.txt"}}]}}}},
+    {{"type": "result", "is_error": False, "result": "DONE"}},
+]
+for event in events:
+    print(json.dumps(event))
+'''
+
+
+def _run_verify_script_with(cli_source: str, tmp_path: Path,
+                            *args: str) -> subprocess.CompletedProcess:
+    bin_dir = tmp_path / "simbin"
+    bin_dir.mkdir()
+    cli = bin_dir / "claude"
+    cli.write_text(cli_source.format(python=sys.executable), encoding="utf-8")
+    cli.chmod(0o755)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "CLAUDE_CODE_OAUTH_TOKEN": FAKE_TOKEN,
+    }
+    return subprocess.run(["bash", str(VERIFY_SCRIPT), *args],
+                          capture_output=True, text=True, timeout=300,
+                          env=env, cwd=tmp_path)
+
+
+def test_verify_script_passes_the_user_scope_probes_and_reports_bashrc(
+        tmp_path):
+    """With the simulated CLI, S/B/U PASS because EQUIPA hands the CLI an
+    empty config dir; R FAILs (known open until isolation) but does not
+    fail the run. On base, S/B/U FAIL: the CLI got the planted user scope."""
+    result = _run_verify_script_with(SIMULATED_CLI, tmp_path)
+    out = result.stdout
+    assert "[PASS] probe S_user_env_SHELL" in out, out + result.stderr
+    assert "[PASS] probe B_user_env_BASH_FUNC" in out, out
+    assert "[PASS] probe U_user_hook_updatedInput" in out, out
+    assert "[FAIL] probe R_bashrc_function" in out, out
+    assert "known open until agent isolation" in out
+    assert result.returncode == 0, out + result.stderr
+    assert FAKE_TOKEN not in out + result.stderr
+
+
+def test_verify_script_strict_counts_the_bashrc_probe(tmp_path):
+    result = _run_verify_script_with(SIMULATED_CLI, tmp_path, "--strict")
+    assert "[FAIL] probe R_bashrc_function" in result.stdout
+    assert result.returncode == 1
+
+
+def test_verify_script_is_inconclusive_when_the_cli_does_not_run_ls(tmp_path):
+    """A CLI that cannot authenticate must not read as a PASS."""
+    not_logged_in = ('#!{python}\nimport sys\n'
+                     'print("Invalid API key · Please run /login")\n'
+                     'sys.exit(1)\n')
+    result = _run_verify_script_with(not_logged_in, tmp_path)
+    assert "[INCONCLUSIVE] probe S_user_env_SHELL" in result.stdout
+    assert "[PASS]" not in result.stdout
+    assert result.returncode == 3
+
+
 def test_verify_script_uses_a_throwaway_home_and_never_prints_the_token():
     text = VERIFY_SCRIPT.read_text(encoding="utf-8")
     assert "mktemp -d" in text
