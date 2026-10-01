@@ -1821,7 +1821,7 @@ def _shape_candidates(
     receives every (line, severity) pair this scan or the candidate regex saw.
 
     Task 3137 (N3): the line rules scan a copy of ``text`` without the lines
-    that hold no severity word (see _LINE_WITHOUT_SEVERITY_RE); the table
+    that hold no severity word (see _SEVERITY_WORD_LINE_RE); the table
     scan reads every row, since a tally header's counts sit on other rows.
     """
     table_found = _table_candidate_severities(text)
