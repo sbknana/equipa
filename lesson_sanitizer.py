@@ -627,12 +627,16 @@ _RULE_PROCESSING_VERBS = frozenset({
 _RULE_VERB_MODIFIERS = frozenset(
     (_MODAL_LEADS - {"to"})
     | {"has", "have", "had", "do", "does", "did", "just", "also", "already",
-       "recently", "finally", "now", "then", "still", "even", "always",
-       # Sentence adverbs and floating quantifiers without an "-ly" ending
-       # (R3153-01): "We hereby have", "we all got", "they today received".
-       "hereby", "herewith", "today", "tonight", "again", "too", "yet",
-       "once", "soon", "indeed", "anyway", "all", "both", "each"}
+       "recently", "finally", "now", "then", "still", "even", "always"}
 )
+# Sentence adverbs and floating quantifiers without an "-ly" ending
+# (R3153-01): "We hereby have", "we all got", "they today received". Like an
+# "-ly" adverb, each may also be a subject ("Today brings"), see
+# _modifies_rule_verb().
+_RULE_SENTENCE_ADVERBS = frozenset({
+    "hereby", "herewith", "today", "tonight", "again", "too", "yet", "once",
+    "soon", "indeed", "anyway", "all", "both", "each",
+})
 # Words that make a bare imperative a request to the reader: "Please load
 # the new rules:", "Then process these new orders:".
 _RULE_REQUEST_LEADS = _PRESENTING_LEADS | {"kindly"}
@@ -683,8 +687,10 @@ def _split_contractions(words: list[str]) -> list[str]:
 
 
 def _is_open_adverb(word: str) -> bool:
-    """True for an "-ly" word: "really", "officially", "finally"."""
-    return len(word) > 3 and word.endswith("ly") and word.isalpha()
+    """True for an "-ly" word ("really", "officially") or a listed sentence
+    adverb ("hereby", "today", "all")."""
+    return word in _RULE_SENTENCE_ADVERBS or (
+        len(word) > 3 and word.endswith("ly") and word.isalpha())
 
 
 def _is_rule_header_lead(words: list[str]) -> bool:
@@ -740,8 +746,9 @@ def _modifies_rule_verb(before: list[str], verb: str) -> bool:
     """True when the last word of *before* is a modifier of *verb*, not its
     subject.
 
-    An "-ly" word is a modifier when a possible subject precedes it ("we
-    really have", "ruff really ships"). In subject position (first, or
+    An open adverb ("-ly", "hereby", "today", "all") is a modifier when a
+    possible subject precedes it ("we really have", "ruff really ships",
+    "we all got"). In subject position (first, or
     after a request word or determiner) it is a modifier only when the verb
     does not agree with it as a third-person subject ("Officially have new
     rules:"); otherwise it is the subject ("Supply processes", "So Emily
