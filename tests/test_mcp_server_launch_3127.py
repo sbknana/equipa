@@ -194,9 +194,17 @@ def _installed(tmp_path: Path, name: str) -> Path:
     return exe
 
 
+def _list_as_trusted(monkeypatch, *paths: Path) -> None:
+    """List installed fakes as an operator lists ~/.local/bin/uvx: since
+    task 3144 (RR3138-C) a uvx must be the real one or listed."""
+    monkeypatch.setattr(equipa_config, "_active_dispatch_config", {
+        agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: [str(p) for p in paths]})
+
+
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
-def test_absolute_isolated_server_is_accepted(tmp_path, server):
+def test_absolute_isolated_server_is_accepted(tmp_path, server, monkeypatch):
     installed = _installed(tmp_path, "uvx").parent
+    _list_as_trusted(monkeypatch, installed / "uvx")
     server = {**server,
               "command": server["command"].format(installed=installed)}
     config = _write_config(tmp_path, {"srv": {"type": "stdio", **server}})
@@ -209,17 +217,22 @@ def test_remote_server_is_not_checked_as_a_process(tmp_path):
     agent_runner._check_mcp_servers(config)
 
 
-def test_shipped_example_config_passes_the_check(tmp_path):
+def test_shipped_example_config_passes_the_check(tmp_path, monkeypatch):
     """Every server shape the example ships passes, once each placeholder
     command (``/path/to/uvx``) names an installed program: since task 3138
-    (RR-02) a command that does not exist is refused."""
+    (RR-02) a command that does not exist is refused. The installed fake is
+    listed as trusted, as the example comment tells the operator to do for
+    a uvx outside the system directories (task 3144, RR3138-C)."""
     example = json.loads((REPO_ROOT / "mcp_config.example.json").read_text(
         encoding="utf-8"))
+    installed = []
     for server in example["mcpServers"].values():
         command = server.get("command", "")
         if command.startswith("/path/to/"):
             server["command"] = str(_installed(tmp_path,
                                                Path(command).name))
+            installed.append(Path(server["command"]))
+    _list_as_trusted(monkeypatch, *installed)
     config = tmp_path / "mcp_config.example.json"
     config.write_text(json.dumps(example), encoding="utf-8")
     agent_runner._check_mcp_servers(config)

@@ -285,7 +285,10 @@ def test_jwt_pattern_matches_the_old_one_on_random_text():
 # --- The hint skip never hides a match ------------------------------------------
 
 def test_hint_fold_covers_every_letter_ignorecase_matches():
-    """Every character (?i) matches to an ASCII letter folds to that letter."""
+    """Every character (?i) matches to an ASCII letter folds to exactly that
+    letter. Task 3144 (RR3138-D): "letter in fold" held for U+0130, which
+    casefold() turns into "i" plus a combining dot that splits a hint word,
+    so the check now demands the letter alone."""
     any_letter = re.compile("(?i)[a-z]")
     missed = []
     for code in range(sys.maxunicode + 1):
@@ -296,7 +299,7 @@ def test_hint_fold_covers_every_letter_ignorecase_matches():
             continue
         for letter in string.ascii_lowercase:
             if (re.fullmatch("(?i)" + letter, char)
-                    and letter not in redact._fold_for_hints(char)):
+                    and redact._fold_for_hints(char) != letter):
                 missed.append((hex(code), letter))
     assert not missed
 

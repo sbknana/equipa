@@ -88,9 +88,11 @@ def _check(layout: dict[str, Path], server: dict) -> None:
     agent_runner._check_mcp_servers(config, (layout["project"],))
 
 
-def _trust(monkeypatch, *paths: str) -> None:
+def _trust(monkeypatch, *paths: str, urls: list[str] | tuple = ()) -> None:
     monkeypatch.setattr(equipa_config, "_active_dispatch_config", {
-        agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: list(paths)})
+        agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: list(paths),
+        # Since 3144 (RR3138-B) a uvx index URL must be listed.
+        agent_runner.MCP_UVX_TRUSTED_URLS_KEY: list(urls)})
 
 
 # Every reviewer case (SR3134-02, RR-02) and every program the task names.
@@ -272,9 +274,11 @@ ACCEPTED = {
     "uvx -w package": {"command": "{bin}/uvx",
                        "args": ["-w", "httpx==0.27", "srv"]},
     "uvx -i remote index": {"command": "{bin}/uvx", "args": [
-        "-i", "https://pypi.example.invalid/simple", "srv"]},
+        "-i", "https://pypi.example.invalid/simple", "srv"],
+        "trust_urls": ["https://pypi.example.invalid/simple"]},
     "uvx --index named remote": {"command": "{bin}/uvx", "args": [
-        "--index", "internal=https://pypi.example.invalid/simple", "srv"]},
+        "--index", "internal=https://pypi.example.invalid/simple", "srv"],
+        "trust_urls": ["https://pypi.example.invalid/simple"]},
     "uvx --index-url absolute outside projects": {"command": "{bin}/uvx",
                                                   "args": ["--index-url",
                                                            "/opt/wheelhouse",
@@ -299,5 +303,10 @@ def test_allowlisted_shape_is_accepted(layout, server, monkeypatch):
     filled = _fill(server, layout)
     if not os.path.exists(filled["command"]):
         pytest.fail(f"{filled['command']} must exist on the test host")
-    _trust(monkeypatch, *filled.pop("trust", []))
+    trust = filled.pop("trust", [])
+    if os.path.basename(filled["command"]) == "uvx":
+        # The fake uvx is listed as an operator lists ~/.local/bin/uvx:
+        # since task 3144 (RR3138-C) a uvx must be the real one or listed.
+        trust.append(filled["command"])
+    _trust(monkeypatch, *trust, urls=filled.pop("trust_urls", []))
     _check(layout, filled)

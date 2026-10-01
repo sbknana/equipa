@@ -447,6 +447,13 @@ PRETOOLUSE_HOOK_SCRIPT = (
 #   command; LD_* load libraries into every program;
 # * interpreter startup code: NODE_OPTIONS (--require), PYTHON*, PERL5*,
 #   RUBY*, JAVA_TOOL_OPTIONS;
+# * Python startup failures (RR3138-A): a bogus PYTHONHASHSEED, PYTHONMALLOC,
+#   PYTHONPLATLIBDIR, PYTHONIOENCODING, PYTHONUTF8, PYTHONINTMAXSTRDIGITS or
+#   PYTHONTRACEMALLOC makes a Python without -I exit 1 before any code runs.
+#   The gate hook runs with -I, which ignores them; emptying them as well
+#   covers it if -I is ever lost. The CLI has no per-hook env (its command
+#   hook schema is command/args/shell/timeout/...), so this block, which
+#   reaches every hook process, is where they are cleared;
 # * Claude CLI switches: CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE (bare
 #   mode) turn every non-managed hook off, which is the Bash gate;
 #   CLAUDE_CODE_SHELL_PREFIX wraps and CLAUDE_CODE_SHELL replaces the shell
@@ -462,11 +469,31 @@ SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
     "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
     "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
-    "PYTHONINSPECT", "PYTHONUSERBASE", "PERL5OPT", "PERL5LIB", "RUBYOPT",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONHASHSEED", "PYTHONMALLOC",
+    "PYTHONPLATLIBDIR", "PYTHONIOENCODING", "PYTHONUTF8",
+    "PYTHONINTMAXSTRDIGITS", "PYTHONTRACEMALLOC", "PERL5OPT", "PERL5LIB", "RUBYOPT",
     "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
     "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SHELL_PREFIX",
     "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
 )
+
+
+def _hook_interpreter() -> str | None:
+    """Absolute path of the interpreter that runs the Bash gate hook, or None.
+
+    Resolved when the settings file is written (RR3138-A): the orchestrator's
+    own ``sys.executable``, else ``python3`` on the orchestrator's PATH. A
+    bare ``python3`` in the hook command would be looked up on the agent's
+    PATH instead. None when neither is an executable file; the caller then
+    wires no gate, and the reactive check keeps killing on sight.
+    """
+    candidate = sys.executable or shutil.which("python3")
+    if not candidate:
+        return None
+    interpreter = os.path.abspath(candidate)
+    if not (os.path.isfile(interpreter) and os.access(interpreter, os.X_OK)):
+        return None
+    return interpreter
 
 
 def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
@@ -487,12 +514,30 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     ``env`` block empties SETTINGS_ENV_NEUTRALISED, including the two
     variables that turn hooks off.
 
+    The hook runs as ``<python> -I <hook>`` (RR3138-A). Without ``-I`` the
+    interpreter reads PYTHON* variables (``PYTHONHASHSEED=bogus`` or
+    ``PYTHONMALLOC=bogus`` from user-scope settings make it exit 1 at
+    startup) and the user site directory (a ``.pth`` file in the agent HOME
+    that calls ``os._exit(0)``). The CLI treats exit 1 as a non-blocking
+    error and exit 0 as allow, so either one ran the blocked command.
+    Isolated mode ignores both; the hook needs only the standard library.
+
     Args:
         hook_script: Absolute path to ``pretooluse_bash_gate.py``.
-        python_bin: Interpreter used to run the hook (normally the same
-            interpreter running the orchestrator, ``sys.executable``).
+        python_bin: Absolute path of the interpreter that runs the hook
+            (``_hook_interpreter()``, resolved when the settings file is
+            written).
+
+    Raises:
+        ValueError: ``python_bin`` or ``hook_script`` is not absolute; the
+            CLI would look a bare name up on the agent's PATH.
     """
-    command = f"{shlex.quote(str(python_bin))} {shlex.quote(str(hook_script))}"
+    if not os.path.isabs(str(python_bin)) or not os.path.isabs(str(hook_script)):
+        raise ValueError(
+            f"the gate hook needs an absolute interpreter and script, got "
+            f"{python_bin!r} and {str(hook_script)!r}")
+    command = (f"{shlex.quote(str(python_bin))} -I "
+               f"{shlex.quote(str(hook_script))}")
     return {
         "disableAllHooks": False,
         "env": {name: "" for name in SETTINGS_ENV_NEUTRALISED},
@@ -528,6 +573,9 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
     whole run). Anything unexpected returns None, and the reactive check then
     keeps the old kill-on-flag behaviour: fail closed.
     """
+    interpreter = _hook_interpreter()
+    if interpreter is None:
+        return None
     try:
         path = cmd[cmd.index("--settings") + 1]
         with open(path, encoding="utf-8") as fh:
@@ -538,7 +586,7 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
             for hook in entry.get("hooks", []):
                 command = hook.get("command", "")
                 expected = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3",
+                    PRETOOLUSE_HOOK_SCRIPT, interpreter,
                 )["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
                 if command == expected:
                     return command
@@ -682,20 +730,26 @@ def _check_mcp_servers(
     loads code from its cwd runs agent-planted code holding the server's
     credentials, such as the EQUIPA_MCP_TOKEN (P2A-02). A denylist of such
     launchers kept missing some (``timeout python3 -m``, ``uv run``, ``node
-    -r``; IR-03), so only these shapes are accepted (see _check_mcp_launch):
+    -r``; IR-03), so this is an allowlist: only these shapes are accepted
+    (see _check_mcp_launch), and the command must exist:
 
     * an absolute python with ``-I`` running an absolute script, or ``-I
       -m`` with an absolute cwd outside every project directory;
     * an absolute node running an absolute script, with no preload, loader
       or eval option;
-    * any other absolute executable file that is not a wrapper, shell,
-      language runtime or package runner.
+    * an absolute uvx running a package, with its own options read from
+      uvx's option table (RR3138-B);
+    * an executable whose absolute path the operator listed under
+      ``mcp_trusted_executables`` (RR-02). Anything else is refused, and a
+      wrapper, shell or loader is refused even when listed.
 
-    Nothing may live inside a project directory (``project_dirs`` plus every
+    The python, node and uvx commands must be the real program, not a
+    renamed copy of another one (RR3138-C, _is_real_interpreter). Nothing
+    may live inside a project directory (``project_dirs`` plus every
     configured PROJECT_DIRS entry), and the server env may not set a
-    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, ...). Fail
-    closed rather than guess. A missing config is left to the CLI, which
-    reports it itself.
+    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, UV_*, ...).
+    Fail closed rather than guess. A missing config is left to the CLI,
+    which reports it itself.
 
     Raises:
         AgentDispatchRefused: a server off the allowlist, or an unreadable
@@ -839,7 +893,10 @@ _MCP_REFUSED_ENV = frozenset({
     "PERL5LIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
     "JDK_JAVA_OPTIONS",
 })
-_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_")
+# UV_*: uvx reads its options from the environment too (UV_FIND_LINKS,
+# UV_PYTHON, UV_INDEX_URL, UV_CONFIG_FILE ...), past the option check
+# (RR3138-B).
+_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_", "UV_")
 # Python options accepted before the script or -m. -I is also required.
 # -W takes a value; -c, -m and -X are handled or refused separately.
 _PYTHON_ALLOWED_FLAGS = frozenset("IBbdEOPqRsSuvW")
@@ -924,6 +981,64 @@ def _launcher_kind(command: str) -> str:
     if "uvx" in stems:
         return "uvx"
     return "executable"
+
+
+# Where a python, node or uvx command must really be that program
+# (RR3138-C): the root-owned system command directories. The orchestrator's
+# PATH is not used: it usually holds the operator's ~/.local/bin, which an
+# agent sharing the operator UID can write.
+_SYSTEM_COMMAND_DIRS = ("/usr/local/bin", "/usr/bin", "/bin",
+                        "/usr/local/sbin", "/usr/sbin", "/sbin")
+_INTERPRETER_NAMES = {
+    "python": ("python3", "python"),
+    "node": ("node", "nodejs"),
+    "uvx": ("uvx",),
+}
+# Name stems (_launcher_stem) that are versioned names of each interpreter:
+# python3.12 and pypy3 are looked up under their own name too.
+_INTERPRETER_STEMS = {
+    "python": frozenset({"python", "pypy"}),
+    "node": frozenset({"node", "nodejs"}),
+    "uvx": frozenset({"uvx"}),
+}
+
+
+def _is_real_interpreter(command: str, kind: str) -> bool:
+    """True when ``command`` is the real python, node or uvx (RR3138-C).
+
+    The launch check picks its python/node/uvx rules by name, so a copy of
+    perl named python3 or of env named uvx passed as that interpreter. Now
+    the file itself must be the program its name says: the same file as
+    that name (the canonical one, or the command's own basename such as
+    python3.12) found in _SYSTEM_COMMAND_DIRS, the orchestrator's own
+    interpreter for python, or a path the operator listed under
+    mcp_trusted_executables (uv installs uvx in ~/.local/bin, which must be
+    listed).
+
+    Residual risk: the binary's content is not verified. A file at a
+    listed path is trusted as the program its name says, so whoever can
+    write that path (an agent sharing the operator UID, for a path in the
+    operator HOME) can replace it. Only agent isolation (a separate UID)
+    closes that; the system directories are root-owned.
+    """
+    names = set(_INTERPRETER_NAMES[kind])
+    if _launcher_stem(command) in _INTERPRETER_STEMS[kind]:
+        names.add(os.path.basename(command))
+    search_path = os.pathsep.join(_SYSTEM_COMMAND_DIRS)
+    candidates = {shutil.which(name, path=search_path) for name in names}
+    if kind == "python":
+        candidates.update({sys.executable,
+                           getattr(sys, "_base_executable", None)})
+    candidates.update(_trusted_mcp_executables())
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            if os.path.samefile(command, candidate):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _trusted_mcp_executables() -> set[str]:
@@ -1052,7 +1167,8 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path,
     for key in env:
         if key in _MCP_REFUSED_ENV or key.startswith(_MCP_REFUSED_ENV_PREFIXES):
             raise refuse(f"sets {key} in its env, which makes the server load "
-                         f"extra code", f"Remove {key} from the env block.")
+                         f"extra code (or uvx install from elsewhere)",
+                         f"Remove {key} from the env block.")
     refuse_inside_project("command", command)
     if cwd is not None:
         refuse_inside_project("cwd", cwd)
@@ -1073,6 +1189,14 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path,
     if not (os.path.isfile(command) and os.access(command, os.X_OK)):
         raise refuse(f"has the command {command!r}, which is not an "
                      f"executable file", "Point it at the server executable.")
+    if kind != "executable" and not _is_real_interpreter(command, kind):
+        raise refuse(
+            f"runs {command!r} as {kind}, but that file is not the {kind} "
+            f"installed in {', '.join(_SYSTEM_COMMAND_DIRS[:3])} (a renamed "
+            f"copy of another program would pass by name)",
+            f"Point it at the system {kind}, or add its absolute path to "
+            f"\"{MCP_TRUSTED_EXECUTABLES_KEY}\" in dispatch_config.json if "
+            f"it is the real {kind} (uv installs uvx in ~/.local/bin).")
     if kind == "python":
         _check_python_launch(args, cwd, refuse, refuse_inside_project)
     elif kind == "node":
@@ -1183,6 +1307,58 @@ _UVX_SHORT_VALUE_LETTERS = frozenset("wcbifpPC")
 # A file: URL names a local path wherever it appears.
 _FILE_URL = re.compile(r"file:(?://(?:localhost)?)?([^\s#?]+)")
 
+# uvx's own option table (uv 0.10, ``uvx --help``), used to read uvx's
+# options up to the tool name (RR3138-B). Everything after the tool name is
+# the tool's own arguments. An option missing from both sets (an alias such
+# as --constraint, or a newer uv option) is refused: without the table it is
+# unknown whether it takes a value, so the tool name cannot be found.
+_UVX_FLAG_OPTIONS = frozenset({
+    "--isolated", "--no-env-file", "--lfs", "--version", "--no-index",
+    "--upgrade", "--no-sources", "--reinstall", "--compile-bytecode",
+    "--no-build-isolation", "--no-build", "--no-binary", "--no-cache",
+    "--refresh", "--managed-python", "--no-managed-python",
+    "--no-python-downloads", "--quiet", "--verbose", "--native-tls",
+    "--offline", "--no-progress", "--no-config", "--help", "--preview",
+    "--no-preview",
+})
+_UVX_VALUE_OPTIONS = frozenset({
+    "--from", "--with", "--with-editable", "--with-requirements",
+    "--constraints", "--build-constraints", "--overrides", "--env-file",
+    "--python-platform", "--torch-backend", "--index", "--default-index",
+    "--index-url", "--extra-index-url", "--find-links", "--index-strategy",
+    "--keyring-provider", "--upgrade-package", "--resolution", "--prerelease",
+    "--fork-strategy", "--exclude-newer", "--exclude-newer-package",
+    "--no-sources-package", "--reinstall-package", "--link-mode",
+    "--config-setting", "--config-settings-package",
+    "--no-build-isolation-package", "--no-build-package",
+    "--no-binary-package", "--cache-dir", "--refresh-package", "--python",
+    "--color", "--allow-insecure-host", "--directory", "--project",
+    "--config-file",
+})
+_UVX_SHORT_FLAG_LETTERS = frozenset("VUnqvh")
+_UVX_SHORT_ALIASES = {
+    "w": "--with", "c": "--constraints", "b": "--build-constraints",
+    "i": "--index-url", "f": "--find-links", "P": "--upgrade-package",
+    "C": "--config-setting", "p": "--python",
+}
+# uvx options before the tool name whose value uv reads as a local file or
+# directory, or fetches: index and find-links locations, requirement and
+# constraint files, and directory options. Each value must be an absolute
+# path outside every project directory, or an https URL the operator listed
+# under mcp_uvx_trusted_urls (RR3138-B). A bare name (``-f wheels``) is
+# relative to the agent-writable project directory. uv splits these values
+# on whitespace (they share the parser of the space-separated UV_* forms),
+# so every word is judged.
+_UVX_LOCATION_OPTIONS = frozenset({
+    "--index", "--default-index", "--index-url", "--extra-index-url",
+    "--find-links", "--with-requirements", "--constraints",
+    "--build-constraints", "--overrides", "--env-file", "--cache-dir",
+    "--directory", "--project", "--config-file",
+})
+# dispatch_config.json key: https URLs (index or find-links locations,
+# requirement files) that uvx options may name (RR3138-B).
+MCP_UVX_TRUSTED_URLS_KEY = "mcp_uvx_trusted_urls"
+
 
 def _is_path_like(value: str) -> bool:
     return (value in (".", "..") or value.startswith(("/", "./", "../", "~"))
@@ -1287,6 +1463,125 @@ def _check_uvx_launch(args: list[str], refuse: Any,
                                  "Use a package from an index, or an absolute "
                                  "path outside every project directory.")
                 refuse_inside_project(f"uvx {option} path", expanded)
+    _check_uvx_options_before_tool(args, refuse, refuse_inside_project)
+
+
+def _uvx_trusted_urls() -> set[str]:
+    """https URLs listed under mcp_uvx_trusted_urls, without a trailing /.
+
+    An unreadable config or a malformed entry trusts nothing.
+    """
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("cannot read %s from the dispatch config: %s",
+                       MCP_UVX_TRUSTED_URLS_KEY, exc)
+        return set()
+    entries = config.get(MCP_UVX_TRUSTED_URLS_KEY, [])
+    if not isinstance(entries, list):
+        logger.warning("%s must be a list of https URLs; ignored",
+                       MCP_UVX_TRUSTED_URLS_KEY)
+        return set()
+    return {entry.rstrip("/") for entry in entries
+            if isinstance(entry, str) and entry.startswith("https://")
+            and not any(char.isspace() for char in entry)}
+
+
+def _uvx_options_before_tool(args: list[str]) -> list[tuple[str, str | None]]:
+    """``(long option, value)`` for each uvx option before the tool name.
+
+    Reads ``--opt value``, ``--opt=value``, ``-o value``, ``-ovalue``,
+    ``-o=value`` and clusters (``-qf value``) with uvx's option table. value
+    is None for a flag, and for a value option with nothing after it.
+
+    Raises:
+        ValueError: an option uvx's table does not list, or a flag given a
+            value; the message names it.
+    """
+    options: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            break  # the tool name (after ``--``): its own arguments follow
+        if arg.startswith("--"):
+            option, has_value, attached = arg.partition("=")
+            if option in _UVX_FLAG_OPTIONS and not has_value:
+                options.append((option, None))
+                index += 1
+                continue
+            if option not in _UVX_VALUE_OPTIONS:
+                raise ValueError(arg)
+            options.append((option, attached if has_value else following))
+            index += 1 if has_value else 2
+            continue
+        cluster = arg[1:]
+        consumed = 1
+        for position, letter in enumerate(cluster):
+            if letter in _UVX_SHORT_FLAG_LETTERS:
+                options.append((f"-{letter}", None))
+                continue
+            if letter not in _UVX_SHORT_ALIASES:
+                raise ValueError(arg)
+            attached = cluster[position + 1:]
+            if attached:
+                value = attached[1:] if attached.startswith("=") else attached
+            else:
+                value, consumed = following, 2
+            options.append((_UVX_SHORT_ALIASES[letter], value))
+            break
+        index += consumed
+    return options
+
+
+def _check_uvx_options_before_tool(args: list[str], refuse: Any,
+                                   refuse_inside_project: Any) -> None:
+    """uvx's own options, read with uvx's option table (RR3138-B).
+
+    _check_uvx_launch judges a short option by whether its value looks like
+    a path, because it scans the tool's arguments too (``srv -f json``).
+    That let ``uvx -f wheels srv`` through: a bare name after -f is a
+    find-links directory in the project. Here only uvx's options are read,
+    up to the tool name, so a short option is judged exactly like its long
+    form: each location value must be an absolute path outside every
+    project directory or a listed https URL.
+    """
+    try:
+        options = _uvx_options_before_tool(args)
+    except ValueError as exc:
+        raise refuse(f"passes uvx the option {str(exc)!r}, which is not in "
+                     f"uvx's option table, so the tool name cannot be found",
+                     "Use the long form of a listed uvx option, or remove it."
+                     ) from exc
+    trusted_urls: set[str] | None = None
+    for option, value in options:
+        if option not in _UVX_LOCATION_OPTIONS:
+            continue
+        words = (value or "").split()
+        if not words:
+            raise refuse(f"passes uvx {option} without a value",
+                         "Give it an absolute path.")
+        for word in words:
+            name, has_name, location = word.partition("=")
+            if (option in ("--index", "--default-index") and has_name
+                    and re.fullmatch(r"[A-Za-z0-9_.-]+", name)):
+                word = location  # --index name=<location>
+            if os.path.isabs(word):
+                refuse_inside_project(f"uvx {option} path", word)
+                continue
+            if trusted_urls is None:
+                trusted_urls = _uvx_trusted_urls()
+            if word.startswith("https://") and word.rstrip("/") in trusted_urls:
+                continue
+            raise refuse(
+                f"passes uvx {option} {word!r}, which is neither an absolute "
+                f"path nor an https URL listed under "
+                f"\"{MCP_UVX_TRUSTED_URLS_KEY}\" (a bare name is relative to "
+                f"the project directory)",
+                f"Use an absolute path outside every project directory, or "
+                f"add the https URL to \"{MCP_UVX_TRUSTED_URLS_KEY}\" in "
+                f"dispatch_config.json.")
 
 
 _DB_PATH_PLACEHOLDER = "/absolute/path/to/theforge.db"
@@ -1443,9 +1738,16 @@ def build_cli_command(
         # The reactive stream check in the streaming loop stays on regardless
         # (defense-in-depth / belt-and-braces).
         if is_feature_enabled(_dc, "bash_security_pretooluse"):
-            if PRETOOLUSE_HOOK_SCRIPT.is_file():
+            hook_python = _hook_interpreter()
+            if hook_python is None:
+                logger.warning(
+                    "bash_security_pretooluse enabled but no absolute Python "
+                    "interpreter was found for the hook; skipping "
+                    "pre-execution gate",
+                )
+            elif PRETOOLUSE_HOOK_SCRIPT.is_file():
                 settings_payload = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3"
+                    PRETOOLUSE_HOOK_SCRIPT, hook_python
                 )
                 settings_file = tempfile.NamedTemporaryFile(
                     mode="w", suffix=".json", prefix="equipa_settings_",

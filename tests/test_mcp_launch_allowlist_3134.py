@@ -209,9 +209,12 @@ ACCEPTED = {
 
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
 def test_allowlisted_launch_is_accepted(layout, server, monkeypatch):
+    # The fake uvx is listed as an operator lists ~/.local/bin/uvx: since
+    # task 3144 (RR3138-C) a uvx must be the real one or listed.
     monkeypatch.setattr(equipa_config, "_active_dispatch_config", {
         agent_runner.MCP_TRUSTED_EXECUTABLES_KEY: [
-            str(layout["trusted"] / "bin" / "mcp-server")]})
+            str(layout["trusted"] / "bin" / "mcp-server"),
+            str(layout["trusted"] / "bin" / "uvx")]})
     _check(layout, _fill(server, layout))
 
 
