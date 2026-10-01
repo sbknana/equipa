@@ -204,6 +204,19 @@ def test_hostile_python_env_cannot_open_the_gate(name, hook_command, tmp_path):
     assert _run_hook(hook_command, SAFE_COMMAND, env, tmp_path).returncode == 0
 
 
+@pytest.mark.parametrize("name", sorted(STARTUP_KILLERS))
+def test_settings_env_block_alone_neutralises_the_startup_killers(
+        name, generated_settings, tmp_path):
+    """Defence in depth: if -I were ever lost, the --settings env block
+    still empties each startup killer. The CLI overlays the flag-scope env
+    on the user-scope env (an empty string wins), and Python ignores an
+    empty PYTHON* variable, so the old command still exits 2."""
+    hostile = {**_base_env(tmp_path), name: STARTUP_KILLERS[name]}
+    overlaid = {**hostile, **generated_settings["env"]}
+    blocked = _run_hook(_old_hook_command(), BLOCKED_COMMAND, overlaid, tmp_path)
+    assert blocked.returncode == 2, blocked.stderr
+
+
 def test_planted_user_site_pth_cannot_open_the_gate(hook_command, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
