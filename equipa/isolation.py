@@ -83,9 +83,22 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 
 # Groups that are root-equivalent or expose other users' data. The agent
 # user must be in none of them (checked here and again inside the launcher).
+# ``privileged_groups`` may add groups, never remove these (review F7).
 DEFAULT_PRIVILEGED_GROUPS: tuple[str, ...] = (
     "root", "sudo", "admin", "wheel", "adm", "docker", "lxd", "incus",
     "libvirt", "kvm", "disk", "shadow", "systemd-journal",
+)
+# Destinations the agent unit may not reach (review F2): loopback, the
+# unspecified addresses (a connect to them reaches loopback), link-local,
+# multicast and the private ranges. Everything else stays reachable: the
+# agent needs the public Anthropic API. ``ip_address_deny_extra`` may add
+# ranges (a tailnet's 100.64.0.0/10, say), never remove these. systemd-run
+# of systemd 255 does not parse the symbolic names (localhost, link-local,
+# multicast), so they are spelled out.
+DEFAULT_IP_ADDRESS_DENY: tuple[str, ...] = (
+    "127.0.0.0/8", "::1/128", "0.0.0.0/8", "::/128",
+    "169.254.0.0/16", "fe80::/10", "224.0.0.0/4", "ff00::/8",
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
 )
 # Credential stores in the orchestrator's HOME the agent must not read.
 ORCHESTRATOR_HOME_SECRETS: tuple[str, ...] = (
@@ -181,6 +194,8 @@ class IsolationSettings:
     db_backup_dirs: tuple[str, ...] = ()
     secret_scan_roots: tuple[str, ...] = ()
     unit_wait_timeout_sec: float = 21600.0
+    ip_address_deny: tuple[str, ...] = DEFAULT_IP_ADDRESS_DENY
+    io_weight: int | None = 50
 
 
 _DEFAULTS: dict[str, Any] = {
@@ -218,6 +233,12 @@ _DEFAULTS: dict[str, Any] = {
     # isolated agent runs, any other unit while a reviewer runs or waits
     # (review R3136-03). Past it the dispatch is refused.
     "unit_wait_timeout_sec": 21600,
+    # Ranges the agent may not reach besides DEFAULT_IP_ADDRESS_DENY.
+    "ip_address_deny_extra": [],
+    # IOWeight= of the unit (1-10000; the orchestrator keeps the default
+    # 100), verified in the scope's io.weight; null leaves IO unweighted
+    # (review F8). Needs the io controller delegated to the user manager.
+    "io_weight": 50,
 }
 
 
@@ -317,6 +338,9 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
     for key, paths in path_lists.items():
         if not all(os.path.isabs(item) for item in paths):
             raise _setting_error(key, "must hold absolute paths")
+    io_weight = raw.get("io_weight", _DEFAULTS["io_weight"])
+    if io_weight is not None:
+        io_weight = _int_in_range(raw, "io_weight", 1, 10_000)
     return IsolationSettings(
         agent_user=agent_user,
         python=_abs_path(raw, "python", sudoers=True),
@@ -340,7 +364,8 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
         exclude_tables=_str_tuple(raw, "exclude_tables", _TABLE_NAME_RE),
         deny_read=tuple(os.path.normpath(p) for p in deny_read),
         deny_write=tuple(os.path.normpath(p) for p in deny_write),
-        privileged_groups=_str_tuple(raw, "privileged_groups"),
+        privileged_groups=tuple(dict.fromkeys(
+            (*DEFAULT_PRIVILEGED_GROUPS, *_str_tuple(raw, "privileged_groups")))),
         oauth_token_file=_abs_path(raw, "oauth_token_file", optional=True),
         carry_ignored_paths=carry,
         db_backup_dirs=tuple(os.path.normpath(p)
@@ -349,7 +374,26 @@ def load_isolation_settings(dispatch_config: Mapping[str, Any] | None
                                 for p in path_lists["secret_scan_roots"]),
         unit_wait_timeout_sec=float(_int_in_range(
             raw, "unit_wait_timeout_sec", 60, 7 * 86400)),
+        ip_address_deny=_ip_address_deny(raw),
+        io_weight=io_weight,
     )
+
+
+def _ip_address_deny(raw: Mapping[str, Any]) -> tuple[str, ...]:
+    """DEFAULT_IP_ADDRESS_DENY plus ``ip_address_deny_extra``, each a
+    network systemd and the launcher both parse the same way."""
+    import ipaddress
+
+    extra = _str_tuple(raw, "ip_address_deny_extra")
+    networks: list[str] = []
+    for item in (*DEFAULT_IP_ADDRESS_DENY, *extra):
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise _setting_error("ip_address_deny_extra",
+                                 f"has an invalid network {item!r}") from exc
+        networks.append(str(network))
+    return tuple(dict.fromkeys(networks))
 
 
 # While this file exists, agent isolation is REQUIRED on this host (review
@@ -507,13 +551,27 @@ def make_unit_name(pid: int | None = None, start_time: int | None = None,
 
 
 def build_launch_command(settings: IsolationSettings, unit: str) -> list[str]:
-    """argv that starts the launcher as the agent user in its own scope."""
+    """argv that starts the launcher as the agent user in its own scope.
+
+    ``IPAddressDeny=`` keeps the agent off loopback and the LAN (review F2).
+    A user manager accepts it but cannot apply it unprivileged ("unit
+    configures an IP firewall, but not running as root"), so the launcher
+    proves from inside the unit that the denied ranges are unreachable and
+    refuses otherwise; on such a host an nftables rule for the agent user
+    does the blocking (docs/AGENT_ISOLATION.md). ``MemorySwapMax=0`` and
+    ``IOWeight=`` are checked in the scope (:func:`verify_scope_cgroup`).
+    """
+    io_weight = ([f"--property=IOWeight={settings.io_weight}"]
+                 if settings.io_weight is not None else [])
     return [
         settings.systemd_run, "--user", "--scope", "--quiet", "--collect",
         f"--unit={unit}",
         f"--property=TasksMax={settings.pids_max}",
         f"--property=MemoryMax={settings.memory_max_bytes}",
+        "--property=MemorySwapMax=0",
         f"--property=CPUWeight={settings.cpu_weight}",
+        *io_weight,
+        f"--property=IPAddressDeny={' '.join(settings.ip_address_deny)}",
         "--",
         settings.sudo, "-n", "-u", settings.agent_user, "--",
         settings.python, "-I", settings.launcher,
@@ -582,16 +640,71 @@ def resolve_agent_identity(settings: IsolationSettings) -> AgentIdentity:
         raise AgentIsolationError(
             f"agent user {settings.agent_user!r} is the orchestrator's own "
             f"user; isolation needs a separate account")
+    try:
+        member_of = set(os.getgrouplist(settings.agent_user, entry.pw_gid))
+    except OSError as exc:
+        raise AgentIsolationError(
+            f"cannot list the groups of {settings.agent_user!r}: {exc}") from exc
     for name in settings.privileged_groups:
         try:
             group = grp.getgrnam(name)
         except KeyError:
             continue
-        if settings.agent_user in group.gr_mem or group.gr_gid == entry.pw_gid:
+        if (settings.agent_user in group.gr_mem or group.gr_gid == entry.pw_gid
+                or group.gr_gid in member_of):
             raise AgentIsolationError(
                 f"agent user {settings.agent_user!r} is in the privileged "
                 f"group {name!r}; remove it (gpasswd -d)")
+    check_agent_has_no_sudo(settings)
     return AgentIdentity(uid=entry.pw_uid, gid=entry.pw_gid, home=entry.pw_dir)
+
+
+_SUDO_NO_RIGHTS = "is not allowed to run sudo"
+_SUDO_HAS_RIGHTS = "may run the following commands"
+
+
+def check_agent_has_no_sudo(settings: IsolationSettings) -> None:
+    """Refuse unless sudo itself reports that the agent user may run
+    nothing (review F7).
+
+    ``sudo -n -l -U <agent user>`` lists another user's rules; it needs the
+    orchestrator to hold sudo's ``ALL`` or the ``list`` permission. A rule
+    for the agent user, or for a group of it that ``privileged_groups``
+    does not name, would make every other boundary moot. An answer that is
+    neither "not allowed" nor a rule list (sudo missing, no permission to
+    list) refuses too: the check fails closed.
+    """
+    argv = [settings.sudo, "-n", "-l", "-U", settings.agent_user]
+    output, status = _run_capture(argv)
+    if status == 0 and _SUDO_NO_RIGHTS in output \
+            and _SUDO_HAS_RIGHTS not in output:
+        return
+    if _SUDO_HAS_RIGHTS in output:
+        rules = output.split(_SUDO_HAS_RIGHTS, 1)[1].strip()
+        raise AgentIsolationError(
+            f"the agent user {settings.agent_user!r} has sudo rights "
+            f"({rules[:300]!r}); remove every sudoers rule for it and its "
+            f"groups (docs/AGENT_ISOLATION.md step 1)")
+    raise AgentIsolationError(
+        f"cannot verify that the agent user {settings.agent_user!r} has no "
+        f"sudo rights: {' '.join(argv)} exited {status}: "
+        f"{output.strip()[-300:]!r} (docs/AGENT_ISOLATION.md step 2)")
+
+
+def _run_capture(argv: Sequence[str], timeout: float = 30) -> tuple[str, int]:
+    """(stdout + stderr, exit status) of a short command in the C locale;
+    status 127 when it cannot run at all."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            list(argv), stdin=subprocess.DEVNULL, capture_output=True,
+            env={"PATH": _LAUNCH_PATH, "LANG": "C", "LC_ALL": "C"},
+            timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"{type(exc).__name__}: {exc}", 127
+    return (result.stdout + result.stderr).decode("utf-8", "replace"), \
+        result.returncode
 
 
 def check_host(settings: IsolationSettings, identity: AgentIdentity) -> None:
@@ -1312,16 +1425,26 @@ def _cgroup_dir(cgroup: str) -> Path:
 
 
 def verify_scope_cgroup(cgroup: str, settings: IsolationSettings) -> None:
-    """The scope carries the configured limits and can be killed by us."""
+    """The scope carries the configured limits and can be killed by us.
+
+    Swap is off (``memory.swap.max`` 0, review F8): ``MemoryMax`` alone lets
+    a unit spill into swap. ``io.weight`` is checked when ``io_weight`` is
+    set; its first line is ``default <weight>``.
+    """
     directory = _cgroup_dir(cgroup)
     expected = {"pids.max": str(settings.pids_max),
                 "memory.max": str(settings.memory_max_bytes),
+                "memory.swap.max": "0",
                 "cpu.weight": str(settings.cpu_weight)}
+    if settings.io_weight is not None:
+        expected["io.weight"] = f"default {settings.io_weight}"
     for name, value in expected.items():
         try:
             actual = (directory / name).read_text(encoding="ascii").strip()
         except OSError:
             actual = None
+        if name == "io.weight" and actual is not None:
+            actual = actual.splitlines()[0] if actual else actual
         if actual != value:
             raise AgentIsolationError(
                 f"agent scope {cgroup}: {name} is {actual!r}, expected {value}; "
@@ -1581,6 +1704,9 @@ def build_handoff(cmd: Sequence[str], cwd: str | None, env: Mapping[str, str],
             "base_sha": worktree.base_sha,
             "export_path": export_path,
             "carry_paths": list(settings.carry_ignored_paths),
+            # The launcher never writes a larger export into the shared
+            # exchange directory (review F8).
+            "max_export_bytes": settings.max_export_bytes,
         }
     header = {
         "unit": unit,
@@ -1598,6 +1724,8 @@ def build_handoff(cmd: Sequence[str], cwd: str | None, env: Mapping[str, str],
                    "cpu_weight": settings.cpu_weight},
         "deny_read": _deny_read_paths(settings, forge_source_db),
         "deny_write": _deny_write_paths(settings, worktree),
+        # Probed from inside the unit: refused unless unreachable (F2).
+        "network": {"deny": list(settings.ip_address_deny)},
         "must_execute": sorted(needs.execute),
         "must_read": sorted(needs.read),
         "git": {"executable": settings.git_executable,

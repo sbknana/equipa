@@ -59,11 +59,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import errno
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -633,6 +636,111 @@ def _abs_path_list(mapping: Mapping, key: str) -> list[str]:
     return value
 
 
+def _network_list(header: Mapping) -> list:
+    """The networks of ``header["network"]["deny"]`` (none without one)."""
+    network = header.get("network")
+    if network is None:
+        return []
+    if not isinstance(network, dict):
+        raise IsolationRefused("handoff field 'network' has the wrong type")
+    try:
+        return [ipaddress.ip_network(item, strict=False)
+                for item in _str_list(network, "deny")]
+    except ValueError as exc:
+        raise IsolationRefused(f"invalid network in the handoff: {exc}") from exc
+
+
+# How long a probe connection to a local listener may take. Loopback
+# connects complete at once; a denied one is dropped or rejected.
+_NETWORK_PROBE_SECONDS = 2.0
+_LOOPBACK_V4 = ipaddress.ip_address("127.0.0.1")
+_FIB_TRIE = "/proc/net/fib_trie"
+_IF_INET6 = "/proc/net/if_inet6"
+_LOCAL_IPV4_RE = re.compile(
+    r"\|-- (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\n[ \t]+/32 host LOCAL")
+
+
+def _local_addresses() -> list[str]:
+    """This host's own addresses: IPv4 from the kernel's local routing
+    table, IPv6 (except link-local, which needs a scope) when enabled."""
+    addresses = ["127.0.0.1"]
+    with contextlib.suppress(OSError):
+        addresses += _LOCAL_IPV4_RE.findall(
+            Path(_FIB_TRIE).read_text(encoding="ascii", errors="replace"))
+    with contextlib.suppress(OSError):
+        lines = Path(_IF_INET6).read_text(encoding="ascii").splitlines()
+        addresses.append("::1")
+        for line in lines:
+            fields = line.split()
+            if len(fields) >= 4 and len(fields[0]) == 32 \
+                    and fields[3] != "20":  # 0x20: link-local scope
+                packed = bytes.fromhex(fields[0])
+                addresses.append(socket.inet_ntop(socket.AF_INET6, packed))
+    return list(dict.fromkeys(addresses))
+
+
+def reachable_denied_addresses(networks: Sequence,
+                               addresses: Sequence[str] | None = None,
+                               timeout: float = _NETWORK_PROBE_SECONDS
+                               ) -> list[str]:
+    """Local addresses inside ``networks`` this process can connect to.
+
+    For each address a listener is bound on it and connected to; with the
+    unit's firewall in effect (systemd ``IPAddressDeny=`` or an nftables
+    rule for the agent user) no connection is ever established. All
+    probes share one ``timeout``. An address that cannot be bound (not
+    local, IPv6 disabled) is skipped.
+    """
+    import select
+
+    candidates = _local_addresses() if addresses is None else list(addresses)
+    probes: dict[socket.socket, str] = {}
+    listeners: list[socket.socket] = []
+    reachable: list[str] = []
+    pending: list[socket.socket] = []
+    try:
+        for address in candidates:
+            ip = ipaddress.ip_address(address)
+            if not any(ip.version == net.version and ip in net
+                       for net in networks):
+                continue
+            family = socket.AF_INET if ip.version == 4 else socket.AF_INET6
+            try:
+                listener = socket.socket(family, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            listeners.append(listener)
+            try:
+                listener.bind((address, 0))
+                listener.listen(1)
+                client = socket.socket(family, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            client.setblocking(False)
+            probes[client] = address
+            code = client.connect_ex(listener.getsockname()[:2])
+            if code == 0:
+                reachable.append(address)
+            elif code in (errno.EINPROGRESS, errno.EALREADY, errno.EAGAIN):
+                pending.append(client)
+            # Anything else (rejected, not permitted) is not reachable.
+        deadline = time.monotonic() + timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _readable, writable, _error = select.select([], pending, [],
+                                                        remaining)
+            for client in writable:
+                pending.remove(client)
+                if client.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    reachable.append(probes[client])
+    finally:
+        for sock in (*probes, *listeners):
+            sock.close()
+    return list(dict.fromkeys(reachable))
+
+
 def _own_cgroup() -> str | None:
     """This process's cgroup v2 path (``0::<path>`` in /proc/self/cgroup)."""
     try:
@@ -714,6 +822,7 @@ class _IsolatedSession:
                        for name in ("pids_max", "memory_max", "cpu_weight")}
         self.deny_read = _abs_path_list(header, "deny_read")
         self.deny_write = _abs_path_list(header, "deny_write")
+        self.network_deny = _network_list(header)
         self.must_execute = _abs_path_list(header, "must_execute")
         self.must_read = _abs_path_list(header, "must_read")
         git = _field(header, "git", dict)
@@ -730,6 +839,7 @@ class _IsolatedSession:
         self.handoff_ref = self.branch_ref = self.base_sha = ""
         self.export_path = ""
         self.carry_paths: list[str] = []
+        self.max_export_bytes = None
         if self.has_workspace:
             self._parse_workspace(_field(header, "workspace", dict))
         self.grace = float(_field(header, "grace", (int, float)))
@@ -752,6 +862,11 @@ class _IsolatedSession:
             raise IsolationRefused("invalid base commit id")
         self.export_path = _field(workspace, "export_path", str)
         self.carry_paths = _str_list(workspace, "carry_paths")
+        cap = workspace.get("max_export_bytes")
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int)
+                                or cap <= 0):
+            raise IsolationRefused("invalid max_export_bytes")
+        self.max_export_bytes: int | None = cap
         if not os.path.isabs(self.export_path) or any(
                 os.path.isabs(p) or ".." in Path(p).parts
                 for p in self.carry_paths):
@@ -868,6 +983,25 @@ class _IsolatedSession:
         for path in self.deny_write:
             if os.access(path, os.W_OK):
                 raise IsolationRefused(f"the agent user can write {path}")
+        self._verify_network_denied()
+
+    def _verify_network_denied(self) -> None:
+        """Loopback and this host's own addresses in the denied ranges are
+        unreachable from the unit (review F2). systemd accepts
+        IPAddressDeny= on a user manager's scope but cannot apply it there,
+        so the property alone proves nothing."""
+        if not self.network_deny:
+            return
+        if not any(net.version == 4 and _LOOPBACK_V4 in net
+                   for net in self.network_deny):
+            raise IsolationRefused("the handoff does not deny loopback")
+        reachable = reachable_denied_addresses(self.network_deny)
+        if reachable:
+            raise IsolationRefused(
+                f"the agent user can connect to {', '.join(reachable)} "
+                f"(loopback/LAN), so IPAddressDeny= is not in effect; block "
+                f"those ranges for the agent user with nftables "
+                f"(docs/AGENT_ISOLATION.md step 6)")
 
     def _verify_required_access(self) -> None:
         for path in [self.executable, self.git_executable, *self.must_execute]:
@@ -880,7 +1014,8 @@ class _IsolatedSession:
     # -- workspace ------------------------------------------------------------
 
     def _git(self, args: list[str], extra_env: Mapping[str, str] | None = None,
-             cwd: Path | None = None) -> str:
+             cwd: Path | None = None, *,
+             max_file_bytes: int | None = None) -> str:
         env = {name: value for name, value in self.build_env().items()
                if not name.endswith("_TOKEN")}
         env.update(extra_env or {})
@@ -895,6 +1030,8 @@ class _IsolatedSession:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, env=env, timeout=_GIT_TIMEOUT_SECONDS,
                 check=False,
+                preexec_fn=(None if max_file_bytes is None
+                            else _file_size_limit(max_file_bytes)),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise IsolationRefused(f"git {args[0]} failed: {exc}") from exc
@@ -1048,8 +1185,20 @@ class _IsolatedSession:
             lambda args, env: self._git(args, env), self.repo_dir,
             self.carry_paths, str(index), self.branch_ref)
         self._git(["update-ref", EXPORT_REF, state])
-        self._git(["bundle", "create", "-q", str(partial), EXPORT_REF,
-                   "--not", self.base_sha])
+        try:
+            self._git(["bundle", "create", "-q", str(partial), EXPORT_REF,
+                       "--not", self.base_sha],
+                      max_file_bytes=self.max_export_bytes)
+            size = os.lstat(partial).st_size
+        except (IsolationRefused, OSError):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(partial)
+            raise
+        if self.max_export_bytes is not None and size > self.max_export_bytes:
+            os.unlink(partial)
+            raise IsolationRefused(
+                f"the export is {size} bytes, more than max_export_bytes "
+                f"{self.max_export_bytes}")
         os.chmod(partial, 0o644)
         os.replace(partial, out)
 
@@ -1070,6 +1219,23 @@ class _IsolatedSession:
             else:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(path)
+
+
+def _file_size_limit(max_bytes: int) -> Callable[[], None]:
+    """A ``preexec_fn`` capping every file the child writes at ``max_bytes``
+    (RLIMIT_FSIZE), so an oversized export stops at the cap instead of
+    filling the exchange directory's filesystem first (review F8). SIGXFSZ
+    is ignored, so the write fails with EFBIG rather than dumping core."""
+    import resource
+
+    def limit() -> None:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        _soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        cap = max_bytes if hard == resource.RLIM_INFINITY else min(max_bytes,
+                                                                   hard)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+
+    return limit
 
 
 def _write_all(fd: int, data: bytes) -> None:

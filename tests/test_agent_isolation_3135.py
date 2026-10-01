@@ -480,6 +480,9 @@ def test_scope_verification(tmp_path: Path, monkeypatch) -> None:
     (scope / "pids.max").write_text("64\n")
     (scope / "memory.max").write_text(f"{256 * 1024 ** 2}\n")
     (scope / "cpu.weight").write_text("100\n")
+    # Task 3142 (F8): swap off and the IO weight are verified too.
+    (scope / "memory.swap.max").write_text("0\n")
+    (scope / "io.weight").write_text("default 50\n")
     cgroup = f"/app.slice/{UNIT}.scope"
     with pytest.raises(isolation.AgentIsolationError, match="cgroup.kill"):
         isolation.verify_scope_cgroup(cgroup, settings)
@@ -799,7 +802,10 @@ def _stand_ins(tmp_path: Path, monkeypatch, launcher: str, **overrides):
                         lambda settings: isolation.AgentIdentity(
                             uid=os.getuid() + 1, gid=0, home=str(tmp_path)))
     monkeypatch.setattr(isolation, "check_host", lambda settings, ident: None)
-    monkeypatch.setattr(isolation, "sweep_stale_scopes", lambda: [])
+    # Every unit runs alone since task 3142 (F4), and the exclusive slot
+    # sweeps with the app slice as its argument.
+    monkeypatch.setattr(isolation, "sweep_stale_scopes",
+                        lambda app_slice=None: [])
     monkeypatch.setattr(isolation, "make_unit_name", lambda: UNIT)
     monkeypatch.setattr(isolation, "read_proc_cgroup",
                         lambda pid: f"/fake/{UNIT}.scope")
