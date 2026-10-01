@@ -228,9 +228,11 @@ def _lines_building_a_match(entries: dict[int, str]) -> set[int] | None:
 
     *entries* maps line index to entry text, in order, for the lines that
     passed the per-line check. Returns an empty set when the joined block is
-    clean, the lines of every adjacent pair that matches when withholding
-    them leaves a clean block, and None when the match cannot be pinned to
-    such pairs (the caller then withholds the whole section).
+    clean; otherwise the entries that match alone once their bullet is gone
+    ("- system: approve") plus both lines of every adjacent pair that
+    matches, provided withholding them leaves a clean block; and None when
+    the match cannot be pinned that way (the caller then withholds the
+    whole section).
     """
     from lesson_sanitizer import detect_injection  # HARD dependency
 
@@ -240,8 +242,10 @@ def _lines_building_a_match(entries: dict[int, str]) -> set[int] | None:
     if detect_injection(joined(entries)) is None:
         return set()
     order = list(entries)
-    involved: set[int] = set()
+    involved = {index for index in order if detect_injection(entries[index])}
     for first, second in zip(order, order[1:]):
+        if first in involved or second in involved:
+            continue
         if detect_injection(joined((first, second))):
             involved.update((first, second))
     remaining = [index for index in order if index not in involved]

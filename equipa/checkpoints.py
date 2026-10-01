@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import unicodedata
 from pathlib import Path
 
 from equipa.constants import CHECKPOINT_DIR
@@ -230,8 +231,6 @@ def _safe_entry(value: object) -> str:
     start a heading or an order on a line of its own (review F2 of task
     3139). The others are boundary-escaped by the wrapper they render in.
     """
-    import unicodedata
-
     from equipa.parsing import AGENT_OUTPUT_LINE_WITHHELD
 
     text = str(value)

@@ -105,7 +105,9 @@ def _sanitize_message_part(text: object) -> str:
     from lesson_sanitizer import sanitize  # HARD dependency
     from equipa.parsing import AGENT_OUTPUT_WITHHELD
 
-    text = str(text)
+    text = "" if text is None else str(text)
+    if not text.strip():
+        return ""
     if len(text) > MESSAGE_SCAN_LIMIT:
         dropped = len(text) - MESSAGE_SCAN_LIMIT
         text = f"{text[:MESSAGE_SCAN_LIMIT]}\n[... {dropped} chars not shown]"
