@@ -56,9 +56,9 @@ _WHITESPACE_RUNS: dict[str, Callable[[int], str]] = {
     # Line separators the sanitizer now matches as newlines (review F6 of
     # task 3139): Unicode Zl / Zp, and the C0/C1 controls str.splitlines()
     # breaks on.
-    "line-separators": lambda n: " " * n,
-    "paragraph-separators": lambda n: " " * n,
-    "sentence-end-line-separators": lambda n: ". " * (n // 2),
+    "line-separators": lambda n: "\u2028" * n,
+    "paragraph-separators": lambda n: "\u2029" * n,
+    "sentence-end-line-separators": lambda n: ".\u2028" * (n // 2),
     "control-line-breaks": lambda n: "\x0b\x0c\x1c\x1d\x1e\x85" * (n // 6),
 }
 
@@ -153,7 +153,7 @@ ADVERSARIAL_CASES: dict[str, tuple[tuple[str, ...], Callable[[int], str]]] = {
     # identifier is a joiner run and a context check, and words between
     # line separators.
     "short-identifiers": ((), lambda n: "a_b " * (n // 4)),
-    "words-between-line-separators": ((), lambda n: "a " * (n // 2)),
+    "words-between-line-separators": ((), lambda n: "a\u2028" * (n // 2)),
     # Phrases in statement position: each one is found and its look-back
     # read, and then the scan moves on.
     "statement-phrases": (

@@ -20,10 +20,12 @@ Policy (reject, never strip-and-keep):
   capitals, IPA, Armenian, Cyrillic, Greek) mapped to Latin. Keyword
   patterns also run with hyphen / underscore / dot joiners between letters
   deleted and spaced. So ``ig<ZWSP>nore``, Cyrillic ``іgnоre``, small-capital
-  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught. Plain
-  lowercase code identifiers (``system_override``, ``sudo_mode``) are not
-  spaced for the fake-header class, and a few phrases ("act as the admin",
-  "new rules:") count only in imperative position.
+  ``ɪɢɴᴏʀᴇ`` and ``ignore_previous_instructions`` are all caught. Unicode
+  line / paragraph separators and the C0/C1 line breaks match as newlines.
+  Plain lowercase code identifiers (``system_override``, ``sudo_mode``) are
+  not spaced for the fake-header class where they read as code, and a few
+  phrases ("act as the root", "new rules:") are accepted only when they
+  continue a statement ("the CA will act as the root CA").
 * If ANY injection pattern matches, the whole text is REJECTED: ``sanitize()``
   returns ``""`` and logs the reason at WARNING. Stripping the matched phrase
   and keeping the rest is the defect sandbox-09 describes — "Ignore previous
@@ -237,6 +239,8 @@ def normalize_for_matching(text: str) -> str:
     drops combining marks, every format character, the other invisible
     fillers, control characters and ANSI escapes, and folds confusable
     letters (small capitals, IPA, Armenian, Cyrillic, Greek) to Latin.
+    Unicode line and paragraph separators become ``"\\n"``, and so does a
+    C0/C1 line break (VT, FF, FS, GS, RS, NEL) that is not inside a word.
 
     Raises:
         ValueError: if NFKD decomposition grows the text abnormally.
@@ -374,12 +378,12 @@ _IMPERATIVE_LOOKBACK = 64
 # A clause starts after a line break or sentence punctuation. The table maps
 # each of those to "\n" (Unicode line separators are already newlines after
 # _normalize, but search() may also see raw text) and typographic
-# apostrophes to "'", so "don’t" reads as "don't". One translate plus
+# apostrophes to "'", so "don\u2019t" reads as "don't". One translate plus
 # str.split() per look-back: a regex tokenizer cost twice as much.
 _CLAUSE_TABLE = str.maketrans({
-    **dict.fromkeys(".!?:;,\r  ", "\n"),
-    "’": "'",
-    "ʼ": "'",
+    **dict.fromkeys(".!?:;,\r\u2028\u2029", "\n"),
+    "\u2019": "'",
+    "\u02bc": "'",
 })
 # Marks around a word that are not part of it: quotes, brackets, emphasis,
 # list and heading marks ("1)", "**Okay**", "(the").
