@@ -37,7 +37,13 @@ from equipa.config import (
     load_dispatch_config,
     resolve_claude_model,
 )
+# ISO-06: GHOST and OPRO run `claude -p` as the orchestrator's user on text
+# derived from agent output; with agent_isolation on they refuse.
+from equipa.isolation import unisolated_spawn_refusal
 from forgesmith_gepa import run_gepa
+
+_ISOLATION_REMEDY = ("run this ForgeSmith phase with agent_isolation off, "
+                     "or skip it")
 
 # forgesmith_simba and forgesmith_impact were moved to scripts/ during
 # repo cleanup.  Add the scripts directory to sys.path so imports resolve.
@@ -2209,6 +2215,11 @@ def dispatch_ghost_scout(prompt: str) -> str | None:
         *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("ForgeSmith GHOST scout", _ISOLATION_REMEDY)
+    if refusal:
+        log(f"  [GHOST] {refusal}")
+        return None
+
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -2704,6 +2715,11 @@ def call_claude_for_proposals(prompt, cfg):
         # IR-01: no project-scope settings, CLAUDE.md or .mcp.json.
         *CLAUDE_CLI_ISOLATION_ARGS,
     ]
+
+    refusal = unisolated_spawn_refusal("ForgeSmith OPRO", _ISOLATION_REMEDY)
+    if refusal:
+        log(f"  [OPRO] {refusal}")
+        return None
 
     try:
         result = subprocess.run(

@@ -28,6 +28,8 @@ from equipa.config import get_configured_model
 # The claude -p calls below embed project files in their prompt, so they get
 # the allowlisted agent env like every other agent CLI (P2A-07).
 from equipa.env_loader import active_agent_env
+# They are not isolated agents, so with agent_isolation on they refuse (CT-04).
+from equipa.isolation import unisolated_spawn_refusal
 from equipa.output import log
 from equipa.parsing import estimate_tokens
 
@@ -273,6 +275,9 @@ def _run_sub_query(
         *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("RLM sub-query")
+    if refusal:
+        return f"[sub_query error: {refusal}]"
     try:
         result = subprocess.run(
             cmd,
@@ -607,6 +612,9 @@ def _call_outer_agent(
         *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("RLM decomposition")
+    if refusal:
+        return f"[agent error: {refusal}]"
     try:
         result = subprocess.run(
             cmd,

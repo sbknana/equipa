@@ -170,7 +170,7 @@ class AgentResult(_AgentResultRequired, total=False):
     # _run_started_at_utc.
     started_at: str
 
-from equipa import agent_launcher
+from equipa import agent_launcher, isolation
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.cli_isolation import (
     CLAUDE_CLI_ISOLATION_ARGS,
@@ -1480,7 +1480,9 @@ def build_cli_command(
         if skills_dir and skills_dir.exists():
             cmd.extend(["--add-dir", str(skills_dir)])
 
-        yield cmd
+        # R3136-03: with agent_isolation on, reviewer units run alone.
+        with isolation.unit_role(role):
+            yield cmd
     finally:
         # Idempotent: missing_ok=True means a second cleanup (or one after a
         # partial setup failure) does not raise.
@@ -1928,6 +1930,15 @@ async def _spawn_agent_process(
         )
     kwargs["env"] = _agent_subprocess_env()
     kwargs["cwd"] = cwd
+
+    if isolation.isolation_enabled():
+        # Task 3135: separate agent UID, per-agent cgroup and clone; refused,
+        # never downgraded, when isolation cannot be established.
+        try:
+            return await isolation.spawn_isolated_agent(
+                cmd, cwd, kwargs["env"], limit=kwargs.get("limit"))
+        except isolation.AgentIsolationError as exc:
+            raise AgentDispatchRefused(f"agent isolation: {exc}") from exc
 
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
@@ -3529,6 +3540,16 @@ async def dispatch_agent(
         provider = get_provider(role, dispatch_config)
 
     if provider == "ollama" and system_prompt and project_dir:
+        # R3136-01: Ollama tool calls run in-process as the orchestrator user,
+        # never through the isolated launcher, so the flag refuses them.
+        refusal = isolation.unisolated_spawn_refusal(
+            "Ollama agent", isolation.OLLAMA_REFUSAL_REMEDY,
+            action=isolation.OLLAMA_REFUSAL_ACTION)
+        if refusal:
+            refused = _dispatch_refused_result(AgentDispatchRefused(refusal))
+            refused["result"] = "blocked"
+            refused["result_text"] = f"RESULT: blocked\nBLOCKERS: {refusal}"
+            return refused
         from ollama_agent import run_ollama_agent
         model = get_ollama_model(role, dispatch_config)
         base_url = get_ollama_base_url(dispatch_config)
