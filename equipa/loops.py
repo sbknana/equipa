@@ -2897,9 +2897,13 @@ _BACKSTOP_AFTER_PREFIX = (
     r"(?:-(?:severity|level|risk|rated|impact|priority)(?![\w-])[*_`]{0,3})?"
 )
 # No two "[ \t]*" touch, so a line padded with spaces is read in linear time.
+# The next word may be negated again ("No CRITICAL and no HIGH findings"):
+# it is a token of its own, so its own negation and what follows it decide
+# ("No CRITICAL and no HIGH: SQL injection" still blocks on HIGH).
 _BACKSTOP_LIST_GOES_ON = (
     r"[ \t]*(?:[/&+]|,(?:[ \t]*(?:or|and|nor|to)(?![\w-]))?"
     r"|(?:or|and|nor|to)(?![\w-]))[ \t]*(?:[*_`]{1,3}[ \t]*)?"
+    r"(?:(?:no|not|zero)[*_` \t]{1,6})?"
     r"(?:\d{1,4}[*_` \t]{1,6})?" + _BACKSTOP_SEVERITY_WORD
 )
 # A generic noun or verb, or a conjunction opening a reason ("rated LOW
