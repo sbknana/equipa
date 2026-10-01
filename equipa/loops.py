@@ -461,7 +461,16 @@ async def run_security_review(
         f"heading, bold lead-in, table cell, `Severity:` field (at any "
         f"list depth), list item that starts with a severity, or "
         f"parenthesis of a list item: each of those is counted as a "
-        f"finding. Mentioning a severity in ordinary prose is fine. "
+        f"finding. "
+        # Task #3154 (R3152-03): the same lower-case rule as
+        # prompts/security-reviewer.md; any other UPPER-case CRITICAL or
+        # HIGH is an unaccounted token and blocks the merge (task 3152).
+        f"In all other prose, the Summary included, write critical, high "
+        f"and medium in lower case (\"no critical findings\", \"0 high\", "
+        f"\"rated below high\"). Write CRITICAL and HIGH in UPPER case only "
+        f"as the severity label of a finding heading and on the single "
+        f"`## Counts` footer line: any other UPPER-case CRITICAL or HIGH, "
+        f"also in a negation, tally, comparison or table, BLOCKS the merge. "
         f"A finding heading still counts even when it is marked "
         f"fixed or resolved, so refer to already-fixed upstream findings "
         f"by their ID only, without a severity word. "

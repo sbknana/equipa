@@ -7,11 +7,15 @@ task 3152 (I3152-*), each with rows that fail before this task:
 * R3152-02: the seven R3149-02 review shapes with the MEDIUM word are
   untrusted again, as on main (ba6065a): "below" and a negation ending the
   line before no longer excuse a MEDIUM word;
+* R3152-03: the task text run_security_review gives every reviewer states
+  the prompt's lower-case rule instead of "a severity in prose is fine";
 
 Copyright 2026 Forgeborn
 """
 
 from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -73,6 +77,56 @@ def test_reconciled_medium_negations_still_merge(body, context):
     analysis = analyze(build_review(body, context))
     assert analysis.trusted, analysis
     assert not gate_blocks(build_review(body, context))
+
+
+# --- R3152-03: the per-task reviewer text states the lower-case rule --------------
+
+async def _reviewer_task_description(tmp_path) -> str:
+    """The task description run_security_review hands the reviewer."""
+    captured: list[str] = []
+
+    def capture_prompt(security_task, *args, **kwargs):
+        captured.append(security_task["description"])
+        return "prompt"
+
+    class _Command:
+        def __enter__(self):
+            return ["fake-cmd"]
+
+        def __exit__(self, *exc_info):
+            return False
+
+    async def fake_run_agent(cmd, timeout=None):
+        return {"success": True, "duration": 0.1, "result_text": "",
+                "errors": []}
+
+    worktree = tmp_path / "wt-3154"
+    worktree.mkdir()
+    task = {"id": 3154, "title": "t", "description": "d", "project_id": 1}
+    with patch("equipa.loops.run_agent", side_effect=fake_run_agent), \
+         patch("equipa.loops.build_cli_command", return_value=_Command()), \
+         patch("equipa.loops.build_system_prompt", side_effect=capture_prompt), \
+         patch("equipa.loops.get_role_turns", return_value=10), \
+         patch("equipa.loops.get_role_model", return_value="opus"), \
+         patch("equipa.loops.load_dispatch_config",
+               return_value={"security_review_timeout": 30}), \
+         patch("equipa.loops._extract_security_findings", return_value=[]), \
+         patch("equipa.loops._create_security_lessons", return_value=0):
+        await loops.run_security_review(task, str(worktree), {}, MagicMock(),
+                                        stable_project_dir=str(tmp_path))
+    assert captured, "run_security_review built no reviewer prompt"
+    return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_task_text_states_the_lower_case_rule(tmp_path):
+    description = await _reviewer_task_description(tmp_path)
+    assert "ordinary prose is fine" not in description
+    assert "write critical, high and medium in lower case" in description
+    assert ("Write CRITICAL and HIGH in UPPER case only as the severity label "
+            "of a finding heading and on the single `## Counts` footer line"
+            ) in description
+    assert "BLOCKS the merge" in description
 
 
 def test_a_counted_medium_finding_does_not_block_the_merge():
