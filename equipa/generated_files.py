@@ -302,9 +302,11 @@ async def _export_entries(
             continue
         mode, kind, blob, size = fields
         if kind != "blob" or mode not in _EXPORTABLE_MODES or not size.isdigit():
+            # N-01 (task #3146): the path is branch-authored and this text
+            # reaches GATE-AUDIT, so it is always quoted (no raw newline).
             return (
-                f"the merged tree's {path} is not a regular file (mode {mode}); "
-                f"the generator's inputs are not exported"
+                f"the merged tree's {path[:80]!r} is not a regular file "
+                f"(mode {mode}); the generator's inputs are not exported"
             )
         if _unsafe_export_path(path):
             return f"the merged tree's path {path[:80]!r} cannot be exported safely"
@@ -568,7 +570,9 @@ async def resolve_generated_conflicts(
     for path in sorted(conflicts):
         spec = generated_file(path)
         if spec is None:
-            return ConflictResolution(False, reason=f"{path} is not a generated file")
+            return ConflictResolution(
+                False, reason=f"{path[:80]!r} is not a generated file",
+            )
         specs.append(spec)
     generator_blobs: dict[str, str] = {}
     for spec in specs:

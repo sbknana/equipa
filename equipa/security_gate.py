@@ -839,6 +839,30 @@ def decide_merge_gate(
     )
 
 
+def escape_audit_text(text: str) -> str:
+    """``text`` with every line-breaking or control character escaped.
+
+    Audit messages embed branch-authored text (file names, git output). A raw
+    CR, LF, other C0/C1 control or a Unicode line/paragraph separator in it
+    could start what reads as a second, forged ``[GATE-AUDIT]`` line, or
+    rewrite the current one on a terminal (N-01, task #3146). Each such
+    character becomes a visible ``\\xNN`` / ``\\uNNNN`` escape, so the line
+    stays one line whatever the embedded text holds.
+    """
+    if text.isprintable():
+        return text
+    escaped: list[str] = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            escaped.append(f"\\x{code:02x}")
+        elif char in "  ":
+            escaped.append(f"\\u{code:04x}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
 def _gate_audit_log(
     message: str,
     *,
@@ -884,7 +908,10 @@ def _gate_audit_log(
         counts: finding counts dict, passed through to the persistence layer.
     """
     if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") != "0":
-        print(f"[GATE-AUDIT] {message}", file=sys.stderr, flush=True)
+        print(
+            f"[GATE-AUDIT] {escape_audit_text(message)}",
+            file=sys.stderr, flush=True,
+        )
 
     resolved_task_id = task_id if task_id is not None else _parse_task_id(message)
     if resolved_task_id is None:

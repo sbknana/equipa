@@ -412,7 +412,7 @@ def test_symlink_in_the_generator_inputs_is_refused(repo, capsys):
 
     assert status == "merge_failed"
     reason = guard.outcomes[TASK].reason
-    assert "equipa/linked.py is not a regular file (mode 120000)" in reason
+    assert "'equipa/linked.py' is not a regular file (mode 120000)" in reason
     _assert_failed_cleanly(repo, guard, main_sha, branch_sha)
     assert "event=generated-files-not-regenerated" in capsys.readouterr().err
 
