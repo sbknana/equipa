@@ -118,7 +118,7 @@ def test_prompt_text_naming_project_sources_is_not_a_widening():
 
 def test_argv_without_end_of_options_is_unchanged_in_shape():
     assert isolate_claude_argv(["claude", "-p", "x"]) == [
-        "claude", "-p", "x", "--setting-sources", "user",
+        "claude", "-p", "x", "--setting-sources", "",
         "--strict-mcp-config"]
 
 

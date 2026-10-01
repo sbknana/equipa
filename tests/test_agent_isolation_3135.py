@@ -526,7 +526,11 @@ def test_handshake_parsing() -> None:
 
 def _header(tmp_path: Path, **overrides) -> dict:
     header = {
-        "unit": UNIT, "argv": ["claude", "-p", "x"],
+        "unit": UNIT,
+        # What the orchestrator sends: isolate_claude_argv output (task 3153:
+        # the launcher refuses a claude argv that loads settings files).
+        "argv": ["claude", "-p", "x", "--setting-sources", "",
+                 "--strict-mcp-config"],
         "executable": sys.executable, "env": {"PATH": os.environ["PATH"]},
         "files": [], "workdir_sources": [],
         "identity": {"user": "equipa-agent", "orchestrator_uid": os.getuid(),
@@ -677,7 +681,8 @@ def _session_for(repo: dict[str, Path], tmp_path: Path,
     bundle = tmp_path / "handoff.bundle"
     handoff = isolation.build_handoff(
         ["claude", "-p", f"Work in: {repo['worktree']}", "--add-dir",
-         str(repo["worktree"])], str(repo["worktree"]),
+         str(repo["worktree"]), "--setting-sources", "",
+         "--strict-mcp-config"], str(repo["worktree"]),
         {"PATH": os.environ["PATH"]}, settings, UNIT, info, "tok", bundle)
     handoff.header["cgroup"]["path"] = f"/app.slice/{UNIT}.scope"  # set by establish()
     session = agent_launcher._IsolatedSession(handoff.header)

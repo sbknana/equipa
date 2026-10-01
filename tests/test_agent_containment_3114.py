@@ -657,7 +657,7 @@ def test_unsupported_platform_spawns_the_cli_directly(monkeypatch):
         ["claude", "-p", "x"], timeout=10, max_retries=1))
 
     # IR-01 (task 3134): the direct path also ignores project-scope settings.
-    assert seen["argv"] == ["claude", "-p", "x", "--setting-sources", "user",
+    assert seen["argv"] == ["claude", "-p", "x", "--setting-sources", "",
                             "--strict-mcp-config"]
     assert "start_new_session" not in seen["kwargs"]
     assert result["success"] is True

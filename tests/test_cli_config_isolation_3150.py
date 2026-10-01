@@ -362,7 +362,7 @@ def test_cli_still_gets_what_it_needs_to_authenticate_and_run(
     assert report["env"]["PATH"] == hostile_agent_env["PATH"]
     assert report["env"]["HOME"] == hostile_agent_env["HOME"]
     argv = report["argv"]
-    assert argv[argv.index("--setting-sources") + 1] == "user"
+    assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
 
 

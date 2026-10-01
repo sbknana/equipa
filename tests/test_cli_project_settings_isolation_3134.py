@@ -35,7 +35,7 @@ import equipa.config as equipa_config
 from equipa import agent_runner, cli_isolation, manager, reflexion, rlm_decompose
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ISOLATION = ["--setting-sources", "user", "--strict-mcp-config"]
+ISOLATION = ["--setting-sources", "", "--strict-mcp-config"]
 
 # The fake CLI records its argv and cwd, then models what the real CLI would
 # load from that cwd: project/local settings unless --setting-sources leaves
@@ -120,10 +120,12 @@ def fake_claude(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _assert_isolated(argv: list[str]) -> None:
-    """The argv loads user settings only and no MCP config but EQUIPA's."""
+    """The argv loads no settings file (task 3153: ``--setting-sources ""``,
+    the empty value as its own argument) and no MCP config but EQUIPA's."""
     assert cli_isolation.has_claude_cli_isolation(argv), argv
     index = argv.index("--setting-sources")
-    assert argv[index + 1] == "user"
+    assert argv[index + 1] == ""
+    assert not any(arg.startswith("--setting-sources=") for arg in argv)
     assert "--strict-mcp-config" in argv
     assert ".mcp.json" not in " ".join(argv)
 

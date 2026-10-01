@@ -61,7 +61,7 @@ def test_mutate_command_carries_the_isolation_flags(autoresearch):
     assert words[:4] == ["claude", "--print", "--model", "opus"]
     assert words[4:] == list(CLAUDE_CLI_ISOLATION_ARGS)
     assert tuple(autoresearch.CLAUDE_CLI_ISOLATION_ARGS) == (
-        "--setting-sources", "user", "--strict-mcp-config")
+        "--setting-sources", "", "--strict-mcp-config")
 
 
 @pytest.mark.parametrize("local", [True, False], ids=["local", "ssh"])
@@ -92,4 +92,4 @@ def test_mutate_prompt_runs_claude_isolated(autoresearch, monkeypatch, local):
     words = claude_calls[0]
     assert words[0] == "claude"
     assert "--strict-mcp-config" in words
-    assert words[words.index("--setting-sources") + 1] == "user"
+    assert words[words.index("--setting-sources") + 1] == ""
