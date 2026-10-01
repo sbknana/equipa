@@ -887,7 +887,10 @@ _MCP_REFUSED_ENV = frozenset({
     "PERL5LIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
     "JDK_JAVA_OPTIONS",
 })
-_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_")
+# UV_*: uvx reads its options from the environment too (UV_FIND_LINKS,
+# UV_PYTHON, UV_INDEX_URL, UV_CONFIG_FILE ...), past the option check
+# (RR3138-B).
+_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_", "UV_")
 # Python options accepted before the script or -m. -I is also required.
 # -W takes a value; -c, -m and -X are handled or refused separately.
 _PYTHON_ALLOWED_FLAGS = frozenset("IBbdEOPqRsSuvW")
@@ -1100,7 +1103,8 @@ def _check_mcp_launch(name: str, server: dict, config_path: Path,
     for key in env:
         if key in _MCP_REFUSED_ENV or key.startswith(_MCP_REFUSED_ENV_PREFIXES):
             raise refuse(f"sets {key} in its env, which makes the server load "
-                         f"extra code", f"Remove {key} from the env block.")
+                         f"extra code (or uvx install from elsewhere)",
+                         f"Remove {key} from the env block.")
     refuse_inside_project("command", command)
     if cwd is not None:
         refuse_inside_project("cwd", cwd)
@@ -1231,6 +1235,58 @@ _UVX_SHORT_VALUE_LETTERS = frozenset("wcbifpPC")
 # A file: URL names a local path wherever it appears.
 _FILE_URL = re.compile(r"file:(?://(?:localhost)?)?([^\s#?]+)")
 
+# uvx's own option table (uv 0.10, ``uvx --help``), used to read uvx's
+# options up to the tool name (RR3138-B). Everything after the tool name is
+# the tool's own arguments. An option missing from both sets (an alias such
+# as --constraint, or a newer uv option) is refused: without the table it is
+# unknown whether it takes a value, so the tool name cannot be found.
+_UVX_FLAG_OPTIONS = frozenset({
+    "--isolated", "--no-env-file", "--lfs", "--version", "--no-index",
+    "--upgrade", "--no-sources", "--reinstall", "--compile-bytecode",
+    "--no-build-isolation", "--no-build", "--no-binary", "--no-cache",
+    "--refresh", "--managed-python", "--no-managed-python",
+    "--no-python-downloads", "--quiet", "--verbose", "--native-tls",
+    "--offline", "--no-progress", "--no-config", "--help", "--preview",
+    "--no-preview",
+})
+_UVX_VALUE_OPTIONS = frozenset({
+    "--from", "--with", "--with-editable", "--with-requirements",
+    "--constraints", "--build-constraints", "--overrides", "--env-file",
+    "--python-platform", "--torch-backend", "--index", "--default-index",
+    "--index-url", "--extra-index-url", "--find-links", "--index-strategy",
+    "--keyring-provider", "--upgrade-package", "--resolution", "--prerelease",
+    "--fork-strategy", "--exclude-newer", "--exclude-newer-package",
+    "--no-sources-package", "--reinstall-package", "--link-mode",
+    "--config-setting", "--config-settings-package",
+    "--no-build-isolation-package", "--no-build-package",
+    "--no-binary-package", "--cache-dir", "--refresh-package", "--python",
+    "--color", "--allow-insecure-host", "--directory", "--project",
+    "--config-file",
+})
+_UVX_SHORT_FLAG_LETTERS = frozenset("VUnqvh")
+_UVX_SHORT_ALIASES = {
+    "w": "--with", "c": "--constraints", "b": "--build-constraints",
+    "i": "--index-url", "f": "--find-links", "P": "--upgrade-package",
+    "C": "--config-setting", "p": "--python",
+}
+# uvx options before the tool name whose value uv reads as a local file or
+# directory, or fetches: index and find-links locations, requirement and
+# constraint files, and directory options. Each value must be an absolute
+# path outside every project directory, or an https URL the operator listed
+# under mcp_uvx_trusted_urls (RR3138-B). A bare name (``-f wheels``) is
+# relative to the agent-writable project directory. uv splits these values
+# on whitespace (they share the parser of the space-separated UV_* forms),
+# so every word is judged.
+_UVX_LOCATION_OPTIONS = frozenset({
+    "--index", "--default-index", "--index-url", "--extra-index-url",
+    "--find-links", "--with-requirements", "--constraints",
+    "--build-constraints", "--overrides", "--env-file", "--cache-dir",
+    "--directory", "--project", "--config-file",
+})
+# dispatch_config.json key: https URLs (index or find-links locations,
+# requirement files) that uvx options may name (RR3138-B).
+MCP_UVX_TRUSTED_URLS_KEY = "mcp_uvx_trusted_urls"
+
 
 def _is_path_like(value: str) -> bool:
     return (value in (".", "..") or value.startswith(("/", "./", "../", "~"))
@@ -1335,6 +1391,125 @@ def _check_uvx_launch(args: list[str], refuse: Any,
                                  "Use a package from an index, or an absolute "
                                  "path outside every project directory.")
                 refuse_inside_project(f"uvx {option} path", expanded)
+    _check_uvx_options_before_tool(args, refuse, refuse_inside_project)
+
+
+def _uvx_trusted_urls() -> set[str]:
+    """https URLs listed under mcp_uvx_trusted_urls, without a trailing /.
+
+    An unreadable config or a malformed entry trusts nothing.
+    """
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("cannot read %s from the dispatch config: %s",
+                       MCP_UVX_TRUSTED_URLS_KEY, exc)
+        return set()
+    entries = config.get(MCP_UVX_TRUSTED_URLS_KEY, [])
+    if not isinstance(entries, list):
+        logger.warning("%s must be a list of https URLs; ignored",
+                       MCP_UVX_TRUSTED_URLS_KEY)
+        return set()
+    return {entry.rstrip("/") for entry in entries
+            if isinstance(entry, str) and entry.startswith("https://")
+            and not any(char.isspace() for char in entry)}
+
+
+def _uvx_options_before_tool(args: list[str]) -> list[tuple[str, str | None]]:
+    """``(long option, value)`` for each uvx option before the tool name.
+
+    Reads ``--opt value``, ``--opt=value``, ``-o value``, ``-ovalue``,
+    ``-o=value`` and clusters (``-qf value``) with uvx's option table. value
+    is None for a flag, and for a value option with nothing after it.
+
+    Raises:
+        ValueError: an option uvx's table does not list, or a flag given a
+            value; the message names it.
+    """
+    options: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            break  # the tool name (after ``--``): its own arguments follow
+        if arg.startswith("--"):
+            option, has_value, attached = arg.partition("=")
+            if option in _UVX_FLAG_OPTIONS and not has_value:
+                options.append((option, None))
+                index += 1
+                continue
+            if option not in _UVX_VALUE_OPTIONS:
+                raise ValueError(arg)
+            options.append((option, attached if has_value else following))
+            index += 1 if has_value else 2
+            continue
+        cluster = arg[1:]
+        consumed = 1
+        for position, letter in enumerate(cluster):
+            if letter in _UVX_SHORT_FLAG_LETTERS:
+                options.append((f"-{letter}", None))
+                continue
+            if letter not in _UVX_SHORT_ALIASES:
+                raise ValueError(arg)
+            attached = cluster[position + 1:]
+            if attached:
+                value = attached[1:] if attached.startswith("=") else attached
+            else:
+                value, consumed = following, 2
+            options.append((_UVX_SHORT_ALIASES[letter], value))
+            break
+        index += consumed
+    return options
+
+
+def _check_uvx_options_before_tool(args: list[str], refuse: Any,
+                                   refuse_inside_project: Any) -> None:
+    """uvx's own options, read with uvx's option table (RR3138-B).
+
+    _check_uvx_launch judges a short option by whether its value looks like
+    a path, because it scans the tool's arguments too (``srv -f json``).
+    That let ``uvx -f wheels srv`` through: a bare name after -f is a
+    find-links directory in the project. Here only uvx's options are read,
+    up to the tool name, so a short option is judged exactly like its long
+    form: each location value must be an absolute path outside every
+    project directory or a listed https URL.
+    """
+    try:
+        options = _uvx_options_before_tool(args)
+    except ValueError as exc:
+        raise refuse(f"passes uvx the option {str(exc)!r}, which is not in "
+                     f"uvx's option table, so the tool name cannot be found",
+                     "Use the long form of a listed uvx option, or remove it."
+                     ) from exc
+    trusted_urls: set[str] | None = None
+    for option, value in options:
+        if option not in _UVX_LOCATION_OPTIONS:
+            continue
+        words = (value or "").split()
+        if not words:
+            raise refuse(f"passes uvx {option} without a value",
+                         "Give it an absolute path.")
+        for word in words:
+            name, has_name, location = word.partition("=")
+            if (option in ("--index", "--default-index") and has_name
+                    and re.fullmatch(r"[A-Za-z0-9_.-]+", name)):
+                word = location  # --index name=<location>
+            if os.path.isabs(word):
+                refuse_inside_project(f"uvx {option} path", word)
+                continue
+            if trusted_urls is None:
+                trusted_urls = _uvx_trusted_urls()
+            if word.startswith("https://") and word.rstrip("/") in trusted_urls:
+                continue
+            raise refuse(
+                f"passes uvx {option} {word!r}, which is neither an absolute "
+                f"path nor an https URL listed under "
+                f"\"{MCP_UVX_TRUSTED_URLS_KEY}\" (a bare name is relative to "
+                f"the project directory)",
+                f"Use an absolute path outside every project directory, or "
+                f"add the https URL to \"{MCP_UVX_TRUSTED_URLS_KEY}\" in "
+                f"dispatch_config.json.")
 
 
 _DB_PATH_PLACEHOLDER = "/absolute/path/to/theforge.db"
