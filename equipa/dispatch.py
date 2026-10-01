@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
@@ -74,6 +75,7 @@ from equipa.git_ops import (
     git_toplevel_async,
     open_pinned_directory,
     pinned_repository,
+    pinned_repository_by_path,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -2934,7 +2936,7 @@ async def _pin_merge_repositories(
             f"{identity.work_tree} pinned at the snapshot"
         )
     if not fd_pinning_available():
-        return await _pin_merge_repositories_by_path(identity, worktree_dir)
+        return await _pin_merge_repositories_by_path(identity, work_tree, worktree_dir)
     pins = _MergePins([], [])
     try:
         common_fd = open_pinned_directory(identity.common_dir, identity.common_dir_id)
@@ -2947,8 +2949,10 @@ async def _pin_merge_repositories(
             git_dir_fd, identity.git_dir, identity.common_dir,
             linked=git_dir_fd != common_fd,
         )
+        # Keyed by the path the merge passes (F2, task #3155); its realpath
+        # was checked against the snapshot above.
         pins.repositories.append(pinned_repository(
-            identity.work_tree, git_dir_fd, common_fd,
+            work_tree, git_dir_fd, common_fd,
             git_dir=identity.git_dir, common_dir=identity.common_dir,
         ))
         if worktree_dir is not None:
@@ -2972,7 +2976,7 @@ async def _pin_merge_repositories(
 
 
 async def _pin_merge_repositories_by_path(
-    identity: RepositoryIdentity, worktree_dir: str | None,
+    identity: RepositoryIdentity, work_tree: str, worktree_dir: str | None,
 ) -> _MergePins:
     """:func:`_pin_merge_repositories` without ``/proc/self/fd``.
 
@@ -2986,15 +2990,15 @@ async def _pin_merge_repositories_by_path(
         None, identity.git_dir, identity.common_dir,
         linked=identity.git_dir_id != identity.common_dir_id,
     )
-    repositories = [PinnedGitRepository(
-        identity.work_tree, identity.git_dir, identity.common_dir,
+    repositories = [pinned_repository_by_path(
+        work_tree, git_dir=identity.git_dir, common_dir=identity.common_dir,
     )]
     if worktree_dir is not None:
         admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
         admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
         _check_commondir_file(None, admin_dir, identity.common_dir, linked=True)
-        repositories.append(PinnedGitRepository(
-            os.path.realpath(worktree_dir), admin_dir, identity.common_dir,
+        repositories.append(pinned_repository_by_path(
+            worktree_dir, git_dir=admin_dir, common_dir=identity.common_dir,
         ))
     return _MergePins(repositories, [])
 
@@ -3009,11 +3013,17 @@ def _check_commondir_file(
     """Refuse a ``commondir`` file in the pinned git dir that does not name
     ``common_dir``. A repository's own git dir (``linked=False``) has none;
     a linked worktree's names the common dir, usually relatively. Read
-    through ``git_dir_fd`` when given, else by path."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    through ``git_dir_fd`` when given, else by path.
+
+    F3 (task #3155): the agent can plant a FIFO or a directory under that
+    name. Only a regular file is read (``lstat`` first, then the opened
+    descriptor must be that same regular file); the open never blocks, and
+    every OS error is a :class:`PinnedRepositoryError`, so a plant blocks
+    the merge instead of hanging the event loop or crashing the run.
+    """
     target = "commondir" if git_dir_fd is not None else os.path.join(git_dir, "commondir")
     try:
-        fd = os.open(target, flags, dir_fd=git_dir_fd)
+        planted = os.stat(target, dir_fd=git_dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         if linked:
             raise PinnedRepositoryError(
@@ -3024,8 +3034,33 @@ def _check_commondir_file(
         raise PinnedRepositoryError(
             f"cannot read {git_dir}/commondir: {exc.strerror}"
         ) from exc
-    with os.fdopen(fd, "rb") as handle:
-        named = handle.read(_COMMONDIR_READ_LIMIT).decode("utf-8", "replace").rstrip("\r\n")
+    if not stat.S_ISREG(planted.st_mode):
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir is not a regular file "
+            f"(mode {stat.filemode(planted.st_mode)})"
+        )
+    if planted.st_size > _COMMONDIR_READ_LIMIT:
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir is {planted.st_size} bytes, longer than any "
+            f"common dir path git writes"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(target, flags, dir_fd=git_dir_fd)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (planted.st_dev, planted.st_ino):
+                raise PinnedRepositoryError(
+                    f"{git_dir}/commondir was replaced while it was being read"
+                )
+            content = os.read(fd, _COMMONDIR_READ_LIMIT + 1)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read {git_dir}/commondir: {exc.strerror}"
+        ) from exc
+    named = content.decode("utf-8", "replace").rstrip("\r\n")
     if not linked or os.path.normpath(os.path.join(git_dir, named)) != common_dir:
         raise PinnedRepositoryError(
             f"{git_dir}/commondir names {named[:200]!r}, not the pinned git "
@@ -3397,6 +3432,14 @@ async def _gated_merge_task(
             event="defensive-invariant-blocked",
         )
         return finish("blocked", f"defensive invariant: {exc}")
+    except PinnedRepositoryError as exc:
+        # F2 (task #3155): a work tree swapped during the merge, or a git
+        # call outside the pinned work trees, was refused before git ran.
+        guard.trip(
+            f"merge task={task_id}", await guard.current_sha(),
+            task_id=task_id, detail=str(exc),
+        )
+        return finish("blocked", guard.alert or str(exc))
     finally:
         pins.close()
     if merged:
