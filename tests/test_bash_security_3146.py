@@ -69,6 +69,8 @@ BASH_RUNS = [
     f"x='a[$({MARKER})]'; : \"$(( x ))\"",
     f"x='a[$({MARKER})]'; for ((i=x; i<0; i++)); do :; done",
     f"x='a[$({MARKER})]'; [[ x -eq 1 ]]",
+    f"x='a[$({MARKER})]'; [[ 1 -lt x ]]",
+    f"[[ -v 'a[$({MARKER})]' ]]",
     # Prompt expansion runs substitutions in the value itself.
     f"x='$({MARKER})'; : \"${{x@P}}\"",
     f"PS4='$({MARKER})'; set -x; :",
@@ -132,6 +134,8 @@ READ_ONLY_SEARCHES = [
     "unset GREP_OPTIONS; grep -n '$(' f",
     "LC_ALL=C grep -rn '`' docs/",
     "[ ! -f out.txt ] || grep -c '$(' out.txt",
+    "[[ -n \"$CI\" ]] || grep -rn '\\$(' scripts/",
+    "[[ -f Makefile ]] && grep -n '`' Makefile",
 ]
 
 

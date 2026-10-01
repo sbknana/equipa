@@ -877,7 +877,7 @@ _SUBSTITUTION_LOOKALIKE_RE = re.compile(
 # command with quotes and backslashes deleted (`l'e't` is `let`); a spurious
 # match only means a quoted look-alike is no longer trusted.
 _EVALUATES_TEXT_RE = re.compile(
-    r"\[\[|=\(|\$\[|\$\{!|\$\{#?(?:\w+|[@*])(?:\[|:(?![-=?+])|@P)"
+    r"=\(|\$\[|\$\{!|\$\{#?(?:\w+|[@*])(?:\[|:(?![-=?+])|@P)"
     r"|(?<![\w.-])(?:let|declare|typeset|local|readonly|export|readarray"
     r"|mapfile|HISTCMD|OPTIND|S?RANDOM|PS[0-4]|PROMPT_COMMAND)(?![\w.-])"
 )
@@ -897,6 +897,14 @@ _ARGUMENT_EVALUATOR_RE = re.compile(
 # bound keeps the scan linear; a longer literal expression simply counts.
 _ARITHMETIC_OPEN_RE = re.compile(r"\(\(")
 _LITERAL_ARITHMETIC_RE = re.compile(r"\(\([0-9\s+\-*/%<>=!&|^~?:,()]{0,256}?\)\)")
+
+# Inside `[[ ]]` only the arithmetic comparisons and -v/-R evaluate their
+# operands (`x='a[$(id)]'; [[ x -eq 1 ]]`); `[[ -n "$CI" ]]` does not. The
+# operators are parsed, never expanded, so a literal one must be present.
+# Searched over the whole command, so `grep -v` next to `[[` also counts.
+_DOUBLE_BRACKET_EVALUATING_OPERATOR_RE = re.compile(
+    r"(?<!\S)-(?:eq|ne|lt|le|gt|ge|v|R)(?!\S)"
+)
 
 _ARGUMENT_EVALUATORS = frozenset({"[", "read", "printf", "test", "wait", "getopts", "unset"})
 
@@ -997,8 +1005,8 @@ def _argument_evaluator(words: list[_ShellWord]) -> str | None:
             if _ASSIGNMENT_WORD_RE.match(word.text) or word.text in _COMMAND_PREFIX_WORDS:
                 continue
             at_command_name = False
-            # A lone `[` is the test builtin, not a glob.
-            if word.expands and word.raw != "[":
+            # A lone `[` or `[[` is a test command, not a glob.
+            if word.expands and word.raw not in ("[", "[["):
                 return f"the expanded command name {word.text!r}"
         if word.text != "[" and not _ARGUMENT_EVALUATOR_RE.search(word.text):
             continue
@@ -1027,6 +1035,8 @@ def _evaluating_construct(command: str) -> str | None:
     match = _EVALUATES_TEXT_RE.search(stripped)
     if match:
         return repr(match.group(0))
+    if "[[" in stripped and _DOUBLE_BRACKET_EVALUATING_OPERATOR_RE.search(stripped):
+        return "'[[' with an arithmetic or -v operator"
     for opening in _ARITHMETIC_OPEN_RE.finditer(stripped):
         if not _LITERAL_ARITHMETIC_RE.match(stripped, opening.start()):
             return "'((' naming a variable"
