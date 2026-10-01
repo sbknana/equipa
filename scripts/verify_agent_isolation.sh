@@ -34,8 +34,13 @@
 #     listens on loopback at 127.0.0.1 or at any host address, or to any
 #     --lan-target (the launcher also refuses while its own loopback and
 #     LAN listeners are reachable);
+#   * cannot send to the IPv4 limited broadcast address 255.255.255.255;
 #   * has a TMPDIR of its own on a filesystem other than /, and cannot
-#     write a shared /tmp or /var/tmp that lies on / (it could fill /).
+#     write a shared /tmp or /var/tmp that lies on / (it could fill /), nor
+#     any other world-writable directory on / (find / -xdev -perm -0002,
+#     plus /tmp/.X11-unix-style names below a /tmp it cannot list);
+#   * cannot hold more than AGENT_SHM_CAP_MB MiB in /dev/shm (files there
+#     outlive the unit).
 # As the orchestrator it also checks that the narrow sudoers rule is
 # installed, by its content (an ALL rule does not count), that the agent
 # user's nftables table (inet equipa_agent) is loaded, and that every
@@ -93,6 +98,161 @@ check_shared_tmp() {
         fi
     done
 }
+
+# No world-writable directory on the root filesystem $1 may be writable by
+# the agent (review SR3147-01): the tmpfiles ACL of step 1 on /tmp is not
+# recursive, and 1777 directories such as /tmp/.X11-unix and /var/crash lie
+# on / too. Candidates are every directory find(1) reports with the other-
+# write bit, run as the agent (it only sees what it can traverse), plus the
+# directories named in "$@" (well-known ones below a /tmp the agent may
+# enter but not list). Each candidate on $1's filesystem is probed with a
+# real file create, removed again at once: access(2) and the mode bits do
+# not tell the whole story (ACLs, read-only mounts).
+check_world_writable_dirs() {
+    local root="$1" root_device directory probe count=0
+    local -a candidates=() writable=()
+    local -A seen=()
+    shift
+    root_device="$(stat -c %d -- "$root" 2>/dev/null)"
+    if [ -z "$root_device" ]; then
+        fail "cannot stat the root filesystem $root"
+        return 0
+    fi
+    while IFS= read -r -d '' directory; do
+        candidates+=("$directory")
+    done < <(find "$root" -xdev -type d -perm -0002 -print0 2>/dev/null)
+    candidates+=("$@")
+    for directory in "${candidates[@]}"; do
+        [ -n "${seen["$directory"]:-}" ] && continue
+        seen["$directory"]=1
+        [ -d "$directory" ] && [ ! -L "$directory" ] || continue
+        [ "$(stat -c %d -- "$directory" 2>/dev/null)" = "$root_device" ] || continue
+        count=$((count + 1))
+        if probe="$(mktemp -p "$directory" .equipa-verify-ww.XXXXXXXX 2>/dev/null)"; then
+            rm -f -- "$probe"
+            writable+=("$directory")
+        fi
+    done
+    for directory in "${writable[@]}"; do
+        fail "agent can write the world-writable directory $directory on the root filesystem $root (it can fill it; close it with a tmpfiles.d ACL u:equipa-agent:---, docs/AGENT_ISOLATION.md step 1)"
+    done
+    if [ "${#writable[@]}" -eq 0 ]; then
+        pass "agent cannot write any of $count world-writable director(y/ies) on the root filesystem $root"
+    fi
+}
+
+# A directory in "$@" the agent may enter but not list hides the names below
+# it from find(1): only the well-known ones were probed.
+note_search_only_dirs() {
+    local directory
+    for directory in "$@"; do
+        if [ -d "$directory" ] && [ -x "$directory" ] && [ ! -r "$directory" ]; then
+            echo "NOTE agent may enter but not list $directory: only well-known names below it were probed (close it completely with u:equipa-agent:---, docs/AGENT_ISOLATION.md step 1)"
+        fi
+    done
+}
+
+# The agent may hold at most $2 MiB in the shared-memory directory $1
+# (review SR3147-01): /dev/shm is a host-wide tmpfs (half the RAM by
+# default) whose files outlive the unit, so units run one after another
+# could pile them up. Either the agent cannot create files there, or its
+# writes stop (quota, ENOSPC) by the cap. The probe writes at most $2 + 16
+# MiB in 1 MiB chunks and always removes its file.
+SHM_PROBE_PY='
+import errno, os, sys
+directory, cap_mb = sys.argv[1], int(sys.argv[2])
+limit_mb = cap_mb + 16
+try:
+    with open("/proc/self/cgroup", encoding="ascii") as handle:
+        cgroup = handle.read().strip().rpartition(":")[2]
+    with open("/sys/fs/cgroup" + cgroup + "/memory.max", encoding="ascii") as handle:
+        memory_max = handle.read().strip()
+except OSError:
+    memory_max = "max"
+if memory_max != "max" and int(memory_max) < (limit_mb + 64) * 1024 * 1024:
+    print("NOMEM", memory_max)
+    sys.exit(0)
+path = os.path.join(directory, ".equipa-verify-shm.%d" % os.getpid())
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except PermissionError:
+    print("CLOSED")
+    sys.exit(0)
+except OSError as exc:
+    print("ERROR", exc.strerror)
+    sys.exit(0)
+written = 0
+chunk = b"\0" * (1024 * 1024)
+try:
+    while written < limit_mb:
+        os.write(fd, chunk)
+        written += 1
+    print("WROTE", written)
+except OSError as exc:
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT, errno.EFBIG):
+        print("STOPPED", written)
+    else:
+        print("ERROR", exc.strerror)
+finally:
+    os.close(fd)
+    os.unlink(path)
+'
+
+check_shm_cap() {
+    local directory="$1" cap_mb="$2" kind value rest
+    if [ ! -d "$directory" ]; then
+        pass "no $directory on this host"
+        return 0
+    fi
+    read -r kind value rest < <(python3 -I -c "$SHM_PROBE_PY" "$directory" "$cap_mb" 2>&1)
+    case "$kind" in
+        CLOSED) pass "agent cannot create files in $directory" ;;
+        STOPPED)
+            if [ "$value" -le "$cap_mb" ]; then
+                pass "agent's writes to $directory stop at $value MiB (cap $cap_mb MiB)"
+            else
+                fail "agent's writes to $directory stop only at $value MiB, beyond the $cap_mb MiB cap (docs/AGENT_ISOLATION.md step 1)"
+            fi ;;
+        WROTE) fail "agent wrote $value MiB to $directory, beyond the $cap_mb MiB cap: its files outlive the unit (close it to the agent user or give it a per-user quota, docs/AGENT_ISOLATION.md step 1)" ;;
+        NOMEM) fail "cannot probe the $cap_mb MiB cap of $directory: the unit's memory.max ($value bytes) is too small for the probe" ;;
+        *) fail "could not probe $directory: $kind $value $rest" ;;
+    esac
+}
+
+# The IPv4 limited broadcast address 255.255.255.255 is neither a local
+# address nor in a denied range, so only an explicit rule rejects it
+# (review SR3147-02). One UDP datagram to the discard port with
+# SO_BROADCAST must be refused.
+BROADCAST_PROBE_PY='
+import socket, sys
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+try:
+    probe.sendto(b"equipa-verify", (sys.argv[1], 9))
+except OSError as exc:
+    print("REJECTED", exc.strerror)
+else:
+    print("SENT")
+finally:
+    probe.close()
+'
+
+check_broadcast() {
+    local address="${1:-255.255.255.255}" kind rest
+    read -r kind rest < <(python3 -I -c "$BROADCAST_PROBE_PY" "$address" 2>&1)
+    case "$kind" in
+        REJECTED) pass "agent cannot send to the broadcast address $address ($rest)" ;;
+        SENT) fail "agent can send to the broadcast address $address (the nftables rule must reject it for the agent user, docs/AGENT_ISOLATION.md step 4a)" ;;
+        *) fail "could not probe the broadcast address $address: $kind $rest" ;;
+    esac
+}
+
+# The cap check_shm_cap enforces (runbook step 1 uses the same number).
+AGENT_SHM_CAP_MB=256
+# Well-known world-writable directories below /tmp and on / that a /tmp the
+# agent may enter but not list would hide from find(1).
+WELL_KNOWN_WORLD_WRITABLE=(/tmp /var/tmp /var/crash /tmp/.X11-unix
+    /tmp/.ICE-unix /tmp/.XIM-unix /tmp/.font-unix /tmp/.Test-unix)
 
 # The unit's TMPDIR is its own (in the unit's state directory, mode 0700)
 # and lies on a filesystem other than the root filesystem $1, the
@@ -455,10 +615,14 @@ inside() {
     # covers every host address, whatever its range, the real services and
     # the operator's LAN targets.
     check_network "${host_addresses[*]}" "${deny_ports[*]}" "${lan_targets[*]}"
+    check_broadcast 255.255.255.255
 
-    # --- disk: a TMPDIR of its own, no shared /tmp on / (F8) ------------------
+    # --- disk: a TMPDIR of its own, no shared /tmp on / (F8, SR3147-01) ------
     check_unit_tmpdir /
     check_shared_tmp / /tmp /var/tmp
+    check_world_writable_dirs / "${WELL_KNOWN_WORLD_WRITABLE[@]}"
+    note_search_only_dirs /tmp /var/tmp
+    check_shm_cap /dev/shm "$AGENT_SHM_CAP_MB"
 
     # --- cannot signal the orchestrator --------------------------------------
     if [ -n "$orchestrator_pid" ]; then
