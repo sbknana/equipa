@@ -1583,6 +1583,8 @@ class ReviewCountAnalysis:
     severity of every finding heading the parser counted in the review as
     written. Blank-line folding keeps offsets, so they index the normalised
     review. The backstop credits these headings and nothing it re-derives.
+    Task 3152: the offset is that of the heading's severity label, so the
+    backstop credits that one token and no other word on the line.
     """
 
     verdict: str
@@ -2792,7 +2794,17 @@ def _rendered_review_text(text: str) -> str:
 # tells reviewers to write severity words in lower case everywhere except a
 # finding's label. LOW and INFO never block a merge and are not read.
 
-BACKSTOP_REASON = "unaccounted severity token"
+# Task 3152 (operator decision after four rounds in which an exemption
+# opened a hole): for the two severities that block a merge there are NO
+# exemptions. Every standalone UPPER-case CRITICAL or HIGH word in any view
+# of the review must be either the severity label of a finding heading the
+# parser counted, at the exact offset the parser attributed, or a label of
+# the final "## Counts" tally line written in the strict footer grammar
+# (_strict_footer). Anything else blocks with this reason and its line
+# numbers: no negation, tally, comparison, "below", soft-wrap, section,
+# finding-ID or "Overall risk" exemption. The exemptions below remain for
+# MEDIUM only, which never blocks a merge and is only logged.
+BACKSTOP_REASON = "unaccounted CRITICAL/HIGH token"
 # The severities whose count blocks a merge (dispatch._security_review_blocks
 # _merge and the defensive invariant: CRITICAL or HIGH above 0). An
 # unaccounted MEDIUM token is counted and logged under this reason instead
@@ -2836,6 +2848,9 @@ _BACKSTOP_LINE_BREAKS = str.maketrans(
     dict.fromkeys("\n\r\x0b\x0c\x1c\x1d\x1e\x85  ", " "),
 )
 _BACKSTOP_REPORTED_LINES = 20
+# Task 3152: everything from here to _BACKSTOP_LIST_JOINER_RE (tallies,
+# negations, lists, "Overall risk") excuses a MEDIUM word only. A CRITICAL or
+# HIGH word is never classified (see BACKSTOP_REASON).
 # Positions that cannot label a finding (task 3143, corpus item C). The words
 # before a token are read in a window of at most _BACKSTOP_CONTEXT characters
 # on its own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a
@@ -3645,8 +3660,10 @@ def _backstop_tokens(
 ) -> dict[tuple[int, str], int]:
     """(line, severity) -> number of standalone UPPER-case severity words.
 
-    Words in a tally whose count the review covers, in a negation, or in a
-    list one of those opens are left out (see ``_BACKSTOP_CONTEXT``).
+    Every CRITICAL and HIGH word is counted (task 3152: no exemptions for
+    the severities that block a merge). A MEDIUM word in a tally whose count
+    the review covers, in a negation, or in a list one of those opens is
+    left out (see ``_BACKSTOP_CONTEXT``).
     """
     found: dict[tuple[int, str], int] = {}
     newlines: list[int] | None = None
@@ -3662,7 +3679,8 @@ def _backstop_tokens(
         severity = _backstop_severity(match.group(0))
         line = bisect.bisect_left(newlines, start)
         stated = None
-        if classified < _BACKSTOP_CLASSIFY_LIMIT:
+        if (severity not in MERGE_BLOCKING_SEVERITIES
+                and classified < _BACKSTOP_CLASSIFY_LIMIT):
             classified += 1
             stated = _backstop_exempt_count(view, newlines, line, start, end,
                                             previous)
@@ -3793,37 +3811,125 @@ def _blank_like(match: re.Match[str]) -> str:
     return " " * len(match.group(0))
 
 
-def _backstop_masked(text: str) -> str:
-    """``text`` without the final footer's labels, the completion line and
-    the provenance line.
+# Task 3152: the strict footer grammar. The "## Counts" heading on a line of
+# its own, nothing but blank lines after it, then ONE line holding the five
+# "SEVERITY: n" fields in order, separated by "|", "," or ";" (or blanks),
+# with an optional table pipe at either end. Only such a final footer's
+# CRITICAL and HIGH labels are credited; a footer of any other shape (fields
+# over several lines, prose or emphasis on the tally line) credits none, so
+# its UPPER-case CRITICAL and HIGH labels block. Possessive blank runs keep
+# a long line linear.
+_STRICT_COUNTS_HEADING_RE = re.compile(r"##[ \t]++Counts[ \t]*+",
+                                       re.IGNORECASE)
+_STRICT_COUNTS_LINE_RE = re.compile(
+    r"[ \t]*+(?:\|[ \t]*+)?+"
+    + r"[ \t]*+(?:[|,;][ \t]*+)?+".join(
+        r"(?i:" + severity + r")[ \t]*+:[ \t]*+[0-9]{1,6}+(?![0-9])"
+        for severity in _REVIEW_SEVERITIES
+    )
+    + r"[ \t]*+(?:\|[ \t]*+)?+",
+)
+# The two marker lines the backstop blanks, exactly as the gate writes them:
+# a longer marker name ("EQUIPA-REVIEW-COMPLETE-HIGH") is read as text.
+_COMPLETION_MARKER_LINE_RE = re.compile(
+    r"[ \t]{0,3}<!--[ \t]*EQUIPA-REVIEW-COMPLETE(?:[ \t]+[0-9A-Fa-f]{1,64})?"
+    r"[ \t]*-->[ \t]*",
+)
+_PROVENANCE_MARKER_LINE_RE = re.compile(
+    r"[ \t]{0,3}<!--[ \t]*EQUIPA-REVIEWER-RUN:?(?:[ \t]*[0-9A-Fa-f]{1,64})?"
+    r"[ \t]*-->[ \t]*",
+)
+
+
+def _strict_footer(text: str, footer: _CountsFooter) -> bool:
+    """True when ``footer`` is written in the strict footer grammar."""
+    heading_end = text.find("\n", footer.start)
+    if heading_end == -1 or _STRICT_COUNTS_HEADING_RE.fullmatch(
+        text, footer.start, heading_end,
+    ) is None:
+        return False
+    first_label = footer.label_starts[0]
+    line_start = text.rfind("\n", 0, first_label) + 1
+    if text[heading_end:line_start].strip(" \t\n"):
+        return False
+    line_end = text.find("\n", first_label)
+    line_end = len(text) if line_end == -1 else line_end
+    return (footer.label_starts[-1] < line_end
+            and _STRICT_COUNTS_LINE_RE.fullmatch(text, line_start, line_end)
+            is not None)
+
+
+def _lowered_at(text: str, labels: list[tuple[int, str]]) -> str:
+    """``text`` with each (offset, severity) label lowered where ``text``
+    spells that severity in UPPER case at that offset."""
+    pieces: list[str] = []
+    copied = 0
+    for offset, severity in sorted(set(labels)):
+        end = offset + len(severity)
+        if offset < copied or text[offset:end] != severity:
+            continue
+        pieces.append(text[copied:offset])
+        pieces.append(severity.lower())
+        copied = end
+    if not pieces:
+        return text
+    pieces.append(text[copied:])
+    return "".join(pieces)
+
+
+def _backstop_masked(
+    text: str, label_offsets: tuple[tuple[int, str], ...] = (),
+) -> str:
+    """``text`` with the words the backstop credits lowered, and the
+    completion and provenance lines blanked.
+
+    Task 3152: credited are the CRITICAL and HIGH labels of the finding
+    headings the parser counted, each at the offset the parser attributed
+    (``label_offsets``, :attr:`ReviewCountAnalysis.heading_offsets`), and
+    the CRITICAL and HIGH labels of the final footer when it is written in
+    the strict footer grammar (:func:`_strict_footer`). Nothing else: a
+    second HIGH on a heading line, or on the tally line, is still read.
 
     The footer is the last one the parser's footer scan finds, with the
-    gate's marker-comment lines read as blank (R3137-03). Only its CRITICAL,
-    HIGH and MEDIUM labels are lowered, each where it is written in UPPER
-    case; anything else on the tally line is still read.
+    gate's marker-comment lines read as blank (R3137-03). Its MEDIUM label
+    is lowered whatever its shape (MEDIUM never blocks a merge).
     """
-    footers = _counts_footers(_STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text))
+    blanked = _STANDALONE_MARKER_COMMENT_RE.sub(_blank_like, text)
+    labels = [(offset, severity) for offset, severity in label_offsets
+              if severity in MERGE_BLOCKING_SEVERITIES]
+    footers = _counts_footers(blanked)
     if footers:
-        for severity, label_start in zip(_BACKSTOP_SEVERITIES,
-                                         footers[-1].label_starts):
-            label_end = label_start + len(severity)
-            if text[label_start:label_end] == severity:
-                text = text[:label_start] + severity.lower() + text[label_end:]
+        footer = footers[-1]
+        strict = _strict_footer(blanked, footer)
+        labels.extend(
+            (label_start, severity)
+            for severity, label_start in zip(_BACKSTOP_SEVERITIES,
+                                             footer.label_starts)
+            if strict or severity not in MERGE_BLOCKING_SEVERITIES
+        )
+    text = _lowered_at(text, labels)
     body = text.rstrip(" \t\n")
     last_start = body.rfind("\n") + 1
     last_line = body[last_start:]
-    if ("EQUIPA-REVIEW-COMPLETE" in last_line
-            and _STANDALONE_MARKER_COMMENT_RE.fullmatch(last_line)):
+    if _COMPLETION_MARKER_LINE_RE.fullmatch(last_line):
         text = text[:last_start] + " " * len(last_line) + text[len(body):]
     # Task 3149 (timing): the provenance line on top is blanked the same
     # way. It holds no word, and a review with no other HTML then needs no
     # view with its markup removed (half the reading of every such review).
     first_end = text.find("\n")
     first_end = len(text) if first_end == -1 else first_end
-    if ("EQUIPA-REVIEWER-RUN" in text[:first_end]
-            and _STANDALONE_MARKER_COMMENT_RE.fullmatch(text, 0, first_end)):
+    if _PROVENANCE_MARKER_LINE_RE.fullmatch(text, 0, first_end):
         text = " " * first_end + text[first_end:]
     return text
+
+
+def _shown_lines(lines: list[int]) -> str:
+    """The first _BACKSTOP_REPORTED_LINES of sorted ``lines``, and how many
+    more there are."""
+    shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
+    if len(lines) > _BACKSTOP_REPORTED_LINES:
+        shown += f" and {len(lines) - _BACKSTOP_REPORTED_LINES} more"
+    return shown
 
 
 def _severity_token_backstop(
@@ -3837,16 +3943,21 @@ def _severity_token_backstop(
 
     ``text`` is the normalised review. The whole body is read in two views:
     as written and with HTML comments and tags removed (which can join a
-    word); per line and severity the larger count is used. A token on a
-    finding heading of its severity is that finding's; every other one is
-    unaccounted. Per severity the review blocks (count-mismatch, reason
-    ``BACKSTOP_REASON`` with the 1-based line numbers) when any token is
-    unaccounted and the footer counts fewer findings than the headings plus
-    the unaccounted tokens. An untrusted analysis is returned unchanged.
+    word); per line and severity the larger count is used.
+
+    Task 3152: the CRITICAL and HIGH labels the parser counted, at their
+    exact offsets, and those of a strict final footer are lowered first
+    (:func:`_backstop_masked`). Any CRITICAL or HIGH word left in any view
+    is unaccounted, and the review blocks (count-mismatch, reason
+    ``BACKSTOP_REASON`` with the 1-based line numbers) whatever the footer
+    counts. A MEDIUM word on a counted MEDIUM heading or in its section is
+    that finding's; other MEDIUM words are counted and logged when the
+    footer counts fewer MEDIUM findings than the headings plus them (they
+    never block). An untrusted analysis is returned unchanged.
     """
     if not analysis.trusted:
         return analysis
-    masked = _backstop_masked(text)
+    masked = _backstop_masked(text, analysis.heading_offsets)
     views: list[tuple[str, list[int] | None]] = [
         (_backstop_normalized(masked), None),
     ]
@@ -3881,11 +3992,18 @@ def _severity_token_backstop(
                 tokens[key] = count
     if not tokens:
         return analysis
+    # Headings, sections and finding IDs excuse MEDIUM words only.
     headings = _counted_heading_lines(
         text if heading_text is None else heading_text,
-        analysis.heading_offsets,
+        tuple(heading for heading in analysis.heading_offsets
+              if heading[1] not in MERGE_BLOCKING_SEVERITIES),
     )
-    headings |= _folded_heading_lines(text, headings, analysis.header_counts)
+    medium_headings = {
+        severity: count
+        for severity, count in (analysis.header_counts or {}).items()
+        if severity not in MERGE_BLOCKING_SEVERITIES
+    }
+    headings |= _folded_heading_lines(text, headings, medium_headings)
     # A finding's section runs from its heading to the next heading of
     # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
     # "MEDIUM because ...") is that finding, not another one.
@@ -3901,7 +4019,9 @@ def _severity_token_backstop(
     masked_lines = masked.split("\n") if headings else []
     problems: list[tuple[str, str]] = []
     reported: dict[str, int] = {}
+    blocking_lines: set[int] = set()
     for severity in _BACKSTOP_SEVERITIES:
+        blocking = severity in MERGE_BLOCKING_SEVERITIES
         heading_lines = sorted(line for line, word in headings
                                if word == severity)
         identifiers = _finding_ids(masked_lines, heading_lines)
@@ -3922,24 +4042,25 @@ def _severity_token_backstop(
         # counted more (a resolved "- **[S1] HIGH ...: FIXED**" recap is
         # counted with no footer at all).
         footer_count = max(footer.get(severity, 0), covered.get(severity, 0))
-        if unaccounted and footer_count < counted + unaccounted:
+        if unaccounted and (blocking
+                            or footer_count < counted + unaccounted):
             lines.sort()
-            shown = ", ".join(str(line) for line in lines[:_BACKSTOP_REPORTED_LINES])
-            if len(lines) > _BACKSTOP_REPORTED_LINES:
-                shown += f" and {len(lines) - _BACKSTOP_REPORTED_LINES} more"
+            if blocking:
+                blocking_lines.update(lines)
             problems.append((severity,
-                f"{severity}={unaccounted} at line {shown} (footer "
-                f"{footer_count}, finding headings {counted})",
+                f"{severity}={unaccounted} at line {_shown_lines(lines)} "
+                f"(footer {footer_count}, finding headings {counted})",
             ))
             reported[severity] = counted + unaccounted
     if not problems:
         return analysis
     detail = "; ".join(problem for _, problem in problems)
-    if any(severity in MERGE_BLOCKING_SEVERITIES for severity, _ in problems):
+    if blocking_lines:
         return replace(
             analysis,
             verdict=REVIEW_VERDICT_COUNT_MISMATCH,
-            detail=f"{BACKSTOP_REASON}: {detail}",
+            detail=(f"{BACKSTOP_REASON} at line "
+                    f"{_shown_lines(sorted(blocking_lines))}: {detail}"),
         )
     # Task 3149 (R3143-06): only MEDIUM tokens are unaccounted, and MEDIUM
     # never blocks a merge. Untrusting the review for them blocked the merge
@@ -4148,7 +4269,9 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         line_end = text.find("\n", match.start())
         header_line = text[match.start():line_end if line_end != -1 else None]
-        heading_offsets.append((match.start(), match.group(1)))
+        # Task 3152: the offset of the severity label itself, the one token
+        # of the heading the backstop credits.
+        heading_offsets.append((match.start(1), match.group(1)))
         if _RESOLVED_FINDING_HEADER_RE.search(header_line):
             resolved_counts[match.group(1)] += 1
         else:
