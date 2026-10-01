@@ -280,9 +280,31 @@ TIMING_FAMILIES = {
     "generic_noun_tails": pad("No HIGH issues remain because the scan was"),
     "list_flood_with_commas": ["not LOW, " * (RB // 9)],
     # Uncounted heading-shaped lines (R3143-01; about 0.6 s on main too).
+    # Over _REVIEW_MAX_SEVERITY_LINES these block as too dense to parse; the
+    # "at_cap" families below hold just under the cap, padded to 200 KB.
     "uncounted_headings": pad(f"<p>### [S2] HIGH {E} x</p>"),
     "entity_headings": pad(f"&#35;## [S2] MEDIUM {E} x"),
 }
+
+
+def at_cap(template):
+    """200 KB in just under the cap's number of lines holding a severity
+    word, each padded with a run the line rules must read to its end."""
+    count = loops._REVIEW_MAX_SEVERITY_LINES - 20
+    room = RB // count - len(template.format(n=0, pad="").encode()) - 2
+    return [template.format(n=number, pad="y" * room)
+            for number in range(count)]
+
+
+TIMING_FAMILIES.update({
+    "at_cap_uncounted_headings": at_cap(f"<p>### [S{{n}}] HIGH {E} x {{pad}}</p>"),
+    "at_cap_entity_headings": at_cap(f"&#35;## [S{{n}}] MEDIUM {E} x {{pad}}"),
+    "at_cap_heading_labels": at_cap("<p>### [S{n}] HIGH: x {pad}</p>"),
+    "at_cap_tag_split_words": at_cap("<b>H</b>IGH <i>x</i> {pad}"),
+    "at_cap_lookalike_words": at_cap(
+        "\N{CYRILLIC CAPITAL LETTER EN WITH DESCENDER}IGH {pad}"),
+    "at_cap_list_labels": at_cap("- [S{n}] HIGH: x {pad}"),
+})
 
 
 def _best_of_two(text):

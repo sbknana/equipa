@@ -665,3 +665,53 @@ def test_tally_tail_grammar_reads_each_item_once(tail, accepted):
     assert tally is not None
     matched = loops._BACKSTOP_TALLY_TAIL_RE.fullmatch(tail, tally.end())
     assert (matched is not None) is accepted, tail
+
+
+# --- Timing: lines holding a severity word are capped ------------------------
+#
+# Each such line costs about 40 microseconds across the shape rules (as
+# written, from HTML, as rendered) and the backstop views. A 200 KB review of
+# 7,500 of them took 0.6 s on main. More than _REVIEW_MAX_SEVERITY_LINES (the
+# real reviews hold at most 138) is not parsed and blocks as incomplete.
+
+CAP = loops._REVIEW_MAX_SEVERITY_LINES
+
+
+def _flood(template, count):
+    return [template.format(number=number) for number in range(count)]
+
+
+@pytest.mark.parametrize("template", [
+    "<p>### [S{number}] HIGH " + E + " x</p>",
+    "low risk item {number}",
+    "Information note {number}.",
+])
+def test_review_over_the_severity_line_cap_blocks_as_incomplete(template):
+    analysis = analyze(zero_review(_flood(template, CAP + 1)))
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
+    assert "too dense to parse" in analysis.detail
+    assert "as written" in analysis.detail
+
+
+def test_severity_lines_spelled_only_when_rendered_count_toward_the_cap():
+    """A reference ("H&#73;GH") spells the word only once it is decoded."""
+    body = _flood("Item {number}: H&#73;GH.", CAP + 1)
+    assert not loops._severity_word_lines("\n".join(body))[1]
+    analysis = analyze(zero_review(body))
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
+    assert "as rendered" in analysis.detail
+
+
+def test_review_under_the_severity_line_cap_is_still_parsed():
+    """Just under the cap the gate reads every line as before."""
+    body = _flood("<p>### [S{number}] HIGH " + E + " x</p>", CAP - 50)
+    analysis = analyze(zero_review(body))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert loops.BACKSTOP_REASON in analysis.detail
+    lower = analyze(zero_review(_flood("a low risk item {number}", CAP - 50)))
+    assert lower.trusted, lower
+
+
+def test_severity_line_cap_is_far_above_any_real_review():
+    # 138 lines in the longest of the 870 distinct real reviews.
+    assert CAP >= 7 * 138
