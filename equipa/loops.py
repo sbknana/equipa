@@ -3267,9 +3267,17 @@ def _backstop_separator_mark(code_point: int) -> str:
         letter = _BACKSTOP_LETTER_FOLDS[code_point]
         return chr(_BACKSTOP_FOLD_MARK + ord(letter))
     category = unicodedata.category(char)
+    if (code_point in _BACKSTOP_DELETED_FILLERS
+            or category in _BACKSTOP_DELETED_CATEGORIES):
+        return _BACKSTOP_GONE_MARK
+    # Fast path: a character without a decomposition is read as itself
+    # (Hangul syllables decompose by rule, not by the table).
+    if (not unicodedata.decomposition(char)
+            and not 0xAC00 <= code_point <= 0xD7A3):
+        return char
     decomposed = unicodedata.normalize("NFKD", char)
-    # Deleted as written, or once decomposed (U+FF9E, a halfwidth sound
-    # mark, decomposes to a combining mark).
+    # Deleted once decomposed (U+FF9E, a halfwidth sound mark, decomposes
+    # to a combining mark).
     if all(ord(part) in _BACKSTOP_DELETED_FILLERS
            or unicodedata.category(part) in _BACKSTOP_DELETED_CATEGORIES
            for part in decomposed):
