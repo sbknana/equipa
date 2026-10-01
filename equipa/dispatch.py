@@ -3071,7 +3071,13 @@ async def _gated_merge_task(
                 event="merge-skipped",
             )
             return finish("blocked", f"default branch could not be pinned: {exc}")
-    if not await guard.verify(f"pre-gate task={task_id}", task_id=task_id):
+    # IND3132-01 (task #3146): the repository the gate is about to diff and
+    # merge in, and the task worktree, must be the one the guard pinned
+    # before any agent ran.
+    if not await guard.verify(
+        f"pre-gate task={task_id}", task_id=task_id,
+        directories=(git_dir, git_worktree_dir),
+    ):
         return finish("blocked", guard.alert or "default branch moved")
 
     # gate-01: pin the branch to ONE commit. The gate diffs that commit and
@@ -3154,7 +3160,10 @@ async def _gated_merge_task(
         )
         return finish("noop", "approved commit already on the default branch", merge_sha)
 
-    if not await guard.verify(f"pre-merge task={task_id}", task_id=task_id):
+    if not await guard.verify(
+        f"pre-merge task={task_id}", task_id=task_id,
+        directories=(git_dir, git_worktree_dir),
+    ):
         return finish("blocked", guard.alert or "default branch moved")
     shutdown_signal = shutdown_requested()
     if shutdown_signal is not None:

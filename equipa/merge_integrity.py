@@ -947,6 +947,98 @@ def reviewed_commit_refusal(record, branch_sha: str | None) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    """Which repository a project directory is, pinned before any agent runs.
+
+    IND3132-01 (task #3146): git finds the repository through whatever
+    ``.git`` entry it meets, and agents can replace that entry (a ``.git``
+    directory swapped for a ``gitdir:`` file pointing at a clone). Each
+    field is re-read at the gate and on every guard check; any difference
+    means the directory now names another repository.
+
+    * ``common_dir``: realpath of the git common dir, with its device and
+      inode (``common_dir_id``) so a directory swapped in at the same path is
+      seen too;
+    * ``git_entry``: the kind of ``<project_dir>/.git`` (``dir``, ``file``,
+      ``symlink``, ``other`` or ``absent`` for a nested project) and its
+      device and inode;
+    * ``default_head``: the default branch's commit read through the pinned
+      common dir itself, never through discovery from the project directory.
+    """
+
+    common_dir: str
+    common_dir_id: tuple[int, int]
+    git_entry: str
+    git_entry_id: tuple[int, int] | None
+    default_head: str
+
+    def describe(self) -> str:
+        return (
+            f"common_dir={self.common_dir} git_entry={self.git_entry} "
+            f"default_head={_short(self.default_head)}"
+        )
+
+
+def _git_entry(directory: str | os.PathLike) -> tuple[str, tuple[int, int] | None]:
+    """Kind and (device, inode) of ``directory/.git``, never following a link."""
+    try:
+        info = os.lstat(os.path.join(os.fspath(directory), ".git"))
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as exc:
+        return f"unreadable ({exc.strerror})", None
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "dir"
+    elif stat.S_ISREG(info.st_mode):
+        kind = "file"
+    else:
+        kind = "other"
+    return kind, (info.st_dev, info.st_ino)
+
+
+async def git_common_dir(directory: str | os.PathLike) -> str | None:
+    """Realpath of the git common dir git finds from ``directory``, or None."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--git-common-dir"], directory, timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[Merge-Integrity] no git common dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    return os.path.realpath(os.path.join(os.fspath(directory), printed))
+
+
+async def repository_identity(
+    directory: str | os.PathLike, default_branch: str,
+) -> RepositoryIdentity | str:
+    """The :class:`RepositoryIdentity` of ``directory``, or why it has none."""
+    common = await git_common_dir(directory)
+    if common is None:
+        return f"git cannot locate the repository of {os.fspath(directory)}"
+    try:
+        common_info = os.stat(common)
+    except OSError as exc:
+        return f"the git common dir {common} is unreadable: {exc.strerror}"
+    # Read through the common dir itself: git run inside a git directory
+    # uses that directory, whatever ``.git`` entry the project now has.
+    head = await resolve_commit(common, f"refs/heads/{default_branch}")
+    if head is None:
+        return (
+            f"default branch '{default_branch}' does not resolve in the git "
+            f"common dir {common}"
+        )
+    kind, entry_id = _git_entry(directory)
+    return RepositoryIdentity(
+        common, (common_info.st_dev, common_info.st_ino), kind, entry_id, head,
+    )
+
+
 @dataclass
 class DefaultBranchGuard:
     """Expected-SHA chain for the default branch over one dispatch run.
@@ -966,6 +1058,9 @@ class DefaultBranchGuard:
     merges: list[tuple[int, str, str]] = field(default_factory=list)
     # Per-task gate result for this run, written by dispatch._gated_merge_task.
     outcomes: dict[int, MergeOutcome] = field(default_factory=dict)
+    # IND3132-01 (task #3146): which repository project_dir was at the
+    # snapshot. Always set by snapshot(); only a hand-built guard has None.
+    identity: RepositoryIdentity | None = None
 
     @classmethod
     async def snapshot(cls, project_dir: str | os.PathLike) -> DefaultBranchGuard:
@@ -994,7 +1089,16 @@ class DefaultBranchGuard:
             raise MergeIntegrityError(
                 f"default branch '{default_branch}' does not resolve in {repo}"
             )
-        return cls(repo, default_branch, sha, sha)
+        identity = await repository_identity(repo, default_branch)
+        if isinstance(identity, str):
+            raise MergeIntegrityError(identity)
+        if identity.default_head != sha:
+            raise MergeIntegrityError(
+                f"default branch '{default_branch}' is {_short(sha)} in {repo} "
+                f"but {_short(identity.default_head)} in its git common dir "
+                f"{identity.common_dir}"
+            )
+        return cls(repo, default_branch, sha, sha, identity=identity)
 
     @property
     def tripped(self) -> bool:
@@ -1005,9 +1109,86 @@ class DefaultBranchGuard:
             self.project_dir, f"refs/heads/{self.default_branch}",
         )
 
-    async def verify(self, stage: str, *, task_id: int | None = None) -> bool:
-        """True while the default branch is still at the expected SHA."""
+    async def repository_problem(
+        self, *directories: str | os.PathLike | None,
+    ) -> str | None:
+        """Why ``project_dir`` (or one of ``directories``) is no longer the
+        pinned repository, or None.
+
+        ``project_dir`` must keep every :class:`RepositoryIdentity` field
+        apart from ``default_head``, and the default branch read through the
+        pinned common dir must be the commit git finds from ``project_dir``
+        (where it points is the SHA chain's check). Each extra directory (the
+        gate's repository root, the task worktree) must use the same common
+        dir. A guard built without an identity checks nothing here.
+        """
+        pinned = self.identity
+        if pinned is None:
+            return None
+        problem = await self._identity_change()
+        if problem is not None:
+            return problem
+        # A plain move of the branch is the SHA chain's business (verify);
+        # here the two reads must name the same commit, or git is reading
+        # the branch from somewhere other than the pinned common dir.
+        pinned_head = await resolve_commit(
+            pinned.common_dir, f"refs/heads/{self.default_branch}",
+        )
+        discovered_head = await self.current_sha()
+        if pinned_head != discovered_head:
+            return (
+                f"default branch '{self.default_branch}' is "
+                f"{_short(pinned_head)} in the pinned git common dir "
+                f"{pinned.common_dir} but {_short(discovered_head)} from "
+                f"{self.project_dir}"
+            )
+        for directory in directories:
+            if directory is None:
+                continue
+            common = await git_common_dir(directory)
+            if common != pinned.common_dir:
+                return (
+                    f"{os.fspath(directory)} uses the repository at "
+                    f"{common or 'none'}, not the pinned {pinned.common_dir}"
+                )
+        return None
+
+    async def _identity_change(self) -> str | None:
+        """Which pinned identity field of ``project_dir`` changed, or None.
+
+        ``default_head`` moves with legitimate merges and is checked against
+        the expected SHA by the callers instead.
+        """
+        pinned = self.identity
+        if pinned is None:
+            return None
+        current = await repository_identity(self.project_dir, self.default_branch)
+        if isinstance(current, str):
+            return current
+        for name in ("common_dir", "common_dir_id", "git_entry", "git_entry_id"):
+            if getattr(current, name) != getattr(pinned, name):
+                return (
+                    f"repository identity of {self.project_dir} changed: {name} "
+                    f"was {getattr(pinned, name)} at the snapshot, now "
+                    f"{getattr(current, name)}"
+                )
+        return None
+
+    async def verify(
+        self,
+        stage: str,
+        *,
+        task_id: int | None = None,
+        directories: tuple[str | os.PathLike | None, ...] = (),
+    ) -> bool:
+        """True while the default branch is still at the expected SHA and
+        ``project_dir`` (plus ``directories``) is still the pinned repository.
+        """
         if self.tripped:
+            return False
+        problem = await self.repository_problem(*directories)
+        if problem is not None:
+            self.trip(stage, await self.current_sha(), task_id=task_id, detail=problem)
             return False
         current = await self.current_sha()
         if current == self.expected_sha:
@@ -1050,6 +1231,15 @@ class DefaultBranchGuard:
         merge, and trips the guard.
         """
         if self.tripped:
+            return False
+        # IND3132-01 (task #3146): the merge must have landed in the pinned
+        # repository, read through its common dir, not by discovery.
+        problem = await self.repository_problem()
+        if problem is not None:
+            self.trip(
+                f"post-merge task={task_id}", await self.current_sha(),
+                task_id=task_id, detail=problem,
+            )
             return False
         current = await self.current_sha()
         previous = self.expected_sha
@@ -1140,15 +1330,32 @@ class DefaultBranchGuard:
             return False
         return True
 
-    def trip(self, stage: str, actual: str | None, *, task_id: int | None = None) -> None:
-        """Record an unexpected default-branch movement and raise the alarm."""
+    def trip(
+        self,
+        stage: str,
+        actual: str | None,
+        *,
+        task_id: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Record an unexpected default-branch movement and raise the alarm.
+
+        ``detail`` (task #3146) explains a repository-identity change: the
+        project directory no longer names the pinned repository.
+        """
         if self.tripped:
             return
-        self.alert = (
-            f"default branch '{self.default_branch}' moved outside the "
-            f"orchestrator's merges (stage={stage}): expected "
-            f"{self.expected_sha} but found {actual or 'MISSING'}"
-        )
+        if detail is not None:
+            self.alert = (
+                f"repository of default branch '{self.default_branch}' changed "
+                f"(stage={stage}): {detail}"
+            )
+        else:
+            self.alert = (
+                f"default branch '{self.default_branch}' moved outside the "
+                f"orchestrator's merges (stage={stage}): expected "
+                f"{self.expected_sha} but found {actual or 'MISSING'}"
+            )
         banner = "!" * 72
         print(f"\n{banner}")
         print(f"  [Merge-Integrity] ALERT: {self.alert}")
@@ -1159,11 +1366,16 @@ class DefaultBranchGuard:
         )
         print(banner)
         logger.error("[Merge-Integrity] ALERT: %s", self.alert)
+        event = (
+            "repository-identity-changed" if detail is not None
+            else "default-branch-moved"
+        )
         _gate_audit_log(
             f"task={task_id if task_id is not None else '-'} "
-            f"event=default-branch-moved branch={self.default_branch} "
+            f"event={event} branch={self.default_branch} "
             f"stage={stage} expected={self.expected_sha} "
-            f"actual={actual or 'MISSING'} baseline={self.baseline_sha}",
+            f"actual={actual or 'MISSING'} baseline={self.baseline_sha}"
+            + (f" reason={detail}" if detail is not None else ""),
             task_id=task_id,
-            event="default-branch-moved",
+            event=event,
         )
