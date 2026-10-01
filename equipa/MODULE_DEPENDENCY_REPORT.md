@@ -8,14 +8,14 @@
 
 ## Summary
 
-The `equipa/` package contains **60 Python modules** totaling **49,204 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **60 Python modules** totaling **49,974 lines** of code across **13 dependency layers** (L0–L12). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
 | Module | Lines | Layer | Imports (equipa) | Late Imports | Exports |
 |---|---:|:---:|---|---|---:|
 | `abort_controller.py` | 218 | L0 | — | — | 3 |
-| `agent_launcher.py` | 1207 | L0 | — | — | 24 |
+| `agent_launcher.py` | 1373 | L0 | — | — | 25 |
 | `bash_security.py` | 3954 | L0 | — | — | 5 |
 | `classifier.py` | 167 | L0 | — | — | 3 |
 | `cli_isolation.py` | 136 | L0 | — | — | 10 |
@@ -35,7 +35,7 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `scaffold.py` | 633 | L0 | — | `db.py` | 8 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 349 | L1 | `constants.py` | `parsing.py` | 8 |
-| `config.py` | 523 | L1 | `constants.py` | — | 23 |
+| `config.py` | 589 | L1 | `constants.py` | — | 26 |
 | `db.py` | 798 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
 | `hooks/__init__.py` | 441 | L1 | `hooks/dispatcher.py` | `config.py`, `env_loader.py` | 17 |
 | `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
@@ -53,7 +53,7 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
 | `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
 | `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
-| `isolation.py` | 2284 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 65 |
+| `isolation.py` | 2802 | L3 | `agent_launcher.py`, `config.py`, `constants.py`, `env_loader.py`, `git_ops.py` | — | 77 |
 | `mcp_server.py` | 967 | L3 | `config.py`, `constants.py`, `tasks.py` | — | 13 |
 | `merge_safety.py` | 293 | L3 | `db.py`, `git_ops.py` | — | 13 |
 | `monitoring.py` | 894 | L3 | `constants.py`, `git_ops.py`, `hooks/__init__.py` | `parsing.py` | 12 |
@@ -70,12 +70,12 @@ The `equipa/` package contains **60 Python modules** totaling **49,204 lines** o
 | `preflight.py` | 379 | L7 | `agent_runner.py`, `constants.py`, `env_loader.py`, `isolation.py`, `output.py` | `prompts.py`, `roles.py` | 3 |
 | `loops.py` | 4642 | L8 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `merge_integrity.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 23 |
 | `manager.py` | 699 | L9 | `agent_runner.py`, `constants.py`, `db.py`, `git_ops.py`, `loops.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `prompts.py`, `roles.py`, `single_agent_guard.py`, `tasks.py` | `dispatch.py` | 18 |
-| `dispatch.py` | 4338 | L10 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `generated_files.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 30 |
-| `cli.py` | 2441 | L11 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `merge_integrity.py`, `merge_safety.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py` | 21 |
+| `dispatch.py` | 4348 | L10 | `agent_runner.py`, `config.py`, `constants.py`, `db.py`, `generated_files.py`, `git_ops.py`, `hooks/__init__.py`, `isolation.py`, `lessons.py`, `loops.py`, `manager.py`, `merge_integrity.py`, `merge_safety.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `role_resolver.py`, `scaffold.py` | 30 |
+| `cli.py` | 2451 | L11 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `isolation.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `merge_integrity.py`, `merge_safety.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py` | 21 |
 | `__init__.py` | 58 | L12 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L12 | `cli.py` | — | 0 |
 
-**Total:** 49,204 lines | 889 public exports
+**Total:** 49,974 lines | 905 public exports
 
 ## Modules by Layer
 
@@ -150,13 +150,13 @@ How many other `equipa` modules each module imports.
 | `bash_security.py` | 0 | 0 | **0** |
 | `checkpoints.py` | 1 | 1 | **2** |
 | `classifier.py` | 0 | 0 | **0** |
-| `cli.py` | 27 | 4 | **31** |
+| `cli.py` | 28 | 4 | **32** |
 | `cli_isolation.py` | 0 | 0 | **0** |
 | `config.py` | 1 | 0 | **1** |
 | `config_versions.py` | 2 | 0 | **2** |
 | `constants.py` | 0 | 0 | **0** |
 | `db.py` | 1 | 4 | **5** |
-| `dispatch.py` | 21 | 4 | **25** |
+| `dispatch.py` | 22 | 4 | **26** |
 | `embeddings.py` | 2 | 2 | **4** |
 | `env_loader.py` | 0 | 1 | **1** |
 | `flows.py` | 2 | 1 | **3** |
