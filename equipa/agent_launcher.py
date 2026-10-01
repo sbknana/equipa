@@ -523,6 +523,50 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
 # --- Isolated mode (task 3135) --------------------------------------------------
 
 
+# R3150-07: inside a unit the CLI's config directory (<unit home>/.claude) is
+# created by, and writable to, the agent user, so nothing on the filesystem
+# stops the agent writing a settings.json there mid-run. Only the CLI's own
+# ``--setting-sources ""`` (no file-based settings source) makes it ignore
+# that file; the gate arrives through ``--settings``, a flag source. This
+# launcher runs with ``python -I`` and imports nothing from equipa, so it
+# repeats the check equipa.cli_isolation.has_claude_cli_isolation makes.
+_SETTING_SOURCES_FLAG = "--setting-sources"
+_CLAUDE_CLI_NAMES = frozenset({"claude", "claude.exe", "claude.cmd"})
+
+
+def _names_claude_cli(path: str) -> bool:
+    return os.path.basename(path).lower() in _CLAUDE_CLI_NAMES
+
+
+def setting_sources_refusal(executable: str, argv: Sequence[str]) -> str | None:
+    """Why a Claude CLI ``argv`` may not start inside a unit, or None.
+
+    Applies when ``executable`` or ``argv[0]`` names the Claude CLI. Every
+    ``--setting-sources`` given as an option (before ``--``) must have the
+    empty value, and there must be at least one; a missing value counts as
+    a refusal. Other executables (the tests' fakes) are not judged.
+    """
+    if not (_names_claude_cli(executable)
+            or (argv and _names_claude_cli(argv[0]))):
+        return None
+    options = list(argv)
+    if "--" in options:
+        options = options[:options.index("--")]
+    values: list[str | None] = []
+    for index, arg in enumerate(options):
+        if arg == _SETTING_SOURCES_FLAG:
+            values.append(options[index + 1] if index + 1 < len(options)
+                          else None)
+        elif arg.startswith(_SETTING_SOURCES_FLAG + "="):
+            values.append(arg.split("=", 1)[1])
+    if values and all(value == "" for value in values):
+        return None
+    return (f"the Claude CLI argv must pass {_SETTING_SOURCES_FLAG} \"\" "
+            f"(got {values!r}): the unit's config directory is writable by "
+            f"the agent, so a settings.json written there mid-run would be "
+            f"loaded and its hooks would run outside the Bash gate")
+
+
 class IsolationRefused(Exception):
     """Isolation does not hold or the handoff is unusable; nothing starts."""
 
@@ -1139,7 +1183,15 @@ class _IsolatedSession:
 
     def materialize_argv(self) -> list[str]:
         """The CLI argv with worktree paths rewritten and every handed-over
-        file written into the private files directory."""
+        file written into the private files directory.
+
+        Raises:
+            IsolationRefused: a Claude CLI argv would load a file-based
+                settings source (see :func:`setting_sources_refusal`).
+        """
+        refusal = setting_sources_refusal(self.executable, self.argv)
+        if refusal is not None:
+            raise IsolationRefused(refusal)
         argv = [self._substitute(arg) for arg in self.argv]
         for entry in self.files:
             path = self.state_dir / "files" / entry["name"]

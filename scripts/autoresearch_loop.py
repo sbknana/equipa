@@ -50,7 +50,7 @@ try:
     )
     from equipa.isolation import unisolated_spawn_refusal
 except ImportError:
-    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
+    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "",
                                  "--strict-mcp-config")
     # Never reached: unisolated_spawn_refusal below refuses every call when
     # equipa cannot be imported. Both fail closed if that ever changes.

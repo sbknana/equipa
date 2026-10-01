@@ -14,22 +14,26 @@ CLI loads project-scope configuration from its cwd:
   plant instructions for later tester and reviewer runs;
 * ``.mcp.json``: adds MCP servers that start in the project directory.
 
-``--setting-sources user`` loads user settings only (the ``--settings`` file
-EQUIPA passes is a flag source and is always loaded), and
-``--strict-mcp-config`` limits MCP servers to the ones EQUIPA passes with
-``--mcp-config`` (none when it passes none). Independent review IR-01 (task
-3127 fix-forward, task 3134) reproduced the gate bypass with the real CLI and
-confirmed these two flags close it.
+``--setting-sources ""`` loads no settings file at all (the ``--settings``
+file EQUIPA passes is a flag source and is always loaded, so the PreToolUse
+gate still applies), and ``--strict-mcp-config`` limits MCP servers to the
+ones EQUIPA passes with ``--mcp-config`` (none when it passes none).
+Independent review IR-01 (task 3127 fix-forward, task 3134) reproduced the
+project-settings gate bypass with the real CLI and confirmed these flags
+close it.
 
-``--setting-sources user`` still loads the USER scope, and without agent
-isolation that is the operator's ``~/.claude``, which agents can write
-(RR3144-A): an ``env`` block (``SHELL``, ``BASH_FUNC_<name>%%``) or a user
-PreToolUse hook that answers ``updatedInput`` ran a command the gate had
-judged harmless. Every CLI run therefore gets its own empty, EQUIPA-owned
-``CLAUDE_CONFIG_DIR`` (:func:`fresh_claude_config_dir`), so no user-scope
-settings, hooks, env blocks, CLAUDE.md or MCP servers exist for it. The CLI
-authenticates from ``CLAUDE_CODE_OAUTH_TOKEN`` in its environment, which
-needs nothing in the config directory.
+The USER scope was loaded until task 3153. Without agent isolation it was
+the operator's ``~/.claude``, which agents can write (RR3144-A): an ``env``
+block (``SHELL``, ``BASH_FUNC_<name>%%``) or a user PreToolUse hook that
+answers ``updatedInput`` ran a command the gate had judged harmless. Every
+CLI run therefore gets its own empty, EQUIPA-owned ``CLAUDE_CONFIG_DIR``
+(:func:`fresh_claude_config_dir`), so no user-scope CLAUDE.md or MCP servers
+exist for it. That directory is still writable by the run (the CLI writes
+its state there and the agent shares its UID), and the CLI re-read a
+``settings.json`` written into it mid-run (R3150-01); with the empty
+setting-sources value it no longer reads one. The CLI authenticates from
+``CLAUDE_CODE_OAUTH_TOKEN`` in its environment, which needs nothing in the
+config directory.
 
 This module has no EQUIPA imports so standalone scripts (forgesmith) can use
 it without pulling in the orchestrator.
@@ -38,15 +42,27 @@ it without pulling in the orchestrator.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import stat
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 
-# The only setting source a Claude CLI run started by EQUIPA may load.
-ALLOWED_SETTING_SOURCES = "user"
+_LOG = logging.getLogger(__name__)
+
+# The setting sources a Claude CLI run started by EQUIPA may load: none.
+# ``--setting-sources ""`` (the empty value as its own argv element) loads no
+# file-based scope at all: no user, project or local settings.json. The
+# ``--settings`` file EQUIPA passes is a flag source the CLI always loads, so
+# the PreToolUse gate still applies. Loading ``user`` bought nothing once the
+# per-run config directory is empty, and it kept the CLI's settings watcher
+# alive: a settings.json the agent writes into its own config directory
+# mid-run was hot-loaded and its hooks ran outside the gate (R3150-01).
+ALLOWED_SETTING_SOURCES = ""
 SETTING_SOURCES_FLAG = "--setting-sources"
 STRICT_MCP_FLAG = "--strict-mcp-config"
 CLAUDE_CLI_ISOLATION_ARGS: tuple[str, ...] = (
@@ -73,14 +89,16 @@ def _option_args(cmd: Sequence[str]) -> list[str]:
     return args
 
 
-def _setting_sources_values(cmd: Sequence[str]) -> list[str]:
+def _setting_sources_values(cmd: Sequence[str]) -> list[str | None]:
     """Every value given to ``--setting-sources`` (both spellings) as an
-    option, i.e. before ``--``."""
+    option, i.e. before ``--``. A flag with no value after it is None, never
+    the (allowed) empty string."""
     options = _option_args(cmd)
-    values: list[str] = []
+    values: list[str | None] = []
     for index, arg in enumerate(options):
         if arg == SETTING_SOURCES_FLAG:
-            values.append(options[index + 1] if index + 1 < len(options) else "")
+            values.append(options[index + 1] if index + 1 < len(options)
+                          else None)
         elif arg.startswith(SETTING_SOURCES_FLAG + "="):
             values.append(arg.split("=", 1)[1])
     return values
@@ -109,19 +127,24 @@ def mcp_config_values(cmd: Sequence[str]) -> list[str]:
 
 
 def isolate_claude_argv(cmd: Sequence[str]) -> list[str]:
-    """``cmd`` with project-scope settings, CLAUDE.md and .mcp.json disabled.
+    """``cmd`` with every file-based settings source, CLAUDE.md and
+    .mcp.json disabled.
 
-    Adds ``--setting-sources user`` and ``--strict-mcp-config`` when they
-    are missing as options: at the end, or just before a ``--``, after which
-    they would be prompt text (RR-05). An argv that already has them is
-    returned unchanged (as a new list). The caller's own ``--mcp-config`` is
-    kept: with the strict flag it is the only MCP configuration the CLI
-    reads.
+    Adds ``--setting-sources ""`` (the empty value as its own argument) and
+    ``--strict-mcp-config`` when they are missing as options: at the end, or
+    just before a ``--``, after which they would be prompt text (RR-05). An
+    argv that already has them is returned unchanged (as a new list). The
+    caller's own ``--mcp-config`` and ``--settings`` are kept: with the
+    strict flag the former is the only MCP configuration the CLI reads, and
+    the latter is a flag source the empty value does not switch off.
 
     Raises:
-        ValueError: ``cmd`` already asks for a setting source other than
-            ``user`` (for example ``project``), which would re-open the
-            bypass. Refused rather than silently rewritten.
+        ValueError: ``cmd`` already asks for a setting source (``user``,
+            ``project``, ``local``) or gives the flag no value. Any of them
+            re-opens a bypass: project settings live in the agent-writable
+            cwd, and user settings in the agent-writable per-run config
+            directory, which the CLI re-reads mid-run (R3150-01). Refused
+            rather than silently rewritten.
     """
     isolated = list(cmd)
     sources = _setting_sources_values(isolated)
@@ -129,8 +152,10 @@ def isolate_claude_argv(cmd: Sequence[str]) -> list[str]:
     if widened:
         raise ValueError(
             f"Claude CLI argv asks for setting sources {widened!r}; EQUIPA "
-            f"runs may load only {ALLOWED_SETTING_SOURCES!r} because project "
-            f"settings in the agent-writable cwd can disable the Bash gate"
+            f"runs pass {SETTING_SOURCES_FLAG} {ALLOWED_SETTING_SOURCES!r} "
+            f"(no settings files) because project settings in the "
+            f"agent-writable cwd and user settings in the agent-writable "
+            f"config directory can disable the Bash gate"
         )
     missing: list[str] = []
     if not sources:
@@ -143,8 +168,9 @@ def isolate_claude_argv(cmd: Sequence[str]) -> list[str]:
 
 
 def has_claude_cli_isolation(cmd: Sequence[str]) -> bool:
-    """True when ``cmd`` loads user settings only and strict MCP config, as
-    options (before any ``--``)."""
+    """True when ``cmd`` loads no settings file (every ``--setting-sources``
+    has the empty value) and strict MCP config, as options (before any
+    ``--``)."""
     sources = _setting_sources_values(cmd)
     return (bool(sources)
             and all(value == ALLOWED_SETTING_SOURCES for value in sources)
@@ -241,10 +267,14 @@ def create_run_config_dir(parent: str | None = None) -> str:
     config directory (settings.json, hooks, CLAUDE.md, .claude.json with MCP
     servers) is exactly what must not be loaded.
 
+    The first call for a ``parent`` in this process also removes the stale
+    directories crashed runs left there (:func:`sweep_stale_run_config_dirs`).
+
     Raises:
         RunConfigDirError: the directory could not be created, or is not
             what mkdtemp promised.
     """
+    _sweep_parent_once(parent)
     try:
         path = tempfile.mkdtemp(prefix=RUN_CONFIG_DIR_PREFIX, dir=parent)
     except OSError as exc:
@@ -283,6 +313,103 @@ def remove_run_config_dir(path: str) -> list[str]:
         shutil.rmtree(path, onerror=lambda _func, failed, exc_info: _record(
             failed, exc_info[1]))
     return errors
+
+
+# A per-run directory outlives a process that is SIGKILLed, OOM-killed or
+# exits with a run pending: neither _terminate_agent nor the finalizer or
+# atexit hook runs (R3150-08). The first per-run directory a process creates
+# in a parent directory therefore sweeps that parent once: EQUIPA-prefixed,
+# real directories (never symlinks) owned by this user whose newest
+# top-level entry is older than this. No CLI run lasts anywhere near a day,
+# so a live run's directory is never taken.
+STALE_RUN_CONFIG_DIR_SECONDS = 24 * 3600
+_swept_parents: set[str] = set()
+_sweep_lock = threading.Lock()
+
+
+def _newest_mtime(path: str, top: os.stat_result) -> float:
+    """The newest mtime of ``path`` and its direct entries (not followed).
+
+    The CLI writes into subdirectories of a live run's directory, which
+    does not touch the directory's own mtime.
+    """
+    newest = top.st_mtime
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    newest = max(newest,
+                                 entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return newest
+
+
+def sweep_stale_run_config_dirs(
+        parent: str | None = None,
+        max_age_seconds: float = STALE_RUN_CONFIG_DIR_SECONDS,
+        now: float | None = None) -> list[str]:
+    """Remove per-run config directories a crashed process left behind.
+
+    Looks only at entries of ``parent`` (default: the temp directory) whose
+    name starts with :data:`RUN_CONFIG_DIR_PREFIX`, that are real
+    directories (``lstat``: a symlink is never followed or removed), owned by
+    this process's user, and whose newest top-level entry is older than
+    ``max_age_seconds``. Everything else, including another user's
+    directory and a fresh one, is left alone. Entries that cannot be removed
+    are logged and skipped.
+
+    Returns:
+        The paths that were removed completely.
+
+    Raises:
+        ValueError: ``max_age_seconds`` is not positive.
+    """
+    if max_age_seconds <= 0:
+        raise ValueError(
+            f"max_age_seconds must be positive, got {max_age_seconds!r}")
+    root = parent if parent is not None else tempfile.gettempdir()
+    cutoff = (time.time() if now is None else now) - max_age_seconds
+    uid = os.getuid()
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        _LOG.warning("cannot list %s for stale Claude config directories: %s",
+                     root, exc)
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(RUN_CONFIG_DIR_PREFIX):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+            continue
+        if _newest_mtime(entry.path, info) > cutoff:
+            continue
+        errors = remove_run_config_dir(entry.path)
+        if errors:
+            _LOG.warning("stale Claude config directory %s not fully "
+                         "removed: %s", entry.path, "; ".join(errors[:5]))
+        else:
+            removed.append(entry.path)
+    return removed
+
+
+def _sweep_parent_once(parent: str | None) -> None:
+    """Run :func:`sweep_stale_run_config_dirs` on ``parent`` the first time
+    this process creates a per-run directory there."""
+    root = os.path.realpath(parent if parent is not None
+                            else tempfile.gettempdir())
+    with _sweep_lock:
+        if root in _swept_parents:
+            return
+        _swept_parents.add(root)
+    sweep_stale_run_config_dirs(root)
 
 
 @contextlib.contextmanager

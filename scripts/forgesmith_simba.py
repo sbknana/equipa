@@ -64,7 +64,7 @@ try:
         claude_cli_run_env,
     )
 except ImportError:
-    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "user",
+    CLAUDE_CLI_ISOLATION_ARGS = ("--setting-sources", "",
                                  "--strict-mcp-config")
     RunConfigDirError = RuntimeError
 
