@@ -1464,6 +1464,12 @@ _HTML_BLOCK_TAG_RE = re.compile(
 _TABLE_COUNT_CELL_RE =re.compile(r"[^A-Za-z0-9]{0,4}(\d{1,6})[^A-Za-z0-9]{0,4}")
 _TABLE_DELIMITER_CELL_RE = re.compile(r"[ \t]*:?-+:?[ \t]*")
 _ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+# Every table severity-cell rule above matches one of these words, in some
+# case, so a row without one holds no severity cell (task 3137: a 200 KB row
+# of empty cells ran six rules per cell, in every scan of both views).
+_TABLE_ROW_SEVERITY_WORD_RE = re.compile(
+    r"critical|high|medium|low|info", re.IGNORECASE,
+)
 _OVERALL_RISK_RE = re.compile(r"overall[ \t]+risk", re.IGNORECASE)
 # Setext and HTML headings, rewritten as ``#`` headings by
 # _canonicalize_headings so every heading rule (title, tally, overall
@@ -1701,6 +1707,11 @@ def _table_candidate_severities(visible_text: str) -> list[tuple[int, str]]:
         return severities  # no table row (task 3137: skip the line loop)
     severity_columns: dict[int, str] | None = None
     for line_number, line in enumerate(visible_text.split("\n")):
+        if (severity_columns is None
+                and not _TABLE_ROW_SEVERITY_WORD_RE.search(line)):
+            # With no tally header above, such a line changes nothing: it is
+            # not a row, a delimiter row, or a row with no severity cell.
+            continue
         # A line without a pipe is not a row (_table_cells returns None).
         cells = _table_cells(line) if "|" in line else None
         if cells is None:

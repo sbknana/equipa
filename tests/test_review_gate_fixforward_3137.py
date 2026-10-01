@@ -480,6 +480,47 @@ def test_bold_lead_ins_with_blanks_and_brackets_still_fail_closed(line, severity
     assert_blocks_behind_zero_footer([line], severity)
 
 
+# Found by a generated search over token pairs: a row of 200 KB of empty
+# cells ran all six table severity-cell rules on every cell, in every scan of
+# both views. A marker comment that shares its line forces both views, so it
+# took about 1 s. A row without a severity word now skips the rules.
+PIPE_FLOODS = {
+    "pipes": "|" * REVIEW_BYTES,
+    "marker-comment-then-pipes": "<!-- EQUIPA-X -->" + "|" * REVIEW_BYTES,
+    "pipes-then-marker-comment": "|" * REVIEW_BYTES + "<!-- EQUIPA-X -->",
+    "tilde-fence-then-pipes": "~~~" + "|" * REVIEW_BYTES,
+    "spaced-cells": "| " * (REVIEW_BYTES // 2),
+    "word-cells": "| x " * (REVIEW_BYTES // 4),
+}
+
+
+@pytest.mark.parametrize("section", [[], ["## Findings"]])
+@pytest.mark.parametrize("name", sorted(PIPE_FLOODS))
+def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
+        name, section):
+    text = review("No findings.", section + [PIPE_FLOODS[name]], ZERO,
+                  low_heading=False)
+    started = time.perf_counter()
+    analysis = analyze(text)
+    elapsed = time.perf_counter() - started
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("body, severity", [
+    # A severity row after a flood of empty cells.
+    (["|" * 5000, "| S1 | HIGH | SQL injection |"], "HIGH"),
+    # A tally header still applies to a later row with no severity word.
+    (["| CRITICAL | HIGH |", "|---|---|", "| 0 | 1 |"], "HIGH"),
+    (["| CRITICAL | HIGH |", "|---|---|", "|" * 5000, "| 2 | 0 |"],
+     "CRITICAL"),
+    # A severity cell inside the flood row itself.
+    (["|" * 5000 + " S1 | HIGH | SQL injection |"], "HIGH"),
+])
+def test_table_rows_still_count_after_rows_without_a_severity(body, severity):
+    assert_blocks_behind_zero_footer(body, severity)
+
+
 @pytest.mark.parametrize("gap", [3, 40, 5000])
 def test_folded_blank_lines_keep_findings_and_footer(gap):
     """Folding blank-line runs changes no verdict: a finding far below the
