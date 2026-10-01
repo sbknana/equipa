@@ -416,13 +416,14 @@ def test_verify_fails_when_the_probe_cannot_run(
 
 
 def test_the_real_probe_batches_many_targets(tmp_path: Path) -> None:
-    """Hundreds of targets run in bounded batches; a reachable one deep in
-    the list is still found and the closed ones are not reported."""
+    """More targets than select() can watch at once (FD_SETSIZE 1024) run in
+    bounded batches; a reachable one deep in the list is still found and
+    the closed ones are not reported."""
     listener = _listener()
     port = listener.getsockname()[1]
     closed = _closed_port()
-    targets = ["127.0.0.1", str(closed)] * 450
-    targets[2 * 430 + 1] = str(port)
+    targets = ["127.0.0.1", str(closed)] * 1500
+    targets[2 * 1400 + 1] = str(port)
     script = 'source "$1"; shift; tcp_probe 3 "$@"'
     try:
         result = subprocess.run(
