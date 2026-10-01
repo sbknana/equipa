@@ -591,6 +591,19 @@ unless named otherwise:
 | I2-I4 INFO | NOT FIXED (outside this task's scope; I4 is ISO-13 below) | none |
 | I5 INFO: `--task` (single-task mode) is refused with the flag on | DOCUMENTED (step 9): use `--tasks <id>` | none |
 
+Independent review of task 3142 and SECURITY-REVIEW-3142 (task 3147). All
+tests are in `tests/test_agent_isolation_3147.py`:
+
+| Finding | Status (flag on) | Test |
+|---|---|---|
+| N1 LOW: the runbook's nftables loading wipes Docker's rules, `/etc/nftables.d` is missing, a reload duplicates rules | FIXED: a self-contained rule file that deletes and re-creates only its own table, loaded by its own one-shot unit after docker and tailscaled (step 4a); the rule matches the agent's sockets positively, so packets without an owning socket never reach its rejects; the verify script checks that the table is loaded | `test_runbook_rule_file_replaces_only_its_own_table`, `test_runbook_loads_the_rule_with_its_own_unit`, `test_runbook_rule_filters_only_the_agent_users_sockets`, `test_a_missing_or_unlistable_firewall_table_fails`, `test_outer_checks_fail_without_the_firewall_table` |
+| R3142-01 MEDIUM: host addresses outside the private ranges (tailnet, public, global IPv6) are neither denied nor probed | FIXED in the rule (`fib daddr type local reject`, `100.64.0.0/10`) and the runbook (`ip_address_deny_extra`, step 7); the verify script connects, as the agent, to its own listener on every host address and to every listening port at each of them | `test_runbook_rule_rejects_every_host_address_and_the_denied_ranges`, `test_probe_command_lists_every_host_address`, `test_verify_probes_own_listeners_ports_and_lan_targets`, `test_verify_fails_when_its_own_listener_on_a_host_address_answers`, `test_verify_probes_ports_at_every_host_address` |
+| R3142-02 LOW: the LAN half of the deny list is never probed | FIXED in the verify script: `--lan-target` services are probed as the agent after the orchestrator reached them itself | `test_verify_fails_when_a_lan_target_answers`, `test_lan_target_control_needs_the_orchestrator_to_reach_it`, `test_verification_main_probes_lan_targets_after_the_control` |
+| N2 LOW: the CLI startup refusal and the verify script's group check are pinned only by source text | FIXED: `async_main` is run with the marker and an isolation-off config; the group check is called with fake group lists | `test_cli_refuses_an_isolation_off_config_before_any_mode_runs`, `test_verify_group_check_fails_on_each_privileged_group`, `test_verify_inside_checks_the_groups_id_reports` |
+| N3 INFO: IO weight is inert without BFQ or iocost; a misleading systemd 255 comment | FIXED in the runbook (`"io_weight": null` on such hosts, steps 4 and 7) and the comments | `test_runbook_recommends_a_null_io_weight_where_weights_do_nothing` |
+| N4 INFO: unpinned MCP server install | FIXED in the runbook (step 0): pinned versions, published hashes, a hash-locked offline install after a scan; `mcp` is pinned below 2 because the server crashes on `mcp` 2.x | `test_runbook_pins_the_mcp_server_with_hashes` |
+| F8 / R3142-04 LOW: the agent can fill `/` through `/tmp` and `/var/tmp` | FIXED in the verify script (the unit's TMPDIR must be its own and off `/`; a writable `/tmp` or `/var/tmp` on `/` fails) and the runbook (step 1: a tmpfiles.d ACL closes both to the agent user) | `test_a_writable_shared_tmp_on_the_root_filesystem_fails`, `test_unit_tmpdir_on_the_root_filesystem_fails`, `test_unit_tmpdir_off_the_root_filesystem_passes` |
+
 ## Residual risks and limitations
 
 * **All agents share one agent UID.** Sequential units no longer share
@@ -679,13 +692,48 @@ must be executable by the agent user from a system location, and must not
 depend on `<orch>`'s HOME, which step 3 closes (0700). A `uvx` under
 `~<orch>/.local/bin` fails that, and under a fresh per-unit HOME `uvx` would
 also download the server again for every unit. Install the server into a
-root-owned virtualenv and point `mcp_config.json` at its absolute path:
+root-owned virtualenv and point `mcp_config.json` at its absolute path.
+
+Every agent executes this code, so **install a pinned version, verify it
+against known hashes, and scan it before it is installed** (review N4).
+The recipe downloads the pinned server and every dependency as wheels,
+installs nothing yet, checks the two pinned wheels against the hashes PyPI
+publishes, writes a lock file that holds every file's hash, scans that,
+and only then installs exactly the scanned files, offline:
 
 ```bash
 python3 -m venv /opt/equipa-mcp
-/opt/equipa-mcp/bin/pip install mcp-server-sqlite
+install -d -m 0700 /root/equipa-mcp-wheels && cd /root/equipa-mcp-wheels
+# 1. Download, install nothing. mcp is pinned too: mcp-server-sqlite
+#    2025.4.25 asks for mcp>=1.6.0 and crashes at startup on mcp 2.x
+#    ("'Server' object has no attribute 'list_resources'").
+/opt/equipa-mcp/bin/pip download --only-binary=:all: --dest . \
+    'mcp-server-sqlite==2025.4.25' 'mcp[cli]==1.30.0'
+# 2. The pinned wheels are the published ones (sha256 from PyPI):
+sha256sum -c - <<'EOF'
+5ba5706aa29d249a3cde8226577e021c07792d3198e9db40fd005578d2a0801d  mcp_server_sqlite-2025.4.25-py3-none-any.whl
+666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0  mcp-1.30.0-py3-none-any.whl
+EOF
+# 3. Lock every downloaded file by its hash:
+for wheel in *.whl; do
+    name="${wheel%%-*}"; rest="${wheel#*-}"
+    printf '%s==%s --hash=sha256:%s\n' "$name" "${rest%%-*}" \
+        "$(sha256sum "$wheel" | cut -d' ' -f1)"
+done > requirements.lock
+# 4. SCAN before installing, with your scanner of record, for example:
+pip-audit --disable-pip --require-hashes -r requirements.lock
+#    (or osv-scanner on requirements.lock). Stop on any finding.
+# 5. Install exactly the scanned files, offline, every hash enforced:
+/opt/equipa-mcp/bin/pip install --no-index --find-links . \
+    --require-hashes --no-deps -r requirements.lock
+/opt/equipa-mcp/bin/pip check
+install -m 0644 requirements.lock /opt/equipa-mcp/requirements.lock
 chmod -R go-w /opt/equipa-mcp && chmod -R o+rX /opt/equipa-mcp
 ```
+
+To upgrade, change the pins, repeat every step, and keep the new
+`requirements.lock` beside the old one. Re-installing from a kept
+`requirements.lock` and its wheel directory gives the same files.
 
 ```json
 "theforge": {
@@ -734,11 +782,40 @@ the same. If `/etc/cron.allow` or `/etc/at.allow` exists, it takes
 precedence: leave the agent user out of it instead.
 
 **Disk.** Each unit's clone, HOME and TMPDIR live under
-`/var/lib/equipa-agent/.equipa-agent`, which EQUIPA does not cap. Put
-`/var/lib/equipa-agent` on a filesystem of its own (a separate partition, or
-a fixed-size image mounted there, for example a 20 GiB ext4 image) so a unit
-cannot fill `/` and break the orchestrator or TheForge. The export into the
-exchange directory is capped by `max_export_bytes` in the launcher itself.
+`/var/lib/equipa-agent/.equipa-agent`, and its exports in the exchange
+directory below `/var/lib/equipa-agent`; EQUIPA caps none of them against a
+hostile agent (`max_export_bytes` caps only the launcher's own export). Put
+`/var/lib/equipa-agent` on a size-capped filesystem of its own (a separate
+partition, or a fixed-size image mounted there, for example a 20 GiB ext4
+image) so a unit cannot fill `/` and break the orchestrator or TheForge.
+
+Each unit's TMPDIR is its own (`.../<unit>/tmp`, mode 0700) and lies on
+that filesystem. A scope cannot take systemd's `PrivateTmp=`, so the shared
+`/tmp` and `/var/tmp` stay writable to every user, and an agent that writes
+`/var/tmp/x` instead of `$TMPDIR/x` fills `/`. Close them to the agent user
+(it has its TMPDIR) with a tmpfiles.d ACL, which also survives the tmpfs
+`/tmp` being re-created at boot:
+
+```bash
+printf '%s\n' 'a+ /tmp     - - - - u:equipa-agent:--x' \
+              'a+ /var/tmp - - - - u:equipa-agent:--x' \
+    > /etc/tmpfiles.d/equipa-agent-tmp.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/equipa-agent-tmp.conf
+getfacl /tmp /var/tmp | grep equipa-agent   # user:equipa-agent:--x on both
+```
+
+The named-user ACL entry takes precedence over the world bits, so the
+agent may still enter `/tmp` (paths other programs hand it) but not create
+files there. Tools inside the unit that honour `TMPDIR` (the CLI, git,
+python's `tempfile`, `mktemp`, bash) are unaffected; a command that
+hard-codes `/tmp/...` fails instead of filling `/`. If agents need a shared
+`/tmp`, make it a size-capped tmpfs instead (`systemctl enable tmp.mount`
+with `size=` in its `Options=`), knowing that an agent can then fill it for
+every other user, the orchestrator's own `/tmp` files included, and keep
+`/var/tmp` closed by the ACL or on a filesystem of its own. The verify
+script fails while the agent can write a
+`/tmp` or `/var/tmp` that lies on `/`, or while the unit's TMPDIR lies on
+`/`.
 
 No global git configuration is needed, and none is read: the launcher
 copies `user.name`/`user.email` from the task worktree into each clone and
@@ -833,46 +910,133 @@ systemctl daemon-reload   # then restart the orchestrator's user manager (log ou
 ```
 
 The io controller carries the units' `IOWeight` (F8). Without it the scope
-has no `io.weight` and every dispatch is refused; set `"io_weight": null`
-in step 7 only if you accept agents competing for IO on equal terms.
-`memory.swap.max` comes with the memory controller.
-
-### 4a. Network: no loopback or LAN for the agent user
-
-Every unit carries `IPAddressDeny=` for loopback, link-local, multicast and
-the private ranges (see "Network"), but the orchestrator's user manager
-cannot apply it, and the launcher refuses every agent until something else
-does. Block the same ranges for the agent user's UID with nftables, except
-DNS to the local resolver (`127.0.0.53` on Ubuntu, where `/etc/resolv.conf`
-names it; the agent must resolve the API's name):
+has no `io.weight` and every dispatch is refused. But a weight only does
+something with the BFQ scheduler or iocost; check before delegating io:
 
 ```bash
+cat /sys/block/*/queue/scheduler        # the active one is in [brackets]
+cat /sys/fs/cgroup/io.cost.qos 2>/dev/null   # iocost: lines with enable=1
+```
+
+If every disk the agents and TheForge use runs `[bfq]`, or iocost is
+enabled, keep the default weight and delegate `io`. On a host whose disks
+run `[none]` or `[mq-deadline]` without iocost (common on NVMe and VMs),
+the weight is ignored: set `"io_weight": null` in step 7 and leave `io` out
+of `Delegate=` (`Delegate=pids memory cpu`). Do the same on a host where
+`io` cannot be delegated. `null` is then the honest setting: agents compete
+for IO on equal terms either way. `memory.swap.max` comes with the memory
+controller.
+
+### 4a. Network: no loopback, LAN, tailnet or host address for the agent user
+
+Every unit carries `IPAddressDeny=` for loopback, link-local, multicast and
+the private ranges (see "Network"), but on many hosts the orchestrator's
+user manager cannot apply it, so **this nftables rule for the agent user's
+UID is the real control**. Until it is loaded the launcher refuses every
+agent (its own reachability check fails closed) and the verify script
+fails.
+
+**Never use the stock `nftables.service` for this, and never run `nft -f
+/etc/nftables.conf`, `systemctl start/restart/reload nftables` or `nft
+flush ruleset` on a host with Docker or Tailscale.** The stock
+`/etc/nftables.conf` begins with `flush ruleset`, which deletes the whole
+ruleset of the host, including the rules Docker and tailscaled keep there
+(iptables-nft writes into the same ruleset): container networking and
+published ports break until Docker restarts. The rule below lives in a
+table of its own, the file deletes and re-creates **only that table**
+(loading it twice leaves one copy, not duplicate rules), and its own
+one-shot unit loads it after Docker and tailscaled.
+
+The rule rejects, for the agent user only:
+
+* `fib daddr type local`: **every address of this host**, whatever its
+  range: loopback, the LAN addresses, a tailnet address, a public IPv4 or
+  global IPv6 address (a service bound to `0.0.0.0` answers on all of
+  them);
+* the denied ranges (see "Network"), **plus `100.64.0.0/10`**, the CGNAT
+  range Tailscale uses for every tailnet peer;
+
+except DNS to the local resolver (`127.0.0.53` on Ubuntu, where
+`/etc/resolv.conf` names it; the agent must resolve the API's name). If
+`/etc/resolv.conf` names another resolver inside a rejected range (a
+tailnet's `100.100.100.100`, a LAN router), accept that one for port 53
+the same way, before the `reject` lines.
+
+```bash
+install -d -o root -g root -m 0755 /etc/nftables.d
 cat > /etc/nftables.d/equipa-agent.nft <<'EOF'
+#!/usr/sbin/nft -f
+# EQUIPA agent user: no loopback, LAN, tailnet or own-host address.
+# Re-creates ONLY this table (never "flush ruleset": Docker and tailscaled
+# keep their rules in the same ruleset). Declaring the table first makes
+# the delete succeed when it does not exist yet; the file is applied as
+# one transaction, so a reload never leaves a gap or a duplicate.
+table inet equipa_agent
+delete table inet equipa_agent
 table inet equipa_agent {
-    chain output {
-        type filter hook output priority 0; policy accept;
-        meta skuid != "equipa-agent" accept
+    chain agent {
         ip daddr 127.0.0.53 udp dport 53 accept
         ip daddr 127.0.0.53 tcp dport 53 accept
-        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
-                   172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } reject
+        fib daddr type local reject
+        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+                   169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+                   224.0.0.0/4 } reject
         ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } reject
+    }
+    chain output {
+        type filter hook output priority 0; policy accept;
+        # Only packets of the agent user's own sockets enter "agent". Never
+        # the negation ('meta skuid != "equipa-agent" accept'): packets
+        # with no owning socket (the kernel's RSTs, ICMP errors, IPv6
+        # neighbour discovery, IGMP) match neither form, and would then
+        # reach the reject rules for every user of the host.
+        meta skuid "equipa-agent" jump agent
     }
 }
 EOF
-nft -f /etc/nftables.d/equipa-agent.nft
-# and load it at boot: include "/etc/nftables.d/*.nft" in /etc/nftables.conf,
-# then systemctl enable nftables
+chmod 0644 /etc/nftables.d/equipa-agent.nft
+
+cat > /etc/systemd/system/equipa-agent-firewall.service <<'EOF'
+[Unit]
+Description=EQUIPA agent user firewall (nftables table inet equipa_agent)
+# Its own unit, never nftables.service (whose config flushes the ruleset).
+Wants=network-pre.target
+After=network-pre.target docker.service tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/equipa-agent.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/equipa-agent.nft
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now equipa-agent-firewall.service
+nft list table inet equipa_agent           # the rule, once
+systemctl reload equipa-agent-firewall.service && nft list table inet equipa_agent
+                                           # still once: reloading is idempotent
 ```
 
-Add every range of `ip_address_deny_extra` (step 7) to the rule as well, a
-tailnet's `100.64.0.0/10` for example (keep its DNS address open if the host
-resolves through it). `reject` rather than `drop` makes each probe fail at
-once instead of after the launcher's 2 s timeout. The launcher's check (its
-own listeners on `127.0.0.1` and on this host's addresses in the denied
-ranges must be unreachable) and the verify script's (every listening
-loopback port, every `--loopback-port`) prove the rule from the agent's
-side.
+The unit has no `ExecStop`: stopping it leaves the table in place. To
+remove the rule on purpose, `nft delete table inet equipa_agent` (the
+launcher then refuses every agent again).
+
+Also add `100.64.0.0/10` to `ip_address_deny_extra` (step 7) on a
+Tailscale host, and every other range you add to the rule: each listed
+range also goes into the unit's `IPAddressDeny=` and into the launcher's
+check of the host's own addresses, which then covers a tailnet address of
+the host fail-closed even without the `fib` line. `reject` rather than
+`drop` makes each probe fail at once instead of after a timeout.
+
+The verify script (step 8) proves the rule from both sides: as `<orch>` it
+checks that the table is loaded (`sudo -n /usr/sbin/nft list table inet
+equipa_agent`; listing needs CAP_NET_ADMIN, see step 6), and as the agent
+it fails if it can connect to a listener of its own on **any** address of
+the host, to any listening port at `127.0.0.1` or at any host address, or to
+any `--lan-target`. The launcher's own check (its listeners on `127.0.0.1`
+and on this host's addresses in the denied ranges) runs before every agent.
 
 The orchestrator process needs `XDG_RUNTIME_DIR=/run/user/<uid of orch>`
 (set automatically for login sessions and user services).
@@ -933,6 +1097,14 @@ listing possible, for example:
 (sudoers(5), "list"). Without it every dispatch is refused with `cannot
 verify that the agent user ... has no sudo rights`.
 
+The verify script (step 8) also lists the agent user's nftables table
+(step 4a), which needs CAP_NET_ADMIN. A narrowed `<orch>` keeps exactly
+that read-only command:
+
+```
+<orch> ALL=(root) NOPASSWD: /usr/sbin/nft list table inet equipa_agent
+```
+
 ### 7. Configure and switch on
 
 In `dispatch_config.json`:
@@ -951,9 +1123,16 @@ In `dispatch_config.json`:
     "secret_scan_roots": ["/path/to/projects"],
     "pids_max": 512,
     "memory_max": "4G",
-    "cpu_weight": 100
+    "cpu_weight": 100,
+    "ip_address_deny_extra": ["100.64.0.0/10"],
+    "io_weight": null
 }
 ```
+
+`ip_address_deny_extra` as shown is for a host running Tailscale (or any
+CGNAT overlay); keep it in step with the nftables rule (step 4a).
+`"io_weight": null` is for a host whose disks ignore IO weights or that
+cannot delegate `io` (step 4); leave the key out to keep the weight of 50.
 
 Other keys, with defaults: `launcher` (this checkout's
 `equipa/agent_launcher.py`), `git_executable` (`/usr/bin/git`), `sudo`,
@@ -967,7 +1146,7 @@ own directory), `secret_scan_roots` (`[]`: project roots the verify script
 scans; it fails while this is empty), `unit_wait_timeout_sec` (21600: how
 long a unit may wait for the one running before it, before the dispatch is
 refused), `ip_address_deny_extra` (`[]`: more ranges the agent may not
-reach, step 4a), `io_weight` (50; `null` for none). Unknown keys are
+reach, step 4a), `io_weight` (50; `null` for none, step 4). Unknown keys are
 refused. `privileged_groups` adds to the built-in root-equivalent groups.
 
 `max_concurrent` must be 1 while the flag is on (dispatch refuses a higher
@@ -1000,9 +1179,19 @@ unit lock: a process still running older code takes no lock.
 As `<orch>`, from `<runtime>`, with the orchestrator's environment:
 
 ```bash
+# --loopback-port: each local service you know of; --lan-target: LAN services
 scripts/verify_agent_isolation.sh --repo /path/to/a/project \
-    --loopback-port 5432 --loopback-port 6379   # each local service you know of
+    --loopback-port 5432 --loopback-port 6379 \
+    --lan-target 192.0.2.10:445 --lan-target 192.0.2.1:443
 ```
+
+Each `--lan-target` is `ADDRESS:PORT` (`[ADDRESS]:PORT` for IPv6) of a
+service on another LAN machine (a NAS, the router's admin page, a database
+server, a tailnet peer) that the orchestrator itself can reach: the agent
+must not. A target that does not answer the orchestrator fails the check,
+since its probe would prove nothing. Without any `--lan-target` the output
+has a `NOTE` line: the LAN ranges were then checked only through the rule's
+content, not probed.
 
 It runs its own checks as an isolated agent through the real path (scope,
 sudoers rule, launcher, handoff). Every line must be `PASS`, and the last
@@ -1022,12 +1211,20 @@ credential except the OAuth token is in its environment; its HOME,
 write its passwd HOME; it cannot use `crontab` or `at` and does not linger;
 it cannot read any SQLite file below the project roots whose schema holds an
 excluded table (found by the orchestrator, probed by name); it cannot
-connect to `127.0.0.1` on any `--loopback-port` or on any port that listens
-on loopback (read from `/proc/net/tcp` and `tcp6` by the orchestrator, so
-the list covers services you did not name). The launcher has already
+connect to a listener of its own on any address of the host (every address
+the kernel's local routing table lists: loopback, LAN, tailnet, public,
+global IPv6), nor to any `--loopback-port` or any port that listens on
+loopback or on every address (read from `/proc/net/tcp` and `tcp6` by the
+orchestrator, so the list covers services you did not name) at `127.0.0.1`
+and at each host address, nor to any `--lan-target`; its TMPDIR is the
+unit's own (mode 0700) and not on `/`, and it cannot write a `/tmp` or
+`/var/tmp` that lies on `/` (step 1). The launcher has already
 refused the probe if its own loopback or LAN listeners were reachable. From
 outside, as the orchestrator, it also fails when the narrow sudoers rule is
-not installed as step 6 prints it (judged by `sudo -n -ll`), when
+not installed as step 6 prints it (judged by `sudo -n -ll`), when the
+agent user's nftables table is not loaded (`sudo -n /usr/sbin/nft list
+table inet equipa_agent`, step 4a), when a `--lan-target` does not answer
+the orchestrator, when
 the database or backup directories are open to others or to a group of the
 agent user, when any copy in them, or any such file below
 `secret_scan_roots`, is world-readable, and when
