@@ -2968,15 +2968,15 @@ _BACKSTOP_HEADING_ID_RE = re.compile(
 )
 
 
-def _finding_id_pattern(
-    lines: list[str], heading_lines: list[int],
-) -> re.Pattern[str] | None:
-    """A pattern for the IDs of the finding headings on ``heading_lines``.
+_BACKSTOP_WORD_RE = re.compile(r"[\w.-]+")
+
+
+def _finding_ids(lines: list[str], heading_lines: list[int]) -> set[str]:
+    """The IDs of the finding headings on ``heading_lines``.
 
     The ID is the first bracketed tag ("[S1]") or finding-ID-shaped word
     ("SR3130-01") of the heading, and must hold a digit (so "[HIGH]" is no
-    ID). A line naming one, as a whole word, refers to that counted finding.
-    None when no heading has an ID.
+    ID). A line naming one as a whole word refers to that counted finding.
     """
     identifiers: set[str] = set()
     for line in heading_lines:
@@ -2987,12 +2987,18 @@ def _finding_id_pattern(
             identifier = found.group(1) or found.group(2)
             if any(char.isdigit() for char in identifier):
                 identifiers.add(identifier)
-    if not identifiers:
-        return None
-    return re.compile(
-        r"(?<![\w-])(?:"
-        + "|".join(re.escape(identifier) for identifier in sorted(identifiers))
-        + r")(?![\w-])",
+    return identifiers
+
+
+def _names_finding(line: str, identifiers: set[str]) -> bool:
+    """True when ``line`` names one of ``identifiers`` as a whole word.
+
+    Linear in the line: its words are looked up in the set, so a review with
+    thousands of finding IDs costs no more per line than one with a few.
+    """
+    return any(
+        word in identifiers or word.rstrip(".") in identifiers
+        for word in _BACKSTOP_WORD_RE.findall(line)
     )
 
 
@@ -3095,7 +3101,7 @@ def _severity_token_backstop(
     for severity in _BACKSTOP_SEVERITIES:
         heading_lines = sorted(line for line, word in headings
                                if word == severity)
-        names_a_finding = _finding_id_pattern(masked_lines, heading_lines)
+        identifiers = _finding_ids(masked_lines, heading_lines)
         unaccounted = 0
         lines: list[int] = []
         for (line, word), count in tokens.items():
@@ -3103,8 +3109,8 @@ def _severity_token_backstop(
                 line, heading_lines, section_starts,
             ):
                 continue
-            if (names_a_finding is not None and line < len(masked_lines)
-                    and names_a_finding.search(masked_lines[line])):
+            if (identifiers and line < len(masked_lines)
+                    and _names_finding(masked_lines[line], identifiers)):
                 continue  # "| S1 | MEDIUM | ..." names counted finding S1
             unaccounted += count
             lines.append(line + 1)
