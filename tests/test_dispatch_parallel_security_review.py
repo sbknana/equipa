@@ -234,7 +234,9 @@ class _FakeMergeGuard:
     def __init__(self) -> None:
         self.outcomes: dict = {}
 
-    async def verify(self, stage, *, task_id=None) -> bool:
+    async def verify(self, stage, *, task_id=None, directories=()) -> bool:
+        # Same signature as DefaultBranchGuard.verify (task #3146 added the
+        # repository-identity ``directories``).
         return True
 
     async def record_merge(
