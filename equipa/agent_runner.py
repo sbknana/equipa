@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from datetime import datetime, timezone
@@ -174,9 +175,16 @@ from equipa import agent_launcher, isolation
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.cli_isolation import (
     CLAUDE_CLI_ISOLATION_ARGS,
+    CLAUDE_CODE_SHELL_VAR,
+    RunConfigDirError,
+    claude_cli_env,
+    create_run_config_dir,
+    has_env_auth,
     is_claude_cli,
     isolate_claude_argv,
     mcp_config_values,
+    remove_run_config_dir,
+    trusted_bash,
 )
 from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
@@ -458,13 +466,18 @@ PRETOOLUSE_HOOK_SCRIPT = (
 #   mode) turn every non-managed hook off, which is the Bash gate;
 #   CLAUDE_CODE_SHELL_PREFIX wraps and CLAUDE_CODE_SHELL replaces the shell
 #   that runs each command, and CLAUDE_ENV_FILE is sourced before it, all
-#   after the gate has judged the command.
+#   after the gate has judged the command. CLAUDE_CODE_SHELL is the one name
+#   that is pinned instead of emptied: to an absolute, root-owned bash
+#   (cli_isolation.trusted_bash). Empty, the CLI fell back to SHELL, and
+#   a planted SHELL ran every command (RR3144-A (1)).
 # An operator passthrough of one of these names is overridden too while the
 # gate is on; they load code and have no place in an agent environment.
-# Residual: user scope can still set other variables (PATH, HOME, SHELL,
-# GIT_*), other settings (apiKeyHelper runs a command, extra hooks) and
-# ~/.claude/CLAUDE.md. The complete fix is a per-unit CLAUDE_CONFIG_DIR that
-# agents cannot write, under agent isolation (task 3136).
+# User scope itself is no longer the operator's ~/.claude: every CLI run gets
+# a fresh, empty CLAUDE_CONFIG_DIR (_spawn_agent_process, RR3144-A), so
+# user-scope env blocks (BASH_FUNC_<name>%%, SHELL), hooks and CLAUDE.md
+# written by an agent are never loaded. This block stays as the second layer.
+# Residual until agent isolation (per-unit HOME): ~/.bashrc functions reach
+# the CLI's shell snapshot (docs/BASH_SECURITY_GATE.md).
 SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
     "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
@@ -496,7 +509,9 @@ def _hook_interpreter() -> str | None:
     return interpreter
 
 
-def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
+def _pretooluse_settings_payload(
+    hook_script: str | Path, python_bin: str, shell_bin: str | None = None,
+) -> dict:
     """Build the Claude CLI ``--settings`` payload wiring the Bash gate hook.
 
     Returns a dict matching the Claude Code settings schema: a single
@@ -512,7 +527,10 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     the only hook switch the CLI reads outside managed policy
     (``allowManagedHooksOnly`` is read from policy settings only). The
     ``env`` block empties SETTINGS_ENV_NEUTRALISED, including the two
-    variables that turn hooks off.
+    variables that turn hooks off, and pins ``CLAUDE_CODE_SHELL`` to an
+    absolute root-owned bash (RR3144-A): the CLI prefers it over ``SHELL``,
+    so a ``SHELL`` planted anywhere no longer chooses the shell that runs
+    the commands the gate judged.
 
     The hook runs as ``<python> -I <hook>`` (RR3138-A). Without ``-I`` the
     interpreter reads PYTHON* variables (``PYTHONHASHSEED=bogus`` or
@@ -527,20 +545,30 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
         python_bin: Absolute path of the interpreter that runs the hook
             (``_hook_interpreter()``, resolved when the settings file is
             written).
+        shell_bin: Absolute bash for ``CLAUDE_CODE_SHELL``; default
+            ``trusted_bash()``. When no trusted bash exists the name stays
+            empty, as before.
 
     Raises:
-        ValueError: ``python_bin`` or ``hook_script`` is not absolute; the
-            CLI would look a bare name up on the agent's PATH.
+        ValueError: ``python_bin``, ``hook_script`` or ``shell_bin`` is not
+            absolute; the CLI would look a bare name up on the agent's PATH.
     """
     if not os.path.isabs(str(python_bin)) or not os.path.isabs(str(hook_script)):
         raise ValueError(
             f"the gate hook needs an absolute interpreter and script, got "
             f"{python_bin!r} and {str(hook_script)!r}")
+    pinned_shell = trusted_bash() if shell_bin is None else shell_bin
+    if pinned_shell is not None and not os.path.isabs(pinned_shell):
+        raise ValueError(
+            f"CLAUDE_CODE_SHELL must be an absolute bash, got {pinned_shell!r}")
     command = (f"{shlex.quote(str(python_bin))} -I "
                f"{shlex.quote(str(hook_script))}")
+    settings_env = {name: "" for name in SETTINGS_ENV_NEUTRALISED}
+    if pinned_shell is not None:
+        settings_env[CLAUDE_CODE_SHELL_VAR] = pinned_shell
     return {
         "disableAllHooks": False,
-        "env": {name: "" for name in SETTINGS_ENV_NEUTRALISED},
+        "env": settings_env,
         "hooks": {
             "PreToolUse": [
                 {
@@ -2235,13 +2263,104 @@ async def _spawn_agent_process(
 
     if isolation.isolation_enabled():
         # Task 3135: separate agent UID, per-agent cgroup and clone; refused,
-        # never downgraded, when isolation cannot be established.
+        # never downgraded, when isolation cannot be established. The unit
+        # gets its own empty HOME and CLAUDE_CONFIG_DIR there.
         try:
             return await isolation.spawn_isolated_agent(
                 cmd, cwd, kwargs["env"], limit=kwargs.get("limit"))
         except isolation.AgentIsolationError as exc:
             raise AgentDispatchRefused(f"agent isolation: {exc}") from exc
 
+    if not (cmd and is_claude_cli(cmd[0])):
+        return await _spawn_unisolated(cmd, kwargs)
+    # RR3144-A: without isolation the agent shares the operator's HOME and
+    # can write ~/.claude, whose user-scope env blocks and hooks bypassed the
+    # gate. Each CLI run reads only its own empty directory instead.
+    config_dir = _create_cli_config_dir()
+    kwargs["env"] = claude_cli_env(kwargs["env"], config_dir)
+    _warn_once_without_env_auth(kwargs["env"])
+    try:
+        process, agent = await _spawn_unisolated(cmd, kwargs)
+    except BaseException:
+        _remove_cli_config_dir(config_dir)
+        raise
+    _bind_cli_config_dir(process, config_dir)
+    return process, agent
+
+
+# Per-run CLAUDE_CONFIG_DIR of each live CLI process (RR3144-A). Removed by
+# _terminate_agent / _terminate_agent_sync, which every run path calls at its
+# end; the finalizer also runs when the process object is collected or the
+# orchestrator exits, so a caller that never terminates leaks nothing.
+_CLI_CONFIG_DIRS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# Process objects that cannot be weak-referenced (test doubles): by identity,
+# removed at termination or, failing that, when the orchestrator exits.
+_CLI_CONFIG_DIRS_BY_ID: dict[int, str] = {}
+_env_auth_warning_logged = False
+
+
+def _create_cli_config_dir() -> str:
+    try:
+        return create_run_config_dir()
+    except RunConfigDirError as exc:
+        raise AgentDispatchRefused(str(exc)) from exc
+
+
+def _remove_cli_config_dir(config_dir: str) -> None:
+    errors = remove_run_config_dir(config_dir)
+    if errors:
+        logger.warning("[Dispatch] per-run Claude config directory %s not "
+                       "fully removed: %s", config_dir, "; ".join(errors[:5]))
+
+
+def _remove_unreleased_cli_config_dirs() -> None:
+    while _CLI_CONFIG_DIRS_BY_ID:
+        _remove_cli_config_dir(_CLI_CONFIG_DIRS_BY_ID.popitem()[1])
+
+
+def _bind_cli_config_dir(process: Any, config_dir: str) -> None:
+    try:
+        _CLI_CONFIG_DIRS[process] = weakref.finalize(
+            process, _remove_cli_config_dir, config_dir)
+    except TypeError:
+        if not _CLI_CONFIG_DIRS_BY_ID:
+            atexit.register(_remove_unreleased_cli_config_dirs)
+        _CLI_CONFIG_DIRS_BY_ID[id(process)] = config_dir
+
+
+def _release_cli_config_dir(process: Any) -> None:
+    """Remove the run's config directory, once; a no-op for other processes."""
+    config_dir = _CLI_CONFIG_DIRS_BY_ID.pop(id(process), None)
+    if config_dir is not None:
+        _remove_cli_config_dir(config_dir)
+        return
+    try:
+        finalizer = _CLI_CONFIG_DIRS.pop(process, None)
+    except TypeError:  # not weak-referenceable and not bound by identity
+        return
+    if finalizer is not None:
+        finalizer()
+
+
+def _warn_once_without_env_auth(env: Mapping[str, str]) -> None:
+    """The fresh config directory holds no login, so a CLI without an
+    environment credential cannot authenticate. Say so once, by name."""
+    global _env_auth_warning_logged
+    if _env_auth_warning_logged or has_env_auth(env):
+        return
+    _env_auth_warning_logged = True
+    logger.warning(
+        "[Dispatch] no CLAUDE_CODE_OAUTH_TOKEN in the agent environment: each "
+        "Claude CLI run uses a fresh, empty CLAUDE_CONFIG_DIR (RR3144-A), so "
+        "the login in ~/.claude is not used and the CLI cannot authenticate. "
+        "Create a token with `claude setup-token` and export it for the "
+        "orchestrator.")
+
+
+async def _spawn_unisolated(
+    cmd: list[str], kwargs: dict[str, Any],
+) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
+    """Start ``cmd`` directly, or behind the per-agent launcher."""
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
@@ -2301,24 +2420,31 @@ async def _terminate_agent(
     """Terminate the agent on a timeout, early termination or normal exit.
 
     Contained agents have their whole tree swept; without the launcher the
-    CLI is killed by pid if it is still running, as before.
+    CLI is killed by pid if it is still running, as before. The run's own
+    CLAUDE_CONFIG_DIR is removed afterwards (RR3144-A).
     """
-    if agent is not None:
-        await agent.terminate()
-    elif process.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+    try:
+        if agent is not None:
+            await agent.terminate()
+        elif process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+    finally:
+        _release_cli_config_dir(process)
 
 
 def _terminate_agent_sync(
     process: asyncio.subprocess.Process, agent: _ContainedAgent | None,
 ) -> None:
     """Blocking variant for cancellation and loop shutdown (PT-02)."""
-    if agent is not None:
-        agent.terminate_sync()
-    elif process.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+    try:
+        if agent is not None:
+            agent.terminate_sync()
+        elif process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+    finally:
+        _release_cli_config_dir(process)
 
 
 def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:

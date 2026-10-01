@@ -9,7 +9,9 @@ flag-scope --settings file beats it. The CLI applies each source's ``env``
 block in source order (user, then flag), and an ``env`` block there can
 also turn hooks off (``CLAUDE_CODE_SAFE_MODE``, ``CLAUDE_CODE_SIMPLE``) or
 run code around every command (``BASH_ENV``, ``LD_PRELOAD``,
-``CLAUDE_CODE_SHELL_PREFIX``, ...). The flag file sets those to empty.
+``CLAUDE_CODE_SHELL_PREFIX``, ...). The flag file sets those to empty,
+except ``CLAUDE_CODE_SHELL``, which task 3150 (RR3144-A) pins to an
+absolute root-owned bash: empty, the CLI fell back to a planted ``SHELL``.
 
 These tests read the generated settings content; no network and no CLI.
 
@@ -33,8 +35,22 @@ from equipa.agent_runner import (
     _pretooluse_settings_payload,
     build_cli_command,
 )
+from equipa.cli_isolation import trusted_bash
 
 GATE_ON = {"features": {"bash_security_pretooluse": True}}
+
+# Task 3150 (RR3144-A): the one name pinned to a value instead of emptied.
+PINNED_SHELL_NAME = "CLAUDE_CODE_SHELL"
+
+
+def _expected_value(name: str) -> str:
+    """"" for every neutralised name; the trusted absolute bash for the
+    shell pin (which must exist on any host the suite runs on)."""
+    if name == PINNED_SHELL_NAME:
+        shell = trusted_bash()
+        assert shell is not None and os.path.isabs(shell)
+        return shell
+    return ""
 
 # What a planted user-scope ~/.claude/settings.json can hold.
 PLANTED_USER_SETTINGS = {
@@ -86,7 +102,7 @@ def test_generated_settings_pin_disable_all_hooks_false(generated_settings):
 def test_generated_settings_empty_every_neutralised_name(generated_settings):
     env = generated_settings["env"]
     assert set(env) == set(SETTINGS_ENV_NEUTRALISED)
-    assert all(value == "" for value in env.values())
+    assert all(value == _expected_value(name) for name, value in env.items())
 
 
 @pytest.mark.parametrize("name", [
@@ -96,7 +112,7 @@ def test_generated_settings_empty_every_neutralised_name(generated_settings):
     "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
 ])
 def test_the_review_and_cli_switch_names_are_neutralised(name, generated_settings):
-    assert generated_settings["env"][name] == ""
+    assert generated_settings["env"][name] == _expected_value(name)
 
 
 def test_generated_settings_still_wire_the_gate(generated_settings):
@@ -106,18 +122,20 @@ def test_generated_settings_still_wire_the_gate(generated_settings):
 
 
 def test_payload_never_names_a_value_to_keep():
-    """The pins are empty strings only: no EQUIPA path or credential is
-    written to the temp settings file."""
+    """The pins are empty strings, plus the system bash for the shell pin:
+    no EQUIPA path or credential is written to the temp settings file."""
     payload = _pretooluse_settings_payload("/hooks/gate.py", "/py/bin")
     assert set(payload) == {"disableAllHooks", "env", "hooks"}
-    assert set(payload["env"].values()) == {""}
+    pinned = {name: value for name, value in payload["env"].items() if value}
+    assert pinned == {PINNED_SHELL_NAME: trusted_bash()}
 
 
 def test_planted_user_scope_is_overridden_by_the_flag_file(generated_settings):
     hooks_disabled, env = _effective(PLANTED_USER_SETTINGS, generated_settings)
     assert hooks_disabled is False
     for name in PLANTED_USER_SETTINGS["env"]:
-        assert env[name] == "", name
+        assert env[name] == _expected_value(name), name
+        assert env[name] != PLANTED_USER_SETTINGS["env"][name], name
     assert not _truthy(env["CLAUDE_CODE_SAFE_MODE"])
     assert not _truthy(env["CLAUDE_CODE_SIMPLE"])
 
