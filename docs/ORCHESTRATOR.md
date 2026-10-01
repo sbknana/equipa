@@ -214,7 +214,7 @@ value is refused, not rewritten.
 
 ### User-scope Claude configuration is not loaded either
 
-Until task 3153 the CLI was started with `--setting-sources user`, which
+Until task 3153 the CLI was started with the setting source `user`, which
 loads the USER scope. Without agent isolation that was the operator's
 `~/.claude`, which agents running as the orchestrator's user can write. The
 independent review (RR3144-A) showed four
