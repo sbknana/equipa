@@ -2664,6 +2664,58 @@ _BACKSTOP_FOOTER_ATTEMPTS = 3
 _BACKSTOP_MAX_TALLY_LINE = 300
 _BACKSTOP_MAX_FOOTER_SPAN = 4096
 _BACKSTOP_REPORTED_LINES = 20
+# Positions that cannot label a finding (task 3143, corpus item C). Each is
+# read in a window of at most _BACKSTOP_CONTEXT characters on the token's
+# own line, and only the first _BACKSTOP_CLASSIFY_LIMIT tokens of a view are
+# read at all: any later token counts (a real review has far fewer).
+#   * a tally: a bare count right before the word ("0 HIGH", "**2** MEDIUM")
+#     or after it and a ":", "=" or "|" ("HIGH: 0", "| MEDIUM | 2 |"). The
+#     count must end there ("HIGH: 2FA bypass" is a title), and it must not
+#     exceed what the review counts of that severity (footer or headings),
+#     so a tally never claims a finding the review did not count;
+#   * a negation or comparison: "no", "not", "nor", "zero", "without",
+#     "than" or "none at/of/reached" right before the word ("No CRITICAL or
+#     HIGH findings", "MEDIUM, not HIGH", "LOW rather than MEDIUM"), not
+#     followed by a ":" (so it cannot open a "HIGH: title" label);
+#   * the next word of a list that opens with one of these ("0 CRITICAL/HIGH",
+#     "no CRITICAL, HIGH or MEDIUM issues"), which takes its count.
+#   * "Overall risk: MEDIUM" (also "LOW-MEDIUM"), which states one finding of
+#     that severity and so needs the footer to count at least one.
+_BACKSTOP_CONTEXT = 40
+_BACKSTOP_CLASSIFY_LIMIT = 2000
+_BACKSTOP_NUMBER_WORDS = {
+    "one": 1, "single": 1, "two": 2, "both": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12,
+}
+_BACKSTOP_COUNT_BEFORE_RE = re.compile(
+    r"(?:^|[^\w.,-])(\d{1,4}|" + "|".join(_BACKSTOP_NUMBER_WORDS)
+    + r")[*_` \t]{1,6}\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_COUNT_AFTER_RE = re.compile(
+    r"[*_`]{0,3}[ \t]*[:=|][ \t]*[*_`]{0,3}(\d{1,4})(?![\w-]|[.,]\d)",
+)
+_BACKSTOP_NEGATION_BEFORE_RE = re.compile(
+    r"(?:^|[^\w-])(?:no|not|nor|zero|without|than|nothing|neither|never|"
+    r"none(?:[ \t]+(?:is|are|was|were|at|of|reach|reaches|reached|rated))?)"
+    r"[*_` \t]{1,6}\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_OVERALL_RISK_BEFORE_RE = re.compile(
+    r"overall[ \t]+risk[*_` \t]*(?:[:=]|is)?[*_` \t]*"
+    r"(?:(?:low|medium|high)[ \t]*(?:-|\N{EN DASH}|/|to)[ \t]*(?:to[ \t]+)?)?\Z",
+    re.IGNORECASE,
+)
+_BACKSTOP_COLON_AFTER_RE = re.compile(r"[*_`]{0,3}[ \t]*:")
+_BACKSTOP_LIST_JOINER_RE = re.compile(
+    r"[*_`]{0,3}[ \t]*(?:/|,|&|\+|and\b|or\b|nor\b|,[ \t]*(?:and|or)\b)"
+    r"[ \t]*[*_`]{0,3}",
+)
+# Headings that end a finding's section: levels 1 to 3, like the finding
+# headings themselves ("#### Evidence" inside a finding does not end it).
+_BACKSTOP_SECTION_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,3}(?:[ \t]|$)",
+                                          re.MULTILINE)
 # Lookalikes of the letters of CRITICAL, HIGH and MEDIUM that NFKD does not
 # fold, beyond the parser's table: the remaining Latin small capitals, Coptic
 # capitals, and the negative circled, negative squared and regional
@@ -2811,15 +2863,60 @@ def _backstop_without_markup(text: str) -> tuple[str, list[int] | None] | None:
     return without_tags, origins
 
 
+def _backstop_exempt_count(
+    view: str, start: int, end: int, previous: tuple[int, int] | None,
+) -> int | None:
+    """The count a token states when it sits in a tally, negation or list.
+
+    0 for a negation, the tally's count for a tally, the count of the word
+    before for the next word of such a list (``previous`` is that word's
+    end and count), None when the token may label a finding.
+    """
+    window_start = view.rfind("\n", max(0, start - _BACKSTOP_CONTEXT), start) + 1
+    before = view[max(window_start, start - _BACKSTOP_CONTEXT):start]
+    after_end = view.find("\n", end, end + _BACKSTOP_CONTEXT)
+    after = view[end:after_end if after_end != -1 else end + _BACKSTOP_CONTEXT]
+    tally = _BACKSTOP_COUNT_BEFORE_RE.search(before)
+    if tally is None:
+        tally = _BACKSTOP_COUNT_AFTER_RE.match(after)
+    if tally is not None:
+        stated = tally.group(1)
+        return (int(stated) if stated.isdigit()
+                else _BACKSTOP_NUMBER_WORDS[stated.lower()])
+    if (_BACKSTOP_NEGATION_BEFORE_RE.search(before)
+            and not _BACKSTOP_COLON_AFTER_RE.match(after)):
+        return 0
+    if _BACKSTOP_OVERALL_RISK_BEFORE_RE.search(before):
+        return 1
+    if (previous is not None and start - previous[0] <= _BACKSTOP_CONTEXT
+            and _BACKSTOP_LIST_JOINER_RE.fullmatch(view, previous[0], start)):
+        return previous[1]
+    return None
+
+
 def _backstop_tokens(
-    view: str, origins: list[int] | None,
+    view: str, origins: list[int] | None, covered: dict[str, int],
 ) -> dict[tuple[int, str], int]:
-    """(line, severity) -> number of standalone UPPER-case severity words."""
+    """(line, severity) -> number of standalone UPPER-case severity words.
+
+    Words in a tally whose count the review covers, in a negation, or in a
+    list one of those opens are left out (see ``_BACKSTOP_CONTEXT``).
+    """
     found: dict[tuple[int, str], int] = {}
     newlines: list[int] | None = None
+    previous: tuple[int, int] | None = None
+    classified = 0
     for match in _BACKSTOP_TOKEN_RE.finditer(view):
-        start = match.start()
+        start, end = match.span()
         if start and view[start - 1].isalnum():
+            continue
+        severity = match.group(0)
+        stated = None
+        if classified < _BACKSTOP_CLASSIFY_LIMIT:
+            classified += 1
+            stated = _backstop_exempt_count(view, start, end, previous)
+        previous = None if stated is None else (end, stated)
+        if stated is not None and stated <= covered.get(severity, 0):
             continue
         if newlines is None:
             newlines = [line_break.start()
@@ -2827,7 +2924,7 @@ def _backstop_tokens(
         line = bisect.bisect_left(newlines, start)
         if origins is not None:
             line = origins[line]
-        key = (line, match.group(0))
+        key = (line, severity)
         found[key] = found.get(key, 0) + 1
     return found
 
@@ -2848,6 +2945,55 @@ def _backstop_heading_lines(
         line = bisect.bisect_left(newlines, match.start())
         headings.add((line if origins is None else origins[line], severity))
     return headings
+
+
+def _in_finding_section(
+    line: int, heading_lines: list[int], section_starts: list[int],
+) -> bool:
+    """True when ``line`` is a finding heading or in that finding's section.
+
+    ``heading_lines`` and ``section_starts`` (lines of level 1-3 headings)
+    are sorted; a section ends where the next heading after its own begins.
+    """
+    index = bisect.bisect_right(heading_lines, line) - 1
+    if index < 0:
+        return False
+    next_heading = bisect.bisect_right(section_starts, heading_lines[index])
+    return (next_heading == len(section_starts)
+            or line < section_starts[next_heading])
+
+
+_BACKSTOP_HEADING_ID_RE = re.compile(
+    r"\[([A-Za-z0-9][\w.-]{0,24})\]|(?<![\w-])(" + _FINDING_ID + r")(?![\w-])",
+)
+
+
+def _finding_id_pattern(
+    lines: list[str], heading_lines: list[int],
+) -> re.Pattern[str] | None:
+    """A pattern for the IDs of the finding headings on ``heading_lines``.
+
+    The ID is the first bracketed tag ("[S1]") or finding-ID-shaped word
+    ("SR3130-01") of the heading, and must hold a digit (so "[HIGH]" is no
+    ID). A line naming one, as a whole word, refers to that counted finding.
+    None when no heading has an ID.
+    """
+    identifiers: set[str] = set()
+    for line in heading_lines:
+        if line < len(lines):
+            found = _BACKSTOP_HEADING_ID_RE.search(lines[line])
+            if found is None:
+                continue
+            identifier = found.group(1) or found.group(2)
+            if any(char.isdigit() for char in identifier):
+                identifiers.add(identifier)
+    if not identifiers:
+        return None
+    return re.compile(
+        r"(?<![\w-])(?:"
+        + "|".join(re.escape(identifier) for identifier in sorted(identifiers))
+        + r")(?![\w-])",
+    )
 
 
 def _blank_like(match: re.Match[str]) -> str:
@@ -2919,9 +3065,12 @@ def _severity_token_backstop(
     if without_markup is not None:
         views.append((_backstop_normalized(without_markup[0]),
                       without_markup[1]))
+    footer = analysis.footer_counts or {}
+    # What the review counts per severity (footer, headings, resolved).
+    covered = analysis.counts or footer
     tokens: dict[tuple[int, str], int] = {}
     for view, origins in views:
-        for key, count in _backstop_tokens(view, origins).items():
+        for key, count in _backstop_tokens(view, origins, covered).items():
             if count > tokens.get(key, 0):
                 tokens[key] = count
     if not tokens:
@@ -2929,21 +3078,36 @@ def _severity_token_backstop(
     headings: set[tuple[int, str]] = set()
     for view, origins in views:
         headings |= _backstop_heading_lines(view, origins)
+    # A finding's section runs from its heading to the next heading of
+    # level 1-3. Its own severity repeated there ("**Severity:** MEDIUM",
+    # "MEDIUM because ...") is that finding, not another one.
+    section_starts: list[int] = []
+    if headings:
+        newlines = [match.start() for match in _NEWLINE_RE.finditer(masked)]
+        section_starts = [
+            bisect.bisect_left(newlines, match.start())
+            for match in _BACKSTOP_SECTION_HEADING_RE.finditer(masked)
+        ]
 
-    footer = analysis.footer_counts or {}
     parser_headings = analysis.header_counts or {}
+    masked_lines = masked.split("\n") if headings else []
     problems: list[str] = []
     for severity in _BACKSTOP_SEVERITIES:
-        heading_lines = {line for line, word in headings if word == severity}
+        heading_lines = sorted(line for line, word in headings
+                               if word == severity)
+        names_a_finding = _finding_id_pattern(masked_lines, heading_lines)
         unaccounted = 0
         lines: list[int] = []
         for (line, word), count in tokens.items():
-            if word != severity:
+            if word != severity or _in_finding_section(
+                line, heading_lines, section_starts,
+            ):
                 continue
-            extra = count - (1 if line in heading_lines else 0)
-            if extra > 0:
-                unaccounted += extra
-                lines.append(line + 1)
+            if (names_a_finding is not None and line < len(masked_lines)
+                    and names_a_finding.search(masked_lines[line])):
+                continue  # "| S1 | MEDIUM | ..." names counted finding S1
+            unaccounted += count
+            lines.append(line + 1)
         counted = max(len(heading_lines), parser_headings.get(severity, 0))
         footer_count = footer.get(severity, 0)
         if unaccounted and footer_count < counted + unaccounted:
