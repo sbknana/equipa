@@ -243,7 +243,9 @@ appears in a function that uses none of these:
   (`systemctl stop`, `timeout`) and a SIGINT left at its default action
   skip atexit, so the orchestrator handles them, chained with any handler
   already in place: it terminates its live agents, removes their
-  directories and dies of the signal (F-3 of the 3153 review). A process
+  directories and dies of the signal (F-3 of the 3153 review). A run
+  started during a merge keeps this handler when the merge's signal
+  shield ends (`merge_safety.wrap_restored_handler`). A process
   that is SIGKILLed or OOM-killed runs none of these, so the first per-run
   directory any EQUIPA process creates also removes the `equipa-claude-config-*`
   directories in the same temp directory that are owned by its user, are real
