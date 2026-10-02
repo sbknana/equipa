@@ -58,13 +58,23 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   `python3 -m pytest -q -p no:cacheprovider tests/test_gen_module_report.py::test_generation_is_deterministic`.
 
 To prove a parallel run matches a serial one (same test ids, same outcomes,
-nothing skipped), save both with `--junitxml` and compare them. A serial run
-too long for one command can be split into parts; pass every part:
+nothing skipped), save both with `--junitxml` and compare them. The serial
+run is too long for one agent Bash call, so it runs in two parts of about six
+to seven minutes each, split by test-file name; pass every part:
 
 ```bash
+timeout 540 python3 -m pytest -q -p no:cacheprovider \
+    --junitxml=serial-1.xml tests/test_[a-l]*.py
+timeout 540 python3 -m pytest -q -p no:cacheprovider \
+    --junitxml=serial-2.xml tests/orchestrator tests/test_[m-z]*.py
+timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile \
+    --junitxml=parallel.xml
 python3 scripts/compare_junit_runs.py --serial serial-1.xml serial-2.xml \
     --parallel parallel.xml
 ```
+
+A test file the two parts miss shows up as a difference: the parallel run
+reports test ids the serial parts do not.
 
 - The test dependencies are `pytest`, `pytest-asyncio` and `pytest-xdist`
   (with `execnet`). Install them with `pip install -r requirements-dev.txt`.
