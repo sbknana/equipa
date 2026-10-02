@@ -224,6 +224,7 @@ def test_a_private_use_character_as_written_is_never_a_letter():
 
 CORPUS_FIXTURE = REPO / "tests" / "fixtures" / "review_gate_probe_corpus_3157.json"
 BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c", "502975b")
+FAMILIES_OF_3161 = ("split", "noun", "comma", "list", "private-use")
 
 
 @functools.lru_cache(maxsize=1)
@@ -260,7 +261,7 @@ def test_the_corpus_is_the_one_the_older_trees_judged():
 
 def _must_block(severity: str) -> list[tuple[int, int, list[str]]]:
     """(body, context, trees) of every text of ``severity`` some older tree
-    blocked."""
+    blocked, in the families of task 3157."""
     bodies, _, fixture = _corpus()
     decode = _differential().decode_bits
     blocked = {
@@ -268,8 +269,12 @@ def _must_block(severity: str) -> list[tuple[int, int, list[str]]]:
         for tree in BASELINE_TREES for context in CONTEXTS
     }
     rows = []
-    for index, (_, body_severity, _) in enumerate(bodies):
-        if body_severity != severity:
+    for index, (key, body_severity, _) in enumerate(bodies):
+        # Every text of the families task 3161 added, blocked by an older
+        # tree or not, is judged by tests/test_review_gate_no_exemptions_3161
+        # .py (test_every_text_of_the_3161_families_blocks).
+        if (body_severity != severity
+                or key.split("|", 1)[0] in FAMILIES_OF_3161):
             continue
         for offset, context in enumerate(CONTEXTS):
             trees = [tree for tree in BASELINE_TREES

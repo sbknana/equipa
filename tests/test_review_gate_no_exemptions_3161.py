@@ -15,9 +15,11 @@ blocks with "unaccounted <SEV> token at line N". LOW and INFO stay ignored.
 
 Covered here, each failing on main before this task (502975b):
 
-* every body of the R3157-01 family (each lookalike the gate knows, before a
-  negation tail and at the end of a noun, comma and list label) and of the
-  R3157-02 private-use family blocks, for MEDIUM, in both review contexts;
+* every text of the probe-corpus families this task added blocks with the
+  reason naming its severity and line, for every severity word, in both
+  review contexts: each lookalike the gate knows before a negation tail and
+  at the end of a noun, comma and list label (R3157-01), and a private-use
+  character inside a word (R3157-02); so do the bodies the reviews wrote;
 * each deleted exemption shape (negation, tally, comparison, soft wrap,
   section, finding ID, "Overall risk") blocks for every severity, with the
   reason naming the severity and the line;
@@ -29,8 +31,10 @@ Copyright 2026 Forgeborn
 """
 
 import ast
+import functools
 import importlib.util
 import inspect
+import json
 import textwrap
 from pathlib import Path
 
@@ -75,42 +79,77 @@ def _unaccounted(text: str, severity: str, body_line: str) -> str | None:
     return f"{analysis.verdict}: {analysis.detail[:120]}"
 
 
-def _family_failures(bodies, context: str) -> list[str]:
+# --- R3157-01, R3157-02: the families of the independent 3157 review -------------
+
+# The probe-corpus families task 3161 added (scripts/review_gate_probe_corpus
+# .py): a lookalike after the M of "MINOR"-like words whose tail is a
+# negation ("split"), at the end of a generic noun ("noun"), of a lower-case
+# word after a comma ("comma") and of a listed LOW ("list"), and a
+# private-use character inside "MINOR" ("private-use"), for every severity
+# word. They are replayed here, every text of them, rather than in
+# tests/test_review_gate_followups_3157.py, which replays the texts some
+# older tree blocked: R3157-02 passed on every older tree.
+NEW_FAMILIES = ("split", "noun", "comma", "list", "private-use")
+CORPUS_FIXTURE = REPO / "tests" / "fixtures" / "review_gate_probe_corpus_3157.json"
+BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c", "502975b")
+
+
+@functools.lru_cache(maxsize=1)
+def _new_family_rows() -> tuple[list[tuple[int, str, str, list[str]]], dict]:
+    """(index, key, severity, lines) of every body of the 3161 families, by
+    its index in the corpus, and per (tree, context) the older tree's
+    verdicts on the whole corpus."""
+    path = REPO / "scripts" / "review_gate_differential.py"
+    spec = importlib.util.spec_from_file_location("review_gate_diff_3161",
+                                                  path)
+    differential = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(differential)
+    bodies = differential.probe_corpus_bodies()
+    fixture = json.loads(CORPUS_FIXTURE.read_text(encoding="ascii"))
+    assert fixture["bodies"] == len(bodies)
+    blocked = {
+        (tree, context): differential.decode_bits(
+            fixture["blocked"][tree][context], len(bodies))
+        for tree in BASELINE_TREES for context in CONTEXTS
+    }
+    rows = [(index, key, severity, lines)
+            for index, (key, severity, lines) in enumerate(bodies)
+            if key.split("|", 1)[0] in NEW_FAMILIES]
+    return rows, blocked
+
+
+# Texts of each severity's 3161 families that ba6065a blocked, per context
+# (the fixture): the split rows of MEDIUM, whose exemption R3157-01 split,
+# and the uncounted CRITICAL and HIGH words ba6065a never exempted.
+BA6065A_BLOCKED_AT_LEAST = {"CRITICAL": 4000, "HIGH": 4000, "MEDIUM": 4000}
+
+
+@pytest.mark.parametrize("context", CONTEXTS)
+@pytest.mark.parametrize("severity", SEVERITIES)
+def test_every_text_of_the_3161_families_blocks(severity, context):
+    rows, blocked = _new_family_rows()
+    offset = CONTEXTS.index(context)
     failures = []
-    for key, severity, lines in bodies:
-        text = build_review(lines, context)
-        problem = _unaccounted(text, severity, lines[0])
+    ba6065a_blocked = 0
+    judged = 0
+    for index, key, body_severity, lines in rows:
+        if body_severity != severity:
+            continue
+        judged += 1
+        trees = [tree for tree in BASELINE_TREES
+                 if blocked[(tree, context)][index]]
+        ba6065a_blocked += "ba6065a" in trees
+        problem = _unaccounted(build_review(lines, context), severity,
+                               lines[0])
         if problem is not None:
-            failures.append(f"{key}: {problem}")
-    return failures
-
-
-# --- R3157-01: a lookalike inside an ordinary word ------------------------------
-
-def _medium(bodies):
-    return [body for body in bodies if body[1] == "MEDIUM"]
-
-
-@pytest.mark.parametrize("context", CONTEXTS)
-def test_every_split_word_body_blocks(context):
-    # "Two M<x>NOR MEDIUM issues remain." for every lookalike x and each of
-    # the nine negation tails, upper and lower case (9,252 bodies).
-    bodies = _medium(CORPUS.split_family())
-    assert len(bodies) == 9 * 2 * len(CORPUS.lookalikes())
-    failures = _family_failures(bodies, context)
+            failures.append(f"{key} {CONTEXTS[offset]} (blocked by "
+                            f"{','.join(trees) or 'no older tree'}): {problem}")
     assert not failures, (len(failures), failures[:10])
-
-
-@pytest.mark.parametrize("shape", ["noun", "comma", "list"])
-@pytest.mark.parametrize("context", CONTEXTS)
-def test_every_label_word_body_blocks(shape, context):
-    # "No MEDIUM issues<x>: ...", "Not MEDIUM, see<x>: ..." and
-    # "not MEDIUM / LOW<x>: ..." for every lookalike x.
-    bodies = [body for body in _medium(CORPUS.label_family())
-              if body[0].startswith(f"{shape}|")]
-    assert len(bodies) == len(CORPUS.lookalikes())
-    failures = _family_failures(bodies, context)
-    assert not failures, (len(failures), failures[:10])
+    # Each family is there for each lookalike (514) or private-use point.
+    lookalikes = len(CORPUS.lookalikes())
+    tails = len(CORPUS.SPLIT_TAILS) * (2 if severity == "MEDIUM" else 1)
+    assert judged == (tails + 3) * lookalikes + len(CORPUS.PRIVATE_USE) + 1
+    assert ba6065a_blocked >= BA6065A_BLOCKED_AT_LEAST[severity]
 
 
 def test_the_family_holds_the_reported_code_points():
@@ -122,17 +161,40 @@ def test_the_family_holds_the_reported_code_points():
         folds)
 
 
-# --- R3157-02: a private-use character inside a word -----------------------------
+# The bodies the 3157 reviews wrote out (R3157-01: SECURITY-REVIEW-3157 and
+# indep-3157-3158; R3157-02).
+REPORTED_BODIES = {
+    "minor-iota": "Two M\N{GREEK CAPITAL LETTER IOTA}NOR MEDIUM issues "
+                  "remain.",
+    "minor-h-stroke": "Two M\N{LATIN CAPITAL LETTER H WITH STROKE}NOR "
+                      "MEDIUM issues remain.",
+    "casino-iota": "CAS\N{GREEK CAPITAL LETTER IOTA}NO MEDIUM issues "
+                   "remain.",
+    "whenever-epsilon": "WH\N{GREEK CAPITAL LETTER EPSILON}NEVER MEDIUM "
+                        "issues remain.",
+    "whenever-small-e": "wh\N{LATIN LETTER SMALL CAPITAL E}never MEDIUM "
+                        "issues remain.",
+    "nano-alpha": "N\N{GREEK CAPITAL LETTER ALPHA}NO MEDIUM issues remain.",
+    "minor-script-l": "m\N{SCRIPT SMALL L}nor MEDIUM issues remain.",
+    "noun-en": "No MEDIUM issues\N{CYRILLIC CAPITAL LETTER EN}: SQL "
+               "injection in login.py allows auth bypass.",
+    "noun-te": "No MEDIUM issues\N{CYRILLIC CAPITAL LETTER TE}: SQL "
+               "injection in login.py allows auth bypass.",
+    "comma-en": "Not MEDIUM, see\N{CYRILLIC CAPITAL LETTER EN}: SQL "
+                "injection in login.py allows auth bypass.",
+    "list-en": "not MEDIUM / LOW\N{CYRILLIC CAPITAL LETTER EN}: SQL "
+               "injection in login.py allows auth bypass.",
+    "private-use-e000": "Two MINOR MEDIUM issues remain.",
+    "private-use-f0000": "Two MI\U000f0000NOR MEDIUM issues remain.",
+}
+
 
 @pytest.mark.parametrize("context", CONTEXTS)
-@pytest.mark.parametrize("severity", SEVERITIES)
-def test_every_private_use_body_blocks(severity, context):
-    bodies = [body for body in CORPUS.private_use_family()
-              if body[1] == severity]
-    assert {key.rsplit("|", 1)[1] for key, _, _ in bodies} == {
-        "E000", "E123", "F8FF", "F0000", "100000", "200B"}
-    failures = _family_failures(bodies, context)
-    assert not failures, failures
+@pytest.mark.parametrize("name", sorted(REPORTED_BODIES))
+def test_a_reported_body_blocks(name, context):
+    line = REPORTED_BODIES[name]
+    text = build_review([line], context)
+    assert _unaccounted(text, "MEDIUM", line) is None, analyze(text)
 
 
 # --- The deleted exemption shapes block for every severity -------------------------
