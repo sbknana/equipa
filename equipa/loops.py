@@ -1573,6 +1573,14 @@ _REVIEW_MAX_PARSED_LINES = 10_000
 # as rendered holds more than this is not parsed (fail closed).
 _REVIEW_MAX_SEVERITY_LINES = 1_000
 
+# Task 3161 (timing): the backstop tables work out each character they have
+# not seen in Python (about 2 us, in each table), and every pass over a text
+# of distinct code points is slow too: 200 KB of 70,000 of them took 0.5 s.
+# The most any of the 1,560 real reviews holds is 26 distinct non-ASCII
+# characters (a review in Chinese uses a few thousand), so a review with
+# more than this is not parsed (fail closed).
+_REVIEW_MAX_DISTINCT_CHARACTERS = 4_096
+
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
 REVIEW_VERDICT_FALLBACK = "fallback"
@@ -2799,11 +2807,21 @@ _RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
 _NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f\N{REPLACEMENT CHARACTER}]+")
 
 
-def _without_combining_marks(run: re.Match[str]) -> str:
+def _marks_dropped(run: re.Match[str]) -> str:
     return "".join(
-        char for char in unicodedata.normalize("NFD", run.group(0))
+        char for char in run.group(0)
         if unicodedata.category(char) not in _COMBINING_MARK_CATEGORIES
     )
+
+
+# Task 3161 (timing): no letter or digit ("\w") is a mark, so only the runs
+# of other characters are read one by one (a run of 70,000 ideographs was).
+_NOT_A_LETTER_RUN_RE = re.compile(r"\W+")
+
+
+def _without_combining_marks(run: re.Match[str]) -> str:
+    return _NOT_A_LETTER_RUN_RE.sub(
+        _marks_dropped, unicodedata.normalize("NFD", run.group(0)))
 
 
 def _strip_combining_marks(text: str) -> str:
@@ -4152,6 +4170,12 @@ def _analyze_review_file(
             verdict=REVIEW_VERDICT_COUNT_MISMATCH,
             detail=f"{REVIEW_BIDI_REASON}: {bidi} (name the character, "
                    f"never paste it)",
+        )
+    if not text.isascii() and len(set(text)) > _REVIEW_MAX_DISTINCT_CHARACTERS:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_INCOMPLETE,
+            detail=(f"review too varied to parse: more than "
+                    f"{_REVIEW_MAX_DISTINCT_CHARACTERS} distinct characters"),
         )
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
