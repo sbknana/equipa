@@ -85,6 +85,7 @@ from equipa.git_ops import (
     pinned_repository_by_path,
     read_regular_file_bounded,
     read_worktree_head,
+    remove_registered_worktree,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -585,9 +586,13 @@ async def _reset_in_private_git_dir(
     failed_head = worktree_git.head
     if not base_sha:
         # No recorded base: fall back to the fork point from the operator's
-        # default branch, never the checked-out HEAD or origin/HEAD.
+        # default branch, never the checked-out HEAD or origin/HEAD. FF-3158
+        # (task #3162): its branches are looked up in the repository that
+        # registers the worktree, never through the worktree's .git.
         try:
-            default_branch = get_trusted_default_branch(worktree_dir)
+            default_branch = get_trusted_default_branch(
+                worktree_dir, common_dir=worktree_git.common_dir,
+            )
         except UntrustedDefaultBranchError as exc:
             raise AttemptCleanupError(str(exc)) from exc
         base_sha = _checked_output(
@@ -715,14 +720,21 @@ async def cleanup_failed_attempt(
         else:
             print(message)
 
-    try:
-        is_git = _is_git_repo(project_dir)
-    except GitRepositoryUnreadableError as exc:
-        raise AttemptCleanupError(str(exc)) from exc
+    in_task_worktree = _in_task_worktree_location(project_dir)
+    if in_task_worktree:
+        # FF-3158 (task #3162): a task worktree is git by construction; asking
+        # git (by discovery, through the agent's .git) is not needed, and
+        # the reset below finds the repository that registers it.
+        is_git = True
+    else:
+        try:
+            is_git = _is_git_repo(project_dir)
+        except GitRepositoryUnreadableError as exc:
+            raise AttemptCleanupError(str(exc)) from exc
     if is_git:
         # R3155-01 (task #3158): a path in a task worktree location is reset
         # as one, whatever its (agent-writable) .git claims.
-        if _in_task_worktree_location(project_dir) or await _is_linked_worktree(project_dir):
+        if in_task_worktree or await _is_linked_worktree(project_dir):
             # R3119-07 (task #3126): a nested project's attempt ran in a
             # sub-directory of its worktree; ``git clean`` there would leave
             # the rest of the worktree dirty for the next attempt.
@@ -2171,7 +2183,7 @@ async def _retire_leftover_worktree(
         and not wt_path.is_symlink()
         and find_worktree_git_dir(str(common_dir), os.path.realpath(wt)) is not None
     )
-    if not registered:
+    if common_dir is None or not registered:
         # Not a worktree of its own: git run there would act on whatever
         # its .git names, so neither stash nor remove it.
         if wt_path.is_dir() and not wt_path.is_symlink() and not any(wt_path.iterdir()):
@@ -2189,9 +2201,7 @@ async def _retire_leftover_worktree(
             f"leftover worktree {wt} has uncommitted work that could not "
             f"be stashed ({problem}); preserved, resolve by hand"
         )
-    remove = await git_run_async(
-        ["worktree", "remove", "--force", wt], project_dir, timeout=30,
-    )
+    remove = await remove_registered_worktree(common_dir, wt, timeout=30)
     if remove.returncode != 0:
         return (
             f"could not remove leftover worktree {wt}: "
@@ -2883,8 +2893,12 @@ async def _cleanup_worktrees(
     investigations have evidence of which step failed.
 
     Uses ``git_run_async`` so the per-task ``git worktree remove`` and
-    ``git branch -D`` calls do not block the event loop.
+    ``git branch -D`` calls do not block the event loop. FF-3158 (task
+    #3162): ``worktree remove`` names the repository found from
+    ``project_dir`` explicitly (:func:`equipa.git_ops.remove_registered_worktree`);
+    when it cannot be found, the worktree is kept.
     """
+    common_dir = await _git_common_dir(project_dir)
     for task_id, wt_path in worktree_dirs.items():
         branch_name = f"forge-task-{task_id}"
         try:
@@ -2902,10 +2916,14 @@ async def _cleanup_worktrees(
                 await _stash_uncommitted_in_worktree(
                     wt_path, task_id, branch_name, project_dir=project_dir,
                 )
-            await git_run_async(
-                ["worktree", "remove", "--force", wt_path],
-                project_dir, timeout=30,
-            )
+            if common_dir is None:
+                print(
+                    f"  [Isolation] Could not locate the repository of "
+                    f"{project_dir}; keeping worktree {wt_path} and branch "
+                    f"'{branch_name}'"
+                )
+                continue
+            await remove_registered_worktree(common_dir, wt_path, timeout=30)
             if task_id in merged_tasks:
                 await git_run_async(
                     ["branch", "-D", branch_name], project_dir, timeout=10,

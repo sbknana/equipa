@@ -1542,6 +1542,25 @@ async def _run_in_main_repository(
     )
 
 
+async def remove_registered_worktree(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike, *, timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    """``git worktree remove --force <work_tree>`` on the repository whose git
+    common dir is ``common_dir``, named explicitly.
+
+    FF-3158 (task #3162): git is not started by discovery, neither in the
+    work tree nor in a checkout. It finds the ``worktrees/<name>`` entry
+    whose ``gitdir`` file names ``work_tree`` and reads the work tree's
+    ``.git`` only as data (a rewritten one makes it refuse). ``--force``
+    skips the clean check, which would run ``git status`` in the work tree.
+    """
+    return await _run_in_main_repository(
+        os.path.realpath(os.fspath(common_dir)),
+        ["worktree", "remove", "--force", os.path.abspath(os.fspath(work_tree))],
+        timeout,
+    )
+
+
 async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None]:
     """``(commit, branch)`` the worktree git dir's HEAD names (branch None
     when detached), resolved in the main repository."""
@@ -1872,8 +1891,10 @@ async def agent_worktree_git(
 # the one call. git reads config and ``info/attributes`` from the common dir,
 # so neither the repository's config, its ``config.worktree`` (the extension
 # is not copied) nor its ``info/attributes`` is read; the global config is
-# ``/dev/null`` and the system files are off. An attribute can select a
-# driver, but none is defined anywhere git looks, so none runs. Objects are
+# ``/dev/null`` and the system files are off. No driver is defined anywhere
+# git looks, so none runs; as defence in depth (FF-3158, task #3162) the
+# attributes come from the empty tree (``GIT_ATTR_SOURCE``) and no global
+# attributes file is read, so nothing selects one either. Objects are
 # the repository's (``GIT_OBJECT_DIRECTORY``); refs, reflogs and packed refs
 # are reached through links to the repository's own (data git reads, never
 # runs). Submodule work trees are not examined (``--ignore-submodules=dirty``,
@@ -2008,6 +2029,7 @@ class _WorktreeView:
     git_dir: str
     work_tree_fd: int | None
     private_dir: str | None = None
+    empty_tree: str | None = None
 
     @property
     def _work_tree_path(self) -> str:
@@ -2025,7 +2047,7 @@ class _WorktreeView:
         return () if self.work_tree_fd is None else (self.work_tree_fd,)
 
     def env(self, extra_env: Mapping[str, str] | None, args: Sequence[str]) -> dict[str, str]:
-        if self.private_dir is None:  # pragma: no cover - made by _open_worktree_view
+        if self.private_dir is None or self.empty_tree is None:  # pragma: no cover
             raise AgentWorktreeGitError("the private common dir was not written")
         env = _hardened_git_env(extra_env, args)
         env.update(_NO_TRANSPORT_ENV)
@@ -2033,12 +2055,16 @@ class _WorktreeView:
             "GIT_COMMON_DIR": self.private_dir,
             "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),
             "GIT_CONFIG_GLOBAL": os.devnull,
+            # FF-3158 (task #3162), defence in depth: the work tree's
+            # .gitattributes select nothing either (git >= 2.40).
+            "GIT_ATTR_SOURCE": self.empty_tree,
         })
         return env
 
     def argv(self, args: Sequence[str], env: Mapping[str, str]) -> list[str]:
         return _hardened_git_argv(
-            [f"--git-dir={self.git_dir}", f"--work-tree={self._work_tree_path}",
+            ["-c", f"core.attributesFile={os.devnull}",
+             f"--git-dir={self.git_dir}", f"--work-tree={self._work_tree_path}",
              *_submodule_work_trees_unexamined(args)],
             env,
         )
@@ -2094,6 +2120,15 @@ def _with_private_common_dir(
     for listing in listings:
         if listing.returncode == 0:
             settings.extend(parse_config_list_z(listing.stdout))
+    object_format = next(
+        ((value or "").strip().lower() for key, value in reversed(settings)
+         if key.lower() == "extensions.objectformat"),
+        "sha1",
+    )
+    if object_format not in _EMPTY_TREES:
+        raise AgentWorktreeGitError(
+            f"{view.common_dir} uses the unknown object format {object_format[:40]!r}"
+        )
     private_dir = tempfile.mkdtemp(prefix="equipa-worktree-view-")
     try:
         Path(private_dir, "config").write_text(serialize_git_config(settings), encoding="utf-8")
@@ -2112,7 +2147,9 @@ def _with_private_common_dir(
     except OSError as exc:
         shutil.rmtree(private_dir, ignore_errors=True)
         raise AgentWorktreeGitError(f"cannot write a private common dir: {exc}") from exc
-    return dataclass_replace(view, private_dir=private_dir)
+    return dataclass_replace(
+        view, private_dir=private_dir, empty_tree=_EMPTY_TREES[object_format],
+    )
 
 
 def _refused_result(
@@ -2668,17 +2705,26 @@ def configured_default_branch(repo_path: str | Path) -> str | None:
     return None
 
 
-def _trusted_branch_exists(repo_path: str | Path, branch: str) -> bool:
+def _trusted_branch_exists(
+    repo_path: str | Path, branch: str, common_dir: str | os.PathLike | None = None,
+) -> bool:
     """True if ``refs/heads/<branch>`` names a commit; raises if git cannot run.
 
     A git failure must not read as "branch absent": that could turn an
-    ambiguous main+master repo into a single-candidate one.
+    ambiguous main+master repo into a single-candidate one. With
+    ``common_dir`` the lookup runs on that git dir, named explicitly, with
+    no transport allowed (no discovery from ``repo_path``).
     """
+    lookup = ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"]
     try:
-        result = git_run(
-            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"],
-            repo_path, timeout=10,
-        )
+        if common_dir is None:
+            result = git_run(lookup, repo_path, timeout=10)
+        else:
+            common = os.fspath(common_dir)
+            result = git_run(
+                [f"--git-dir={common}", *lookup], common, timeout=10,
+                env=_NO_TRANSPORT_ENV,
+            )
     except (subprocess.SubprocessError, OSError) as exc:
         raise UntrustedDefaultBranchError(
             f"could not check refs/heads/{branch} in {repo_path!s}: {exc}"
@@ -2686,12 +2732,20 @@ def _trusted_branch_exists(repo_path: str | Path, branch: str) -> bool:
     return result.returncode == 0
 
 
-def get_trusted_default_branch(repo_path: str | Path) -> str:
+def get_trusted_default_branch(
+    repo_path: str | Path, *, common_dir: str | os.PathLike | None = None,
+) -> str:
     """Default branch of ``repo_path`` from operator-controlled sources only.
 
     Never reads ``refs/remotes/origin/HEAD`` or the checked-out HEAD, and is
     never cached, so a symbolic ref repointed from an agent worktree has no
-    effect. Resolution:
+    effect.
+
+    ``common_dir`` (FF-3158, task #3162) is the git common dir of the
+    repository to look the branches up in, for a ``repo_path`` in an agent's
+    task worktree: git is then never started there by discovery, where the
+    worktree's ``.git`` (the agent's) could name another repository.
+    ``repo_path`` still selects the operator's configured entry. Resolution:
 
       1. The operator-named branch in ``project_default_branches``. It must be
          a plain branch name, must not be a ``forge-task-*`` agent branch, and
@@ -2710,7 +2764,7 @@ def get_trusted_default_branch(repo_path: str | Path) -> str:
                 f"configured default branch {configured!r} for {repo_path!s} is "
                 f"not an operator branch name"
             )
-        if not _trusted_branch_exists(repo_path, configured):
+        if not _trusted_branch_exists(repo_path, configured, common_dir):
             raise UntrustedDefaultBranchError(
                 f"configured default branch {configured!r} does not exist in "
                 f"{repo_path!s}"
@@ -2718,7 +2772,7 @@ def get_trusted_default_branch(repo_path: str | Path) -> str:
         return configured
     existing = [
         candidate for candidate in TRUSTED_DEFAULT_BRANCH_CANDIDATES
-        if _trusted_branch_exists(repo_path, candidate)
+        if _trusted_branch_exists(repo_path, candidate, common_dir)
     ]
     if len(existing) == 1:
         return existing[0]
