@@ -266,6 +266,49 @@ def test_answers_match_plain_git_on_an_unplanted_worktree(tmp_path: Path) -> Non
     assert "debug.log" not in git_run(["status", "--porcelain"], worktree).stdout
 
 
+@pytest.fixture
+def pinned_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A throwaway HOME whose global config the test writes and then pins;
+    the pin is forgotten before and after."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    for name in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_WORK_TREE"):
+        monkeypatch.delenv(name, raising=False)
+    git_ops_mod.reset_global_git_config_pin()
+    yield home
+    git_ops_mod.reset_global_git_config_pin()
+
+
+def test_a_driver_in_the_pinned_global_config_never_runs(
+    tmp_path: Path, pinned_home: Path,
+) -> None:
+    """The pinned global config can hold drivers (an operator's LFS, or one
+    an agent wrote to ``~/.gitconfig`` before the pin). Only the operator's
+    identity and ``core.excludesFile`` reach the view; ``.gitattributes``
+    cannot select a global driver."""
+    _repo, worktree = _task_worktree(tmp_path)
+    drivers = Drivers(tmp_path)
+    ignore = tmp_path / "global-ignore"
+    ignore.write_text("*.tmp\n")
+    (pinned_home / ".gitconfig").write_text(
+        f'[filter "probe"]\n\tclean = {drivers.filter}\n'
+        f"[core]\n\texcludesFile = {ignore}\n"
+    )
+    git_ops_mod.pin_global_git_config()
+    (worktree / ".gitattributes").write_text("* filter=probe\n")
+    _leave_unsaved_work(worktree)
+    (worktree / "scratch.tmp").write_text("ignored\n")
+
+    status = git_run(["status", "--porcelain"], worktree)
+    diff = git_run(["diff", "HEAD"], worktree)
+
+    assert not drivers.ran(), "the global config's driver ran in the orchestrator"
+    assert " M README.md" in status.stdout and "scratch.tmp" not in status.stdout
+    assert "+SEED" in diff.stdout
+
+
 def test_location_queries_still_name_the_real_repository(tmp_path: Path) -> None:
     repo, worktree = _task_worktree(tmp_path)
 
