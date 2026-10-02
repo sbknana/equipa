@@ -109,13 +109,67 @@ def _sweep_stale_session_dirs(root: str,
     return removed
 
 
-_sweep_stale_session_dirs(_ORIGINAL_TMP)
+#
+# --- pytest-xdist workers (task 3160) ---
+#
+# Under `pytest -n N` every worker is its own process and runs this file
+# itself, so each worker gets its own session directory (inside the
+# controller's: the worker inherits TMPDIR) and its own THEFORGE_DB. Workers
+# never share a database. tmp_path is different: the controller hands every
+# worker a base directory under ITS basetemp (<controller session>/
+# pytest-of-<user>/pytest-N/popen-gwN), outside the worker's own session
+# directory. So a worker judges test-DB paths against the controller's
+# session directory, the one directory that holds both. The controller
+# exports it in SESSION_ROOT_ENV; a worker accepts it only when it is the
+# TMPDIR the worker inherited and a real "eqt-" directory of this user.
+SESSION_ROOT_ENV = "EQUIPA_TEST_SESSION_ROOT"
+_XDIST_WORKER_ID = re.compile(r"gw\d+")
+
+
+def _xdist_session_root(worker_id: str | None, exported_root: str | None,
+                        inherited_tmp: str) -> Path | None:
+    """The controller's session directory if this process is one of its
+    xdist workers, else None (a top-level session, serial or controller).
+
+    A test that starts a Python subprocess inherits PYTEST_XDIST_WORKER but
+    not the controller's TMPDIR (the worker moved it), so it stays top-level.
+    """
+    if not worker_id or not _XDIST_WORKER_ID.fullmatch(worker_id):
+        return None
+    if not exported_root or Path(exported_root) != Path(inherited_tmp):
+        return None
+    root = Path(exported_root)
+    try:
+        info = root.lstat()
+    except OSError:
+        return None
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or not root.name.startswith(_SESSION_TMP_PREFIX)):
+        return None
+    return root
+
+
+XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER") or None
+_CONTROLLER_SESSION_ROOT = _xdist_session_root(
+    XDIST_WORKER, os.environ.get(SESSION_ROOT_ENV), _ORIGINAL_TMP)
+if _CONTROLLER_SESSION_ROOT is None:
+    XDIST_WORKER = None
+
+# A worker's parent temp directory is the controller's live session
+# directory: never sweep it (nothing in it is a day old anyway).
+if XDIST_WORKER is None:
+    _sweep_stale_session_dirs(_ORIGINAL_TMP)
 SESSION_TMP = Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX,
                                     dir=_ORIGINAL_TMP))
 os.environ["TMPDIR"] = str(SESSION_TMP)
 tempfile.tempdir = str(SESSION_TMP)
+# The directory every DB path and tmp_path of this run must sit inside.
+SESSION_ROOT = _CONTROLLER_SESSION_ROOT or SESSION_TMP
+os.environ[SESSION_ROOT_ENV] = str(SESSION_ROOT)
 
-_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="equipa-test-db-"))
+_TEST_DB_DIR = Path(tempfile.mkdtemp(
+    prefix=f"equipa-test-db-{XDIST_WORKER}-" if XDIST_WORKER
+    else "equipa-test-db-"))
 TEST_DB_PATH = _TEST_DB_DIR / "theforge-test.db"
 os.environ["THEFORGE_DB"] = str(TEST_DB_PATH)
 
@@ -124,16 +178,18 @@ def _is_safe_test_db(path) -> bool:
     """True only for a DB path that cannot be a real TheForge database.
 
     The path must not itself be a symlink, and after resolving any symlinks
-    in its parents it must sit inside the system temp directory (where this
-    conftest's DB and every tmp_path live). A repo-root theforge.db that is a
-    symlink to production fails both tests. Nothing inside the repo counts
-    as safe either, even when the checkout itself lives under /tmp: the
-    repo-root default is never a test DB.
+    in its parents it must sit inside this run's session directory
+    (SESSION_ROOT, in the system temp directory, where this conftest's DB
+    and every tmp_path live; under xdist the controller's, holding every
+    worker's). A repo-root theforge.db that is a symlink to production fails
+    both tests. Nothing inside the repo counts as safe either, even when the
+    checkout itself lives under /tmp: the repo-root default is never a test
+    DB.
     """
     p = Path(path)
     if p.is_symlink():
         return False
-    tmp_root = Path(tempfile.gettempdir()).resolve()
+    tmp_root = SESSION_ROOT.resolve()
     try:
         resolved = p.resolve()
     except OSError:
