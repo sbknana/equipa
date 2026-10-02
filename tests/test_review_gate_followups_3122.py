@@ -11,13 +11,13 @@ Copyright 2026 Forgeborn
 """
 
 import re
-import time
 from pathlib import Path
 
 import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -366,12 +366,11 @@ ADVERSARIAL_BODIES = {
 }
 
 
+@timing_test
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
 def test_200kb_adversarial_review_parses_under_two_seconds(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.process_time()
-    analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert elapsed < 2.0, f"{name}: {elapsed:.2f}s"

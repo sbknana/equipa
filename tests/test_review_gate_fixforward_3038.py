@@ -17,7 +17,6 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +31,7 @@ from equipa.loops import (
     backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -317,14 +317,14 @@ def test_non_zero_tally_or_blocking_risk_heading_still_blocks(
     ],
     ids=["bold-parens", "l2-brackets", "l4-paren-x"],
 )
+@timing_test
 def test_long_candidate_title_parses_quickly_and_still_blocks(
     tmp_path: Path, adversarial_line: str,
 ) -> None:
     path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
 
-    started = time.process_time()
     blocked = _blocks_merge(path)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(_blocks_merge, path)
 
     assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
     assert blocked

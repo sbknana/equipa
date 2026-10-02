@@ -31,13 +31,13 @@ Copyright 2026 Forgeborn
 
 import random
 import re
-import time
 from pathlib import Path
 
 import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -277,11 +277,10 @@ def test_hex_digits_after_a_reference_are_part_of_it():
             == "\N{REPLACEMENT CHARACTER}RITICAL")
 
 
+@timing_test
 def test_a_200kb_reference_is_decided_without_int():
     text = build_review(["&#" + "9" * RB + "HIGH severity RCE"], "zero")
-    started = time.process_time()
-    assert_backstop_blocks(text)
-    assert time.process_time() - started < 0.5
+    assert median_cpu_seconds(assert_backstop_blocks, text) < 0.5
 
 
 # --- R3149-05: the link reader is linear and reads what it read before ------------
@@ -349,14 +348,11 @@ def test_link_reader_reads_what_the_old_reader_read():
     ["[a]: x", "", "a]" * (RB // 2)],
     ["[a]: x", "", "[" + " " * (RB // 2) + "a]" * (RB // 4)],
 ])
+@timing_test
 def test_r3149_05_link_bodies_parse_in_half_a_second(body):
     text = build_review(body, "zero")
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text)
+    assert elapsed < 0.5, elapsed
 
 
 def test_link_text_longer_than_any_label_is_no_shortcut_link():
@@ -451,13 +447,13 @@ def test_only_the_final_footer_is_credited():
     assert_backstop_blocks(text)
 
 
+@timing_test
 def test_strict_footer_grammar_is_linear_on_a_padded_line():
     footer = ("CRITICAL: 0" + " " * RB + "| HIGH: 1 | MEDIUM: 0 | LOW: 0 | "
               "INFO: 0 x")
     text = one_high_review([], [footer])
-    started = time.process_time()
     assert gate_blocks(text)
-    assert time.process_time() - started < 0.5
+    assert median_cpu_seconds(gate_blocks, text) < 0.5
 
 
 @pytest.mark.parametrize("last_line", [

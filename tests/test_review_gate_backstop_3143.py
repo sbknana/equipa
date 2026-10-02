@@ -32,7 +32,6 @@ Copyright 2026 Forgeborn
 import hashlib
 import json
 import random
-import time
 import unicodedata
 from pathlib import Path
 
@@ -44,6 +43,7 @@ from equipa.security_gate import (
     review_complete_line,
     reviewer_nonce_line,
 )
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -705,24 +705,14 @@ BACKSTOP_FAMILIES = {
 }
 
 
-def _best_of_two(text):
-    # CPU time: under `pytest -n auto` a wall clock also counts the time this
-    # worker waits for a core (task 3160).
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    return best
-
-
+@timing_test
 @pytest.mark.parametrize("name", sorted({**REVIEWER_FAMILIES,
                                          **BACKSTOP_FAMILIES}))
 def test_200kb_adversarial_review_parses_in_half_a_second(name):
     body = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}[name]
     text = review("No findings.", body, ZERO)
     assert len(text.encode()) >= RB * 0.99, name
-    elapsed = _best_of_two(text)
+    elapsed = median_cpu_seconds(analyze, text)
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
 
