@@ -24,25 +24,47 @@ pre-commit hook in `.githooks/pre-commit`.
 
 ## 2. Running the test suite
 
-The suite is `pytest`-based. It never touches a real TheForge database: point
-`THEFORGE_DB` at a throwaway path and every test (and `tests/conftest.py`'s
-schema-apply) uses it instead.
+The suite is `pytest`-based. It never touches a real TheForge database:
+`tests/conftest.py` points `THEFORGE_DB` at a throwaway file in a private temp
+directory before any `equipa` module is imported, whatever the environment
+says, and refuses to run if a loaded module still points elsewhere.
+
+The full suite runs in parallel with pytest-xdist. Serially it takes over ten
+minutes; in parallel it takes under four on a 16-core host. This is the
+default invocation, used by CI and by EQUIPA's tester and developer agents:
 
 ```bash
 # From the repo root:
-THEFORGE_DB="$(mktemp -d)/theforge-test.db" pytest -q
+timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
 ```
 
-For a run that mirrors CI exactly (with the slowest 15 tests reported):
+- `--dist loadfile` keeps every test file on one worker, in file order.
+- Every worker is a separate process with its own test DB and temp directory
+  (`tests/conftest.py`), so workers never share database state. Under xdist,
+  test-DB paths are checked against the controller's session directory, which
+  holds every worker's DB and `tmp_path`.
+- `timeout 540` keeps the run inside the 10-minute limit of an agent's Bash
+  call. Run it in the foreground.
+- Report the counts from pytest's final summary line (passed / skipped / total).
+  The suite must have 0 skipped tests.
+- Add `--durations=25` to list the slowest tests. No single test should take
+  more than 20 seconds.
+- Run a single file or test without `-n`, e.g.
+  `python3 -m pytest -q -p no:cacheprovider tests/test_gen_module_report.py::test_generation_is_deterministic`.
+
+To prove a parallel run matches a serial one (same test ids, same outcomes,
+nothing skipped), save both with `--junitxml` and compare them. A serial run
+too long for one command can be split into parts; pass every part:
 
 ```bash
-THEFORGE_DB="$(mktemp -d)/theforge-test.db" pytest -q --durations=15
+python3 scripts/compare_junit_runs.py --serial serial-1.xml serial-2.xml \
+    --parallel parallel.xml
 ```
 
-- `pytest` is the **only** test-time dependency. Install it with
-  `pip install pytest` (it is not needed to run EQUIPA itself, only to test it).
-- Run a single file or test with the usual pytest selectors, e.g.
-  `pytest -q tests/test_gen_module_report.py::test_generation_is_deterministic`.
+- The test dependencies are `pytest`, `pytest-asyncio` and `pytest-xdist`
+  (with `execnet`). Install them with `pip install -r requirements-dev.txt`.
+  That file pins every package with sha256 hashes, so pip checks every
+  download. They are not needed to run EQUIPA itself, only to test it.
 
 ## 3. Zero dependencies
 
@@ -53,8 +75,9 @@ not a preference:
   Use `urllib`, `sqlite3`, `json`, `ast`, `argparse`, `subprocess`, etc.
 - **No `pip install` to run.** Copy the `equipa/` folder onto any machine with
   Python 3.10+ and it works. Zero supply-chain surface.
-- `pytest` is the single exception, and only for the test suite — never import
-  it from `equipa/` or `scripts/` production code.
+- The pytest packages in `requirements-dev.txt` are the single exception, and
+  only for the test suite. Never import them from `equipa/` or `scripts/`
+  production code.
 
 If a change would introduce a runtime dependency, it will be rejected. Solve
 the problem with the stdlib or reconsider the design.
@@ -99,7 +122,7 @@ locally before pushing.
 
 | Workflow | File | What it enforces |
 |---|---|---|
-| Tests | `.github/workflows/tests.yml` | Runs `pytest -q --durations=15` under Python 3.12 with a hermetic `THEFORGE_DB`. The full suite must pass. |
+| Tests | `.github/workflows/tests.yml` | Runs `python -m pytest -q -p no:cacheprovider -n auto --dist loadfile --durations=25` under Python 3.10 and 3.12 with a hermetic `THEFORGE_DB`. The full suite must pass. |
 | Docs Drift Check | `.github/workflows/docs-drift-check.yml` | Runs `scripts/check_docs_drift.py`: doc/README path references resolve, the README module & test-badge counts are within tolerance, and the committed module report is not stale (see [§7](#7-generated-docs--drift)). |
 | Plugin Boundary Check | `.github/workflows/plugin-boundary-check.yml` | Core `equipa/` must never directly import a plugin package — plugins integrate only through `equipa.plugins` entry points. |
 

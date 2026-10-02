@@ -30,14 +30,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run pytest suite
-        # Mirrors the local invocation exactly (pytest -q --durations=15).
-        # Output is teed to a file for the failure artifact. `shell: bash`
-        # is REQUIRED: only an explicit bash shell runs with `-o pipefail`.
-        # Without it the step's status was tee's, so a failing pytest
-        # reported green (seen on the first real run: 1 failed, job passed).
+        # Mirrors the documented local invocation (CONTRIBUTING.md §2):
+        # parallel with pytest-xdist, one isolated test DB per worker, the
+        # 25 slowest tests reported. Output is teed to a file for the
+        # failure artifact. `shell: bash` is REQUIRED: only an explicit bash
+        # shell runs with `-o pipefail`. Without it the step's status was
+        # tee's, so a failing pytest reported green (seen on the first real
+        # run: 1 failed, job passed).
         shell: bash
         run: |
-          pytest -q --durations=15 | tee "$RUNNER_TEMP/pytest-output.txt"
+          python -m pytest -q -p no:cacheprovider -n auto --dist loadfile \
+            --durations=25 | tee "$RUNNER_TEMP/pytest-output.txt"
       - name: Upload pytest output on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
