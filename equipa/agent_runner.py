@@ -2211,8 +2211,11 @@ def _terminate_live_agents_at_exit() -> None:
         try:
             agent.terminate_sync()
         except Exception:  # noqa: BLE001 - every remaining agent must be tried
-            logger.exception("[ProcessTree] failed to terminate agent "
-                             "launcher %d at exit", agent.pid)
+            # Also runs from the stop-signal handler, where a failing log
+            # call must not skip the remaining agents.
+            with contextlib.suppress(Exception):
+                logger.exception("[ProcessTree] failed to terminate agent "
+                                 "launcher %d at exit", agent.pid)
 
 
 def _track_live_agent(agent: _ContainedAgent) -> None:
@@ -2320,15 +2323,36 @@ _STOP_CLEANUP_MARKER = "_equipa_cli_config_dir_cleanup"
 # Set while a stop-signal handler cleans up; a second stop signal arriving
 # meanwhile returns at once, and the interrupted handler finishes.
 _stop_cleanup_running = False
+# R6 of the 3156 review: a stop signal between mkdtemp and the registration
+# below would miss the new directory. While a directory is being created
+# (by this PID: a forked child inherits these values), the handler only
+# records the signal, and it is re-sent once the directory is registered.
+_cli_config_dir_creator_pid: int | None = None
+_stop_signal_during_creation: int | None = None
 
 
 def _create_cli_config_dir() -> str:
-    try:
-        config_dir = create_run_config_dir()
-    except RunConfigDirError as exc:
-        raise AgentDispatchRefused(str(exc)) from exc
-    _LIVE_CLI_CONFIG_DIRS[config_dir] = os.getpid()
+    """Create a per-run directory, registered before a stop signal sees it.
+
+    The handler is installed first, so the first run has it too; a stop
+    signal that arrives while the directory is created is deferred until
+    the directory is registered, then re-sent.
+    """
+    global _cli_config_dir_creator_pid, _stop_signal_during_creation
     _install_stop_signal_cleanup()
+    _cli_config_dir_creator_pid = os.getpid()
+    try:
+        try:
+            config_dir = create_run_config_dir()
+        except RunConfigDirError as exc:
+            raise AgentDispatchRefused(str(exc)) from exc
+        _LIVE_CLI_CONFIG_DIRS[config_dir] = os.getpid()
+    finally:
+        _cli_config_dir_creator_pid = None
+        deferred_signum = _stop_signal_during_creation
+        _stop_signal_during_creation = None
+        if deferred_signum is not None:
+            signal.raise_signal(deferred_signum)
     return config_dir
 
 
@@ -2393,9 +2417,17 @@ def _stop_signal_cleanup_handler(previous: Any) -> Any:
     request) and its runs stay intact; when it raises (SystemExit,
     KeyboardInterrupt) the directories are removed before the exception
     unwinds, which a slow shutdown cut short by SIGKILL would skip.
+
+    The SIG_DFL path re-sends the signal in a ``finally``: whatever the
+    cleanup raises, the process still dies of the signal (R1 of the 3156
+    review).
     """
     def handler(signum: int, frame: FrameType | None) -> None:
+        global _stop_signal_during_creation
         if _stop_cleanup_running:
+            return
+        if _cli_config_dir_creator_pid == os.getpid():
+            _stop_signal_during_creation = signum
             return
         if callable(previous):
             try:
@@ -2404,33 +2436,86 @@ def _stop_signal_cleanup_handler(previous: Any) -> Any:
                 _remove_live_cli_config_dirs_on_stop(terminate_agents=False)
                 raise
             return
-        _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        try:
+            _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
+        finally:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
 
     setattr(handler, _STOP_CLEANUP_MARKER, True)
     return handler
 
 
+@contextlib.contextmanager
+def _logging_cannot_raise() -> Iterator[None]:
+    """Keep every log call in the block from raising.
+
+    The stop handler can interrupt the main thread inside a write to
+    stderr; a log line then fails with "reentrant call inside
+    <_io.BufferedWriter name='<stderr>'>" (RuntimeError), and logging's
+    error report, which writes to the same stderr, raises it again out of
+    the log call (R1 of the 3156 review). With ``raiseExceptions`` off,
+    ``Handler.handleError`` reports nothing, so a failing handler loses its
+    line instead of raising. That covers the log calls deep in agent
+    termination too; the direct ones use ``_log_on_stop``.
+    """
+    saved = logging.raiseExceptions
+    logging.raiseExceptions = False
+    try:
+        yield
+    finally:
+        logging.raiseExceptions = saved
+
+
+def _log_on_stop(level: int, message: str, *args: Any) -> None:
+    """Log from the stop path; a handler that raises (a closed, full or
+    busy stderr: BrokenPipeError, BlockingIOError, OSError, RuntimeError)
+    costs the line, never the signal."""
+    # Nothing can report the failure: the stream that failed is the report.
+    with contextlib.suppress(Exception):
+        logger.log(level, message, *args)
+
+
 def _remove_live_cli_config_dirs_on_stop(*, terminate_agents: bool) -> None:
     """Remove every live per-run directory this process created.
 
-    Never raises: the caller must still re-send or re-raise the signal.
+    Never raises an Exception, including from logging: the caller must
+    still re-send or re-raise the signal. Agents are terminated first, so a
+    CLI still running cannot write into a directory after its removal.
     """
     global _stop_cleanup_running
     _stop_cleanup_running = True
     try:
-        if terminate_agents:
-            _terminate_live_agents_at_exit()
-        own_pid = os.getpid()
-        for config_dir, creator_pid in _LIVE_CLI_CONFIG_DIRS.copy().items():
-            if creator_pid == own_pid:
-                _remove_cli_config_dir(config_dir)
-    except Exception:  # noqa: BLE001 - the signal must still end the process
-        logger.exception("[Dispatch] per-run Claude config directory "
-                         "cleanup on a stop signal failed")
+        with _logging_cannot_raise():
+            if terminate_agents:
+                try:
+                    _terminate_live_agents_at_exit()
+                except Exception as exc:  # noqa: BLE001 - the signal goes on
+                    # A CLI that may still run could write into a directory
+                    # removed now; the stale-directory sweep takes them.
+                    _log_on_stop(logging.ERROR, "[Dispatch] terminating the "
+                                 "live agents on a stop signal failed, per-run"
+                                 " Claude config directories left: %r", exc)
+                    return
+            own_pid = os.getpid()
+            for config_dir, creator_pid in _LIVE_CLI_CONFIG_DIRS.copy().items():
+                if creator_pid == own_pid:
+                    _remove_cli_config_dir_on_stop(config_dir)
     finally:
         _stop_cleanup_running = False
+
+
+def _remove_cli_config_dir_on_stop(config_dir: str) -> None:
+    """``_remove_cli_config_dir`` for the stop path: never raises."""
+    try:
+        errors = remove_run_config_dir(config_dir)
+    except Exception as exc:  # noqa: BLE001 - the other dirs still go
+        errors = [repr(exc)]
+    _LIVE_CLI_CONFIG_DIRS.pop(config_dir, None)
+    if errors:
+        _log_on_stop(logging.WARNING, "[Dispatch] per-run Claude config "
+                     "directory %s not fully removed: %s", config_dir,
+                     "; ".join(errors[:5]))
 
 
 def _remove_cli_config_dir(config_dir: str) -> None:
