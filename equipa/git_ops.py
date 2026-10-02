@@ -35,7 +35,7 @@ from equipa.constants import (
     GITHUB_OWNER,
     PROJECT_DIRS,
 )
-from equipa.role_resolver import _GIT_SAFE_CONFIG
+from equipa.role_resolver import _GIT_SAFE_CONFIG, WORKTREE_BASE_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -1273,9 +1273,17 @@ def git_run(
     ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
     Inside :func:`git_repositories_pinned`, a ``cwd`` that is a pinned work
-    tree runs on the pinned repository (R3146-01, task #3151).
+    tree runs on the pinned repository (R3146-01, task #3151). Outside one,
+    a subcommand that reads work-tree files (``diff``, ``status``,
+    ``ls-files``, ...) whose ``cwd`` is in a task worktree runs where no
+    agent-planted driver is defined (FF-3155, task #3158; see
+    :func:`_git_run_in_worktree_view`).
     """
     pin = _pinned_repository_for(cwd)
+    if pin is None and _reads_work_tree(args):
+        location = _task_worktree_path(cwd)
+        if location is not None:
+            return _git_run_in_worktree_view(location, args, cwd, timeout, env, text)
     run_env = _hardened_git_env(env, args, pin)
     # Only a descriptor pin hands anything down; other calls keep the plain
     # runner signature.
@@ -1314,6 +1322,12 @@ async def git_run_async(
     the child process is killed before the error propagates.
     """
     pin = _pinned_repository_for(cwd)
+    if pin is None and _reads_work_tree(args):
+        location = _task_worktree_path(cwd)
+        if location is not None:
+            return await _git_run_async_in_worktree_view(
+                location, args, cwd, timeout, env, input, text,
+            )
     run_env = _hardened_git_env(env, args, pin)
     result = await _run_git_process_async(
         _hardened_git_argv(args, run_env, pin),
@@ -1836,6 +1850,346 @@ async def agent_worktree_git(
             os.close(fd)
         if private_dir is not None:
             shutil.rmtree(private_dir, ignore_errors=True)
+
+
+# --- Read-only git in a task worktree (FF-3155, task #3158) --------------------
+#
+# Cleanup is not the only git the orchestrator runs in an agent's worktree.
+# While the agent runs and right after, the dev-test loop (the tester's diff
+# context, the no-change check, the markdown scan), the claimed-file check,
+# the progress monitor and the reviewer's tree snapshot run ``git diff`` /
+# ``git status`` / ``git ls-files`` there through git_run / git_run_async.
+# Found by discovery, that git read the repository's config and the work
+# tree's attributes, so hashing a stat-dirty file (``git diff <rev>`` every
+# time, ``git status`` on a same-size edit) ran the clean filter the agent
+# had planted: a plain ``git config`` in its worktree writes the shared
+# config, and ``.gitattributes`` or ``info/attributes`` selects the driver.
+#
+# Those subcommands now run, when their cwd lies in
+# ``<project>/.forge-worktrees/<name>``, on the git dir the main repository
+# registered for that worktree (HEAD and index are the worktree's own), with
+# ``GIT_COMMON_DIR`` naming a private directory the orchestrator writes for
+# the one call. git reads config and ``info/attributes`` from the common dir,
+# so neither the repository's config, its ``config.worktree`` (the extension
+# is not copied) nor its ``info/attributes`` is read; the global config is
+# ``/dev/null`` and the system files are off. An attribute can select a
+# driver, but none is defined anywhere git looks, so none runs. Objects are
+# the repository's (``GIT_OBJECT_DIRECTORY``); refs, reflogs and packed refs
+# are reached through links to the repository's own (data git reads, never
+# runs). Submodule work trees are not examined (``--ignore-submodules=dirty``,
+# or the caller's ``=all``): git would start inside each one, by discovery,
+# with that submodule's own config. A path under ``.forge-worktrees`` that is
+# not a registered worktree, or that leaves its work tree through a symlink,
+# is refused with a failed result rather than run by discovery.
+
+# Read-only subcommands that hash work-tree files (and so can run a clean
+# filter). Other subcommands keep running by discovery: location queries
+# must report the real repository, and cleanup writes go through
+# agent_worktree_git.
+_WORK_TREE_READING_SUBCOMMANDS = frozenset({
+    "diff", "diff-files", "diff-index", "grep", "ls-files", "status",
+})
+# The ones that check each checked-out submodule for local changes.
+_SUBMODULE_EXAMINING_SUBCOMMANDS = frozenset({"diff", "diff-files", "diff-index", "status"})
+# The repository settings the private config keeps: its format, and how git
+# compares a file with its index entry. None names a program.
+_VIEW_SETTINGS_FROM_REPOSITORY = (
+    r"^(core\.(repositoryformatversion|filemode|symlinks|ignorecase"
+    r"|precomposeunicode|trustctime|checkstat)|extensions\.(objectformat|refstorage))$"
+)
+# Linked from the repository's common dir into the private one.
+_VIEW_LINKED_ENTRIES = ("refs", "packed-refs", "logs", "shallow", "reftable")
+# git's exit status for "could not run"; what a refused call returns.
+_REFUSED_RETURNCODE = 128
+
+
+@dataclass(frozen=True)
+class _TaskWorktreePath:
+    """A cwd inside ``<project_root>/.forge-worktrees/<name>`` (``work_tree``)."""
+
+    project_root: str
+    work_tree: str
+
+
+def _reads_work_tree(args: Sequence[str]) -> bool:
+    subcommand = _git_subcommand_index(args)
+    return subcommand is not None and args[subcommand] in _WORK_TREE_READING_SUBCOMMANDS
+
+
+def _task_worktree_path(cwd: str | os.PathLike) -> _TaskWorktreePath | None:
+    """The task worktree ``cwd`` lies in, judged on the path as given and
+    on its realpath (a symlink into or out of a worktree counts); None for
+    any other directory."""
+    for candidate in (os.path.abspath(os.fspath(cwd)), os.path.realpath(cwd)):
+        parts = Path(candidate).parts
+        if WORKTREE_BASE_DIRNAME in parts[:-1]:
+            index = parts.index(WORKTREE_BASE_DIRNAME)
+            return _TaskWorktreePath(
+                project_root=str(Path(*parts[:index])),
+                work_tree=str(Path(*parts[:index + 2])),
+            )
+    return None
+
+
+def _checkout_common_dir(project_root: str) -> str:
+    """Realpath of the git common dir of the checkout at ``project_root``,
+    read as data (a ``.git`` directory, or the ``gitdir:`` file and the
+    ``commondir`` file of the git dir it names). Raises
+    :class:`AgentWorktreeGitError`."""
+    dot_git = os.path.join(project_root, ".git")
+    try:
+        if os.path.isdir(dot_git):
+            git_dir = dot_git
+        else:
+            named = read_regular_file_bounded(dot_git, _GIT_LINE_FILE_LIMIT)
+            text = named.decode("utf-8", "replace").strip()
+            if not text.startswith("gitdir:"):
+                raise AgentWorktreeGitError(f"{dot_git} names no git dir")
+            git_dir = os.path.join(project_root, text[len("gitdir:"):].strip())
+        try:
+            common = read_regular_file_bounded(
+                os.path.join(git_dir, "commondir"), _GIT_LINE_FILE_LIMIT,
+            ).decode("utf-8", "replace").strip()
+        except FileNotFoundError:
+            common = "."
+    except OSError as exc:
+        raise AgentWorktreeGitError(
+            f"cannot locate the repository of {project_root}: {exc}"
+        ) from exc
+    return os.path.realpath(os.path.join(git_dir, common))
+
+
+def _submodule_work_trees_unexamined(args: Sequence[str]) -> list[str]:
+    """``args`` with ``--ignore-submodules=dirty`` before any ``--``, for a
+    subcommand that examines submodules, unless the caller's own last
+    ``--ignore-submodules`` already ignores them all. The flag overrides
+    ``.gitmodules`` and config; ``dirty`` still reports a moved gitlink."""
+    command = list(args)
+    subcommand = _git_subcommand_index(command)
+    if subcommand is None or command[subcommand] not in _SUBMODULE_EXAMINING_SUBCOMMANDS:
+        return command
+    end = command.index("--") if "--" in command[subcommand:] else len(command)
+    chosen = [
+        token.partition("=")[2] or "all"
+        for token in command[subcommand + 1:end]
+        if token == "--ignore-submodules" or token.startswith("--ignore-submodules=")
+    ]
+    if chosen and chosen[-1] == "all":
+        return command
+    command.insert(end, "--ignore-submodules=dirty")
+    return command
+
+
+def _view_settings_commands(common_dir: str) -> list[list[str]]:
+    """``git config`` listings of the settings the private config keeps:
+    the repository's (:data:`_VIEW_SETTINGS_FROM_REPOSITORY`) and, while the
+    global config is pinned and verifies, the operator's identity and
+    ``core.excludesFile``."""
+    commands = [[
+        "config", "--file", os.path.join(common_dir, "config"), "-z",
+        "--get-regexp", _VIEW_SETTINGS_FROM_REPOSITORY,
+    ]]
+    pin = _global_config_pin
+    if pin is not None and verify_global_git_config_pin() is None:
+        commands.append([
+            "config", "--file", str(pin.path), "-z",
+            "--get-regexp", _PRIVATE_SETTINGS_FROM_GLOBAL,
+        ])
+    return commands
+
+
+@dataclass(frozen=True)
+class _WorktreeView:
+    """One read-only call's view of a task worktree; see the section comment."""
+
+    work_tree: str
+    relative: str
+    common_dir: str
+    git_dir: str
+    work_tree_fd: int | None
+    private_dir: str | None = None
+
+    @property
+    def _work_tree_path(self) -> str:
+        if self.work_tree_fd is None:
+            return self.work_tree
+        return f"{_FD_DIRECTORY}/{self.work_tree_fd}"
+
+    @property
+    def cwd(self) -> str:
+        """Where git starts: the caller's directory, below the opened work tree."""
+        return os.path.join(self._work_tree_path, self.relative)
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        return () if self.work_tree_fd is None else (self.work_tree_fd,)
+
+    def env(self, extra_env: Mapping[str, str] | None, args: Sequence[str]) -> dict[str, str]:
+        if self.private_dir is None:  # pragma: no cover - made by _open_worktree_view
+            raise AgentWorktreeGitError("the private common dir was not written")
+        env = _hardened_git_env(extra_env, args)
+        env.update(_NO_TRANSPORT_ENV)
+        env.update({
+            "GIT_COMMON_DIR": self.private_dir,
+            "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        })
+        return env
+
+    def argv(self, args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+        return _hardened_git_argv(
+            [f"--git-dir={self.git_dir}", f"--work-tree={self._work_tree_path}",
+             *_submodule_work_trees_unexamined(args)],
+            env,
+        )
+
+    def close(self) -> None:
+        if self.work_tree_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.work_tree_fd)
+        if self.private_dir is not None:
+            shutil.rmtree(self.private_dir, ignore_errors=True)
+
+
+def _locate_worktree_view(location: _TaskWorktreePath, cwd: str | os.PathLike) -> _WorktreeView:
+    """Open the work tree of ``location`` and find its registered git dir.
+
+    Raises :class:`AgentWorktreeGitError` when the work tree is a symlink,
+    ``cwd`` leaves it, or the repository holding ``.forge-worktrees`` does
+    not register it. The caller owns the open descriptor.
+    """
+    common_dir = _checkout_common_dir(location.project_root)
+    fd, real_work_tree = _open_agent_work_tree(location.work_tree)
+    try:
+        real_cwd = os.path.realpath(cwd)
+        if real_cwd != real_work_tree and not real_cwd.startswith(real_work_tree + os.sep):
+            raise AgentWorktreeGitError(
+                f"{os.fspath(cwd)} leaves the task worktree {real_work_tree}"
+            )
+        git_dir = find_worktree_git_dir(common_dir, real_work_tree)
+        if git_dir is None:
+            raise AgentWorktreeGitError(
+                f"{real_work_tree} is not a registered worktree of {common_dir}"
+            )
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    return _WorktreeView(
+        work_tree=real_work_tree,
+        relative=os.path.relpath(real_cwd, real_work_tree),
+        common_dir=common_dir,
+        git_dir=git_dir,
+        work_tree_fd=fd,
+    )
+
+
+def _with_private_common_dir(
+    view: _WorktreeView, listings: Sequence[subprocess.CompletedProcess],
+) -> _WorktreeView:
+    """``view`` with its private common dir written: the settings parsed
+    from ``listings`` (the :func:`_view_settings_commands` results), the
+    links of :data:`_VIEW_LINKED_ENTRIES` and a copy of ``info/exclude``."""
+    settings: list[tuple[str, str | None]] = [("core.bare", "false")]
+    for listing in listings:
+        if listing.returncode == 0:
+            settings.extend(parse_config_list_z(listing.stdout))
+    private_dir = tempfile.mkdtemp(prefix="equipa-worktree-view-")
+    try:
+        Path(private_dir, "config").write_text(serialize_git_config(settings), encoding="utf-8")
+        for name in _VIEW_LINKED_ENTRIES:
+            target = os.path.join(view.common_dir, name)
+            if os.path.lexists(target):
+                os.symlink(target, os.path.join(private_dir, name))
+        # Patterns only (nothing git runs); a planted FIFO or a huge file
+        # is skipped rather than read.
+        with contextlib.suppress(OSError):
+            exclude = read_regular_file_bounded(
+                os.path.join(view.common_dir, "info", "exclude"), MAX_TRUSTED_FILE_BYTES,
+            )
+            os.mkdir(os.path.join(private_dir, "info"))
+            Path(private_dir, "info", "exclude").write_bytes(exclude)
+    except OSError as exc:
+        shutil.rmtree(private_dir, ignore_errors=True)
+        raise AgentWorktreeGitError(f"cannot write a private common dir: {exc}") from exc
+    return dataclass_replace(view, private_dir=private_dir)
+
+
+def _refused_result(
+    args: Sequence[str], reason: AgentWorktreeGitError, text: bool,
+) -> subprocess.CompletedProcess:
+    """A failed result for a call that would have run git by discovery in
+    an agent-controlled directory. Callers already treat a failed git as
+    "could not tell", so none of them is left with an exception it does
+    not expect."""
+    message = f"equipa: refused to run git {list(args)!r} by discovery: {reason}"
+    logger.warning("[git] %r", message)
+    return subprocess.CompletedProcess(
+        args=["git", *args], returncode=_REFUSED_RETURNCODE,
+        stdout="" if text else b"",
+        stderr=f"{message}\n" if text else f"{message}\n".encode("utf-8", "replace"),
+    )
+
+
+def _git_run_in_worktree_view(
+    location: _TaskWorktreePath,
+    args: list[str],
+    cwd: str | Path,
+    timeout: int,
+    env: Mapping[str, str] | None,
+    text: bool,
+) -> subprocess.CompletedProcess:
+    """:func:`git_run` for a work-tree reading call inside a task worktree."""
+    try:
+        view = _locate_worktree_view(location, cwd)
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    try:
+        listings = [
+            git_run(command, view.common_dir, timeout=10)
+            for command in _view_settings_commands(view.common_dir)
+        ]
+        view = _with_private_common_dir(view, listings)
+        run_env = view.env(env, args)
+        return _run_with_env(
+            view.argv(args, run_env), view.cwd, timeout, run_env,
+            text=text, pass_fds=view.pass_fds,
+        )
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    finally:
+        view.close()
+
+
+async def _git_run_async_in_worktree_view(
+    location: _TaskWorktreePath,
+    args: list[str],
+    cwd: str | Path,
+    timeout: int,
+    env: Mapping[str, str] | None,
+    input: bytes | None,
+    text: bool,
+) -> subprocess.CompletedProcess:
+    """:func:`git_run_async` for a work-tree reading call inside a task worktree."""
+    try:
+        view = _locate_worktree_view(location, cwd)
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    try:
+        listings = [
+            await git_run_async(command, view.common_dir, timeout=10)
+            for command in _view_settings_commands(view.common_dir)
+        ]
+        view = _with_private_common_dir(view, listings)
+        run_env = view.env(env, args)
+        return await _run_git_process_async(
+            view.argv(args, run_env), view.cwd, run_env, timeout,
+            input=input, text=text, pass_fds=view.pass_fds,
+        )
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    finally:
+        view.close()
 
 
 # --- Pinned global git config (task #3116, MI-04) -----------------------------
