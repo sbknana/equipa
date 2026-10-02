@@ -679,6 +679,15 @@ def detect_project_language(project_dir: str | Path) -> dict:
 # credential.helper (an empty -c value would also discard the operator's
 # global helper), core.gitProxy (the first matching value wins, so a -c value
 # cannot override repo config) and remote.<name>.uploadpack/receivepack/vcs.
+#
+# FF-3155 (task #3158): "network operations only" does not hold in a partial
+# clone. With extensions.partialClone and a promisor remote in repo config
+# (an agent's plain `git config` in its worktree writes the shared config),
+# any local command that looks up a missing object (`rev-parse --verify`)
+# lazy-fetches it and runs that remote's uploadpack program, or its ext::
+# command. GIT_NO_LAZY_FETCH (below) stops the lazy fetch on every hardened
+# call; git on an agent's worktree also runs with no transport allowed at all
+# (_NO_TRANSPORT_ENV), which does not depend on the git version.
 
 _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
     # A non-directory, so no hook can be found under it. role_resolver's
@@ -732,11 +741,22 @@ GIT_HARDENING_ARGS: tuple[str, ...] = (
 # GIT_CONFIG_NOSYSTEM / GIT_ATTR_NOSYSTEM (task #3116, MI-04): the system
 # config and attributes files are skipped; the global config is replaced by
 # the orchestrator's pre-dispatch snapshot (see pin_global_git_config).
+#
+# GIT_NO_LAZY_FETCH (FF-3155, task #3158): a missing object is an error,
+# never fetched from a promisor remote (see the residual note above).
+# EQUIPA's repositories are full clones, so nothing it reads is ever missing.
 GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType({
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_LAZY_FETCH": "1",
 })
+
+# FF-3155 (task #3158): an allow-list naming no protocol, so git refuses
+# every transport (file, ssh, ext::, remote helpers) whatever the repo config
+# allows. For git that only reads and writes local objects and refs: older
+# git ignores GIT_NO_LAZY_FETCH, but has honoured this since 2.6.
+_NO_TRANSPORT_ENV: Mapping[str, str] = MappingProxyType({"GIT_ALLOW_PROTOCOL": ""})
 
 # diff.external cannot be cleared with -c: git runs an empty value as a
 # command and every patch diff dies. Diff drivers are switched off per
@@ -1500,8 +1520,12 @@ def _copy_regular_file(source: str, destination: str, limit: int) -> bool:
 async def _run_in_main_repository(
     common_dir: str, args: list[str], timeout: int,
 ) -> subprocess.CompletedProcess:
-    """Hardened git on the main repository's git dir, named explicitly."""
-    return await git_run_async([f"--git-dir={common_dir}", *args], common_dir, timeout=timeout)
+    """Hardened git on the main repository's git dir, named explicitly,
+    with no transport allowed (only local objects and refs are touched)."""
+    return await git_run_async(
+        [f"--git-dir={common_dir}", *args], common_dir, timeout=timeout,
+        env=_NO_TRANSPORT_ENV,
+    )
 
 
 async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None]:
@@ -1528,6 +1552,29 @@ async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None
     if resolved.returncode != 0 or not _HEX_OBJECT_NAME_RE.fullmatch(commit):
         raise AgentWorktreeGitError(f"HEAD of {git_dir} ({revision}) is not a commit")
     return commit, branch
+
+
+async def read_worktree_head(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike,
+) -> tuple[str, str | None]:
+    """``(commit, branch)`` checked out in the task worktree ``work_tree`` of
+    the repository whose git common dir is ``common_dir``; branch is None
+    when HEAD is detached.
+
+    FF-3155 (task #3158): read from the repository's ``worktrees/<name>``
+    entry whose ``gitdir`` file names ``work_tree``, never by running git
+    through the work tree's ``.git``, so a repository the agent planted
+    there (and a promisor remote whose upload-pack is the agent's program)
+    is neither read nor run. Raises :class:`AgentWorktreeGitError`.
+    """
+    common = os.path.realpath(os.fspath(common_dir))
+    real_work_tree = os.path.realpath(os.fspath(work_tree))
+    git_dir = find_worktree_git_dir(common, real_work_tree)
+    if git_dir is None:
+        raise AgentWorktreeGitError(
+            f"{real_work_tree} is not a registered worktree of {common}"
+        )
+    return await _worktree_head(common, git_dir)
 
 
 async def _settings_from_file(config_file: Path, pattern: str) -> list[tuple[str, str | None]]:
@@ -1565,7 +1612,7 @@ class AgentWorktreeGit:
     work_tree_fd: int | None
 
     def _env(self) -> dict[str, str]:
-        env = _hardened_git_env()
+        env = _hardened_git_env(_NO_TRANSPORT_ENV)
         env.update({
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),

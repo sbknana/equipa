@@ -84,6 +84,7 @@ from equipa.git_ops import (
     pinned_repository,
     pinned_repository_by_path,
     read_regular_file_bounded,
+    read_worktree_head,
 )
 from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
 from equipa.isolation import concurrency_refusal
@@ -854,20 +855,36 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
 async def _require_task_branch(worktree_dir: str, task_branch: str) -> str:
     """Return HEAD's SHA if ``worktree_dir`` is on ``task_branch``.
 
+    ``worktree_dir`` is the task worktree, or the sub-directory of it that a
+    nested project's agent runs in. FF-3155 (task #3158): this runs before
+    and after every agent, so it never runs git through the worktree. By
+    discovery, ``rev-parse HEAD`` read whatever repository the agent left at
+    its ``.git`` (or in the sub-directory), and lazy-fetching a missing HEAD
+    there ran that repository's promisor upload-pack program in the
+    orchestrator. HEAD is read from the repository's own ``worktrees/<name>``
+    entry instead (:func:`equipa.git_ops.read_worktree_head`).
+
     Raises:
-        AttemptCleanupError: the worktree is on another branch, detached, or
-            git could not be run there.
+        AttemptCleanupError: the worktree is on another branch, detached, not
+            a worktree its repository registers, or its HEAD is unreadable.
     """
-    current = await _current_branch(worktree_dir)
+    location = await _task_worktree_location(worktree_dir)
+    if location is None:
+        raise AttemptCleanupError(
+            f"{worktree_dir} is not in a worktree its repository registers; "
+            f"cannot read its branch"
+        )
+    worktree_root, common_dir = location
+    try:
+        head, current = await read_worktree_head(common_dir, worktree_root)
+    except (AgentWorktreeGitError, subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"read HEAD in {worktree_dir}: {exc}") from exc
     if current != task_branch:
         raise AttemptCleanupError(
             f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
             f"expected {task_branch!r}"
         )
-    return await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action=f"read the HEAD of {task_branch}",
-    )
+    return head
 
 
 def _audit_task_abort(
