@@ -1574,7 +1574,10 @@ class AgentWorktreeGit:
         })
         return env
 
-    async def run(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+    async def run(
+        self, args: list[str], *, timeout: int,
+        input: bytes | None = None, text: bool = True,
+    ) -> subprocess.CompletedProcess:
         """``git <args>`` on the private git dir, inside the work tree."""
         env = self._env()
         command = [
@@ -1587,8 +1590,54 @@ class AgentWorktreeGit:
             cwd = f"{_FD_DIRECTORY}/{self.work_tree_fd}"
             pass_fds = (self.work_tree_fd,)
         return await _run_git_process_async(
-            _hardened_git_argv(command, env), cwd, env, timeout, pass_fds=pass_fds,
+            _hardened_git_argv(command, env), cwd, env, timeout,
+            input=input, text=text, pass_fds=pass_fds,
         )
+
+    async def skip_submodule_work_trees(self) -> None:
+        """Mark every submodule entry (gitlink) of the private index
+        skip-worktree, so git never looks inside a submodule's directory.
+
+        git checks a checked-out submodule for local changes by starting git
+        inside it, by discovery. That git reads the submodule's own config
+        and ``info/attributes``, both the agent's, so the agent's filter
+        driver would run. ``diff.ignoreSubmodules`` cannot stop it, since the
+        agent's ``.gitmodules`` can set ``submodule.<name>.ignore`` back for
+        each submodule; git does not examine the work tree of a skip-worktree
+        entry at all. A stash still records each submodule entry as staged;
+        a submodule HEAD moved but not staged is not recorded.
+
+        Raises :class:`AgentWorktreeGitError` when the index cannot be read,
+        holds an unmerged submodule entry, or cannot be marked.
+        """
+        listing = await self.run(["ls-files", "--stage", "-z"], timeout=30, text=False)
+        if listing.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"cannot list the index of {self.work_tree} (rc={listing.returncode})"
+            )
+        submodules: list[bytes] = []
+        # Each record is "<mode> <object> <stage>\t<path>".
+        for record in listing.stdout.split(b"\0"):
+            entry, _, path = record.partition(b"\t")
+            fields = entry.split(b" ")
+            if len(fields) != 3 or fields[0] != b"160000":
+                continue
+            if fields[2] != b"0":
+                raise AgentWorktreeGitError(
+                    f"the submodule entry {path[:200]!r} of {self.work_tree} is unmerged"
+                )
+            submodules.append(path)
+        if not submodules:
+            return
+        marked = await self.run(
+            ["update-index", "-z", "--skip-worktree", "--stdin"], timeout=30,
+            input=b"".join(path + b"\0" for path in submodules),
+        )
+        if marked.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"cannot mark the submodule entries of {self.work_tree} "
+                f"(rc={marked.returncode}: {(marked.stderr or '').strip()[:200]})"
+            )
 
     async def run_in_repository(
         self, args: list[str], *, timeout: int,

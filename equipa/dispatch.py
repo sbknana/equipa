@@ -2811,6 +2811,9 @@ async def _stash_uncommitted_in_worktree(
             elif not status.stdout.strip():
                 return None
             else:
+                # A stash compares submodule entries with their directories
+                # by running git inside them, on the agent's config.
+                await worktree_git.skip_submodule_work_trees()
                 result = await worktree_git.run(
                     ["stash", "push", "-u", "-m", stash_msg], timeout=30,
                 )
@@ -2823,7 +2826,11 @@ async def _stash_uncommitted_in_worktree(
                         # The stash already cleared the work tree but is not
                         # in the repository (refs/stash locked, ...): put the
                         # work back, so a kept worktree still holds it.
-                        await worktree_git.run(["stash", "pop", "--index"], timeout=30)
+                        # --quiet: otherwise the pop ends by running git
+                        # status, which looks inside submodules again.
+                        await worktree_git.run(
+                            ["stash", "pop", "--index", "--quiet"], timeout=30,
+                        )
                         raise
                     print(
                         f"  [Isolation] Task #{task_id}: stashed uncommitted work "
