@@ -428,6 +428,42 @@ def test_a_busy_stderr_never_costs_the_signal(live_dirs, resend, monkeypatch,
     assert logging.raiseExceptions is True, "the logging setting was not restored"
 
 
+def test_a_log_line_inside_agent_termination_does_not_cut_it_short(
+        tmp_path, monkeypatch, stop_path_logger):
+    """Agent termination logs on its own (the launcher was slow, the group
+    still has members). On a busy stderr that line must cost nothing more:
+    the termination after it still runs, then the directory goes."""
+    own = tmp_path / "equipa-claude-config-own"
+    (own / "projects").mkdir(parents=True)
+    busy = _BusyStream()
+    monkeypatch.setattr(sys, "stderr", busy)
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    stop_path_logger.addHandler(logging.StreamHandler(busy))
+    steps: list[str] = []
+
+    class Agent:
+        pid = 4242
+        owner_pid = os.getpid()
+
+        def request_termination(self) -> None:
+            steps.append("requested")
+
+        def terminate_sync(self) -> None:
+            agent_runner.logger.warning("[ProcessTree] agent process group "
+                                        "%d still has members", self.pid)
+            steps.append("group killed")
+
+    monkeypatch.setattr(agent_runner, "_LIVE_CONTAINED_AGENTS", [Agent()])
+    monkeypatch.setattr(agent_runner, "_LIVE_CLI_CONFIG_DIRS",
+                        {str(own): os.getpid()})
+
+    agent_runner._remove_live_cli_config_dirs_on_stop(terminate_agents=True)
+
+    assert steps == ["requested", "group killed"]
+    assert not os.path.lexists(own)
+    assert logging.raiseExceptions is True
+
+
 def test_a_failing_agent_termination_still_resends_the_signal(
         live_dirs, resend, monkeypatch, stop_path_logger):
     """Terminating the agents fails and so does the log line about it."""
