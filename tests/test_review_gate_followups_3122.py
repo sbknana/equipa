@@ -19,6 +19,12 @@ import pytest
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
 NONCE = "fedcba9876543210fedcba9876543210"
 ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
@@ -74,7 +80,7 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
     if any(SEVERITY_TOKEN.search(line) for line in body):
         analysis = analyze(review("1 finding.", body, ONE_LOW, low_heading=True))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
             body, analysis.detail)
 
 
@@ -296,7 +302,7 @@ def test_shape_counted_by_the_footer_merges_with_that_count(line):
                              ONE_HIGH, low_heading=False))
     if SEVERITY_TOKEN.search(line):
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, line
-        assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         return
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (line, analysis.detail)
     assert analysis.counts["HIGH"] == 1

@@ -29,6 +29,12 @@ import pytest
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
 NONCE = "0123456789abcdef0123456789abcdef"
 ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
@@ -87,7 +93,7 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         analysis = analyze(review("1 finding.", ["## Notes", ""] + body,
                                   ONE_LOW, low_heading=True))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
             body, analysis.detail)
 
 
@@ -356,7 +362,7 @@ def test_honest_review_of_the_new_shapes_merges():
     upper = [line.replace("high:", "HIGH:") for line in body]
     blocked = analyze(review("1 finding.", upper, footer, low_heading=False))
     assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
-    assert blocked.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert blocked.detail.startswith(BLOCKING_TOKEN_REASONS)
 
 
 # --- prompt: the format rule claims only what the gate counts --------------------

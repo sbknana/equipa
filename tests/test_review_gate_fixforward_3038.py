@@ -23,14 +23,21 @@ from pathlib import Path
 import pytest
 
 from equipa.loops import (
-    BACKSTOP_REASON,
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
     _analyze_review_views,
     _count_findings_in_review_file,
+    backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
+)
 
 BODY = (
     "# Security Review\n\n## Summary\nReviewed the diff for the payments "
@@ -88,7 +95,18 @@ def _assert_backstop_blocks(path: Path) -> None:
     merge before as well, by its CRITICAL or HIGH count."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
+    assert _count_findings_in_review_file(path) is None
+    assert _blocks_merge(path)
+
+
+def _assert_medium_backstop_blocks(path: Path) -> None:
+    """Task 3161: an UPPER-case MEDIUM outside a counted heading's label and
+    the final strict footer blocks the same way (no MEDIUM exemption)."""
+    analysis = _analyze_review_file(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        backstop_reason("MEDIUM") + " at line "), analysis
     assert _count_findings_in_review_file(path) is None
     assert _blocks_merge(path)
 
@@ -216,7 +234,11 @@ def test_resolved_medium_candidate_is_counted_not_dropped(
         + DETAIL + _footer(),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(medium=1)
+    # The shape rules count it; its UPPER-case MEDIUM is no label of a
+    # counted "###" heading, so the backstop blocks (task 3161, as task 3152
+    # did for the CRITICAL and HIGH forms above).
+    assert _rules_counts(path) == _counts(medium=1)
+    _assert_medium_backstop_blocks(path)
 
 
 # ---------- IR38-05: tally / overall-risk headings are not findings ----------
@@ -243,11 +265,11 @@ def test_zero_tally_or_low_risk_heading_is_not_a_finding(
     assert _rules_counts(path) == _counts()
     if "CRITICAL" in heading or "HIGH" in heading:
         # Task 3152: the UPPER-case zero tally merged under the 3143 tally
-        # exemption; CRITICAL and HIGH have none now. In lower case it
-        # merges.
+        # exemption; CRITICAL and HIGH have none now, nor MEDIUM since task
+        # 3161. In lower case it merges.
         _assert_backstop_blocks(path)
         path = _write(tmp_path, path.read_text(encoding="utf-8").replace(
-            "0 CRITICAL / 0 HIGH", "0 critical / 0 high"))
+            "0 CRITICAL / 0 HIGH / 0 MEDIUM", "0 critical / 0 high / 0 medium"))
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
     assert _count_findings_in_review_file(path) == _counts()
 
@@ -317,4 +339,7 @@ def test_resolved_status_after_long_title_is_still_recognised(
         + _footer(),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(medium=1)
+    # Counted as resolved by the shape rules; the recap's UPPER-case MEDIUM
+    # is no counted heading label, so it blocks (task 3161).
+    assert _rules_counts(path) == _counts(medium=1)
+    _assert_medium_backstop_blocks(path)

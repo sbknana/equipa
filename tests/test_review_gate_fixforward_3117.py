@@ -19,6 +19,12 @@ import pytest
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
 NONCE = "0123456789abcdef0123456789abcdef"
 ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
 ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
@@ -56,7 +62,7 @@ def assert_only_the_backstop_blocks(text: str) -> None:
     severity-token backstop blocked it."""
     analysis = loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
 
 

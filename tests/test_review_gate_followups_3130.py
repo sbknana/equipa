@@ -23,6 +23,12 @@ import pytest
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATH = REPO_ROOT / "prompts" / "security-reviewer.md"
 
@@ -83,7 +89,7 @@ def assert_only_the_backstop_blocks(text: str) -> loops.ReviewCountAnalysis:
     severity-token backstop blocked it."""
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
     return analysis
 
@@ -284,7 +290,7 @@ def test_severity_range_cell_counted_by_footer_merges():
     # MEDIUM counted as an advisory.
     blocked = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
     assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
-    assert blocked.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert blocked.detail.startswith(BLOCKING_TOKEN_REASONS)
     assert "HIGH=1" in blocked.detail and "MEDIUM=1" in blocked.detail
     body[-1] = "| S1 | SQL injection | High/medium |"
     analysis = analyze(review("1 finding.", body, ONE_HIGH, low_heading=False))
@@ -330,7 +336,7 @@ def test_confusable_heading_is_a_strict_finding_heading():
         ONE_HIGH, low_heading=False))
     assert analysis.header_counts["HIGH"] == 1
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
 
 
 @pytest.mark.parametrize("line", [

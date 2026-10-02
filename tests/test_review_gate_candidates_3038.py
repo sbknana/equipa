@@ -23,9 +23,17 @@ from pathlib import Path
 import pytest
 
 from equipa.loops import (
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    backstop_reason,
+)
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
 )
 
 TITLE = "# Security Review — Task 9999\n\n"
@@ -56,7 +64,7 @@ def _assert_only_the_backstop_blocks(path: Path) -> None:
     UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
 
 
@@ -125,7 +133,8 @@ def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
         ))
         assert blocked.verdict == REVIEW_VERDICT_COUNT_MISMATCH, blocked
         assert blocked.detail.startswith(
-            "unaccounted MEDIUM token: MEDIUM=1 at line "), blocked.detail
+            backstop_reason("MEDIUM") + " at line "), blocked.detail
+        assert "MEDIUM=1 at line " in blocked.detail, blocked.detail
     elif _SEVERITY_TOKEN_RE.search(prose_line):
         _assert_only_the_backstop_blocks(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,

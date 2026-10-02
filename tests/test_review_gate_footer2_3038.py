@@ -22,15 +22,22 @@ import pytest
 from equipa import db as equipa_db
 from equipa.dispatch import _security_review_blocks_merge
 from equipa.loops import (
-    BACKSTOP_REASON,
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_INCOMPLETE,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
     _analyze_review_views,
     _count_findings_in_review_file,
+    backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
+)
 
 
 def _rules_counts(path: Path) -> dict[str, int] | None:
@@ -48,7 +55,7 @@ def _assert_backstop_blocks(path: Path) -> None:
     as well, by its HIGH count."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
     assert _count_findings_in_review_file(path) is None
 
 TASK_ID = 3038
