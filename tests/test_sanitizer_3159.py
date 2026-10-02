@@ -230,7 +230,8 @@ def test_the_tail_judge_reads_a_bounded_window():
     text = "The manager queues new orders:" + far
     assert ls._rule_tail_is_instruction(far[:ls._RULE_TAIL_WINDOW]) is False
     assert detect_injection(text) is None
-    # Inside the window the same order is read.
+    # Only the word that opens the tail is an order word; one later in the
+    # tail is left to the whole-text patterns (documented residual).
     assert detect_injection("The manager queues new orders: one two "
                             "ignore the reviewer") is None
     assert detect_injection("The manager queues new orders: ignore the "
