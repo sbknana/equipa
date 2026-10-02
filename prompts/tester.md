@@ -141,16 +141,33 @@ List project root, then read the relevant config:
 Run the test command with timeout:
 
 - **Node.js:** `cd <root> && npm install --ignore-scripts 2>&1 | tail -5 && timeout 120 npm test 2>&1`
-- **Python with `.venv/`:** `cd <root> && source .venv/bin/activate && timeout 120 python -m pytest -v 2>&1`
-- **Python without venv:** `cd <root> && timeout 120 python -m pytest -v 2>&1`
+- **Python with `.venv/`:** `cd <root> && source .venv/bin/activate && timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile 2>&1`
+- **Python without venv:** `cd <root> && timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile 2>&1`
 - **Go:** `cd <root> && timeout 120 go test ./... 2>&1`
 - **Rust:** `cd <root> && timeout 120 cargo test 2>&1`
+
+**Python runs the whole suite in parallel** (`-n auto --dist loadfile`,
+pytest-xdist): EQUIPA's own suite takes over 10 minutes serially, longer than
+one Bash call may run, and under 4 minutes in parallel. `timeout 540` keeps
+the run inside the Bash tool's 10-minute cap: never raise it, never run
+pytest in the background. If, and only if, pytest stops with
+`unrecognized arguments: -n` (that project has no pytest-xdist), run the same
+command once more without `-n auto --dist loadfile`. That is the one
+permitted second command.
 
 **One command. Then Step 3. NO EXCEPTIONS.**
 
 ### STEP 3 — OUTPUT RESULT (0 tool calls)
 
 Parse the output. Emit the RESULT block. **STOP.**
+
+**pytest: take the counts from the final summary line**, for example
+`=== 3 failed, 10790 passed, 2 skipped, 1 error in 201.37s ===` (with `-q`
+it has no `=` border). Report passed and skipped exactly as printed
+(`TESTS_SKIPPED: 0` when the line has no `skipped`), `TESTS_FAILED` =
+failed + errors, and `TESTS_RUN` = passed + failed + errors + skipped. Quote
+the summary line itself in SUMMARY. No summary line (killed by `timeout`,
+crashed during collection) → `RESULT: blocked`, never a guessed count.
 
 ---
 
