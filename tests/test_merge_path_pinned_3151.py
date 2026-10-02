@@ -155,7 +155,10 @@ def test_every_merge_path_git_call_runs_on_the_pinned_repository(
 ) -> None:
     """Each git call made during the merge (dispatch's own and the helpers'
     in other modules, such as the dirty-checkout status) carries the pinned
-    ``--git-dir`` / ``--work-tree`` and ``GIT_COMMON_DIR``."""
+    ``--git-dir`` / ``--work-tree`` and ``GIT_COMMON_DIR``.
+
+    R3155-02 (task #3158): the work tree is the directory git starts in, a
+    pinned descriptor of the real checkout, not a path looked up again."""
     real = _real_with_task_branch(tmp_path)
     guard = _run(DefaultBranchGuard.snapshot(real))
     calls: list[tuple[list[str], list[str], dict[str, str]]] = []
@@ -163,6 +166,25 @@ def test_every_merge_path_git_call_runs_on_the_pinned_repository(
     real_argv = git_ops_mod._hardened_git_argv
     real_env = git_ops_mod._hardened_git_env
     envs: list[dict[str, str]] = []
+    # (argv, start directory, the directory that start directory names now)
+    started: list[tuple[list[str], str, str]] = []
+    real_process = git_ops_mod._run_git_process_async
+    real_run_with_env = git_ops_mod._run_with_env
+
+    def _record_start(argv, cwd) -> None:
+        if merging:
+            started.append((list(argv), str(cwd), os.path.realpath(str(cwd))))
+
+    async def recording_process(argv, cwd, env, timeout, **kwargs):
+        _record_start(argv, cwd)
+        return await real_process(argv, cwd, env, timeout, **kwargs)
+
+    def recording_run_with_env(args_list, cwd, timeout, env=None, **kwargs):
+        _record_start(args_list, cwd)
+        return real_run_with_env(args_list, cwd, timeout, env, **kwargs)
+
+    monkeypatch.setattr(git_ops_mod, "_run_git_process_async", recording_process)
+    monkeypatch.setattr(git_ops_mod, "_run_with_env", recording_run_with_env)
 
     def recording_env(*args, **kwargs):
         env = real_env(*args, **kwargs)
@@ -194,8 +216,12 @@ def test_every_merge_path_git_call_runs_on_the_pinned_repository(
     assert {"status", "checkout", "merge", "rev-parse"} & subcommands >= {"status", "merge"}
     for args, argv, env in calls:
         assert any(a.startswith("--git-dir=/proc/self/fd/") for a in argv), argv
-        assert f"--work-tree={os.path.realpath(real)}" in argv, argv
+        assert "--work-tree=." in argv, argv
         assert env.get("GIT_COMMON_DIR", "").startswith("/proc/self/fd/"), args
+    assert len(started) == len(calls)
+    for argv, cwd, named in started:
+        assert cwd.startswith("/proc/self/fd/"), (argv, cwd)
+        assert named == os.path.realpath(real), (argv, cwd, named)
 
 
 def _worktree_and_clone(tmp_path: Path) -> tuple[Path, Path, Path, DefaultBranchGuard]:
@@ -375,7 +401,9 @@ def test_pins_never_leak_descriptors_control(tmp_path: Path) -> None:
     guard = _run(DefaultBranchGuard.snapshot(real))
     before = set(os.listdir("/proc/self/fd"))
     pins = _run(dispatch_mod._pin_merge_repositories(guard, str(real), str(worktree)))
-    assert len(pins.fds) == 2  # common dir (= git dir) and the worktree's admin dir
+    # common dir (= git dir), the worktree's admin dir, and (R3155-02, task
+    # #3158) the two work trees git starts in
+    assert len(pins.fds) == 4
     pins.close()
     assert set(os.listdir("/proc/self/fd")) <= before
 

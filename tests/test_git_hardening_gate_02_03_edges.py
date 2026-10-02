@@ -473,10 +473,12 @@ def test_hardening_env_is_read_only() -> None:
     with pytest.raises(TypeError):
         GIT_HARDENING_ENV["GIT_NO_REPLACE_OBJECTS"] = "0"  # type: ignore[index]
     # Task #3116 (MI-04): system config and system attributes are off too.
+    # Task #3158 (FF-3155): and no lazy fetch from a promisor remote.
     assert dict(GIT_HARDENING_ENV) == {
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
     }
 
 
