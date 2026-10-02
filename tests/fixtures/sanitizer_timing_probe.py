@@ -198,9 +198,12 @@ def _selected_patterns(lesson_sanitizer, reasons: tuple[str, ...]) -> list:
 
 
 def _elapsed(call: Callable[[], object]) -> float:
-    start = time.perf_counter()
+    # CPU time of this probe process: under `pytest -n auto` a wall clock
+    # also counts the time it waits for a core (task 3160). A runaway
+    # pattern is still stopped by the caller's wall-clock subprocess timeout.
+    start = time.process_time()
     call()
-    return time.perf_counter() - start
+    return time.process_time() - start
 
 
 def main(argv: list[str]) -> int:

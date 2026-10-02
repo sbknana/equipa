@@ -205,9 +205,11 @@ class TestTokenizerModel:
             "echo " + "\"$(echo '\"')\" " * (cap // 18),
         ]
         for command in commands:
-            start = time.perf_counter()
+            # CPU time: under `pytest -n auto` a wall clock also counts the
+            # time this worker waits for a core (task 3160).
+            start = time.process_time()
             scan(command + " ")  # bypass the lru_cache entry of a prior test
-            assert time.perf_counter() - start < 1.0, command[:20]
+            assert time.process_time() - start < 1.0, command[:20]
 
 
 class TestNewBypassShapes:

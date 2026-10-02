@@ -300,9 +300,9 @@ def test_long_candidate_title_parses_quickly_and_still_blocks(
 ) -> None:
     path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
 
-    started = time.perf_counter()
+    started = time.process_time()
     blocked = _blocks_merge(path)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
     assert blocked

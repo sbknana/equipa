@@ -267,9 +267,9 @@ def test_hex_digits_after_a_reference_are_part_of_it():
 
 def test_a_200kb_reference_is_decided_without_int():
     text = build_review(["&#" + "9" * RB + "HIGH severity RCE"], "zero")
-    started = time.perf_counter()
+    started = time.process_time()
     assert_backstop_blocks(text)
-    assert time.perf_counter() - started < 0.5
+    assert time.process_time() - started < 0.5
 
 
 # --- R3149-05: the link reader is linear and reads what it read before ------------
@@ -341,9 +341,9 @@ def test_r3149_05_link_bodies_parse_in_half_a_second(body):
     text = build_review(body, "zero")
     best = float("inf")
     for _ in range(2):
-        started = time.perf_counter()
+        started = time.process_time()
         analyze(text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     assert best < 0.5, best
 
 
@@ -443,9 +443,9 @@ def test_strict_footer_grammar_is_linear_on_a_padded_line():
     footer = ("CRITICAL: 0" + " " * RB + "| HIGH: 1 | MEDIUM: 0 | LOW: 0 | "
               "INFO: 0 x")
     text = one_high_review([], [footer])
-    started = time.perf_counter()
+    started = time.process_time()
     assert gate_blocks(text)
-    assert time.perf_counter() - started < 0.5
+    assert time.process_time() - started < 0.5
 
 
 @pytest.mark.parametrize("last_line", [

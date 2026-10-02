@@ -365,7 +365,7 @@ def test_200kb_adversarial_review_parses_under_two_seconds(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.perf_counter()
+    started = time.process_time()
     analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert elapsed < 2.0, f"{name}: {elapsed:.2f}s"

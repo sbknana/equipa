@@ -423,18 +423,18 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
     text = review_body(footer=ONE_LOW_FOOTER).replace("Details.", line)
     path = tmp_path / "SECURITY-REVIEW-94400.md"
     path.write_text(text, encoding="utf-8")
-    start = time.perf_counter()
+    start = time.process_time()
     analysis = loops._analyze_review_file(path, text=text)
-    assert time.perf_counter() - start < 2.0
+    assert time.process_time() - start < 2.0
     if SEVERITY_TOKEN.search(line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
         # only; the rules still read the padded line as prose.
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
         assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line ")
         text = lowercase_severity_words(text)
-        start = time.perf_counter()
+        start = time.process_time()
         analysis = loops._analyze_review_file(path, text=text)
-        assert time.perf_counter() - start < 2.0
+        assert time.process_time() - start < 2.0
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 
