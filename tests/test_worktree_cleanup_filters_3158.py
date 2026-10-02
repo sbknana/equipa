@@ -230,6 +230,122 @@ def test_stash_that_cannot_be_recorded_leaves_the_work_in_place(
     assert "Could not stash uncommitted work" in capsys.readouterr().out
 
 
+NESTED = ("submodule-entry", "untracked-repository")
+
+
+def _plant_nested_repository(worktree: Path, drivers: Drivers, kind: str) -> None:
+    """A repository inside the worktree, which the worktree's index records
+    as a submodule (a gitlink) or not at all. git checks a submodule for
+    local changes by starting git inside it, by discovery, where the agent's
+    config names a driver and the agent's ``info/attributes`` selects it.
+    The agent's ``.gitmodules`` sets ``ignore = none``, which undoes a
+    ``diff.ignoreSubmodules`` setting for that submodule."""
+    nested = _init_repo(worktree / "vendored")
+    if kind == "submodule-entry":
+        head = _git(nested, "rev-parse", "HEAD")
+        _git(worktree, "update-index", "--add", "--cacheinfo", f"160000,{head},vendored")
+        (worktree / ".gitmodules").write_text(
+            '[submodule "vendored"]\n\tpath = vendored\n\turl = ./vendored\n'
+            "\tignore = none\n"
+        )
+    elif kind != "untracked-repository":  # pragma: no cover - a typo in NESTED
+        raise AssertionError(kind)
+    # Defined last, so the setup's own git calls run nothing.
+    _define_filter(nested, drivers)
+    (nested / ".git" / "info").mkdir(exist_ok=True)
+    (nested / ".git" / "info" / "attributes").write_text("* filter=probe\n")
+    # Same size as the committed "seed\n": the nested git has to hash it.
+    (nested / "README.md").write_text("SEED\n")
+
+
+@pytest.mark.parametrize("kind", NESTED)
+def test_stash_never_starts_git_in_a_nested_repository(
+    tmp_path: Path, kind: str, capsys,
+) -> None:
+    repo, worktree = _task_worktree(tmp_path)
+    drivers = Drivers(tmp_path)
+    _leave_unsaved_work(worktree)
+    _plant_nested_repository(worktree, drivers, kind)
+
+    problem = _run(_with_project_dir(
+        dispatch_mod._stash_uncommitted_in_worktree,
+        str(worktree), TASK_ID, TASK_BRANCH, project_dir=repo,
+    ))
+
+    assert not drivers.ran(), "the nested repository's driver ran in the orchestrator"
+    assert problem is None, problem
+    assert "stashed uncommitted work" in capsys.readouterr().out
+    _assert_work_stashed(repo)
+    if kind == "submodule-entry":
+        # The staged submodule entry is part of the stash's index commit.
+        nested_head = _git(worktree / "vendored", "rev-parse", "HEAD")
+        recorded = _git(repo, "ls-tree", "stash@{0}^2", "vendored")
+        assert recorded == f"160000 commit {nested_head}\tvendored", recorded
+
+
+@pytest.mark.parametrize("kind", NESTED)
+def test_dirty_check_never_starts_git_in_a_nested_repository(
+    tmp_path: Path, kind: str,
+) -> None:
+    repo, worktree = _task_worktree(tmp_path)
+    drivers = Drivers(tmp_path)
+    _leave_unsaved_work(worktree)
+    _plant_nested_repository(worktree, drivers, kind)
+
+    dirty = _run(_with_project_dir(
+        dispatch_mod._worktree_dirty_reason, str(worktree), project_dir=repo,
+    ))
+
+    assert not drivers.ran(), "the nested repository's driver ran in the orchestrator"
+    assert dirty and "uncommitted change" in dirty, dirty
+
+
+@pytest.mark.parametrize("kind", NESTED)
+def test_stash_put_back_never_starts_git_in_a_nested_repository(
+    tmp_path: Path, kind: str, capsys,
+) -> None:
+    """The fallback of a stash the repository cannot record (its
+    ``refs/stash`` locked, which the agent can arrange) pops the stash back;
+    that pop must not start git in the nested repository either."""
+    repo, worktree = _task_worktree(tmp_path)
+    drivers = Drivers(tmp_path)
+    _leave_unsaved_work(worktree)
+    _plant_nested_repository(worktree, drivers, kind)
+    (repo / ".git" / "refs" / "stash.lock").write_text("held by the agent\n")
+
+    problem = _run(_with_project_dir(
+        dispatch_mod._stash_uncommitted_in_worktree,
+        str(worktree), TASK_ID, TASK_BRANCH, project_dir=repo,
+    ))
+
+    assert not drivers.ran(), "the nested repository's driver ran in the orchestrator"
+    assert problem and "could not record stash" in problem, problem
+    assert (worktree / "README.md").read_text() == "SEED\n"
+    assert (worktree / "work.py").read_text() == f"{UNSAVED}\n"
+    assert "Could not stash uncommitted work" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kind", NESTED)
+def test_failed_attempt_reset_never_starts_git_in_a_nested_repository(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, worktree = _task_worktree(tmp_path)
+    base_sha = _master(repo)
+    drivers = Drivers(tmp_path)
+    _leave_unsaved_work(worktree)
+    _plant_nested_repository(worktree, drivers, kind)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+
+    _run(dispatch_mod.cleanup_failed_attempt(
+        TASK_ID, str(worktree), [], output=[], base_sha=base_sha,
+    ))
+
+    assert not drivers.ran(), "the nested repository's driver ran in the orchestrator"
+    assert _git(repo, "rev-parse", TASK_BRANCH) == base_sha
+    assert (worktree / "README.md").read_text() == "seed\n"
+    assert not (worktree / "work.py").exists()
+
+
 def test_index_copy_keeps_the_index_timestamps(tmp_path: Path) -> None:
     """git re-hashes an entry whose file is not older than the index
     ("racily clean"). A copy stamped now would let a same-size edit made in
