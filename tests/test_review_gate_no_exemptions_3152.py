@@ -526,11 +526,12 @@ def test_an_unaccounted_medium_blocks_as_on_main(body, context):
 def test_prompt_states_there_are_no_exceptions_for_critical_and_high():
     prompt = (REPO / "prompts" / "security-reviewer.md").read_text(
         encoding="utf-8")
+    # Task 3161: the rule covers MEDIUM too.
     for phrase in (
-        "For critical and high there are no exceptions",
-        "write critical and high in lower case everywhere except the severity "
-        "label of a finding heading and the `## Counts` footer line",
-        "Any other UPPER-case CRITICAL or HIGH blocks the merge",
+        "There are no exceptions for critical, high or medium",
+        "write critical, high and medium in lower case everywhere except the "
+        "severity label of a finding heading and the `## Counts` footer line",
+        "Any other UPPER-case CRITICAL, HIGH or MEDIUM blocks the merge",
         "a negation",
         "a tally",
         "a comparison",

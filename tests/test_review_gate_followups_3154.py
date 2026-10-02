@@ -138,9 +138,11 @@ async def test_reviewer_task_text_states_the_lower_case_rule(tmp_path):
     description = await _reviewer_task_description(tmp_path)
     assert "ordinary prose is fine" not in description
     assert "write critical, high and medium in lower case" in description
-    assert ("Write CRITICAL and HIGH in UPPER case only as the severity label "
-            "of a finding heading and on the single `## Counts` footer line"
-            ) in description
+    # Task 3161: the rule covers MEDIUM too.
+    assert ("Write CRITICAL, HIGH and MEDIUM in UPPER case only as the "
+            "severity label of a finding heading and on the single "
+            "`## Counts` footer line") in description
+    assert "any other UPPER-case CRITICAL, HIGH or MEDIUM" in description
     assert "BLOCKS the merge" in description
 
 
