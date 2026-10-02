@@ -34,9 +34,11 @@ TIME_LIMIT_SECONDS = 1.0
 
 
 def _timed(func, *args):
-    start = time.perf_counter()
+    # CPU time: under `pytest -n auto` a wall clock also counts the time this
+    # worker waits for a core (task 3160).
+    start = time.process_time()
     result = func(*args)
-    return result, time.perf_counter() - start
+    return result, time.process_time() - start
 
 
 # ---------------------------------------------------------------------------

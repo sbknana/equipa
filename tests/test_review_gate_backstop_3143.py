@@ -676,11 +676,13 @@ BACKSTOP_FAMILIES = {
 
 
 def _best_of_two(text):
+    # CPU time: under `pytest -n auto` a wall clock also counts the time this
+    # worker waits for a core (task 3160).
     best = float("inf")
     for _ in range(2):
-        started = time.perf_counter()
+        started = time.process_time()
         analyze(text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     return best
 
 

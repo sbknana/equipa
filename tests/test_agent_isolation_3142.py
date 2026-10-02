@@ -244,11 +244,13 @@ def test_trie_walk_is_linear_in_the_directory_depth() -> None:
         calls.append(path)
         return links.get(path)
 
-    started = time.perf_counter()
+    # CPU time: under `pytest -n auto` a wall clock also counts the time this
+    # worker waits for a core (task 3160).
+    started = time.process_time()
     assert not isolation._link_escapes("start", f"{deep}/l/README", lookup,
                                        links=trie)
     assert isolation._link_escapes("start", f"{deep}/l/..", lookup, links=trie)
-    assert time.perf_counter() - started < 0.05
+    assert time.process_time() - started < 0.05
     # Only real links are looked up by path.
     assert calls == [f"{deep}/l", f"{deep}/l"]
 

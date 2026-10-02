@@ -76,9 +76,9 @@ elif case == "many-small-fields-one-hostile":
     rows = [tester(json.dumps(fields))] * 5
 else:
     raise SystemExit(f"unknown case {case}")
-start = time.perf_counter()
+start = time.process_time()
 messages.format_messages_for_prompt(rows)
-print(time.perf_counter() - start)
+print(time.process_time() - start)
 '''
 
 

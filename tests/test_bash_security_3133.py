@@ -441,9 +441,9 @@ def test_new_passes_are_fast_at_the_cap(command: str):
     import time
 
     assert len(command.encode()) <= CAP
-    start = time.perf_counter()
+    start = time.process_time()
     check_bash_command(command + " ")  # bypass any cached scan
-    assert time.perf_counter() - start < 1.0
+    assert time.process_time() - start < 1.0
 
 
 # ---------------------------------------------------------------------------

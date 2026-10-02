@@ -395,9 +395,9 @@ def test_html_block_floods_parse_in_half_a_second(flood):
     text = build_review([flood], "zero")
     best = float("inf")
     for _ in range(2):
-        started = time.perf_counter()
+        started = time.process_time()
         analyze(text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     assert best < 0.5, best
 
 
@@ -454,9 +454,9 @@ def test_a_hostile_review_does_not_slow_the_next_one(later):
     best = float("inf")
     for _ in range(2):
         analyze(hostile)
-        started = time.perf_counter()
+        started = time.process_time()
         analyze(text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     assert best < 0.5, best
 
 

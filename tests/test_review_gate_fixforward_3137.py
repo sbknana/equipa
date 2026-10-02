@@ -514,9 +514,9 @@ def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     body = section + [line_break * (REVIEW_BYTES // len(line_break.encode()))]
     text = review("No findings.", body, ZERO, low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.perf_counter()
+    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
 
@@ -577,9 +577,9 @@ def test_200kb_adversarial_review_parses_under_one_second(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.perf_counter()
+    started = time.process_time()
     analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
 
 
@@ -600,9 +600,9 @@ BOLD_OPENER_BYTES = 32 * 1024
 def test_blanks_after_a_bold_opener_parse_in_linear_time(line):
     text = review("No findings.", ["## Findings", "", line], ZERO,
                   low_heading=False)
-    started = time.perf_counter()
+    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line[:12]!r}: {elapsed:.2f}s"
 
@@ -638,9 +638,9 @@ def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
         name, section):
     text = review("No findings.", section + [PIPE_FLOODS[name]], ZERO,
                   low_heading=False)
-    started = time.perf_counter()
+    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
@@ -663,9 +663,9 @@ COMMENT_LINE_FLOODS = {
 def test_200kb_line_of_comments_parses_in_half_a_second(name, section):
     text = review("No findings.", section + [COMMENT_LINE_FLOODS[name]], ZERO,
                   low_heading=False)
-    started = time.perf_counter()
+    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 

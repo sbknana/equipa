@@ -246,9 +246,9 @@ cases = {
     "esc-rule-headers": ("\x1bnew rules :" * n)[:n],
 }
 text = cases[sys.argv[2]]
-start = time.perf_counter()
+start = time.process_time()
 ls.sanitize(text, label="timing")
-print(time.perf_counter() - start)
+print(time.process_time() - start)
 '''
 
 

@@ -36,12 +36,15 @@ TIME_LIMIT_SECONDS = 0.3
 
 
 def _best_of_three(func, *args) -> tuple[float, object]:
-    """Shortest of three runs, so one scheduler hiccup cannot fail the test."""
+    """Shortest of three runs, so one scheduler hiccup cannot fail the test.
+
+    CPU time: under `pytest -n auto` a wall clock also counts the time this
+    worker waits for a core (task 3160)."""
     best, result = float("inf"), None
     for _ in range(3):
-        started = time.perf_counter()
+        started = time.process_time()
         result = func(*args)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     return best, result
 
 

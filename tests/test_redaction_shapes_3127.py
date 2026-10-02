@@ -221,9 +221,9 @@ def test_ordinary_commands_are_unchanged(command):
 def test_long_name_runs_are_redacted_in_linear_time():
     """No quadratic backtracking on long runs of name characters."""
     blob = "a.b-" * 50_000 + " password=FAKElin3127"
-    started = time.monotonic()
+    started = time.process_time()
     out = redact_secrets(blob)
-    assert time.monotonic() - started < 2.0
+    assert time.process_time() - started < 2.0
     assert "FAKElin3127" not in out
 
 

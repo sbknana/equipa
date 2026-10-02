@@ -55,9 +55,9 @@ def test_long_bold_tag_line_parses_in_linear_time(
 ) -> None:
     path = _write(tmp_path, BODY + adversarial_line + "\n" + ZERO_FOOTER)
 
-    started = time.perf_counter()
+    started = time.process_time()
     analysis = _analyze_review_file(path)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert elapsed < PARSE_BOUND_SECONDS, f"parse took {elapsed:.2f}s"
     assert analysis.verdict == REVIEW_VERDICT_OK

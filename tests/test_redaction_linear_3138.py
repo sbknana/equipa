@@ -133,9 +133,11 @@ def _repeat(unit: str, size: int = SIXTY_FOUR_KB) -> str:
 
 
 def _timed(func, *args) -> float:
-    started = time.perf_counter()
+    # CPU time: under `pytest -n auto` a wall clock also counts the time this
+    # worker waits for a core (task 3160).
+    started = time.process_time()
     func(*args)
-    return time.perf_counter() - started
+    return time.process_time() - started
 
 
 def _best_time(func, *args, limit: float) -> float:

@@ -300,11 +300,11 @@ def test_long_literal_arithmetic_stays_linear():
     import time
 
     command = "echo \"$((" + "1+" * 8000 + "1))\" '$(x)'"
-    start = time.perf_counter()
+    start = time.process_time()
     assert bash_security._evaluating_construct(command) is not None
     many = "(( " * 5000
     assert bash_security._evaluating_construct(many) is not None
-    assert time.perf_counter() - start < 1.0
+    assert time.process_time() - start < 1.0
 
 
 @pytest.mark.parametrize(
@@ -321,6 +321,6 @@ def test_builtin_argument_scan_is_linear(command: str):
     import time
 
     bash_security._scan_shell.cache_clear()
-    start = time.perf_counter()
+    start = time.process_time()
     bash_security._evaluating_construct(command)
-    assert time.perf_counter() - start < 0.4
+    assert time.process_time() - start < 0.4
