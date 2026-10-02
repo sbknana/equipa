@@ -15,7 +15,9 @@
   scripts/review_gate_probe_corpus.py for every severity word, is replayed
   here. Nothing ba6065a, main (3afec74) or the 3154 tree (cb3373c) blocked
   may merge (tests/fixtures/review_gate_probe_corpus_3157.json, written by
-  scripts/review_gate_differential.py --families --write-fixture).
+  scripts/review_gate_differential.py --families --write-fixture). Task
+  3161 added the split, label and private-use shapes of the independent
+  3157 review (R3157-01, R3157-02) and main before it (502975b).
 * R3154-01, I3154-01: circled, squared, parenthesised and modifier capitals
   are letters of a severity word next to a filler or a number form.
 * R3154-04: the two title-case HTML bodies of R3152-04 block.
@@ -34,7 +36,6 @@ import hashlib
 import importlib.util
 import json
 import re
-import time
 import unicodedata
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from equipa.severity_confusables import (
     CONFUSABLES_LETTER_MAPPINGS,
     SEVERITY_LETTER_CONFUSABLES,
 )
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
     CONTEXTS,
     RB,
@@ -221,7 +223,7 @@ def test_a_private_use_character_as_written_is_never_a_letter():
 # --- Acceptance: the probe corpus of the independent 3154 review -----------------
 
 CORPUS_FIXTURE = REPO / "tests" / "fixtures" / "review_gate_probe_corpus_3157.json"
-BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c")
+BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c", "502975b")
 
 
 @functools.lru_cache(maxsize=1)
@@ -252,7 +254,8 @@ def test_the_corpus_is_the_one_the_older_trees_judged():
     assert _differential().corpus_digest(texts) == fixture["corpus_sha256"]
     assert set(BASELINE_TREES) <= set(fixture["blocked"])
     families = {key.split("|", 1)[0] for key, _, _ in bodies}
-    assert families == {"replay", "separator", "tally", "negation"}
+    assert families == {"replay", "separator", "tally", "negation", "split",
+                        "noun", "comma", "list", "private-use"}
 
 
 def _must_block(severity: str) -> list[tuple[int, int, list[str]]]:
@@ -408,14 +411,11 @@ def test_markdown_outside_an_html_block_keeps_its_rendering(body, context):
     "<div>" + "&#1" * (RB // 3),
     "<span>\n" + "&#x4" * (RB // 4),
 ])
+@timing_test
 def test_html_block_floods_parse_in_half_a_second(flood):
     text = build_review([flood], "zero")
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text)
+    assert elapsed < 0.5, elapsed
 
 
 # --- R3154-05: the shared lookup tables start over when full ---------------------
@@ -445,36 +445,71 @@ def test_a_full_reference_table_caches_the_next_review(monkeypatch):
     assert table["&#72;"] == "H" and table.get("&#72;") == "H"
 
 
-def _hostile_review() -> str:
-    """A review of 61,000 distinct code points (CJK Extension B onwards)."""
-    characters = "".join(chr(0x20000 + offset) for offset in range(61000))
+def _distinct_review(first: int, count: int) -> str:
+    """A review of ``count`` distinct code points from ``first`` on."""
+    characters = "".join(chr(first + offset) for offset in range(count))
     lines = [characters[start:start + 100]
              for start in range(0, len(characters), 100)]
     return build_review(lines, "zero")
 
 
+# Task 3161: a review of more than 4,096 distinct characters is not parsed,
+# so the shared tables are filled by fifteen reviews just under that cap
+# (60,000 distinct code points of CJK Extension B onwards, as one review of
+# 61,000 did before).
+HOSTILE_REVIEW_COUNT = 15
+HOSTILE_REVIEW_DISTINCT = 4_000
+
+
+def _hostile_reviews() -> list[str]:
+    return [_distinct_review(0x20000 + index * HOSTILE_REVIEW_DISTINCT,
+                             HOSTILE_REVIEW_DISTINCT)
+            for index in range(HOSTILE_REVIEW_COUNT)]
+
+
 def _hangul_review() -> str:
-    """200 KB of distinct Hangul syllables (decomposed by rule)."""
-    syllables = "".join(chr(0xAC00 + offset % 11172)
+    """200 KB of Hangul syllables (decomposed by rule), 4,000 of them
+    distinct (under the distinct-character cap)."""
+    syllables = "".join(chr(0xAC00 + offset % 4000)
                         for offset in range(RB // 3))
     return build_review([syllables[start:start + 80]
                          for start in range(0, len(syllables), 80)], "zero")
 
 
+def _fill_tables(hostile: list[str]) -> None:
+    for text in hostile:
+        analyze(text)
+
+
+def test_the_hostile_reviews_fill_the_shared_tables():
+    hostile = _hostile_reviews()
+    assert all(analyze(text).verdict != loops.REVIEW_VERDICT_INCOMPLETE
+               for text in hostile)
+    assert len(loops._BACKSTOP_CHARACTERS) >= 50_000
+
+
+@timing_test
 @pytest.mark.parametrize("later", [
     _hangul_review,
     lambda: build_review([f"HIGH{SUPERSCRIPT_ONE} " * (RB // 6)], "zero"),
 ])
 def test_a_hostile_review_does_not_slow_the_next_one(later):
-    hostile = _hostile_review()
+    hostile = _hostile_reviews()
     text = later()
-    best = float("inf")
-    for _ in range(2):
-        analyze(hostile)
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text,
+                                 before=lambda: _fill_tables(hostile))
+    assert elapsed < 0.5, elapsed
+
+
+@timing_test
+def test_a_review_of_too_many_distinct_characters_fails_closed_fast():
+    # 61,000 distinct code points: not parsed, so not trusted, in well under
+    # the 0.5 s budget (task 3161 target: 0.25 s).
+    text = _distinct_review(0x20000, 61_000)
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
+    assert not analysis.trusted
+    assert median_cpu_seconds(analyze, text) < 0.25
 
 
 # --- R3154-06: the confusables table against independent properties --------------

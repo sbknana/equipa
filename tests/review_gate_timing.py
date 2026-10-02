@@ -24,10 +24,15 @@ timing_test = pytest.mark.xdist_group("review_gate_timing")
 
 
 def median_cpu_seconds(function: Callable[..., Any], *args: Any,
-                       runs: int = TIMING_RUNS, **kwargs: Any) -> float:
-    """The median CPU time of ``runs`` calls of ``function(*args)``."""
+                       runs: int = TIMING_RUNS,
+                       before: Callable[[], Any] | None = None,
+                       **kwargs: Any) -> float:
+    """The median CPU time of ``runs`` calls of ``function(*args)``;
+    ``before`` (untimed) runs ahead of each call."""
     times = []
     for _ in range(runs):
+        if before is not None:
+            before()
         started = time.process_time()
         function(*args, **kwargs)
         times.append(time.process_time() - started)
