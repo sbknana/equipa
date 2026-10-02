@@ -49,7 +49,7 @@
 # that every --lan-target answers the orchestrator (else its probe proves
 # nothing).
 # Every check prints PASS or FAIL (a NOTE names what was not probed); the
-# last line is RESULT: PASS|FAIL.
+# last line, and the only RESULT line, is RESULT: PASS|FAIL.
 # Exit status: 0 all checks passed, 1 a check failed, 2 isolation could not
 # be established at all.
 #
