@@ -829,10 +829,35 @@ self="$(readlink -f -- "$0")"
 runtime="$(dirname -- "$(dirname -- "$self")")"
 cd -- "$runtime" || exit 2
 check_loaded_firewall
-"${EQUIPA_PYTHON:-python3}" -m equipa.isolation --verify-probe "$self" "$@"
+# The probe's own RESULT line is held back and folded into the one final
+# RESULT line below, so a passing probe next to a failing firewall check
+# never prints "RESULT: PASS" (R5 of the 3156 review).
+probe_verdict=""
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        "RESULT: "*) probe_verdict="${line#RESULT: }" ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+done < <("${EQUIPA_PYTHON:-python3}" -m equipa.isolation --verify-probe "$self" "$@")
+wait "$!"
 status=$?
+reasons=""
+case "$probe_verdict" in
+    PASS) ;;
+    "FAIL ("*")") reasons="${probe_verdict#FAIL (}"; reasons="${reasons%)}" ;;
+    "") [ "$status" -ne 0 ] && reasons="the isolation check exited $status without a verdict" ;;
+    *) reasons="probe: $probe_verdict" ;;
+esac
+if [ "$probe_verdict" = "PASS" ] && [ "$status" -ne 0 ]; then
+    reasons="the isolation check exited $status"
+fi
 if [ "$failures" -gt 0 ]; then
-    echo "RESULT: FAIL ($failures orchestrator-side firewall rule check(s) failed)"
+    reasons="${reasons:+$reasons; }$failures orchestrator-side firewall rule check(s) failed"
+fi
+if [ "$status" -eq 0 ] && [ "$failures" -eq 0 ]; then
+    echo "RESULT: PASS"
+else
+    echo "RESULT: FAIL ($reasons)"
     [ "$status" -eq 0 ] && status=1
 fi
 exit "$status"

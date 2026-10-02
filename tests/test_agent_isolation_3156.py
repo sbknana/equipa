@@ -283,7 +283,7 @@ def test_the_script_fails_on_an_older_rule_even_when_the_probe_passes(
         timeout=60, env={**os.environ, **env})
     lines = result.stdout.splitlines()
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "RESULT: PASS" in lines, "the probe did not run"
+    assert "PASS probe" in lines, "the probe did not run"
     assert lines[-1] == ("RESULT: FAIL (4 orchestrator-side firewall rule "
                          "check(s) failed)")
 
