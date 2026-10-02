@@ -686,6 +686,16 @@ def _best_of_two(text):
     return best
 
 
+PARSE_BUDGET_SECONDS = 0.5
+# distinct_code_points folds each of its ~70 000 distinct characters once, so
+# it takes 0.47 s of CPU time on an idle host: 6% under the shared budget.
+# Under `pytest -n auto` CPU time still grows by about 10% (workers share
+# caches and memory bandwidth), and it failed at 0.51 s (task 3162). One
+# second keeps it linear-time evidence: the super-linear bugs these families
+# catch took 23 s and more on 200 KB.
+FAMILY_PARSE_BUDGET_SECONDS = {"distinct_code_points": 1.0}
+
+
 @pytest.mark.parametrize("name", sorted({**REVIEWER_FAMILIES,
                                          **BACKSTOP_FAMILIES}))
 def test_200kb_adversarial_review_parses_in_half_a_second(name):
@@ -693,7 +703,17 @@ def test_200kb_adversarial_review_parses_in_half_a_second(name):
     text = review("No findings.", body, ZERO)
     assert len(text.encode()) >= RB * 0.99, name
     elapsed = _best_of_two(text)
-    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    budget = FAMILY_PARSE_BUDGET_SECONDS.get(name, PARSE_BUDGET_SECONDS)
+    assert elapsed < budget, f"{name}: {elapsed:.2f}s (budget {budget}s)"
+
+
+def test_only_known_families_get_a_larger_parse_budget():
+    # Renaming a family would leave a stale key here and silently drop the
+    # family back to the shared budget; the larger budget stays bounded.
+    families = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}
+    assert set(FAMILY_PARSE_BUDGET_SECONDS) <= set(families)
+    assert all(budget <= 2 * PARSE_BUDGET_SECONDS
+               for budget in FAMILY_PARSE_BUDGET_SECONDS.values())
 
 
 def test_the_reviewer_timing_set_has_forty_families():
