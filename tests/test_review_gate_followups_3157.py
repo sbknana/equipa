@@ -3,6 +3,9 @@
 * R3154-02: a count before the MEDIUM word and a zero tally after it ("Found
   2 MEDIUM: 0 open.") untrust the review again, as on ba6065a, which read
   the count before the word first. The larger of the two counts is used.
+  (Task 3161 deleted the MEDIUM exemptions: every such tally now blocks,
+  and the tests that kept MEDIUM tallies and negations merging assert the
+  block instead.)
 * R3154-03: a lookalike letter is read as its letter inside a severity
   word only. Task 3154 folded every Unicode confusable of the letters of
   the three words to an ASCII capital in every view, so "ne<U+2113>ther",
@@ -89,34 +92,40 @@ def test_a_count_before_the_word_is_not_undone_by_a_zero_tally(body, context):
     assert _medium_untrusts(build_review([body], context)), body
 
 
-@pytest.mark.parametrize("written,count", [
-    ("Found 2 MEDIUM: 0 open.", 2),
-    ("0 MEDIUM: 2", 2),
-    ("MEDIUM: 0", 0),
-    ("0 MEDIUM: 0", 0),
-    ("two MEDIUM = 1", 2),
-])
-def test_the_larger_count_is_the_words(written, count):
-    start = written.index("MEDIUM")
-    assert loops._backstop_exempt_count(
-        written, [], 0, start, start + len("MEDIUM"), None) == count
+def _blocks_on_medium(text: str) -> bool:
+    """True when the review is untrusted for an unaccounted MEDIUM word."""
+    analysis = analyze(text)
+    return (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+            and analysis.detail.startswith(
+                loops.backstop_reason("MEDIUM") + " at line "))
 
 
+# Task 3161: the tally counting that read these is deleted with the other
+# MEDIUM exemptions; each tally blocks whatever its counts, and merges in
+# lower case.
 @pytest.mark.parametrize("context", CONTEXTS)
-@pytest.mark.parametrize("body", ["0 MEDIUM: 0", "MEDIUM: 0", "No MEDIUM: 0."])
-def test_a_zero_tally_still_merges_quietly(body, context):
-    analysis = analyze(build_review([body], context))
-    assert analysis.trusted, analysis.detail
+@pytest.mark.parametrize("written", [
+    "Found 2 MEDIUM: 0 open.", "0 MEDIUM: 2", "MEDIUM: 0", "0 MEDIUM: 0",
+    "two MEDIUM = 1", "No MEDIUM: 0.",
+])
+def test_a_medium_tally_blocks_whatever_its_counts(written, context):
+    assert _blocks_on_medium(build_review([written], context)), written
+    lower = build_review([written.replace("MEDIUM", "medium")], context)
+    assert analyze(lower).trusted, written
 
 
-def test_a_counted_medium_tally_merges_with_its_count():
+def test_a_counted_medium_tally_blocks_and_merges_in_lower_case():
+    """The tally merged with the review's two counted MEDIUM findings
+    (task 3157); with no exemption it blocks, and merges in lower case."""
     footer = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 2 | LOW: 0 | INFO: 0"
-    text = review("2 findings.", [
+    body = [
         "### [M1] MEDIUM \N{EM DASH} weak hash in auth.py", "Details.", "",
         "### [M2] MEDIUM \N{EM DASH} verbose errors in app.py", "Details.", "",
         "## Notes", "", "Found 2 MEDIUM: 0 open.",
-    ], footer)
-    analysis = analyze(text)
+    ]
+    assert _blocks_on_medium(review("2 findings.", body, footer))
+    body[-1] = "Found 2 medium: 0 open."
+    analysis = analyze(review("2 findings.", body, footer))
     assert analysis.trusted, analysis.detail
     assert analysis.counts["MEDIUM"] == 2
 
@@ -171,9 +180,11 @@ def test_a_lookalike_never_spells_an_exemption_word(body, context):
     f"no MED{chr(0x2113)}UM findings.",
     f"No {chr(0x13B7)}EDIUM issues were found.",
 ])
-def test_a_lookalike_inside_the_word_keeps_its_exemption(body, context):
-    analysis = analyze(build_review([body], context))
-    assert analysis.trusted, (ascii(body), analysis.detail)
+def test_a_negated_word_blocks_with_or_without_a_lookalike(body, context):
+    """These merged under the MEDIUM negation exemption (task 3157). Task
+    3161 deleted it: a negated MEDIUM, spelled with lookalikes or not,
+    blocks."""
+    assert _blocks_on_medium(build_review([body], context)), ascii(body)
 
 
 @pytest.mark.parametrize("context", CONTEXTS)
@@ -187,12 +198,18 @@ def test_a_lookalike_still_spells_the_word(body, context):
     assert gate_blocks(build_review([body], context)), ascii(body)
 
 
-def test_a_lookalike_is_a_mark_outside_the_word():
-    mark = loops._backstop_view_fold(0x2113, "I")
-    assert loops._backstop_is_fold_mark(mark)
-    assert loops._backstop_unmarked(mark) == "I"
-    # NFKC already reads a fullwidth capital as the letter: no mark needed.
-    assert loops._backstop_view_fold(0xFF34, "T") == "T"
+def test_a_lookalike_is_a_mark_only_the_severity_words_read():
+    """Task 3161: every folded lookalike is the FOLD mark of its letter,
+    fullwidth capitals included, and only lookalikes of the letters the
+    severity words hold are folded (no other word is read any more)."""
+    for code_point, letter in ((0x2113, "I"), (0xFF34, "T"), (0x0399, "I")):
+        mark = loops._BACKSTOP_VIEW_FOLDS[code_point]
+        assert loops._backstop_is_fold_mark(mark), hex(code_point)
+        assert loops._backstop_unmarked(mark) == letter, hex(code_point)
+    # Greek NU and OMICRON, Cyrillic small O and the parenthesised N.
+    for code_point in (0x039D, 0x039F, 0x043E, 0x1F11D):
+        assert code_point not in loops._BACKSTOP_LETTER_FOLDS, hex(code_point)
+    assert set(loops._BACKSTOP_LETTER_FOLDS.values()) <= set("CRITALHGMEDUl")
 
 
 def test_a_private_use_character_as_written_is_never_a_letter():
