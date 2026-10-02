@@ -25,7 +25,12 @@ trees:
 * ``negation``: every negation word with one of its letters replaced by
   each lookalike of that letter the review gate knows (the Unicode
   confusables of the letters of the three words and the styled capitals
-  above), before the word (R3154-03).
+  above), before the word (R3154-03);
+* ``split``, ``noun``, ``comma``, ``list`` and ``private-use`` (task 3161,
+  from the independent review of task 3157): a lookalike after the M of a
+  word whose tail is a negation ("MINOR"), at the end of a generic noun, of a
+  lower-case word after a comma and of a listed LOW, and a private-use
+  character inside "MINOR" (R3157-01, R3157-02).
 
 Every body is a list of lines; ``probe_bodies`` returns them in a fixed
 order with a key and the severity word they hold. Nothing here reads the
@@ -218,6 +223,63 @@ def negation_family() -> list[tuple[str, str, list[str]]]:
     return bodies
 
 
+# Task 3161: the shapes of the independent review of task 3157 (R3157-01,
+# R3157-02). A lookalike, or a private-use character, inside an ordinary
+# word split it for the deleted exemption rules: the tail of "MINOR" became
+# a negation, and a label word ending in one was no longer read as a label.
+SPLIT_TAILS = ("nor", "no", "not", "never", "none", "zero", "without",
+               "nothing", "neither")
+PRIVATE_USE = (0xE000, 0xE123, 0xF8FF, 0xF0000, 0x100000)
+
+
+def split_family() -> list[tuple[str, str, list[str]]]:
+    """``Two M<x><tail> WORD issues remain.``: a lookalike after the M of a
+    word whose tail is a negation. MEDIUM, whose exemptions R3157-01 split,
+    gets each tail in upper and lower case; CRITICAL and HIGH (exemption-free
+    since task 3152) each tail in upper case."""
+    bodies = []
+    folds = lookalikes()
+    for word in SEVERITY_WORDS:
+        cases = ("up", "low") if word == "MEDIUM" else ("up",)
+        for tail, case in itertools.product(SPLIT_TAILS, cases):
+            written = tail.upper() if case == "up" else tail
+            for code_point in folds:
+                bodies.append((
+                    f"split|{word}|{tail}|{case}|{code_point:04X}", word,
+                    [f"Two M{chr(code_point)}{written} {word} issues remain."]))
+    return bodies
+
+
+def label_family() -> list[tuple[str, str, list[str]]]:
+    """A lookalike at the end of a label word: after a generic noun
+    (``noun``), a lower-case word after a comma (``comma``) and a listed
+    severity word (``list``)."""
+    bodies = []
+    folds = lookalikes()
+    for word in SEVERITY_WORDS:
+        for code_point in folds:
+            mark = chr(code_point)
+            for shape, line in (
+                    ("noun", f"No {word} issues{mark}{TAIL}"),
+                    ("comma", f"Not {word}, see{mark}{TAIL}"),
+                    ("list", f"not {word} / LOW{mark}{TAIL}")):
+                bodies.append((f"{shape}|{word}|{code_point:04X}", word,
+                               [line]))
+    return bodies
+
+
+def private_use_family() -> list[tuple[str, str, list[str]]]:
+    """``Two MI<private use>NOR WORD issues remain.`` (R3157-02), and the
+    same with a zero-width space, which was always deleted."""
+    bodies = []
+    for word in SEVERITY_WORDS:
+        for code_point in (*PRIVATE_USE, 0x200B):
+            bodies.append((
+                f"private-use|{word}|{code_point:04X}", word,
+                [f"Two MI{chr(code_point)}NOR {word} issues remain."]))
+    return bodies
+
+
 def replay_family() -> list[tuple[str, str, list[str]]]:
     replay = json.loads(REPLAY_FIXTURE.read_text(encoding="utf-8"))
     bodies = []
@@ -232,7 +294,8 @@ def replay_family() -> list[tuple[str, str, list[str]]]:
 def probe_bodies() -> list[tuple[str, str, list[str]]]:
     """(key, severity word, lines) of every probe body, in a fixed order."""
     bodies = (replay_family() + separator_family() + tally_family()
-              + negation_family())
+              + negation_family() + split_family() + label_family()
+              + private_use_family())
     keys = [key for key, _, _ in bodies]
     if len(set(keys)) != len(keys):
         raise RuntimeError("duplicate probe body keys")
