@@ -49,6 +49,11 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   The suite must have 0 skipped tests.
 - Add `--durations=25` to list the slowest tests. No single test should take
   more than 20 seconds.
+- Time a budget on in-process work (a parser or regex "runs in half a
+  second") with `time.process_time()`, not `time.perf_counter()`. Every core
+  runs a worker, so a wall clock also counts the time a worker waits for a
+  core, and such budgets fail whenever the host is busy. Keep the wall clock
+  only for what really waits: subprocesses, threads, sockets, timeouts.
 - Run a single file or test without `-n`, e.g.
   `python3 -m pytest -q -p no:cacheprovider tests/test_gen_module_report.py::test_generation_is_deterministic`.
 
