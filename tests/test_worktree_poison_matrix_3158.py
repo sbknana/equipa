@@ -1,0 +1,876 @@
+"""Task #3162 (FF-3158) — the worktree poison-vector matrix.
+
+The independent review of task #3158 approved it on EQUIPA's own marker
+tests and asked for a wider probe before deploy: plant every way an agent
+can make git run a program of its choosing from its own task worktree, run
+the orchestrator's real cleanup on that worktree, and check that no planted
+program ran while the cleanup still did its job.
+
+* VECTORS plant programs (``touch`` scripts in a temp dir, each creating its
+  own marker) where an agent can write them: the shared repository config
+  (a plain ``git config`` in the worktree writes it), ``config.worktree``,
+  ``.git/hooks``, ``info/attributes``, the work tree's files, the worktree's
+  ``.git`` file and an untracked repository nested in the worktree.
+* OPERATIONS are the orchestrator's cleanup calls: the stash of an unmerged
+  task, the dirty check, the failed-attempt reset (with and without a
+  recorded base), the branch check, the read-only diff/status view, the
+  worktree removal (merged and unmerged) and the retirement of a leftover
+  worktree. Each one also has to do its job (the work is stashed, the reset
+  lands on the base, the worktree is gone).
+* Whole isolated runs (success, failure, early termination) plant the
+  vector from inside the agent and run the real post-agent path.
+
+Every check snapshots the markers right after the orchestrator's call; a
+failure reads ``EXECUTED <vector>/<operation>: [<markers>]``.
+``scripts/poison_matrix_summary.py`` tabulates a JUnit report of this module
+by vector and operation. On d5dcc05 (before task #3158) the matrix shows the
+filter, include, promisor and redirected-``.git`` vectors executing; on this
+tree none does.
+
+The review also listed three calls that still found the repository by
+discovery: ``_is_git_repo(project_dir)`` in ``cleanup_failed_attempt``,
+``get_trusted_default_branch(worktree_dir)`` when no base is recorded, and
+``git worktree remove --force``. Each cleanup operation is therefore checked
+structurally too: every git process it starts either names its repository
+(``--git-dir``) or starts outside the worktree, and ``worktree remove``
+names it. A second dimension reruns the transport vectors as on a git that
+ignores ``GIT_NO_LAZY_FETCH`` (older than 2.44 without the May 2024
+backports): the cleanup must start no transport there either.
+
+Copyright 2026 Forgeborn
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import os
+import subprocess
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
+from typing import Any
+
+import pytest
+
+import equipa.dispatch as dispatch_mod
+import equipa.git_ops as git_ops_mod
+from equipa.git_ops import git_run, git_run_async
+
+from test_dispatch_modes_gated_3112 import (
+    _git,
+    _init_repo,
+    _master,
+    _reset_shutdown_flag,  # noqa: F401  (autouse fixture)
+    _task,
+)
+from test_repository_identity_3146 import TASK_BRANCH, TASK_ID
+
+STASH_TAG = f"equipa-early-term task-{TASK_ID}"
+UNSAVED = "print('unsaved agent work')"
+# A commit no repository here holds: what a promisor remote is asked for.
+MISSING_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+HOOKS = ("post-checkout", "post-merge", "reference-transaction", "pre-auto-gc")
+PAGED_COMMANDS = ("status", "diff", "log", "stash", "branch")
+
+
+def _run(coroutine):
+    return asyncio.run(coroutine)
+
+
+def _with_project_dir(func: Callable[..., Any], *args: Any, project_dir: Path) -> Any:
+    """Call ``func`` the way the code under test accepts: task #3158 added
+    ``project_dir``; without it the call is the pre-3158 one, so the matrix
+    runs on d5dcc05 and fails there for what the code does, not a TypeError."""
+    if "project_dir" in inspect.signature(func).parameters:
+        return func(*args, project_dir=str(project_dir))
+    return func(*args)
+
+
+# --- The agent and its programs ----------------------------------------------
+
+
+@dataclass
+class Agent:
+    """Where the agent writes, and the programs it names. Each program
+    creates its marker when it runs; nothing else does."""
+
+    repo: Path
+    worktree: Path | None
+    tmp: Path
+    monkeypatch: pytest.MonkeyPatch
+    # git itself refuses `worktree remove` once the worktree's .git is rewritten.
+    git_refuses_removal: bool = False
+    ran_while_planting: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.bin = self.tmp / "agent-bin"
+        self.markers = self.tmp / "markers"
+        self.bin.mkdir(exist_ok=True)
+        self.markers.mkdir(exist_ok=True)
+        # Any ssh git starts is this one: a transport started at all shows
+        # up as a marker, and no test ever reaches the network.
+        path_bin = self.tmp / "path-bin"
+        self.program("transport-ssh", "exit 1", path=path_bin / "ssh")
+        monkeypatch = self.monkeypatch
+        monkeypatch.setenv("PATH", f"{path_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+        for variable in ("GIT_SSH", "GIT_SSH_COMMAND"):
+            monkeypatch.delenv(variable, raising=False)
+
+    @property
+    def tree(self) -> Path:
+        if self.worktree is None:  # pragma: no cover - set before any plant
+            raise AssertionError("the agent has no worktree yet")
+        return self.worktree
+
+    def program(self, marker: str, then: str = "exit 0", *, path: Path | None = None) -> str:
+        """A shell script that creates ``markers/<marker>``, then runs ``then``."""
+        script = path or self.bin / marker
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f"#!/bin/sh\ntouch '{self.markers / marker}'\n{then}\n")
+        script.chmod(0o755)
+        return str(script)
+
+    def config(self, *args: str, where: Path | None = None) -> None:
+        """``git config`` as the agent runs it, in its worktree by default."""
+        _git(where or self.tree, "config", *args)
+
+    def select(self, attribute: str) -> None:
+        """Select ``attribute`` for every path through the work tree's own
+        ``.gitattributes``."""
+        (self.tree / ".gitattributes").write_text(f"* {attribute}\n")
+
+    def ran(self) -> list[str]:
+        return sorted(marker.name for marker in self.markers.iterdir())
+
+
+# --- Vectors -----------------------------------------------------------------
+
+
+def _define_filter(agent: Agent, marker: str, *scope: str, where: Path | None = None) -> None:
+    program = agent.program(marker, "exec cat")
+    agent.config(*scope, "filter.probe.clean", program, where=where)
+    agent.config(*scope, "filter.probe.smudge", program, where=where)
+
+
+def _agent_config_file(agent: Agent, marker: str) -> Path:
+    """A config file of the agent's defining a filter and an external diff;
+    the work tree's ``.gitattributes`` selects the filter for every path."""
+    program = agent.program(marker, "exec cat")
+    external = agent.program(f"{marker}-diff-external")
+    config_file = agent.tmp / f"{marker}.cfg"
+    config_file.write_text(
+        f'[filter "probe"]\n\tclean = {program}\n\tsmudge = {program}\n'
+        f"[diff]\n\texternal = {external}\n"
+    )
+    agent.select("filter=probe")
+    return config_file
+
+
+def _promisor(agent: Agent, url: str, repo: Path | None = None) -> None:
+    """``repo`` (the shared repository by default) made a partial clone whose
+    promisor remote is ``url``, with a branch naming a commit only that
+    remote could supply: looking the branch up lazy-fetches it."""
+    git_dir = (repo or agent.repo) / ".git"
+    where = repo or agent.tree
+    agent.config("extensions.partialClone", "probe", where=where)
+    agent.config("remote.probe.url", url, where=where)
+    agent.config("remote.probe.promisor", "true", where=where)
+    (git_dir / "refs" / "heads" / "main").write_text(f"{MISSING_COMMIT}\n")
+
+
+def _hooks(agent: Agent, directory: Path, prefix: str) -> None:
+    for hook in HOOKS:
+        agent.program(f"{prefix}-{hook}", path=directory / hook)
+
+
+def plant_fsmonitor(agent: Agent) -> None:
+    agent.config("core.fsmonitor", agent.program("fsmonitor", "exit 1"))
+
+
+def plant_fsmonitor_config_worktree(agent: Agent) -> None:
+    agent.config("extensions.worktreeConfig", "true")
+    agent.config("--worktree", "core.fsmonitor", agent.program("fsmonitor-worktree", "exit 1"))
+
+
+def plant_hooks_path(agent: Agent) -> None:
+    hooks = agent.tmp / "agent-hooks"
+    _hooks(agent, hooks, "hooksPath")
+    agent.config("core.hooksPath", str(hooks))
+
+
+def plant_git_hooks_dir(agent: Agent) -> None:
+    _hooks(agent, agent.repo / ".git" / "hooks", "git-hooks")
+
+
+def plant_filter_gitattributes(agent: Agent) -> None:
+    _define_filter(agent, "filter-gitattributes")
+    agent.select("filter=probe")
+
+
+def plant_filter_info_attributes(agent: Agent) -> None:
+    _define_filter(agent, "filter-info-attributes")
+    info = agent.repo / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text("* filter=probe\n")
+
+
+def plant_filter_attributes_file(agent: Agent) -> None:
+    _define_filter(agent, "filter-attributesFile")
+    attributes = agent.tmp / "agent-attributes"
+    attributes.write_text("* filter=probe\n")
+    agent.config("core.attributesFile", str(attributes))
+
+
+def plant_filter_process(agent: Agent) -> None:
+    agent.config("filter.probe.process", agent.program("filter-process", "exit 1"))
+    agent.select("filter=probe")
+
+
+def plant_diff_textconv(agent: Agent) -> None:
+    agent.config("diff.probe.textconv", agent.program("diff-textconv", 'cat "$1"'))
+    agent.select("diff=probe")
+
+
+def plant_diff_external(agent: Agent) -> None:
+    agent.config("diff.external", agent.program("diff-external"))
+
+
+def plant_merge_driver(agent: Agent) -> None:
+    agent.config("merge.probe.driver", agent.program("merge-driver") + " %O %A %B")
+    agent.select("merge=probe")
+
+
+def plant_include_path(agent: Agent) -> None:
+    agent.config("include.path", str(_agent_config_file(agent, "include-path")))
+
+
+def plant_include_if(agent: Agent) -> None:
+    config_file = str(_agent_config_file(agent, "includeIf"))
+    git_dir = os.path.realpath(agent.repo / ".git")
+    agent.config(f"includeIf.gitdir:{git_dir}/.path", config_file)
+    agent.config(f"includeIf.onbranch:{TASK_BRANCH}.path", config_file)
+
+
+def plant_config_worktree_include(agent: Agent) -> None:
+    config_file = str(_agent_config_file(agent, "config-worktree-include"))
+    agent.config("extensions.worktreeConfig", "true")
+    agent.config("--worktree", "include.path", config_file)
+    agent.config("--worktree", f"includeIf.onbranch:{TASK_BRANCH}.path", config_file)
+
+
+def plant_promisor_uploadpack(agent: Agent) -> None:
+    remote = agent.tmp / "agent-remote"
+    remote.mkdir()
+    agent.config("remote.probe.uploadpack", agent.program("promisor-uploadpack", "exit 1"))
+    _promisor(agent, str(remote))
+
+
+def plant_promisor_ssh_command(agent: Agent) -> None:
+    agent.config("core.sshCommand", agent.program("promisor-sshCommand", "exit 1"))
+    _promisor(agent, "ssh://agent.invalid/remote.git")
+
+
+def plant_promisor_protocol_ext(agent: Agent) -> None:
+    agent.config("protocol.ext.allow", "always")
+    _promisor(agent, "ext::" + agent.program("promisor-ext", "exit 1"))
+
+
+def plant_pager(agent: Agent) -> None:
+    pager = agent.program("pager", "exec cat")
+    agent.config("core.pager", pager)
+    for command in PAGED_COMMANDS:
+        agent.config(f"pager.{command}", pager)
+
+
+def _poisoned_repository(agent: Agent, repo: Path, prefix: str) -> None:
+    """Every in-repository vector at once in ``repo``, the agent's own."""
+    _define_filter(agent, f"{prefix}-filter", where=repo)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* filter=probe\n")
+    agent.config("core.fsmonitor", agent.program(f"{prefix}-fsmonitor", "exit 1"), where=repo)
+    hooks = agent.tmp / f"{prefix}-hooks"
+    _hooks(agent, hooks, prefix)
+    agent.config("core.hooksPath", str(hooks), where=repo)
+    agent.config("diff.external", agent.program(f"{prefix}-diff-external"), where=repo)
+    remote = agent.tmp / f"{prefix}-remote"
+    remote.mkdir()
+    agent.config(
+        "remote.probe.uploadpack", agent.program(f"{prefix}-uploadpack", "exit 1"), where=repo,
+    )
+    _promisor(agent, str(remote), repo)
+
+
+def plant_redirected_gitfile(agent: Agent) -> None:
+    """The worktree's ``.git`` rewritten to name the agent's own repository:
+    a partial clone whose task branch only its promisor holds, which has a
+    ``main`` but no ``master``, and every in-repository vector."""
+    other = _init_repo(agent.tmp / "agent-repo")
+    _git(other, "branch", "-m", "master", "agent-main")
+    _poisoned_repository(agent, other, "gitfile")
+    git_dir = other / ".git"
+    (git_dir / "refs" / "heads" / "main").write_text(f"{_git(other, 'rev-parse', 'agent-main')}\n")
+    (git_dir / "refs" / "heads" / TASK_BRANCH).write_text(f"{MISSING_COMMIT}\n")
+    (git_dir / "HEAD").write_text(f"ref: refs/heads/{TASK_BRANCH}\n")
+    (agent.tree / ".git").write_text(f"gitdir: {git_dir}\n")
+    agent.git_refuses_removal = True
+
+
+def plant_nested_repository(agent: Agent) -> None:
+    """An untracked repository inside the worktree, with its own poisoned
+    config and a same-size edit git would have to hash."""
+    nested = _init_repo(agent.tree / "vendored")
+    _poisoned_repository(agent, nested, "nested")
+    (nested / "README.md").write_text("SEED\n")
+
+
+VECTORS: dict[str, Callable[[Agent], None]] = {
+    "fsmonitor": plant_fsmonitor,
+    "fsmonitor-config-worktree": plant_fsmonitor_config_worktree,
+    "hooks-path": plant_hooks_path,
+    "git-hooks-dir": plant_git_hooks_dir,
+    "filter-gitattributes": plant_filter_gitattributes,
+    "filter-info-attributes": plant_filter_info_attributes,
+    "filter-attributes-file": plant_filter_attributes_file,
+    "filter-process": plant_filter_process,
+    "diff-textconv": plant_diff_textconv,
+    "diff-external": plant_diff_external,
+    "merge-driver": plant_merge_driver,
+    "include-path": plant_include_path,
+    "include-if": plant_include_if,
+    "config-worktree-include": plant_config_worktree_include,
+    "promisor-uploadpack": plant_promisor_uploadpack,
+    "promisor-ssh-command": plant_promisor_ssh_command,
+    "promisor-protocol-ext": plant_promisor_protocol_ext,
+    "pager": plant_pager,
+    "redirected-gitfile": plant_redirected_gitfile,
+    "nested-repository": plant_nested_repository,
+}
+# The vectors whose program is started through a transport (a lazy fetch).
+TRANSPORT_VECTORS = (
+    "promisor-uploadpack", "promisor-ssh-command", "promisor-protocol-ext",
+    "redirected-gitfile", "nested-repository",
+)
+
+
+def _plant(agent: Agent, vector: str) -> None:
+    VECTORS[vector](agent)
+    agent.ran_while_planting = agent.ran()
+
+
+def _leave_unsaved_work(worktree: Path) -> None:
+    # Same size as the committed "seed\n": git has to hash it to see the
+    # change, which is when a clean filter runs.
+    (worktree / "README.md").write_text("SEED\n")
+    (worktree / "work.py").write_text(f"{UNSAVED}\n")
+
+
+def _assert_nothing_ran(agent: Agent, vector: str, operation: str, fired: list[str]) -> None:
+    assert not agent.ran_while_planting, f"the plant itself ran {agent.ran_while_planting}"
+    assert not fired, f"EXECUTED {vector}/{operation}: {fired}"
+
+
+# --- Recording the git processes the orchestrator starts ----------------------
+
+
+@dataclass(frozen=True)
+class GitCall:
+    argv: tuple[str, ...]
+    # Where the process starts, resolved when it was started.
+    where: str
+    explicit_repository: bool
+
+
+class GitRecorder:
+    """Every git process started while :meth:`recording` is active."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[GitCall] = []
+        self._active = False
+        real_run = subprocess.run
+        real_exec = asyncio.create_subprocess_exec
+
+        def recording_run(argv, *args, **kwargs):
+            self._record(argv, kwargs)
+            return real_run(argv, *args, **kwargs)
+
+        async def recording_exec(*argv, **kwargs):
+            self._record(argv, kwargs)
+            return await real_exec(*argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", recording_run)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_exec)
+
+    def _record(self, argv: Any, kwargs: dict[str, Any]) -> None:
+        if not self._active or isinstance(argv, (str, bytes)):
+            return
+        command = tuple(os.fspath(token) for token in argv)
+        if not command or os.path.basename(command[0]) != "git":
+            return
+        cwd = kwargs.get("cwd")
+        env = kwargs.get("env") or {}
+        explicit = "GIT_DIR" in env or any(
+            token == "--git-dir" or token.startswith("--git-dir=") for token in command
+        )
+        self.calls.append(GitCall(
+            command, os.path.realpath(os.fspath(cwd) if cwd else os.getcwd()), explicit,
+        ))
+
+    @contextmanager
+    def recording(self) -> Iterator[None]:
+        self._active = True
+        try:
+            yield
+        finally:
+            self._active = False
+
+    def discovery_in(self, directory: Path) -> list[tuple[str, ...]]:
+        """git calls that found their repository from inside ``directory``."""
+        root = os.path.realpath(directory)
+        return [
+            call.argv for call in self.calls
+            if not call.explicit_repository
+            and (call.where == root or call.where.startswith(root + os.sep))
+        ]
+
+    def worktree_removals(self) -> list[GitCall]:
+        return [
+            call for call in self.calls
+            if "worktree" in call.argv and "remove" in call.argv
+        ]
+
+
+# --- Operations ----------------------------------------------------------------
+
+
+class _NoDb:
+    """The task-status write of ``cleanup_failed_attempt``, discarded."""
+
+    def __init__(self, write: bool = False) -> None:
+        pass
+
+    def execute(self, *args, **kwargs):
+        return self
+
+    def commit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _assert_work_stashed(repo: Path) -> None:
+    """The stash is in the repository, on the task branch, with the work."""
+    stashes = _git(repo, "stash", "list")
+    assert STASH_TAG in stashes and f"On {TASK_BRANCH}:" in stashes, stashes
+    assert _git(repo, "cat-file", "-p", "stash@{0}:README.md") == "SEED"
+    assert _git(repo, "cat-file", "-p", "stash@{0}^3:work.py") == UNSAVED
+    assert _git(repo, "rev-parse", "stash@{0}^1") == _git(repo, "rev-parse", TASK_BRANCH)
+
+
+def _branch_exists(repo: Path) -> bool:
+    return bool(_git(repo, "rev-parse", "--verify", "--quiet", TASK_BRANCH, check=False))
+
+
+def _commit_failed_attempt(agent: Agent) -> None:
+    (agent.tree / "failed.py").write_text("failed attempt\n")
+    _git(agent.tree, "add", "failed.py")
+    _git(agent.tree, "commit", "-q", "-m", "failed attempt")
+
+
+def _assert_reset(agent: Agent, base_sha: str) -> None:
+    assert _git(agent.repo, "rev-parse", TASK_BRANCH) == base_sha
+    assert (agent.tree / "README.md").read_text() == "seed\n"
+    assert not (agent.tree / "failed.py").exists()
+    assert not (agent.tree / "work.py").exists()
+
+
+def _reset(agent: Agent, base_sha: str | None) -> None:
+    agent.monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    _run(dispatch_mod.cleanup_failed_attempt(
+        TASK_ID, str(agent.tree), [], output=[], base_sha=base_sha,
+    ))
+
+
+# (git arguments, text every correct answer contains)
+READ_VIEW_CALLS = (
+    (["diff", "HEAD"], "+SEED"),
+    (["diff", "--stat"], "README.md"),
+    (["status", "--porcelain"], " M README.md"),
+    (["ls-files", "-m"], "README.md"),
+)
+
+
+def _read_view(agent: Agent) -> list[subprocess.CompletedProcess]:
+    results = [git_run(args, agent.tree, timeout=30) for args, _ in READ_VIEW_CALLS]
+    results.extend(
+        _run(git_run_async(args, agent.tree, timeout=30)) for args, _ in READ_VIEW_CALLS
+    )
+    return results
+
+
+def _check_read_view(agent: Agent, results: list[subprocess.CompletedProcess]) -> None:
+    for result, (args, expected) in zip(results, READ_VIEW_CALLS * 2):
+        assert result.returncode == 0, (args, result.stderr)
+        assert expected in result.stdout, (args, result.stdout)
+
+
+def _remove(agent: Agent, merged: bool) -> None:
+    _run(dispatch_mod._cleanup_worktrees(
+        str(agent.repo), {TASK_ID: str(agent.tree)},
+        {TASK_ID} if merged else set(), agent.repo / ".forge-worktrees",
+    ))
+
+
+def _check_removed(agent: Agent, *, merged: bool) -> None:
+    if not merged:
+        _assert_work_stashed(agent.repo)
+    assert agent.tree.exists() is agent.git_refuses_removal
+    # A merged task's branch goes with its worktree; one git refused to
+    # remove still holds the branch, which git then refuses to delete.
+    assert _branch_exists(agent.repo) is (not merged or agent.git_refuses_removal)
+
+
+def _check_retired(agent: Agent, problem: str | None) -> None:
+    _assert_work_stashed(agent.repo)
+    if agent.git_refuses_removal:
+        assert problem and "could not remove" in problem, problem
+        assert agent.tree.exists()
+    else:
+        assert problem is None, problem
+        assert not agent.tree.exists()
+
+
+@dataclass(frozen=True)
+class Operation:
+    """One orchestrator cleanup call: ``prepare`` runs before the plant,
+    ``run`` is the call under test and ``check`` asserts it did its job."""
+
+    run: Callable[[Agent], Any]
+    check: Callable[[Agent, Any], None]
+    prepare: Callable[[Agent], None] = lambda agent: None
+    removes_worktree: bool = False
+
+
+OPERATIONS: dict[str, Operation] = {
+    "stash": Operation(
+        run=lambda agent: _run(_with_project_dir(
+            dispatch_mod._stash_uncommitted_in_worktree,
+            str(agent.tree), TASK_ID, TASK_BRANCH, project_dir=agent.repo,
+        )),
+        check=lambda agent, problem: (
+            _assert_work_stashed(agent.repo) if problem is None
+            else pytest.fail(f"the stash failed: {problem}")
+        ),
+    ),
+    "dirty-check": Operation(
+        run=lambda agent: _run(_with_project_dir(
+            dispatch_mod._worktree_dirty_reason, str(agent.tree), project_dir=agent.repo,
+        )),
+        check=lambda agent, dirty: None if dirty and "uncommitted change" in dirty else (
+            pytest.fail(f"the dirty check answered {dirty!r}")
+        ),
+    ),
+    "reset": Operation(
+        prepare=_commit_failed_attempt,
+        run=lambda agent: _reset(agent, _master(agent.repo)),
+        check=lambda agent, _: _assert_reset(agent, _master(agent.repo)),
+    ),
+    "reset-no-base": Operation(
+        prepare=_commit_failed_attempt,
+        run=lambda agent: _reset(agent, None),
+        check=lambda agent, _: _assert_reset(agent, _master(agent.repo)),
+    ),
+    "branch-check": Operation(
+        run=lambda agent: _run(dispatch_mod._require_task_branch(str(agent.tree), TASK_BRANCH)),
+        check=lambda agent, head: None if head == _git(agent.repo, "rev-parse", TASK_BRANCH) else (
+            pytest.fail(f"the branch check read {head!r}")
+        ),
+    ),
+    "read-view": Operation(run=_read_view, check=_check_read_view),
+    "remove-unmerged": Operation(
+        run=lambda agent: _remove(agent, merged=False),
+        check=lambda agent, _: _check_removed(agent, merged=False),
+        removes_worktree=True,
+    ),
+    "remove-merged": Operation(
+        run=lambda agent: _remove(agent, merged=True),
+        check=lambda agent, _: _check_removed(agent, merged=True),
+        removes_worktree=True,
+    ),
+    "retire": Operation(
+        run=lambda agent: _run(dispatch_mod._retire_leftover_worktree(
+            str(agent.repo), agent.tree, TASK_ID, TASK_BRANCH,
+        )),
+        check=_check_retired,
+        removes_worktree=True,
+    ),
+}
+
+
+def _task_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = repo / ".forge-worktrees" / f"task-{TASK_ID}"
+    _git(repo, "worktree", "add", "-q", "-b", TASK_BRANCH, str(worktree), "master")
+    return repo, worktree
+
+
+def _check_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, name: str,
+) -> None:
+    operation = OPERATIONS[name]
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    operation.prepare(agent)
+    _plant(agent, vector)
+    _leave_unsaved_work(worktree)
+    recorder = GitRecorder(monkeypatch)
+
+    # The markers are read before anything else can fail: an exception from
+    # the call is raised only once they have been checked.
+    error: Exception | None = None
+    result: Any = None
+    with recorder.recording():
+        try:
+            result = operation.run(agent)
+        except Exception as exc:  # re-raised below, after the markers
+            error = exc
+    fired = agent.ran()
+    _assert_nothing_ran(agent, vector, name, fired)
+    if error is not None:
+        raise error
+
+    assert recorder.discovery_in(worktree) == [], (
+        f"git found its repository from inside the worktree ({vector}/{name})"
+    )
+    if operation.removes_worktree:
+        removals = recorder.worktree_removals()
+        assert removals, "the worktree was never removed"
+        assert all(call.explicit_repository for call in removals), [
+            call.argv for call in removals
+        ]
+    operation.check(agent, result)
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("vector", VECTORS)
+def test_cleanup_runs_no_agent_program_and_does_its_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, operation: str,
+) -> None:
+    _check_operation(tmp_path, monkeypatch, vector, operation)
+
+
+def _git_without_lazy_fetch_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What every hardened call gets from a git older than 2.44 without the
+    May 2024 backports: GIT_NO_LAZY_FETCH is not honoured, so it is gone."""
+    monkeypatch.setattr(git_ops_mod, "GIT_HARDENING_ENV", MappingProxyType({
+        key: value for key, value in git_ops_mod.GIT_HARDENING_ENV.items()
+        if key != "GIT_NO_LAZY_FETCH"
+    }))
+    monkeypatch.delenv("GIT_NO_LAZY_FETCH", raising=False)
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("vector", TRANSPORT_VECTORS)
+def test_cleanup_starts_no_transport_on_a_git_without_lazy_fetch_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, operation: str,
+) -> None:
+    """Review item I3158-02: the cleanup's own git starts no transport at
+    all (``GIT_ALLOW_PROTOCOL`` empty), whatever the git version."""
+    _git_without_lazy_fetch_control(monkeypatch)
+    _check_operation(tmp_path, monkeypatch, vector, operation)
+
+
+def test_without_lazy_fetch_control_a_discovered_lookup_does_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the dimension above: the same plant, looked up
+    by discovery from the worktree with the hardened env minus the lazy
+    fetch pin, does run the agent's upload-pack."""
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    _plant(agent, "promisor-uploadpack")
+    _git_without_lazy_fetch_control(monkeypatch)
+
+    git_run(["rev-parse", "--verify", "--quiet", "refs/heads/main^{commit}"], worktree)
+
+    assert agent.ran() == ["promisor-uploadpack"]
+
+
+# --- Whole isolated runs ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("vector", VECTORS)
+@pytest.mark.parametrize(
+    ("outcome", "commit"),
+    [
+        ("tests_passed", True),       # success with commits
+        ("tests_failed", True),       # failure
+        ("early_terminated", False),  # early termination
+    ],
+    ids=["success", "failure", "early-termination"],
+)
+def test_isolated_run_runs_no_agent_program_after_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, outcome: str, commit: bool,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    master_before = _master(repo)
+    agent = Agent(repo, None, tmp_path, monkeypatch)
+
+    async def execute(agent_dir: str, task_branch: str):
+        agent.worktree = Path(agent_dir)
+        if commit:
+            (agent.worktree / "NOTES.md").write_text("agent notes\n")
+            _git(agent.worktree, "add", "NOTES.md")
+            _git(agent.worktree, "commit", "-q", "-m", "agent notes")
+        _plant(agent, vector)
+        _leave_unsaved_work(agent.worktree)
+        return {"cost": 0.0, "duration": 0.0}, 1, outcome
+
+    args = SimpleNamespace(security_review=False, dispatch_config={})
+    run = _run(dispatch_mod.run_task_in_isolation(
+        _task(TASK_ID), str(repo), {}, args, execute=execute,
+    ))
+
+    _assert_nothing_ran(agent, vector, f"isolated-{outcome}", agent.ran())
+    assert agent.tree.exists() is agent.git_refuses_removal
+    if run.merged_sha is not None:
+        # Only a success merges, and only when the plant is not a merge
+        # hazard (a program key the hardening pins, e.g. core.fsmonitor):
+        # the agent's commit is on the default branch and its branch is gone.
+        assert outcome == "tests_passed", run
+        assert _master(repo) == run.merged_sha
+        assert _git(repo, "cat-file", "-p", f"{run.merged_sha}:NOTES.md") == "agent notes"
+        assert not _branch_exists(repo)
+    else:
+        # Nothing merged: the agent's uncommitted work is a stash on its branch.
+        assert _master(repo) == master_before
+        _assert_work_stashed(repo)
+
+
+# --- The three remaining discovery calls, one by one ----------------------------
+
+
+def test_reset_without_a_base_reads_the_default_branch_of_the_registered_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worktree's ``.git`` names the agent's repository, which has a
+    ``main`` and no ``master``. Read by discovery, ``main`` was taken as the
+    default branch and the reset could not find its fork point."""
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    other = _init_repo(tmp_path / "agent-repo")
+    _git(other, "branch", "-m", "master", "main")
+    (worktree / ".git").write_text(f"gitdir: {other / '.git'}\n")
+
+    assert git_ops_mod.get_trusted_default_branch(
+        worktree, common_dir=repo / ".git",
+    ) == "master"
+    _reset(agent, None)
+
+    assert _git(repo, "rev-parse", TASK_BRANCH) == _master(repo)
+
+
+def test_cleanup_failed_attempt_never_asks_git_whether_a_task_worktree_is_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    asked: list[str] = []
+    monkeypatch.setattr(dispatch_mod, "_is_git_repo", lambda path: asked.append(path) or True)
+
+    _reset(agent, _master(repo))
+
+    assert asked == []
+    assert _git(repo, "rev-parse", TASK_BRANCH) == _master(repo)
+
+
+def test_cleanup_keeps_the_worktree_when_the_repository_cannot_be_located(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    repo, worktree = _task_worktree(tmp_path)
+
+    async def no_common_dir(directory):
+        return None
+
+    monkeypatch.setattr(dispatch_mod, "_git_common_dir", no_common_dir)
+    _run(dispatch_mod._cleanup_worktrees(
+        str(repo), {TASK_ID: str(worktree)}, {TASK_ID}, repo / ".forge-worktrees",
+    ))
+
+    assert worktree.exists()
+    assert _branch_exists(repo)
+    assert "Could not locate the repository" in capsys.readouterr().out
+
+
+# --- The read-only view takes attributes from the empty tree ----------------------
+
+
+def _diff_readme(worktree: Path) -> list[subprocess.CompletedProcess]:
+    args = ["diff", "HEAD", "--", "README.md"]
+    return [git_run(args, worktree, timeout=30), _run(git_run_async(args, worktree, timeout=30))]
+
+
+def test_read_view_ignores_the_work_tree_attributes(tmp_path: Path) -> None:
+    """``-diff`` in the work tree's ``.gitattributes`` would make the diff
+    read "Binary files differ"; with attributes from the empty tree the
+    change is shown as text."""
+    _repo, worktree = _task_worktree(tmp_path)
+    (worktree / ".gitattributes").write_text("README.md -diff\n")
+    (worktree / "README.md").write_text("SEED\n")
+
+    for diff in _diff_readme(worktree):
+        assert diff.returncode == 0, diff.stderr
+        assert "+SEED" in diff.stdout, diff.stdout
+
+
+def test_read_view_ignores_the_global_attributes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no ``core.attributesFile`` set, git reads
+    ``$HOME/.config/git/attributes``, which the agent can write."""
+    _repo, worktree = _task_worktree(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "attributes").write_text("README.md -diff\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (worktree / "README.md").write_text("SEED\n")
+
+    for diff in _diff_readme(worktree):
+        assert diff.returncode == 0, diff.stderr
+        assert "+SEED" in diff.stdout, diff.stdout
+
+
+def test_read_view_of_a_sha256_repository_uses_its_empty_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--object-format=sha256", "-b", "master")
+    _git(repo, "config", "user.email", "test@forgeborn.dev")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README.md").write_text("seed\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "seed")
+    worktree = repo / ".forge-worktrees" / f"task-{TASK_ID}"
+    _git(repo, "worktree", "add", "-q", "-b", TASK_BRANCH, str(worktree), "master")
+    (worktree / ".gitattributes").write_text("README.md -diff\n")
+    (worktree / "README.md").write_text("SEED\n")
+
+    for diff in _diff_readme(worktree):
+        assert diff.returncode == 0, diff.stderr
+        assert "+SEED" in diff.stdout, diff.stdout
+
+
+def test_read_view_refuses_an_unknown_object_format(tmp_path: Path) -> None:
+    view = git_ops_mod._WorktreeView(
+        work_tree=str(tmp_path), relative=".", common_dir=str(tmp_path),
+        git_dir=str(tmp_path), work_tree_fd=None,
+    )
+    listing = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="extensions.objectformat\nsha512\0",
+    )
+
+    with pytest.raises(git_ops_mod.AgentWorktreeGitError, match="unknown object format"):
+        git_ops_mod._with_private_common_dir(view, [listing])
