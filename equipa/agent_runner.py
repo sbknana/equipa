@@ -2437,13 +2437,71 @@ def _stop_signal_cleanup_handler(previous: Any) -> Any:
                 raise
             return
         try:
-            _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
+            with _stop_cleanup_watchdog():
+                _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
         finally:
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
 
     setattr(handler, _STOP_CLEANUP_MARKER, True)
     return handler
+
+
+# Upper bound on the cleanup before the SIG_DFL path re-sends the signal:
+# agent termination is bounded by its own timeouts, plus slack for the
+# directory removal. Only a cleanup that hangs reaches it.
+_STOP_CLEANUP_BUDGET_SECONDS = (
+    _LAUNCHER_EXIT_TIMEOUT_SECONDS + _GROUP_KILL_TIMEOUT_SECONDS + 10.0)
+
+
+class _StopCleanupTimeout(BaseException):
+    """Raised by the SIGALRM watchdog into a stop-signal cleanup that hangs.
+
+    A BaseException, so the ``except Exception`` blocks of the cleanup and
+    of logging let it through to the handler's ``finally``.
+    """
+
+
+def _raise_stop_cleanup_timeout(signum: int,
+                                frame: FrameType | None) -> None:
+    raise _StopCleanupTimeout(
+        f"stop-signal cleanup still running after "
+        f"{_STOP_CLEANUP_BUDGET_SECONDS:.0f}s")
+
+
+@contextlib.contextmanager
+def _stop_cleanup_watchdog() -> Iterator[None]:
+    """Cut the SIG_DFL cleanup short once it runs past the budget.
+
+    A log line can block for good: the handler runs in the main thread,
+    which may itself be blocked in a large write to a full stderr pipe that
+    nobody drains, and then the handler's own write to that stderr waits
+    for the same space (seen on CPython 3.12). SIGALRM interrupts the
+    blocked write and raises _StopCleanupTimeout out of it; the handler's
+    ``finally`` then re-sends the stop signal.
+
+    Armed only when nothing else uses SIGALRM (default disposition, no
+    interval timer running); otherwise the cleanup runs unbounded, as
+    before. The SIGALRM handler is not restored afterwards: the caller
+    re-sends the stop signal and the process dies, and a SIGALRM already
+    pending would otherwise reach the default disposition (or a "signal
+    ignored" report written to the same stderr).
+    """
+    armed = False
+    try:
+        if (signal.getsignal(signal.SIGALRM) == signal.SIG_DFL
+                and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)):
+            signal.signal(signal.SIGALRM, _raise_stop_cleanup_timeout)
+            signal.setitimer(signal.ITIMER_REAL,
+                             _STOP_CLEANUP_BUDGET_SECONDS)
+            armed = True
+    except (ValueError, OSError):
+        armed = False  # not the main thread, or no timer: run unbounded
+    try:
+        yield
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 @contextlib.contextmanager
