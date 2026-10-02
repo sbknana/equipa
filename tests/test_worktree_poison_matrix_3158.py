@@ -802,7 +802,9 @@ def test_cleanup_keeps_the_worktree_when_the_repository_cannot_be_located(
 
     assert worktree.exists()
     assert _branch_exists(repo)
-    assert "Could not locate the repository" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"Cleanup error for task #{TASK_ID} (branch '{TASK_BRANCH}')" in out, out
+    assert "could not locate the repository" in out, out
 
 
 # --- The read-only view takes attributes from the empty tree ----------------------

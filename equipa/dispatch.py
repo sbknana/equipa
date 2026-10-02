@@ -2918,9 +2918,9 @@ async def _cleanup_worktrees(
                 )
             if common_dir is None:
                 print(
-                    f"  [Isolation] Could not locate the repository of "
-                    f"{project_dir}; keeping worktree {wt_path} and branch "
-                    f"'{branch_name}'"
+                    f"  [Isolation] Cleanup error for task #{task_id} "
+                    f"(branch '{branch_name}'): could not locate the "
+                    f"repository of {project_dir}; worktree {wt_path} kept"
                 )
                 continue
             await remove_registered_worktree(common_dir, wt_path, timeout=30)
