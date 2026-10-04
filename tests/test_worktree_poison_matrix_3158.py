@@ -880,6 +880,55 @@ def test_isolated_run_runs_no_agent_program_after_the_agent(
         _assert_work_stashed(repo)
 
 
+@pytest.mark.parametrize("vector", ["symlinked-root", "symlinked-root-to-own-worktree"])
+@pytest.mark.parametrize("outcome", ["tests_failed", "tests_passed"])
+def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, outcome: str,
+) -> None:
+    """R3162-01, the single-task ``--task --dev-test`` loop: the agent swaps
+    its worktree root during the attempt. The branch check after the
+    attempt stops the loop before any cleanup, so the failed attempt is not
+    reset by discovery in the agent's repository (where ``git checkout``
+    ran its smudge filter), and a passing attempt is not accepted."""
+    import equipa.cli as cli_mod
+
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    attempts: list[str] = []
+    cleanups: list[str] = []
+    task_branch_after_agent: list[str] = []
+    real_cleanup = cli_mod.cleanup_failed_attempt
+
+    async def attempt(task, project_dir, project_context, args):
+        attempts.append(project_dir)
+        _commit_failed_attempt(agent)
+        task_branch_after_agent.append(_git(repo, "rev-parse", TASK_BRANCH))
+        _plant(agent, vector)
+        _leave_unsaved_work(agent.tree)
+        return {"cost": 0.0, "duration": 0.0}, 1, outcome
+
+    async def recorded_cleanup(task_id, project_dir, *args, **kwargs):
+        cleanups.append(project_dir)
+        return await real_cleanup(task_id, project_dir, *args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "run_dev_test_loop", attempt)
+    monkeypatch.setattr(cli_mod, "cleanup_failed_attempt", recorded_cleanup)
+    args = SimpleNamespace(dispatch_config={
+        "features": {"autoresearch": True}, "autoresearch_max_retries": 1,
+    })
+
+    _, _, final_outcome = _run(cli_mod._run_dev_test_mode(
+        _task(TASK_ID), str(worktree), {}, args, task_branch=TASK_BRANCH,
+    ))
+
+    _assert_nothing_ran(agent, vector, f"cli-{outcome}", agent.ran())
+    assert final_outcome == "worktree_branch_mismatch"
+    assert attempts == [str(worktree)]
+    assert cleanups == [], "the swapped worktree reached cleanup_failed_attempt"
+    _assert_replaced_root_untouched(agent, task_branch_after_agent[0])
+
+
 # --- The three remaining discovery calls, one by one ----------------------------
 
 
@@ -935,6 +984,37 @@ def test_cleanup_keeps_the_worktree_when_the_repository_cannot_be_located(
     out = capsys.readouterr().out
     assert f"Cleanup error for task #{TASK_ID} (branch '{TASK_BRANCH}')" in out, out
     assert "could not locate the repository" in out, out
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "unmerged"])
+@pytest.mark.parametrize("refusal", ["locked", "redirected-gitfile"])
+def test_cleanup_logs_a_worktree_git_refuses_to_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, refusal: str, merged: bool,
+) -> None:
+    """R3162-02: git refuses ``worktree remove --force`` for a worktree the
+    agent locked or whose ``.git`` it rewrote. The kept directory is logged
+    as a cleanup error, and the branch it still holds is not deleted."""
+    repo, worktree = _task_worktree(tmp_path)
+    agent = Agent(repo, worktree, tmp_path, monkeypatch)
+    if refusal == "locked":
+        _git(repo, "worktree", "lock", "--reason", "agent", str(worktree))
+    else:
+        _plant(agent, "redirected-gitfile")
+    recorder = GitRecorder(monkeypatch)
+    capsys.readouterr()
+
+    with recorder.recording():
+        _remove(agent, merged=merged)
+
+    out = capsys.readouterr().out
+    assert f"Cleanup error for task #{TASK_ID} (branch '{TASK_BRANCH}')" in out, out
+    assert f"git refused to remove worktree {worktree}" in out, out
+    assert worktree.exists()
+    assert _branch_exists(repo)
+    assert not [call.argv for call in recorder.calls if "branch" in call.argv], (
+        "branch -D ran for a branch the kept worktree holds"
+    )
+    assert agent.ran() == []
 
 
 # --- The read-only view takes attributes from the empty tree ----------------------
