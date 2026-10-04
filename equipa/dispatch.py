@@ -2960,7 +2960,18 @@ async def _cleanup_worktrees(
                     f"repository of {project_dir}; worktree {wt_path} kept"
                 )
                 continue
-            await remove_registered_worktree(common_dir, wt_path, timeout=30)
+            removal = await remove_registered_worktree(common_dir, wt_path, timeout=30)
+            if removal.returncode != 0:
+                # R3162-02 (task #3165): git refuses a worktree whose .git the
+                # agent rewrote, or one it locked. The directory stays, so say
+                # so; the branch it still holds cannot be deleted either.
+                print(
+                    f"  [Isolation] Cleanup error for task #{task_id} "
+                    f"(branch '{branch_name}'): git refused to remove worktree "
+                    f"{wt_path} (rc={removal.returncode}): {_git_output(removal)}; "
+                    f"worktree and branch kept"
+                )
+                continue
             if task_id in merged_tasks:
                 await git_run_async(
                     ["branch", "-D", branch_name], project_dir, timeout=10,
