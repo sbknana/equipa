@@ -63,7 +63,7 @@ indep-3155 confirmed R3155-01 by its own probe; R3155-02 and R3155-03 by reading
 
 ## SECURITY-REVIEW-3162 (EQUIPA security review of task 3162), follow-ups fixed by task 3165
 
-The review blocked task 3162 on one HIGH: the symlinked worktree root was the one remaining way back to discovery in failed-attempt cleanup. Task 3165 fixes it and the LOW, and adds the symlinked root to the poison matrix as two vectors: a symlink to the agent's own repository, and a symlink to a worktree that repository registers (on a branch named like the task's). Before the fix, the first vector ran the agent's smudge filter in `reset` and `reset-no-base`, with and without lazy-fetch control (4 cases). The second reset the agent's repository and reported success, and its branch check, isolated runs and CLI loop accepted the symlinked worktree (13 cases). After the fix, every case refuses.
+The review blocked task 3162 on one HIGH: the symlinked worktree root was the one remaining way back to discovery in failed-attempt cleanup. Task 3165 fixes it and the LOW, and adds the symlinked root to the poison matrix as two vectors: a symlink to the agent's own repository, and a symlink to a worktree that repository registers (on a branch named like the task's). On f637fca (task 3162), the first vector ran the agent's smudge filter in 5 cases: `reset` and `reset-no-base`, with and without lazy-fetch control, plus the CLI loop's cleanup. The second vector failed 11 cases. Its reset acted on the agent's repository and reported success, and its branch check, isolated runs and CLI loop accepted the symlinked worktree. After the fix, every case refuses.
 
 | ID | Finding | Status | Fix | Regression test |
 |---|---|---|---|---|
