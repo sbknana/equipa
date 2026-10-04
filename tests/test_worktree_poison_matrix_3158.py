@@ -506,6 +506,10 @@ class _NoDb:
     def execute(self, *args, **kwargs):
         return self
 
+    def fetchone(self) -> None:
+        # No task row: the reflection injection then writes nothing.
+        return None
+
     def commit(self) -> None:
         pass
 
@@ -902,10 +906,13 @@ def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
 
     async def attempt(task, project_dir, project_context, args):
         attempts.append(project_dir)
-        _commit_failed_attempt(agent)
-        task_branch_after_agent.append(_git(repo, "rev-parse", TASK_BRANCH))
-        _plant(agent, vector)
-        _leave_unsaved_work(agent.tree)
+        if len(attempts) == 1:
+            # Only the first attempt swaps the root; a second one starting
+            # at all is the failure, and must not run the test's own git.
+            _commit_failed_attempt(agent)
+            task_branch_after_agent.append(_git(repo, "rev-parse", TASK_BRANCH))
+            _plant(agent, vector)
+            _leave_unsaved_work(agent.tree)
         return {"cost": 0.0, "duration": 0.0}, 1, outcome
 
     async def recorded_cleanup(task_id, project_dir, *args, **kwargs):
@@ -918,11 +925,19 @@ def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
         "features": {"autoresearch": True}, "autoresearch_max_retries": 1,
     })
 
-    _, _, final_outcome = _run(cli_mod._run_dev_test_mode(
-        _task(TASK_ID), str(worktree), {}, args, task_branch=TASK_BRANCH,
-    ))
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    final_outcome = None
+    try:
+        _, _, final_outcome = _run(cli_mod._run_dev_test_mode(
+            _task(TASK_ID), str(worktree), {}, args, task_branch=TASK_BRANCH,
+        ))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
 
     _assert_nothing_ran(agent, vector, f"cli-{outcome}", agent.ran())
+    if error is not None:
+        raise error
     assert final_outcome == "worktree_branch_mismatch"
     assert attempts == [str(worktree)]
     assert cleanups == [], "the swapped worktree reached cleanup_failed_attempt"
