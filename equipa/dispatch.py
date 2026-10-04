@@ -67,6 +67,7 @@ from equipa.git_ops import (
     PinnedRepositoryError,
     UntrustedDefaultBranchError,
     _is_git_repo,
+    _nearest_git_entry,
     agent_worktree_git,
     check_pinned_directory,
     descriptor_path,
@@ -714,6 +715,7 @@ async def cleanup_failed_attempt(
     output: list[str] | None = None,
     *,
     base_sha: str | None = None,
+    expect_repository: bool = True,
 ) -> None:
     """Reset a failed task for a fresh autoresearch attempt.
 
@@ -728,6 +730,11 @@ async def cleanup_failed_attempt(
     * ``project_dir`` is the main checkout: leave ``forge-task-<id>`` for the
       trusted default branch if it is checked out, then delete it unless a
       worktree still holds it.
+    * ``expect_repository`` is False: the project was not a git repository
+      when the task was dispatched (no worktree was made for it). No git
+      step runs at all (R3165-01, task #3166). A repository found there now
+      is one the agent created during its attempt; it is reported, never
+      discovered or checked out.
 
     Every git step is checked. On failure :class:`AttemptCleanupError` is
     raised BEFORE the task is reset to ``todo``; the task must not be
@@ -744,6 +751,8 @@ async def cleanup_failed_attempt(
             list is allowed (skips reflection injection).
         output: Optional buffer for ``log()`` calls; if ``None``, prints.
         base_sha: Commit the task worktree was created on.
+        expect_repository: False when the project was not a git repository
+            at dispatch; both loops pass ``task_branch is not None``.
 
     Raises:
         AttemptCleanupError: a git step failed or the worktree is not on
@@ -757,6 +766,54 @@ async def cleanup_failed_attempt(
         else:
             print(message)
 
+    if expect_repository:
+        await _clean_up_attempt_branch(project_dir, branch_name, base_sha, emit)
+    else:
+        _report_repository_made_by_attempt(project_dir, emit)
+
+    conn = get_db_connection(write=True)
+    try:
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        if reflections:
+            _inject_attempt_reflections(conn, task_id, reflections)
+        conn.commit()
+    finally:
+        conn.close()
+
+    emit(
+        f"  [Autoresearch] Reset task #{task_id} to todo with "
+        f"{len(reflections)} attempt reflection(s)"
+    )
+
+
+def _report_repository_made_by_attempt(
+    project_dir: str, emit: Callable[[str], None],
+) -> None:
+    """Report a ``.git`` that appeared in a project that was not git at
+    dispatch, found without running git.
+
+    R3165-01 (task #3166): asking git (by discovery) found the agent's own
+    repository, and checking out its default branch ran the smudge filter
+    the agent had defined, as a child of the orchestrator and outside the
+    agent's containment. Nothing is done with the repository.
+    """
+    git_entry = _nearest_git_entry(Path(project_dir))
+    if git_entry is not None:
+        emit(
+            f"  [Autoresearch] A git repository appeared at "
+            f"{escape_audit_text(str(git_entry))} during the failed attempt; "
+            f"the project was not git at dispatch, so no git step runs there"
+        )
+
+
+async def _clean_up_attempt_branch(
+    project_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """The git step of :func:`cleanup_failed_attempt` for a project that was
+    a git repository at dispatch."""
     in_task_worktree = _in_task_worktree_location(project_dir)
     if in_task_worktree:
         # FF-3158 (task #3162): a task worktree is git by construction; asking
@@ -789,20 +846,6 @@ async def cleanup_failed_attempt(
             await _delete_task_branch_in_main_checkout(
                 project_dir, branch_name, emit,
             )
-
-    conn = get_db_connection(write=True)
-    try:
-        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
-        if reflections:
-            _inject_attempt_reflections(conn, task_id, reflections)
-        conn.commit()
-    finally:
-        conn.close()
-
-    emit(
-        f"  [Autoresearch] Reset task #{task_id} to todo with "
-        f"{len(reflections)} attempt reflection(s)"
-    )
 
 
 # --- DB Scanning & Scoring ---
@@ -1089,10 +1132,12 @@ async def run_dev_test_loop_with_autoresearch(
         )
 
         # Clean up failed git branch and reset task for next attempt.
+        # R3165-01 (task #3166): without a task branch the project was not
+        # git at dispatch, so no git step may run in it.
         try:
             await cleanup_failed_attempt(
                 task_id, project_dir, attempt_reflections, output,
-                base_sha=base_sha,
+                base_sha=base_sha, expect_repository=task_branch is not None,
             )
         except AttemptCleanupError as exc:
             _audit_task_abort(task_id, "attempt-cleanup-failed", exc, output)

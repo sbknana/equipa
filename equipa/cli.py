@@ -1634,9 +1634,12 @@ async def _run_dev_test_mode(
         # 3107 review N1: a failed reset must not crash the run and leave the
         # task in_progress — stop retrying and record why (same as
         # equipa.dispatch.run_dev_test_loop_with_autoresearch).
+        # R3165-01 (task #3166): without a task branch the project was not
+        # git at dispatch, so no git step may run in it.
         try:
             await cleanup_failed_attempt(
                 task["id"], project_dir, attempt_reflections, base_sha=base_sha,
+                expect_repository=task_branch is not None,
             )
         except AttemptCleanupError as exc:
             _audit_task_abort(task["id"], "attempt-cleanup-failed", exc, None)
