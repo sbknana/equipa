@@ -1044,10 +1044,20 @@ def _rule_tail_permits_action(words: list[str], start: int) -> bool:
     for index, word in enumerate(window):
         if word in _RULE_TAIL_COORDINATORS:
             return False
-        if word in _RULE_TAIL_BE:
-            predicate = _skip_rule_tail_modifiers(window[index + 1:])
-            if predicate and predicate[0] in _RULE_TAIL_ACCEPTABLE:
-                return True
+        if word in _RULE_TAIL_BE and _calls_acceptable(window[index + 1:]):
+            return True
+    return False
+
+
+def _calls_acceptable(predicate: list[str]) -> bool:
+    """True when *predicate*, the words after "is", is an acceptable word
+    past adverbs ("fine", "totally okay"). "ok" and "okay" are also fillers,
+    so each word is tested before it is skipped."""
+    for word in predicate:
+        if word in _RULE_TAIL_ACCEPTABLE:
+            return True
+        if word not in _RULE_TAIL_FILLERS and not _is_open_adverb(word):
+            return False
     return False
 
 
