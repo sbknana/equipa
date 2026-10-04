@@ -104,6 +104,14 @@ class Agent:
     # git itself refuses `worktree remove` once the worktree's .git is rewritten.
     git_refuses_removal: bool = False
     ran_while_planting: list[str] = field(default_factory=list)
+    # R3162-01: the repository a symlink at the worktree's path now names,
+    # and the commit it had checked out when the symlink was planted.
+    replaced_root: Path | None = None
+    replaced_root_head: str = ""
+
+    @property
+    def root_replaced(self) -> bool:
+        return self.replaced_root is not None
 
     def __post_init__(self) -> None:
         self.bin = self.tmp / "agent-bin"
@@ -326,6 +334,47 @@ def plant_nested_repository(agent: Agent) -> None:
     (nested / "README.md").write_text("SEED\n")
 
 
+def _replace_root(agent: Agent, target: Path) -> None:
+    """Move the worktree aside (staying inside ``.forge-worktrees``, where
+    the agent may write) and put a symlink to ``target`` at its path."""
+    agent.replaced_root_head = _git(target, "rev-parse", "HEAD")
+    agent.tree.rename(agent.tree.with_name(f"{agent.tree.name}-moved"))
+    agent.tree.symlink_to(target, target_is_directory=True)
+    agent.replaced_root = target
+    agent.git_refuses_removal = True
+
+
+def plant_symlinked_root(agent: Agent) -> None:
+    """R3162-01: the worktree root replaced with a symlink to the agent's
+    own repository outside ``.forge-worktrees``. That repository is on the
+    task branch and has a ``main`` adding a file its ``.gitattributes``
+    sends through the agent's filter, so checking ``main`` out there runs
+    the filter; it also carries every in-repository vector."""
+    other = _init_repo(agent.tmp / "agent-repo")
+    _git(other, "branch", "-m", "master", "main")
+    (other / ".gitattributes").write_text("* filter=probe\n")
+    (other / "a.txt").write_text("agent main\n")
+    _git(other, "add", ".gitattributes", "a.txt")
+    _git(other, "commit", "-q", "-m", "agent main")
+    agent_main = _git(other, "rev-parse", "main")
+    _git(other, "checkout", "-q", "-b", TASK_BRANCH, "main~1")
+    _replace_root(agent, other)
+    _poisoned_repository(agent, other, "symlinked-root")
+    # _poisoned_repository points main at a commit only the promisor has.
+    (other / ".git" / "refs" / "heads" / "main").write_text(f"{agent_main}\n")
+
+
+def plant_symlinked_root_to_own_worktree(agent: Agent) -> None:
+    """The worktree root replaced with a symlink to a worktree the agent's
+    own repository registers, on a branch named like the task's: read
+    through the symlink, it looks like a registered task worktree."""
+    other = _init_repo(agent.tmp / "agent-repo")
+    own_worktree = agent.tmp / "agent-worktree"
+    _git(other, "worktree", "add", "-q", "-b", TASK_BRANCH, str(own_worktree), "master")
+    _replace_root(agent, own_worktree)
+    _poisoned_repository(agent, other, "own-worktree")
+
+
 VECTORS: dict[str, Callable[[Agent], None]] = {
     "fsmonitor": plant_fsmonitor,
     "fsmonitor-config-worktree": plant_fsmonitor_config_worktree,
@@ -347,11 +396,14 @@ VECTORS: dict[str, Callable[[Agent], None]] = {
     "pager": plant_pager,
     "redirected-gitfile": plant_redirected_gitfile,
     "nested-repository": plant_nested_repository,
+    "symlinked-root": plant_symlinked_root,
+    "symlinked-root-to-own-worktree": plant_symlinked_root_to_own_worktree,
 }
 # The vectors whose program is started through a transport (a lazy fetch).
 TRANSPORT_VECTORS = (
     "promisor-uploadpack", "promisor-ssh-command", "promisor-protocol-ext",
-    "redirected-gitfile", "nested-repository",
+    "redirected-gitfile", "nested-repository", "symlinked-root",
+    "symlinked-root-to-own-worktree",
 )
 
 
@@ -543,13 +595,64 @@ def _check_retired(agent: Agent, problem: str | None) -> None:
         assert not agent.tree.exists()
 
 
+def _assert_replaced_root_untouched(agent: Agent, task_branch_before: str) -> None:
+    """R3162-01: nothing acted on the repository the symlink names, nor on
+    the task branch of the project's repository."""
+    target = agent.replaced_root
+    assert target is not None
+    assert agent.tree.is_symlink(), "the symlink at the worktree's path is gone"
+    assert _git(target, "symbolic-ref", "HEAD") == f"refs/heads/{TASK_BRANCH}"
+    assert _git(target, "rev-parse", "HEAD") == agent.replaced_root_head
+    assert (target / "work.py").read_text() == f"{UNSAVED}\n", "the agent's files were cleaned"
+    assert _git(agent.repo, "rev-parse", TASK_BRANCH) == task_branch_before
+
+
+def _refused_with_cleanup_error(agent: Agent, result: Any, error: Exception | None) -> None:
+    assert isinstance(error, dispatch_mod.AttemptCleanupError), (
+        f"not refused: returned {result!r}, raised {error!r}"
+    )
+
+
+def _refused_stash(agent: Agent, problem: Any, error: Exception | None) -> None:
+    assert error is None, error
+    assert problem, "the stash reported the work saved"
+
+
+def _refused_dirty_check(agent: Agent, dirty: Any, error: Exception | None) -> None:
+    assert error is None, error
+    assert dirty and "could not be inspected safely" in dirty, dirty
+
+
+def _refused_read_view(
+    agent: Agent, results: list[subprocess.CompletedProcess], error: Exception | None,
+) -> None:
+    assert error is None, error
+    assert all(result.returncode != 0 for result in results), [
+        (result.returncode, result.stdout) for result in results
+    ]
+
+
+def _refused_removal(agent: Agent, _: Any, error: Exception | None) -> None:
+    assert error is None, error
+    # R3162-02: the branch the kept worktree holds is not deleted either.
+    assert _branch_exists(agent.repo)
+
+
+def _refused_retirement(agent: Agent, problem: Any, error: Exception | None) -> None:
+    assert error is None, error
+    assert problem and "not a registered worktree" in problem, problem
+
+
 @dataclass(frozen=True)
 class Operation:
     """One orchestrator cleanup call: ``prepare`` runs before the plant,
-    ``run`` is the call under test and ``check`` asserts it did its job."""
+    ``run`` is the call under test and ``check`` asserts it did its job.
+    ``refused`` asserts how it declines a worktree whose root the agent
+    replaced with a symlink (R3162-01), given its result or exception."""
 
     run: Callable[[Agent], Any]
     check: Callable[[Agent, Any], None]
+    refused: Callable[[Agent, Any, Exception | None], None]
     prepare: Callable[[Agent], None] = lambda agent: None
     removes_worktree: bool = False
 
@@ -564,6 +667,7 @@ OPERATIONS: dict[str, Operation] = {
             _assert_work_stashed(agent.repo) if problem is None
             else pytest.fail(f"the stash failed: {problem}")
         ),
+        refused=_refused_stash,
     ),
     "dirty-check": Operation(
         run=lambda agent: _run(_with_project_dir(
@@ -572,32 +676,38 @@ OPERATIONS: dict[str, Operation] = {
         check=lambda agent, dirty: None if dirty and "uncommitted change" in dirty else (
             pytest.fail(f"the dirty check answered {dirty!r}")
         ),
+        refused=_refused_dirty_check,
     ),
     "reset": Operation(
         prepare=_commit_failed_attempt,
         run=lambda agent: _reset(agent, _master(agent.repo)),
         check=lambda agent, _: _assert_reset(agent, _master(agent.repo)),
+        refused=_refused_with_cleanup_error,
     ),
     "reset-no-base": Operation(
         prepare=_commit_failed_attempt,
         run=lambda agent: _reset(agent, None),
         check=lambda agent, _: _assert_reset(agent, _master(agent.repo)),
+        refused=_refused_with_cleanup_error,
     ),
     "branch-check": Operation(
         run=lambda agent: _run(dispatch_mod._require_task_branch(str(agent.tree), TASK_BRANCH)),
         check=lambda agent, head: None if head == _git(agent.repo, "rev-parse", TASK_BRANCH) else (
             pytest.fail(f"the branch check read {head!r}")
         ),
+        refused=_refused_with_cleanup_error,
     ),
-    "read-view": Operation(run=_read_view, check=_check_read_view),
+    "read-view": Operation(run=_read_view, check=_check_read_view, refused=_refused_read_view),
     "remove-unmerged": Operation(
         run=lambda agent: _remove(agent, merged=False),
         check=lambda agent, _: _check_removed(agent, merged=False),
+        refused=_refused_removal,
         removes_worktree=True,
     ),
     "remove-merged": Operation(
         run=lambda agent: _remove(agent, merged=True),
         check=lambda agent, _: _check_removed(agent, merged=True),
+        refused=_refused_removal,
         removes_worktree=True,
     ),
     "retire": Operation(
@@ -605,6 +715,7 @@ OPERATIONS: dict[str, Operation] = {
             str(agent.repo), agent.tree, TASK_ID, TASK_BRANCH,
         )),
         check=_check_retired,
+        refused=_refused_retirement,
         removes_worktree=True,
     ),
 }
@@ -624,6 +735,7 @@ def _check_operation(
     repo, worktree = _task_worktree(tmp_path)
     agent = Agent(repo, worktree, tmp_path, monkeypatch)
     operation.prepare(agent)
+    task_branch_before = _git(repo, "rev-parse", TASK_BRANCH)
     _plant(agent, vector)
     _leave_unsaved_work(worktree)
     recorder = GitRecorder(monkeypatch)
@@ -639,18 +751,26 @@ def _check_operation(
             error = exc
     fired = agent.ran()
     _assert_nothing_ran(agent, vector, name, fired)
-    if error is not None:
+    if error is not None and not agent.root_replaced:
         raise error
 
+    # With a replaced root, the worktree's path resolves to the agent's
+    # repository: no git may find its repository from there either.
     assert recorder.discovery_in(worktree) == [], (
         f"git found its repository from inside the worktree ({vector}/{name})"
     )
+    removals = recorder.worktree_removals()
+    assert all(call.explicit_repository for call in removals), [
+        call.argv for call in removals
+    ]
+    if agent.root_replaced:
+        # R3162-01: every operation declines the worktree and leaves both
+        # repositories as they were.
+        operation.refused(agent, result, error)
+        _assert_replaced_root_untouched(agent, task_branch_before)
+        return
     if operation.removes_worktree:
-        removals = recorder.worktree_removals()
         assert removals, "the worktree was never removed"
-        assert all(call.explicit_repository for call in removals), [
-            call.argv for call in removals
-        ]
     operation.check(agent, result)
 
 
@@ -718,6 +838,7 @@ def test_isolated_run_runs_no_agent_program_after_the_agent(
     repo = _init_repo(tmp_path / "repo")
     master_before = _master(repo)
     agent = Agent(repo, None, tmp_path, monkeypatch)
+    task_branch_after_agent: list[str] = []
 
     async def execute(agent_dir: str, task_branch: str):
         agent.worktree = Path(agent_dir)
@@ -725,6 +846,7 @@ def test_isolated_run_runs_no_agent_program_after_the_agent(
             (agent.worktree / "NOTES.md").write_text("agent notes\n")
             _git(agent.worktree, "add", "NOTES.md")
             _git(agent.worktree, "commit", "-q", "-m", "agent notes")
+        task_branch_after_agent.append(_git(repo, "rev-parse", TASK_BRANCH))
         _plant(agent, vector)
         _leave_unsaved_work(agent.worktree)
         return {"cost": 0.0, "duration": 0.0}, 1, outcome
@@ -736,6 +858,14 @@ def test_isolated_run_runs_no_agent_program_after_the_agent(
 
     _assert_nothing_ran(agent, vector, f"isolated-{outcome}", agent.ran())
     assert agent.tree.exists() is agent.git_refuses_removal
+    if agent.root_replaced:
+        # R3162-01: the post-agent branch check refuses the swapped root, so
+        # nothing is merged, and the branch and the agent's repository stay.
+        assert run.outcome == "worktree_branch_mismatch", run
+        assert run.merged_sha is None
+        assert _master(repo) == master_before
+        _assert_replaced_root_untouched(agent, task_branch_after_agent[0])
+        return
     if run.merged_sha is not None:
         # Only a success merges, and only when the plant is not a merge
         # hazard (a program key the hardening pins, e.g. core.fsmonitor):
