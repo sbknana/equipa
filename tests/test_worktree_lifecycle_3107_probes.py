@@ -319,9 +319,14 @@ def test_branch_is_rechecked_before_the_retry_attempt(repo: Path) -> None:
     _git(repo, "worktree", "add", "-q", "-b", "forge-task-33", str(worktree))
     agent = FakeAgent(["cycles_exhausted", "tests_passed"])
     gate_audit = MagicMock()
+    expected_repository: list[bool] = []
 
     async def cleanup_that_detaches(task_id, project_dir, reflections,
-                                    output=None, *, base_sha=None):
+                                    output=None, *, base_sha=None,
+                                    expect_repository=True):
+        # Task 3166 (R3165-01): a loop with a task branch says a repository
+        # is expected.
+        expected_repository.append(expect_repository)
         _git(Path(project_dir), "checkout", "-q", "--detach")
 
     with patch.object(dispatch_mod, "run_dev_test_loop", new=agent), \
@@ -342,6 +347,7 @@ def test_branch_is_rechecked_before_the_retry_attempt(repo: Path) -> None:
     assert len(agent.calls) == 1, "the retry ran on a detached HEAD"
     events = [call.kwargs.get("event") for call in gate_audit.call_args_list]
     assert events == ["worktree-branch-mismatch"]
+    assert expected_repository == [True]
 
 
 # --- abort outcomes and their audit trail -----------------------------------
