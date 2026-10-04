@@ -702,6 +702,14 @@ BACKSTOP_FAMILIES = {
     "reference_of_200kb_digits": ["&#" + "9" * RB + "HIGH"],
     "hex_reference_of_200kb_digits": ["&#x" + "f" * RB + "HIGH"],
     "zero_padded_reference_of_200kb": ["&#" + "0" * RB + "72;IGH"],
+    # Task 3164 (R3161-02): a lookalike capital eta leading each word (0.53
+    # to 0.57 s before), and a combining mark after each letter or each word
+    # (one mark-stripper callback per short non-ASCII run).
+    "eta_led": ["\N{GREEK CAPITAL LETTER ETA}IGH " * (RB // 6)],
+    "mark_after_each_letter": [
+        ("".join(f"{letter}\N{COMBINING ACUTE ACCENT}" for letter in "HIGH")
+         + " ") * (RB // 13)],
+    "mark_after_each_word": ["HIGH\N{COMBINING ACUTE ACCENT} " * (RB // 7)],
 }
 
 
