@@ -24,6 +24,16 @@ program ran while the cleanup still did its job.
   registers. Every operation must then refuse (``Operation.refused``) and
   leave both repositories as they were; the single-task CLI loop must stop
   at its post-attempt branch check, before any cleanup.
+* R3165-03 (task #3166): two more vectors replace ``.forge-worktrees``
+  itself, leaving the worktree's own path alone, so ``task-<id>`` is the
+  agent's own repository or a worktree that repository registers. They are
+  refused like the root vectors. A ``_canonical_task_worktree_root`` that
+  follows the symlinked base fails 10 of their cases, branch check
+  included.
+* R3165-01 (task #3166): a project that was not git at dispatch, where
+  the agent runs ``git init`` during a failed attempt. Both retry loops are
+  driven as production calls them (no task branch). The cleanup must start
+  no git process at all and must report the repository instead.
 
 Every check snapshots the markers right after the orchestrator's call; a
 failure reads ``EXECUTED <vector>/<operation>: [<markers>]``.
@@ -113,6 +123,8 @@ class Agent:
     # and the commit it had checked out when the symlink was planted.
     replaced_root: Path | None = None
     replaced_root_head: str = ""
+    # The symlink planted: the worktree's path, or (R3165-03) its base.
+    replaced_link: Path | None = None
 
     @property
     def root_replaced(self) -> bool:
@@ -346,6 +358,7 @@ def _replace_root(agent: Agent, target: Path) -> None:
     agent.tree.rename(agent.tree.with_name(f"{agent.tree.name}-moved"))
     agent.tree.symlink_to(target, target_is_directory=True)
     agent.replaced_root = target
+    agent.replaced_link = agent.tree
     agent.git_refuses_removal = True
 
 
@@ -380,6 +393,59 @@ def plant_symlinked_root_to_own_worktree(agent: Agent) -> None:
     _poisoned_repository(agent, other, "own-worktree")
 
 
+def _agent_repository(agent: Agent, path: Path, prefix: str) -> Path:
+    """A repository of the agent's at ``path``, on the task branch, whose
+    ``main`` adds a file its ``.gitattributes`` sends through the agent's
+    filter (checking ``main`` out runs the filter), with every
+    in-repository vector besides."""
+    _init_repo(path)
+    _git(path, "branch", "-m", "master", "main")
+    (path / ".gitattributes").write_text("* filter=probe\n")
+    (path / "a.txt").write_text("agent main\n")
+    _git(path, "add", ".gitattributes", "a.txt")
+    _git(path, "commit", "-q", "-m", "agent main")
+    agent_main = _git(path, "rev-parse", "main")
+    _git(path, "checkout", "-q", "-b", TASK_BRANCH, "main~1")
+    _poisoned_repository(agent, path, prefix)
+    # _poisoned_repository points main at a commit only the promisor has.
+    (path / ".git" / "refs" / "heads" / "main").write_text(f"{agent_main}\n")
+    return path
+
+
+def _replace_base(agent: Agent, target: Path) -> None:
+    """R3165-03: move ``.forge-worktrees`` itself aside and put a symlink at
+    its path to the directory holding ``target``, the agent's directory
+    named like the task worktree. The worktree's own path is untouched."""
+    base = agent.tree.parent
+    agent.replaced_root_head = _git(target, "rev-parse", "HEAD")
+    base.rename(base.with_name(f"{base.name}-moved"))
+    base.symlink_to(target.parent, target_is_directory=True)
+    agent.replaced_root = target
+    agent.replaced_link = base
+    agent.git_refuses_removal = True
+
+
+def plant_symlinked_worktree_base(agent: Agent) -> None:
+    """``.forge-worktrees`` replaced with a symlink to a directory whose
+    ``task-<id>`` is the agent's own repository (see
+    :func:`_agent_repository`)."""
+    target = agent.tmp / "agent-base" / agent.tree.name
+    _replace_base(agent, _agent_repository(agent, target, "symlinked-base"))
+
+
+def plant_symlinked_worktree_base_to_own_worktree(agent: Agent) -> None:
+    """``.forge-worktrees`` replaced with a symlink to a directory whose
+    ``task-<id>`` is a worktree the agent's own repository registers, on a
+    branch named like the task's. A check that follows the symlinked base
+    (and compares the result with itself) reads it as a registered task
+    worktree and returns the agent's HEAD."""
+    other = _init_repo(agent.tmp / "agent-repo")
+    own_worktree = agent.tmp / "agent-base" / agent.tree.name
+    _git(other, "worktree", "add", "-q", "-b", TASK_BRANCH, str(own_worktree), "master")
+    _replace_base(agent, own_worktree)
+    _poisoned_repository(agent, other, "own-base")
+
+
 VECTORS: dict[str, Callable[[Agent], None]] = {
     "fsmonitor": plant_fsmonitor,
     "fsmonitor-config-worktree": plant_fsmonitor_config_worktree,
@@ -403,12 +469,20 @@ VECTORS: dict[str, Callable[[Agent], None]] = {
     "nested-repository": plant_nested_repository,
     "symlinked-root": plant_symlinked_root,
     "symlinked-root-to-own-worktree": plant_symlinked_root_to_own_worktree,
+    "symlinked-worktree-base": plant_symlinked_worktree_base,
+    "symlinked-worktree-base-to-own-worktree": plant_symlinked_worktree_base_to_own_worktree,
 }
 # The vectors whose program is started through a transport (a lazy fetch).
 TRANSPORT_VECTORS = (
     "promisor-uploadpack", "promisor-ssh-command", "promisor-protocol-ext",
     "redirected-gitfile", "nested-repository", "symlinked-root",
-    "symlinked-root-to-own-worktree",
+    "symlinked-root-to-own-worktree", "symlinked-worktree-base",
+    "symlinked-worktree-base-to-own-worktree",
+)
+# The vectors that put a symlink at the worktree's path or at its base.
+SYMLINKED_VECTORS = (
+    "symlinked-root", "symlinked-root-to-own-worktree",
+    "symlinked-worktree-base", "symlinked-worktree-base-to-own-worktree",
 )
 
 
@@ -608,8 +682,9 @@ def _assert_replaced_root_untouched(agent: Agent, task_branch_before: str) -> No
     """R3162-01: nothing acted on the repository the symlink names, nor on
     the task branch of the project's repository."""
     target = agent.replaced_root
-    assert target is not None
-    assert agent.tree.is_symlink(), "the symlink at the worktree's path is gone"
+    assert target is not None and agent.replaced_link is not None
+    assert agent.replaced_link.is_symlink(), f"the symlink at {agent.replaced_link} is gone"
+    assert os.path.realpath(agent.tree) == os.path.realpath(target)
     assert _git(target, "symbolic-ref", "HEAD") == f"refs/heads/{TASK_BRANCH}"
     assert _git(target, "rev-parse", "HEAD") == agent.replaced_root_head
     assert (target / "work.py").read_text() == f"{UNSAVED}\n", "the agent's files were cleaned"
@@ -889,7 +964,7 @@ def test_isolated_run_runs_no_agent_program_after_the_agent(
         _assert_work_stashed(repo)
 
 
-@pytest.mark.parametrize("vector", ["symlinked-root", "symlinked-root-to-own-worktree"])
+@pytest.mark.parametrize("vector", SYMLINKED_VECTORS)
 @pytest.mark.parametrize("outcome", ["tests_failed", "tests_passed"])
 def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: str, outcome: str,
@@ -963,21 +1038,8 @@ def _non_git_project(tmp_path: Path) -> Path:
 
 def _make_agent_repository(agent: Agent, project: Path) -> None:
     """What an agent can do during a failed attempt in a project that was
-    not git at dispatch: make it a repository on the task branch, whose
-    ``main`` adds a file its ``.gitattributes`` sends through the agent's
-    filter (checking ``main`` out runs the filter), with every
-    in-repository vector besides."""
-    _init_repo(project)
-    _git(project, "branch", "-m", "master", "main")
-    (project / ".gitattributes").write_text("* filter=probe\n")
-    (project / "a.txt").write_text("agent main\n")
-    _git(project, "add", ".gitattributes", "a.txt")
-    _git(project, "commit", "-q", "-m", "agent main")
-    agent_main = _git(project, "rev-parse", "main")
-    _git(project, "checkout", "-q", "-b", TASK_BRANCH, "main~1")
-    _poisoned_repository(agent, project, NON_GIT_VECTOR)
-    # _poisoned_repository points main at a commit only the promisor has.
-    (project / ".git" / "refs" / "heads" / "main").write_text(f"{agent_main}\n")
+    not git at dispatch: make it a repository of its own."""
+    _agent_repository(agent, project, NON_GIT_VECTOR)
     agent.ran_while_planting = agent.ran()
 
 
