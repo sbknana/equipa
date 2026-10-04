@@ -18,6 +18,8 @@ import os
 import re
 import subprocess
 import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -25,11 +27,13 @@ import pytest
 import conftest
 
 PROBE = conftest.REPO_ROOT / "tests" / "xdist_refusal_probe.py"
+ISOLATION_TESTS = conftest.REPO_ROOT / "tests" / "test_conftest_db_isolation.py"
 
 
 def _run_probe(tmp_path, mode: str, worker: str = "gw1",
                dist: str = "loadfile", extra_args: tuple = (),
-               extra_env: dict | None = None) -> subprocess.CompletedProcess:
+               extra_env: dict | None = None,
+               target: Path = PROBE) -> subprocess.CompletedProcess:
     run_tmp = tmp_path / "tmp"
     run_tmp.mkdir()
     env = {key: value for key, value in os.environ.items()
@@ -43,7 +47,7 @@ def _run_probe(tmp_path, mode: str, worker: str = "gw1",
     })
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "-n", "2", "--dist", dist, *extra_args, str(PROBE)],
+         "-n", "2", "--dist", dist, *extra_args, str(target)],
         cwd=conftest.REPO_ROOT, env=env, capture_output=True, text=True,
         timeout=180)
 
@@ -139,6 +143,68 @@ def test_the_controller_records_a_refusing_node(monkeypatch):
     assert failures == ["xdist worker gw1 refused:\nREFUSING TO RUN x"]
 
 
+# --- only a refusal that stopped the run counts (tester, cycle 1) ---
+#
+# The reason used to be recorded when the refusal was raised, so
+# tests/test_conftest_db_isolation.py, which raises one on purpose and
+# catches it, made its worker report a refusal: the full parallel run
+# passed every test and still exited 3.
+
+REASON = "[conftest] REFUSING TO RUN (unit-test): why"
+
+
+def _exit_info(returncode):
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        pytest.exit(REASON, returncode=returncode)
+    return excinfo
+
+
+def test_a_refusal_a_test_catches_records_nothing(monkeypatch):
+    reasons: list[str] = []
+    monkeypatch.setattr(conftest, "_REFUSAL_REASONS", reasons)
+    fake = types.ModuleType("equipa._refusal_unit_probe")
+    fake.__file__ = str(conftest.REPO_ROOT / "equipa" / "_refusal_unit_probe.py")
+    fake.THEFORGE_DB = conftest.REPO_ROOT / "theforge.db"  # never opened
+    monkeypatch.setitem(sys.modules, "equipa._refusal_unit_probe", fake)
+
+    with pytest.raises(pytest.exit.Exception) as refusal:
+        conftest._assert_db_isolated("unit-test")
+
+    assert refusal.value.returncode == 3
+    assert reasons == []
+
+
+def test_a_refusal_that_stopped_the_run_is_recorded(monkeypatch):
+    reasons: list[str] = []
+    monkeypatch.setattr(conftest, "_REFUSAL_REASONS", reasons)
+
+    conftest.pytest_keyboard_interrupt(_exit_info(3))
+
+    assert reasons == [REASON]
+
+
+@pytest.mark.parametrize("returncode", [None, 0, 1, 2])
+def test_an_exit_with_another_status_is_not_a_refusal(monkeypatch,
+                                                      returncode):
+    reasons: list[str] = []
+    monkeypatch.setattr(conftest, "_REFUSAL_REASONS", reasons)
+
+    conftest.pytest_keyboard_interrupt(_exit_info(returncode))
+
+    assert reasons == []
+
+
+def test_ctrl_c_is_not_a_refusal(monkeypatch):
+    reasons: list[str] = []
+    monkeypatch.setattr(conftest, "_REFUSAL_REASONS", reasons)
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        raise KeyboardInterrupt
+
+    conftest.pytest_keyboard_interrupt(excinfo)
+
+    assert reasons == []
+
+
 # --- end to end: a child `pytest -n 2` ---
 
 def test_control_run_with_no_misbehaving_worker_passes(tmp_path):
@@ -146,6 +212,28 @@ def test_control_run_with_no_misbehaving_worker_passes(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "4 passed" in result.stdout, result.stdout
     assert "REFUSING" not in result.stdout + result.stderr
+
+
+def test_a_refusal_every_worker_catches_does_not_fail_the_run(tmp_path):
+    result = _run_probe(tmp_path, "caught", worker="all")
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "4 passed" in result.stdout, output
+    assert "refused" not in output, output
+    assert "RUN FAILED" not in output, output
+
+
+def test_the_isolation_tests_pass_under_xdist(tmp_path):
+    """The tester's failure: test_conftest_db_isolation.py catches the
+    refusal it provokes, and its worker made the run exit 3."""
+    result = _run_probe(tmp_path, "none", dist="load", target=ISOLATION_TESTS)
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "6 passed" in result.stdout, output
+    assert "refused" not in output, output
+    assert "RUN FAILED" not in output, output
 
 
 @pytest.mark.parametrize("worker", ["gw0", "gw1"])

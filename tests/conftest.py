@@ -246,16 +246,11 @@ def _is_project_module(name, mod) -> bool:
 # controller in workeroutput, and the controller fails the run with exit
 # status 3, printing why, when any worker refused or went down.
 WORKER_REFUSAL_KEY = "equipa_refusal"
-# Every refusal this process made (sent to the controller if it is a worker).
+# Every refusal that stopped this process's run (sent to the controller if
+# it is a worker). Filled by pytest_keyboard_interrupt, never at the call.
 _REFUSAL_REASONS: list[str] = []
 # Controller only: why each refusing or crashed worker fails the run.
 _WORKER_FAILURES: list[str] = []
-
-
-def _refuse_to_run(reason: str) -> None:
-    """Stop this process's run with exit status 3, recording *reason*."""
-    _REFUSAL_REASONS.append(reason)
-    pytest.exit(reason, returncode=3)
 
 
 def _assert_db_isolated(stage: str) -> None:
@@ -264,10 +259,28 @@ def _assert_db_isolated(stage: str) -> None:
                for name, value in _db_bindings()
                if not _is_safe_test_db(value)]
     if escaped:
-        _refuse_to_run(
+        pytest.exit(
             f"[conftest] REFUSING TO RUN ({stage}): a TheForge DB path escaped "
             "the test sandbox and could point at a real database:\n  "
-            + "\n  ".join(escaped))
+            + "\n  ".join(escaped),
+            returncode=3,
+        )
+
+
+def pytest_keyboard_interrupt(excinfo):
+    """Record a refusal (a pytest.exit with status 3) once it has stopped
+    this process's run.
+
+    pytest calls this hook only for an exit that reached the session. A test
+    that calls _assert_db_isolated on purpose and catches the exit
+    (tests/test_conftest_db_isolation.py) records nothing. When the reason
+    was recorded at the call instead, that test made its worker report a
+    refusal and failed the whole parallel run.
+    """
+    refusal = excinfo.value
+    if (isinstance(refusal, pytest.exit.Exception)
+            and refusal.returncode == pytest.ExitCode.INTERNAL_ERROR):
+        _REFUSAL_REASONS.append(refusal.msg)
 
 
 def _worker_failure(worker_id: str, workeroutput: dict | None,
@@ -452,9 +465,11 @@ def pytest_configure(config):
     from equipa import constants as equipa_constants
 
     if Path(equipa_constants.THEFORGE_DB) != TEST_DB_PATH:
-        _refuse_to_run(
+        pytest.exit(
             "[conftest] REFUSING TO RUN: equipa.constants was imported before "
-            f"the test DB was set (THEFORGE_DB={equipa_constants.THEFORGE_DB}).")
+            f"the test DB was set (THEFORGE_DB={equipa_constants.THEFORGE_DB}).",
+            returncode=3,
+        )
     _assert_db_isolated("configure")
     try:
         from equipa import db as equipa_db
