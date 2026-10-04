@@ -949,6 +949,145 @@ def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
     _assert_replaced_root_untouched(agent, task_branch_after_agent[0])
 
 
+# --- A project that was not git at dispatch (R3165-01) --------------------------
+
+NON_GIT_VECTOR = "non-git-project"
+
+
+def _non_git_project(tmp_path: Path) -> Path:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text("print('project')\n")
+    return project
+
+
+def _make_agent_repository(agent: Agent, project: Path) -> None:
+    """What an agent can do during a failed attempt in a project that was
+    not git at dispatch: make it a repository on the task branch, whose
+    ``main`` adds a file its ``.gitattributes`` sends through the agent's
+    filter (checking ``main`` out runs the filter), with every
+    in-repository vector besides."""
+    _init_repo(project)
+    _git(project, "branch", "-m", "master", "main")
+    (project / ".gitattributes").write_text("* filter=probe\n")
+    (project / "a.txt").write_text("agent main\n")
+    _git(project, "add", ".gitattributes", "a.txt")
+    _git(project, "commit", "-q", "-m", "agent main")
+    agent_main = _git(project, "rev-parse", "main")
+    _git(project, "checkout", "-q", "-b", TASK_BRANCH, "main~1")
+    _poisoned_repository(agent, project, NON_GIT_VECTOR)
+    # _poisoned_repository points main at a commit only the promisor has.
+    (project / ".git" / "refs" / "heads" / "main").write_text(f"{agent_main}\n")
+    agent.ran_while_planting = agent.ran()
+
+
+async def _run_non_git_loop(loop: str, project: Path, output: list[str]) -> str:
+    """The failed-attempt path of ``loop`` exactly as production calls it
+    for a project that is not git: no worktree, so no task branch."""
+    import equipa.cli as cli_mod
+
+    autoresearch = {"features": {"autoresearch": True}, "autoresearch_max_retries": 1}
+    if loop == "cli":
+        args = SimpleNamespace(dispatch_config=autoresearch)
+        _, _, outcome = await cli_mod._run_dev_test_mode(_task(TASK_ID), str(project), {}, args)
+        return outcome
+    _, _, outcome, _, _, _ = await dispatch_mod.run_dev_test_loop_with_autoresearch(
+        _task(TASK_ID), str(project), {}, SimpleNamespace(), autoresearch, output=output,
+    )
+    return outcome
+
+
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, loop: str,
+) -> None:
+    """R3165-01: in a project that was not git at dispatch, the agent runs
+    ``git init`` during a failed attempt. ``cleanup_failed_attempt`` asked
+    ``_is_git_repo`` by discovery, found the agent's repository and checked
+    out its ``main``, which ran the agent's smudge filter in the
+    orchestrator. Now no git step runs there and the repository is reported.
+    ``loop`` is the single-task ``--task --dev-test`` loop (``cli``) or the
+    autoresearch wrapper the parallel and per-project loops share
+    (``dispatch``), each called without a task branch as production does."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: _task(task_id))
+    recorder = GitRecorder(monkeypatch)
+    attempts: list[str] = []
+    real_cleanup = dispatch_mod.cleanup_failed_attempt
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        attempts.append(project_dir)
+        if len(attempts) == 1:
+            _make_agent_repository(agent, project)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
+
+    async def recorded_cleanup(*args, **kwargs):
+        with recorder.recording():
+            return await real_cleanup(*args, **kwargs)
+
+    for module in (cli_mod, dispatch_mod):
+        monkeypatch.setattr(module, "run_dev_test_loop", attempt)
+        monkeypatch.setattr(module, "cleanup_failed_attempt", recorded_cleanup)
+    output: list[str] = []
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    outcome = None
+    try:
+        outcome = _run(_run_non_git_loop(loop, project, output))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, NON_GIT_VECTOR, f"{loop}-cleanup", agent.ran())
+    if error is not None:
+        raise error
+    assert recorder.calls == [], [call.argv for call in recorder.calls]
+    # The cleanup went through: the retry ran and the retries ran out.
+    assert outcome == "tests_failed"
+    assert attempts == [str(project), str(project)]
+    # The agent's repository is as the agent left it.
+    assert _git(project, "symbolic-ref", "HEAD") == f"refs/heads/{TASK_BRANCH}"
+    assert _branch_exists(project)
+    logged = "\n".join(output) + capsys.readouterr().out
+    assert f"A git repository appeared at {project / '.git'}" in logged, logged
+
+
+def test_cleanup_of_a_non_git_project_without_a_repository_reports_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _non_git_project(tmp_path)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    recorder = GitRecorder(monkeypatch)
+    output: list[str] = []
+
+    with recorder.recording():
+        _run(dispatch_mod.cleanup_failed_attempt(
+            TASK_ID, str(project), [], output=output, expect_repository=False,
+        ))
+
+    assert recorder.calls == []
+    assert not any("appeared" in line for line in output), output
+    assert any(f"Reset task #{TASK_ID} to todo" in line for line in output), output
+
+
+def test_checking_out_the_agents_main_does_run_its_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the plant above: the checkout the cleanup used
+    to run in the agent's repository runs the agent's filter."""
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _make_agent_repository(agent, project)
+
+    _git(project, "checkout", "-q", "main")
+
+    assert f"{NON_GIT_VECTOR}-filter" in agent.ran()
+
+
 # --- The three remaining discovery calls, one by one ----------------------------
 
 
