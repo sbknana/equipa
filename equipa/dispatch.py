@@ -453,8 +453,19 @@ _GITFILE_LIMIT = 4096
 
 
 def _in_task_worktree_location(path: str) -> bool:
-    """True when ``path`` lies in ``<project>/.forge-worktrees/<name>``."""
-    return _WORKTREE_BASE_DIRNAME in Path(os.path.realpath(path)).parts[:-1]
+    """True when ``path`` lies in ``<project>/.forge-worktrees/<name>``,
+    judged on the path as given and on its realpath.
+
+    R3162-01 (task #3165): the path as given decides first. An agent that
+    replaces its worktree root with a symlink to a repository outside
+    ``.forge-worktrees`` must still be treated as a task worktree (and then
+    refused by :func:`_task_worktree_location`), never sent to discovery.
+    This is the rule :func:`equipa.git_ops._task_worktree_path` applies.
+    """
+    return any(
+        _WORKTREE_BASE_DIRNAME in Path(candidate).parts[:-1]
+        for candidate in (os.path.abspath(path), os.path.realpath(path))
+    )
 
 
 def _common_dir_named_by_gitfile(root: Path) -> Path | None:
@@ -472,6 +483,21 @@ def _common_dir_named_by_gitfile(root: Path) -> Path | None:
     return Path(os.path.realpath(git_dir / named.decode("utf-8", "replace").strip()))
 
 
+def _canonical_task_worktree_root(given: Path) -> Path | None:
+    """Realpath of the ``<project>/.forge-worktrees/<name>`` directory on the
+    absolute path ``given``; None when ``.forge-worktrees`` or ``<name>``
+    is a symlink (the directory is then not where the path says it is)."""
+    parts = given.parts
+    index = parts.index(_WORKTREE_BASE_DIRNAME)
+    lexical_root = Path(*parts[:index + 2])
+    canonical = Path(
+        os.path.realpath(Path(*parts[:index])), _WORKTREE_BASE_DIRNAME, parts[index + 1],
+    )
+    if Path(os.path.realpath(lexical_root)) != canonical:
+        return None
+    return canonical
+
+
 async def _task_worktree_location(agent_dir: str) -> tuple[str, str] | None:
     """``(work-tree root, git common dir)`` of the task worktree holding
     ``agent_dir``; None unless that repository registers the worktree.
@@ -483,13 +509,24 @@ async def _task_worktree_location(agent_dir: str) -> tuple[str, str] | None:
     holding ``.forge-worktrees``); for any other layout the ``.git`` file is
     read as data. Whichever it is, git on the worktree then reads neither its
     config nor its attributes (:func:`equipa.git_ops.agent_worktree_git`).
+
+    R3162-01 (task #3165): the path as given is classified first. When it
+    names ``.forge-worktrees/<name>`` but that directory (or
+    ``.forge-worktrees``) is a symlink, the worktree is refused: following
+    it would act on whatever repository the agent pointed it at.
     """
     from equipa.role_resolver import stable_project_root
 
+    given = Path(os.path.abspath(agent_dir))
     resolved = Path(os.path.realpath(agent_dir))
     parts = resolved.parts
-    if _WORKTREE_BASE_DIRNAME in parts[:-1]:
-        root: Path | None = Path(*parts[:parts.index(_WORKTREE_BASE_DIRNAME) + 2])
+    root: Path | None
+    if _WORKTREE_BASE_DIRNAME in given.parts[:-1]:
+        root = _canonical_task_worktree_root(given)
+        if root is None:
+            return None
+    elif _WORKTREE_BASE_DIRNAME in parts[:-1]:
+        root = Path(*parts[:parts.index(_WORKTREE_BASE_DIRNAME) + 2])
     else:
         root = next(
             (p for p in (resolved, *resolved.parents) if os.path.lexists(p / ".git")),
