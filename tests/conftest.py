@@ -235,6 +235,24 @@ def _is_project_module(name, mod) -> bool:
     return result
 
 
+#
+# --- A refusing or crashed xdist worker fails the whole run (task 3163) ---
+#
+# xdist treats only a worker's exit status 2 as fatal. A worker that stopped
+# itself with pytest.exit(returncode=3) (an isolation refusal below) was just
+# dropped from the schedule: the other workers ran its tests, the run could
+# end green, and the REFUSING reason was printed nowhere (a worker's terminal
+# output is not forwarded). So a refusing worker hands its reason to the
+# controller in workeroutput, and the controller fails the run with exit
+# status 3, printing why, when any worker refused or went down.
+WORKER_REFUSAL_KEY = "equipa_refusal"
+# Every refusal that stopped this process's run (sent to the controller if
+# it is a worker). Filled by pytest_keyboard_interrupt, never at the call.
+_REFUSAL_REASONS: list[str] = []
+# Controller only: why each refusing or crashed worker fails the run.
+_WORKER_FAILURES: list[str] = []
+
+
 def _assert_db_isolated(stage: str) -> None:
     """Abort the whole run if any loaded module points outside the temp dir."""
     escaped = [f"{name}.THEFORGE_DB = {value}"
@@ -247,6 +265,81 @@ def _assert_db_isolated(stage: str) -> None:
             + "\n  ".join(escaped),
             returncode=3,
         )
+
+
+def pytest_keyboard_interrupt(excinfo):
+    """Record a refusal (a pytest.exit with status 3) once it has stopped
+    this process's run.
+
+    pytest calls this hook only for an exit that reached the session. A test
+    that calls _assert_db_isolated on purpose and catches the exit
+    (tests/test_conftest_db_isolation.py) records nothing. When the reason
+    was recorded at the call instead, that test made its worker report a
+    refusal and failed the whole parallel run.
+    """
+    refusal = excinfo.value
+    if (isinstance(refusal, pytest.exit.Exception)
+            and refusal.returncode == pytest.ExitCode.INTERNAL_ERROR):
+        _REFUSAL_REASONS.append(refusal.msg)
+
+
+def _worker_failure(worker_id: str, workeroutput: dict | None,
+                    error: object | None) -> str | None:
+    """Why the xdist worker *worker_id* fails the whole run, or None.
+
+    It fails the run when it refused (the reasons it sent, or exit status 3
+    without them) or went down (xdist passes the crash as *error*). A worker
+    that finished with failed tests (1) or none to run (5) does not: the
+    controller counts those itself.
+    """
+    output = workeroutput or {}
+    reasons = output.get(WORKER_REFUSAL_KEY)
+    if reasons:
+        return f"xdist worker {worker_id} refused:\n" + "\n".join(reasons)
+    if output.get("exitstatus") == pytest.ExitCode.INTERNAL_ERROR:
+        return (f"xdist worker {worker_id} stopped with exit status 3 "
+                "(an internal error or a refusal without a reason)")
+    if error is not None:
+        return f"xdist worker {worker_id} went down: {error}"
+    return None
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """Controller side (xdist): record a refusing or crashed worker and say
+    so at once, so the reason shows even if the run is killed later."""
+    failure = _worker_failure(node.gateway.id,
+                              getattr(node, "workeroutput", None), error)
+    if failure is None:
+        return
+    _WORKER_FAILURES.append(failure)
+    reporter = node.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line("")
+        reporter.write_line(f"[conftest] {failure}", red=True, bold=True)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """A worker sends its refusal reasons to the controller (workeroutput is
+    sent after every sessionfinish implementation has run). The controller
+    fails the run with exit status 3 if any worker refused or went down,
+    whatever the workers that kept going reported."""
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        if _REFUSAL_REASONS:
+            workeroutput[WORKER_REFUSAL_KEY] = list(_REFUSAL_REASONS)
+        return
+    if not _WORKER_FAILURES:
+        return
+    session.exitstatus = pytest.ExitCode.INTERNAL_ERROR
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.section("[conftest] RUN FAILED: an xdist worker refused or "
+                         "went down (exit status 3)", sep="!", red=True,
+                         bold=True)
+        for failure in _WORKER_FAILURES:
+            reporter.write_line(failure, red=True)
 
 
 
