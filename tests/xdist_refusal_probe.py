@@ -3,11 +3,12 @@
 
 Not collected by the suite itself (no test_ prefix): only that test runs it,
 in a child pytest. The xdist worker named by EQUIPA_REFUSAL_PROBE_WORKER
-misbehaves the way EQUIPA_REFUSAL_PROBE_MODE says:
+(every worker when it is ``all``) misbehaves the way EQUIPA_REFUSAL_PROBE_MODE says:
 
 - ``escape``: at import time (collection) it rebinds
-  equipa.constants.THEFORGE_DB to the repo-root default, so that worker's
-  conftest isolation check refuses to run;
+  equipa.constants.THEFORGE_DB to EQUIPA_REFUSAL_PROBE_DB, a sentinel path
+  outside the run's session directory, so that worker's conftest isolation
+  check refuses to run (the parent test checks the sentinel never appears);
 - ``crash``: its first test kills the worker process.
 
 Every other worker (and every worker when the mode is ``none``) just runs
@@ -20,16 +21,16 @@ import os
 
 import pytest
 
-import conftest
 from equipa import constants
 
 PROBE_WORKER = os.environ.get("EQUIPA_REFUSAL_PROBE_WORKER", "")
 PROBE_MODE = os.environ.get("EQUIPA_REFUSAL_PROBE_MODE", "none")
-IS_PROBE_WORKER = os.environ.get("PYTEST_XDIST_WORKER") == PROBE_WORKER
+IS_PROBE_WORKER = (PROBE_WORKER == "all"
+                   or os.environ.get("PYTEST_XDIST_WORKER") == PROBE_WORKER)
 
 if IS_PROBE_WORKER and PROBE_MODE == "escape":
     # Never opened: the collection-stage check stops this worker first.
-    constants.THEFORGE_DB = str(conftest.REPO_ROOT / "theforge.db")
+    constants.THEFORGE_DB = os.environ["EQUIPA_REFUSAL_PROBE_DB"]
 
 
 @pytest.mark.parametrize("index", range(4))
