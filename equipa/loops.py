@@ -4164,8 +4164,8 @@ def _analyze_review_file(
             return ReviewCountAnalysis(verdict=REVIEW_VERDICT_MISSING)
     # Task 3149 (R3143-07): a bidi override or isolate reorders what the
     # reader sees, and normalising strips it, so it is looked for first. The
-    # gate's own text was normalised by the provenance check, which rejects
-    # the same characters in the bytes as written.
+    # gate's own text is the artifact as written (task 3164, R3161-01): the
+    # provenance check rejects the same characters before it gets here.
     bidi = find_bidi_control(text)
     if bidi is not None:
         return ReviewCountAnalysis(
