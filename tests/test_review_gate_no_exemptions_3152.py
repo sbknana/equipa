@@ -22,20 +22,28 @@ Covered here, each with rows that fail before this task:
   read (a differential against the old algorithm on random markup);
 * only the exact counted label and a strict final footer are credited;
 * the exact completion and provenance marker lines alone are blanked;
-* MEDIUM keeps its exemptions, and an unaccounted MEDIUM blocks again as
-  on main (task 3149 had made it a logged advisory).
+* an unaccounted MEDIUM blocks again as on main (task 3149 had made it a
+  logged advisory). MEDIUM kept its exemptions here; task 3161 removed
+  them, so MEDIUM negations and tallies block too.
 
 Copyright 2026 Forgeborn
 """
 
 import random
-import time
+import re
 from pathlib import Path
 
 import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_timing import median_cpu_seconds, timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
 
 REPO = Path(__file__).resolve().parent.parent
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -92,7 +100,7 @@ def gate_blocks(text):
 def assert_backstop_blocks(text):
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
     return analysis
 
@@ -219,8 +227,12 @@ def test_r3149_bodies_block_with_the_new_reason_and_line(body):
     expected = next(number for number, line in enumerate(lines, 1)
                     if any(word in line for word in ("HIGH", "CRITICAL"))
                     and "|" not in line and not line.startswith("### [E1]"))
-    assert analysis.detail.startswith(
-        f"{loops.BACKSTOP_REASON} at line {expected}"), analysis.detail
+    severity = next(word for word in ("CRITICAL", "HIGH")
+                    if word in lines[expected - 1])
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis.detail
+    assert re.search(rf"{loops.backstop_reason(severity)} at line "
+                     rf"(?:\d+, )*{expected}(?!\d)", analysis.detail), (
+        analysis.detail)
 
 
 @pytest.mark.parametrize("body", R3149_02_BODIES + R3149_01_BODIES
@@ -265,11 +277,10 @@ def test_hex_digits_after_a_reference_are_part_of_it():
             == "\N{REPLACEMENT CHARACTER}RITICAL")
 
 
+@timing_test
 def test_a_200kb_reference_is_decided_without_int():
     text = build_review(["&#" + "9" * RB + "HIGH severity RCE"], "zero")
-    started = time.process_time()
-    assert_backstop_blocks(text)
-    assert time.process_time() - started < 0.5
+    assert median_cpu_seconds(assert_backstop_blocks, text) < 0.5
 
 
 # --- R3149-05: the link reader is linear and reads what it read before ------------
@@ -337,14 +348,11 @@ def test_link_reader_reads_what_the_old_reader_read():
     ["[a]: x", "", "a]" * (RB // 2)],
     ["[a]: x", "", "[" + " " * (RB // 2) + "a]" * (RB // 4)],
 ])
+@timing_test
 def test_r3149_05_link_bodies_parse_in_half_a_second(body):
     text = build_review(body, "zero")
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text)
+    assert elapsed < 0.5, elapsed
 
 
 def test_link_text_longer_than_any_label_is_no_shortcut_link():
@@ -431,7 +439,7 @@ def test_other_footer_shapes_credit_nothing(footer_lines):
     analysis = analyze(text)
     if loops._analyze_review_views(
             loops.normalize_review_text(text)).trusted:
-        assert analysis.detail.startswith(loops.BACKSTOP_REASON), analysis
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
 
 
 def test_only_the_final_footer_is_credited():
@@ -439,13 +447,13 @@ def test_only_the_final_footer_is_credited():
     assert_backstop_blocks(text)
 
 
+@timing_test
 def test_strict_footer_grammar_is_linear_on_a_padded_line():
     footer = ("CRITICAL: 0" + " " * RB + "| HIGH: 1 | MEDIUM: 0 | LOW: 0 | "
               "INFO: 0 x")
     text = one_high_review([], [footer])
-    started = time.process_time()
     assert gate_blocks(text)
-    assert time.process_time() - started < 0.5
+    assert median_cpu_seconds(gate_blocks, text) < 0.5
 
 
 @pytest.mark.parametrize("last_line", [
@@ -472,16 +480,25 @@ def test_the_exact_marker_lines_are_still_blanked():
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
 
 
-# --- MEDIUM keeps its exemptions; anything else blocks, as on main -----------------
+# --- MEDIUM: no exemptions either (task 3161); anything else blocks ---------------
 
 @pytest.mark.parametrize("body", [
     ["No MEDIUM findings."],
     ["Rated LOW rather than MEDIUM."],
     ["0 MEDIUM results from semgrep."],
 ])
-def test_medium_negations_and_tallies_still_merge_quietly(body):
-    analysis = analyze(build_review(body, "one_low"))
-    assert analysis.trusted and analysis.detail == "", analysis
+@pytest.mark.parametrize("context", CONTEXTS)
+def test_medium_negations_and_tallies_block(body, context):
+    """Task 3152 kept these trusted (MEDIUM exemptions). Task 3161 deleted
+    the exemptions, so they block like their CRITICAL and HIGH forms; the
+    lower-case prose merges."""
+    analysis = analyze(build_review(body, context))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
+    assert gate_blocks(build_review(body, context))
+    lower = [line.replace("MEDIUM", "medium") for line in body]
+    assert not gate_blocks(build_review(lower, context)), lower
 
 
 @pytest.mark.parametrize("body", [
@@ -497,8 +514,8 @@ def test_an_unaccounted_medium_blocks_as_on_main(body, context):
     merge. They block again, with their own reason."""
     analysis = analyze(build_review(body, context))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON + ": "), (
-        analysis.detail)
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
     assert gate_blocks(build_review(body, context))
     lower = [line.replace("MEDIUM", "medium") for line in body]
     assert not gate_blocks(build_review(lower, context)), lower
@@ -509,11 +526,12 @@ def test_an_unaccounted_medium_blocks_as_on_main(body, context):
 def test_prompt_states_there_are_no_exceptions_for_critical_and_high():
     prompt = (REPO / "prompts" / "security-reviewer.md").read_text(
         encoding="utf-8")
+    # Task 3161: the rule covers MEDIUM too.
     for phrase in (
-        "For critical and high there are no exceptions",
-        "write critical and high in lower case everywhere except the severity "
-        "label of a finding heading and the `## Counts` footer line",
-        "Any other UPPER-case CRITICAL or HIGH blocks the merge",
+        "There are no exceptions for critical, high or medium",
+        "write critical, high and medium in lower case everywhere except the "
+        "severity label of a finding heading and the `## Counts` footer line",
+        "Any other UPPER-case CRITICAL, HIGH or MEDIUM blocks the merge",
         "a negation",
         "a tally",
         "a comparison",

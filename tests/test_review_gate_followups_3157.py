@@ -3,6 +3,9 @@
 * R3154-02: a count before the MEDIUM word and a zero tally after it ("Found
   2 MEDIUM: 0 open.") untrust the review again, as on ba6065a, which read
   the count before the word first. The larger of the two counts is used.
+  (Task 3161 deleted the MEDIUM exemptions: every such tally now blocks,
+  and the tests that kept MEDIUM tallies and negations merging assert the
+  block instead.)
 * R3154-03: a lookalike letter is read as its letter inside a severity
   word only. Task 3154 folded every Unicode confusable of the letters of
   the three words to an ASCII capital in every view, so "ne<U+2113>ther",
@@ -12,7 +15,9 @@
   scripts/review_gate_probe_corpus.py for every severity word, is replayed
   here. Nothing ba6065a, main (3afec74) or the 3154 tree (cb3373c) blocked
   may merge (tests/fixtures/review_gate_probe_corpus_3157.json, written by
-  scripts/review_gate_differential.py --families --write-fixture).
+  scripts/review_gate_differential.py --families --write-fixture). Task
+  3161 added the split, label and private-use shapes of the independent
+  3157 review (R3157-01, R3157-02) and main before it (502975b).
 * R3154-01, I3154-01: circled, squared, parenthesised and modifier capitals
   are letters of a severity word next to a filler or a number form.
 * R3154-04: the two title-case HTML bodies of R3152-04 block.
@@ -31,7 +36,6 @@ import hashlib
 import importlib.util
 import json
 import re
-import time
 import unicodedata
 from pathlib import Path
 
@@ -43,6 +47,7 @@ from equipa.severity_confusables import (
     CONFUSABLES_LETTER_MAPPINGS,
     SEVERITY_LETTER_CONFUSABLES,
 )
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
     CONTEXTS,
     RB,
@@ -89,34 +94,40 @@ def test_a_count_before_the_word_is_not_undone_by_a_zero_tally(body, context):
     assert _medium_untrusts(build_review([body], context)), body
 
 
-@pytest.mark.parametrize("written,count", [
-    ("Found 2 MEDIUM: 0 open.", 2),
-    ("0 MEDIUM: 2", 2),
-    ("MEDIUM: 0", 0),
-    ("0 MEDIUM: 0", 0),
-    ("two MEDIUM = 1", 2),
-])
-def test_the_larger_count_is_the_words(written, count):
-    start = written.index("MEDIUM")
-    assert loops._backstop_exempt_count(
-        written, [], 0, start, start + len("MEDIUM"), None) == count
+def _blocks_on_medium(text: str) -> bool:
+    """True when the review is untrusted for an unaccounted MEDIUM word."""
+    analysis = analyze(text)
+    return (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+            and analysis.detail.startswith(
+                loops.backstop_reason("MEDIUM") + " at line "))
 
 
+# Task 3161: the tally counting that read these is deleted with the other
+# MEDIUM exemptions; each tally blocks whatever its counts, and merges in
+# lower case.
 @pytest.mark.parametrize("context", CONTEXTS)
-@pytest.mark.parametrize("body", ["0 MEDIUM: 0", "MEDIUM: 0", "No MEDIUM: 0."])
-def test_a_zero_tally_still_merges_quietly(body, context):
-    analysis = analyze(build_review([body], context))
-    assert analysis.trusted, analysis.detail
+@pytest.mark.parametrize("written", [
+    "Found 2 MEDIUM: 0 open.", "0 MEDIUM: 2", "MEDIUM: 0", "0 MEDIUM: 0",
+    "two MEDIUM = 1", "No MEDIUM: 0.",
+])
+def test_a_medium_tally_blocks_whatever_its_counts(written, context):
+    assert _blocks_on_medium(build_review([written], context)), written
+    lower = build_review([written.replace("MEDIUM", "medium")], context)
+    assert analyze(lower).trusted, written
 
 
-def test_a_counted_medium_tally_merges_with_its_count():
+def test_a_counted_medium_tally_blocks_and_merges_in_lower_case():
+    """The tally merged with the review's two counted MEDIUM findings
+    (task 3157); with no exemption it blocks, and merges in lower case."""
     footer = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 2 | LOW: 0 | INFO: 0"
-    text = review("2 findings.", [
+    body = [
         "### [M1] MEDIUM \N{EM DASH} weak hash in auth.py", "Details.", "",
         "### [M2] MEDIUM \N{EM DASH} verbose errors in app.py", "Details.", "",
         "## Notes", "", "Found 2 MEDIUM: 0 open.",
-    ], footer)
-    analysis = analyze(text)
+    ]
+    assert _blocks_on_medium(review("2 findings.", body, footer))
+    body[-1] = "Found 2 medium: 0 open."
+    analysis = analyze(review("2 findings.", body, footer))
     assert analysis.trusted, analysis.detail
     assert analysis.counts["MEDIUM"] == 2
 
@@ -171,9 +182,11 @@ def test_a_lookalike_never_spells_an_exemption_word(body, context):
     f"no MED{chr(0x2113)}UM findings.",
     f"No {chr(0x13B7)}EDIUM issues were found.",
 ])
-def test_a_lookalike_inside_the_word_keeps_its_exemption(body, context):
-    analysis = analyze(build_review([body], context))
-    assert analysis.trusted, (ascii(body), analysis.detail)
+def test_a_negated_word_blocks_with_or_without_a_lookalike(body, context):
+    """These merged under the MEDIUM negation exemption (task 3157). Task
+    3161 deleted it: a negated MEDIUM, spelled with lookalikes or not,
+    blocks."""
+    assert _blocks_on_medium(build_review([body], context)), ascii(body)
 
 
 @pytest.mark.parametrize("context", CONTEXTS)
@@ -187,12 +200,18 @@ def test_a_lookalike_still_spells_the_word(body, context):
     assert gate_blocks(build_review([body], context)), ascii(body)
 
 
-def test_a_lookalike_is_a_mark_outside_the_word():
-    mark = loops._backstop_view_fold(0x2113, "I")
-    assert loops._backstop_is_fold_mark(mark)
-    assert loops._backstop_unmarked(mark) == "I"
-    # NFKC already reads a fullwidth capital as the letter: no mark needed.
-    assert loops._backstop_view_fold(0xFF34, "T") == "T"
+def test_a_lookalike_is_a_mark_only_the_severity_words_read():
+    """Task 3161: every folded lookalike is the FOLD mark of its letter,
+    fullwidth capitals included, and only lookalikes of the letters the
+    severity words hold are folded (no other word is read any more)."""
+    for code_point, letter in ((0x2113, "I"), (0xFF34, "T"), (0x0399, "I")):
+        mark = loops._BACKSTOP_VIEW_FOLDS[code_point]
+        assert loops._backstop_is_fold_mark(mark), hex(code_point)
+        assert loops._backstop_unmarked(mark) == letter, hex(code_point)
+    # Greek NU and OMICRON, Cyrillic small O and the parenthesised N.
+    for code_point in (0x039D, 0x039F, 0x043E, 0x1F11D):
+        assert code_point not in loops._BACKSTOP_LETTER_FOLDS, hex(code_point)
+    assert set(loops._BACKSTOP_LETTER_FOLDS.values()) <= set("CRITALHGMEDUl")
 
 
 def test_a_private_use_character_as_written_is_never_a_letter():
@@ -204,7 +223,8 @@ def test_a_private_use_character_as_written_is_never_a_letter():
 # --- Acceptance: the probe corpus of the independent 3154 review -----------------
 
 CORPUS_FIXTURE = REPO / "tests" / "fixtures" / "review_gate_probe_corpus_3157.json"
-BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c")
+BASELINE_TREES = ("ba6065a", "3afec74", "cb3373c", "502975b")
+FAMILIES_OF_3161 = ("split", "noun", "comma", "list", "private-use")
 
 
 @functools.lru_cache(maxsize=1)
@@ -235,12 +255,13 @@ def test_the_corpus_is_the_one_the_older_trees_judged():
     assert _differential().corpus_digest(texts) == fixture["corpus_sha256"]
     assert set(BASELINE_TREES) <= set(fixture["blocked"])
     families = {key.split("|", 1)[0] for key, _, _ in bodies}
-    assert families == {"replay", "separator", "tally", "negation"}
+    assert families == {"replay", "separator", "tally", "negation", "split",
+                        "noun", "comma", "list", "private-use"}
 
 
 def _must_block(severity: str) -> list[tuple[int, int, list[str]]]:
     """(body, context, trees) of every text of ``severity`` some older tree
-    blocked."""
+    blocked, in the families of task 3157."""
     bodies, _, fixture = _corpus()
     decode = _differential().decode_bits
     blocked = {
@@ -248,8 +269,12 @@ def _must_block(severity: str) -> list[tuple[int, int, list[str]]]:
         for tree in BASELINE_TREES for context in CONTEXTS
     }
     rows = []
-    for index, (_, body_severity, _) in enumerate(bodies):
-        if body_severity != severity:
+    for index, (key, body_severity, _) in enumerate(bodies):
+        # Every text of the families task 3161 added, blocked by an older
+        # tree or not, is judged by tests/test_review_gate_no_exemptions_3161
+        # .py (test_every_text_of_the_3161_families_blocks).
+        if (body_severity != severity
+                or key.split("|", 1)[0] in FAMILIES_OF_3161):
             continue
         for offset, context in enumerate(CONTEXTS):
             trees = [tree for tree in BASELINE_TREES
@@ -391,14 +416,11 @@ def test_markdown_outside_an_html_block_keeps_its_rendering(body, context):
     "<div>" + "&#1" * (RB // 3),
     "<span>\n" + "&#x4" * (RB // 4),
 ])
+@timing_test
 def test_html_block_floods_parse_in_half_a_second(flood):
     text = build_review([flood], "zero")
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text)
+    assert elapsed < 0.5, elapsed
 
 
 # --- R3154-05: the shared lookup tables start over when full ---------------------
@@ -428,36 +450,71 @@ def test_a_full_reference_table_caches_the_next_review(monkeypatch):
     assert table["&#72;"] == "H" and table.get("&#72;") == "H"
 
 
-def _hostile_review() -> str:
-    """A review of 61,000 distinct code points (CJK Extension B onwards)."""
-    characters = "".join(chr(0x20000 + offset) for offset in range(61000))
+def _distinct_review(first: int, count: int) -> str:
+    """A review of ``count`` distinct code points from ``first`` on."""
+    characters = "".join(chr(first + offset) for offset in range(count))
     lines = [characters[start:start + 100]
              for start in range(0, len(characters), 100)]
     return build_review(lines, "zero")
 
 
+# Task 3161: a review of more than 4,096 distinct characters is not parsed,
+# so the shared tables are filled by fifteen reviews just under that cap
+# (60,000 distinct code points of CJK Extension B onwards, as one review of
+# 61,000 did before).
+HOSTILE_REVIEW_COUNT = 15
+HOSTILE_REVIEW_DISTINCT = 4_000
+
+
+def _hostile_reviews() -> list[str]:
+    return [_distinct_review(0x20000 + index * HOSTILE_REVIEW_DISTINCT,
+                             HOSTILE_REVIEW_DISTINCT)
+            for index in range(HOSTILE_REVIEW_COUNT)]
+
+
 def _hangul_review() -> str:
-    """200 KB of distinct Hangul syllables (decomposed by rule)."""
-    syllables = "".join(chr(0xAC00 + offset % 11172)
+    """200 KB of Hangul syllables (decomposed by rule), 4,000 of them
+    distinct (under the distinct-character cap)."""
+    syllables = "".join(chr(0xAC00 + offset % 4000)
                         for offset in range(RB // 3))
     return build_review([syllables[start:start + 80]
                          for start in range(0, len(syllables), 80)], "zero")
 
 
+def _fill_tables(hostile: list[str]) -> None:
+    for text in hostile:
+        analyze(text)
+
+
+def test_the_hostile_reviews_fill_the_shared_tables():
+    hostile = _hostile_reviews()
+    assert all(analyze(text).verdict != loops.REVIEW_VERDICT_INCOMPLETE
+               for text in hostile)
+    assert len(loops._BACKSTOP_CHARACTERS) >= 50_000
+
+
+@timing_test
 @pytest.mark.parametrize("later", [
     _hangul_review,
     lambda: build_review([f"HIGH{SUPERSCRIPT_ONE} " * (RB // 6)], "zero"),
 ])
 def test_a_hostile_review_does_not_slow_the_next_one(later):
-    hostile = _hostile_review()
+    hostile = _hostile_reviews()
     text = later()
-    best = float("inf")
-    for _ in range(2):
-        analyze(hostile)
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    assert best < 0.5, best
+    elapsed = median_cpu_seconds(analyze, text,
+                                 before=lambda: _fill_tables(hostile))
+    assert elapsed < 0.5, elapsed
+
+
+@timing_test
+def test_a_review_of_too_many_distinct_characters_fails_closed_fast():
+    # 61,000 distinct code points: not parsed, so not trusted, in well under
+    # the 0.5 s budget (task 3161 target: 0.25 s).
+    text = _distinct_review(0x20000, 61_000)
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
+    assert not analysis.trusted
+    assert median_cpu_seconds(analyze, text) < 0.25
 
 
 # --- R3154-06: the confusables table against independent properties --------------

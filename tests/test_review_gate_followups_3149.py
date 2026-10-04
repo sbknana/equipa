@@ -30,6 +30,12 @@ import pytest
 from equipa import loops, security_gate
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
 REPO = Path(__file__).resolve().parent.parent
 NONCE = "0123456789abcdef0123456789abcdef"
 ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
@@ -112,16 +118,21 @@ def test_r3143_01_uncounted_heading_credits_nothing(body):
 
 
 def test_r3143_01_heading_lines_come_from_the_parser():
-    """The credited lines are the parser's own counted headings."""
+    """The credited labels are the parser's own counted headings. Task 3161:
+    the MEDIUM label too, and only at the offset the parser attributed (the
+    heading and section credit that read lines is deleted)."""
     text = loops.normalize_review_text(review("1 finding.", [
         "## Findings", "", f"### [S1] MEDIUM {E} Missing rate limit",
         f"<p>### [S2] MEDIUM {E} not a heading</p>",
     ], ONE_MEDIUM))
     analysis = analyze(text)
-    lines = text.split("\n")
-    counted = loops._counted_heading_lines(text, analysis.heading_offsets)
-    assert counted == {(lines.index(f"### [S1] MEDIUM {E} Missing rate limit"),
-                        "MEDIUM")}
+    masked = loops._backstop_masked(text, analysis.heading_offsets).split("\n")
+    assert f"### [S1] medium {E} Missing rate limit" in masked
+    assert f"<p>### [S2] MEDIUM {E} not a heading</p>" in masked
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    line = masked.index(f"<p>### [S2] MEDIUM {E} not a heading</p>") + 1
+    assert analysis.detail.startswith(
+        f"{loops.backstop_reason('MEDIUM')} at line {line}:"), analysis.detail
 
 
 # --- R3143-02 / SR3143-02: no exemption may excuse a finding label ---------------
@@ -197,18 +208,25 @@ def test_r3143_02_exemptions_never_excuse_a_label(body):
     assert_gate_blocks(body)
 
 
-# Tallies and negations of MEDIUM a reviewer writes, which still merge (none
-# of these leaves an unaccounted token).
-R3143_02_MERGES = [
+# Tallies and negations of MEDIUM a reviewer writes. They merged under the
+# MEDIUM exemptions; task 3161 deleted those, so they block, and the same
+# prose in lower case (what the prompt asks for) merges.
+R3143_02_MEDIUM_PROSE = [
     ["Rated LOW, not MEDIUM, as it needs a local account."],
     ["Kept at LOW rather than MEDIUM."],
 ]
 
 
-@pytest.mark.parametrize("body", R3143_02_MERGES)
-def test_r3143_02_plain_tallies_and_negations_still_merge(body):
+@pytest.mark.parametrize("body", R3143_02_MEDIUM_PROSE)
+def test_r3143_02_medium_tallies_and_negations_block(body):
     analysis = analyze(one_low_review(body))
-    assert analysis.trusted and analysis.detail == "", (body, analysis)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
+    assert_gate_blocks(body)
+    lower = analyze(one_low_review([line.replace("MEDIUM", "medium")
+                                    for line in body]))
+    assert lower.trusted and lower.detail == "", (body, lower)
 
 
 # Task 3152: these merged under the 3143/3149 exemptions. CRITICAL and HIGH
@@ -251,7 +269,7 @@ def _lower_case_critical_high(body):
 def test_r3143_02_critical_high_tallies_and_negations_block(body):
     analysis = analyze(one_low_review(body))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
     assert_gate_blocks(body)
     lower = analyze(one_low_review(_lower_case_critical_high(body)))
@@ -269,7 +287,7 @@ def test_r3143_06_soft_wrapped_negation_blocks():
             "CRITICAL/HIGH/MEDIUM issues. Remaining items are LOW/INFO."]
     analysis = analyze(one_low_review(body))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
     lower = analyze(one_low_review(_lower_case_critical_high(body)))
     assert lower.trusted, lower
 
@@ -342,7 +360,7 @@ def test_r3143_04_old_crash_input_blocks_with_a_logged_verdict(monkeypatch, tmp_
     text = one_low_review(["HIGH &#" + "9" * 5000])
     assert loops._count_findings_in_review_file(
         tmp_path / "SECURITY-REVIEW-8.md", task_id=8, text=text) is None
-    assert any("unaccounted CRITICAL/HIGH token at line" in message for message in logged)
+    assert any("unaccounted HIGH token at line" in message for message in logged)
 
 
 # --- R3143-06: MEDIUM-only tokens block again (task 3152) ------------------------
@@ -360,7 +378,8 @@ def test_r3143_06_medium_only_tokens_block_and_are_logged(monkeypatch,
     assert counts is None
     events = [fields["event"] for _, fields in logged]
     assert events == ["count-mismatch"], logged
-    assert (loops.BACKSTOP_MEDIUM_REASON + ": MEDIUM=1 at line") in logged[0][0]
+    assert (loops.backstop_reason("MEDIUM") + " at line ") in logged[0][0]
+    assert "MEDIUM=1 at line" in logged[0][0]
     assert not hasattr(loops, "BACKSTOP_ADVISORY_REASON")
 
 
@@ -368,7 +387,7 @@ def test_r3143_06_medium_with_high_still_blocks_and_names_both():
     text = one_low_review(["A MEDIUM issue and a HIGH one: SQL injection."])
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
     assert "HIGH=1" in analysis.detail and "MEDIUM=1" in analysis.detail
 
 
@@ -567,7 +586,8 @@ def test_r3143_07_lookalike_severity_word_is_read(word):
         analysis = analyze(one_low_review(body))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
         assert analysis.detail.startswith(
-            loops.BACKSTOP_MEDIUM_REASON + ": MEDIUM=1 at line"), analysis
+            loops.backstop_reason("MEDIUM") + " at line "), analysis
+        assert "MEDIUM=1 at line" in analysis.detail, analysis
     assert_gate_blocks(body)
 
 
@@ -723,23 +743,29 @@ def test_fold_tables_leave_ascii_and_line_feeds_alone():
         assert "\n" not in loops._BACKSTOP_CHARACTERS[code_point], code_point
 
 
-@pytest.mark.parametrize("tail, accepted", [
-    (": 0", True),
-    (": 0 | CRITICAL: 0", True),
-    (": 0 and 0 HIGH from semgrep.", True),
-    (": 0 | 0 HIGH: 0", True),
-    (": 0, **2** MEDIUM", True),
-    (": 0 0 HIGH**: 0", True),
-    (": 0 rate limiting on login", False),
-    (": 0 0 HIGH:", False),
-    (": 0" + " 1" * 95 + " x", False),
+@pytest.mark.parametrize("tail", [
+    ": 0",
+    ": 0 | CRITICAL: 0",
+    ": 0 and 0 HIGH from semgrep.",
+    ": 0 | 0 HIGH: 0",
+    ": 0, **2** MEDIUM",
+    ": 0 0 HIGH**: 0",
+    ": 0 rate limiting on login",
+    ": 0 0 HIGH:",
+    ": 0" + " 1" * 95 + " x",
 ])
-def test_tally_tail_grammar_reads_each_item_once(tail, accepted):
-    """The tail repeats possessively; each item is still read whole."""
-    tally = loops._BACKSTOP_COUNT_AFTER_RE.match(tail)
-    assert tally is not None
-    matched = loops._BACKSTOP_TALLY_TAIL_RE.fullmatch(tail, tally.end())
-    assert (matched is not None) is accepted, tail
+def test_every_medium_tally_tail_blocks(tail):
+    """These tails were read by the MEDIUM tally grammar, and the first six
+    excused the word. Task 3161 deleted the grammar: a MEDIUM tally blocks
+    whatever follows it, and its lower-case form merges."""
+    body = ["semgrep MEDIUM" + tail]
+    analysis = analyze(one_low_review(body))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert loops.backstop_reason("MEDIUM") + " at line " in analysis.detail
+    assert_gate_blocks(body)
+    lower = [line.replace("CRITICAL", "critical").replace("HIGH", "high")
+             .replace("MEDIUM", "medium") for line in body]
+    assert analyze(one_low_review(lower)).trusted, lower
 
 
 # --- Timing: lines holding a severity word are capped ------------------------
@@ -782,7 +808,7 @@ def test_review_under_the_severity_line_cap_is_still_parsed():
     body = _flood("<p>### [S{number}] HIGH " + E + " x</p>", CAP - 50)
     analysis = analyze(zero_review(body))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert loops.BACKSTOP_REASON in analysis.detail
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis.detail
     lower = analyze(zero_review(_flood("a low risk item {number}", CAP - 50)))
     assert lower.trusted, lower
 

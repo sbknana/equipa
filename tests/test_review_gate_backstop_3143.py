@@ -7,8 +7,9 @@ each left or opened a shape that renders as a finding and is not counted, so
 the gate now ends with a backstop that models no shape: every standalone
 UPPER-case CRITICAL, HIGH or MEDIUM anywhere in the review (code and quotes
 included) must be a counted finding, or the review blocks with the reason
-"unaccounted severity token" (task 3152: "unaccounted CRITICAL/HIGH token")
-and the line numbers.
+"unaccounted severity token" (task 3152: "unaccounted CRITICAL/HIGH token";
+task 3161: "unaccounted HIGH token", per severity, MEDIUM included) and the
+line numbers.
 
 Also covered, each with rows that fail before this task:
 
@@ -31,7 +32,6 @@ Copyright 2026 Forgeborn
 import hashlib
 import json
 import random
-import time
 import unicodedata
 from pathlib import Path
 
@@ -42,6 +42,13 @@ from equipa.security_gate import (
     normalize_review_text,
     review_complete_line,
     reviewer_nonce_line,
+)
+from tests.review_gate_timing import median_cpu_seconds, timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -77,7 +84,7 @@ def rules_only(text):
 def blocked_by_backstop(text):
     analysis = analyze(text)
     return (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
-            and analysis.detail.startswith(loops.BACKSTOP_REASON))
+            and analysis.detail.startswith(BLOCKING_TOKEN_REASONS))
 
 
 def zero_review(body):
@@ -160,10 +167,12 @@ def test_the_reason_names_every_line():
                                            if severity in line
                                            and "|" not in line)) + 1
                 for severity in ("HIGH", "MEDIUM", "CRITICAL")}
-    # Task 3152: the reason leads with the CRITICAL/HIGH lines.
+    # Task 3161: one reason per severity, the most severe first.
     assert analysis.detail.startswith(
-        f"unaccounted CRITICAL/HIGH token at line {expected['HIGH']}, "
-        f"{expected['CRITICAL']}: "), analysis.detail
+        f"unaccounted CRITICAL token at line {expected['CRITICAL']}; "
+        f"unaccounted HIGH token at line {expected['HIGH']}; "
+        f"unaccounted MEDIUM token at line {expected['MEDIUM']}: "
+    ), analysis.detail
     for severity, line in expected.items():
         assert f"{severity}=1 at line {line} " in analysis.detail, (
             severity, analysis.detail)
@@ -176,7 +185,7 @@ def test_the_reason_is_logged_by_the_gate(monkeypatch, tmp_path):
     path = tmp_path / "SECURITY-REVIEW-1.md"
     text = zero_review(["The HIGH one."])
     assert loops._count_findings_in_review_file(path, text=text) is None
-    assert any("unaccounted CRITICAL/HIGH token at line" in message
+    assert any("unaccounted HIGH token at line" in message
                and "HIGH=1 at line" in message
                for message in logged), logged
 
@@ -195,8 +204,12 @@ def test_footer_labels_and_completion_line_are_exempt():
     assert analyze(text).verdict == loops.REVIEW_VERDICT_OK
 
 
-def test_a_counted_finding_heading_and_its_section_merge():
-    text = review("1 finding.", [
+def test_a_counted_finding_section_repeating_its_severity_blocks():
+    """Task 3161: the section and finding-ID exemptions are gone. Only the
+    heading's own label is the finding's; its severity repeated in the
+    section or in a table row naming it blocks, as CRITICAL and HIGH do
+    since task 3152. In lower case the review merges."""
+    body = [
         "## Findings", "",
         f"### [S1] MEDIUM {E} Missing rate limit",
         "- **Severity:** MEDIUM",
@@ -206,8 +219,11 @@ def test_a_counted_finding_heading_and_its_section_merge():
         "| ID | Severity | Title |",
         "|---|---|---|",
         "| S1 | MEDIUM | Missing rate limit |",
-    ], ONE_MEDIUM)
-    analysis = analyze(text)
+    ]
+    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 3)
+    lowered = body[:3] + [line.replace("MEDIUM", "medium")
+                          for line in body[3:]]
+    analysis = analyze(review("1 finding.", lowered, ONE_MEDIUM))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["MEDIUM"] == 1
 
@@ -233,8 +249,8 @@ def assert_medium_blocks(text, unaccounted):
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         analysis.detail)
-    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON + ": "), (
-        analysis.detail)
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
     assert f"MEDIUM={unaccounted} at line" in analysis.detail, analysis.detail
 
 
@@ -270,14 +286,21 @@ def test_more_tokens_than_the_footer_counts_blocks():
             assert_medium_blocks(text, 1)
 
 
-def test_footer_covering_heading_less_findings_merges():
-    """Findings written as prose and counted by the footer are accounted."""
-    text = review("2 findings.", [
+def test_footer_covering_heading_less_findings_blocks():
+    """Task 3161: findings written as prose with an UPPER-case MEDIUM are
+    not counted findings, even when the footer covers them (task 3152 made
+    the same rows with HIGH block). With headings the review merges."""
+    footer = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 2 | LOW: 0 | INFO: 0"
+    assert_medium_blocks(review("2 findings.", [
         "## Findings", "",
         "1. Missing rate limit on /login (MEDIUM).",
         "2. Verbose errors on /api (MEDIUM).",
-    ], "CRITICAL: 0 | HIGH: 0 | MEDIUM: 2 | LOW: 0 | INFO: 0")
-    analysis = analyze(text)
+    ], footer), 2)
+    analysis = analyze(review("2 findings.", [
+        "## Findings", "",
+        f"### [S1] MEDIUM {E} Missing rate limit on /login", "Details.", "",
+        f"### [S2] MEDIUM {E} Verbose errors on /api", "Details.",
+    ], footer))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
 
 
@@ -285,9 +308,12 @@ def test_footer_covering_heading_less_findings_merges():
     ["Rated LOW, not MEDIUM, as it needs a local account."],
     ["Kept at LOW rather than MEDIUM."],
 ])
-def test_tallies_and_negations_merge(body):
-    """MEDIUM keeps its tally and negation exemptions (task 3152)."""
-    assert_merges(body)
+def test_medium_tallies_and_negations_block(body):
+    """Task 3161: MEDIUM has no tally or negation exemption any more (task
+    3152 kept them); the lower-case prose merges."""
+    assert_medium_blocks(review("1 finding.", ["## Notes", ""] + body, ONE_LOW,
+                                heading=f"### [E1] LOW {E} verbose error"), 1)
+    assert_merges([line.replace("MEDIUM", "medium") for line in body])
 
 
 @pytest.mark.parametrize("body", [
@@ -305,7 +331,7 @@ def test_critical_high_tallies_and_negations_block(body):
     analysis = analyze(review("1 finding.", ["## Notes", ""] + body, ONE_LOW,
                               heading=f"### [E1] LOW {E} verbose error"))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-    assert analysis.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
     # MEDIUM is lowered too: "no critical, high or MEDIUM" leaves MEDIUM
     # outside the negation's list, and main blocks it as well.
     assert_merges([line.replace("CRITICAL", "critical").replace("HIGH", "high")
@@ -331,12 +357,16 @@ def test_tallies_beyond_the_counts_block(body):
 def test_one_medium_tally_with_one_counted_medium_blocks():
     """Task 3152: "the one MEDIUM has a one-line fix" is no tally since task
     3149 (R3143-02: the words after it are not a safe tail), and the MEDIUM
-    advisory that kept the review trusted is gone, so it blocks. In lower
-    case (reviewer prompt) the review merges with its one counted MEDIUM."""
+    advisory that kept the review trusted is gone, so it blocks. Task 3161:
+    "Overall risk: MEDIUM" has no exemption either, so both words block,
+    and so does the risk line alone. In lower case (reviewer prompt) the
+    review merges with its one counted MEDIUM."""
     body = [f"### [S1] MEDIUM {E} Missing rate limit", "", "## Notes",
             "Overall risk: MEDIUM; the one MEDIUM has a one-line fix."]
-    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 1)
+    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 2)
     body[-1] = "Overall risk: MEDIUM; the one medium has a one-line fix."
+    assert_medium_blocks(review("1 finding.", body, ONE_MEDIUM), 1)
+    body[-1] = "Overall risk: medium; the one medium has a one-line fix."
     analysis = analyze(review("1 finding.", body, ONE_MEDIUM))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["MEDIUM"] == 1
@@ -672,48 +702,26 @@ BACKSTOP_FAMILIES = {
     "reference_of_200kb_digits": ["&#" + "9" * RB + "HIGH"],
     "hex_reference_of_200kb_digits": ["&#x" + "f" * RB + "HIGH"],
     "zero_padded_reference_of_200kb": ["&#" + "0" * RB + "72;IGH"],
+    # Task 3164 (R3161-02): a lookalike capital eta leading each word (0.53
+    # to 0.57 s before), and a combining mark after each letter or each word
+    # (one mark-stripper callback per short non-ASCII run).
+    "eta_led": ["\N{GREEK CAPITAL LETTER ETA}IGH " * (RB // 6)],
+    "mark_after_each_letter": [
+        ("".join(f"{letter}\N{COMBINING ACUTE ACCENT}" for letter in "HIGH")
+         + " ") * (RB // 13)],
+    "mark_after_each_word": ["HIGH\N{COMBINING ACUTE ACCENT} " * (RB // 7)],
 }
 
 
-def _best_of_two(text):
-    # CPU time: under `pytest -n auto` a wall clock also counts the time this
-    # worker waits for a core (task 3160).
-    best = float("inf")
-    for _ in range(2):
-        started = time.process_time()
-        analyze(text)
-        best = min(best, time.process_time() - started)
-    return best
-
-
-PARSE_BUDGET_SECONDS = 0.5
-# distinct_code_points folds each of its ~70 000 distinct characters once, so
-# it takes 0.47 s of CPU time on an idle host: 6% under the shared budget.
-# Under `pytest -n auto` CPU time still grows by about 10% (workers share
-# caches and memory bandwidth), and it failed at 0.51 s (task 3162). One
-# second keeps it linear-time evidence: the super-linear bugs these families
-# catch took 23 s and more on 200 KB.
-FAMILY_PARSE_BUDGET_SECONDS = {"distinct_code_points": 1.0}
-
-
+@timing_test
 @pytest.mark.parametrize("name", sorted({**REVIEWER_FAMILIES,
                                          **BACKSTOP_FAMILIES}))
 def test_200kb_adversarial_review_parses_in_half_a_second(name):
     body = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}[name]
     text = review("No findings.", body, ZERO)
     assert len(text.encode()) >= RB * 0.99, name
-    elapsed = _best_of_two(text)
-    budget = FAMILY_PARSE_BUDGET_SECONDS.get(name, PARSE_BUDGET_SECONDS)
-    assert elapsed < budget, f"{name}: {elapsed:.2f}s (budget {budget}s)"
-
-
-def test_only_known_families_get_a_larger_parse_budget():
-    # Renaming a family would leave a stale key here and silently drop the
-    # family back to the shared budget; the larger budget stays bounded.
-    families = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}
-    assert set(FAMILY_PARSE_BUDGET_SECONDS) <= set(families)
-    assert all(budget <= 2 * PARSE_BUDGET_SECONDS
-               for budget in FAMILY_PARSE_BUDGET_SECONDS.values())
+    elapsed = median_cpu_seconds(analyze, text)
+    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
 
 def test_the_reviewer_timing_set_has_forty_families():

@@ -15,7 +15,6 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -26,6 +25,7 @@ from equipa.loops import (
     _analyze_review_file,
     _count_findings_in_review_file,
 )
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 BODY = "# Security Review\n\n## Summary\nNo findings.\n\n## Findings\n\n"
 ZERO_FOOTER = (
@@ -50,14 +50,14 @@ def _write(tmp_path: Path, markdown: str) -> Path:
     ],
     ids=["digits", "word-chars", "mixed-tag-chars", "numbered-digits"],
 )
+@timing_test
 def test_long_bold_tag_line_parses_in_linear_time(
     tmp_path: Path, adversarial_line: str,
 ) -> None:
     path = _write(tmp_path, BODY + adversarial_line + "\n" + ZERO_FOOTER)
 
-    started = time.process_time()
     analysis = _analyze_review_file(path)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(_analyze_review_file, path)
 
     assert elapsed < PARSE_BOUND_SECONDS, f"parse took {elapsed:.2f}s"
     assert analysis.verdict == REVIEW_VERDICT_OK

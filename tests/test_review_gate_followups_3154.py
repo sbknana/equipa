@@ -36,7 +36,7 @@ from tests.test_review_gate_no_exemptions_3152 import (
     gate_blocks,
 )
 
-# --- R3152-02: MEDIUM keeps exactly main's exemptions ----------------------------
+# --- R3152-02: MEDIUM kept exactly main's exemptions (none since task 3161) -------
 
 # The seven R3149-02 bodies with MEDIUM in place of CRITICAL or HIGH. Main
 # blocks every one ("unaccounted severity token"); task 3152 trusted them
@@ -65,14 +65,15 @@ def test_medium_r3149_02_shapes_are_untrusted_as_on_main(body, context):
     analysis = analyze(build_review(body, context))
     assert not analysis.trusted, analysis
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
-    assert analysis.detail.startswith(loops.BACKSTOP_MEDIUM_REASON), (
-        analysis.detail)
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
     assert gate_blocks(build_review(body, context))
 
 
-# Negations main excused keep merging: an unaccounted MEDIUM is the defect,
-# a reconciled one never blocks.
-MEDIUM_NEGATIONS_THAT_MERGE = [
+# Negations main excused, which merged under the MEDIUM exemptions. Task 3161
+# deleted the exemptions (five rounds of holes), so every one blocks; the
+# same prose in lower case (what the prompt asks for) merges.
+MEDIUM_NEGATIONS = [
     ["The page needs a login, so this is not MEDIUM."],
     ["Kept at LOW rather than MEDIUM."],
     ["There are no MEDIUM findings."],
@@ -81,11 +82,16 @@ MEDIUM_NEGATIONS_THAT_MERGE = [
 
 
 @pytest.mark.parametrize("context", CONTEXTS)
-@pytest.mark.parametrize("body", MEDIUM_NEGATIONS_THAT_MERGE)
-def test_reconciled_medium_negations_still_merge(body, context):
+@pytest.mark.parametrize("body", MEDIUM_NEGATIONS)
+def test_medium_negations_block(body, context):
     analysis = analyze(build_review(body, context))
-    assert analysis.trusted, analysis
-    assert not gate_blocks(build_review(body, context))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
+    assert gate_blocks(build_review(body, context))
+    lower = [line.replace("MEDIUM", "medium") for line in body]
+    assert analyze(build_review(lower, context)).trusted, lower
+    assert not gate_blocks(build_review(lower, context))
 
 
 # --- R3152-03: the per-task reviewer text states the lower-case rule --------------
@@ -132,21 +138,41 @@ async def test_reviewer_task_text_states_the_lower_case_rule(tmp_path):
     description = await _reviewer_task_description(tmp_path)
     assert "ordinary prose is fine" not in description
     assert "write critical, high and medium in lower case" in description
-    assert ("Write CRITICAL and HIGH in UPPER case only as the severity label "
-            "of a finding heading and on the single `## Counts` footer line"
-            ) in description
+    # Task 3161: the rule covers MEDIUM too.
+    assert ("Write CRITICAL, HIGH and MEDIUM in UPPER case only as the "
+            "severity label of a finding heading and on the single "
+            "`## Counts` footer line") in description
+    assert "any other UPPER-case CRITICAL, HIGH or MEDIUM" in description
     assert "BLOCKS the merge" in description
 
 
-def test_a_counted_medium_finding_does_not_block_the_merge():
-    text = build_review(["MEDIUM issue: stored XSS in app/view.py:7."], "zero")
-    text = text.replace("MEDIUM: 0 | LOW: 0", "MEDIUM: 1 | LOW: 0").replace(
+def _counted_medium_review(prose: str) -> str:
+    """A review with one counted MEDIUM finding [M1] and ``prose`` in its
+    section."""
+    text = build_review([prose], "zero")
+    return text.replace("MEDIUM: 0 | LOW: 0", "MEDIUM: 1 | LOW: 0").replace(
         "## Findings\n", "## Findings\n### [M1] MEDIUM \N{EM DASH} stored XSS"
         "\nDetails.\n")
+
+
+def test_a_counted_medium_finding_does_not_block_the_merge():
+    text = _counted_medium_review("medium issue: stored XSS in app/view.py:7.")
     analysis = analyze(text)
     assert analysis.trusted, analysis
     assert analysis.counts["MEDIUM"] == 1
     assert not gate_blocks(text)
+
+
+def test_a_counted_medium_repeated_in_its_section_blocks():
+    """Task 3161: the section exemption is deleted, so the finding's own
+    severity repeated in UPPER case in its section is unaccounted (this
+    merged under task 3154)."""
+    text = _counted_medium_review("MEDIUM issue: stored XSS in app/view.py:7.")
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        loops.backstop_reason("MEDIUM") + " at line "), analysis.detail
+    assert gate_blocks(text)
 
 
 # --- I3152-01: a deleted character separates words --------------------------------
@@ -321,12 +347,12 @@ def _standalone_severities(line: str) -> set[str]:
     found = set()
     for view, origins in loops._backstop_views(folded):
         found |= {severity for _, severity in
-                  loops._backstop_tokens(view, origins, {})}
+                  loops._backstop_tokens(view, origins)}
     separated = loops._backstop_separated_text(line)
     if separated is not None:
         for view, origins in loops._backstop_views(separated, links=False):
             found |= {severity for _, severity in loops._backstop_tokens(
-                view, origins, {}, separated=True)}
+                view, origins, separated=True)}
     return found
 
 

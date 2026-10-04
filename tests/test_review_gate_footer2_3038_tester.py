@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from equipa.loops import (
-    BACKSTOP_REASON,
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_INCOMPLETE,
     REVIEW_VERDICT_OK,
@@ -31,8 +31,15 @@ from equipa.loops import (
     _analyze_review_views,
     _blank_code,
     _count_findings_in_review_file,
+    backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
+)
 
 
 def _rules_analysis(path: Path):
@@ -47,7 +54,7 @@ def _assert_backstop_blocks(path: Path) -> None:
     blocked the merge before as well, by HIGH=1)."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith(BACKSTOP_REASON + " at line "), analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
     assert _count_findings_in_review_file(path) is None
 
 BODY = "# Security Review\n\n## Summary\nReviewed the diff.\n\n## Findings\n\n"
@@ -93,7 +100,7 @@ def _assert_only_the_backstop_blocks(path: Path) -> None:
     UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
     analysis = _analyze_review_file(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
 
 

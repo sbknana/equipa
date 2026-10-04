@@ -46,6 +46,13 @@ from equipa.security_gate import (
     reviewer_run_failure,
     verify_reviewer_provenance,
 )
+from tests.review_gate_timing import median_cpu_seconds, timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
 
 NONCE = "0123456789abcdef0123456789abcdef"
 OTHER_NONCE = "fedcba9876543210fedcba9876543210"
@@ -126,7 +133,7 @@ def assert_only_the_backstop_blocks(text: str) -> None:
     analysis = loops._analyze_review_file(
         Path("SECURITY-REVIEW-94300.md"), text=text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-    assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
 
 
@@ -416,25 +423,24 @@ def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention)
     "- Severity" + " " * 50000 + "level",
     "- x (" + " " * 50000 + "HIGH" + " " * 50000 + "x",
 ], ids=["severity-spaces", "severity-level-spaces", "list-paren-spaces"])
+@timing_test
 def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
     """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds."""
-    import time
-
     text = review_body(footer=ONE_LOW_FOOTER).replace("Details.", line)
     path = tmp_path / "SECURITY-REVIEW-94400.md"
     path.write_text(text, encoding="utf-8")
-    start = time.process_time()
     analysis = loops._analyze_review_file(path, text=text)
-    assert time.process_time() - start < 2.0
+    assert median_cpu_seconds(loops._analyze_review_file, path,
+                              text=text) < 2.0
     if SEVERITY_TOKEN.search(line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
         # only; the rules still read the padded line as prose.
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
-        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line ")
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         text = lowercase_severity_words(text)
-        start = time.process_time()
         analysis = loops._analyze_review_file(path, text=text)
-        assert time.process_time() - start < 2.0
+        assert median_cpu_seconds(loops._analyze_review_file, path,
+                                  text=text) < 2.0
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 

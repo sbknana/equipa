@@ -411,6 +411,12 @@ class ProvenanceVerdict:
     ``text`` is the decoded content of the exact bytes ``fingerprint`` hashed
     (SR41-02): callers count findings from it rather than re-reading the
     path, so the verified bytes and the parsed bytes are the same bytes.
+
+    Task 3164 (R3161-01): ``text`` is the review AS WRITTEN, never its
+    normalised form. The finding parser normalises it itself, and some of its
+    views (the separated reading of task 3154, the fold-before-NFKC copy of
+    task 3143) are built from the characters normalisation deletes or folds,
+    so a normalised ``text`` would hide "Rated<U+3164>HIGH" from all of them.
     """
 
     trusted: bool
@@ -561,11 +567,13 @@ def verify_reviewer_provenance(
         pre-#3041 artifact-only trust (reason ``no-reviewer-run-recorded``).
 
     The artifact is read ONCE (SR41-02): the fingerprint, the nonce check and
-    the returned ``text`` all come from the same bytes. The text is
-    normalised ONCE here (gate-09 / gate-14) with
-    :func:`normalize_review_text`, so the nonce check, the completion
-    sentinel and the finding parser all see the same ``\\n``-separated lines
-    whatever line breaks or invisible characters the file used.
+    the returned ``text`` all come from the same bytes. The nonce check and
+    the completion sentinel read the text normalised with
+    :func:`normalize_review_text` (gate-09 / gate-14), so they see the same
+    ``\\n``-separated lines whatever line breaks or invisible characters the
+    file used. The returned ``text`` is the text as written (task 3164,
+    R3161-01): the finding parser normalises it itself, after reading the
+    characters normalisation would delete.
     """
     snapshot = snapshot_artifact(review_path)
     fingerprint = snapshot.fingerprint
@@ -575,7 +583,7 @@ def verify_reviewer_provenance(
 
     def verdict(trusted: bool, reason: str) -> ProvenanceVerdict:
         return ProvenanceVerdict(
-            trusted, reason, fingerprint, text=text, record=record,
+            trusted, reason, fingerprint, text=raw_text, record=record,
         )
 
     # Task 3149 (R3143-07): the normalised text has lost its bidi controls,

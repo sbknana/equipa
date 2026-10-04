@@ -21,13 +21,19 @@ Copyright 2026 Forgeborn
 
 import random
 import re
-import time
 from pathlib import Path
 
 import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_timing import median_cpu_seconds, timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
 
 NONCE = "0123456789abcdef0123456789abcdef"
 ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
@@ -87,7 +93,7 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         analysis = analyze(review("1 finding.", ["## Notes", ""] + body,
                                   ONE_LOW, low_heading=True))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith("unaccounted CRITICAL/HIGH token at line "), (
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
             body, analysis.detail)
 
 
@@ -356,7 +362,7 @@ def test_honest_review_of_the_new_shapes_merges():
     upper = [line.replace("high:", "HIGH:") for line in body]
     blocked = analyze(review("1 finding.", upper, footer, low_heading=False))
     assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
-    assert blocked.detail.startswith(loops.BACKSTOP_REASON + " at line ")
+    assert blocked.detail.startswith(BLOCKING_TOKEN_REASONS)
 
 
 # --- prompt: the format rule claims only what the gate counts --------------------
@@ -506,6 +512,7 @@ REVIEW_BYTES = 200 * 1024
     "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
     "\N{PARAGRAPH SEPARATOR}",
 ])
+@timing_test
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     # Inside the Summary section, and after a heading that ends it (where
@@ -514,9 +521,8 @@ def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     body = section + [line_break * (REVIEW_BYTES // len(line_break.encode()))]
     text = review("No findings.", body, ZERO, low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
 
@@ -572,14 +578,13 @@ ADVERSARIAL_BODIES = {
 }
 
 
+@timing_test
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
 def test_200kb_adversarial_review_parses_under_one_second(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    started = time.process_time()
-    analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
 
 
@@ -597,12 +602,12 @@ BOLD_OPENER_BYTES = 32 * 1024
     "<strong>" + "\N{NO-BREAK SPACE}" * BOLD_OPENER_BYTES,
     "<b>" + "`` " * (BOLD_OPENER_BYTES // 3),
 ])
+@timing_test
 def test_blanks_after_a_bold_opener_parse_in_linear_time(line):
     text = review("No findings.", ["## Findings", "", line], ZERO,
                   low_heading=False)
-    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line[:12]!r}: {elapsed:.2f}s"
 
@@ -634,13 +639,13 @@ PIPE_FLOODS = {
 
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 @pytest.mark.parametrize("name", sorted(PIPE_FLOODS))
+@timing_test
 def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
         name, section):
     text = review("No findings.", section + [PIPE_FLOODS[name]], ZERO,
                   low_heading=False)
-    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
@@ -660,12 +665,12 @@ COMMENT_LINE_FLOODS = {
 
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 @pytest.mark.parametrize("name", sorted(COMMENT_LINE_FLOODS))
+@timing_test
 def test_200kb_line_of_comments_parses_in_half_a_second(name, section):
     text = review("No findings.", section + [COMMENT_LINE_FLOODS[name]], ZERO,
                   low_heading=False)
-    started = time.process_time()
     analysis = analyze(text)
-    elapsed = time.process_time() - started
+    elapsed = median_cpu_seconds(analyze, text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
