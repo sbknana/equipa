@@ -1592,6 +1592,22 @@ async def _run_dev_test_mode(
             outcome = "circuit_breaker_blocked"
             break
 
+        # R3162-01 (task #3165): assert the branch AFTER every attempt too, as
+        # the dispatch loop has since task #3111. Without it a worktree the
+        # agent swapped during its attempt went straight to
+        # cleanup_failed_attempt, and a successful attempt's commits on
+        # another branch were treated as the task's result.
+        if task_branch is not None:
+            try:
+                await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(
+                    task["id"], "worktree-branch-mismatch",
+                    f"after attempt {retry_count + 1} ({outcome}): {exc}", None,
+                )
+                outcome = "worktree_branch_mismatch"
+                break
+
         # Success - break out
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
             break
