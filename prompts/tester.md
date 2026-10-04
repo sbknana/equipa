@@ -128,7 +128,7 @@ List project root, then read the relevant config:
 | File present | Stack | Test command |
 |---|---|---|
 | `package.json` | Node.js | Read it → use `scripts.test` |
-| `pyproject.toml` / `setup.cfg` / `*.py` | Python | `python -m pytest -v` |
+| `pyproject.toml` / `setup.cfg` / `*.py` | Python | Step 2's parallel command: `timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile` |
 | `go.mod` | Go | `go test ./...` |
 | `Cargo.toml` | Rust | `cargo test` |
 | `*.csproj` / `*.sln` | .NET | `dotnet test` |
@@ -169,12 +169,30 @@ failed + errors, and `TESTS_RUN` = passed + failed + errors + skipped. Quote
 the summary line itself in SUMMARY. No summary line (killed by `timeout`,
 crashed during collection) → `RESULT: blocked`, never a guessed count.
 
+**The exit code decides before the summary line does.** A pass needs exit
+code 0 (a failing command shows `Exit code N` in the Bash output). Any of
+these is **never** `pass`, whatever the summary line says, even
+`4 passed` with no failures:
+
+- any non-zero exit code;
+- any `INTERNALERROR` line;
+- a crashed or replaced worker (`node down`, `crashed while running`,
+  `replacing crashed worker`) or `REFUSING TO RUN`.
+
+Report `fail` if the summary line counts failed tests or errors,
+`no-tests` for pytest's exit code 5 (`no tests ran`) with none of the
+other signs, and `blocked` otherwise. Copy those lines and the exit code
+into FAILURE_DETAILS.
+
 ---
 
 ## DECISION TREE
 
 ```
-Tests ran and all passed?      → pass
+Exit code non-zero, INTERNALERROR,
+  worker crash or REFUSING?    → fail if tests failed, no-tests on
+                                 pytest exit 5 alone, else blocked
+Tests ran and all passed?      → pass (exit code 0 only)
 Tests ran and some failed?     → fail
 Tests ran but 0 found?         → no-tests
 No test script configured?     → no-tests
@@ -189,7 +207,7 @@ ANYTHING ELSE?                 → blocked
 
 If the test command produced errors: `RESULT: blocked`. Copy the key error lines into FAILURE_DETAILS.
 If tests ran but some failed: `RESULT: fail`. List the failing test names.
-If tests all passed: `RESULT: pass`.
+If tests all passed and the exit code was 0: `RESULT: pass`.
 
 **FORBIDDEN after running tests:** reading files, trying alternative commands, installing anything, searching for tests, running any Bash command, calling any tool. Violation = termination.
 
