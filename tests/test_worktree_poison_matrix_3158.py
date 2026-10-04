@@ -19,6 +19,11 @@ program ran while the cleanup still did its job.
   lands on the base, the worktree is gone).
 * Whole isolated runs (success, failure, early termination) plant the
   vector from inside the agent and run the real post-agent path.
+* R3162-01 (task #3165): two vectors replace the worktree root with a
+  symlink, to the agent's own repository or to a worktree that repository
+  registers. Every operation must then refuse (``Operation.refused``) and
+  leave both repositories as they were; the single-task CLI loop must stop
+  at its post-attempt branch check, before any cleanup.
 
 Every check snapshots the markers right after the orchestrator's call; a
 failure reads ``EXECUTED <vector>/<operation>: [<markers>]``.
