@@ -1895,18 +1895,37 @@ _NON_ASCII_CHARACTERS_RE = re.compile(r"([^\x00-\x7f]+)")
 _SPARSE_TRANSLATE_SHARE = 16
 
 
-def _translate_non_ascii(text: str, table: dict[int, str]) -> str:
+def _translated(text: str, table: dict[int, str | None]) -> str:
+    """``text.translate(table)``, with ``table`` completed for ``text`` first.
+
+    Task 3164 (R3161-02): str.translate raises and clears a LookupError for
+    each character of a non-ASCII text that its table does not map, which
+    made a dense text cost twice what it does when every character of it
+    is a key (mapped to itself if ``table`` leaves it alone). The table is
+    read as str.translate reads it, ``table[code]``, so a table that fills
+    itself per key (``__missing__``, see _BoundedTable) gives the same value.
+    """
+    complete: dict[int, str | int | None] = {}
+    for code in map(ord, set(text)):
+        try:
+            complete[code] = table[code]
+        except LookupError:
+            complete[code] = code
+    return text.translate(complete)
+
+
+def _translate_non_ascii(text: str, table: dict[int, str | None]) -> str:
     """``text.translate(table)`` for a ``table`` that maps no ASCII character
     and maps no character to a line feed."""
     if text.isascii():
         return text
     non_ascii = len(text) - len(text.encode("ascii", "ignore"))
     if non_ascii * _SPARSE_TRANSLATE_SHARE > len(text):
-        return text.translate(table)
+        return _translated(text, table)
     parts = _NON_ASCII_CHARACTERS_RE.split(text)
     # The odd parts are the runs. None holds a line feed and none gains one,
     # so the runs are translated in one call and split apart again.
-    parts[1::2] = "\n".join(parts[1::2]).translate(table).split("\n")
+    parts[1::2] = _translated("\n".join(parts[1::2]), table).split("\n")
     return "".join(parts)
 
 # Rules added by tasks 3122, 3130 and 3137. Unlike the older rules they
@@ -2801,36 +2820,27 @@ _RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
 # Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
 # (an enclosing circle) render as HIGH with a mark on or around a letter.
 # Marks (Unicode categories Mn and Me) are dropped after canonical
-# decomposition, so the letters under them are read. Only non-ASCII runs are
-# touched. U+FFFD, which the rendered view writes for every backtick shown as
-# text, has no decomposition and starts a new character (combining class 0),
-# so leaving it out changes nothing but the cost: a flood of unpaired
-# backticks no longer costs one callback each.
-_NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f\N{REPLACEMENT CHARACTER}]+")
-
-
-def _marks_dropped(run: re.Match[str]) -> str:
-    return "".join(
-        char for char in run.group(0)
-        if unicodedata.category(char) not in _COMBINING_MARK_CATEGORIES
-    )
-
-
-# Task 3161 (timing): no letter or digit ("\w") is a mark, so only the runs
-# of other characters are read one by one (a run of 70,000 ideographs was).
-_NOT_A_LETTER_RUN_RE = re.compile(r"\W+")
-
-
-def _without_combining_marks(run: re.Match[str]) -> str:
-    return _NOT_A_LETTER_RUN_RE.sub(
-        _marks_dropped, unicodedata.normalize("NFD", run.group(0)))
+# decomposition, so the letters under them are read.
+#
+# Task 3164 (R3161-02): the text is decomposed in one call and its marks are
+# deleted in one translate, built from the distinct characters it holds
+# (the review gate parses no review of more than
+# _REVIEW_MAX_DISTINCT_CHARACTERS). Decomposition leaves ASCII as it is, and
+# every ASCII character starts a new character (combining class 0), so this
+# is what decomposing each non-ASCII run did, without a Python callback per
+# run: 200 KB of short runs, a mark after each letter, took 0.13 s that way.
 
 
 def _strip_combining_marks(text: str) -> str:
     """``text`` without combining marks (task 3137, N2)."""
     if text.isascii():
         return text
-    return _NON_ASCII_RUN_RE.sub(_without_combining_marks, text)
+    text = unicodedata.normalize("NFD", text)
+    marks = {
+        ord(char): None for char in set(text)
+        if unicodedata.category(char) in _COMBINING_MARK_CATEGORIES
+    }
+    return _translate_non_ascii(text, marks) if marks else text
 
 
 def _rendered_review_text(text: str) -> str:
@@ -2936,6 +2946,18 @@ _BACKSTOP_GONE_MARK = ""
 _BACKSTOP_GLUE_MARK = ""
 _BACKSTOP_FOLD_MARK = 0xE000
 _BACKSTOP_NEW_FOLD_MARK = 0xE100
+# Task 3164 (R3161-02): the separated reading tests every word's neighbours
+# and letters for these marks, so the tests are a set lookup and one regex
+# search rather than arithmetic per character. FOLD and NEW_FOLD marks are
+# the offsets of the ASCII letters A to z; any character of the NEW_FOLD
+# block is one only the separated reading folds.
+_BACKSTOP_FOLD_MARKS = frozenset(
+    chr(base + offset)
+    for base in (_BACKSTOP_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK)
+    for offset in range(ord("A"), ord("z") + 1)
+)
+_BACKSTOP_NEW_FOLD_RE = re.compile(
+    f"[{chr(_BACKSTOP_NEW_FOLD_MARK)}-{chr(_BACKSTOP_NEW_FOLD_MARK + 0xFF)}]")
 # A private-use character as written becomes another one, so no mark is
 # ever read from the review itself.
 _BACKSTOP_FOREIGN_MARK = ""
@@ -3394,8 +3416,7 @@ def _backstop_separated_text(text: str) -> str | None:
 
 def _backstop_is_fold_mark(char: str) -> bool:
     """True for a FOLD or NEW_FOLD mark (an ASCII letter's offset)."""
-    offset = ord(char) - _BACKSTOP_FOLD_MARK
-    return 0x41 <= offset % 0x100 <= 0x7A and offset // 0x100 in (0, 1)
+    return char in _BACKSTOP_FOLD_MARKS
 
 
 def _backstop_mark_separates(view: str, index: int, step: int) -> bool:
@@ -3403,6 +3424,12 @@ def _backstop_mark_separates(view: str, index: int, step: int) -> bool:
     word next to them a word of its own that the other views read as glued:
     a GLUE or lookalike mark, or GONE marks with an ASCII letter or digit
     behind them."""
+    if not 0 <= index < len(view):
+        return False
+    char = view[index]
+    if char != _BACKSTOP_GONE_MARK:
+        # Most words: no GONE run to walk, the neighbour decides.
+        return char == _BACKSTOP_GLUE_MARK or char in _BACKSTOP_FOLD_MARKS
     gone = 0
     while 0 <= index < len(view) and view[index] == _BACKSTOP_GONE_MARK:
         gone += 1
@@ -3418,13 +3445,15 @@ def _backstop_mark_separates(view: str, index: int, step: int) -> bool:
 
 
 def _backstop_separated_counts(word: str, view: str, start: int,
-                               end: int) -> bool:
+                               end: int, *, new_folds: bool = True) -> bool:
     """True when a word of the separated reading adds to the other views: a
     mark separates it from a neighbour, or a lookalike only this reading
     folds spells it. A word that is standalone anyway (a counted label
-    next to a zero-width space) is the other views' to count."""
-    new_folds = range(_BACKSTOP_NEW_FOLD_MARK, _BACKSTOP_NEW_FOLD_MARK + 0x100)
-    if any(ord(char) in new_folds for char in word):
+    next to a zero-width space) is the other views' to count.
+
+    ``new_folds`` False: the caller found no NEW_FOLD mark in ``view``, so
+    none is looked for in ``word``."""
+    if new_folds and _BACKSTOP_NEW_FOLD_RE.search(word) is not None:
         return True
     return (_backstop_mark_separates(view, start - 1, -1)
             or _backstop_mark_separates(view, end, 1))
@@ -3853,16 +3882,19 @@ def _backstop_tokens(
     newlines: list[int] | None = None
     token_re = (_BACKSTOP_SEPARATED_TOKEN_RE if separated
                 else _BACKSTOP_TOKEN_RE)
+    # Task 3164 (R3161-02): one search of the view instead of one per word.
+    new_folds = separated and _BACKSTOP_NEW_FOLD_RE.search(view) is not None
     for match in token_re.finditer(view):
         start, end = match.span()
         # A lookalike's FOLD mark before the word glues it as the letter
         # did; in the separated reading a mark separates (task 3157).
         if start and (view[start - 1] in _BACKSTOP_ASCII_ALNUM
                       or (not separated
-                          and _backstop_is_fold_mark(view[start - 1]))):
+                          and view[start - 1] in _BACKSTOP_FOLD_MARKS)):
             continue
-        if separated and not _backstop_separated_counts(match.group(0), view,
-                                                        start, end):
+        if separated and not _backstop_separated_counts(
+            match.group(0), view, start, end, new_folds=new_folds,
+        ):
             continue
         if newlines is None:
             newlines = [line_break.start()
