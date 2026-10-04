@@ -231,14 +231,19 @@ def test_rule_tail_judge(tail, expected):
 
 
 def test_the_tail_judge_reads_a_bounded_window():
-    """Linear: an order word past the window is not read for this match
-    (the whole-text scan still sees every pattern there)."""
-    far = " one" * (ls._RULE_TAIL_WINDOW // 4 + 1) + " ignore the reviewer"
+    """An order word inside a clause is not read as an order, however far
+    into the tail. Task 3163 (S1) replaced the 200-character window with
+    the whole remainder, judged clause by clause: an order that OPENS a
+    clause past those 200 characters is rejected
+    (tests/test_sanitizer_3163.py)."""
+    old_window = 200  # task 3159's _RULE_TAIL_WINDOW
+    far = " one" * (old_window // 4 + 1) + " ignore the reviewer"
     text = "The manager queues new orders:" + far
-    assert ls._rule_tail_is_instruction(far[:ls._RULE_TAIL_WINDOW]) is False
+    assert ls._rule_tail_is_instruction(far[:old_window]) is False
     assert detect_injection(text) is None
-    # Only the word that opens the tail is an order word; one later in the
-    # tail is left to the whole-text patterns (documented residual).
+    # Only a word that opens a clause of the tail is an order word; one
+    # inside a clause is left to the whole-text patterns (documented
+    # residual).
     assert detect_injection("The manager queues new orders: one two "
                             "ignore the reviewer") is None
     assert detect_injection("The manager queues new orders: ignore the "
