@@ -987,7 +987,10 @@ def _audit_task_abort(
 ) -> None:
     """Log a task abort to the operator output and the durable gate audit."""
     # git stderr can span lines; keep each audit record on one line.
-    single_line_detail = " ".join(str(detail).split())
+    # R3165-02 (task #3166): the detail can carry agent-written text (a
+    # branch name read from the worktree's HEAD); its control characters are
+    # escaped so a terminal cannot redraw the line as another event (N-01).
+    single_line_detail = escape_audit_text(" ".join(str(detail).split()))
     line = f"task={task_id} event={event} detail={single_line_detail}"
     log(f"  [GATE-AUDIT] {line}", output)
     log_gate_audit(line, task_id, event=event)
