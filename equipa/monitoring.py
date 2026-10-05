@@ -11,12 +11,9 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
-import contextvars
 import hashlib
 import os
 import subprocess
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 from equipa.constants import (
     BUDGET_CHECK_INTERVAL,
@@ -32,7 +29,11 @@ from equipa.constants import (
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
 )
-from equipa.git_ops import git_run
+from equipa.git_ops import (  # noqa: F401  (re-exported)
+    dispatched_without_git,
+    git_checks_allowed,
+    git_run,
+)
 from equipa.hooks import fire as fire_hook_sync
 
 # --- Compaction Detection Constants ---
@@ -255,59 +256,12 @@ def _check_cost_limit(
 
 
 # --- Projects that were not git at dispatch (R3166-01, task #3168) ---
-
-# The given and the resolved form of every project directory a dispatch in
-# this context recorded as not git. A ContextVar, so each task of the
-# parallel loop (its own asyncio task) sees only the records of its own run.
-_NON_GIT_PROJECT_ROOTS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
-    "equipa_non_git_project_roots", default=frozenset(),
-)
-
-
-def _path_forms(directory: str | os.PathLike[str]) -> set[str]:
-    """The absolute and the symlink-resolved form of ``directory``."""
-    path = os.fspath(directory)
-    return {os.path.abspath(path), os.path.realpath(path)}
-
-
-@contextmanager
-def dispatched_without_git(project_dir: str | os.PathLike[str]) -> Iterator[None]:
-    """Record, while the block runs, that ``project_dir`` was not a git
-    repository when its task was dispatched.
-
-    R3166-01 (task #3168): a ``.git`` found there later is one an agent
-    made. Git run there by discovery reads the agent's config and
-    attributes, so a work-tree ``git diff`` runs the agent's clean filter
-    as a child of the orchestrator, outside agent containment. While the
-    record is active, the change checks of this module (and
-    :func:`equipa.parsing.verify_files_changed`) run no git at or under
-    ``project_dir``, in its given or its resolved form. Nesting is safe:
-    an inner record only adds paths.
-    """
-    roots = _NON_GIT_PROJECT_ROOTS.get() | _path_forms(project_dir)
-    token = _NON_GIT_PROJECT_ROOTS.set(frozenset(roots))
-    try:
-        yield
-    finally:
-        _NON_GIT_PROJECT_ROOTS.reset(token)
-
-
-def git_checks_allowed(directory: str | os.PathLike[str] | None) -> bool:
-    """False when ``directory`` lies in a project :func:`dispatched_without_git`
-    recorded; True otherwise, including when nothing is recorded.
-
-    Both forms of ``directory`` are compared with both recorded forms, so an
-    agent that swaps the project path for a symlink is still matched by the
-    path as given.
-    """
-    roots = _NON_GIT_PROJECT_ROOTS.get()
-    if not roots or not directory:
-        return True
-    for candidate in _path_forms(directory):
-        for root in roots:
-            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
-                return False
-    return True
+#
+# ``dispatched_without_git`` and ``git_checks_allowed`` are imported from
+# equipa.git_ops above and re-exported here. IR73-02 (task #3176): the
+# record lives where git runs, so the process runners refuse every git call
+# in a recorded project; the checks below still ask first, for their own
+# "not git" answers.
 
 
 # --- Git Change Detection ---

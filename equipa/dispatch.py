@@ -1090,8 +1090,16 @@ def _nearest_repository(project_dir: str) -> Path | None:
 # project that would discover it instead of adopting the agent's repository
 # as the project's checkout (``git worktree add`` there ran the agent's
 # smudge filter in the orchestrator). Outside every project tree, next to
-# the operator's TheForge DB: one file per repository location.
+# the operator's TheForge DB: one file per repository location. With
+# THEFORGE_DB unset and the default theforge.db a real file, that is the
+# EQUIPA checkout's root, where .gitignore lists it (IR73-01, task #3176).
 AGENT_REPOSITORY_REFUSALS_DIRNAME = "equipa-agent-repository-refusals"
+
+
+class RefusalStoreError(OSError):
+    """The refusal records' directory is not one EQUIPA can trust: a
+    symlink, not a directory, another user's, or writable by others
+    (IR73-01, task #3176). Records there could be redirected or removed."""
 
 
 class AgentMadeRepositoryError(GitRepositoryUnreadableError):
@@ -1105,9 +1113,45 @@ class AgentMadeRepositoryError(GitRepositoryUnreadableError):
 
 def _agent_repository_refusals_dir() -> Path:
     """The refusal records' directory, read at call time (THEFORGE_DB is
-    set per run and per test)."""
-    database = Path(os.fspath(_equipa_constants.THEFORGE_DB)).absolute()
+    set per run and per test).
+
+    IR73-01 (task #3176): next to the database itself. The database path is
+    symlink-resolved, so a THEFORGE_DB that is (or lies under) a symlink
+    puts the records next to the real database, not next to the link; with
+    THEFORGE_DB unset and the checkout's default theforge.db a link to the
+    operator's database, that is outside the EQUIPA checkout.
+    """
+    database = Path(os.path.realpath(os.fspath(_equipa_constants.THEFORGE_DB)))
     return database.parent / AGENT_REPOSITORY_REFUSALS_DIRNAME
+
+
+def _check_refusal_store(refusals_dir: Path) -> None:
+    """Raise :class:`RefusalStoreError` unless ``refusals_dir`` is a real
+    directory (not a symlink to one) owned by this user and writable by no
+    one else; FileNotFoundError when there is nothing at ``refusals_dir``.
+
+    IR73-01 (task #3176): a symlinked store would put the records wherever
+    the link points, and a store others can write lets them delete records.
+    """
+    try:
+        info = os.lstat(refusals_dir)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise RefusalStoreError(f"{refusals_dir} cannot be examined ({exc})") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise RefusalStoreError(f"{refusals_dir} is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RefusalStoreError(f"{refusals_dir} is not a directory")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise RefusalStoreError(
+            f"{refusals_dir} is owned by uid {info.st_uid}, not by this user"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RefusalStoreError(
+            f"{refusals_dir} is writable by other users "
+            f"(mode {stat.S_IMODE(info.st_mode):o})"
+        )
 
 
 def _refusal_record(refusals_dir: Path, location: str) -> Path:
@@ -1123,12 +1167,15 @@ def _record_agent_made_repository(
     """Record ``repository`` (found by the N1 check) under its location, in
     the form found and the resolved form. Returns the records written.
 
-    Raises OSError when none could be written.
+    Raises OSError when none could be written, :class:`RefusalStoreError`
+    when the store is not a directory EQUIPA can trust (nothing is written
+    through a symlinked store).
     """
     found = os.fspath(repository)
     location = os.path.dirname(found) if os.path.basename(found) == ".git" else found
     refusals_dir = _agent_repository_refusals_dir()
     refusals_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _check_refusal_store(refusals_dir)
     content = json.dumps({
         "repository": found,
         "project_dir": project_dir,
@@ -1150,9 +1197,14 @@ def _agent_made_repository_record(project_dir: str) -> Path | None:
     ``project_dir``, None if there is none. Runs no git.
 
     Fails closed: a record that cannot be examined (anything but "no such
-    file") counts as present.
+    file") counts as present. Raises :class:`RefusalStoreError` when the
+    store exists but is not a directory EQUIPA can trust (IR73-01).
     """
     refusals_dir = _agent_repository_refusals_dir()
+    try:
+        _check_refusal_store(refusals_dir)
+    except FileNotFoundError:
+        return None  # no N1 check has recorded anything yet
     for directory in _walk_up(project_dir):
         record = _refusal_record(refusals_dir, directory)
         try:
@@ -1172,9 +1224,17 @@ def refuse_agent_made_repository(project_dir: str) -> None:
     S3168-03 (task #3173): call before anything runs git in the project at
     dispatch (``_is_git_repo``, ``git worktree add``). The refusal stays
     until the operator, having inspected or removed that repository,
-    deletes the record named in the message.
+    deletes the record named in the message. A store that cannot be
+    trusted refuses every project (fail closed, IR73-01).
     """
-    record = _agent_made_repository_record(project_dir)
+    try:
+        record = _agent_made_repository_record(project_dir)
+    except RefusalStoreError as exc:
+        raise AgentMadeRepositoryError(
+            f"{project_dir}: the records of repositories EQUIPA refuses cannot be "
+            f"trusted: {exc}. Refusing to run git there: make it a directory owned "
+            f"by this user and writable by no one else, keeping the records in it."
+        ) from exc
     if record is None:
         return
     raise AgentMadeRepositoryError(

@@ -60,6 +60,11 @@ forgesmith.log
 # Agent state persistence (anti-compaction, ephemeral working state)
 .forge-state.json
 
+# Refused agent repositories (equipa/dispatch.py, IR73-01): kept next to the
+# TheForge DB, so in the checkout root when THEFORGE_DB is unset and the
+# default theforge.db is a real file. Operator state: never commit it.
+/equipa-agent-repository-refusals/
+
 # Security audit reports (contain pre-refactor vulnerability details)
 SECURITY-AUDIT-REPORT.md
 
