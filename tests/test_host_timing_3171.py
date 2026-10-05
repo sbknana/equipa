@@ -13,6 +13,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import ast
+import gc
 import math
 import subprocess
 import sys
@@ -507,6 +508,62 @@ def test_growth_ratio_raises_the_small_time_to_the_floor():
     assert growth_ratio(0.0, 0.004) == 0.004 / GROWTH_FLOOR_SECONDS
     assert growth_ratio(0.0006, 0.0052) == 0.0052 / GROWTH_FLOOR_SECONDS
     assert growth_ratio(0.05, 0.2) == pytest.approx(4.0)
+
+
+def test_a_heap_sized_collection_pause_does_not_fail_linear_work():
+    """Task 3175: a linear tokenizer scan read 0.0129 s against 0.1341 s in a
+    long full-suite worker, where a full collection of the worker's heap
+    landed in each larger scan. Modelled as a 0.1 s pause that only a
+    larger call takes, and only while the collector may run: unpaused, the
+    ratio would read (0.0516 + 0.1) / 0.0129, about 11.8x."""
+    calls_with_the_collector_enabled: list[int] = []
+
+    def seconds_at(size: int) -> float:
+        if gc.isenabled():
+            calls_with_the_collector_enabled.append(size)
+        collection_pause = 0.1 if gc.isenabled() and size == 16_384 else 0.0
+        return 0.0129 * size / 4096 + collection_pause
+
+    timing = assert_linear_time(seconds_at, 16_384, 1.0, "scan")
+    assert calls_with_the_collector_enabled == []
+    # Linear readings under the floor are taken once (0.0129 s raised to it).
+    assert timing.repetitions == 1
+    assert timing.ratio == pytest.approx(0.0516 / GROWTH_FLOOR_SECONDS)
+
+
+def test_the_collector_is_paused_only_inside_each_timed_call():
+    states: list[bool] = []
+
+    def seconds_at(size: int) -> float:
+        states.append(gc.isenabled())
+        return 1e-6 * size
+
+    assert gc.isenabled()
+    assert_linear_time(seconds_at, 40_000, 0.5, "paused")
+    assert states and not any(states)
+    assert gc.isenabled()
+
+
+def test_a_disabled_collector_stays_disabled_and_a_failure_restores_it():
+    gc.disable()
+    try:
+        with host_timing.collector_paused():
+            assert not gc.isenabled()
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
+    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+        assert_linear_time(_model(1e-10, 2), 40_000, 1.0, "quad")
+    assert gc.isenabled()
+
+
+def test_the_reference_runs_with_the_collector_paused(monkeypatch):
+    states: list[bool] = []
+    monkeypatch.setattr(host_timing, "reference_workload",
+                        lambda: states.append(gc.isenabled()))
+    host_timing.reference_samples(3)
+    assert states == [False, False, False]
+    assert gc.isenabled()
 
 
 # --- The fence: every timing test is calibrated or a listed deadline -------------

@@ -69,13 +69,15 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import gc
 import math
 import os
 import statistics
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, TypeVar
+from typing import Callable, Iterator, Mapping, TypeVar
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
 
@@ -132,6 +134,34 @@ class HostTooSlowError(TimingCheckFailed):
     """The factor measured around a measurement is over ``MAX_HOST_FACTOR``."""
 
 
+@contextlib.contextmanager
+def collector_paused() -> Iterator[None]:
+    """Keep the cyclic garbage collector from running inside a timed call,
+    as ``timeit`` does. A full collection walks the whole heap of the
+    process, so its pause depends on what earlier tests left alive, not on
+    the timed input: in a worker holding 6 million objects one took 0.12 s
+    inside a 0.05 s scan, and the larger size (allocating 4x as much)
+    triggers more of them (task 3175: a linear scan read 0.0129 s against
+    0.1341 s). The collector's previous state is restored afterwards."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def _collector_paused_calls(seconds_at: Callable[[int], T]
+                            ) -> Callable[[int], T]:
+    """``seconds_at`` with the collector paused around each call."""
+    @functools.wraps(seconds_at)
+    def paused(size: int) -> T:
+        with collector_paused():
+            return seconds_at(size)
+    return paused
+
+
 def reference_workload(iterations: int = REFERENCE_ITERATIONS) -> int:
     """Fixed pure-Python work of the kinds the timed code does: calls,
     integer arithmetic, string building and slicing, dict and list use."""
@@ -148,12 +178,14 @@ def reference_workload(iterations: int = REFERENCE_ITERATIONS) -> int:
 
 
 def reference_samples(runs: int) -> list[float]:
-    """The CPU time of each of ``runs`` calls of ``reference_workload``."""
+    """The CPU time of each of ``runs`` calls of ``reference_workload``,
+    with the collector paused as it is around a timed call."""
     times = []
     for _ in range(runs):
-        started = time.process_time()
-        reference_workload()
-        times.append(time.process_time() - started)
+        with collector_paused():
+            started = time.process_time()
+            reference_workload()
+            times.append(time.process_time() - started)
     return times
 
 
@@ -418,6 +450,7 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     with the input then fails at the larger size too."""
     if size < GROWTH:
         raise ValueError(f"size {size} has no quarter to compare against")
+    seconds_at = _collector_paused_calls(seconds_at)
     if compare_with_larger:
         small_size, large_size = size, size * GROWTH
     else:
