@@ -33,6 +33,7 @@ import hashlib
 import html
 import html.entities
 import itertools
+import random
 import re
 import unicodedata
 from pathlib import Path
@@ -404,3 +405,83 @@ def test_200kb_of_references_is_checked_in_time(body):
     assert len(text) > 200_000
     assert loops._character_outside_gate_unicode_data(text, None) is None
     assert production_seconds(text) < 0.5
+
+
+def test_references_to_table_code_points_are_not_decoded(monkeypatch):
+    """Cycle 3 (3.10 timing): the check decoded every distinct spelling with
+    ``html.unescape``, 0.09 s for 22,000 of them, and the 3143 family
+    eta_then_distinct_reference took 0.51 s in the 3.10 full suite. A
+    reference to a table code point is read from its digits; only one to
+    another code point is decoded."""
+    decoded: list[str] = []
+    unescape = html.unescape
+
+    def counting_unescape(text: str) -> str:
+        decoded.append(text)
+        return unescape(text)
+
+    monkeypatch.setattr(html, "unescape", counting_unescape)
+    assert loops._character_outside_gate_unicode_data(
+        DISTINCT_REFERENCES, None) is None
+    assert decoded == []
+    text = DISTINCT_REFERENCES + "\n&#xA7F2;"
+    assert (loops._character_outside_gate_unicode_data(text, None)
+            == "U+A7F2 reference at line 2")
+    assert "&#xA7F2;" in decoded
+
+
+def _outside_after_decoding(text: str) -> str | None:
+    """The check's expected answer for ``text`` holding one reference and
+    otherwise ASCII: the first character of ``html.unescape(text)`` outside
+    the table, named as the check names a reference."""
+    for char in html.unescape(text):
+        if not loops._in_gate_unicode_table(char):
+            return f"U+{ord(char):04X} reference at line 1"
+    return None
+
+
+# Both sides of every table range edge, every code point html.unescape shows
+# as something other than its own character (NUL, the surrogates, the C1
+# controls, the controls and noncharacters it drops), and the first code
+# points past U+10FFFF and the largest a short digit run names.
+REFERENCE_EDGE_CODE_POINTS = sorted(
+    {code_point + offset
+     for code_point in loops._GATE_UNICODE_EDGES for offset in (-1, 0)
+     if code_point + offset >= 0}
+    | {0, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0x10FFFF, 0x110000, 0xFFFFFF,
+       9_999_999}
+    | set(html._invalid_charrefs) | set(html._invalid_codepoints)
+)
+
+
+@pytest.mark.parametrize("form", ["&#{};", "&#x{:X};", "&#00{}", "&#X0{:x}"])
+def test_a_reference_is_refused_exactly_when_its_decoding_is(form):
+    """Skipping the decoding of a reference to a table code point gives the
+    verdict of decoding it, at every edge where the two could differ."""
+    differ = []
+    for code_point in REFERENCE_EDGE_CODE_POINTS:
+        text = f"a {form.format(code_point)} b"
+        expected = _outside_after_decoding(text)
+        if loops._references_name_only_table_code_points(text):
+            assert expected is None, text
+        found = loops._character_outside_gate_unicode_data(text, None)
+        if found != expected:
+            differ.append((text, found, expected))
+    assert differ == []
+    assert len(REFERENCE_EDGE_CODE_POINTS) > 1_500
+
+
+def test_the_decimal_and_hex_halves_find_the_checked_references():
+    """_GATE_DECIMAL_REFERENCE_RE and _GATE_HEX_REFERENCE_RE find the
+    references and digits _GATE_NUMERIC_REFERENCE_RE finds, so the read
+    without decoding covers every reference the decoding would."""
+    generator = random.Random(3172)
+    alphabet = "&&##xX0019aAfFg; "
+    for _ in range(20_000):
+        text = "".join(generator.choice(alphabet)
+                       for _ in range(generator.randrange(1, 20)))
+        both = loops._GATE_NUMERIC_REFERENCE_RE.findall(text)
+        assert loops._GATE_DECIMAL_REFERENCE_RE.findall(text) == [
+            decimal for decimal, _ in both if decimal], text
+        assert loops._GATE_HEX_REFERENCE_RE.findall(text) == [
+            hexadecimal for _, hexadecimal in both if hexadecimal], text
