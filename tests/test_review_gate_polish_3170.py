@@ -30,11 +30,13 @@ import time
 import pytest
 
 from equipa import loops
+from tests.host_timing import GROWTH, GROWTH_LIMIT, assert_linear_time, budget
 from tests.review_gate_production import blocked_by_the_gate
 from tests.review_gate_timing import median_cpu_seconds, timing_test
 from tests.test_review_gate_backstop_3143 import (
     BACKSTOP_FAMILIES,
     ZERO,
+    backstop_families,
     review,
 )
 from tests.test_review_gate_linear_3167 import (
@@ -117,10 +119,13 @@ def test_resolved_status_edge_cases(line, resolved):
                                   "a)", "sql injection "])
 def test_a_200kb_heading_status_is_read_in_one_pass(unit):
     """The combined regex took 0.03-0.04 s per 200 KB heading on Python
-    3.10, twice per review; the split check 0.002-0.011 s."""
-    line = "### [S1] HIGH " + unit * (RB // len(unit.encode()))
-    elapsed = median_cpu_seconds(loops._ends_in_resolved_status, line)
-    assert elapsed < 0.025, f"{unit!r}: {elapsed:.3f}s"
+    3.10, twice per review; the split check 0.002-0.011 s. Budget
+    host-calibrated, growth from 50 KB to 200 KB linear (task 3171)."""
+    def seconds_at(size):
+        line = "### [S1] HIGH " + unit * (size // len(unit.encode()))
+        return median_cpu_seconds(loops._ends_in_resolved_status, line)
+
+    assert_linear_time(seconds_at, RB, 0.025, repr(unit))
 
 
 @pytest.mark.parametrize("name", DASH_FIXED_FAMILIES)
@@ -200,11 +205,16 @@ def test_the_chained_table_is_not_read_as_two_passes():
 def test_a_200kb_fold_of_one_character_reads_the_text_once(name):
     """str.translate on 200 KB of a dense eta or mark family took about
     0.02 s per call (several calls per review); one str.replace pass is a
-    fraction of that."""
-    text = review("No findings.", BACKSTOP_FAMILIES[name], ZERO)
+    fraction of that. Budget host-calibrated, growth from 50 KB to 200 KB
+    linear (task 3171)."""
     table = loops._BackstopCharacterTable()
-    elapsed = median_cpu_seconds(loops._translated, text, table)
-    assert elapsed < 0.012, f"{name}: {elapsed:.3f}s"
+
+    def seconds_at(rb):
+        text = review("No findings.", backstop_families(rb)[name], ZERO)
+        return median_cpu_seconds(loops._translated, text, table)
+
+    assert_linear_time(seconds_at, RB, 0.012, name)
+    text = review("No findings.", BACKSTOP_FAMILIES[name], ZERO)
     assert loops._translated(text, table) == text.translate(table)
 
 
@@ -219,11 +229,10 @@ GROWTH_UNITS = [
     "a\N{COMBINING ACUTE ACCENT}", "\N{NO-BREAK SPACE}",
 ]
 SMALL_BYTES = 8 * 1024
-GROWTH = 4
-# Linear growth is 4x for 4x the text; quadratic is 16x.
-GROWTH_LIMIT = 8.0
 # Below this a scan's time is mostly noise, and fast whatever its growth.
 GROWTH_FLOOR_SECONDS = 0.004
+# Scaled by the host factor (tests/host_timing.py, task 3171); GROWTH and
+# GROWTH_LIMIT are the shared ones.
 LARGE_BUDGET_SECONDS = 0.05
 # Quadratic on a digit run, and only ever reads `git diff --shortstat`.
 KNOWN_SUPERLINEAR = {"_SHORTSTAT_RE"}
@@ -272,7 +281,7 @@ def test_no_loops_regex_grows_faster_than_linear():
             large_seconds = _best_scan_seconds(pattern, anchored, large)
             small_seconds = _best_scan_seconds(pattern, anchored, small)
             ratio = large_seconds / max(small_seconds, 1e-6)
-            if (large_seconds > LARGE_BUDGET_SECONDS
+            if (large_seconds > budget(LARGE_BUDGET_SECONDS)
                     or (large_seconds >= GROWTH_FLOOR_SECONDS
                         and ratio > GROWTH_LIMIT)):
                 slow.append((name, prefix, unit, round(small_seconds, 4),

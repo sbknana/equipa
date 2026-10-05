@@ -25,12 +25,19 @@ import unicodedata
 import pytest
 
 from equipa import loops
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     blocked_by_the_gate,
 )
 from tests.review_gate_timing import median_cpu_seconds, timing_test
-from tests.test_review_gate_backstop_3143 import BACKSTOP_FAMILIES, ZERO, review
+from tests.test_review_gate_backstop_3143 import (
+    BACKSTOP_FAMILIES,
+    RB,
+    ZERO,
+    backstop_families,
+    review,
+)
 
 MARK_CATEGORIES = ("Mn", "Me")
 NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
@@ -94,11 +101,14 @@ def test_the_stripper_reads_letters_under_precomposed_accents():
 
 @timing_test
 def test_200kb_of_marks_strip_in_one_pass():
-    """One callback per short run took 0.13 s here (task 3161)."""
-    text = review("No findings.", BACKSTOP_FAMILIES["mark_after_each_letter"],
-                  ZERO)
-    elapsed = median_cpu_seconds(loops._strip_combining_marks, text)
-    assert elapsed < 0.06, f"{elapsed:.3f}s"
+    """One callback per short run took 0.13 s here (task 3161). Budget
+    host-calibrated, growth from 50 KB to 200 KB linear (task 3171)."""
+    def seconds_at(rb):
+        text = review("No findings.",
+                      backstop_families(rb)["mark_after_each_letter"], ZERO)
+        return median_cpu_seconds(loops._strip_combining_marks, text)
+
+    assert_linear_time(seconds_at, RB, 0.06, "mark_after_each_letter")
 
 
 # --- The completed translate table -----------------------------------------
