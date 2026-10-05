@@ -93,10 +93,16 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   its traceback is dumped. That stop is a POSIX timer signal, not a thread,
   so it costs a worker no task under a task cap (systemd `TasksMax`); it
   falls back to faulthandler's watchdog thread off 64-bit Linux. After one
-  test of a worker has run past its
-  deadline, every later test of that worker gets 30 s, so a regression
-  that hangs a whole module costs one deadline and then 30 s per test. A
-  hung regression fails by name instead of timing out the CI job.
+  test of a worker has run past its deadline, every later test of that
+  worker gets 30 s, so a regression that hangs a whole module costs one
+  deadline and then 30 s per test. A hung regression fails by name instead
+  of timing out the CI job.
+- To check the timing tests under contention, run them at `-n 16` while a
+  CPU-burning process runs. Under a task cap, leave git room: at `-n 16`
+  the xdist workers alone hold about 50 tasks, and the files holding the
+  timing tests peak near 70 because `git fetch` starts index-pack threads,
+  so a `TasksMax=64` scope fails those git tests with "unable to create
+  thread" (main does too). The timing tests on their own fit in 64.
 - Set `EQUIPA_TIMING_HOST_FACTOR` (a number > 0, at most 4.0) to force the
   host factor, e.g. `EQUIPA_TIMING_HOST_FACTOR=2.0` to run the timing tests
   as on a runner twice as slow. The session-start factor is printed in the
