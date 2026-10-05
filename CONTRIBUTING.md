@@ -105,7 +105,11 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   the xdist workers alone hold about 50 tasks, and the files holding the
   timing tests peak near 70 because `git fetch` starts index-pack threads,
   so a `TasksMax=64` scope fails those git tests with "unable to create
-  thread" (main does too). The timing tests on their own fit in 64.
+  thread" (main does too). The timing tests on their own fit in 64. Under
+  that load a bound must read the clock its claim is about: an event-loop
+  heartbeat leaves out the time its thread waited for a CPU
+  (`/proc/thread-self/schedstat`), and a child run bounded for its work is
+  held to its CPU time (`resource.getrusage`), which the fence sees too.
 - Set `EQUIPA_TIMING_HOST_FACTOR` (a number > 0, at most 4.0) to force the
   host factor, e.g. `EQUIPA_TIMING_HOST_FACTOR=2.0` to run the timing tests
   as on a runner twice as slow. The session-start factor is printed in the
