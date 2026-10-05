@@ -69,7 +69,10 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   measured repeatedly (or, for a regex scan, made larger) until the
   smaller size takes 20 ms. Never raise a base budget. Build the input
   before the clock starts: allocating a multi-megabyte string is page
-  faults, which grew 32x from 1 MB to 4 MB under load.
+  faults, which grew 32x from 1 MB to 4 MB under load. `assert_linear_time`
+  pauses the garbage collector inside each timed call: a full collection
+  walks the heap a long xdist worker has built up, and it paused a linear
+  scan's larger size 0.1 s.
 - The factor is capped at 4.0. A budget loosened further would hide a
   linear slowdown as large (growth only sees superlinear work), so a
   measurement on a host or load more than 4x slower than the development

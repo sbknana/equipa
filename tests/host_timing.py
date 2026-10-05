@@ -45,7 +45,11 @@ timing test checks two things through this module:
    within ``GROWTH_REPETITION_SECONDS`` of wall time for the whole calls,
    building the shape included); the totals are compared, the smaller
    raised to the floor. Linear work under the floor is not repeated: it
-   cannot reach the limit.
+   cannot reach the limit. Each timed call (and each reference run) runs
+   with the garbage collector paused, as ``timeit`` does: a full collection
+   walks the whole heap a long xdist worker has built up, so it paused the
+   larger size far more than its input could (task 3175: 0.0129 s against
+   0.1341 s for a linear scan).
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
