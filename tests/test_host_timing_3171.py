@@ -245,6 +245,10 @@ DEADLINE_TESTS = {
         "a hanging find is cut at its 1 s scan bound, not the 120 s timeout",
     "test_agent_isolation_3169.py::test_the_bound_fails_even_when_nothing_else_does":
         "a hanging find is cut at its 1 s scan bound",
+    "test_agent_isolation_3172.py::"
+    "test_a_search_cut_short_at_the_default_bound_reports_before_the_caller_stops":
+        "the cut-short search is reported within the 25 s the default bound "
+        "and kill grace leave before the caller's 120 s read timeout",
     "test_generated_file_merge_3131.py::"
     "test_generator_timeout_kills_its_group_and_fails_cleanly":
         "the generator is killed at its timeout, not after its 120 s sleep",
@@ -267,6 +271,17 @@ NOT_TIMING_TESTS = {
         "reads the script's output; the run's seconds are discarded",
     "test_agent_isolation_3169.py::"
     "test_root_fs_moves_every_disk_check_below_the_given_root":
+        "reads the script's output; the run's seconds are discarded",
+    "test_agent_isolation_3172.py::"
+    "test_a_root_holding_an_ampersand_still_probes_the_well_known_directories":
+        "reads the script's output; the run's seconds are discarded",
+    "test_agent_isolation_3172.py::"
+    "test_the_well_known_directories_are_joined_to_the_root_one_by_one":
+        "reads the script's output; the run's seconds are discarded",
+    "test_agent_isolation_3172.py::"
+    "test_a_root_that_is_not_an_existing_absolute_directory_fails":
+        "reads the script's output; the run's seconds are discarded",
+    "test_agent_isolation_3172.py::test_a_valid_root_is_not_reported":
         "reads the script's output; the run's seconds are discarded",
     "test_agent_isolation_3169.py::"
     "test_without_root_fs_the_real_root_filesystem_is_searched":
