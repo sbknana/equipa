@@ -114,32 +114,41 @@ def production_decision(text: str, *, project_dir: Path | None = None,
                               verify_reviewer_provenance(task_id, path))
 
 
-def gate_blocks(text: str) -> bool:
+def gate_blocks(text: str, *, nonce: str = NONCE) -> bool:
     """The production merge decision on a review the reviewer could have
     written. Provenance must trust it, or reject it for a bidi control the
     text holds on purpose (production's own first check), so a block never
     comes from a test artifact missing its nonce or completion line."""
-    decision = production_decision(text)
+    decision = production_decision(text, nonce=nonce)
     reason = decision.provenance.reason
     assert (decision.provenance.trusted
             or reason.startswith(REVIEW_BIDI_CONTROL_REASON)), reason
     return decision.blocks
 
 
-def production_analysis(text: str) -> loops.ReviewCountAnalysis:
-    """The parser's analysis of the text provenance hands the gate, for the
-    assertions on a verdict's reason; ``gate_blocks`` decides the merge."""
-    path = write_recorded_review(gate_project(), GATE_TASK_ID, text)
-    provenance = verify_reviewer_provenance(GATE_TASK_ID, path)
-    assert provenance.text is not None, provenance.reason
-    return loops._analyze_review_file(path, text=provenance.text)
+def decision_and_analysis(
+    text: str, *, nonce: str = NONCE,
+) -> tuple[ProductionDecision, loops.ReviewCountAnalysis]:
+    """The production merge decision on ``text``, and the parser's analysis
+    of the text provenance handed the gate (for assertions on the reason
+    behind a verdict)."""
+    decision = production_decision(text, nonce=nonce)
+    assert decision.provenance.text is not None, decision.provenance.reason
+    analysis = loops._analyze_review_file(
+        Path(f"SECURITY-REVIEW-{GATE_TASK_ID}.md"),
+        text=decision.provenance.text,
+    )
+    return decision, analysis
 
 
-def production_seconds(text: str) -> float:
+def production_seconds(text: str, *, nonce: str = NONCE) -> float:
     """Median CPU time of the merge gate on ``text`` (provenance, parse and
-    audit), the artifact written once beforehand."""
+    audit line), the artifact written once beforehand. Provenance must trust
+    the artifact, so the time is never that of an early rejection."""
     project = gate_project()
-    write_recorded_review(project, GATE_TASK_ID, text)
+    path = write_recorded_review(project, GATE_TASK_ID, text, nonce=nonce)
+    provenance = verify_reviewer_provenance(GATE_TASK_ID, path)
+    assert provenance.trusted, provenance.reason
     with audit_rows_not_persisted():
         return median_cpu_seconds(
             _security_review_blocks_merge, str(project), GATE_TASK_ID,

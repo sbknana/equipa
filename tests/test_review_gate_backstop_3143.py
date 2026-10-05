@@ -43,7 +43,11 @@ from equipa.security_gate import (
     review_complete_line,
     reviewer_nonce_line,
 )
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import (
+    decision_and_analysis,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -73,6 +77,7 @@ def review(summary, body, footer, *, heading=None, footer_prefix=()):
 
 
 def analyze(text):
+    """The parser alone, for assertions on a verdict's reason."""
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
 
 
@@ -82,8 +87,12 @@ def rules_only(text):
 
 
 def blocked_by_backstop(text):
-    analysis = analyze(text)
-    return (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    """The production gate blocks ``text`` (task 3167), and the parser,
+    given the text provenance hands the gate, blocks it for an unaccounted
+    severity word."""
+    decision, analysis = decision_and_analysis(text)
+    return (decision.blocks
+            and analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
             and analysis.detail.startswith(BLOCKING_TOKEN_REASONS))
 
 
@@ -92,15 +101,19 @@ def zero_review(body):
 
 
 def assert_blocks(body):
-    analysis = analyze(zero_review(body))
+    decision, analysis = decision_and_analysis(zero_review(body))
+    assert decision.blocks, (body, decision.counts, analysis.detail)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         body, analysis.detail)
 
 
 def assert_merges(body, footer=ONE_LOW,
                   heading=f"### [E1] LOW {E} verbose error message"):
-    analysis = analyze(review("1 finding.", ["## Notes", ""] + list(body),
-                              footer, heading=heading))
+    decision, analysis = decision_and_analysis(
+        review("1 finding.", ["## Notes", ""] + list(body), footer,
+               heading=heading))
+    assert decision.provenance.trusted, decision.provenance.reason
+    assert not decision.blocks, (body, analysis.detail)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (body, analysis.detail)
 
 
@@ -710,6 +723,22 @@ BACKSTOP_FAMILIES = {
         ("".join(f"{letter}\N{COMBINING ACUTE ACCENT}" for letter in "HIGH")
          + " ") * (RB // 13)],
     "mark_after_each_word": ["HIGH\N{COMBINING ACUTE ACCENT} " * (RB // 7)],
+    # Task 3167 (I3164-01): a finding heading followed by a run of "(" or
+    # "[" made the resolved-status regex read the rest of the line from
+    # every bracket (100 KB took 170 s in the gate).
+    "heading_then_open_parens": ["### [S1] HIGH " + "(" * RB],
+    "heading_then_open_brackets": ["### [S1] HIGH " + "([" * (RB // 2)],
+    "low_heading_then_open_parens": ["### [S1] LOW " + "(" * RB],
+    "heading_then_not_counted_runs": [
+        "### [S1] HIGH " + "(not counted " * (RB // 13)],
+    # Task 3167 (R3164-03): references to distinct characters, which the
+    # rendered view decodes into more distinct characters than the raw
+    # text's cap allows, alone and after a lookalike capital eta.
+    "distinct_hex_references": ["".join(
+        f"&#x{code_point:x}; " for code_point in range(0x4E00, 0x4E00 + RB // 9))],
+    "eta_then_distinct_reference": ["".join(
+        f"\N{GREEK CAPITAL LETTER ETA}IGH &#x{code_point:x}; "
+        for code_point in range(0x4E00, 0x4E00 + RB // 15))],
 }
 
 
@@ -717,10 +746,12 @@ BACKSTOP_FAMILIES = {
 @pytest.mark.parametrize("name", sorted({**REVIEWER_FAMILIES,
                                          **BACKSTOP_FAMILIES}))
 def test_200kb_adversarial_review_parses_in_half_a_second(name):
+    """Timed through the merge gate itself (task 3167, I3164-03): provenance
+    reads, hashes and normalises the artifact before the parser runs."""
     body = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}[name]
     text = review("No findings.", body, ZERO)
     assert len(text.encode()) >= RB * 0.99, name
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
 

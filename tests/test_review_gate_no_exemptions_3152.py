@@ -38,6 +38,7 @@ import pytest
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 from tests.review_gate_production import (
+    decision_and_analysis,
     gate_blocks,
     production_decision,
     production_seconds,
@@ -108,9 +109,7 @@ def parser_blocks(text):
 def assert_backstop_blocks(text):
     """The production gate blocks ``text``, and the parser, given the text
     provenance hands the gate, blocks it for an unaccounted severity word."""
-    decision = production_decision(text)
-    analysis = loops._analyze_review_file(
-        Path("SECURITY-REVIEW-1.md"), text=decision.provenance.text)
+    decision, analysis = decision_and_analysis(text)
     assert decision.blocks, (decision.counts, analysis)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (

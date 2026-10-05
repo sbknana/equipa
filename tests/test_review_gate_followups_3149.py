@@ -29,6 +29,7 @@ import pytest
 
 from equipa import loops, security_gate
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_production import gate_blocks as production_gate_blocks
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -62,15 +63,11 @@ def analyze(text):
 
 
 def gate_blocks(text):
-    """The merge decision of dispatch._security_review_blocks_merge.
+    """dispatch._security_review_blocks_merge itself (task 3167).
 
     An untrusted review blocks; a trusted one blocks on CRITICAL or HIGH.
     """
-    analysis = analyze(text)
-    if not analysis.trusted:
-        return True
-    counts = analysis.counts or {}
-    return counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
+    return production_gate_blocks(text, nonce=NONCE)
 
 
 def zero_review(body):

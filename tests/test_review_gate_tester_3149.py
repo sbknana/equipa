@@ -30,7 +30,9 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import gate_blocks as production_gate_blocks
+from tests.review_gate_production import production_seconds
+from tests.review_gate_timing import timing_test
 
 REPO = Path(__file__).resolve().parent.parent
 NONCE = "fedcba9876543210fedcba9876543210"
@@ -58,12 +60,9 @@ def analyze(text):
 
 
 def gate_blocks(text):
-    """dispatch._security_review_blocks_merge: untrusted, or CRITICAL/HIGH."""
-    analysis = analyze(text)
-    if not analysis.trusted:
-        return True
-    counts = analysis.counts or {}
-    return counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
+    """dispatch._security_review_blocks_merge itself (task 3167): untrusted,
+    or CRITICAL/HIGH."""
+    return production_gate_blocks(text, nonce=NONCE)
 
 
 def zero_review(body):
@@ -318,5 +317,5 @@ TIMING_FAMILIES.update({
 def test_200kb_flood_on_a_3149_path_parses_in_half_a_second(name):
     text = review("No findings.", TIMING_FAMILIES[name], ZERO)
     assert len(text.encode()) >= RB * 0.99, name
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text, nonce=NONCE)
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
