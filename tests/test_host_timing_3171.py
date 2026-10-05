@@ -677,6 +677,9 @@ CORPUS_CAPS = {
 # ``<event loop>.time()``; the ``_ns`` variants too.
 CLOCKS = {"process_time", "perf_counter", "monotonic", "time", "thread_time"}
 CLOCKS |= {f"{clock}_ns" for clock in CLOCKS}
+# Clock readings that name their clock: ``time.clock_gettime(clock_id)``,
+# e.g. another thread's CPU clock from ``time.pthread_getcpuclockid``.
+CLOCKS_BY_ID = {"clock_gettime", "clock_gettime_ns"}
 # Readings that carry CPU (or elapsed) seconds in fields: ``os.times()`` and
 # ``resource.getrusage(who)``, compared as ``after.ru_utime -
 # before.ru_utime`` (a child process's CPU time, task 3175).
@@ -704,7 +707,7 @@ def _is_clock_call(node: ast.AST) -> bool:
         name = function.id
     else:
         return False
-    if name == "getrusage":
+    if name == "getrusage" or name in CLOCKS_BY_ID:
         return True
     return not node.args and not node.keywords and (
         name in CLOCKS or name in USAGE_CLOCKS)
@@ -953,6 +956,12 @@ def test_the_fence_sees_the_shapes_it_must(timing_reach):
      "after = resource.getrusage(resource.RUSAGE_SELF)\n"
      "x = after.ru_maxrss - before.ru_maxrss", False),
     ("x = usage.ru_utime - baseline.ru_utime", False),
+    ("clock = time.pthread_getcpuclockid(ident)\n"
+     "start = time.clock_gettime(clock)\n"
+     "x = time.clock_gettime(clock) - start", True),
+    ("start = clock_gettime_ns(CLOCK_MONOTONIC)\n"
+     "x = clock_gettime_ns(CLOCK_MONOTONIC) - start", True),
+    ("deadline = time.clock_gettime(CLOCK_MONOTONIC) + 5", False),
 ])
 def test_a_clock_subtraction_is_found_and_a_deadline_is_not(source, measures):
     tree = ast.parse(source)
@@ -1086,6 +1095,15 @@ def test_shape():
     gaps = []
     asyncio.run(beat(gaps, asyncio.Event()))
     assert max(gaps) < 1.0
+"""),
+    "thread-cpu-clock": ("unscaled", """
+import threading
+import time
+def test_shape():
+    clock = time.pthread_getcpuclockid(threading.main_thread().ident)
+    start = time.clock_gettime(clock)
+    work()
+    assert time.clock_gettime(clock) - start < 0.5
 """),
     "annotated-start": ("unscaled", """
 import time
