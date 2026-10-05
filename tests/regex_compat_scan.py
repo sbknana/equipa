@@ -28,7 +28,8 @@ from typing import Iterator, NamedTuple
 
 EQUIPA_DIR = Path(__file__).resolve().parent.parent / "equipa"
 
-_BRACE_QUANTIFIER_RE = re.compile(r"\{[0-9]*(?:,[0-9]*)?\}")
+# "{m}", "{m,}", "{m,n}", "{,n}" and "{,}" repeat; "{}" is two literals.
+_BRACE_QUANTIFIER_RE = re.compile(r"\{(?:[0-9]+(?:,[0-9]*)?|,[0-9]*)\}")
 
 
 class Construct(NamedTuple):
