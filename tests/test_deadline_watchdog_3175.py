@@ -255,19 +255,26 @@ def test_4_keeps_a_shorter_deadline():
 '''
 
 
+def _scratch_environment() -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("PYTEST_", "EQUIPA_"))}
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    return environment
+
+
+def _scratch_command(*options: str) -> list[str]:
+    return [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "-p", "tests.deadline_watchdog", *options, "test_scratch.py"]
+
+
 def _run_scratch(tmp_path: Path, *options: str, swallow: bool = False,
                  source: str = SCRATCH_TESTS) -> subprocess.CompletedProcess:
     (tmp_path / "test_scratch.py").write_text(
         source.format(swallow=swallow) if source is SCRATCH_TESTS else source,
         encoding="utf-8")
-    environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("PYTEST_", "EQUIPA_"))}
-    environment["PYTHONPATH"] = str(REPO_ROOT)
     return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "-p", "tests.deadline_watchdog", *options, "test_scratch.py"],
-        cwd=tmp_path, env=environment, capture_output=True, text=True,
-        timeout=120, check=False)
+        _scratch_command(*options), cwd=tmp_path, env=_scratch_environment(),
+        capture_output=True, text=True, timeout=120, check=False)
 
 
 def test_a_hung_test_fails_by_name_and_the_run_goes_on(tmp_path):
@@ -299,9 +306,9 @@ def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
 
 
 def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):
-    """The deadline is 1 s, so the hard stop comes 2 s in on the wall
-    clock: the timer's signal ends the pytest process after faulthandler
-    has written the test's frame."""
+    """The deadline is 1 s, so the hard stop comes 6 s in on the wall clock
+    (the 5 s minimum grace): the timer's signal ends the pytest process
+    after faulthandler has written the test's frame."""
     started = time.monotonic()
     completed = _run_scratch(tmp_path, "-k", "swallows", swallow=True)
     assert completed.returncode == -HARD_STOP_SIGNAL, (
@@ -332,7 +339,8 @@ def test_with_the_signal_taken_the_thread_stops_a_swallowed_deadline(
     completed = _run_scratch(tmp_path, "-p", "ignore_hard_stop_signal", "-k",
                              "swallows", swallow=True)
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    assert re.search(r"^Timeout \(0:00:0[0-2][.\d]*\)!$", completed.stderr,
+    # Armed for what is left of the 1 s deadline plus its 5 s grace.
+    assert re.search(r"^Timeout \(0:00:0[0-6][.\d]*\)!$", completed.stderr,
                      re.MULTILINE), completed.stderr
     assert re.search(r'File ".*test_scratch.py", line \d+ in '
                      r"test_swallows_the_deadline", completed.stderr), (
@@ -377,3 +385,60 @@ def test_under_xdist_a_swallowed_deadline_is_a_named_crash(tmp_path):
     assert ("crashed while running 'test_scratch.py::test_swallows_the_deadline'"
             in output), output
     assert "1 failed, 1 passed" in output, output
+
+
+@pytest.mark.parametrize("seconds, grace", [
+    (0.3, 5.0), (1, 5.0), (2, 8.0), (30, 120.0),
+    (TIMING_TEST_DEADLINE_SECONDS, 300.0), (TEST_DEADLINE_SECONDS, 300.0),
+])
+def test_the_hard_stop_leaves_a_contended_worker_room(seconds, grace):
+    """Four times a short deadline (a worker on a fifth of a core still
+    reaches its soft deadline first), at least 5 s, at most 300 s: the
+    longest deadline is still stopped inside the 30-minute CI job."""
+    assert deadline_watchdog.hard_stop_grace(seconds) == grace
+    assert TEST_DEADLINE_SECONDS + deadline_watchdog.hard_stop_grace(
+        TEST_DEADLINE_SECONDS) < 30 * 60
+
+
+SHORT_DEADLINE_SCRATCH_TESTS = '''
+import pytest
+
+
+@pytest.mark.deadline(0.3)
+def test_spins_past_a_short_deadline():
+    while True:
+        pass
+'''
+
+
+def test_a_worker_on_a_third_of_a_core_fails_by_name_not_by_crash(tmp_path):
+    """The child is stopped two thirds of the time (SIGSTOP / SIGCONT), as a
+    worker sharing its core with two busy processes. Its 0.3 s of CPU time
+    then take about 0.9 s on the wall clock: past a hard stop at twice the
+    deadline (0.6 s), which crashed workers under contention (task 3175),
+    and well inside the 5.3 s it now has."""
+    (tmp_path / "test_scratch.py").write_text(SHORT_DEADLINE_SCRATCH_TESTS,
+                                              encoding="utf-8")
+    output_path = tmp_path / "output.txt"
+    with output_path.open("w", encoding="utf-8") as output:
+        process = subprocess.Popen(
+            _scratch_command(), cwd=tmp_path, env=_scratch_environment(),
+            stdout=output, stderr=subprocess.STDOUT)
+        try:
+            # At most about 120 s (4000 cycles of 30 ms) before the kill.
+            for _ in range(4000):
+                if process.poll() is not None:
+                    break
+                os.kill(process.pid, signal.SIGSTOP)
+                time.sleep(0.02)
+                os.kill(process.pid, signal.SIGCONT)
+                time.sleep(0.01)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+    text = output_path.read_text(encoding="utf-8")
+    assert process.returncode == 1, text
+    assert "1 failed" in text, text
+    assert ("DeadlineExceeded: test_scratch.py::test_spins_past_a_short_deadline "
+            "(call) ran past its deadline of 0.3 s of CPU time") in text, text

@@ -81,9 +81,18 @@ TIMING_TEST_DEADLINE_SECONDS = 300.0
 # regex put back hung 13 tests of tests/test_review_gate_linear_3167.py, 65
 # minutes at a full deadline each (a CI job timeout), 11 with this cut.
 AFTER_A_HANG_DEADLINE_SECONDS = 30.0
-# The hard stop comes this long after the deadline on the wall clock (or as
-# long again as a shorter deadline): a phase that waits uses no CPU time.
+# The hard stop comes this long after the deadline on the wall clock: a
+# phase that waits uses no CPU time. A busy host gives a worker a fraction
+# of a core, so a CPU-time deadline lasts longer on the wall clock: a
+# shorter deadline gets HARD_STOP_SLOWDOWN times itself as grace, never
+# under HARD_STOP_MIN_GRACE_SECONDS. With a fifth of a core a test still
+# reaches its soft deadline (a named failure, the worker goes on) before
+# the hard stop ends the worker: a 0.5 s deadline was hard-stopped 1 s in
+# with 16 CPU burners beside 16 workers on 16 cores. The 600 s deadline is
+# still stopped 15 minutes in, inside the 30-minute CI job.
 HARD_DEADLINE_GRACE_SECONDS = 300.0
+HARD_STOP_SLOWDOWN = 4.0
+HARD_STOP_MIN_GRACE_SECONDS = 5.0
 # The handler ran while a deadline was being armed or disarmed: it looks
 # again this many CPU seconds later.
 RETRY_SECONDS = 0.01
@@ -92,6 +101,13 @@ TIMING_HELPER_MODULE = "tests.host_timing"
 
 class DeadlineExceeded(BaseException):
     """A test (or a ``deadline`` block) ran past its deadline."""
+
+
+def hard_stop_grace(seconds: float) -> float:
+    """How long after a deadline of ``seconds`` of CPU time the hard stop
+    comes on the wall clock."""
+    return min(HARD_DEADLINE_GRACE_SECONDS,
+               max(HARD_STOP_SLOWDOWN * seconds, HARD_STOP_MIN_GRACE_SECONDS))
 
 
 @dataclass(eq=False)
@@ -113,8 +129,7 @@ class Deadline:
     @property
     def hard_at(self) -> float:
         """On the ``time.monotonic()`` clock."""
-        return (self.wall_started + self.seconds
-                + min(HARD_DEADLINE_GRACE_SECONDS, self.seconds))
+        return self.wall_started + self.seconds + hard_stop_grace(self.seconds)
 
     def message(self) -> str:
         return (f"{self.label} ran past its deadline of {self.seconds:g} s "
