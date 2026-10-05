@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -27,8 +28,9 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
@@ -1028,6 +1030,159 @@ def _audit_task_abort(
 # recorded blocked; it is never retried.
 REPOSITORY_APPEARED_OUTCOME = "repository_appeared"
 
+# S3168-01 (task #3173): the entries that make git's discovery take a
+# directory with no ``.git`` entry as a git directory (git's
+# ``is_git_directory``): ``HEAD`` with ``refs`` (``objects`` can come from
+# the environment), or ``HEAD`` with ``commondir`` (a linked worktree's git
+# directory, whose refs and objects are in the common directory).
+_GIT_DIRECTORY_SIGNATURES: tuple[tuple[str, ...], ...] = (
+    ("HEAD", "refs"),
+    ("HEAD", "commondir"),
+)
+
+
+def _is_implicit_git_directory(directory: str) -> bool:
+    """True when git's discovery would take ``directory`` itself for a git
+    directory (an implicit bare repository). Runs no git."""
+    return any(
+        all(os.path.lexists(os.path.join(directory, name)) for name in signature)
+        for signature in _GIT_DIRECTORY_SIGNATURES
+    )
+
+
+def _walk_up(project_dir: str) -> Iterator[str]:
+    """``project_dir`` and every directory above it, first in the form given
+    (made absolute), then in the symlink-resolved form (git discovers from
+    the resolved working directory). ``os.path.realpath`` does not raise on
+    a symlink loop."""
+    for start in dict.fromkeys((os.path.abspath(project_dir), os.path.realpath(project_dir))):
+        directory = start
+        while True:
+            yield directory
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+
+
+def _nearest_repository(project_dir: str) -> Path | None:
+    """The repository git's discovery would find from ``project_dir``,
+    located without running git: the first ``.git`` entry, or directory
+    that is itself a git directory, at or above it. None if there is none.
+
+    S3168-01 (task #3173): ``git_ops._nearest_git_entry`` looks for a
+    ``.git`` entry only. An agent that moved its repository's ``HEAD``,
+    ``objects``, ``refs`` and ``config`` into the project directory (with
+    ``core.worktree`` naming the work tree) left no ``.git`` anywhere, yet
+    git run in the project discovers that repository and its filters.
+    """
+    for directory in _walk_up(project_dir):
+        git_entry = os.path.join(directory, ".git")
+        if os.path.lexists(git_entry):
+            return Path(git_entry)
+        if _is_implicit_git_directory(directory):
+            return Path(directory)
+    return None
+
+
+# S3168-03 (task #3173): where the N1 check records a repository found in a
+# project that was not git at dispatch, so a later dispatch refuses every
+# project that would discover it instead of adopting the agent's repository
+# as the project's checkout (``git worktree add`` there ran the agent's
+# smudge filter in the orchestrator). Outside every project tree, next to
+# the operator's TheForge DB: one file per repository location.
+AGENT_REPOSITORY_REFUSALS_DIRNAME = "equipa-agent-repository-refusals"
+
+
+class AgentMadeRepositoryError(GitRepositoryUnreadableError):
+    """A dispatch refused because the repository its project would discover
+    was found by the N1 check, in a project that was not git at dispatch.
+
+    A :class:`GitRepositoryUnreadableError`, so every dispatch that already
+    refuses a repository git cannot read refuses this one the same way.
+    """
+
+
+def _agent_repository_refusals_dir() -> Path:
+    """The refusal records' directory, read at call time (THEFORGE_DB is
+    set per run and per test)."""
+    database = Path(os.fspath(_equipa_constants.THEFORGE_DB)).absolute()
+    return database.parent / AGENT_REPOSITORY_REFUSALS_DIRNAME
+
+
+def _refusal_record(refusals_dir: Path, location: str) -> Path:
+    """The record of the repository at ``location`` (the directory holding
+    its ``.git``, or the git directory itself)."""
+    digest = hashlib.sha256(os.fsencode(location)).hexdigest()
+    return refusals_dir / f"{digest}.json"
+
+
+def _record_agent_made_repository(
+    task_id: int, project_dir: str, repository: Path,
+) -> list[Path]:
+    """Record ``repository`` (found by the N1 check) under its location, in
+    the form found and the resolved form. Returns the records written.
+
+    Raises OSError when none could be written.
+    """
+    found = os.fspath(repository)
+    location = os.path.dirname(found) if os.path.basename(found) == ".git" else found
+    refusals_dir = _agent_repository_refusals_dir()
+    refusals_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    content = json.dumps({
+        "repository": found,
+        "project_dir": project_dir,
+        "task_id": task_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, indent=2) + "\n"
+    records = []
+    for form in dict.fromkeys((os.path.abspath(location), os.path.realpath(location))):
+        record = _refusal_record(refusals_dir, form)
+        partial = record.with_name(f".{record.name}.{os.getpid()}.tmp")
+        partial.write_text(content, encoding="utf-8")
+        os.replace(partial, record)
+        records.append(record)
+    return records
+
+
+def _agent_made_repository_record(project_dir: str) -> Path | None:
+    """The refusal record of a repository location at or above
+    ``project_dir``, None if there is none. Runs no git.
+
+    Fails closed: a record that cannot be examined (anything but "no such
+    file") counts as present.
+    """
+    refusals_dir = _agent_repository_refusals_dir()
+    for directory in _walk_up(project_dir):
+        record = _refusal_record(refusals_dir, directory)
+        try:
+            os.lstat(record)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return record
+        return record
+    return None
+
+
+def refuse_agent_made_repository(project_dir: str) -> None:
+    """Raise :class:`AgentMadeRepositoryError` when an N1 check recorded the
+    repository ``project_dir`` would discover; return otherwise.
+
+    S3168-03 (task #3173): call before anything runs git in the project at
+    dispatch (``_is_git_repo``, ``git worktree add``). The refusal stays
+    until the operator, having inspected or removed that repository,
+    deletes the record named in the message.
+    """
+    record = _agent_made_repository_record(project_dir)
+    if record is None:
+        return
+    raise AgentMadeRepositoryError(
+        f"{project_dir} is under a repository an EQUIPA check found in a project "
+        f"that was not git at dispatch (recorded in {record}). Refusing to run "
+        f"git there: inspect or remove that repository, then delete {record}."
+    )
+
 
 def _repository_appeared_in_non_git_project(
     task_id: int,
@@ -1035,24 +1190,38 @@ def _repository_appeared_in_non_git_project(
     when: str,
     output: list[str] | None,
 ) -> bool:
-    """True, with a durable GATE-AUDIT record, when a ``.git`` is at or above
-    ``project_dir``, a project that was not git at dispatch.
+    """True, with a durable GATE-AUDIT record, when a repository is at or
+    above ``project_dir``, a project that was not git at dispatch.
 
     N1 (task #3168): found by a filesystem walk; no git runs. Such a
     repository is the agent's: before this check it was only reported, the
     task was retried in it, and the dev-test loop ran ``git diff`` there.
-    The repository is left as it is for the operator. A later dispatch of
-    the project still finds it by discovery and treats it as the project's
-    main checkout; the blocked task and the audit record are the signal to
-    inspect (or remove) it first.
+    The repository is left as it is for the operator.
+
+    S3168-01 (task #3173): the walk also finds a directory that is itself a
+    git directory (:func:`_nearest_repository`), not only a ``.git`` entry.
+    S3168-03: the repository is recorded outside the project, and every
+    later dispatch of a project that would discover it is refused
+    (:func:`refuse_agent_made_repository`) until the operator deletes the
+    record; before, the next dispatch adopted it as the project's checkout.
     """
-    git_entry = _nearest_git_entry(Path(project_dir))
-    if git_entry is None:
+    repository = _nearest_repository(project_dir)
+    if repository is None:
         return False
+    try:
+        records = _record_agent_made_repository(task_id, project_dir, repository)
+    except OSError as exc:
+        refusal = f"the refusal of later dispatches could NOT be recorded ({exc})"
+    else:
+        refusal = (
+            "later dispatches there are refused until "
+            + " and ".join(str(record) for record in records) + " is deleted"
+        )
     _audit_task_abort(
         task_id, "repository-appeared",
-        f"{when}: a git repository appeared at {git_entry} in a project that "
-        f"was not git at dispatch; no git runs there, task blocked, not retried",
+        f"{when}: a git repository appeared at {repository} in a project that "
+        f"was not git at dispatch; no git runs there, task blocked, not retried; "
+        f"{refusal}",
         output,
     )
     return True
@@ -1501,6 +1670,8 @@ async def run_project_tasks(
     # else trips it and the remaining tasks are refused.
     project_guard: DefaultBranchGuard | None = None
     try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
         use_isolation = _is_git_repo(project_dir)
     except GitRepositoryUnreadableError as exc:
         # R3119-02 (task #3126): never run an unreadable repo ungated.
@@ -4678,6 +4849,8 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
     try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
         use_worktrees = _is_git_repo(project_dir)
     except GitRepositoryUnreadableError as exc:
         # R3119-02 (task #3126): never run an unreadable repo ungated.
