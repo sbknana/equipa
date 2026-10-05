@@ -625,6 +625,10 @@ DEADLINE_TESTS = {
     "test_reactive_check_process_3127.py::"
     "test_catastrophic_regex_checker_does_not_freeze_the_event_loop":
         "the check gives up at its deadline instead of freezing the loop",
+    "test_reactive_check_process_3127.py::"
+    "test_the_heartbeat_reads_a_frozen_loop_in_full":
+        "a 1 s freeze of the loop reads at least 0.9 s once run-queue wait "
+        "is taken out, not the scheduling noise around it",
     "test_stop_signal_3159.py::test_the_watchdog_cuts_a_hanging_cleanup_short":
         "the watchdog cuts cleanup at its budget, not after a 10 s hang",
 }

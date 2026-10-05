@@ -74,12 +74,33 @@ def cpu_checker(tmp_path):
     checker.close()
 
 
+RUN_QUEUE_STATISTICS = Path("/proc/thread-self/schedstat")
+
+
+def _run_queue_wait_seconds() -> float:
+    """Seconds the calling thread has spent runnable but waiting for a CPU
+    (the second field of ``/proc/thread-self/schedstat``, in nanoseconds),
+    or 0.0 where the kernel does not report it."""
+    try:
+        fields = RUN_QUEUE_STATISTICS.read_text(encoding="ascii").split()
+        return int(fields[1]) / 1e9
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
 async def _with_heartbeat(coro):
     """Run ``coro`` while measuring the longest event-loop stall.
 
     The heartbeat is ticking BEFORE ``coro`` starts: a check that grabs the
     GIL as soon as it is submitted would otherwise freeze the loop before
     the heartbeat took its first timestamp, and the stall would go unseen.
+
+    A gap counts the time the loop's thread ran or slept (on the GIL, on a
+    blocking call), not the time it was runnable and waiting for a CPU: that
+    is the host's load, not a frozen loop. With 16 CPU burners beside 16
+    workers at a host load near 100, a gap read 0.65 s against the 0.5 s
+    deadline (task 3175). A regex holding the GIL, or a blocking wait for
+    the check's deadline, still counts in full.
     """
     done = asyncio.Event()
     gaps: list[float] = []
@@ -87,12 +108,14 @@ async def _with_heartbeat(coro):
 
     async def beat() -> None:
         last = time.monotonic()
+        last_waited = _run_queue_wait_seconds()
         while not done.is_set():
             ticking.set()
             await asyncio.sleep(0.02)
             now = time.monotonic()
-            gaps.append(now - last)
-            last = now
+            waited = _run_queue_wait_seconds()
+            gaps.append((now - last) - (waited - last_waited))
+            last, last_waited = now, waited
 
     beater = asyncio.create_task(beat())
     await ticking.wait()
@@ -110,6 +133,40 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+FREEZE_SECONDS = 1.0
+
+
+def _spin_on_this_thread(seconds: float) -> None:
+    busy_until = time.thread_time() + seconds
+    while time.thread_time() < busy_until:
+        pass
+
+
+async def _freeze_the_loop(freeze) -> None:
+    await asyncio.sleep(0.1)
+    freeze()
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.parametrize("freeze", [
+    lambda: _spin_on_this_thread(FREEZE_SECONDS),
+    lambda: time.sleep(FREEZE_SECONDS),
+], ids=["cpu-bound-work", "blocking-wait"])
+def test_the_heartbeat_reads_a_frozen_loop_in_full(freeze):
+    """The heartbeat's control: taking run-queue wait out of a gap leaves
+    a loop frozen by work on its own thread, or by a blocking wait, at its
+    full length, on any load."""
+    _, longest_stall = asyncio.run(_with_heartbeat(_freeze_the_loop(freeze)))
+    assert longest_stall >= FREEZE_SECONDS * 0.9, longest_stall
+
+
+def test_the_run_queue_wait_is_read_where_the_kernel_reports_it():
+    if RUN_QUEUE_STATISTICS.exists():
+        assert _run_queue_wait_seconds() > 0
+    else:
+        assert _run_queue_wait_seconds() == 0.0
 
 
 def test_catastrophic_regex_checker_does_not_freeze_the_event_loop(
