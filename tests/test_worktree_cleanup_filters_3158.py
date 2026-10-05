@@ -337,7 +337,7 @@ def test_failed_attempt_reset_never_starts_git_in_a_nested_repository(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
 
     _run(dispatch_mod.cleanup_failed_attempt(
-        TASK_ID, str(worktree), [], output=[], base_sha=base_sha,
+        TASK_ID, str(worktree), [], output=[], base_sha=base_sha, expect_repository=True,
     ))
 
     assert not drivers.ran(), "the nested repository's driver ran in the orchestrator"
@@ -449,7 +449,7 @@ def test_failed_attempt_reset_never_runs_an_agent_driver(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
 
     _run(dispatch_mod.cleanup_failed_attempt(
-        TASK_ID, str(worktree), [], output=[], base_sha=base_sha,
+        TASK_ID, str(worktree), [], output=[], base_sha=base_sha, expect_repository=True,
     ))
 
     assert not drivers.ran(), f"the agent's {kind} driver ran in the orchestrator"

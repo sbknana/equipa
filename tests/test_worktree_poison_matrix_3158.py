@@ -625,7 +625,7 @@ def _assert_reset(agent: Agent, base_sha: str) -> None:
 def _reset(agent: Agent, base_sha: str | None) -> None:
     agent.monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
     _run(dispatch_mod.cleanup_failed_attempt(
-        TASK_ID, str(agent.tree), [], output=[], base_sha=base_sha,
+        TASK_ID, str(agent.tree), [], output=[], base_sha=base_sha, expect_repository=True,
     ))
 
 

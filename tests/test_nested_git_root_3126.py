@@ -339,7 +339,7 @@ def test_nested_project_retry_cleanup_runs_at_the_worktree_root(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
 
     asyncio.run(dispatch_mod.cleanup_failed_attempt(
-        3403, str(worktree / "apps" / "web"), [], output=[], base_sha=base_sha,
+        3403, str(worktree / "apps" / "web"), [], output=[], base_sha=base_sha, expect_repository=True,
     ))
 
     assert not leftover.exists(), "untracked file outside the sub-directory survived"

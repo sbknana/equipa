@@ -225,7 +225,7 @@ def test_retry_cleanup_refuses_a_redirected_repository(tmp_path: Path) -> None:
     other_branch = _git(other, "rev-parse", f"refs/heads/{TASK_BRANCH}")
 
     with pytest.raises(dispatch_mod.AttemptCleanupError):
-        _run(dispatch_mod.cleanup_failed_attempt(TASK_ID, str(real), []))
+        _run(dispatch_mod.cleanup_failed_attempt(TASK_ID, str(real), [], expect_repository=True))
 
     assert _git(other, "rev-parse", f"refs/heads/{TASK_BRANCH}") == other_branch
 

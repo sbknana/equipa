@@ -285,7 +285,7 @@ def test_cleanup_with_unreachable_base_fails_loud_before_status_reset(
 
     with pytest.raises(AttemptCleanupError, match="reset forge-task-31"):
         asyncio.run(dispatch_mod.cleanup_failed_attempt(
-            31, str(worktree), [], output=[], base_sha="0" * 40,
+            31, str(worktree), [], output=[], base_sha="0" * 40, expect_repository=True,
         ))
 
     db_opened.assert_not_called()
@@ -302,7 +302,7 @@ def test_main_checkout_cleanup_without_task_branch_still_resets_todo(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", lambda write=False: db)
     output: list[str] = []
 
-    asyncio.run(dispatch_mod.cleanup_failed_attempt(32, str(repo), [], output=output))
+    asyncio.run(dispatch_mod.cleanup_failed_attempt(32, str(repo), [], output=output, expect_repository=True))
 
     assert any("does not exist" in line for line in output), output
     assert _checked_out_branch(repo) == "master"
