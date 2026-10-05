@@ -1959,6 +1959,22 @@ _NEWLINE_RE = re.compile("\n")
 # one pass over the whole text is cheaper.
 _NON_ASCII_CHARACTERS_RE = re.compile(r"([^\x00-\x7f]+)")
 _SPARSE_TRANSLATE_SHARE = 16
+# Task 3170 (R3167-04): str.translate still reads every character of a
+# non-ASCII text through its table (about 0.1 us each), the largest shared
+# cost of the 200 KB lookalike-eta, combining-mark and em-dash reviews,
+# which hold only a few distinct characters the table changes. Up to this
+# many changed characters are replaced one str.replace pass each instead.
+_REPLACED_CHARACTERS_LIMIT = 8
+
+
+def _translation_of(code: int, value: str | int | None) -> str:
+    """The text str.translate writes for ``code`` when its table gives
+    ``value`` (a string, a code point, or None to delete it)."""
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return chr(value)
+    return value
 
 
 def _translated(text: str, table: dict[int, str | None]) -> str:
@@ -1970,13 +1986,34 @@ def _translated(text: str, table: dict[int, str | None]) -> str:
     is a key (mapped to itself if ``table`` leaves it alone). The table is
     read as str.translate reads it, ``table[code]``, so a table that fills
     itself per key (``__missing__``, see _BoundedTable) gives the same value.
+
+    Task 3170: a text whose characters the table leaves alone is returned
+    as it is, and one with at most _REPLACED_CHARACTERS_LIMIT characters to
+    change has each replaced in one pass. No replacement holds a character
+    that is replaced, so no pass rewrites another's output and the result
+    is the one str.translate gives.
     """
     complete: dict[int, str | int | None] = {}
+    changed: dict[str, str] = {}
     for code in map(ord, set(text)):
         try:
-            complete[code] = table[code]
+            value = table[code]
         except LookupError:
             complete[code] = code
+            continue
+        complete[code] = value
+        replacement = _translation_of(code, value)
+        if replacement != chr(code):
+            changed[chr(code)] = replacement
+    if not changed:
+        return text
+    if len(changed) <= _REPLACED_CHARACTERS_LIMIT and not any(
+        char in replacement
+        for replacement in changed.values() for char in changed
+    ):
+        for char, replacement in changed.items():
+            text = text.replace(char, replacement)
+        return text
     return text.translate(complete)
 
 
