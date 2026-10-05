@@ -21,11 +21,14 @@ from __future__ import annotations
 import random
 import re
 import unicodedata
-from pathlib import Path
 
 import pytest
 
 from equipa import loops
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+)
 from tests.review_gate_timing import median_cpu_seconds, timing_test
 from tests.test_review_gate_backstop_3143 import BACKSTOP_FAMILIES, ZERO, review
 
@@ -177,9 +180,22 @@ def test_the_new_families_are_in_the_timing_set():
 
 @pytest.mark.parametrize("name", NEW_TIMING_FAMILIES)
 def test_a_new_timing_family_blocks(name):
+    """Decided through the merge gate (task 3170, IR67-02)."""
     text = review("No findings.", BACKSTOP_FAMILIES[name], ZERO)
-    analysis = loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"),
-                                          text=text)
+    analysis = blocked_by_the_gate(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(loops.backstop_reason("HIGH")), (
         analysis.detail[:120])
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helper_reads_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through the merge gate here as well, so a gate that parsed the
+    normalised text (R3161-01) fails this suite too."""
+    text = review("No findings.", [AS_WRITTEN_ONLY_FINDINGS[finding]], ZERO)
+    analysis = blocked_by_the_gate(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(tuple(
+        loops.backstop_reason(severity)
+        for severity in loops.MERGE_BLOCKING_SEVERITIES)), analysis.detail

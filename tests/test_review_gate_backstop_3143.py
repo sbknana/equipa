@@ -739,6 +739,12 @@ BACKSTOP_FAMILIES = {
     "eta_then_distinct_reference": ["".join(
         f"\N{GREEK CAPITAL LETTER ETA}IGH &#x{code_point:x}; "
         for code_point in range(0x4E00, 0x4E00 + RB // 15))],
+    # Task 3170 (IR67-03): a finding heading followed by a run of resolved
+    # statuses, each separator a place the resolved-status regex tried (0.42
+    # and 0.44 s through the gate in the independent review of 3167).
+    "heading_then_dash_fixed_runs": ["### [S1] HIGH " + " - FIXED" * (RB // 8)],
+    "heading_then_em_dash_fixed_runs": [
+        "### [S1] HIGH " + f" {E} FIXED" * (RB // 10)],
 }
 
 
