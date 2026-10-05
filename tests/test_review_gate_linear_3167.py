@@ -289,15 +289,26 @@ def scan_growth(pattern, anchored, prefix, unit, count):
     """How a scan of ``prefix + unit * n`` grows from a quarter size to four
     times it (task 3175). A ratio of sub-millisecond scans is noise (CI read
     0.0006 s against 0.0052 s on a linear regex), so the quarter size starts
-    at ``count`` units and doubles until one scan of it takes
-    ``GROWTH_FLOOR_SECONDS`` (or the larger text would pass
+    at ``count`` units and doubles until the median of ``SCAN_RUNS`` scans
+    of it takes ``GROWTH_FLOOR_SECONDS`` (or the larger text would pass
     ``MAX_GROWTH_SCAN_CHARACTERS``). Each size is the median of
     ``SCAN_RUNS`` scans, measured again (keeping the faster median) while
-    the ratio is over the limit."""
+    the ratio is over the limit.
+
+    The size is chosen on a median, not one scan: a linear regex can cost
+    more per character past a size, where its state outgrows the memory
+    the allocator keeps (``_BLANK_LINE_RUN_RE`` on a newline run holds
+    about 150 bytes per newline; past 32 MB, glibc's largest mmap threshold,
+    each scan faults its state in afresh: 0.05 s per MB below 256K newlines,
+    0.16 s per MB from 1M on, linear on each side). A single noisy scan at
+    256K newlines reached the floor under contention while their median was
+    0.013 s, so the pair straddled that step and read 12x (task 3175). On
+    the median, the quarter size passes the step before it takes the floor,
+    and both sizes are measured on the same side of it."""
     quarter_count = count
     while True:
         quarter_text = prefix + unit * quarter_count
-        if (_scan_seconds(pattern, anchored, quarter_text)
+        if (_median_scan_seconds(pattern, anchored, quarter_text)
                 >= GROWTH_FLOOR_SECONDS
                 or len(quarter_text) * GROWTH * 2
                 > MAX_GROWTH_SCAN_CHARACTERS):

@@ -31,6 +31,7 @@ import statistics
 import pytest
 
 from equipa import loops
+from tests import test_review_gate_linear_3167 as linear_3167
 from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
@@ -333,6 +334,53 @@ def test_a_noisy_first_look_is_not_the_verdict():
     anchored = _called_anchored_only("_INLINE_CODE_RE")
     assert superlinear_scan(pattern, anchored, CI_PREFIX, "`",
                             SMALL_BYTES * GROWTH, 0.0006) is None
+
+
+# A linear scan whose cost per character steps up past a size (its state
+# outgrows the memory the allocator keeps), and whose first scan of each
+# text is a noisy reading at the floor: the shape that flagged
+# _BLANK_LINE_RUN_RE under contention (task 3175).
+STEP_CHARACTERS = 300_000
+BELOW_STEP_SECONDS_PER_CHARACTER = 5e-8
+ABOVE_STEP_SECONDS_PER_CHARACTER = 1.6e-7
+STEP_QUARTER_COUNT = 256 * 1024
+
+
+def test_the_quarter_size_is_chosen_on_a_median_not_one_noisy_scan(
+        monkeypatch):
+    """One scan of the quarter size reaching the floor must not fix the
+    sizes: the median of that size is still under it, so the size doubles
+    past the step and both sizes cost the same per character. Choosing on
+    the noisy scan compares 256K (under the step) with 1M (over it): 8.4x."""
+    scanned_lengths = set()
+
+    def stepped_scan_seconds(pattern, anchored, text):
+        per_character = (BELOW_STEP_SECONDS_PER_CHARACTER
+                         if len(text) < STEP_CHARACTERS
+                         else ABOVE_STEP_SECONDS_PER_CHARACTER)
+        seconds = len(text) * per_character
+        if len(text) not in scanned_lengths:
+            scanned_lengths.add(len(text))
+            seconds = max(seconds, GROWTH_FLOOR_SECONDS)
+        return seconds
+
+    monkeypatch.setattr(linear_3167, "_scan_seconds", stepped_scan_seconds)
+    growth = scan_growth(None, False, "", "\n", STEP_QUARTER_COUNT)
+    assert growth.quarter_count == 2 * STEP_QUARTER_COUNT
+    assert growth.quarter_seconds >= GROWTH_FLOOR_SECONDS
+    assert growth.ratio == pytest.approx(GROWTH)
+
+
+@timing_test
+def test_a_regex_whose_cost_steps_with_its_memory_reads_linear():
+    """_BLANK_LINE_RUN_RE on a newline run, the pair contention flagged:
+    linear on each side of its memory step, so the growth scan reads it
+    under the limit, on a quarter size whose median takes the floor."""
+    pattern = loops._BLANK_LINE_RUN_RE
+    anchored = _called_anchored_only("_BLANK_LINE_RUN_RE")
+    growth = scan_growth(pattern, anchored, "", "\n", SMALL_BYTES * GROWTH)
+    assert growth.quarter_seconds >= GROWTH_FLOOR_SECONDS / 2, growth
+    assert growth.ratio < GROWTH_LIMIT, growth
 
 
 # The CI shape at 50 KB, 200 KB and 2 MB (task 3175). One run scans a size
