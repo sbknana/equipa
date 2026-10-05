@@ -27,6 +27,7 @@ import equipa.config as equipa_config
 from equipa import agent_runner
 from equipa.bash_security import MAX_COMMAND_BYTES, CheckID
 from equipa.reactive_check import ReactiveBashChecker
+from tests.host_timing import assert_linear_time
 
 # A checker whose verdict fields come from the command, and which records
 # every command it is asked about next to itself.
@@ -102,10 +103,19 @@ def test_oversize_command_is_blocked_without_reaching_the_worker(shaped):
     checker, log = shaped
     command = "echo " + "a" * MAX_COMMAND_BYTES
 
-    started = time.monotonic()
+    def seconds_at(size):
+        started = time.monotonic()
+        verdict = checker.check_blocking("echo " + "a" * size, 5.0)
+        elapsed = time.monotonic() - started
+        assert verdict.check_id == CheckID.COMMAND_TOO_LONG
+        return elapsed
+
+    # Budget host-calibrated; a quarter of the command is under the cap, so
+    # the growth runs from the test's size to 4x it (task 3171).
+    assert_linear_time(seconds_at, MAX_COMMAND_BYTES, 0.5, "oversize command",
+                       compare_with_larger=True)
     verdict = checker.check_blocking(command, 5.0)
 
-    assert time.monotonic() - started < 0.5
     assert verdict.safe is False
     assert verdict.check_id == CheckID.COMMAND_TOO_LONG
     assert f"{MAX_COMMAND_BYTES}-byte limit" in verdict.message
@@ -135,16 +145,22 @@ def test_command_at_the_cap_still_reaches_the_worker(shaped):
 
 
 def test_four_mb_command_with_the_real_checker_is_blocked_immediately():
+    """Budget host-calibrated, growth from 1 MB linear (task 3171)."""
     checker = ReactiveBashChecker()
-    try:
+    verdicts = []
+
+    def seconds_at(size):
         started = time.monotonic()
-        verdict = checker.check_blocking("cat <<EOF\n" + "x" * (4 << 20), 5.0)
-        elapsed = time.monotonic() - started
+        verdicts.append(checker.check_blocking("cat <<EOF\n" + "x" * size, 5.0))
+        return time.monotonic() - started
+
+    try:
+        assert_linear_time(seconds_at, 4 << 20, 0.5, "4 MB command")
     finally:
         checker.close()
 
-    assert elapsed < 0.5, f"{elapsed:.2f}s"
-    assert verdict.safe is False and verdict.check_id == CheckID.COMMAND_TOO_LONG
+    for verdict in verdicts:
+        assert verdict.safe is False and verdict.check_id == CheckID.COMMAND_TOO_LONG
 
 
 FAKE_CLI = '''import os, sys, time
