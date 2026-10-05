@@ -26,6 +26,7 @@ import pytest
 
 import lesson_sanitizer as ls
 from lesson_sanitizer import detect_injection
+from tests.host_timing import assert_linear_time
 
 # The review's rows. Accepted on 3159 (and on base and pre-3150 too):
 FILLER_LEAD_ROWS = [
@@ -160,8 +161,13 @@ def test_the_tail_ends_at_the_next_rule_list_phrase():
         "clause-run", "one-long-tail"])
 def test_the_tail_judge_stays_linear(text):
     """Chains of reports, filler and coordinator runs, determiner runs and
-    clause runs near the 64 KB cap scan in well under a second."""
+    clause runs near the 64 KB cap scan in well under a second. Budget
+    host-calibrated, growth from a quarter of the text linear (task 3171)."""
     text = text[:ls.MAX_SANITIZE_INPUT_LENGTH]
-    started = time.process_time()
-    detect_injection(text)
-    assert time.process_time() - started < 1.0
+
+    def seconds_at(size):
+        started = time.process_time()
+        detect_injection(text[:size])
+        return time.process_time() - started
+
+    assert_linear_time(seconds_at, len(text), 1.0, text[:40])

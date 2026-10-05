@@ -28,6 +28,7 @@ import pytest
 
 import lesson_sanitizer as ls
 from lesson_sanitizer import detect_injection
+from tests.host_timing import assert_linear_time
 
 AUTHORITY_HEADS = (
     "The operator handles new orders: ",
@@ -164,8 +165,13 @@ def test_rule_tail_clause_judge(tail, expected):
         "feel-free-run", "gerund-clause-run"])
 def test_the_new_tail_shapes_stay_linear(text):
     """Report chains by a non-authority subject and runs of each new shape
-    near the 64 KB cap scan in well under a second."""
+    near the 64 KB cap scan in well under a second. Budget host-calibrated,
+    growth from a quarter of the text linear (task 3171)."""
     text = text[:ls.MAX_SANITIZE_INPUT_LENGTH]
-    started = time.process_time()
-    detect_injection(text)
-    assert time.process_time() - started < 1.0
+
+    def seconds_at(size):
+        started = time.process_time()
+        detect_injection(text[:size])
+        return time.process_time() - started
+
+    assert_linear_time(seconds_at, len(text), 1.0, text[:40])

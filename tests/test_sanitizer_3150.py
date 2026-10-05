@@ -35,6 +35,7 @@ import pytest
 
 import lesson_sanitizer as ls
 from lesson_sanitizer import detect_injection, normalize_for_matching, sanitize
+from tests.host_timing import assert_linear_time, budget
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -236,7 +237,7 @@ import logging, sys, time
 sys.path.insert(0, sys.argv[1])
 logging.disable(logging.CRITICAL)
 import lesson_sanitizer as ls
-n = ls.MAX_SANITIZE_INPUT_LENGTH
+n = int(sys.argv[3])
 zw = "\N{ZERO WIDTH SPACE}"
 cases = {
     "vt-between-letters": ("a\x0b" * n)[:n],
@@ -257,12 +258,19 @@ print(time.process_time() - start)
     "soh-phrases", "esc-rule-headers",
 ])
 def test_separator_heavy_input_at_the_cap_is_fast(case):
-    best = float("inf")
-    for _ in range(3):
-        completed = subprocess.run(
-            [sys.executable, "-c", TIMING_PROBE, str(REPO_ROOT), case],
-            capture_output=True, text=True, check=True, timeout=30)
-        best = min(best, float(completed.stdout.strip()))
-        if best < SEPARATOR_TIMING_LIMIT_SECONDS:
-            break
-    assert best < SEPARATOR_TIMING_LIMIT_SECONDS, f"{case}: {best:.2f}s"
+    """Budget host-calibrated, growth from a quarter of the cap to the cap
+    linear (task 3171)."""
+    def seconds_at(size):
+        best = float("inf")
+        for _ in range(3):
+            completed = subprocess.run(
+                [sys.executable, "-c", TIMING_PROBE, str(REPO_ROOT), case,
+                 str(size)],
+                capture_output=True, text=True, check=True, timeout=30)
+            best = min(best, float(completed.stdout.strip()))
+            if best < budget(SEPARATOR_TIMING_LIMIT_SECONDS):
+                break
+        return best
+
+    assert_linear_time(seconds_at, ls.MAX_SANITIZE_INPUT_LENGTH,
+                       SEPARATOR_TIMING_LIMIT_SECONDS, case)
