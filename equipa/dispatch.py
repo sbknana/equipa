@@ -1085,6 +1085,38 @@ def _nearest_repository(project_dir: str) -> Path | None:
     return None
 
 
+# The entries the walks look for in each directory: ``.git`` and those of
+# _GIT_DIRECTORY_SIGNATURES.
+_REPOSITORY_ENTRY_NAMES: tuple[str, ...] = tuple(dict.fromkeys(
+    (".git", *(name for signature in _GIT_DIRECTORY_SIGNATURES for name in signature))
+))
+
+
+def _unexaminable_directory(project_dir: str) -> Path | None:
+    """The first directory at or above ``project_dir`` in which the walks
+    cannot tell whether a repository entry is there, None when they can in
+    every one. Runs no git.
+
+    IR3174-04 (task #3177): ``os.path.lexists`` reads every error as "no
+    such entry", so a project holding ``.git`` that the agent made mode
+    0600 (no search permission for anyone, the orchestrator included) read
+    as "no repository": N1 blocked nothing and recorded nothing, and once
+    the operator restored the mode the next dispatch adopted the agent's
+    repository. Only "no such file" (ENOENT) and "not a directory"
+    (ENOTDIR; git cannot start there either) show that an entry is absent;
+    any other error (EACCES, EIO, ELOOP) does not.
+    """
+    for directory in _walk_up(project_dir):
+        for name in _REPOSITORY_ENTRY_NAMES:
+            try:
+                os.lstat(os.path.join(directory, name))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return Path(directory)
+    return None
+
+
 # S3168-03 (task #3173): where the N1 check records a repository found in a
 # project that was not git at dispatch, so a later dispatch refuses every
 # project that would discover it instead of adopting the agent's repository
@@ -1270,6 +1302,9 @@ def _repository_appeared_in_non_git_project(
     shows that no repository is reachable through it. It is reported as the
     repository (fail closed): the task is blocked, never retried, and the
     check does not raise.
+
+    IR3174-04 (task #3177): the same for a directory the walk cannot
+    search, such as a project made mode 0600 (:func:`_unexaminable_directory`).
     """
     repository = _nearest_repository(project_dir)
     if repository is None:
@@ -1279,6 +1314,9 @@ def _repository_appeared_in_non_git_project(
         # itself; anything else it returns is a ``.git`` entry, which blocks
         # the task as well.
         repository = _nearest_git_entry(Path(project_dir))
+    if repository is None:
+        # Both walks read an entry they cannot examine as absent.
+        repository = _unexaminable_directory(project_dir)
     if repository is None:
         return False
     try:
