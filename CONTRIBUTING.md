@@ -90,7 +90,10 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   `@pytest.mark.deadline(seconds)`. Past it the test fails with
   `DeadlineExceeded`; a test that swallows that, or waits without using
   CPU, is stopped once the wall clock passes the deadline plus a grace, and
-  its traceback is dumped. After one test of a worker has run past its
+  its traceback is dumped. That stop is a POSIX timer signal, not a thread,
+  so it costs a worker no task under a task cap (systemd `TasksMax`); it
+  falls back to faulthandler's watchdog thread off 64-bit Linux. After one
+  test of a worker has run past its
   deadline, every later test of that worker gets 30 s, so a regression
   that hangs a whole module costs one deadline and then 30 s per test. A
   hung regression fails by name instead of timing out the CI job.
