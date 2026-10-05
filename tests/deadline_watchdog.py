@@ -57,14 +57,16 @@ DEADLINE_SIGNAL = signal.SIGPROF
 # The slowest test took 92 s of wall time with every core busy (16
 # workers); a CI runner is slower, and the CI job stops at 30 minutes.
 TEST_DEADLINE_SECONDS = 600.0
-# The slowest timing test took 19 s here. A budget-only corpus cap of 60 s
-# at the highest host factor (4.0) is 240 s, still inside it.
+# The slowest timing test (test_nothing_an_older_tree_blocked_merges) took
+# 55 s with every core busy, 220 s at the highest host factor (4.0); a
+# budget-only corpus cap of 60 s is 240 s there. Both are inside it.
 TIMING_TEST_DEADLINE_SECONDS = 300.0
 # Once a phase of this process has run past its deadline, the run has failed
 # and named that test, and every later phase gets at most this much. A
 # reintroduced quadratic regex hangs many tests of one module, and
-# ``--dist loadfile`` runs them one after another in one worker: at a full
-# deadline each, six of them were a 30-minute CI job timeout again.
+# ``--dist loadfile`` runs them one after another in one worker: I3164-01's
+# regex put back hung 13 tests of tests/test_review_gate_linear_3167.py, 65
+# minutes at a full deadline each (a CI job timeout), 11 with this cut.
 AFTER_A_HANG_DEADLINE_SECONDS = 30.0
 # The hard stop comes this long after the deadline on the wall clock (or as
 # long again as a shorter deadline): a phase that waits uses no CPU time.
