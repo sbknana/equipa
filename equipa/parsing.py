@@ -18,6 +18,7 @@ import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
 from equipa.git_ops import git_run
+from equipa.monitoring import git_checks_allowed
 
 _log = logging.getLogger(__name__)
 
@@ -904,8 +905,11 @@ def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str
 
     Returns only files that actually changed according to git.
     Prevents agents from faking progress by claiming changes they didn't make.
+    In a project that was not git at dispatch no git runs and the claim is
+    returned as is (R3166-01: see
+    :func:`equipa.monitoring.dispatched_without_git`).
     """
-    if not claimed_files or not project_dir:
+    if not claimed_files or not project_dir or not git_checks_allowed(project_dir):
         return claimed_files
     try:
         # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).

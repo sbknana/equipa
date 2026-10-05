@@ -11,9 +11,12 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import os
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from equipa.constants import (
     BUDGET_CHECK_INTERVAL,
@@ -251,6 +254,62 @@ def _check_cost_limit(
     return None
 
 
+# --- Projects that were not git at dispatch (R3166-01, task #3168) ---
+
+# The given and the resolved form of every project directory a dispatch in
+# this context recorded as not git. A ContextVar, so each task of the
+# parallel loop (its own asyncio task) sees only the records of its own run.
+_NON_GIT_PROJECT_ROOTS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "equipa_non_git_project_roots", default=frozenset(),
+)
+
+
+def _path_forms(directory: str | os.PathLike[str]) -> set[str]:
+    """The absolute and the symlink-resolved form of ``directory``."""
+    path = os.fspath(directory)
+    return {os.path.abspath(path), os.path.realpath(path)}
+
+
+@contextmanager
+def dispatched_without_git(project_dir: str | os.PathLike[str]) -> Iterator[None]:
+    """Record, while the block runs, that ``project_dir`` was not a git
+    repository when its task was dispatched.
+
+    R3166-01 (task #3168): a ``.git`` found there later is one an agent
+    made. Git run there by discovery reads the agent's config and
+    attributes, so a work-tree ``git diff`` runs the agent's clean filter
+    as a child of the orchestrator, outside agent containment. While the
+    record is active, the change checks of this module (and
+    :func:`equipa.parsing.verify_files_changed`) run no git at or under
+    ``project_dir``, in its given or its resolved form. Nesting is safe:
+    an inner record only adds paths.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get() | _path_forms(project_dir)
+    token = _NON_GIT_PROJECT_ROOTS.set(frozenset(roots))
+    try:
+        yield
+    finally:
+        _NON_GIT_PROJECT_ROOTS.reset(token)
+
+
+def git_checks_allowed(directory: str | os.PathLike[str] | None) -> bool:
+    """False when ``directory`` lies in a project :func:`dispatched_without_git`
+    recorded; True otherwise, including when nothing is recorded.
+
+    Both forms of ``directory`` are compared with both recorded forms, so an
+    agent that swaps the project path for a symlink is still matched by the
+    path as given.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get()
+    if not roots or not directory:
+        return True
+    for candidate in _path_forms(directory):
+        for root in roots:
+            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+                return False
+    return True
+
+
 # --- Git Change Detection ---
 
 def _check_git_changes(project_dir: str | None) -> bool:
@@ -258,6 +317,8 @@ def _check_git_changes(project_dir: str | None) -> bool:
 
     Runs `git diff --stat` and `git status --short` in the project directory.
     Returns True if either command produces output (indicating file changes).
+    Runs no git, and returns False, in a project that was not git at
+    dispatch (R3166-01: see :func:`dispatched_without_git`).
 
     Args:
         project_dir: Path to the project directory (must be a git repo).
@@ -265,7 +326,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
     Returns:
         bool: True if file changes detected, False otherwise (including errors).
     """
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return False
 
     project_dir_str = str(project_dir)
@@ -295,7 +356,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
 
 def get_starting_sha(project_dir: str | None) -> str | None:
     """Capture the current HEAD SHA at loop start for session-commit detection."""
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return None
     try:
         result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
@@ -315,7 +376,7 @@ def has_session_commits(
     finding a merge-base or remote branches. Works on main, isolation
     branches, and worktrees alike.
     """
-    if not project_dir or not starting_sha:
+    if not project_dir or not starting_sha or not git_checks_allowed(project_dir):
         return False
     try:
         result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
@@ -340,7 +401,7 @@ def has_branch_commits(project_dir: str | None) -> bool:
     This is used by the no-progress guard to avoid false-positives when an
     agent committed work in early cycles but then idled in later cycles.
     """
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return False
 
     project_dir_str = str(project_dir)
