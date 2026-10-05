@@ -204,8 +204,30 @@ def test_a_bad_scan_bound_fails_and_keeps_the_default(tmp_path, value):
 
 
 def test_the_default_bound_leaves_a_real_host_time_to_search():
-    """The default is long enough for a large real root filesystem."""
+    """The default gives a real root filesystem a minute and more, and ends
+    (with its 5 s kill grace) at least 20 s before the operator check stops
+    reading the probe, so a cut-short search reaches the operator (task
+    3172, R3169-02: the 600 s default could never fire before the 120 s
+    read gave up, and this test held it at 300 s or more)."""
     match = re.search(r"^WORLD_WRITABLE_SCAN_SECONDS=([0-9]+)$",
                       VERIFY_SCRIPT.read_text(encoding="utf-8"), re.MULTILINE)
     assert match is not None
-    assert int(match.group(1)) >= 300
+    default = int(match.group(1))
+    assert "timeout --kill-after=5 " in VERIFY_SCRIPT.read_text(
+        encoding="utf-8")
+    assert default >= 60
+    assert default + 5 + 20 <= probe_read_timeout_seconds()
+
+
+def probe_read_timeout_seconds() -> int:
+    """The seconds ``equipa.isolation._run_probe`` (the operator's
+    ``--verify-probe`` run, the only real-host caller of ``--inside``)
+    reads the probe's output before giving up."""
+    import inspect
+
+    from equipa import isolation
+
+    found = re.findall(r"wait_for\(process\.stdout\.read\(\), timeout=(\d+)\)",
+                       inspect.getsource(isolation._run_probe))
+    assert len(found) == 1, found
+    return int(found[0])
