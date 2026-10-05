@@ -100,6 +100,10 @@ REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
 # or U+2028 review otherwise hid a finding heading from the MULTILINE regexes
 # while splitlines() still split it.
 _LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# Task 3169: the ASCII line breaks of _LINE_BREAK_RE other than "\r\n", for
+# str.translate after "\r\n" is replaced (an ASCII review's whole
+# normalisation; one C pass where the regex built a piece per CR).
+_ASCII_LINE_BREAKS = str.maketrans(dict.fromkeys("\r\x0b\x0c\x1c\x1d\x1e", "\n"))
 # gate-06: invisible characters that split a severity word ("HI<U+200B>GH") so
 # no regex sees it, while the operator reading the rendered file does.
 # Task 3143 (I-04): every Default_Ignorable_Code_Point and every Unicode Cf
@@ -175,10 +179,25 @@ def normalize_review_text(text: str) -> str:
     ``\\n``. Idempotent, so a caller that already normalised can pass the
     result through again without changing it.
     """
-    text = _INVISIBLE_CHARS_RE.sub("", text)
-    text = unicodedata.normalize("NFKC", text)
-    # NFKC can itself produce invisible characters (U+3164 -> U+1160).
-    text = _INVISIBLE_CHARS_RE.sub("", text)
+    return _normalized(text, "")
+
+
+def _normalized(text: str, separator: str) -> str:
+    """``text`` with ``separator`` for each invisible character, in NFKC,
+    every line break mapped to ``\\n``.
+
+    Task 3169: an ASCII text holds no invisible character and NFKC keeps it
+    as it is, so only its line breaks change; and when NFKC changes nothing,
+    no invisible character is left for a second pass to find. The result is
+    the same as the three passes; Python 3.10 spent a tenth of a second per
+    200 KB review on the character-class scans the gate repeats."""
+    if text.isascii():
+        return text.replace("\r\n", "\n").translate(_ASCII_LINE_BREAKS)
+    stripped = _INVISIBLE_CHARS_RE.sub(separator, text)
+    text = unicodedata.normalize("NFKC", stripped)
+    if text != stripped:
+        # NFKC can itself produce invisible characters (U+3164 -> U+1160).
+        text = _INVISIBLE_CHARS_RE.sub(separator, text)
     return _LINE_BREAK_RE.sub("\n", text)
 
 
@@ -197,10 +216,7 @@ def separated_review_text(text: str, separator: str) -> str:
     if (len(separator) != 1 or _ANY_LINE_BREAK_RE.match(separator)
             or unicodedata.normalize("NFKC", separator) != separator):
         raise ValueError(f"unusable separator {separator!r}")
-    text = _INVISIBLE_CHARS_RE.sub(separator, text)
-    text = unicodedata.normalize("NFKC", text)
-    text = _INVISIBLE_CHARS_RE.sub(separator, text)
-    return _LINE_BREAK_RE.sub("\n", text)
+    return _normalized(text, separator)
 
 
 @dataclass(frozen=True)
