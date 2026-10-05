@@ -1684,6 +1684,250 @@ def test_parallel_reviewer_of_a_non_git_task_starts_no_git_in_a_repository_made_
     assert run.statuses[TASK_ID] != "tests_passed", run.statuses
 
 
+# --- S3168-01 (task #3173): an implicit bare repository -------------------------
+
+BARE_VECTOR = "implicit-bare-repository"
+# Where the agent's work tree is: git discovers the repository from the
+# project directory either way.
+BARE_LAYOUTS = ("work-tree-in-subdirectory", "work-tree-at-root")
+
+
+def _plant_implicit_bare_repository(agent: Agent, project: Path, layout: str) -> None:
+    """S3168-01: what an agent can leave instead of a ``.git``. It runs
+    ``git init`` in a work tree, commits, moves the repository's own files
+    (``HEAD``, ``objects``, ``refs``, ``config``, ...) up into the project
+    directory and names the work tree in ``core.worktree``. No ``.git``
+    exists anywhere, yet git run in the project takes the project directory
+    for a git directory. Its clean and smudge filter is a program of the
+    agent's, selected for every path (work tree and ``info/attributes``),
+    and a committed file is left changed (same size)."""
+    work_tree = project / "src" if layout == "work-tree-in-subdirectory" else project
+    work_tree.mkdir(exist_ok=True)
+    if work_tree != project:
+        shutil.copy2(project / "app.py", work_tree / "app.py")
+    _git(work_tree, "init", "-q", "-b", "main")
+    (work_tree / ".gitattributes").write_text("* filter=probe\n")
+    _git(work_tree, "add", ".gitattributes", "app.py")
+    _git(work_tree, "-c", "user.name=agent", "-c", "user.email=agent@example.invalid",
+         "commit", "-q", "-m", "agent")
+    git_dir = work_tree / ".git"
+    for entry in list(git_dir.iterdir()):
+        entry.rename(project / entry.name)
+    git_dir.rmdir()
+    # Defined after the commit, so planting never runs it.
+    program = agent.program(f"{BARE_VECTOR}-filter", "exec cat")
+    for key, value in (
+        ("core.worktree", str(work_tree)),
+        ("filter.probe.clean", program),
+        ("filter.probe.smudge", program),
+    ):
+        _git(project, f"--git-dir={project}", "config", key, value)
+    (project / "info").mkdir(exist_ok=True)
+    (project / "info" / "attributes").write_text("* filter=probe\n")
+    (work_tree / "app.py").write_text("PRINT('project')\n")
+    agent.ran_while_planting = agent.ran()
+
+
+def _plant_bare_repository_during_run(
+    agent: Agent, project: Path, layout: str, recorder: GitRecorder,
+    run: ParallelNonGitRun,
+) -> None:
+    """:func:`_plant_implicit_bare_repository` as the agent's Bash calls do
+    it, during a run the recorder is watching."""
+    with recorder.paused():
+        _plant_implicit_bare_repository(agent, project, layout)
+    run.planted_at = len(recorder.calls)
+
+
+def _assert_bare_planted(agent: Agent, project: Path) -> None:
+    """The plant happened, and it is one the ``.git`` walk N1 used misses."""
+    assert not os.path.lexists(project / ".git")
+    assert (project / "HEAD").is_file() and (project / "refs").is_dir()
+    assert git_ops_mod._nearest_git_entry(project) is None
+    assert _git(project, f"--git-dir={project}", "config", "filter.probe.clean") == str(
+        agent.bin / f"{BARE_VECTOR}-filter"
+    )
+
+
+def _overloaded_tester_result() -> dict[str, Any]:
+    """A tester run that ends the dev-test cycle (the 529 shape)."""
+    import equipa.agent_runner as agent_runner
+
+    return agent_runner._fail_overloaded(
+        {"success": False, "result_text": "", "num_turns": 0, "cost": 0.0,
+         "duration": 0.0, "errors": ["API Error: 529 overloaded_error: Overloaded"]},
+        ["claude"], 10, 10,
+    )
+
+
+def _stub_dev_test_agents(
+    monkeypatch: pytest.MonkeyPatch,
+    developer: Callable[[str], None],
+    tester: Callable[[str, Any], Any] | None = None,
+) -> list[str]:
+    """The real ``run_dev_test_loop`` with its agents, DB, prompts and budget
+    stubbed. Everything that runs git in the project is the loop's own: the
+    HEAD anchor (``_resolve_head_sha``), the audit-task diff check
+    (``_git_diff_is_empty``) and the tester's diff context
+    (``_capture_git_diff_context``). ``developer(project_dir)`` is what the
+    developer agent does; ``tester(project_dir, output)`` returns the tester
+    result (by default a 529, which ends the cycle). Returns the roles
+    dispatched, in order."""
+    import equipa.loops as loops
+
+    dispatched: list[str] = []
+
+    async def async_none(*args, **kwargs):
+        return None
+
+    async def preflight_ok(*args, **kwargs):
+        return (True, "python", None)
+
+    async def fake_dispatch(cmd, *, role, project_dir, output=None, **kwargs):
+        dispatched.append(role)
+        if role == "tester":
+            if tester is None:
+                return _overloaded_tester_result()
+            return await tester(project_dir, output)
+        developer(project_dir)
+        return {
+            "success": True, "result_text": "RESULT: success\nFILES_CHANGED: app.py",
+            "num_turns": 3, "cost": 0.0, "duration": 0.0, "errors": [],
+            "has_file_changes": True,
+        }
+
+    @contextmanager
+    def fake_cli(*args, **kwargs):
+        yield ["claude"]
+
+    for name, value in {
+        "auto_install_dependencies": async_none,
+        "preflight_build_check": preflight_ok,
+        "get_db_connection": lambda *a, **k: _NoDb(),
+        "get_task_complexity": lambda _task: "simple",
+        "get_role_model": lambda *a, **k: "claude-test",
+        "get_role_turns": lambda *a, **k: 10,
+        "calculate_dynamic_budget": lambda max_turns, effort=None: (max_turns, max_turns),
+        "load_checkpoint": lambda *a, **k: ("", 0),
+        "fire_hook": async_none,
+        "read_agent_messages": lambda *a, **k: [],
+        "build_system_prompt": lambda *a, **k: "prompt",
+        "build_cli_command": fake_cli,
+        "_accumulate_cost": lambda *a, **k: 0.0,
+        "_check_cost_limit": lambda *a, **k: None,
+        "_get_task_status": lambda _task_id: "in_progress",
+        "_check_dev_progress": lambda *a, **k: ("continue", 0, None),
+        "dispatch_agent": fake_dispatch,
+    }.items():
+        monkeypatch.setattr(loops, name, value)
+    return dispatched
+
+
+def _audit_task(task_id: int) -> dict[str, Any]:
+    """A review task: the dev-test loop asks git whether the developer
+    changed code (``_git_diff_is_empty``) before giving the tester its diff."""
+    return {**_task(task_id), "task_type": "review"}
+
+
+@pytest.mark.parametrize("layout", BARE_LAYOUTS)
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_dev_test_loop_runs_no_git_in_an_implicit_bare_repository_the_agent_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop: str, layout: str,
+) -> None:
+    """S3168-01: in a project that was not git at dispatch, the developer
+    agent leaves an implicit bare repository (no ``.git`` at all). The N1
+    walk looked for ``.git`` only, so the attempt was not stopped, and the
+    dev-test loop's own diff helpers, which never consulted the non-git
+    record, ran ``git diff`` there by discovery: the agent's clean filter
+    ran in the orchestrator, and its diff went into the tester's prompt.
+    With the work tree at the project root, ``HEAD`` is ambiguous with the
+    git directory's own ``HEAD`` file, so it was the retried attempt
+    (``_resolve_head_sha`` named the agent's commit) that ran it. Now the
+    helpers run no git under the record and N1 finds the repository after
+    the attempt: blocked, audited, never retried. The real
+    ``run_dev_test_loop`` runs inside each retry loop as production calls
+    it for a project that is not git."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    planted: list[str] = []
+
+    def developer(project_dir: str) -> None:
+        if not planted:
+            with recorder.paused():
+                _plant_implicit_bare_repository(agent, project, layout)
+            planted.append(project_dir)
+
+    dispatched = _stub_dev_test_agents(monkeypatch, developer)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: _audit_task(task_id))
+    output: list[str] = []
+
+    async def run_loop() -> str:
+        autoresearch = {"features": {"autoresearch": True}, "autoresearch_max_retries": 1}
+        if loop == "cli":
+            args = SimpleNamespace(dispatch_config=autoresearch)
+            _, _, outcome = await cli_mod._run_dev_test_mode(
+                _audit_task(TASK_ID), str(project), {}, args,
+            )
+            return outcome
+        _, _, outcome, _, _, _ = await dispatch_mod.run_dev_test_loop_with_autoresearch(
+            _audit_task(TASK_ID), str(project), {}, SimpleNamespace(), autoresearch,
+            output=output,
+        )
+        return outcome
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    outcome = None
+    try:
+        with recorder.recording():
+            outcome = _run(run_loop())
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, BARE_VECTOR, f"{loop}-dev-test-loop/{layout}", agent.ran())
+    if error is not None:
+        raise error
+    assert planted == [str(project)], "the developer never planted"
+    _assert_bare_planted(agent, project)
+    assert recorder.discovery_in(project) == [], recorder.discovery_in(project)
+    assert not any("Captured git diff" in line for line in output), output
+    # N1 after the attempt: one developer and one tester run, then blocked.
+    assert dispatched == ["developer", "tester"], dispatched
+    assert outcome == REPOSITORY_APPEARED
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert f"a git repository appeared at {project} in a project" in audit[0][0], audit
+
+
+@pytest.mark.parametrize("layout", BARE_LAYOUTS)
+def test_the_dev_test_loop_helpers_run_the_filter_of_an_implicit_bare_repository_without_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str,
+) -> None:
+    """Positive control for the plant above: without the dispatch's non-git
+    record, the dev-test loop's diff helpers do discover the repository and
+    run the agent's filter, though no ``.git`` exists."""
+    import equipa.loops as loops
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _plant_implicit_bare_repository(agent, project, layout)
+    assert agent.ran() == [], "planting ran the filter"
+
+    base = _run(loops._resolve_head_sha(str(project)))
+    if layout == "work-tree-at-root":
+        # The retried attempt's anchor: the agent's own commit.
+        assert base == _git(project, f"--git-dir={project}", "rev-parse", "HEAD")
+    assert _run(loops._git_diff_is_empty(str(project), base_ref=base)) is False
+    assert "PRINT('project')" in _run(loops._capture_git_diff_context(str(project), 1, None, base))
+
+    assert f"{BARE_VECTOR}-filter" in agent.ran()
+    _assert_bare_planted(agent, project)
+
+
 # --- R3166-01 / N1 (task #3168): the CLI's single-agent mode -------------------
 
 
