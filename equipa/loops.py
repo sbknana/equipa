@@ -21,7 +21,7 @@ import subprocess
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -2262,6 +2262,9 @@ _COMBINING_MARK_CATEGORIES = ("Mn", "Me")
 _CHARACTER_REFERENCE_RE = re.compile(
     r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});",
 )
+# The same references as one group, for _references_replaced.
+_CHARACTER_REFERENCE_SPLIT_RE = re.compile(
+    "(" + _CHARACTER_REFERENCE_RE.pattern + ")")
 # A reference is decoded only to letters, digits, blanks and this punctuation.
 # Anything else ("`", "~", "#", "<", "|", "*", "=", line breaks) would build
 # Markdown the renderer never builds from a reference: "&#96;HIGH: ...&#96;"
@@ -2393,8 +2396,8 @@ _HTML_BLOCK_TYPE7_RE = re.compile(
 # Inside an HTML block a browser decodes a numeric character reference
 # without its ";" ("<p>&#72igh: ...</p>" shows "High: ..."), taking every
 # digit that follows. Markdown text needs the ";" (task 3157, R3154-04).
-# Each is given its ";" by a template (no callback per reference); one with
-# more significant digits than any code point is U+FFFD, as in a browser.
+# One with more significant digits than any code point is U+FFFD, as in a
+# browser.
 _OVERLONG_NUMERIC_REFERENCE_RE = re.compile(
     r"&#(?:0*(?!0)[0-9]{8,}(?![0-9])"
     r"|[xX]0*(?!0)[0-9A-Fa-f]{7,}(?![0-9A-Fa-f]))(?!;)",
@@ -2405,6 +2408,25 @@ _UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(
 _UNTERMINATED_HEX_REFERENCE_RE = re.compile(
     r"&#([xX])0*(?!0)([0-9A-Fa-f]{1,6})(?![0-9A-Fa-f;])",
 )
+# Task 3169 (timing on Python 3.10, where re expands a template with groups
+# in Python once per match): the references the three patterns above
+# rewrite, as one group for _references_replaced. Each spelling is rewritten
+# once (_html_block_reference) and kept in _HTML_BLOCK_REFERENCES. No two
+# of them match the same text, and a rewrite only changes its own spelling,
+# so one pass reads what the three passes in turn read.
+_HTML_BLOCK_REFERENCE_RE = re.compile(
+    "(" + _OVERLONG_NUMERIC_REFERENCE_RE.pattern
+    + r"|&#0*(?!0)[0-9]{1,7}(?![0-9;])"
+    + r"|&#[xX]0*(?!0)[0-9A-Fa-f]{1,6}(?![0-9A-Fa-f;]))",
+)
+
+
+def _html_block_reference(reference: str) -> str:
+    """A reference _HTML_BLOCK_REFERENCE_RE finds, as the parser reads it:
+    with its ";" and no leading zeros, or U+FFFD's when overlong."""
+    reference = _OVERLONG_NUMERIC_REFERENCE_RE.sub("&#65533;", reference)
+    reference = _UNTERMINATED_DECIMAL_REFERENCE_RE.sub(r"&#\1;", reference)
+    return _UNTERMINATED_HEX_REFERENCE_RE.sub(r"&#\1\2;", reference)
 
 
 def _html_block_line(line: str) -> str:
@@ -2413,9 +2435,8 @@ def _html_block_line(line: str) -> str:
     if "`" in line:
         line = _neutralize_backticks(line)
     if "&#" in line:
-        line = _OVERLONG_NUMERIC_REFERENCE_RE.sub("&#65533;", line)
-        line = _UNTERMINATED_DECIMAL_REFERENCE_RE.sub(r"&#\1;", line)
-        line = _UNTERMINATED_HEX_REFERENCE_RE.sub(r"&#\1\2;", line)
+        line = _references_replaced(line, _HTML_BLOCK_REFERENCE_RE,
+                                    _HTML_BLOCK_REFERENCES)
     return line
 
 
@@ -2864,9 +2885,20 @@ _CACHED_REFERENCE_LENGTH = 40
 _REFERENCE_TABLE_LIMIT = 65536
 
 
-def _decode_character_reference(match: re.Match[str]) -> str:
-    """One character reference as the text the parser should see."""
-    return _RENDERED_REFERENCES[match.group(0)]
+def _references_replaced(text: str, references: re.Pattern[str],
+                         table: Mapping[str, str]) -> str:
+    """``text`` with each match of ``references`` (one group, the whole
+    match) replaced by ``table[match]``, as ``references.sub`` would.
+
+    Task 3169 (timing on Python 3.10): ``re.sub`` runs Python code for every
+    match when given a function (and on 3.10 a template with groups), so a
+    flood of 68,000 "&#1" paid it once per pass, in four passes. re.split
+    and a map of the table's lookup run in C; only a spelling the table does
+    not hold yet runs its ``__missing__``.
+    """
+    pieces = references.split(text)
+    pieces[1::2] = map(table.__getitem__, pieces[1::2])
+    return "".join(pieces)
 
 
 def _decoded_reference_text(reference: str) -> str:
@@ -2894,6 +2926,7 @@ def _decoded_reference_text(reference: str) -> str:
 
 
 _RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
+_HTML_BLOCK_REFERENCES = _ReferenceTable(_html_block_reference)
 
 
 # Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
@@ -2935,7 +2968,8 @@ def _rendered_review_text(text: str) -> str:
     if "&" in text:
         # A raw NUL renders as U+FFFD; it must not pass for a decoded blank.
         text = text.replace(_REFERENCE_BLANK, _UNSAFE_REFERENCE_CHAR)
-        text = _CHARACTER_REFERENCE_RE.sub(_decode_character_reference, text)
+        text = _references_replaced(text, _CHARACTER_REFERENCE_SPLIT_RE,
+                                    _RENDERED_REFERENCES)
         if _REFERENCE_BLANK in text:
             text = _LEADING_REFERENCE_BLANKS_RE.sub(
                 lambda run: run.group(0).replace(_REFERENCE_BLANK, ""), text,
@@ -3102,10 +3136,15 @@ _BACKSTOP_TOKEN_RE = re.compile(
 # to the next word ("&#999999999HIGH" shows U+FFFD and a standalone HIGH).
 # A value of more than 7 decimal or 6 hex significant digits is past
 # U+10FFFF and decodes to U+FFFD without int() (see
-# _backstop_decoded_reference), so thousands of digits cost nothing.
+# _backstop_decoded_spelling), so thousands of digits cost nothing.
 _BACKSTOP_REFERENCE_RE = re.compile(
     r"&(?:#(0*)([0-9]+)(?![0-9]);?|#[xX](0*)([0-9A-Fa-f]+)(?![0-9A-Fa-f]);?"
     r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
+)
+# The same references as one group, for _references_replaced.
+_BACKSTOP_REFERENCE_SPLIT_RE = re.compile(
+    r"(&(?:#0*[0-9]+(?![0-9]);?|#[xX]0*[0-9A-Fa-f]+(?![0-9A-Fa-f]);?"
+    r"|[A-Za-z][A-Za-z0-9]{0,31};?))",
 )
 _BACKSTOP_MAX_DECIMAL_DIGITS = 7
 _BACKSTOP_MAX_HEX_DIGITS = 6
@@ -3307,29 +3346,25 @@ def _backstop_decoded_spelling(match: re.Match[str]) -> str:
 
 
 class _BackstopSpellingTable(_BoundedTable):
-    """Decoded text per reference as written (at most
-    ``_CACHED_REFERENCE_LENGTH`` characters), filled per spelling seen."""
-
-    def __missing__(self, reference: str) -> str:
-        return self._remember(reference, _backstop_decoded_spelling(
-            _BACKSTOP_REFERENCE_RE.fullmatch(reference)))
-
-
-_BACKSTOP_SPELLINGS = _BackstopSpellingTable()
-
-
-def _backstop_decoded_reference(match: re.Match[str]) -> str:
-    """One character reference as a browser shows it, on the same line.
+    """Each character reference as written, as a browser shows it on the
+    same line; filled per spelling seen, and a spelling longer than
+    ``_CACHED_REFERENCE_LENGTH`` is decoded each time instead of kept.
 
     Task 3157 (timing): every view decodes every reference, so a flood of
     one ("&#1" 68,000 times in an HTML block) cost a 200 KB review 0.3 s in
-    group lookups and key building alone. A short reference is looked up as
+    group lookups and key building alone. A reference is looked up as
     written first; only a new spelling is parsed.
     """
-    reference = match.group(0)
-    if len(reference) <= _CACHED_REFERENCE_LENGTH:
-        return _BACKSTOP_SPELLINGS[reference]
-    return _backstop_decoded_spelling(match)
+
+    def __missing__(self, reference: str) -> str:
+        decoded = _backstop_decoded_spelling(
+            _BACKSTOP_REFERENCE_RE.fullmatch(reference))
+        if len(reference) > _CACHED_REFERENCE_LENGTH:
+            return decoded
+        return self._remember(reference, decoded)
+
+
+_BACKSTOP_SPELLINGS = _BackstopSpellingTable()
 
 
 def _backstop_normalized(text: str) -> str:
@@ -3343,7 +3378,8 @@ def _backstop_normalized(text: str) -> str:
     line keeps its number.
     """
     if "&" in text:
-        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_decoded_reference, text)
+        text = _references_replaced(text, _BACKSTOP_REFERENCE_SPLIT_RE,
+                                    _BACKSTOP_SPELLINGS)
     text = _backstop_translated(text)
     if text.isascii():
         return text
@@ -3454,23 +3490,38 @@ class _BackstopSeparatorTable(_BoundedTable):
 _BACKSTOP_SEPARATORS = _BackstopSeparatorTable()
 
 
-def _backstop_separated_reference(match: re.Match[str]) -> str:
+def _backstop_separated_spelling(reference: str) -> str:
     """A character reference to a character the separated reading marks, as
     that mark ("Rated&#x3164;HIGH" separates the words); any other reference
     is left for _backstop_normalized to decode."""
-    decoded = _backstop_decoded_reference(match)
+    decoded = _BACKSTOP_SPELLINGS[reference]
     if not decoded:
         # html.unescape drops a noncharacter ("&#x3FFFF;"), which a browser
         # shows (as a box).
         return _BACKSTOP_GONE_MARK
     if len(decoded) != 1:
-        return match.group(0)
+        return reference
     if _BACKSTOP_SEPARATED_CONTROLS_RE.match(decoded):
         return _BACKSTOP_GONE_MARK
     if decoded.isascii():
-        return match.group(0)
+        return reference
     marked = _BACKSTOP_SEPARATORS[ord(decoded)]
-    return match.group(0) if marked == decoded else marked
+    return reference if marked == decoded else marked
+
+
+class _BackstopSeparatedSpellingTable(_BoundedTable):
+    """_backstop_separated_spelling per reference as written, filled per
+    spelling seen; a spelling longer than ``_CACHED_REFERENCE_LENGTH`` is
+    read each time instead of kept."""
+
+    def __missing__(self, reference: str) -> str:
+        separated = _backstop_separated_spelling(reference)
+        if len(reference) > _CACHED_REFERENCE_LENGTH:
+            return separated
+        return self._remember(reference, separated)
+
+
+_BACKSTOP_SEPARATED_SPELLINGS = _BackstopSeparatedSpellingTable()
 
 
 def _backstop_separated_text(text: str) -> str | None:
@@ -3490,7 +3541,8 @@ def _backstop_separated_text(text: str) -> str | None:
     text = _translate_non_ascii(text, _BACKSTOP_SEPARATORS)
     text = _BACKSTOP_SEPARATED_CONTROLS_RE.sub(_BACKSTOP_GONE_MARK, text)
     if "&" in text:
-        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_separated_reference, text)
+        text = _references_replaced(text, _BACKSTOP_REFERENCE_SPLIT_RE,
+                                    _BACKSTOP_SEPARATED_SPELLINGS)
     if _BACKSTOP_MARK_RE.search(text) is None:
         return None
     text = separated_review_text(text, _BACKSTOP_GONE_MARK)
