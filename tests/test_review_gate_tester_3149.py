@@ -23,6 +23,7 @@ adds what a tester found by probing the new code paths:
 Copyright 2026 Forgeborn
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -30,6 +31,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import AS_WRITTEN_ONLY_FINDINGS
 from tests.review_gate_production import gate_blocks as production_gate_blocks
 from tests.review_gate_production import production_seconds
@@ -245,94 +247,113 @@ def test_r3143_06_prompt_keeps_every_obligation():
 
 # --- Timing: 200 KB floods aimed at the 3149 code paths ---------------------------
 
-def pad(line):
-    return [line] * (RB // (len(line.encode()) + 1) + 1)
+def pad(rb, line):
+    return [line] * (rb // (len(line.encode()) + 1) + 1)
 
 
-TIMING_FAMILIES = {
-    # Inline-markup view (R3143-03).
-    "inline_split_tokens": ["H*IG*H " * (RB // 7)],
-    "mark_runs_after_letter": pad("a" + "*" * 1000 + " "),
-    "backslash_flood": ["\\" * RB],
-    "backtick_flood": ["`" * RB],
-    "letter_mark_alternation": ["a*" * (RB // 2)],
-    "open_bracket_flood": ["[" * RB],
-    "open_link_flood": ["[a](" * (RB // 4)],
-    "open_image_flood": ["![](" * (RB // 4)],
-    "max_bounded_links": pad("[" + "a" * 200 + "](" + "b" * 499 + " "),
-    "reference_link_tokens": ["[HI][r]GH " * (RB // 10)],
-    "collapsed_reference_pairs": ["[][]" * (RB // 4)],
-    # Numeric references (R3143-04).
-    "long_numeric_references": pad("&#" + "9" * 5000 + " "),
-    "zero_padded_references": pad("&#" + "0" * 1000 + "72;IGH "),
-    "hex_references_flood": ["&#xFFFFFFF;" * (RB // 11)],
-    # U+0130 through the case-insensitive rules (R3143-05).
-    "dotted_capital_i_tokens": ["H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}GH "
-                                * (RB // 6)],
-    "dotted_capital_i_labels": pad("- H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
-                                   "GH: x"),
-    # Lookalike letters (R3143-07).
-    "ascii_lookalike_tokens": ["HlGH CR1T1CAL MED|UM " * (RB // 21)],
-    # TeX math view (R3143-07).
-    "math_spelled_tokens": ["$\\mathrm{H}\\mathrm{I}\\mathrm{G}\\mathrm{H}$ "
-                            * (RB // 37)],
-    "dollar_flood": ["$" * RB],
-    "unclosed_math_runs": pad("$" + "\\a{ " * 600),
-    "math_gap_flood": ["$" + "\\, " * (RB // 3) + "$"],
-    # Bidi (R3143-07).
-    "bidi_override_flood":["\N{RIGHT-TO-LEFT OVERRIDE}" * (RB // 3)],
-    "allowed_mark_flood": ["\N{LEFT-TO-RIGHT MARK}x" * (RB // 4)],
-    "entity_bidi_flood": ["&#x202E;" * (RB // 8)],
-    # Exemption guard and soft wraps (R3143-02, R3143-06).
-    "soft_wrapped_negations": ["the scan found no", "HIGH issues."]
-    * (RB // 31),
-    # Each token runs the strict tally grammar over up to 200 characters
-    # that fail only at the last one (0.13 s / 0.26 s on main).
-    "tally_tails_that_fail": pad("HIGH: 0" + " 1" * 95 + " x"),
-    "tally_separator_tails_that_fail": pad("HIGH: 0" + " |" * 95 + " x"),
-    "cut_after_text": pad("No HIGH" + " " * 300),
-    "generic_noun_tails": pad("No HIGH issues remain because the scan was"),
-    "list_flood_with_commas": ["not LOW, " * (RB // 9)],
-    # Uncounted heading-shaped lines (R3143-01; about 0.6 s on main too).
-    # Over _REVIEW_MAX_SEVERITY_LINES these block as too dense to parse; the
-    # "at_cap" families below hold just under the cap, padded to 200 KB.
-    "uncounted_headings": pad(f"<p>### [S2] HIGH {E} x</p>"),
-    "entity_headings": pad(f"&#35;## [S2] MEDIUM {E} x"),
-}
+@functools.lru_cache(maxsize=None)
+def timing_families(rb):
+    """The floods built at ``rb`` bytes: timed at RB and a quarter of it
+    (task 3171)."""
+    return {
+        # Inline-markup view (R3143-03).
+        "inline_split_tokens": ["H*IG*H " * (rb // 7)],
+        "mark_runs_after_letter": pad(rb, "a" + "*" * 1000 + " "),
+        "backslash_flood": ["\\" * rb],
+        "backtick_flood": ["`" * rb],
+        "letter_mark_alternation": ["a*" * (rb // 2)],
+        "open_bracket_flood": ["[" * rb],
+        "open_link_flood": ["[a](" * (rb // 4)],
+        "open_image_flood": ["![](" * (rb // 4)],
+        "max_bounded_links": pad(rb, "[" + "a" * 200 + "](" + "b" * 499 + " "),
+        "reference_link_tokens": ["[HI][r]GH " * (rb // 10)],
+        "collapsed_reference_pairs": ["[][]" * (rb // 4)],
+        # Numeric references (R3143-04).
+        "long_numeric_references": pad(rb, "&#" + "9" * 5000 + " "),
+        "zero_padded_references": pad(rb, "&#" + "0" * 1000 + "72;IGH "),
+        "hex_references_flood": ["&#xFFFFFFF;" * (rb // 11)],
+        # U+0130 through the case-insensitive rules (R3143-05).
+        "dotted_capital_i_tokens": ["H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}GH "
+                                    * (rb // 6)],
+        "dotted_capital_i_labels": pad(rb, "- H\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
+                                       "GH: x"),
+        # Lookalike letters (R3143-07).
+        "ascii_lookalike_tokens": ["HlGH CR1T1CAL MED|UM " * (rb // 21)],
+        # TeX math view (R3143-07).
+        "math_spelled_tokens": ["$\\mathrm{H}\\mathrm{I}\\mathrm{G}\\mathrm{H}$ "
+                                * (rb // 37)],
+        "dollar_flood": ["$" * rb],
+        "unclosed_math_runs": pad(rb, "$" + "\\a{ " * 600),
+        "math_gap_flood": ["$" + "\\, " * (rb // 3) + "$"],
+        # Bidi (R3143-07).
+        "bidi_override_flood":["\N{RIGHT-TO-LEFT OVERRIDE}" * (rb // 3)],
+        "allowed_mark_flood": ["\N{LEFT-TO-RIGHT MARK}x" * (rb // 4)],
+        "entity_bidi_flood": ["&#x202E;" * (rb // 8)],
+        # Exemption guard and soft wraps (R3143-02, R3143-06).
+        "soft_wrapped_negations": ["the scan found no", "HIGH issues."]
+        * (rb // 31),
+        # Each token runs the strict tally grammar over up to 200 characters
+        # that fail only at the last one (0.13 s / 0.26 s on main).
+        "tally_tails_that_fail": pad(rb, "HIGH: 0" + " 1" * 95 + " x"),
+        "tally_separator_tails_that_fail": pad(rb, "HIGH: 0" + " |" * 95 + " x"),
+        "cut_after_text": pad(rb, "No HIGH" + " " * 300),
+        "generic_noun_tails": pad(rb, "No HIGH issues remain because the scan was"),
+        "list_flood_with_commas": ["not LOW, " * (rb // 9)],
+        # Uncounted heading-shaped lines (R3143-01; about 0.6 s on main too).
+        # Over _REVIEW_MAX_SEVERITY_LINES these block as too dense to parse; the
+        # "at_cap" families below hold just under the cap, padded to 200 KB.
+        "uncounted_headings": pad(rb, f"<p>### [S2] HIGH {E} x</p>"),
+        "entity_headings": pad(rb, f"&#35;## [S2] MEDIUM {E} x"),
+        "at_cap_uncounted_headings": at_cap(
+            rb, f"<p>### [S{{n}}] HIGH {E} x {{pad}}</p>"),
+        "at_cap_entity_headings": at_cap(
+            rb, f"&#35;## [S{{n}}] MEDIUM {E} x {{pad}}"),
+        "at_cap_heading_labels": at_cap(rb, "<p>### [S{n}] HIGH: x {pad}</p>"),
+        "at_cap_tag_split_words": at_cap(rb, "<b>H</b>IGH <i>x</i> {pad}"),
+        "at_cap_lookalike_words": at_cap(
+            rb, "\N{CYRILLIC CAPITAL LETTER EN WITH DESCENDER}IGH {pad}"),
+        "at_cap_list_labels": at_cap(rb, "- [S{n}] HIGH: x {pad}"),
+    }
 
 
-def at_cap(template):
-    """200 KB in just under the cap's number of lines holding a severity
-    word, each padded with a run the line rules must read to its end."""
+def at_cap(rb, template):
+    """``rb`` bytes in just under the cap's number of lines holding a
+    severity word, each padded with a run the line rules must read to its
+    end. The line count stays at the cap whatever the size, so a quarter of
+    the size shortens each run."""
     count = loops._REVIEW_MAX_SEVERITY_LINES - 20
-    room = RB // count - len(template.format(n=0, pad="").encode()) - 2
+    unpadded = sum(len(template.format(n=number, pad="").encode()) + 1
+                   for number in range(count))
+    room = (rb - unpadded) // count + 1
     return [template.format(n=number, pad="y" * room)
             for number in range(count)]
 
 
-TIMING_FAMILIES.update({
-    "at_cap_uncounted_headings": at_cap(f"<p>### [S{{n}}] HIGH {E} x {{pad}}</p>"),
-    "at_cap_entity_headings": at_cap(f"&#35;## [S{{n}}] MEDIUM {E} x {{pad}}"),
-    "at_cap_heading_labels": at_cap("<p>### [S{n}] HIGH: x {pad}</p>"),
-    "at_cap_tag_split_words": at_cap("<b>H</b>IGH <i>x</i> {pad}"),
-    "at_cap_lookalike_words": at_cap(
-        "\N{CYRILLIC CAPITAL LETTER EN WITH DESCENDER}IGH {pad}"),
-    "at_cap_list_labels": at_cap("- [S{n}] HIGH: x {pad}"),
-})
-
-
+TIMING_FAMILIES = timing_families(RB)
 PROVENANCE_REFUSED_FAMILIES = {"bidi_override_flood", "entity_bidi_flood"}
+
+
+def _flood_seconds(name, rb):
+    """The merge gate's time on the review holding flood ``name`` built at
+    ``rb`` bytes."""
+    text = review("No findings.", timing_families(rb)[name], ZERO)
+    assert len(text.encode()) >= rb * 0.99, name
+    return production_seconds(text, nonce=NONCE)
+
+
+def _flood_parser_seconds(name, rb):
+    text = review("No findings.", timing_families(rb)[name], ZERO)
+    return median_cpu_seconds(analyze, text)
 
 
 @timing_test
 @pytest.mark.parametrize("name", sorted(TIMING_FAMILIES))
 def test_200kb_flood_on_a_3149_path_parses_in_half_a_second(name):
-    text = review("No findings.", TIMING_FAMILIES[name], ZERO)
-    assert len(text.encode()) >= RB * 0.99, name
-    elapsed = production_seconds(text, nonce=NONCE)
-    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(lambda rb: _flood_seconds(name, rb), RB, 0.5, name)
     if name in PROVENANCE_REFUSED_FAMILIES:
         # Provenance refuses a bidi control before the parser runs, so the
         # parser's own reading of the flood is timed as well.
-        elapsed = median_cpu_seconds(analyze, text)
-        assert elapsed < 0.5, f"{name} (parser): {elapsed:.2f}s"
+        assert_linear_time(lambda rb: _flood_parser_seconds(name, rb), RB,
+                           0.5, f"{name} (parser)")
