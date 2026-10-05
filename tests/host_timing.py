@@ -7,19 +7,22 @@ the development host, and a slower runner (a GitHub runner, or Python 3.10
 here) went a few percent over them on work that was still linear. So every
 timing test checks two things through this module:
 
-1. **A budget calibrated under the same load.** A fixed pure-Python
-   reference workload is timed in the same process right before and right
-   after each measurement (``LOAD_REFERENCE_RUNS`` runs of CPU time on each
-   side), and that measurement's budget is its base budget times
-   ``max(1.0, median / REFERENCE_SECONDS)``. ``REFERENCE_SECONDS`` is the
-   same workload measured on the development host. A factor measured once
-   at session start missed the contention between xdist workers on a small
-   runner (task 3175: a linear 0.51 s against a 0.5 s budget on CI); one
-   measured around the work sees the load the work saw. ``budget(seconds)``
-   serves tests that time their own work: it scales by a factor measured in
-   this process within the last ``FACTOR_REUSE_SECONDS``, or measures one
-   right then. A faster host never tightens a budget, and no base budget is
-   ever raised.
+1. **A budget calibrated under the same load.** A measurement over its base
+   budget is taken again with a fixed pure-Python reference workload timed
+   in the same process right before and right after it
+   (``LOAD_REFERENCE_RUNS`` runs of CPU time on each side), and its budget
+   is the base budget times ``max(1.0, median / REFERENCE_SECONDS)``.
+   ``REFERENCE_SECONDS`` is the same workload measured on the development
+   host. A factor measured once at session start missed the contention
+   between xdist workers on a small runner (task 3175: a linear 0.51 s
+   against a 0.5 s budget on CI); one measured around the work sees the
+   load the work saw. A measurement within its base budget passes at any
+   factor, so the reference does not run for it: a test timing thousands
+   of fast shapes ran the reference around each one for 25 minutes.
+   ``budget(seconds)`` serves tests that time their own work: it scales by
+   a factor measured in this process within the last
+   ``FACTOR_REUSE_SECONDS``, or measures one right then. A faster host
+   never tightens a budget, and no base budget is ever raised.
 
 2. **A cap on the factor.** A measured factor over ``MAX_HOST_FACTOR``
    fails the measurement (``HostTooSlowError``) instead of loosening its
@@ -34,12 +37,15 @@ timing test checks two things through this module:
    does not depend on the host's speed, so a quadratic regression fails on
    a slow runner even when the host factor has loosened its budget. A
    ratio of two sub-millisecond times is noise (task 3175: 0.0006 s against
-   0.0052 s), so when the quarter size takes under ``GROWTH_FLOOR_SECONDS``
-   both sizes are measured again, the same number of times, until the
-   quarter size's total reaches it (at most ``MAX_GROWTH_REPETITIONS``
-   times, and within ``GROWTH_REPETITION_SECONDS`` of wall time for the
-   whole calls, building the shape included); the totals are compared, the
-   smaller raised to the floor.
+   0.0052 s), so the smaller time is raised to ``GROWTH_FLOOR_SECONDS``
+   before the ratio is taken. When the quarter size takes under the floor
+   and the larger size's reading could still reach the limit, both sizes
+   are measured again, the same number of times, until the quarter size's
+   total reaches the floor (at most ``MAX_GROWTH_REPETITIONS`` times, and
+   within ``GROWTH_REPETITION_SECONDS`` of wall time for the whole calls,
+   building the shape included); the totals are compared, the smaller
+   raised to the floor. Linear work under the floor is not repeated: it
+   cannot reach the limit.
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
@@ -209,9 +215,9 @@ class HostCalibration:
                     f"{HOST_FACTOR_ENVIRONMENT_VARIABLE})")
         text = (f"timing host factor {self.factor:.2f} at session start "
                 f"(reference workload {self.measured_seconds:.4f} s here, "
-                f"{REFERENCE_SECONDS:.4f} s on the development host); each "
-                f"measurement is scaled by the factor measured around it, "
-                f"capped at {MAX_HOST_FACTOR}")
+                f"{REFERENCE_SECONDS:.4f} s on the development host); a "
+                f"measurement over its base budget is scaled by the factor "
+                f"measured around it, capped at {MAX_HOST_FACTOR}")
         if self.factor > MAX_HOST_FACTOR:
             text += "; OVER THE CAP: timing tests will fail on this host"
         return text
@@ -241,13 +247,37 @@ def _remember_load_factor(factor: float) -> None:
     _last_load_factor = (time.monotonic(), factor)
 
 
-def measure_under_load(measure: Callable[[], T]) -> tuple[T, float]:
+def measure_under_load(measure: Callable[[], T],
+                       base_budget_seconds: float | None = None,
+                       slowest: Callable[[T], float] = float,
+                       ) -> tuple[T, float]:
     """``measure()`` and the host factor of the load it ran under: the
     reference workload timed right before and right after it in this
-    process, median of both sides. The forced factor if one is set."""
+    process, median of both sides. The forced factor if one is set.
+
+    With ``base_budget_seconds``, the reference only runs when it can
+    change the verdict. A measurement whose ``slowest(result)`` is within
+    the base budget passes at any factor (never below 1.0), so it is
+    returned at factor 1.0 unmeasured: a test timing thousands of
+    sub-millisecond shapes must not pay for the reference each time. One
+    over it is measured again between two readings of the reference, and
+    its budget is scaled by that factor. One at ``MAX_HOST_FACTOR`` times
+    the base budget or more cannot pass at any factor up to the cap, so it
+    is not measured again (a quadratic regression must not run twice); the
+    reference runs right after it."""
     calibration = host_calibration()
     if calibration.forced:
         return measure(), calibration.factor
+    if base_budget_seconds is not None:
+        result = measure()
+        seconds = slowest(result)
+        if seconds < base_budget_seconds:
+            return result, 1.0
+        if seconds >= base_budget_seconds * MAX_HOST_FACTOR:
+            factor = factor_from_reference(
+                measure_reference_seconds(2 * LOAD_REFERENCE_RUNS))
+            _remember_load_factor(factor)
+            return result, factor
     before = reference_samples(LOAD_REFERENCE_RUNS)
     result = measure()
     after = reference_samples(LOAD_REFERENCE_RUNS)
@@ -288,18 +318,29 @@ def growth_ratio(small_seconds: float, seconds: float) -> float:
 
 
 def growth_repetitions(small_seconds: float,
-                       pair_cost_seconds: float = 0.0) -> int:
+                       pair_cost_seconds: float = 0.0,
+                       seconds: float | None = None) -> int:
     """How many times to measure each size so that the quarter size's total
     reaches ``GROWTH_FLOOR_SECONDS``: at most ``MAX_GROWTH_REPETITIONS``,
     and no more extra pairs than ``GROWTH_REPETITION_SECONDS`` of wall time
-    pays for when one call of each size took ``pair_cost_seconds``."""
+    pays for when one call of each size took ``pair_cost_seconds``.
+
+    ``seconds`` is the larger size's first reading. When that many
+    repetitions of it would total under ``GROWTH_LIMIT`` floors, the
+    smaller total is raised to the floor and the ratio cannot reach the
+    limit, so the sizes are measured once: linear work under the floor
+    (about 4 floors in all) is never repeated, a suspicious reading is."""
     if small_seconds >= GROWTH_FLOOR_SECONDS:
         return 1
     needed = math.ceil(GROWTH_FLOOR_SECONDS / max(small_seconds, 1e-6))
     affordable = MAX_GROWTH_REPETITIONS
     if pair_cost_seconds > 0:
         affordable = 1 + int(GROWTH_REPETITION_SECONDS / pair_cost_seconds)
-    return max(1, min(MAX_GROWTH_REPETITIONS, needed, affordable))
+    repetitions = max(1, min(MAX_GROWTH_REPETITIONS, needed, affordable))
+    if (seconds is not None
+            and repetitions * seconds < GROWTH_LIMIT * GROWTH_FLOOR_SECONDS):
+        return 1
+    return repetitions
 
 
 def fail(message: str) -> None:
@@ -311,7 +352,8 @@ def fail(message: str) -> None:
 class LinearTiming:
     """The two measurements of one ``assert_linear_time`` call: the seconds
     of one call at each size (a mean over ``repetitions`` calls), and the
-    budget and host factor of the larger size's first measurement."""
+    budget and host factor of the larger size's first measurement (factor
+    1.0, unmeasured, when it was within its base budget)."""
 
     label: str
     small_size: int
@@ -380,24 +422,29 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         small_size, large_size = size, size * GROWTH
     else:
         small_size, large_size = size // GROWTH, size
-    call_costs: list[float] = []
+    call_costs: dict[int, float] = {}
 
     def costed(at_size: int) -> float:
         """``seconds_at(at_size)``, keeping the wall time of the whole call
         (building the shape included): what one more repetition costs."""
         started = time.monotonic()
         seconds_taken = seconds_at(at_size)
-        call_costs.append(time.monotonic() - started)
+        call_costs[at_size] = time.monotonic() - started
         return seconds_taken
 
     small_seconds, small_factor = measure_under_load(
-        lambda: costed(small_size))
+        lambda: costed(small_size), base_budget_seconds)
     _check_budget(label, small_seconds, small_size, base_budget_seconds,
                   small_factor)
-    seconds, factor = measure_under_load(lambda: costed(large_size))
-    if not compare_with_larger:
+    if compare_with_larger:
+        # Past ``size`` only the growth counts: no budget, no reference.
+        seconds, factor = costed(large_size), small_factor
+    else:
+        seconds, factor = measure_under_load(lambda: costed(large_size),
+                                             base_budget_seconds)
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
-    repetitions = growth_repetitions(small_seconds, sum(call_costs))
+    repetitions = growth_repetitions(small_seconds, sum(call_costs.values()),
+                                     seconds)
     timing = LinearTiming(
         label, small_size,
         _mean_seconds(seconds_at, small_size, repetitions, small_seconds),
@@ -440,9 +487,15 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
             fail(f"{label}: over the budget {budget_seconds:.4f} s at host "
                  f"factor {factor:.2f} at size {at_size}: {over}")
 
-    small, small_factor = measure_under_load(lambda: dict(seconds_at(small_size)))
+    def slowest_part(times: Mapping[str, float]) -> float:
+        return max(times.values(), default=0.0)
+
+    small, small_factor = measure_under_load(
+        lambda: dict(seconds_at(small_size)), base_budget_seconds,
+        slowest_part)
     check_budget(small, small_size, small_factor)
-    large, factor = measure_under_load(lambda: dict(seconds_at(size)))
+    large, factor = measure_under_load(
+        lambda: dict(seconds_at(size)), base_budget_seconds, slowest_part)
     check_budget(large, size, factor)
     if set(small) != set(large):
         fail(f"{label}: the parts differ between the sizes: "

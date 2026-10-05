@@ -215,8 +215,51 @@ def test_a_factor_over_the_cap_fails_loudly(monkeypatch):
     large; growth only sees superlinear work."""
     _measure_load(monkeypatch, 4.5, 4.5, 4.5, 4.5)
     with pytest.raises(HostTooSlowError, match="over the cap of 4.0x"):
-        assert_linear_time(lambda size: 0.001 * size / 40_000, 40_000, 0.5)
+        assert_linear_time(lambda size: 0.6 * size / 10_000, 40_000, 0.5)
     assert issubclass(HostTooSlowError, AssertionError)
+
+
+def test_work_within_its_base_budget_never_runs_the_reference(monkeypatch):
+    """It passes at any factor (never below 1.0): a test timing thousands
+    of fast shapes must not pay for the reference around each one. No load
+    is queued, so a reference run would fail on an empty queue."""
+    log = _measure_load(monkeypatch)
+    timing = assert_linear_time(_model(1e-6, 1), 40_000, 0.5, "fast")
+    assert log == []
+    assert (timing.factor, timing.budget_seconds) == (1.0, 0.5)
+    timings = assert_linear_times(lambda size: {"part": 1e-6 * size},
+                                  40_000, 0.5)
+    assert log == []
+    assert timings["part"].factor == 1.0
+
+
+def test_a_measurement_over_its_base_budget_is_taken_again_under_the_load(
+        monkeypatch):
+    log = _measure_load(monkeypatch, 1.5, 1.5, 1.5, 1.5)
+
+    def work() -> float:
+        log.append("work")
+        return 0.6
+
+    seconds, factor = host_timing.measure_under_load(work, 0.5)
+    assert log == ["work", "reference x2", "work", "reference x2"]
+    assert (seconds, factor) == (0.6, pytest.approx(1.5))
+
+
+def test_a_measurement_no_factor_can_pass_is_not_taken_again(monkeypatch):
+    """At MAX_HOST_FACTOR times its base budget or more, a quadratic
+    regression must not run twice: the reference runs once, after it."""
+    log = _measure_load(monkeypatch, *[1.5] * 8)
+
+    def work() -> float:
+        log.append("work")
+        return 0.5 * MAX_HOST_FACTOR
+
+    seconds, factor = host_timing.measure_under_load(work, 0.5)
+    assert log == ["work", "reference x4"]
+    assert factor == pytest.approx(1.5)
+    with pytest.raises(TimingCheckFailed, match="over the budget 0.7500 s"):
+        assert_linear_time(lambda size: 2.0 * size / 10_000, 40_000, 0.5)
 
 
 def test_the_cap_is_inclusive(monkeypatch):
@@ -370,25 +413,52 @@ def test_one_descheduled_run_is_measured_again():
 
 
 def test_work_below_the_floor_passes_the_growth_check():
-    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. Measured
-    # MAX_GROWTH_REPETITIONS times, the quarter size totals 3.2 ms and is
-    # still raised to the floor.
-    timing = assert_linear_time(
-        lambda size: 0.0001 if size < 40_000 else 0.0006, 40_000, 0.5, "tiny")
-    assert timing.repetitions == MAX_GROWTH_REPETITIONS
-    assert timing.ratio == pytest.approx(
-        0.0006 * MAX_GROWTH_REPETITIONS / GROWTH_FLOOR_SECONDS)
+    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. Even
+    # MAX_GROWTH_REPETITIONS runs of the larger size (19.2 ms) could not
+    # reach the limit against the floor, so neither size is repeated.
+    calls: list[int] = []
+
+    def seconds_at(size: int) -> float:
+        calls.append(size)
+        return 0.0001 if size < 40_000 else 0.0006
+
+    timing = assert_linear_time(seconds_at, 40_000, 0.5, "tiny")
+    assert calls == [10_000, 40_000]
+    assert timing.repetitions == 1
+    assert timing.ratio == pytest.approx(0.0006 / GROWTH_FLOOR_SECONDS)
 
 
-def test_a_quarter_size_under_the_floor_is_measured_until_it_reaches_it():
-    """Task 3175: a sub-millisecond ratio is noise. 5 ms at the quarter size
-    is measured 4 times (20 ms) at each size, and the means compared."""
+def test_linear_work_under_the_floor_is_not_repeated():
+    """Repeated until the quarter size took the floor, linear work totals
+    about 4 floors at the larger size: it cannot reach the limit, so 5 ms
+    against 20 ms is decided as read (20 ms against the 20 ms floor)."""
     calls: list[int] = []
     timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000] + [10_000] * 3 + [40_000] * 3
-    assert timing.repetitions == 4
-    assert timing.small_seconds == pytest.approx(0.005)
-    assert timing.ratio == pytest.approx(4.0)
+    assert calls == [10_000, 40_000]
+    assert timing.repetitions == 1
+    assert timing.ratio == pytest.approx(1.0)
+
+
+def test_the_ci_reading_is_measured_again_and_passes():
+    """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
+    sub-millisecond ratio of 8.7x. That larger reading could reach the
+    limit once repeated, so both sizes run 32 times and the totals (19.2 ms
+    raised to 20 ms, against 80 ms of linear work) are compared."""
+    calls: list[int] = []
+    readings = iter([0.0052])
+
+    def seconds_at(size: int) -> float:
+        calls.append(size)
+        if size < 40_000:
+            return 0.0006
+        return next(readings, 0.0024)
+
+    timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
+    assert timing.repetitions == MAX_GROWTH_REPETITIONS
+    assert calls.count(10_000) == calls.count(40_000) == MAX_GROWTH_REPETITIONS
+    assert timing.ratio == pytest.approx(
+        (0.0052 + 0.0024 * 31) / GROWTH_FLOOR_SECONDS)
+    assert timing.ratio < 4.1
 
 
 def test_repetitions_are_bounded_by_what_a_call_costs():
