@@ -425,6 +425,12 @@ DEADLINE_TESTS = {
         "a hanging find is cut at its 1 s scan bound, not the 120 s timeout",
     "test_agent_isolation_3169.py::test_the_bound_fails_even_when_nothing_else_does":
         "a hanging find is cut at its 1 s scan bound",
+    "test_deadline_watchdog_3175.py::"
+    "test_a_catastrophic_regex_is_cut_at_its_deadline":
+        "the regex is cut at its 0.5 s deadline, not after its minutes",
+    "test_deadline_watchdog_3175.py::"
+    "test_a_swallowed_deadline_stops_the_process_and_names_the_test":
+        "the child is stopped 2 s in, not after its endless loop",
     "test_agent_isolation_3172.py::"
     "test_a_search_cut_short_at_the_default_bound_reports_before_the_caller_stops":
         "the cut-short search is reported within the 25 s the default bound "

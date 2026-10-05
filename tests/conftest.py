@@ -461,7 +461,13 @@ def _ensure_full_schema():
 
 
 def pytest_configure(config):
-    """Ensure database schema exists before any tests collect."""
+    """Ensure database schema exists before any tests collect, and bound
+    every test with a deadline (task 3175, tests/deadline_watchdog.py)."""
+    from tests import deadline_watchdog
+
+    if not config.pluginmanager.is_registered(deadline_watchdog):
+        config.pluginmanager.register(deadline_watchdog,
+                                      "tests.deadline_watchdog")
     from equipa import constants as equipa_constants
 
     if Path(equipa_constants.THEFORGE_DB) != TEST_DB_PATH:
