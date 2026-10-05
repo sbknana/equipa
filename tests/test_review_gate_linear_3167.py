@@ -81,7 +81,8 @@ def test_the_pre_3167_copy_is_the_old_source():
     assert PRE_3167_RESOLVED_FINDING_HEADER_RE.pattern == (
         "(?:[(\\[][ \\t]*(?i:fixed|resolved)\\b[^)\\]\\n]*[)\\]]"
         "|[(\\[][^)\\]\\n]*\\b(?i:not[ \\t]+counted)\\b[^)\\]\\n]*[)\\]]"
-        "|[—–:→-][ \\t]*[*_]{0,2}(?:FIXED|RESOLVED)\\b"
+        "|[" + EM_DASH + "\N{EN DASH}:" + ARROW
+        + "-][ \\t]*[*_]{0,2}(?:FIXED|RESOLVED)\\b"
         "[*_]{0,2}(?:[ \\t]*[,;][ \\t]*[A-Za-z][A-Za-z \\t,;-]{0,40})?"
         "(?:[ \\t]*\\([^()\\n]{0,60}\\))?)[ \\t*_.\\r]*$"
     )
