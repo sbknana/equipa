@@ -1258,8 +1258,10 @@ _NON_GIT_PROJECT_ROOTS: contextvars.ContextVar[frozenset[str]] = contextvars.Con
 )
 
 # The environment variables that point git at a repository or work tree
-# other than the one it would discover from its working directory.
-_GIT_LOCATION_ENV_KEYS: tuple[str, ...] = ("GIT_DIR", "GIT_WORK_TREE")
+# other than the one it would discover from its working directory. git
+# reads config, hooks and info/attributes, so filters, from GIT_COMMON_DIR
+# even when its own repository lies elsewhere.
+_GIT_LOCATION_ENV_KEYS: tuple[str, ...] = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
 
 def _path_forms(directory: str | os.PathLike[str]) -> set[str]:
@@ -1313,14 +1315,14 @@ def _git_call_directories(
     argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
 ) -> list[str]:
     """Every directory the process ``argv`` runs in or takes a repository
-    from: ``cwd``, and for git each ``-C`` applied in turn and every
-    ``--git-dir`` / ``--work-tree`` option or ``GIT_DIR`` / ``GIT_WORK_TREE``
-    variable, resolved as git resolves them."""
+    from: ``cwd``; for git each ``-C`` applied in turn and every
+    ``--git-dir`` / ``--work-tree`` option; and every ``GIT_DIR`` /
+    ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` variable (gh passes them to the
+    git it runs), resolved as git resolves them."""
     directory = os.path.abspath(os.fspath(cwd))
     directories = [directory]
-    if not argv or os.path.basename(os.fspath(argv[0])) != "git":
-        return directories
-    options = [os.fspath(token) for token in argv[1:]]
+    is_git = bool(argv) and os.path.basename(os.fspath(argv[0])) == "git"
+    options = [os.fspath(token) for token in argv[1:]] if is_git else []
     index = 0
     while index < len(options):
         token = options[index]
