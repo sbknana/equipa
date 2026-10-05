@@ -28,6 +28,7 @@ import pytest
 
 from equipa import redact
 from equipa.redact import REDACTED, redact_secrets
+from tests.host_timing import assert_linear_time
 
 DOTTED_I = "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}"
 DOTLESS_I = "\N{LATIN SMALL LETTER DOTLESS I}"
@@ -155,15 +156,21 @@ SIXTY_FOUR_KB = 64 * 1024
 ])
 def test_unclosed_quote_scope_is_linear(unit):
     """A 64 KB text of repeated (un)closed quotes and command words, with a
-    final unclosed quote, redacts in well under a second (linear)."""
-    text = (unit * (SIXTY_FOUR_KB // len(unit) + 1))[:SIXTY_FOUR_KB - 2] + " '"
-    best = min(_timed(redact_secrets, text) for _ in range(2))
-    assert best < 0.3, f"{unit!r}: {best:.3f}s"
+    final unclosed quote, redacts in well under a second (linear). Budget
+    host-calibrated, growth from 16 KB to 64 KB linear (task 3171)."""
+    def seconds_at(size):
+        text = (unit * (size // len(unit) + 1))[:size - 2] + " '"
+        return min(_timed(redact_secrets, text) for _ in range(2))
+
+    assert_linear_time(seconds_at, SIXTY_FOUR_KB, 0.3, repr(unit))
 
 
 def test_fold_is_fast_on_64kb():
-    text = (f"x{DOTTED_I}{DOTLESS_I}A" * SIXTY_FOUR_KB)[:SIXTY_FOUR_KB]
-    assert min(_timed(redact._fold_for_hints, text) for _ in range(2)) < 0.05
+    def seconds_at(size):
+        text = (f"x{DOTTED_I}{DOTLESS_I}A" * size)[:size]
+        return min(_timed(redact._fold_for_hints, text) for _ in range(2))
+
+    assert_linear_time(seconds_at, SIXTY_FOUR_KB, 0.05, "fold")
 
 
 def _timed(func, *args) -> float:

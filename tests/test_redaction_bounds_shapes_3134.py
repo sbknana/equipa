@@ -30,6 +30,7 @@ from equipa.redact import (
     redact_tool_input,
     redacted_json_preview,
 )
+from tests.host_timing import assert_linear_time
 
 FOUR_MB = 4 * 1024 * 1024
 TIME_LIMIT_SECONDS = 0.3
@@ -65,43 +66,59 @@ HEAVY_UNITS = {
 }
 
 
+def _assert_linear(func, build, size: int, label: str) -> None:
+    """``func(*build(n))`` within the host-calibrated TIME_LIMIT_SECONDS at
+    *size* and a quarter of it, and linear between them (task 3171). The
+    arguments are built before the clock starts."""
+    assert_linear_time(lambda at_size: _best_of_three(func, *build(at_size))[0],
+                       size, TIME_LIMIT_SECONDS, label)
+
+
 @pytest.mark.parametrize("unit", HEAVY_UNITS.values(), ids=HEAVY_UNITS.keys())
 def test_four_mb_multiedit_of_heavy_strings_is_fast(unit):
-    tool_input = _multiedit(unit, FOUR_MB // (2 * len(unit)))
+    def build(size):
+        return _multiedit(unit, size // (2 * len(unit))), 200
+
+    tool_input, limit = build(FOUR_MB)
     assert len(json.dumps(tool_input)) > 3_500_000
 
-    elapsed, (preview, digest) = _best_of_three(redact_tool_input,
-                                                tool_input, 200)
+    _assert_linear(redact_tool_input, build, FOUR_MB, unit[:20])
+    preview, digest = redact_tool_input(tool_input, limit)
 
-    assert elapsed < TIME_LIMIT_SECONDS, f"{elapsed:.3f}s"
     assert "FAKEheavy3134" not in preview
     assert len(preview) <= 200 and len(digest) == 64
+
+
+def _ordinary_shape(shape: str, size: int) -> dict:
+    return {
+        "write": lambda: {"file_path": "/srv/app/big.py",
+                          "content": "x = 1  # line\n" * (size // 14)},
+        "command": lambda: {"command": "echo " + "a" * size},
+        "many-tiny-edits": lambda: _multiedit("a", size // 40),
+        "many-assignments": lambda: {
+            "lines": [f"K{i}=v" for i in range(size // 12)]},
+        "one-long-run": lambda: {
+            "command": "Pwd_" * (size // 4) + "=FAKEheavy3134"},
+    }[shape]()
 
 
 @pytest.mark.parametrize("shape", [
     "write", "command", "many-tiny-edits", "many-assignments", "one-long-run",
 ])
 def test_four_mb_ordinary_shapes_are_fast(shape):
-    tool_input = {
-        "write": {"file_path": "/srv/app/big.py",
-                  "content": "x = 1  # line\n" * (FOUR_MB // 14)},
-        "command": {"command": "echo " + "a" * FOUR_MB},
-        "many-tiny-edits": _multiedit("a", FOUR_MB // 40),
-        "many-assignments": {"lines": [f"K{i}=v" for i in range(FOUR_MB // 12)]},
-        "one-long-run": {"command": "Pwd_" * (FOUR_MB // 4) + "=FAKEheavy3134"},
-    }[shape]
+    _assert_linear(redact_tool_input,
+                   lambda size: (_ordinary_shape(shape, size), 200),
+                   FOUR_MB, shape)
+    preview, _digest = redact_tool_input(_ordinary_shape(shape, FOUR_MB), 200)
 
-    elapsed, (preview, _digest) = _best_of_three(redact_tool_input,
-                                                 tool_input, 200)
-
-    assert elapsed < TIME_LIMIT_SECONDS, f"{elapsed:.3f}s"
     assert "FAKEheavy3134" not in preview
 
 
 def test_one_long_keyword_run_is_linear():
     run = "Pwd_" * 50_000 + "=FAKErun3134"  # 200 KB, one name run
-    elapsed, out = _best_of_three(redact_secrets, run[:MAX_REDACT_INPUT])
-    assert elapsed < TIME_LIMIT_SECONDS, f"{elapsed:.3f}s"
+    _assert_linear(redact_secrets, lambda size: (run[:size],),
+                   MAX_REDACT_INPUT, "Pwd_ run")
+    out = redact_secrets(run[:MAX_REDACT_INPUT])
     assert "FAKErun3134" not in out
 
 

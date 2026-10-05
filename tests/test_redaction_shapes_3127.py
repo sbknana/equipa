@@ -39,6 +39,7 @@ from equipa.redact import (
     redact_tool_input,
     redacted_json_preview,
 )
+from tests.host_timing import assert_linear_time
 
 FAKE_CLI = '''import os, sys, time
 here = os.path.dirname(os.path.abspath(__file__))
@@ -219,11 +220,18 @@ def test_ordinary_commands_are_unchanged(command):
 
 
 def test_long_name_runs_are_redacted_in_linear_time():
-    """No quadratic backtracking on long runs of name characters."""
+    """No quadratic backtracking on long runs of name characters. Budget
+    host-calibrated, growth from 50 KB to 200 KB linear (task 3171; the
+    50 KB run is under MAX_REDACT_INPUT, so it reaches the password too)."""
+    def seconds_at(size):
+        blob = "a.b-" * (size // 4) + " password=FAKElin3127"
+        started = time.process_time()
+        redact_secrets(blob)
+        return time.process_time() - started
+
+    assert_linear_time(seconds_at, 200_000, 2.0, "a.b- run")
     blob = "a.b-" * 50_000 + " password=FAKElin3127"
-    started = time.process_time()
     out = redact_secrets(blob)
-    assert time.process_time() - started < 2.0
     assert "FAKElin3127" not in out
 
 
