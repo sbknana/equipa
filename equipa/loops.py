@@ -1155,9 +1155,15 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 #     lookahead.
 #   * _atomic(body) for an atomic group, and for a possessive group whose
 #     follower could match where the group gives back.
+#   * a run of one class, or _committed_loop, for a possessive loop over a
+#     group ("(?:a|bc)*+"): re keeps a backtracking entry for every pass of
+#     a plain loop over a group (about 115 bytes; 366 MB for a 3.2 MB link
+#     title), where the possessive loop kept none.
 # Every rewrite keeps the original's linear time: a give-back fails at once.
-# tests/test_regex_py310_compat_3169.py compares each with its 3.11 form.
+# tests/test_regex_py310_compat_3169.py compares each with its 3.11 form
+# and bounds the memory each takes on a long run.
 _ATOMIC_GROUP_NUMBERS = itertools.count(1)
+_COMMITTED_LOOP_BATCH = 64
 
 
 def _atomic(body: str) -> str:
@@ -1172,6 +1178,19 @@ def _atomic(body: str) -> str:
     """
     name = f"_atomic{next(_ATOMIC_GROUP_NUMBERS)}"
     return f"(?=(?P<{name}>{body}))(?P={name})"
+
+
+def _committed_loop(body: str) -> str:
+    """``(?:body)*+`` for a loop whose follower cannot match where a pass
+    of body begins, so that committing to each pass loses no match.
+
+    The passes are read in batches of up to _COMMITTED_LOOP_BATCH, each
+    committed with _atomic: re drops a lookahead's backtracking entries
+    when it ends, so the loop keeps one entry per batch, not one per pass.
+    Built on _atomic, so read by group name or whole match only.
+    """
+    return ("(?:" + _atomic(f"(?:{body}){{1,{_COMMITTED_LOOP_BATCH}}}")
+            + ")*")
 
 
 # Task #3033: fix-verification re-reviews keep the prior finding's heading
@@ -2353,12 +2372,11 @@ _HTML_BLOCK_START_RE = re.compile(
 # blank line, so "<span>" / "```" / "Risk: High" / "```" / "</span>" shows
 # the backticks and the label as text.
 #
-# The attributes are read in batches of up to 64, each committed (_atomic):
-# re drops a batch's backtracking entries when it ends, so a line of 800,000
-# attributes keeps one entry per batch instead of one per attribute (200 MB;
-# task 3169). Committing loses no match, as in the possessive original:
-# what follows the attributes ("[ \t]*/?>") cannot match where an attribute
-# starts (blanks, then a name character), so no give-back lets it match.
+# The attributes are a _committed_loop (a line of 800,000 attributes kept
+# 200 MB of backtracking entries as a plain loop; task 3169). Committing
+# loses no match, as in the possessive original: what follows them
+# ("[ \t]*/?>") cannot match where an attribute starts (blanks, then a name
+# character), so no give-back lets it match.
 _HTML_ATTRIBUTE = (
     r"[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
     r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+(?![^ \t\"'=<>`])"
@@ -2367,8 +2385,8 @@ _HTML_ATTRIBUTE = (
 _HTML_BLOCK_TYPE7_RE = re.compile(
     r"<(?!(?:script|style|pre|textarea)(?![A-Za-z0-9-]))"
     r"(?:[A-Za-z][A-Za-z0-9-]*"
-    r"(?:" + _atomic(r"(?:" + _HTML_ATTRIBUTE + r"){1,64}") + r")*"
-    r"[ \t]*/?"
+    + _committed_loop(_HTML_ATTRIBUTE)
+    + r"[ \t]*/?"
     r"|/[A-Za-z][A-Za-z0-9-]*[ \t]*)>[ \t]*",
     re.IGNORECASE,
 )
@@ -3666,18 +3684,27 @@ def _backstop_math_joined(view: str) -> str | None:
 # character up to 32 times, 0.3 s on 200 KB of "a[a](").
 #
 # The runs of escapes and plain characters below are unrolled ("plain*
-# (escape plain*)*", same texts as "(escape|plain)*"): a loop over a group
-# keeps one backtracking entry per pass (about 115 bytes in re, 366 MB for a
-# 3.2 MB title; task 3169), a run of one character class keeps none, so
-# only an escape costs a pass.
+# (escape plain*)*", the same texts as "(escape|plain)*") and the escapes
+# are a _committed_loop: a plain loop over a group keeps a backtracking
+# entry per pass (366 MB for a 3.2 MB title; task 3169), a run of one
+# character class keeps none. The closing character never begins a pass
+# (an escape), so committing loses no match.
 _LINK_SPACE = r"[ \t]*(?:\n[ \t]*)?"
+
+
+def _link_escaped_run(plain: str, escape: str = r"\\[\s\S]") -> str:
+    """Plain characters and escapes, read as "(?:escape|plain)*+"."""
+    return plain + "*" + _committed_loop(escape + plain + "*")
+
+
 _LINK_TITLE = (
-    r"\"[^\"\\]*(?:\\[\s\S][^\"\\]*)*\"|'[^'\\]*(?:\\[\s\S][^'\\]*)*'"
-    r"|\([^()\\]*(?:\\[\s\S][^()\\]*)*\)"
+    r"\"" + _link_escaped_run(r"[^\"\\]") + r"\""
+    + r"|'" + _link_escaped_run(r"[^'\\]") + r"'"
+    + r"|\(" + _link_escaped_run(r"[^()\\]") + r"\)"
 )
 _LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
 _LINK_POINTY_DESTINATION_RE = re.compile(
-    r"<[^<>\n\\]*(?:\\[^\n][^<>\n\\]*)*>")
+    r"<" + _link_escaped_run(r"[^<>\n\\]", r"\\[^\n]") + r">")
 _LINK_TAIL_END_RE = re.compile(
     _atomic(r"(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)(?:" + _LINK_TITLE + r"))?")
     + _LINK_SPACE + r"\)",
@@ -3695,8 +3722,10 @@ _LINK_PARENTHESES_DEPTH = 32
 # the review defines a reference, which a shortcut "[text]" may name). The
 # alt text stops at another "![" or a blank line, so a flood of unclosed
 # "![" is read once.
-_LINK_IMAGE = (r"!\[[^\]!\n\\]*"
-               r"(?:(?:\\[^\n]|!(?!\[)|\n(?![ \t]*\n))[^\]!\n\\]*)*\]")
+_LINK_IMAGE = (r"!\["
+               + _link_escaped_run(r"[^\]!\n\\]",
+                                   r"(?:\\[^\n]|!(?!\[)|\n(?![ \t]*\n))")
+               + r"\]")
 _LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
 _LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
 # A link reference definition ("[label]: destination"), also inside a quote

@@ -5,7 +5,7 @@ Python 3.10 has no possessive quantifiers (``*+``, ``{m,n}+``) and no
 atomic groups (``(?>...)``): one such pattern at module level made
 equipa.loops, and everything importing it, unimportable there (``re.error:
 multiple repeat``). The 17 patterns that used them were rewritten in 3.10
-syntax (see the comment above ``loops._atomic``). Three guards:
+syntax (see the comment above ``loops._atomic``). Four guards:
 
 * every equipa module imports under the running interpreter, and every
   module-level pattern in it recompiles from its own text;
@@ -16,7 +16,10 @@ syntax (see the comment above ``loops._atomic``). Three guards:
   (tests/regex_py311_originals_3169.py) on a generated corpus: compared
   match for match where the original compiles (3.11+), and through a digest
   of the original's results (recorded on 3.12) on every interpreter, so 3.10
-  checks the same matching.
+  checks the same matching;
+* each rewritten pattern runs a long run of what its loops read in a few
+  bytes per character, as the possessive original did (a plain loop over a
+  group keeps a backtracking entry per pass: 366 MB for a 3.2 MB title).
 
 Linear time is held by the existing timing tests (review-gate families),
 which run these patterns on 200 KB inputs.
@@ -32,6 +35,7 @@ import importlib
 import pkgutil
 import re
 import sys
+import tracemalloc
 from pathlib import Path
 from types import ModuleType
 
@@ -442,3 +446,140 @@ def test_the_3_10_form_matches_exactly_as_the_original(key):
         # The reason for the rewrite: 3.10 cannot compile the original.
         with pytest.raises(re.error):
             re.compile(original_text, original_flags)
+
+
+# --- each rewritten pattern runs in bounded memory, as the original did -------
+#
+# A possessive loop over a group kept no backtracking entries; a plain loop
+# keeps one per pass (about 115 bytes in re), so a 3.2 MB link title took
+# 366 MB where the original took none. The 3.10 forms read such loops as
+# runs of one class or as loops._committed_loop batches. Each long run below
+# is what a pattern's loop reads, given as (method, text); the peak memory
+# traced while it runs is held to a few bytes per character of input.
+
+MEMORY_RUN = 200_000
+MEMORY_BYTES_PER_CHARACTER = 2
+
+MEMORY_FLOODS: dict[str, list[tuple[str, str]]] = {
+    "_LINK_TAIL_END_RE": [
+        ("match", ' "' + "a" * MEMORY_RUN + '")'),
+        ("match", ' "' + "\\a" * (MEMORY_RUN // 2) + '")'),
+        ("match", " '" + "\\'" * (MEMORY_RUN // 2) + "')"),
+        ("match", " (" + "\\)" * (MEMORY_RUN // 2) + "))"),
+        ("match", ' "' + "\\a" * (MEMORY_RUN // 2) + ")"),
+    ],
+    "_LINK_POINTY_DESTINATION_RE": [
+        ("match", "<" + "a" * MEMORY_RUN + ">"),
+        ("match", "<" + "\\>" * (MEMORY_RUN // 2) + ">"),
+        ("match", "<" + "\\>" * (MEMORY_RUN // 2)),
+    ],
+    "_LINK_CLOSE_RE": [
+        ("search", "![" + "a" * MEMORY_RUN + "]"),
+        ("search", "![" + "!" * MEMORY_RUN + "]"),
+        ("search", "![" + "\\]" * (MEMORY_RUN // 2) + "]"),
+        ("search", "![" + "a\n" * (MEMORY_RUN // 2) + "]"),
+    ],
+    "_LINK_ANY_CLOSE_RE": [
+        ("search", "![" + "!a" * (MEMORY_RUN // 2)),
+        ("search", "![" + "\\a" * (MEMORY_RUN // 2)),
+    ],
+    "_LINK_DEFINITION_RE": [
+        ("search", ">" * MEMORY_RUN + "[a]:"),
+        ("search", "> " * (MEMORY_RUN // 2) + "[a]:"),
+        ("search", ">\t" * (MEMORY_RUN // 2) + " x"),
+    ],
+    "_HTML_BLOCK_TYPE7_RE": [
+        ("fullmatch", "<span" + " a=b" * (MEMORY_RUN // 4) + ">"),
+        ("fullmatch", "<span" + " a='b'" * (MEMORY_RUN // 6) + " x"),
+        ("fullmatch", "<span" + " a" * (MEMORY_RUN // 2) + " ="),
+        ("fullmatch", "<span" + " " * MEMORY_RUN + "x"),
+    ],
+    "_RESOLVED_FINDING_HEADER_RE": [
+        ("search", "(" * MEMORY_RUN),
+        ("search", "(fixed" + "x" * MEMORY_RUN + ")"),
+        ("search", "[" + "x" * MEMORY_RUN + " not counted]"),
+    ],
+    "_STRICT_COUNTS_LINE_RE": [
+        ("fullmatch", "CRITICAL: 0 |" + " " * MEMORY_RUN + "HIGH: 0"),
+    ],
+    "_STRICT_COUNTS_HEADING_RE": [
+        ("fullmatch", "##" + " " * MEMORY_RUN + "Counts"),
+    ],
+    "_OVERLONG_NUMERIC_REFERENCE_RE": [
+        ("finditer", "&#" + "0" * MEMORY_RUN + "123456789"),
+    ],
+    "_UNTERMINATED_DECIMAL_REFERENCE_RE": [
+        ("finditer", "&#" + "0" * MEMORY_RUN + "1"),
+    ],
+    "_UNTERMINATED_HEX_REFERENCE_RE": [
+        ("finditer", "&#x" + "0" * MEMORY_RUN + "f"),
+    ],
+    "_BACKSTOP_REFERENCE_RE": [
+        ("finditer", "&#" + "0" * MEMORY_RUN),
+        ("finditer", "&#x" + "f" * MEMORY_RUN),
+    ],
+    "_BACKSTOP_SPLIT_WORD_RE": [
+        ("finditer", "H" + "*" * MEMORY_RUN + "IGH"),
+    ],
+    "_BACKSTOP_LINK_JOIN_RE": [
+        ("finditer", "a" + "*" * MEMORY_RUN + "["),
+        ("finditer", "]" + "!" * MEMORY_RUN + "a"),
+    ],
+    "_LINK_TAIL_START_RE": [
+        ("match", "(" + " " * MEMORY_RUN + "\n" + "\t" * MEMORY_RUN),
+    ],
+    "_LINK_LABEL_RE": [
+        ("finditer", "[" + "\\a" * 499 + "]" + "[" * MEMORY_RUN),
+    ],
+}
+
+
+def _peak_traced_bytes(pattern: re.Pattern, method: str, text: str) -> int:
+    """Peak bytes traced above the start while one call runs; the text is
+    built before, and finditer is drained without keeping a match."""
+    started = not tracemalloc.is_tracing()
+    if started:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        if method == "finditer":
+            for _match in pattern.finditer(text):
+                pass
+        else:
+            getattr(pattern, method)(text)
+        return tracemalloc.get_traced_memory()[1] - before
+    finally:
+        if started:
+            tracemalloc.stop()
+
+
+def test_every_rewritten_pattern_has_memory_floods():
+    assert set(MEMORY_FLOODS) == {name for (_module, name) in ORIGINALS}
+
+
+@pytest.mark.parametrize("name", sorted(MEMORY_FLOODS))
+def test_the_3_10_form_runs_in_bounded_memory(name):
+    pattern = getattr(loops, name)
+    for method, text in MEMORY_FLOODS[name]:
+        re.purge()
+        peak = _peak_traced_bytes(pattern, method, text)
+        assert peak <= MEMORY_BYTES_PER_CHARACTER * len(text), (
+            f"{name}.{method} on {text[:12]!r}... ({len(text)} characters): "
+            f"{peak} bytes")
+
+
+def test_a_plain_loop_over_a_group_exceeds_the_memory_bound():
+    """Positive control: the measure sees re's backtracking entries. The
+    pre-3169 link title as a plain loop (the first 3.10 form) takes far more
+    than the bound on the title flood the committed form passes."""
+    plain_loop = re.compile(r"\"(?:\\[\s\S]|[^\"\\])*\"")
+    for text in ('"' + "a" * MEMORY_RUN + '"',
+                 '"' + "\\a" * (MEMORY_RUN // 2) + '"'):
+        peak = _peak_traced_bytes(plain_loop, "match", text)
+        assert peak > 20 * MEMORY_BYTES_PER_CHARACTER * len(text), peak
+    committed = re.compile(r"\"" + loops._link_escaped_run(r"[^\"\\]") + r"\"")
+    text = '"' + "\\a" * (MEMORY_RUN // 2) + '"'
+    assert committed.match(text).end() == len(text)
+    assert (_peak_traced_bytes(committed, "match", text)
+            <= MEMORY_BYTES_PER_CHARACTER * len(text))
