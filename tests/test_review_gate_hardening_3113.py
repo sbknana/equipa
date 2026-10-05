@@ -46,6 +46,7 @@ from equipa.security_gate import (
     reviewer_run_failure,
     verify_reviewer_provenance,
 )
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
@@ -433,19 +434,35 @@ def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention)
     assert blocks is False and counts and counts["LOW"] == 1, (blocks, counts)
 
 
-@pytest.mark.parametrize("line", [
-    "Severity" + " " * 50000 + "x",
-    "- Severity" + " " * 50000 + "level",
-    "- x (" + " " * 50000 + "HIGH" + " " * 50000 + "x",
+PADDING_SPACES = 50000
+
+
+@pytest.mark.parametrize("make_line", [
+    lambda spaces: "Severity" + " " * spaces + "x",
+    lambda spaces: "- Severity" + " " * spaces + "level",
+    lambda spaces: "- x (" + " " * spaces + "HIGH" + " " * spaces + "x",
 ], ids=["severity-spaces", "severity-level-spaces", "list-paren-spaces"])
 @timing_test
-def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
-    """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds."""
-    text = review_body(footer=ONE_LOW_FOOTER).replace("Details.", line)
+def test_new_severity_forms_parse_in_linear_time(tmp_path, make_line):
+    """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds.
+    Budget host-calibrated, growth from a quarter of the padding to all of
+    it linear (task 3171)."""
+    def padded_review(spaces, rewrite=lambda text: text):
+        return rewrite(review_body(footer=ONE_LOW_FOOTER).replace(
+            "Details.", make_line(spaces)))
+
+    def assert_parses_in_linear_time(rewrite=lambda text: text):
+        assert_linear_time(
+            lambda spaces: production_seconds(
+                as_reviewer_artifact(padded_review(spaces, rewrite))),
+            PADDING_SPACES, 2.0, make_line(0))
+
+    line = make_line(PADDING_SPACES)
+    text = padded_review(PADDING_SPACES)
     path = tmp_path / "SECURITY-REVIEW-94400.md"
     path.write_text(text, encoding="utf-8")
     analysis = loops._analyze_review_file(path, text=text)
-    assert production_seconds(as_reviewer_artifact(text)) < 2.0
+    assert_parses_in_linear_time()
     if SEVERITY_TOKEN.search(line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
         # only; the rules still read the padded line as prose. Task 3170:
@@ -455,7 +472,7 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
         assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         text = lowercase_severity_words(text)
         analysis = loops._analyze_review_file(path, text=text)
-        assert production_seconds(as_reviewer_artifact(text)) < 2.0
+        assert_parses_in_linear_time(lowercase_severity_words)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 

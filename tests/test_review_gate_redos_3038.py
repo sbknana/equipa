@@ -25,6 +25,7 @@ from equipa.loops import (
     _analyze_review_file,
     _count_findings_in_review_file,
 )
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
@@ -48,25 +49,31 @@ def _write(tmp_path: Path, markdown: str) -> Path:
 
 
 @pytest.mark.parametrize(
-    "adversarial_line",
+    "prefix, unit, count, suffix",
     [
-        "**S1" + "1" * 600,
-        "**S1" + "a" * 20_000,
-        "- **AB1" + "a-1_" * 5_000,
-        "1. **RT-01" + "9" * 600 + "*",
+        ("**S1", "1", 600, ""),
+        ("**S1", "a", 20_000, ""),
+        ("- **AB1", "a-1_", 5_000, ""),
+        ("1. **RT-01", "9", 600, "*"),
     ],
     ids=["digits", "word-chars", "mixed-tag-chars", "numbered-digits"],
 )
 @timing_test
 def test_long_bold_tag_line_parses_in_linear_time(
-    tmp_path: Path, adversarial_line: str,
+    tmp_path: Path, prefix: str, unit: str, count: int, suffix: str,
 ) -> None:
-    path = _write(tmp_path, BODY + adversarial_line + "\n" + ZERO_FOOTER)
+    """Budget host-calibrated, growth from a quarter of the run to the
+    whole run linear (task 3171)."""
+    def write(units: int) -> Path:
+        return _write(tmp_path, BODY + prefix + unit * units + suffix + "\n"
+                      + ZERO_FOOTER)
 
-    analysis = _analyze_review_file(path)
-    elapsed = production_seconds(as_reviewer_artifact(review_as_written(path)))
+    analysis = _analyze_review_file(write(count))
 
-    assert elapsed < PARSE_BOUND_SECONDS, f"parse took {elapsed:.2f}s"
+    assert_linear_time(
+        lambda units: production_seconds(
+            as_reviewer_artifact(review_as_written(write(units)))),
+        count, PARSE_BOUND_SECONDS, prefix + unit)
     assert analysis.verdict == REVIEW_VERDICT_OK
 
 
