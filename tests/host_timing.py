@@ -42,7 +42,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Mapping
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
 
@@ -230,3 +230,46 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     assert timing.ratio < GROWTH_LIMIT, (
         f"superlinear growth: {timing.describe()}")
     return timing
+
+
+def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
+                        size: int, base_budget_seconds: float,
+                        label: str = "") -> dict[str, LinearTiming]:
+    """``assert_linear_time`` for work timed in several parts by one
+    measurement (every pattern of a scan, timed by one probe run):
+    ``seconds_at(n)`` returns the seconds of each part at size ``n``, and
+    every part is held to the budget and to the growth limit. A part over
+    the growth limit is measured again (all parts, keeping each part's
+    fastest time) before it counts."""
+    if size < GROWTH:
+        raise ValueError(f"size {size} has no quarter to compare against")
+    small_size = size // GROWTH
+    budget_seconds = budget(base_budget_seconds)
+
+    def assert_within_budget(times: Mapping[str, float], at_size: int) -> None:
+        over = {part: round(seconds, 4) for part, seconds in times.items()
+                if seconds >= budget_seconds}
+        assert not over, (
+            f"{label}: over the budget {budget_seconds:.4f} s at host factor "
+            f"{host_factor():.2f} at size {at_size}: {over}")
+
+    small = dict(seconds_at(small_size))
+    assert_within_budget(small, small_size)
+    large = dict(seconds_at(size))
+    assert_within_budget(large, size)
+    assert set(small) == set(large), (label, sorted(set(small) ^ set(large)))
+    for _ in range(GROWTH_RETRIES):
+        if all(growth_ratio(small[part], large[part]) < GROWTH_LIMIT
+               for part in large):
+            break
+        for part, seconds in seconds_at(small_size).items():
+            small[part] = min(small[part], seconds)
+        for part, seconds in seconds_at(size).items():
+            large[part] = min(large[part], seconds)
+    timings = {part: LinearTiming(f"{label}: {part}", small_size, small[part],
+                                  size, large[part], budget_seconds)
+               for part in large}
+    superlinear = [timing.describe() for timing in timings.values()
+                   if timing.ratio >= GROWTH_LIMIT]
+    assert not superlinear, f"superlinear growth: {superlinear}"
+    return timings
