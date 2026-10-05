@@ -1062,10 +1062,15 @@ def test_verify_script_reports_failures_for_an_unisolated_user(
     git_dir = tmp_path / "repo.git"
     git_dir.mkdir()
     env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    # Task 3169: a root filesystem of the test's own; searching the host's
+    # whole / outlasted the timeout on a CI runner (/ is the default,
+    # tests/test_agent_isolation_3169.py).
+    root_fs = tmp_path / "rootfs"
+    root_fs.mkdir()
     result = subprocess.run(
         [str(VERIFY_SCRIPT), "--inside", "--db", str(database),
          "--git-dir", str(git_dir), "--orchestrator-pid", str(os.getpid()),
-         "--pids-max", "64"],
+         "--pids-max", "64", "--root-fs", str(root_fs)],
         capture_output=True, text=True, env=env, timeout=120, check=False)
     lines = result.stdout.splitlines()
     assert f"FAIL agent can read {database}" in lines

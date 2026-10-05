@@ -1099,7 +1099,13 @@ def _run_inside_with(tmp_path: Path, tools: dict[str, tuple[str, int]],
     loginctl.write_text(f"#!/bin/sh\necho {linger}\n")
     loginctl.chmod(0o755)
     env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path)}
-    result = subprocess.run([str(VERIFY_SCRIPT), "--inside"],
+    # Task 3169: a root filesystem of the test's own; searching the host's
+    # whole / outlasted the timeout on a CI runner (/ is the default,
+    # tests/test_agent_isolation_3169.py).
+    root_fs = tmp_path / "rootfs"
+    root_fs.mkdir(exist_ok=True)
+    result = subprocess.run([str(VERIFY_SCRIPT), "--inside",
+                             "--root-fs", str(root_fs)],
                             capture_output=True, text=True, env=env,
                             timeout=120, check=False)
     return result.stdout.splitlines()

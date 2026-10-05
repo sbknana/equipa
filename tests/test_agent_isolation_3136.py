@@ -582,7 +582,13 @@ def _run_inside(tmp_path: Path, *args: str) -> list[str]:
     sudo.write_text("#!/bin/sh\nexit 1\n")
     sudo.chmod(0o755)
     env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(tmp_path)}
-    result = subprocess.run([str(VERIFY_SCRIPT), "--inside", *args],
+    # Task 3169: a root filesystem of the test's own; searching the host's
+    # whole / outlasted the timeout on a CI runner (/ is the default,
+    # tests/test_agent_isolation_3169.py).
+    root_fs = tmp_path / "rootfs"
+    root_fs.mkdir(exist_ok=True)
+    result = subprocess.run([str(VERIFY_SCRIPT), "--inside", *args,
+                             "--root-fs", str(root_fs)],
                             capture_output=True, text=True, env=env,
                             timeout=120, check=False)
     return result.stdout.splitlines()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import html
+import itertools
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import subprocess
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1141,6 +1142,57 @@ _SUMMARY_FIELD_RE = re.compile(
 )
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 
+# Task 3169: Python 3.10 has no possessive quantifiers ("*+", "{m,n}+") and
+# no atomic groups ("(?>...)"); re.compile rejects them, so one such pattern
+# made this module unimportable there. The regexes below commit the same
+# way in 3.10 syntax, matching exactly what the 3.11 forms matched:
+#   * a plain quantifier when what follows the run (in every use) can never
+#     begin with a character the run itself reads, or is the end of the
+#     pattern: a shorter run leaves such a character next, so a give-back
+#     never matches. "[^)\]\n]*[)\]]" and "[ \t]*:" are of this kind.
+#   * "C+(?!C)" (or "C*", "C{m,}") for a run of one character class C that
+#     what follows could read on from: only the full run passes the
+#     lookahead.
+#   * _atomic(body) for an atomic group, and for a possessive group whose
+#     follower could match where the group gives back.
+#   * a run of one class, or _committed_loop, for a possessive loop over a
+#     group ("(?:a|bc)*+"): re keeps a backtracking entry for every pass of
+#     a plain loop over a group (about 115 bytes; 366 MB for a 3.2 MB link
+#     title), where the possessive loop kept none.
+# Every rewrite keeps the original's linear time: a give-back fails at once.
+# tests/test_regex_py310_compat_3169.py compares each with its 3.11 form
+# and bounds the memory each takes on a long run.
+_ATOMIC_GROUP_NUMBERS = itertools.count(1)
+_COMMITTED_LOOP_BATCH = 64
+
+
+def _atomic(body: str) -> str:
+    """``(?>body)`` in syntax Python 3.10 compiles.
+
+    A lookahead is atomic in ``re``: once it has matched, a later failure
+    does not re-enter it. So ``(?=(body))`` commits to body's first match,
+    and the backreference after it consumes exactly that text. Each call
+    names its group afresh, so one pattern may hold many; the group still
+    takes a number, so a pattern built with this one is read by group name
+    or whole match only.
+    """
+    name = f"_atomic{next(_ATOMIC_GROUP_NUMBERS)}"
+    return f"(?=(?P<{name}>{body}))(?P={name})"
+
+
+def _committed_loop(body: str) -> str:
+    """``(?:body)*+`` for a loop whose follower cannot match where a pass
+    of body begins, so that committing to each pass loses no match.
+
+    The passes are read in batches of up to _COMMITTED_LOOP_BATCH, each
+    committed with _atomic: re drops a lookahead's backtracking entries
+    when it ends, so the loop keeps one entry per batch, not one per pass.
+    Built on _atomic, so read by group name or whole match only.
+    """
+    return ("(?:" + _atomic(f"(?:{body}){{1,{_COMMITTED_LOOP_BATCH}}}")
+            + ")*")
+
+
 # Task #3033: fix-verification re-reviews keep the prior finding's heading
 # but mark it resolved and leave it out of the footer, e.g.
 #   ### SR29-00 HIGH (fixed, verified, not counted) — ...
@@ -1161,18 +1213,19 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 # followed by 100 KB of "(" took 170 s in the gate (quadratic). Each now
 # starts only where a bracket segment starts (the start of the text or the
 # character after ")", "]" or a newline; no bracket group crosses one), so
-# a segment is read once. Inside it an atomic group commits to the FIRST
-# opener that reads "fixed"/"resolved", or to the first opener and the
-# first "not counted" after it: every later choice ends at the same closing
-# bracket, so committing loses no match. The matches are exactly the old
-# ones (tests/test_review_gate_linear_3167.py compares them).
+# a segment is read once. Inside it an atomic group (_atomic) commits to
+# the FIRST opener that reads "fixed"/"resolved", or to the first opener
+# and the first "not counted" after it: every later choice ends at the same
+# closing bracket, so committing loses no match. The matches are exactly
+# the old ones (tests/test_review_gate_linear_3167.py compares them).
 _RESOLVED_FINDING_HEADER_RE = re.compile(
     r"(?:"
-    r"(?<![^)\]\n])(?>[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b)"
-    r"[^)\]\n]*+[)\]]"
+    r"(?<![^)\]\n])"
+    + _atomic(r"[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b")
+    + r"[^)\]\n]*[)\]]"
     r"|(?<![^)\]\n])"
-    r"(?>[^()\[\]\n]*+[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b)"
-    r"[^)\]\n]*+[)\]]"
+    + _atomic(r"[^()\[\]\n]*[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b")
+    + r"[^)\]\n]*[)\]]"
     r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
     r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
     r"(?:[ \t]*\([^()\n]{0,60}\))?"
@@ -2209,6 +2262,9 @@ _COMBINING_MARK_CATEGORIES = ("Mn", "Me")
 _CHARACTER_REFERENCE_RE = re.compile(
     r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});",
 )
+# The same references as one group, for _references_replaced.
+_CHARACTER_REFERENCE_SPLIT_RE = re.compile(
+    "(" + _CHARACTER_REFERENCE_RE.pattern + ")")
 # A reference is decoded only to letters, digits, blanks and this punctuation.
 # Anything else ("`", "~", "#", "<", "|", "*", "=", line breaks) would build
 # Markdown the renderer never builds from a reference: "&#96;HIGH: ...&#96;"
@@ -2318,27 +2374,59 @@ _HTML_BLOCK_START_RE = re.compile(
 # cannot interrupt a paragraph. Like a type 6 block it runs to the next
 # blank line, so "<span>" / "```" / "Risk: High" / "```" / "</span>" shows
 # the backticks and the label as text.
+#
+# The attributes are a _committed_loop (a line of 800,000 attributes kept
+# 200 MB of backtracking entries as a plain loop; task 3169). Committing
+# loses no match, as in the possessive original: what follows them
+# ("[ \t]*/?>") cannot match where an attribute starts (blanks, then a name
+# character), so no give-back lets it match.
+_HTML_ATTRIBUTE = (
+    r"[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+(?![^ \t\"'=<>`])"
+    r"|'[^'\n]*'|\"[^\"\n]*\"))?"
+)
 _HTML_BLOCK_TYPE7_RE = re.compile(
     r"<(?!(?:script|style|pre|textarea)(?![A-Za-z0-9-]))"
-    r"(?:[A-Za-z][A-Za-z0-9-]*+"
-    r"(?:[ \t]++[A-Za-z_:][A-Za-z0-9_.:-]*+"
-    r"(?:[ \t]*+=[ \t]*+(?:[^ \t\"'=<>`]++|'[^'\n]*+'|\"[^\"\n]*+\"))?+)*+"
-    r"[ \t]*+/?"
-    r"|/[A-Za-z][A-Za-z0-9-]*+[ \t]*+)>[ \t]*",
+    r"(?:[A-Za-z][A-Za-z0-9-]*"
+    + _committed_loop(_HTML_ATTRIBUTE)
+    + r"[ \t]*/?"
+    r"|/[A-Za-z][A-Za-z0-9-]*[ \t]*)>[ \t]*",
     re.IGNORECASE,
 )
 # Inside an HTML block a browser decodes a numeric character reference
 # without its ";" ("<p>&#72igh: ...</p>" shows "High: ..."), taking every
 # digit that follows. Markdown text needs the ";" (task 3157, R3154-04).
-# Each is given its ";" by a template (no callback per reference); one with
-# more significant digits than any code point is U+FFFD, as in a browser.
+# One with more significant digits than any code point is U+FFFD, as in a
+# browser.
 _OVERLONG_NUMERIC_REFERENCE_RE = re.compile(
-    r"&#(?:0*+[0-9]{8,}+|[xX]0*+[0-9A-Fa-f]{7,}+)(?!;)",
+    r"&#(?:0*(?!0)[0-9]{8,}(?![0-9])"
+    r"|[xX]0*(?!0)[0-9A-Fa-f]{7,}(?![0-9A-Fa-f]))(?!;)",
 )
-_UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(r"&#0*+([0-9]{1,7}+)(?![0-9;])")
+_UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(
+    r"&#0*(?!0)([0-9]{1,7})(?![0-9;])",
+)
 _UNTERMINATED_HEX_REFERENCE_RE = re.compile(
-    r"&#([xX])0*+([0-9A-Fa-f]{1,6}+)(?![0-9A-Fa-f;])",
+    r"&#([xX])0*(?!0)([0-9A-Fa-f]{1,6})(?![0-9A-Fa-f;])",
 )
+# Task 3169 (timing on Python 3.10, where re expands a template with groups
+# in Python once per match): the references the three patterns above
+# rewrite, as one group for _references_replaced. Each spelling is rewritten
+# once (_html_block_reference) and kept in _HTML_BLOCK_REFERENCES. No two
+# of them match the same text, and a rewrite only changes its own spelling,
+# so one pass reads what the three passes in turn read.
+_HTML_BLOCK_REFERENCE_RE = re.compile(
+    "(" + _OVERLONG_NUMERIC_REFERENCE_RE.pattern
+    + r"|&#0*(?!0)[0-9]{1,7}(?![0-9;])"
+    + r"|&#[xX]0*(?!0)[0-9A-Fa-f]{1,6}(?![0-9A-Fa-f;]))",
+)
+
+
+def _html_block_reference(reference: str) -> str:
+    """A reference _HTML_BLOCK_REFERENCE_RE finds, as the parser reads it:
+    with its ";" and no leading zeros, or U+FFFD's when overlong."""
+    reference = _OVERLONG_NUMERIC_REFERENCE_RE.sub("&#65533;", reference)
+    reference = _UNTERMINATED_DECIMAL_REFERENCE_RE.sub(r"&#\1;", reference)
+    return _UNTERMINATED_HEX_REFERENCE_RE.sub(r"&#\1\2;", reference)
 
 
 def _html_block_line(line: str) -> str:
@@ -2347,9 +2435,8 @@ def _html_block_line(line: str) -> str:
     if "`" in line:
         line = _neutralize_backticks(line)
     if "&#" in line:
-        line = _OVERLONG_NUMERIC_REFERENCE_RE.sub("&#65533;", line)
-        line = _UNTERMINATED_DECIMAL_REFERENCE_RE.sub(r"&#\1;", line)
-        line = _UNTERMINATED_HEX_REFERENCE_RE.sub(r"&#\1\2;", line)
+        line = _references_replaced(line, _HTML_BLOCK_REFERENCE_RE,
+                                    _HTML_BLOCK_REFERENCES)
     return line
 
 
@@ -2798,9 +2885,20 @@ _CACHED_REFERENCE_LENGTH = 40
 _REFERENCE_TABLE_LIMIT = 65536
 
 
-def _decode_character_reference(match: re.Match[str]) -> str:
-    """One character reference as the text the parser should see."""
-    return _RENDERED_REFERENCES[match.group(0)]
+def _references_replaced(text: str, references: re.Pattern[str],
+                         table: Mapping[str, str]) -> str:
+    """``text`` with each match of ``references`` (one group, the whole
+    match) replaced by ``table[match]``, as ``references.sub`` would.
+
+    Task 3169 (timing on Python 3.10): ``re.sub`` runs Python code for every
+    match when given a function (and on 3.10 a template with groups), so a
+    flood of 68,000 "&#1" paid it once per pass, in four passes. re.split
+    and a map of the table's lookup run in C; only a spelling the table does
+    not hold yet runs its ``__missing__``.
+    """
+    pieces = references.split(text)
+    pieces[1::2] = map(table.__getitem__, pieces[1::2])
+    return "".join(pieces)
 
 
 def _decoded_reference_text(reference: str) -> str:
@@ -2828,6 +2926,7 @@ def _decoded_reference_text(reference: str) -> str:
 
 
 _RENDERED_REFERENCES = _ReferenceTable(_decoded_reference_text)
+_HTML_BLOCK_REFERENCES = _ReferenceTable(_html_block_reference)
 
 
 # Task 3137 (N2): "H̲IGH" (H with a combining low line), "HÍGH" and "H⃝IGH"
@@ -2869,7 +2968,8 @@ def _rendered_review_text(text: str) -> str:
     if "&" in text:
         # A raw NUL renders as U+FFFD; it must not pass for a decoded blank.
         text = text.replace(_REFERENCE_BLANK, _UNSAFE_REFERENCE_CHAR)
-        text = _CHARACTER_REFERENCE_RE.sub(_decode_character_reference, text)
+        text = _references_replaced(text, _CHARACTER_REFERENCE_SPLIT_RE,
+                                    _RENDERED_REFERENCES)
         if _REFERENCE_BLANK in text:
             text = _LEADING_REFERENCE_BLANKS_RE.sub(
                 lambda run: run.group(0).replace(_REFERENCE_BLANK, ""), text,
@@ -2971,6 +3071,11 @@ _BACKSTOP_FOLD_MARKS = frozenset(
 )
 _BACKSTOP_NEW_FOLD_RE = re.compile(
     f"[{chr(_BACKSTOP_NEW_FOLD_MARK)}-{chr(_BACKSTOP_NEW_FOLD_MARK + 0xFF)}]")
+# A neighbour that can make a word of the separated reading its own (a GLUE
+# or lookalike mark), or begins a run of GONE marks to walk
+# (_backstop_mark_separates); any other neighbour leaves the word glued.
+_BACKSTOP_MARKED_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {
+    _BACKSTOP_GLUE_MARK, _BACKSTOP_GONE_MARK}
 # A private-use character as written becomes another one, so no mark is
 # ever read from the review itself.
 _BACKSTOP_FOREIGN_MARK = ""
@@ -3031,10 +3136,15 @@ _BACKSTOP_TOKEN_RE = re.compile(
 # to the next word ("&#999999999HIGH" shows U+FFFD and a standalone HIGH).
 # A value of more than 7 decimal or 6 hex significant digits is past
 # U+10FFFF and decodes to U+FFFD without int() (see
-# _backstop_decoded_reference), so thousands of digits cost nothing.
+# _backstop_decoded_spelling), so thousands of digits cost nothing.
 _BACKSTOP_REFERENCE_RE = re.compile(
-    r"&(?:#(0*)([0-9]++);?|#[xX](0*)([0-9A-Fa-f]++);?"
+    r"&(?:#(0*)([0-9]+)(?![0-9]);?|#[xX](0*)([0-9A-Fa-f]+)(?![0-9A-Fa-f]);?"
     r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
+)
+# The same references as one group, for _references_replaced.
+_BACKSTOP_REFERENCE_SPLIT_RE = re.compile(
+    r"(&(?:#0*[0-9]+(?![0-9]);?|#[xX]0*[0-9A-Fa-f]+(?![0-9A-Fa-f]);?"
+    r"|[A-Za-z][A-Za-z0-9]{0,31};?))",
 )
 _BACKSTOP_MAX_DECIMAL_DIGITS = 7
 _BACKSTOP_MAX_HEX_DIGITS = 6
@@ -3236,29 +3346,25 @@ def _backstop_decoded_spelling(match: re.Match[str]) -> str:
 
 
 class _BackstopSpellingTable(_BoundedTable):
-    """Decoded text per reference as written (at most
-    ``_CACHED_REFERENCE_LENGTH`` characters), filled per spelling seen."""
-
-    def __missing__(self, reference: str) -> str:
-        return self._remember(reference, _backstop_decoded_spelling(
-            _BACKSTOP_REFERENCE_RE.fullmatch(reference)))
-
-
-_BACKSTOP_SPELLINGS = _BackstopSpellingTable()
-
-
-def _backstop_decoded_reference(match: re.Match[str]) -> str:
-    """One character reference as a browser shows it, on the same line.
+    """Each character reference as written, as a browser shows it on the
+    same line; filled per spelling seen, and a spelling longer than
+    ``_CACHED_REFERENCE_LENGTH`` is decoded each time instead of kept.
 
     Task 3157 (timing): every view decodes every reference, so a flood of
     one ("&#1" 68,000 times in an HTML block) cost a 200 KB review 0.3 s in
-    group lookups and key building alone. A short reference is looked up as
+    group lookups and key building alone. A reference is looked up as
     written first; only a new spelling is parsed.
     """
-    reference = match.group(0)
-    if len(reference) <= _CACHED_REFERENCE_LENGTH:
-        return _BACKSTOP_SPELLINGS[reference]
-    return _backstop_decoded_spelling(match)
+
+    def __missing__(self, reference: str) -> str:
+        decoded = _backstop_decoded_spelling(
+            _BACKSTOP_REFERENCE_RE.fullmatch(reference))
+        if len(reference) > _CACHED_REFERENCE_LENGTH:
+            return decoded
+        return self._remember(reference, decoded)
+
+
+_BACKSTOP_SPELLINGS = _BackstopSpellingTable()
 
 
 def _backstop_normalized(text: str) -> str:
@@ -3272,7 +3378,8 @@ def _backstop_normalized(text: str) -> str:
     line keeps its number.
     """
     if "&" in text:
-        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_decoded_reference, text)
+        text = _references_replaced(text, _BACKSTOP_REFERENCE_SPLIT_RE,
+                                    _BACKSTOP_SPELLINGS)
     text = _backstop_translated(text)
     if text.isascii():
         return text
@@ -3383,23 +3490,38 @@ class _BackstopSeparatorTable(_BoundedTable):
 _BACKSTOP_SEPARATORS = _BackstopSeparatorTable()
 
 
-def _backstop_separated_reference(match: re.Match[str]) -> str:
+def _backstop_separated_spelling(reference: str) -> str:
     """A character reference to a character the separated reading marks, as
     that mark ("Rated&#x3164;HIGH" separates the words); any other reference
     is left for _backstop_normalized to decode."""
-    decoded = _backstop_decoded_reference(match)
+    decoded = _BACKSTOP_SPELLINGS[reference]
     if not decoded:
         # html.unescape drops a noncharacter ("&#x3FFFF;"), which a browser
         # shows (as a box).
         return _BACKSTOP_GONE_MARK
     if len(decoded) != 1:
-        return match.group(0)
+        return reference
     if _BACKSTOP_SEPARATED_CONTROLS_RE.match(decoded):
         return _BACKSTOP_GONE_MARK
     if decoded.isascii():
-        return match.group(0)
+        return reference
     marked = _BACKSTOP_SEPARATORS[ord(decoded)]
-    return match.group(0) if marked == decoded else marked
+    return reference if marked == decoded else marked
+
+
+class _BackstopSeparatedSpellingTable(_BoundedTable):
+    """_backstop_separated_spelling per reference as written, filled per
+    spelling seen; a spelling longer than ``_CACHED_REFERENCE_LENGTH`` is
+    read each time instead of kept."""
+
+    def __missing__(self, reference: str) -> str:
+        separated = _backstop_separated_spelling(reference)
+        if len(reference) > _CACHED_REFERENCE_LENGTH:
+            return separated
+        return self._remember(reference, separated)
+
+
+_BACKSTOP_SEPARATED_SPELLINGS = _BackstopSeparatedSpellingTable()
 
 
 def _backstop_separated_text(text: str) -> str | None:
@@ -3419,7 +3541,8 @@ def _backstop_separated_text(text: str) -> str | None:
     text = _translate_non_ascii(text, _BACKSTOP_SEPARATORS)
     text = _BACKSTOP_SEPARATED_CONTROLS_RE.sub(_BACKSTOP_GONE_MARK, text)
     if "&" in text:
-        text = _BACKSTOP_REFERENCE_RE.sub(_backstop_separated_reference, text)
+        text = _references_replaced(text, _BACKSTOP_REFERENCE_SPLIT_RE,
+                                    _BACKSTOP_SEPARATED_SPELLINGS)
     if _BACKSTOP_MARK_RE.search(text) is None:
         return None
     text = separated_review_text(text, _BACKSTOP_GONE_MARK)
@@ -3551,7 +3674,7 @@ _BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
 # letters also merged a word into its neighbour: "a_*HIGH" became "aHIGH",
 # no token, where a renderer shows "a_*" and a standalone HIGH.
 _BACKSTOP_SPLIT_WORD_RE = re.compile("|".join(
-    _backstop_marked_word(word, r"[*_~`\\]*+")
+    _backstop_marked_word(word, r"[*_~`\\]*")
     for word in ("CRITICAL", "HIGH", "MEDIUM")
 ))
 _BACKSTOP_WORD_MARKS = str.maketrans("", "", "*_~`\\")
@@ -3616,18 +3739,34 @@ def _backstop_math_joined(view: str) -> str | None:
 # destination is read by jumping from each top-level "(" to its partner, so
 # no character is read twice per destination (a 32-level regex read each
 # character up to 32 times, 0.3 s on 200 KB of "a[a](").
-_LINK_SPACE = r"[ \t]*+(?:\n[ \t]*+)?+"
+#
+# The runs of escapes and plain characters below are unrolled ("plain*
+# (escape plain*)*", the same texts as "(escape|plain)*") and the escapes
+# are a _committed_loop: a plain loop over a group keeps a backtracking
+# entry per pass (366 MB for a 3.2 MB title; task 3169), a run of one
+# character class keeps none. The closing character never begins a pass
+# (an escape), so committing loses no match.
+_LINK_SPACE = r"[ \t]*(?:\n[ \t]*)?"
+
+
+def _link_escaped_run(plain: str, escape: str = r"\\[\s\S]") -> str:
+    """Plain characters and escapes, read as "(?:escape|plain)*+"."""
+    return plain + "*" + _committed_loop(escape + plain + "*")
+
+
 _LINK_TITLE = (
-    r"\"(?:\\[\s\S]|[^\"\\])*+\"|'(?:\\[\s\S]|[^'\\])*+'"
-    r"|\((?:\\[\s\S]|[^()\\])*+\)"
+    r"\"" + _link_escaped_run(r"[^\"\\]") + r"\""
+    + r"|'" + _link_escaped_run(r"[^'\\]") + r"'"
+    + r"|\(" + _link_escaped_run(r"[^()\\]") + r"\)"
 )
 _LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
-_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*+>")
+_LINK_POINTY_DESTINATION_RE = re.compile(
+    r"<" + _link_escaped_run(r"[^<>\n\\]", r"\\[^\n]") + r">")
 _LINK_TAIL_END_RE = re.compile(
-    r"(?:(?:[ \t]++(?:\n[ \t]*+)?+|\n[ \t]*+)(?:" + _LINK_TITLE + r"))?+"
+    _atomic(r"(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)(?:" + _LINK_TITLE + r"))?")
     + _LINK_SPACE + r"\)",
 )
-_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}+\]")
+_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}\]")
 # The longest label a definition holds (_LINK_DEFINITION_RE); in characters,
 # so an escape counts two and a longer text is never a defined label.
 _LINK_LABEL_LIMIT = 2 * 999
@@ -3640,23 +3779,34 @@ _LINK_PARENTHESES_DEPTH = 32
 # the review defines a reference, which a shortcut "[text]" may name). The
 # alt text stops at another "![" or a blank line, so a flood of unclosed
 # "![" is read once.
-_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*+\n))*+\]"
+_LINK_IMAGE = (r"!\["
+               + _link_escaped_run(r"[^\]!\n\\]",
+                                   r"(?:\\[^\n]|!(?!\[)|\n(?![ \t]*\n))")
+               + r"\]")
 _LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
 _LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
 # A link reference definition ("[label]: destination"), also inside a quote
 # or list item. Read loosely: a reading that trusts these is paired with one
 # that trusts none, since a "definition" inside a paragraph or code is text.
+# The quote markers (">" with at most one blank after each, "(?:>[ \t]?)*")
+# are read as one run of ">" and blanks, which re keeps no backtracking
+# entry for (a loop over the group kept one per ">"; task 3169). The run
+# starts with ">" (a blank after the indent can begin nothing that follows)
+# and holds no two blanks in a row, which is exactly what that loop reads;
+# what follows never begins with ">" or a blank, so the run ends where the
+# loop did.
 _LINK_DEFINITION_RE = re.compile(
-    r"^[ \t]{0,3}(?:>[ \t]?)*+(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?+"
-    r"\[((?:\\[^\n]|[^\[\]\\]){1,999}+)\]:",
+    r"^[ \t]{0,3}(?![ \t])(?![> \t]*?[ \t][ \t])[> \t]*"
+    r"(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
+    r"\[((?:\\[^\n]|[^\[\]\\]){1,999})\]:",
     re.MULTILINE,
 )
 # Link markup a removal can join a word across: a letter or digit (or the
 # "|" drawn as I, or a lookalike's FOLD mark) right before "[" or "![", or
 # right after "]" or ")", emphasis marks and further brackets between.
 _BACKSTOP_LINK_JOIN_RE = re.compile(
-    r"(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])[*_~`\\]*+!?\["
-    r"|[\])][*_~`\\!\[]*+(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])",
+    r"(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])[*_~`\\]*!?\["
+    r"|[\])][*_~`\\!\[]*(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])",
 )
 
 
@@ -3665,6 +3815,8 @@ class _LinkTails:
 
     def __init__(self, view: str) -> None:
         self.view = view
+        # An inline tail ends at a ")": a "(" after the last one opens none.
+        self.last_close_parenthesis = view.rfind(")")
         self._parentheses: list[int] | None = None
         self._partners: list[int] = []
         self._depths: list[int] = []
@@ -3746,7 +3898,8 @@ class _LinkTails:
         holds), so a rejected "]" after a long run of text costs nothing.
         """
         view = self.view
-        if view.startswith("(", position):
+        if (position < self.last_close_parenthesis
+                and view.startswith("(", position)):
             start = _LINK_TAIL_START_RE.match(view, position).end()
             destination_end = self._destination_end(start)
             if destination_end is not None:
@@ -3797,8 +3950,18 @@ def _backstop_link_reading(
     is kept in a running index, and each stretch of the view is searched for
     "[" once; rescanning back to the last link for every "]" that formed
     none was quadratic (23 s on 200 KB of "a[" and "b]").
+
+    Task 3169 (timing on Python 3.10): two runs of closes that cannot form
+    a link are passed over without reading each. With no label defined,
+    only an inline tail makes a link, and it ends at a ")": once no ")"
+    follows, no close does. With labels, a bare "]" (no "(" or "[" after
+    it) is a link only when its text names a label; when it cannot (no "["
+    before it and no empty label, or a text longer than any label), no bare
+    "]" before the next "[" can either, since each has that text or a longer
+    one (_link_reader_resume).
     """
     closes = _LINK_ANY_CLOSE_RE if labels else _LINK_CLOSE_RE
+    empty_label_defined = "" in labels
     kept: list[str] = []
     joined_spans: list[tuple[int, int]] = []
     copied = searched = 0
@@ -3806,20 +3969,29 @@ def _backstop_link_reading(
     scanned = 0
     saw_image = False
     while (close := closes.search(view, searched)) is not None:
-        bracket = close.end() - 1
+        close_end = close.end()
+        if not labels and close_end >= tails.last_close_parenthesis:
+            break
+        bracket = close_end - 1
         found = view.rfind("[", scanned, bracket)
         if found >= 0:
             last_open = found
-        scanned = max(scanned, bracket)
+        if bracket > scanned:
+            scanned = bracket
         image = view.startswith("!", close.start())
         if image:
             opener = close.start() + 1
         else:
             opener = last_open if last_open >= copied else -1
         text_span = (opener + 1, bracket) if opener >= 0 else (bracket, bracket)
-        end = tails.end(close.end(), text_span, labels)
+        end = tails.end(close_end, text_span, labels)
         if end is None:
-            searched = close.end()
+            searched = close_end
+            if (labels and not image
+                    and view[close_end:close_end + 1] not in ("(", "[")
+                    and (bracket - text_span[0] > _LINK_LABEL_LIMIT
+                         or (opener < 0 and not empty_label_defined))):
+                searched = _link_reader_resume(view, close_end)
             continue
         text = view[text_span[0]:text_span[1]]
         if image:
@@ -3842,6 +4014,26 @@ def _backstop_link_reading(
     origins = (_backstop_line_origins(view, joined_spans)
                if joined_spans else None)
     return _backstop_split_words_joined("".join(kept)), origins, saw_image
+
+
+def _link_reader_resume(view: str, position: int) -> int:
+    """Where the link reader resumes when no bare "]" from ``position`` up to
+    the next "[" forms a link: at the first close that can still form one
+    before it (a "]" with "(" or "[" after it, or an image), else at that
+    "[" (or the end of ``view``).
+
+    An image starts with "![", so the only one that can start before the
+    next "[" starts right before it: the search stops at that "[" (it may
+    still see it after a "]"), and the reader resumes one character early
+    to read such an image whole."""
+    next_open = view.find("[", position)
+    search_end = len(view) if next_open < 0 else next_open + 1
+    close = _LINK_CLOSE_RE.search(view, position, search_end)
+    if close is not None:
+        return close.start()
+    if next_open < 0:
+        return len(view)
+    return max(position, next_open - 1)
 
 
 def _backstop_links_read(view: str) -> list[tuple[str, list[int] | None]]:
@@ -3905,10 +4097,19 @@ def _backstop_tokens(
                       or (not separated
                           and view[start - 1] in _BACKSTOP_FOLD_MARKS)):
             continue
-        if separated and not _backstop_separated_counts(
-            match.group(0), view, start, end, new_folds=new_folds,
-        ):
-            continue
+        if separated:
+            # Task 3169 (timing): most words have no mark on either side,
+            # and then only a NEW_FOLD mark in the word adds it (what
+            # _backstop_separated_counts decides, without its calls).
+            if (view[start - 1:start] in _BACKSTOP_MARKED_NEIGHBOURS
+                    or view[end:end + 1] in _BACKSTOP_MARKED_NEIGHBOURS):
+                if not _backstop_separated_counts(
+                    match.group(0), view, start, end, new_folds=new_folds,
+                ):
+                    continue
+            elif not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
+                    match.group(0)) is not None):
+                continue
         if newlines is None:
             newlines = [line_break.start()
                         for line_break in _NEWLINE_RE.finditer(view)]
@@ -3933,15 +4134,15 @@ def _blank_like(match: re.Match[str]) -> str:
 # footer of any other shape (fields over several lines, prose or emphasis on
 # the tally line) credits none, so its UPPER-case labels block. Possessive
 # blank runs keep a long line linear.
-_STRICT_COUNTS_HEADING_RE = re.compile(r"##[ \t]++Counts[ \t]*+",
+_STRICT_COUNTS_HEADING_RE = re.compile(r"##[ \t]+Counts[ \t]*",
                                        re.IGNORECASE)
 _STRICT_COUNTS_LINE_RE = re.compile(
-    r"[ \t]*+(?:\|[ \t]*+)?+"
-    + r"[ \t]*+(?:[|,;][ \t]*+)?+".join(
-        r"(?i:" + severity + r")[ \t]*+:[ \t]*+[0-9]{1,6}+(?![0-9])"
+    r"[ \t]*(?:\|[ \t]*)?"
+    + r"[ \t]*(?:[|,;][ \t]*)?".join(
+        r"(?i:" + severity + r")[ \t]*:[ \t]*[0-9]{1,6}(?![0-9])"
         for severity in _REVIEW_SEVERITIES
     )
-    + r"[ \t]*+(?:\|[ \t]*+)?+",
+    + r"[ \t]*(?:\|[ \t]*)?",
 )
 # The two marker lines the backstop blanks, exactly as the gate writes them:
 # a longer marker name ("EQUIPA-REVIEW-COMPLETE-HIGH") is read as text.

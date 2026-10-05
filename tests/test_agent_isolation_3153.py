@@ -157,8 +157,14 @@ def test_the_inside_run_calls_the_new_checks():
                                                            source.index("\ninside() {"))]
     calls = [line.strip() for line in body.splitlines()
              if line.strip() and not line.strip().startswith("#")]
-    assert 'check_world_writable_dirs / "${WELL_KNOWN_WORLD_WRITABLE[@]}"' in calls
-    assert "note_search_only_dirs /tmp /var/tmp" in calls
+    # Task 3169: the root is / unless the tests name their own (--root-fs);
+    # tests/test_agent_isolation_3169.py runs the default.
+    assert 'local root_fs=/ scan_seconds=""' in calls
+    assert 'local root_prefix="${root_fs%/}"' in calls
+    assert ('check_world_writable_dirs "$root_fs" '
+            '"${WELL_KNOWN_WORLD_WRITABLE[@]/#/$root_prefix}"') in calls
+    assert ('note_search_only_dirs "$root_prefix/tmp" '
+            '"$root_prefix/var/tmp"') in calls
     assert 'check_shm_cap /dev/shm "$AGENT_SHM_CAP_MB"' in calls
     assert "check_broadcast 255.255.255.255" in calls
     known = re.search(r"WELL_KNOWN_WORLD_WRITABLE=\(([^)]*)\)", source).group(1)

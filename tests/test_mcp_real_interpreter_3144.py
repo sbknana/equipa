@@ -31,9 +31,12 @@ import pytest
 
 import equipa.config as equipa_config
 from equipa import agent_runner
+from tests.system_node import install_system_node
 
 PY = "/usr/bin/python3"
-NODE = "/usr/bin/node"
+# Task 3169: the system node is one of the test's own (the system_node
+# fixture); a clean CI runner has no /usr/bin/node.
+NODE = "{node}"
 PERL = shutil.which("perl") or "/usr/bin/env"  # perl-base is essential on Debian
 
 
@@ -41,6 +44,13 @@ PERL = shutil.which("perl") or "/usr/bin/env"  # perl-base is essential on Debia
 def _isolated_dispatch_config(monkeypatch):
     monkeypatch.setattr(equipa_config, "_active_dispatch_config", {})
     monkeypatch.setattr(agent_runner, "PROJECT_DIRS", {})
+
+
+@pytest.fixture(autouse=True)
+def system_node(tmp_path, monkeypatch) -> dict[str, str]:
+    """Every test sees a real (system) node, so a renamed program named node
+    is refused because it is not that node, on any host."""
+    return install_system_node(monkeypatch, tmp_path / "system-bin")
 
 
 def _copy(source: str, target: Path) -> Path:
@@ -137,7 +147,9 @@ ACCEPTED = {
 
 
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
-def test_real_interpreter_is_accepted(tmp_path, server):
+def test_real_interpreter_is_accepted(tmp_path, server, system_node):
+    server = {**server,
+              "command": server["command"].format(node=system_node["node"])}
     if not os.path.exists(server["command"]):
         pytest.fail(f"{server['command']} must exist on the test host")
     _check(tmp_path, server)
@@ -183,8 +195,11 @@ def test_check_mcp_servers_docstring_describes_the_allowlist():
         assert needle in doc, needle
 
 
-def test_is_real_interpreter_direct():
+def test_is_real_interpreter_direct(system_node):
     assert agent_runner._is_real_interpreter(PY, "python")
     assert agent_runner._is_real_interpreter(sys.executable, "python")
     assert not agent_runner._is_real_interpreter("/usr/bin/env", "python")
     assert not agent_runner._is_real_interpreter(PY, "node")
+    assert agent_runner._is_real_interpreter(system_node["node"], "node")
+    assert agent_runner._is_real_interpreter(system_node["nodejs"], "node")
+    assert not agent_runner._is_real_interpreter(system_node["node"], "python")
