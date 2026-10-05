@@ -31,6 +31,7 @@ import pytest
 
 from equipa import bash_security
 from equipa.bash_security import CheckID, check_bash_command
+from tests.host_timing import assert_linear_time
 
 SENTINEL = "touch /tmp/zz-sentinel"
 
@@ -422,28 +423,36 @@ CAP = bash_security.MAX_COMMAND_BYTES
 
 
 @pytest.mark.parametrize(
-    "command",
+    "build",
     [
-        "echo " + "$\\\n(" * ((CAP - 5) // 4),                    # continuations
-        "echo " + "'$\\\n(' " * ((CAP - 5) // 7),                 # unjoined ones
-        "cat <<'A'\n`x`\nA\n" * (CAP // 17),                      # bodies x look-alikes
-        "echo " + "'`' " * ((CAP - 5) // 4),                      # quoted look-alikes
-        "cd /tmp/a; " * (CAP // 12) + "echo x > f",               # directory changes
-        "cd a; echo x > f; " * (CAP // 19),
-        "echo \"" + "\\$(" * ((CAP - 7) // 3) + "\"",              # escaped in "..."
-        "echo \"${x:-" + "'$(" * ((CAP - 20) // 3) + "}\"",        # literal apostrophes
+        lambda cap: "echo " + "$\\\n(" * ((cap - 5) // 4),        # continuations
+        lambda cap: "echo " + "'$\\\n(' " * ((cap - 5) // 7),     # unjoined ones
+        lambda cap: "cat <<'A'\n`x`\nA\n" * (cap // 17),          # bodies x look-alikes
+        lambda cap: "echo " + "'`' " * ((cap - 5) // 4),          # quoted look-alikes
+        lambda cap: "cd /tmp/a; " * (cap // 12) + "echo x > f",   # directory changes
+        lambda cap: "cd a; echo x > f; " * (cap // 19),
+        lambda cap: "echo \"" + "\\$(" * ((cap - 7) // 3) + "\"",  # escaped in "..."
+        lambda cap: "echo \"${x:-" + "'$(" * ((cap - 20) // 3) + "}\"",  # literal apostrophes
     ],
     ids=["dollar-continuations", "sq-continuations", "heredoc-bodies",
          "sq-lookalikes", "cd-chain", "cd-redirect-chain", "dq-escapes",
          "brace-apostrophes"],
 )
-def test_new_passes_are_fast_at_the_cap(command: str):
+def test_new_passes_are_fast_at_the_cap(build):
+    """Budget host-calibrated, growth from a quarter of the cap to the cap
+    linear (task 3171)."""
     import time
 
-    assert len(command.encode()) <= CAP
-    start = time.process_time()
-    check_bash_command(command + " ")  # bypass any cached scan
-    assert time.process_time() - start < 1.0
+    assert len(build(CAP).encode()) <= CAP
+
+    def seconds_at(size):
+        command = build(size)
+        bash_security._scan_shell.cache_clear()  # bypass any cached scan
+        start = time.process_time()
+        check_bash_command(command + " ")
+        return time.process_time() - start
+
+    assert_linear_time(seconds_at, CAP, 1.0, build(40)[:20])
 
 
 # ---------------------------------------------------------------------------

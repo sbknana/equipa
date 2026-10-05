@@ -25,6 +25,7 @@ import pytest
 
 from equipa import bash_security
 from equipa.bash_security import CheckID, check_bash_command
+from tests.host_timing import assert_linear_time
 
 MARKER = "m"  # a prelude function that only appends a line to marks.txt
 PRELUDE = "set -f\nexec 3>>marks.txt\nm() { printf 'ran\\n' >&3; echo 0; }\ns=hello\n"
@@ -296,31 +297,42 @@ def test_literal_arithmetic_names_no_variable(command: str):
 
 
 def test_long_literal_arithmetic_stays_linear():
-    """The literal-arithmetic exemption is bounded; a long run just counts."""
+    """The literal-arithmetic exemption is bounded; a long run just counts.
+    Budget host-calibrated, growth from a quarter of both runs linear
+    (task 3171)."""
     import time
 
-    command = "echo \"$((" + "1+" * 8000 + "1))\" '$(x)'"
-    start = time.process_time()
-    assert bash_security._evaluating_construct(command) is not None
-    many = "(( " * 5000
-    assert bash_security._evaluating_construct(many) is not None
-    assert time.process_time() - start < 1.0
+    def seconds_at(size):
+        command = "echo \"$((" + "1+" * size + "1))\" '$(x)'"
+        many = "(( " * (size * 5 // 8)  # 5000 at the test's size
+        bash_security._scan_shell.cache_clear()
+        start = time.process_time()
+        assert bash_security._evaluating_construct(command) is not None
+        assert bash_security._evaluating_construct(many) is not None
+        return time.process_time() - start
+
+    assert_linear_time(seconds_at, 8000, 1.0, "literal arithmetic")
 
 
 @pytest.mark.parametrize(
-    "command",
+    "unit, count",
     [
-        "read " * 3200 + "'$(x)'",
-        ("read " + "x " * 10) * 640 + "'$(x)'",
-        "read > x " * 1777 + "'$(x)'",
-        "[ " * 8000 + "'$(x)'",
+        ("read ", 3200),
+        ("read " + "x " * 10, 640),
+        ("read > x ", 1777),
+        ("[ ", 8000),
     ],
 )
-def test_builtin_argument_scan_is_linear(command: str):
-    """Each builtin used to rescan every later word: 0.9 s at 16 KB."""
+def test_builtin_argument_scan_is_linear(unit: str, count: int):
+    """Each builtin used to rescan every later word: 0.9 s at 16 KB. Budget
+    host-calibrated, growth from a quarter of the words linear (task 3171)."""
     import time
 
-    bash_security._scan_shell.cache_clear()
-    start = time.process_time()
-    bash_security._evaluating_construct(command)
-    assert time.process_time() - start < 0.4
+    def seconds_at(size):
+        command = unit * size + "'$(x)'"
+        bash_security._scan_shell.cache_clear()
+        start = time.process_time()
+        bash_security._evaluating_construct(command)
+        return time.process_time() - start
+
+    assert_linear_time(seconds_at, count, 0.4, repr(unit))

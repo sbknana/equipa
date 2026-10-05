@@ -27,6 +27,7 @@ from equipa.bash_security import (
     CheckID,
     check_bash_command,
 )
+from tests.host_timing import assert_linear_time, budget
 
 # Generous for a linear scan (tens of milliseconds) and far below the
 # minutes the quadratic versions took.
@@ -41,6 +42,21 @@ def _timed(func, *args):
     return result, time.process_time() - start
 
 
+def _assert_linear(func, build, size: int, *,
+                   compare_with_larger: bool = False) -> None:
+    """``func(*build(n))`` within the host-calibrated TIME_LIMIT_SECONDS,
+    growing linearly from a quarter of *size* to *size* (task 3171). Every
+    measurement scans afresh: the shell scan is cached."""
+    def seconds_at(at_size: int) -> float:
+        args = build(at_size)
+        bash_security._scan_shell.cache_clear()
+        return _timed(func, *args)[1]
+
+    assert_linear_time(seconds_at, size, TIME_LIMIT_SECONDS,
+                       repr(build(8))[:40],
+                       compare_with_larger=compare_with_larger)
+
+
 # ---------------------------------------------------------------------------
 # sandbox-07: length cap + linear scans
 # ---------------------------------------------------------------------------
@@ -48,11 +64,16 @@ def _timed(func, *args):
 class TestLengthCapAndLinearScans:
 
     @pytest.mark.parametrize(
-        "command", ["{" * 40_000, "'" * 50_000], ids=["40k-braces", "50k-quotes"]
+        "char, size", [("{", 40_000), ("'", 50_000)], ids=["40k-braces", "50k-quotes"]
     )
-    def test_oversized_command_blocked_fast(self, command: str):
+    def test_oversized_command_blocked_fast(self, char: str, size: int):
+        # A quarter of the command is under the cap, which takes another
+        # path, so the growth runs from the test's size to 4x it (task 3171).
+        _assert_linear(check_bash_command, lambda n: (char * n,), size,
+                       compare_with_larger=True)
+        command = char * size
         result, elapsed = _timed(check_bash_command, command)
-        assert elapsed < TIME_LIMIT_SECONDS, f"took {elapsed:.2f}s"
+        assert elapsed < budget(TIME_LIMIT_SECONDS), f"took {elapsed:.2f}s"
         assert not result.safe
         assert result.check_id == CheckID.COMMAND_TOO_LONG
         assert str(MAX_COMMAND_BYTES) in result.message
@@ -70,39 +91,38 @@ class TestLengthCapAndLinearScans:
         assert check_bash_command(multibyte).check_id == CheckID.COMMAND_TOO_LONG
 
     @pytest.mark.parametrize(
-        "command",
+        "prefix, unit, suffix, count",
         [
-            "{" * 40_000,
-            "\\" * 40_000 + "{a,b}",
-            "{a," * 10_000,
-            "{a.." * 10_000,
-            "}" * 40_000,
+            ("", "{", "", 40_000),
+            ("", "\\", "{a,b}", 40_000),
+            ("", "{a,", "", 10_000),
+            ("", "{a..", "", 10_000),
+            ("", "}", "", 40_000),
         ],
         ids=["braces", "backslashes", "commas", "sequences", "closers"],
     )
-    def test_brace_scan_is_linear(self, command: str):
+    def test_brace_scan_is_linear(self, prefix, unit, suffix, count):
         """The scan itself, not the cap, must be fast (bypasses the cap)."""
-        _, elapsed = _timed(
-            bash_security._check_brace_expansion, command, command
-        )
-        assert elapsed < TIME_LIMIT_SECONDS, f"took {elapsed:.2f}s"
+        def build(n):
+            command = prefix + unit * n + suffix
+            return command, command
+
+        _assert_linear(bash_security._check_brace_expansion, build, count)
 
     @pytest.mark.parametrize("quote", ["'", '"'])
     def test_quote_run_scan_is_linear(self, quote: str):
-        command = quote * 50_000
-        _, elapsed = _timed(bash_security._check_obfuscated_flags, command, "")
-        assert elapsed < TIME_LIMIT_SECONDS, f"took {elapsed:.2f}s"
+        _assert_linear(bash_security._check_obfuscated_flags,
+                       lambda n: (quote * n, ""), 50_000)
 
     @pytest.mark.parametrize(
-        "command",
-        ["{" * 16_000, "'" * 16_000, "echo {a," * 2_000, '"$(' * 5_000],
+        "unit, count",
+        [("{", 16_000), ("'", 16_000), ("echo {a,", 2_000), ('"$(', 5_000)],
         ids=["braces", "quotes", "brace-lists", "dq-substitutions"],
     )
-    def test_full_pipeline_fast_at_the_cap(self, command: str):
+    def test_full_pipeline_fast_at_the_cap(self, unit: str, count: int):
         """Largest allowed size through every check stays well under 1 s."""
-        assert len(command.encode()) <= MAX_COMMAND_BYTES
-        _, elapsed = _timed(check_bash_command, command)
-        assert elapsed < TIME_LIMIT_SECONDS, f"took {elapsed:.2f}s"
+        assert len((unit * count).encode()) <= MAX_COMMAND_BYTES
+        _assert_linear(check_bash_command, lambda n: (unit * n,), count)
 
     def test_quote_regex_rewrite_keeps_semantics(self):
         """``(?:""|''){1,}['"]-`` and the anchored-free one-pair form agree."""
