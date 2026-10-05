@@ -176,15 +176,26 @@ def production_seconds(text: str, *, nonce: str = NONCE,
     audit line), the artifact written once beforehand; ``before`` (untimed)
     runs ahead of each call. Provenance must trust the artifact (or reject a
     bidi control the text holds on purpose, production's first check), so
-    the time is never that of a malformed test artifact's early rejection."""
+    the time is never that of a malformed test artifact's early rejection.
+
+    The gate refuses a bidi control before the parser runs, so for such a
+    text the parser's time on the text provenance read is added: a family
+    holding a bidi control (on purpose or from a code-point range) is still
+    held to its budget for the parse."""
     project = gate_project()
     path = write_recorded_review(project, GATE_TASK_ID, text, nonce=nonce)
     provenance = verify_reviewer_provenance(GATE_TASK_ID, path)
-    assert (provenance.trusted
-            or provenance.reason.startswith(REVIEW_BIDI_CONTROL_REASON)), (
-        provenance.reason)
+    refused_before_parsing = (
+        not provenance.trusted
+        and provenance.reason.startswith(REVIEW_BIDI_CONTROL_REASON))
+    assert provenance.trusted or refused_before_parsing, provenance.reason
     with audit_rows_not_persisted():
-        return median_cpu_seconds(
+        gate_seconds = median_cpu_seconds(
             _security_review_blocks_merge, str(project), GATE_TASK_ID,
             block_on_missing=True, before=before,
         )
+    if not refused_before_parsing:
+        return gate_seconds
+    return gate_seconds + median_cpu_seconds(
+        loops._analyze_review_file, path, text=provenance.text, before=before,
+    )

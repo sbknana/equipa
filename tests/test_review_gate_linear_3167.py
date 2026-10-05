@@ -14,7 +14,9 @@
   fail, and provenance hands the gate the decoded bytes for every character
   normalisation deletes or rewrites.
 * I3164-03: the 200 KB timing families are timed through the merge gate
-  (tests/test_review_gate_backstop_3143.py and the other timing suites).
+  (tests/test_review_gate_backstop_3143.py and the other timing suites),
+  and a review the gate refuses before parsing (a bidi control) still has
+  its parse timed.
 
 The source stays ASCII: special characters are named.
 
@@ -46,7 +48,7 @@ from tests.review_gate_production import (
     production_decision,
     production_seconds,
 )
-from tests.review_gate_timing import timing_test
+from tests.review_gate_timing import TIMING_RUNS, timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
     RB,
     assert_backstop_blocks,
@@ -291,6 +293,33 @@ def _rewritten_characters():
     deleted -= set(_BIDI_CONTROL_RE.findall(every))
     breaks = set(_ANY_LINE_BREAK_RE.findall(every)) - {"\n"}
     return sorted(deleted | breaks | {"\N{BYTE ORDER MARK}"})
+
+
+def test_every_timed_review_is_parsed(monkeypatch):
+    """I3164-03: ``production_seconds`` times the parse of every review. The
+    gate parses a trusted review itself; it refuses a bidi control before
+    parsing, so the helper times the parser on that text as well, and a
+    family holding one cannot meet its budget on the refusal alone."""
+    parsed = []
+    analyze = loops._analyze_review_file
+
+    def counting(*args, **kwargs):
+        parsed.append(kwargs.get("text"))
+        return analyze(*args, **kwargs)
+
+    monkeypatch.setattr(loops, "_analyze_review_file", counting)
+    trusted = build_review(["Notes: nothing to report."], "zero")
+    refused = build_review(["\N{RIGHT-TO-LEFT OVERRIDE}HGIH"
+                            "\N{POP DIRECTIONAL FORMATTING} SQLi"], "zero")
+
+    production_seconds(trusted)
+    assert parsed == [trusted] * TIMING_RUNS
+
+    parsed.clear()
+    assert production_decision(refused).blocks
+    assert parsed == []
+    production_seconds(refused)
+    assert parsed == [refused] * TIMING_RUNS
 
 
 def test_provenance_hands_the_gate_the_bytes_as_written(tmp_path):
