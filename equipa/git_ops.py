@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import contextlib
 import contextvars
+import errno
 import hashlib
 import logging
 import os
@@ -446,8 +447,27 @@ def _nearest_git_entry(path: Path) -> Path | None:
 
     Both the path as given and its symlink-resolved form are walked: git
     itself discovers the repository from the resolved working directory.
+
+    S3168-04 (task 3172): a symlink loop at or above ``path`` made
+    ``Path.resolve`` raise (RuntimeError on Python 3.10 to 3.12), and the
+    error escaped every repository-appearance check. Such a path cannot be
+    walked, so nothing shows that no repository is reachable through it: the
+    looping path itself is returned (fail closed), and every caller treats
+    the project as holding a repository (N1 blocks the task). The loop is
+    found with ``os.stat`` (ELOOP), which every Python version reports the
+    same way; ``Path.resolve`` stopped raising for it in Python 3.13.
     """
-    for start in dict.fromkeys((path.absolute(), path.resolve())):
+    absolute = path.absolute()
+    try:
+        os.stat(absolute)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return absolute
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return absolute
+    for start in dict.fromkeys((absolute, resolved)):
         for directory in (start, *start.parents):
             entry = directory / ".git"
             if os.path.lexists(entry):

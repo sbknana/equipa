@@ -15,13 +15,14 @@ import html
 import itertools
 import json
 import logging
+import operator
 import os
 import re
 import subprocess
 import time
 import unicodedata
-from collections import deque
-from collections.abc import Callable, Mapping
+from collections import Counter, deque
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,7 @@ from equipa.security_gate import (
     REVIEWER_STATUS_RUNNING,
     REVIEWER_STATUS_SUCCEEDED,
     ReviewerRunRecord,
+    _ANY_LINE_BREAK_RE,
     _gate_audit_log,
     audit_reviewer_run,
     find_bidi_control,
@@ -1688,6 +1690,294 @@ _REVIEW_MAX_SEVERITY_LINES = 1_000
 # more than this is not parsed (fail closed).
 _REVIEW_MAX_DISTINCT_CHARACTERS = 4_096
 
+# Task 3172 (R3169-01): the gate reads every character through the running
+# interpreter's Unicode data (NFKC, categories, case, the regex classes), and
+# that data is not the same everywhere: Python 3.10 ships Unicode 13.0, 3.12
+# Unicode 15.0. U+A7F2 is a C under NFKC on 3.12 and unassigned on 3.10, so a
+# heading that spelled the top severity with it blocked on 3.12 and merged on
+# 3.10. The gate now reads only the characters of this checked-in table:
+# every code point assigned in Unicode 13.0 except the three whose properties
+# changed by 15.0 (U+10FC and U+AB69 became lowercase, U+1734 went from Mn to
+# Mc). Each of them has the same category, bidi class, decomposition,
+# NFC/NFD/NFKC/NFKD form, numeric values, name, case mappings, str
+# predicates, \w \s \d membership and sre case fold on 3.10 and on 3.12 (a
+# digest of all of them is pinned by tests/test_review_gate_unicode_data_3172
+# .py, which every CI interpreter runs), and Unicode's normalization
+# stability keeps NFKC of a text made of them the same in every later
+# version. A review holding any other character is not parsed (fail closed),
+# so the verdict does not depend on the interpreter. An interpreter whose
+# Unicode data predates 13.0 does not know every character of the table, so
+# it parses no review that is not ASCII. Each "XXXX-YYYY" is an inclusive
+# range of code points in hexadecimal.
+_GATE_UNICODE_DATA_VERSION = (13, 0, 0)
+_GATE_UNICODE_RANGES = (
+    "0000-0377 037A-037F 0384-038A 038C-038C 038E-03A1 03A3-052F "
+    "0531-0556 0559-058A 058D-058F 0591-05C7 05D0-05EA 05EF-05F4 "
+    "0600-061C 061E-070D 070F-074A 074D-07B1 07C0-07FA 07FD-082D "
+    "0830-083E 0840-085B 085E-085E 0860-086A 08A0-08B4 08B6-08C7 "
+    "08D3-0983 0985-098C 098F-0990 0993-09A8 09AA-09B0 09B2-09B2 "
+    "09B6-09B9 09BC-09C4 09C7-09C8 09CB-09CE 09D7-09D7 09DC-09DD "
+    "09DF-09E3 09E6-09FE 0A01-0A03 0A05-0A0A 0A0F-0A10 0A13-0A28 "
+    "0A2A-0A30 0A32-0A33 0A35-0A36 0A38-0A39 0A3C-0A3C 0A3E-0A42 "
+    "0A47-0A48 0A4B-0A4D 0A51-0A51 0A59-0A5C 0A5E-0A5E 0A66-0A76 "
+    "0A81-0A83 0A85-0A8D 0A8F-0A91 0A93-0AA8 0AAA-0AB0 0AB2-0AB3 "
+    "0AB5-0AB9 0ABC-0AC5 0AC7-0AC9 0ACB-0ACD 0AD0-0AD0 0AE0-0AE3 "
+    "0AE6-0AF1 0AF9-0AFF 0B01-0B03 0B05-0B0C 0B0F-0B10 0B13-0B28 "
+    "0B2A-0B30 0B32-0B33 0B35-0B39 0B3C-0B44 0B47-0B48 0B4B-0B4D "
+    "0B55-0B57 0B5C-0B5D 0B5F-0B63 0B66-0B77 0B82-0B83 0B85-0B8A "
+    "0B8E-0B90 0B92-0B95 0B99-0B9A 0B9C-0B9C 0B9E-0B9F 0BA3-0BA4 "
+    "0BA8-0BAA 0BAE-0BB9 0BBE-0BC2 0BC6-0BC8 0BCA-0BCD 0BD0-0BD0 "
+    "0BD7-0BD7 0BE6-0BFA 0C00-0C0C 0C0E-0C10 0C12-0C28 0C2A-0C39 "
+    "0C3D-0C44 0C46-0C48 0C4A-0C4D 0C55-0C56 0C58-0C5A 0C60-0C63 "
+    "0C66-0C6F 0C77-0C8C 0C8E-0C90 0C92-0CA8 0CAA-0CB3 0CB5-0CB9 "
+    "0CBC-0CC4 0CC6-0CC8 0CCA-0CCD 0CD5-0CD6 0CDE-0CDE 0CE0-0CE3 "
+    "0CE6-0CEF 0CF1-0CF2 0D00-0D0C 0D0E-0D10 0D12-0D44 0D46-0D48 "
+    "0D4A-0D4F 0D54-0D63 0D66-0D7F 0D81-0D83 0D85-0D96 0D9A-0DB1 "
+    "0DB3-0DBB 0DBD-0DBD 0DC0-0DC6 0DCA-0DCA 0DCF-0DD4 0DD6-0DD6 "
+    "0DD8-0DDF 0DE6-0DEF 0DF2-0DF4 0E01-0E3A 0E3F-0E5B 0E81-0E82 "
+    "0E84-0E84 0E86-0E8A 0E8C-0EA3 0EA5-0EA5 0EA7-0EBD 0EC0-0EC4 "
+    "0EC6-0EC6 0EC8-0ECD 0ED0-0ED9 0EDC-0EDF 0F00-0F47 0F49-0F6C "
+    "0F71-0F97 0F99-0FBC 0FBE-0FCC 0FCE-0FDA 1000-10C5 10C7-10C7 "
+    "10CD-10CD 10D0-10FB 10FD-1248 124A-124D 1250-1256 1258-1258 "
+    "125A-125D 1260-1288 128A-128D 1290-12B0 12B2-12B5 12B8-12BE "
+    "12C0-12C0 12C2-12C5 12C8-12D6 12D8-1310 1312-1315 1318-135A "
+    "135D-137C 1380-1399 13A0-13F5 13F8-13FD 1400-169C 16A0-16F8 "
+    "1700-170C 170E-1714 1720-1733 1735-1736 1740-1753 1760-176C "
+    "176E-1770 1772-1773 1780-17DD 17E0-17E9 17F0-17F9 1800-180E "
+    "1810-1819 1820-1878 1880-18AA 18B0-18F5 1900-191E 1920-192B "
+    "1930-193B 1940-1940 1944-196D 1970-1974 1980-19AB 19B0-19C9 "
+    "19D0-19DA 19DE-1A1B 1A1E-1A5E 1A60-1A7C 1A7F-1A89 1A90-1A99 "
+    "1AA0-1AAD 1AB0-1AC0 1B00-1B4B 1B50-1B7C 1B80-1BF3 1BFC-1C37 "
+    "1C3B-1C49 1C4D-1C88 1C90-1CBA 1CBD-1CC7 1CD0-1CFA 1D00-1DF9 "
+    "1DFB-1F15 1F18-1F1D 1F20-1F45 1F48-1F4D 1F50-1F57 1F59-1F59 "
+    "1F5B-1F5B 1F5D-1F5D 1F5F-1F7D 1F80-1FB4 1FB6-1FC4 1FC6-1FD3 "
+    "1FD6-1FDB 1FDD-1FEF 1FF2-1FF4 1FF6-1FFE 2000-2064 2066-2071 "
+    "2074-208E 2090-209C 20A0-20BF 20D0-20F0 2100-218B 2190-2426 "
+    "2440-244A 2460-2B73 2B76-2B95 2B97-2C2E 2C30-2C5E 2C60-2CF3 "
+    "2CF9-2D25 2D27-2D27 2D2D-2D2D 2D30-2D67 2D6F-2D70 2D7F-2D96 "
+    "2DA0-2DA6 2DA8-2DAE 2DB0-2DB6 2DB8-2DBE 2DC0-2DC6 2DC8-2DCE "
+    "2DD0-2DD6 2DD8-2DDE 2DE0-2E52 2E80-2E99 2E9B-2EF3 2F00-2FD5 "
+    "2FF0-2FFB 3000-303F 3041-3096 3099-30FF 3105-312F 3131-318E "
+    "3190-31E3 31F0-321E 3220-9FFC A000-A48C A490-A4C6 A4D0-A62B "
+    "A640-A6F7 A700-A7BF A7C2-A7CA A7F5-A82C A830-A839 A840-A877 "
+    "A880-A8C5 A8CE-A8D9 A8E0-A953 A95F-A97C A980-A9CD A9CF-A9D9 "
+    "A9DE-A9FE AA00-AA36 AA40-AA4D AA50-AA59 AA5C-AAC2 AADB-AAF6 "
+    "AB01-AB06 AB09-AB0E AB11-AB16 AB20-AB26 AB28-AB2E AB30-AB68 "
+    "AB6A-AB6B AB70-ABED ABF0-ABF9 AC00-D7A3 D7B0-D7C6 D7CB-D7FB "
+    "D800-FA6D FA70-FAD9 FB00-FB06 FB13-FB17 FB1D-FB36 FB38-FB3C "
+    "FB3E-FB3E FB40-FB41 FB43-FB44 FB46-FBC1 FBD3-FD3F FD50-FD8F "
+    "FD92-FDC7 FDF0-FDFD FE00-FE19 FE20-FE52 FE54-FE66 FE68-FE6B "
+    "FE70-FE74 FE76-FEFC FEFF-FEFF FF01-FFBE FFC2-FFC7 FFCA-FFCF "
+    "FFD2-FFD7 FFDA-FFDC FFE0-FFE6 FFE8-FFEE FFF9-FFFD 10000-1000B "
+    "1000D-10026 10028-1003A 1003C-1003D 1003F-1004D 10050-1005D "
+    "10080-100FA 10100-10102 10107-10133 10137-1018E 10190-1019C "
+    "101A0-101A0 101D0-101FD 10280-1029C 102A0-102D0 102E0-102FB "
+    "10300-10323 1032D-1034A 10350-1037A 10380-1039D 1039F-103C3 "
+    "103C8-103D5 10400-1049D 104A0-104A9 104B0-104D3 104D8-104FB "
+    "10500-10527 10530-10563 1056F-1056F 10600-10736 10740-10755 "
+    "10760-10767 10800-10805 10808-10808 1080A-10835 10837-10838 "
+    "1083C-1083C 1083F-10855 10857-1089E 108A7-108AF 108E0-108F2 "
+    "108F4-108F5 108FB-1091B 1091F-10939 1093F-1093F 10980-109B7 "
+    "109BC-109CF 109D2-10A03 10A05-10A06 10A0C-10A13 10A15-10A17 "
+    "10A19-10A35 10A38-10A3A 10A3F-10A48 10A50-10A58 10A60-10A9F "
+    "10AC0-10AE6 10AEB-10AF6 10B00-10B35 10B39-10B55 10B58-10B72 "
+    "10B78-10B91 10B99-10B9C 10BA9-10BAF 10C00-10C48 10C80-10CB2 "
+    "10CC0-10CF2 10CFA-10D27 10D30-10D39 10E60-10E7E 10E80-10EA9 "
+    "10EAB-10EAD 10EB0-10EB1 10F00-10F27 10F30-10F59 10FB0-10FCB "
+    "10FE0-10FF6 11000-1104D 11052-1106F 1107F-110C1 110CD-110CD "
+    "110D0-110E8 110F0-110F9 11100-11134 11136-11147 11150-11176 "
+    "11180-111DF 111E1-111F4 11200-11211 11213-1123E 11280-11286 "
+    "11288-11288 1128A-1128D 1128F-1129D 1129F-112A9 112B0-112EA "
+    "112F0-112F9 11300-11303 11305-1130C 1130F-11310 11313-11328 "
+    "1132A-11330 11332-11333 11335-11339 1133B-11344 11347-11348 "
+    "1134B-1134D 11350-11350 11357-11357 1135D-11363 11366-1136C "
+    "11370-11374 11400-1145B 1145D-11461 11480-114C7 114D0-114D9 "
+    "11580-115B5 115B8-115DD 11600-11644 11650-11659 11660-1166C "
+    "11680-116B8 116C0-116C9 11700-1171A 1171D-1172B 11730-1173F "
+    "11800-1183B 118A0-118F2 118FF-11906 11909-11909 1190C-11913 "
+    "11915-11916 11918-11935 11937-11938 1193B-11946 11950-11959 "
+    "119A0-119A7 119AA-119D7 119DA-119E4 11A00-11A47 11A50-11AA2 "
+    "11AC0-11AF8 11C00-11C08 11C0A-11C36 11C38-11C45 11C50-11C6C "
+    "11C70-11C8F 11C92-11CA7 11CA9-11CB6 11D00-11D06 11D08-11D09 "
+    "11D0B-11D36 11D3A-11D3A 11D3C-11D3D 11D3F-11D47 11D50-11D59 "
+    "11D60-11D65 11D67-11D68 11D6A-11D8E 11D90-11D91 11D93-11D98 "
+    "11DA0-11DA9 11EE0-11EF8 11FB0-11FB0 11FC0-11FF1 11FFF-12399 "
+    "12400-1246E 12470-12474 12480-12543 13000-1342E 13430-13438 "
+    "14400-14646 16800-16A38 16A40-16A5E 16A60-16A69 16A6E-16A6F "
+    "16AD0-16AED 16AF0-16AF5 16B00-16B45 16B50-16B59 16B5B-16B61 "
+    "16B63-16B77 16B7D-16B8F 16E40-16E9A 16F00-16F4A 16F4F-16F87 "
+    "16F8F-16F9F 16FE0-16FE4 16FF0-16FF1 17000-187F7 18800-18CD5 "
+    "18D00-18D08 1B000-1B11E 1B150-1B152 1B164-1B167 1B170-1B2FB "
+    "1BC00-1BC6A 1BC70-1BC7C 1BC80-1BC88 1BC90-1BC99 1BC9C-1BCA3 "
+    "1D000-1D0F5 1D100-1D126 1D129-1D1E8 1D200-1D245 1D2E0-1D2F3 "
+    "1D300-1D356 1D360-1D378 1D400-1D454 1D456-1D49C 1D49E-1D49F "
+    "1D4A2-1D4A2 1D4A5-1D4A6 1D4A9-1D4AC 1D4AE-1D4B9 1D4BB-1D4BB "
+    "1D4BD-1D4C3 1D4C5-1D505 1D507-1D50A 1D50D-1D514 1D516-1D51C "
+    "1D51E-1D539 1D53B-1D53E 1D540-1D544 1D546-1D546 1D54A-1D550 "
+    "1D552-1D6A5 1D6A8-1D7CB 1D7CE-1DA8B 1DA9B-1DA9F 1DAA1-1DAAF "
+    "1E000-1E006 1E008-1E018 1E01B-1E021 1E023-1E024 1E026-1E02A "
+    "1E100-1E12C 1E130-1E13D 1E140-1E149 1E14E-1E14F 1E2C0-1E2F9 "
+    "1E2FF-1E2FF 1E800-1E8C4 1E8C7-1E8D6 1E900-1E94B 1E950-1E959 "
+    "1E95E-1E95F 1EC71-1ECB4 1ED01-1ED3D 1EE00-1EE03 1EE05-1EE1F "
+    "1EE21-1EE22 1EE24-1EE24 1EE27-1EE27 1EE29-1EE32 1EE34-1EE37 "
+    "1EE39-1EE39 1EE3B-1EE3B 1EE42-1EE42 1EE47-1EE47 1EE49-1EE49 "
+    "1EE4B-1EE4B 1EE4D-1EE4F 1EE51-1EE52 1EE54-1EE54 1EE57-1EE57 "
+    "1EE59-1EE59 1EE5B-1EE5B 1EE5D-1EE5D 1EE5F-1EE5F 1EE61-1EE62 "
+    "1EE64-1EE64 1EE67-1EE6A 1EE6C-1EE72 1EE74-1EE77 1EE79-1EE7C "
+    "1EE7E-1EE7E 1EE80-1EE89 1EE8B-1EE9B 1EEA1-1EEA3 1EEA5-1EEA9 "
+    "1EEAB-1EEBB 1EEF0-1EEF1 1F000-1F02B 1F030-1F093 1F0A0-1F0AE "
+    "1F0B1-1F0BF 1F0C1-1F0CF 1F0D1-1F0F5 1F100-1F1AD 1F1E6-1F202 "
+    "1F210-1F23B 1F240-1F248 1F250-1F251 1F260-1F265 1F300-1F6D7 "
+    "1F6E0-1F6EC 1F6F0-1F6FC 1F700-1F773 1F780-1F7D8 1F7E0-1F7EB "
+    "1F800-1F80B 1F810-1F847 1F850-1F859 1F860-1F887 1F890-1F8AD "
+    "1F8B0-1F8B1 1F900-1F978 1F97A-1F9CB 1F9CD-1FA53 1FA60-1FA6D "
+    "1FA70-1FA74 1FA78-1FA7A 1FA80-1FA86 1FA90-1FAA8 1FAB0-1FAB6 "
+    "1FAC0-1FAC2 1FAD0-1FAD6 1FB00-1FB92 1FB94-1FBCA 1FBF0-1FBF9 "
+    "20000-2A6DD 2A700-2B734 2B740-2B81D 2B820-2CEA1 2CEB0-2EBE0 "
+    "2F800-2FA1D 30000-3134A E0001-E0001 E0020-E007F E0100-E01EF "
+    "F0000-FFFFD 100000-10FFFD "
+)
+# Sorted range edges (each start, and each end plus one): a code point is in
+# the table when an odd number of edges are at or below it.
+_GATE_UNICODE_EDGES = tuple(itertools.chain.from_iterable(
+    (int(start, 16), int(end, 16) + 1)
+    for start, end in (piece.split("-")
+                       for piece in _GATE_UNICODE_RANGES.split())
+))
+REVIEW_UNICODE_DATA_REASON = "character outside the gate's Unicode data"
+
+
+def _gate_unicode_data_is_current() -> bool:
+    """Whether the running interpreter's Unicode data is at least the version
+    the gate's character table was built from (_GATE_UNICODE_DATA_VERSION)."""
+    try:
+        version = tuple(int(part)
+                        for part in unicodedata.unidata_version.split("."))
+    except ValueError:
+        return False
+    return version >= _GATE_UNICODE_DATA_VERSION
+
+
+def _in_gate_unicode_table(char: str) -> bool:
+    """Whether the gate reads ``char`` (see _GATE_UNICODE_RANGES)."""
+    return bisect.bisect_right(_GATE_UNICODE_EDGES, ord(char)) % 2 == 1
+
+
+# Every numeric character reference the gate's views decode (see
+# _BACKSTOP_REFERENCE_RE: any digit count, with or without the ";"); a
+# group holds its digits without most leading zeros. Every named reference
+# decodes to characters of the table (tests/test_review_gate_unicode_data_
+# 3172.py checks html5 on each interpreter).
+_GATE_NUMERIC_REFERENCE_RE = re.compile(
+    r"&#(?:0*([0-9]+)|[xX]0*([0-9A-Fa-f]+))",
+)
+
+
+def _reference_decoded(decimal: str, hexadecimal: str) -> str:
+    """A numeric reference _GATE_NUMERIC_REFERENCE_RE found, as
+    ``html.unescape`` decodes it; one past U+10FFFF is U+FFFD without
+    int(), as in _backstop_decoded_spelling."""
+    if decimal:
+        if len(decimal) > _BACKSTOP_MAX_DECIMAL_DIGITS:
+            return "\N{REPLACEMENT CHARACTER}"
+        return html.unescape(f"&#{int(decimal)};")
+    if len(hexadecimal) > _BACKSTOP_MAX_HEX_DIGITS:
+        return "\N{REPLACEMENT CHARACTER}"
+    return html.unescape(f"&#x{hexadecimal};")
+
+
+# The two halves of _GATE_NUMERIC_REFERENCE_RE, each finding the same
+# references and digits as its group there; one group gives plain strings
+# (no tuple per reference for the garbage collector to track).
+_GATE_DECIMAL_REFERENCE_RE = re.compile(r"&#0*([0-9]+)")
+_GATE_HEX_REFERENCE_RE = re.compile(r"&#[xX]0*([0-9A-Fa-f]+)")
+# _GATE_UNICODE_EDGES plus one more start: every code point past U+10FFFF,
+# which ``html.unescape`` shows as U+FFFD (a table character).
+_GATE_REFERENCE_EDGES = _GATE_UNICODE_EDGES + (0x110000,)
+
+
+def _references_name_only_table_code_points(text: str) -> bool:
+    """Whether every numeric reference in ``text`` names a code point of the
+    gate's table, or one past U+10FFFF.
+
+    Task 3172 (timing): decoding each of 22,000 distinct spellings with
+    ``html.unescape`` cost a 200 KB review 0.09 s. A reference to a table
+    code point decodes to table characters (U+FFFD for NUL and a surrogate,
+    Windows-1252 for a C1 control, nothing for a control or noncharacter
+    html drops, the character itself otherwise), so a review whose
+    references all name one needs no decoding. A digit run longer than any
+    code point's is past U+10FFFF without int()."""
+    code_points = {
+        int(digits) for digits in set(_GATE_DECIMAL_REFERENCE_RE.findall(text))
+        if len(digits) <= _BACKSTOP_MAX_DECIMAL_DIGITS
+    }
+    code_points.update(
+        int(digits, 16)
+        for digits in set(_GATE_HEX_REFERENCE_RE.findall(text))
+        if len(digits) <= _BACKSTOP_MAX_HEX_DIGITS
+    )
+    # In the table when an odd number of edges are at or below it; map keeps
+    # the per-code-point loop in C.
+    edges_at_or_below = map(bisect.bisect_right,
+                            itertools.repeat(_GATE_REFERENCE_EDGES), code_points)
+    return all(map(operator.mod, edges_at_or_below, itertools.repeat(2)))
+
+
+def _character_outside_gate_unicode_data(
+        text: str, characters: set[str] | None) -> str | None:
+    """Why the gate does not parse ``text``, or None when it reads every
+    character the same way on every interpreter.
+
+    ``characters`` is ``set(text)``, or None for an ASCII text. Names the
+    first character outside the table as ``"U+A7F2 at line 3"``, or a
+    numeric reference that decodes to one as ``"U+A7F2 reference at line
+    3"`` (every line-break form counts as one break), whichever comes first.
+    On an interpreter older than the table, the first non-ASCII character
+    (or reference to one) is named, with the interpreter's version. Reads
+    only the checked-in table, never the interpreter's Unicode data."""
+    current = _gate_unicode_data_is_current()
+
+    def outside(char: str) -> bool:
+        if current:
+            return not _in_gate_unicode_table(char)
+        return not char.isascii()
+
+    found: list[tuple[int, int, str]] = []
+    if characters:
+        unread = [char for char in characters if outside(char)]
+        if unread:
+            position = min(text.index(char) for char in unread)
+            found.append((position, ord(text[position]), ""))
+    if "&#" in text and not (
+            current and _references_name_only_table_code_points(text)):
+        # Distinct spellings first: a flood of one reference decodes once.
+        unread_spellings = {
+            spelling
+            for spelling in set(_GATE_NUMERIC_REFERENCE_RE.findall(text))
+            if any(outside(char) for char in _reference_decoded(*spelling))
+        }
+        for match in (_GATE_NUMERIC_REFERENCE_RE.finditer(text)
+                      if unread_spellings else ()):
+            # findall gives "" for the group that did not take part.
+            spelling = match.groups("")
+            if spelling in unread_spellings:
+                decoded = _reference_decoded(*spelling)
+                code_point = ord(next(char for char in decoded
+                                      if outside(char)))
+                found.append((match.start(), code_point, " reference"))
+                break
+    if not found:
+        return None
+    position, code_point, kind = min(found)
+    line = len(_ANY_LINE_BREAK_RE.findall(text, 0, position)) + 1
+    named = f"U+{code_point:04X}{kind} at line {line}"
+    if not current:
+        table_version = ".".join(map(str, _GATE_UNICODE_DATA_VERSION))
+        return (f"{named}: the interpreter's Unicode data "
+                f"{unicodedata.unidata_version} predates {table_version}")
+    return named
+
+
 REVIEW_VERDICT_OK = "ok"
 REVIEW_VERDICT_MISSING = "missing"
 REVIEW_VERDICT_FALLBACK = "fallback"
@@ -2173,6 +2463,27 @@ def _shape_candidates(
 # line: a blockquote ">" or a list bullet / number with its spaces.
 _CONTAINER_MARKER_RE = re.compile(r">[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]{1,4}")
 _THEMATIC_BREAK_RE = re.compile(r"[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
+# Task 3172 (timing): the run of container markers at a position, each
+# where the one before it ended (empty when none is there). Nothing follows
+# the loop, so committing to each pass loses no match (_committed_loop).
+_CONTAINER_MARKER_RUN_RE = re.compile(
+    _committed_loop(_CONTAINER_MARKER_RE.pattern),
+)
+_MATCH_END = operator.methodcaller("end")
+
+
+def _container_markers(text: str, start: int) -> Iterator[re.Match[str]]:
+    """The container markers of the run at ``start``: what matching
+    _CONTAINER_MARKER_RE again where the last match ended finds, in order.
+
+    Task 3172 (timing): one match finds the run's end and finditer reads its
+    markers in C, so 100,000 nested "- " markers take no Python step each
+    (the 200 KB list_markers family sat at 0.45 s of its 0.5 s budget on
+    Python 3.10). Inside the run each marker starts where the one before it
+    ended, so finditer finds exactly the markers the repeated match does.
+    """
+    run_end = _CONTAINER_MARKER_RUN_RE.match(text, start).end()
+    return _CONTAINER_MARKER_RE.finditer(text, start, run_end)
 
 
 def _innermost_container_line(line: str) -> str:
@@ -2195,8 +2506,12 @@ def _innermost_container_line(line: str) -> str:
     innermost = _CONTAINER_MARKER_RE.match(line, first.end())
     if innermost is None or _THEMATIC_BREAK_RE.fullmatch(line):
         return line
-    while (inner := _CONTAINER_MARKER_RE.match(line, innermost.end())) is not None:
-        innermost = inner
+    inner = _CONTAINER_MARKER_RE.match(line, innermost.end())
+    if inner is not None:
+        # A deeper run: its markers are read in C (_container_markers) and
+        # a one-slot deque keeps the last.
+        innermost = deque(_container_markers(line, inner.start()),
+                          maxlen=1)[0]
     content = line[innermost.end():]
     if not content.strip():
         return line
@@ -2660,8 +2975,9 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
         ):
             continue  # a continuation line of the paragraph above
         blocks.breaks.add(index)
-        while item_columns and indent < item_columns[-1]:
-            item_columns.pop()
+        # Each column pushed is past the one before it, so the items this
+        # line ends (content column past its indent) are a tail of the list.
+        del item_columns[bisect.bisect_right(item_columns, indent):]
         base = item_columns[-1] if item_columns else 0
         relative = indent - base
         # An HTML block of type 7 cannot interrupt a paragraph.
@@ -2711,15 +3027,24 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                 # GFM: a footnote's later paragraphs are indented 4 columns,
                 # like a list item's ("[^1]: x" / "" / "    HIGH: SQLi").
                 item_columns.append(base + 4)
-        position = markers = 0
+        marker_ends: list[int] = []
         quoted = False
-        while (marker := _CONTAINER_MARKER_RE.match(content, position)) is not None:
-            position = marker.end()
-            markers += 1
-            if marker.group(0).startswith(">"):
-                quoted = True
-            elif not quoted and footnote is None:
-                item_columns.append(base + relative + position)
+        if _CONTAINER_MARKER_RE.match(content) is not None:
+            marker_ends = list(map(_MATCH_END,
+                                   _container_markers(content, 0)))
+            # Only a quote marker holds ">". Each list marker before the
+            # first one opens a list item at the column where the marker
+            # ends; one inside a quote opens none here.
+            first_quote = content.find(">", 0, marker_ends[-1])
+            quoted = first_quote != -1
+            if footnote is None:
+                opened = (bisect.bisect_right(marker_ends, first_quote)
+                          if quoted else len(marker_ends))
+                item_columns.extend(map(operator.add,
+                                        itertools.repeat(base + relative),
+                                        itertools.islice(marker_ends, opened)))
+        markers = len(marker_ends)
+        position = marker_ends[-1] if marker_ends else 0
         rest = content[position:]
         if footnote is None and rest.startswith("[^"):
             # A footnote inside a quote or list item ("> [^1]: HIGH: SQLi")
@@ -3152,6 +3477,13 @@ _BACKSTOP_NEW_FOLD_RE = re.compile(
 # (_backstop_mark_separates); any other neighbour leaves the word glued.
 _BACKSTOP_MARKED_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {
     _BACKSTOP_GLUE_MARK, _BACKSTOP_GONE_MARK}
+# Task 3172 (timing): a neighbour that makes a word of the separated reading
+# its own with no GONE run to walk (_backstop_mark_separates).
+_BACKSTOP_SEPARATING_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {_BACKSTOP_GLUE_MARK}
+# A character before a word that glues it to the text before, in the views
+# other than the separated reading: an ASCII letter or digit, or a
+# lookalike's FOLD or NEW_FOLD mark (task 3157).
+_BACKSTOP_GLUING_BEFORE = _BACKSTOP_ASCII_ALNUM | _BACKSTOP_FOLD_MARKS
 # A private-use character as written becomes another one, so no mark is
 # ever read from the review itself.
 _BACKSTOP_FOREIGN_MARK = ""
@@ -4148,6 +4480,17 @@ def _backstop_severity(word: str) -> str:
     return _BACKSTOP_SEVERITY_BY_INITIAL[chr(initial)]
 
 
+# Task 3172 (timing): _backstop_severity of every character a token can
+# begin with (C, H or M, or the FOLD or NEW_FOLD mark of one), looked up
+# instead of computed for each word.
+_BACKSTOP_SEVERITY_BY_FIRST_CHARACTER = {
+    first: _backstop_severity(first)
+    for initial in _BACKSTOP_SEVERITY_BY_INITIAL
+    for first in (initial, chr(_BACKSTOP_FOLD_MARK + ord(initial)),
+                  chr(_BACKSTOP_NEW_FOLD_MARK + ord(initial)))
+}
+
+
 def _backstop_tokens(
     view: str, origins: list[int] | None, *, separated: bool = False,
 ) -> dict[tuple[int, str], int]:
@@ -4158,44 +4501,53 @@ def _backstop_tokens(
     With ``separated`` the view is one of the separated reading
     (_backstop_separated_text), whose marks may sit inside a word, and only
     the words it adds are counted (_backstop_separated_counts).
+
+    Task 3172 (timing): a word costs no Python call unless a GONE run sits
+    next to it. The words counted are numbered and tallied in C at the end
+    (a 200 KB flood of marked words took 0.14 s of its 0.5 s gate budget on
+    Python 3.10).
     """
-    found: dict[tuple[int, str], int] = {}
-    newlines: list[int] | None = None
     token_re = (_BACKSTOP_SEPARATED_TOKEN_RE if separated
                 else _BACKSTOP_TOKEN_RE)
+    # A lookalike's FOLD mark before the word glues it as the letter did;
+    # in the separated reading a mark separates (task 3157).
+    gluing = _BACKSTOP_ASCII_ALNUM if separated else _BACKSTOP_GLUING_BEFORE
     # Task 3164 (R3161-02): one search of the view instead of one per word.
     new_folds = separated and _BACKSTOP_NEW_FOLD_RE.search(view) is not None
+    starts: list[int] = []
     for match in token_re.finditer(view):
         start, end = match.span()
-        # A lookalike's FOLD mark before the word glues it as the letter
-        # did; in the separated reading a mark separates (task 3157).
-        if start and (view[start - 1] in _BACKSTOP_ASCII_ALNUM
-                      or (not separated
-                          and view[start - 1] in _BACKSTOP_FOLD_MARKS)):
+        if start and view[start - 1] in gluing:
             continue
-        if separated:
-            # Task 3169 (timing): most words have no mark on either side,
-            # and then only a NEW_FOLD mark in the word adds it (what
-            # _backstop_separated_counts decides, without its calls).
-            if (view[start - 1:start] in _BACKSTOP_MARKED_NEIGHBOURS
-                    or view[end:end + 1] in _BACKSTOP_MARKED_NEIGHBOURS):
-                if not _backstop_separated_counts(
-                    match.group(0), view, start, end, new_folds=new_folds,
-                ):
-                    continue
-            elif not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
-                    match.group(0)) is not None):
+        if separated and not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
+                view, start, end) is not None):
+            # What _backstop_separated_counts decides, without its calls
+            # (tasks 3169 and 3172): most words have no mark on either side
+            # and are not added; a GLUE or lookalike mark next to the word
+            # adds it; a GONE run is walked only where one is.
+            before = view[start - 1:start]
+            after = view[end:end + 1]
+            if (before not in _BACKSTOP_MARKED_NEIGHBOURS
+                    and after not in _BACKSTOP_MARKED_NEIGHBOURS):
                 continue
-        if newlines is None:
-            newlines = [line_break.start()
-                        for line_break in _NEWLINE_RE.finditer(view)]
-        severity = _backstop_severity(match.group(0))
-        line = bisect.bisect_left(newlines, start)
-        if origins is not None:
-            line = origins[line]
-        key = (line, severity)
-        found[key] = found.get(key, 0) + 1
-    return found
+            if not (before in _BACKSTOP_SEPARATING_NEIGHBOURS
+                    or after in _BACKSTOP_SEPARATING_NEIGHBOURS
+                    or (before == _BACKSTOP_GONE_MARK
+                        and _backstop_mark_separates(view, start - 1, -1))
+                    or (after == _BACKSTOP_GONE_MARK
+                        and _backstop_mark_separates(view, end, 1))):
+                continue
+        starts.append(start)
+    if not starts:
+        return {}
+    newlines = [line_break.start()
+                for line_break in _NEWLINE_RE.finditer(view)]
+    lines = map(bisect.bisect_left, itertools.repeat(newlines), starts)
+    if origins is not None:
+        lines = map(origins.__getitem__, lines)
+    severities = map(_BACKSTOP_SEVERITY_BY_FIRST_CHARACTER.__getitem__,
+                     map(view.__getitem__, starts))
+    return Counter(zip(lines, severities))
 
 
 def _blank_like(match: re.Match[str]) -> str:
@@ -4495,11 +4847,25 @@ def _analyze_review_file(
             detail=f"{REVIEW_BIDI_REASON}: {bidi} (name the character, "
                    f"never paste it)",
         )
-    if not text.isascii() and len(set(text)) > _REVIEW_MAX_DISTINCT_CHARACTERS:
+    characters = None
+    if not text.isascii():
+        characters = set(text)
+        if len(characters) > _REVIEW_MAX_DISTINCT_CHARACTERS:
+            return ReviewCountAnalysis(
+                verdict=REVIEW_VERDICT_INCOMPLETE,
+                detail=(f"review too varied to parse: more than "
+                        f"{_REVIEW_MAX_DISTINCT_CHARACTERS} distinct "
+                        f"characters"),
+            )
+    # Task 3172 (R3169-01): before anything reads the interpreter's Unicode
+    # data, which differs between interpreters. A character reference is
+    # decoded into the rendered views, so it counts as its character.
+    outside = _character_outside_gate_unicode_data(text, characters)
+    if outside is not None:
         return ReviewCountAnalysis(
             verdict=REVIEW_VERDICT_INCOMPLETE,
-            detail=(f"review too varied to parse: more than "
-                    f"{_REVIEW_MAX_DISTINCT_CHARACTERS} distinct characters"),
+            detail=(f"{REVIEW_UNICODE_DATA_REASON}: {outside} (name the "
+                    f"character, never paste it)"),
         )
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
