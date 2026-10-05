@@ -1861,25 +1861,76 @@ def _in_gate_unicode_table(char: str) -> bool:
     return bisect.bisect_right(_GATE_UNICODE_EDGES, ord(char)) % 2 == 1
 
 
-def _character_outside_gate_unicode_data(text: str,
-                                         characters: set[str]) -> str | None:
+# Every numeric character reference the gate's views decode (see
+# _BACKSTOP_REFERENCE_RE: any digit count, with or without the ";"); a
+# group holds its digits without most leading zeros. Every named reference
+# decodes to characters of the table (tests/test_review_gate_unicode_data_
+# 3172.py checks html5 on each interpreter).
+_GATE_NUMERIC_REFERENCE_RE = re.compile(
+    r"&#(?:0*([0-9]+)|[xX]0*([0-9A-Fa-f]+))",
+)
+
+
+def _reference_decoded(decimal: str, hexadecimal: str) -> str:
+    """A numeric reference _GATE_NUMERIC_REFERENCE_RE found, as
+    ``html.unescape`` decodes it; one past U+10FFFF is U+FFFD without
+    int(), as in _backstop_decoded_spelling."""
+    if decimal:
+        if len(decimal) > _BACKSTOP_MAX_DECIMAL_DIGITS:
+            return "\N{REPLACEMENT CHARACTER}"
+        return html.unescape(f"&#{int(decimal)};")
+    if len(hexadecimal) > _BACKSTOP_MAX_HEX_DIGITS:
+        return "\N{REPLACEMENT CHARACTER}"
+    return html.unescape(f"&#x{hexadecimal};")
+
+
+def _character_outside_gate_unicode_data(
+        text: str, characters: set[str] | None) -> str | None:
     """Why the gate does not parse ``text``, or None when it reads every
     character the same way on every interpreter.
 
-    ``characters`` is ``set(text)``. Names the first character outside the
-    table as ``"U+A7F2 at line 3"`` (every line-break form counts as one
-    break). On an interpreter older than the table, the first non-ASCII
-    character is named instead, with the interpreter's version. Reads only
-    the checked-in table, never the interpreter's Unicode data."""
+    ``characters`` is ``set(text)``, or None for an ASCII text. Names the
+    first character outside the table as ``"U+A7F2 at line 3"``, or a
+    numeric reference that decodes to one as ``"U+A7F2 reference at line
+    3"`` (every line-break form counts as one break), whichever comes first.
+    On an interpreter older than the table, the first non-ASCII character
+    (or reference to one) is named, with the interpreter's version. Reads
+    only the checked-in table, never the interpreter's Unicode data."""
     current = _gate_unicode_data_is_current()
-    outside = [char for char in characters
-               if (not char.isascii() if not current
-                   else not _in_gate_unicode_table(char))]
-    if not outside:
+
+    def outside(char: str) -> bool:
+        if current:
+            return not _in_gate_unicode_table(char)
+        return not char.isascii()
+
+    found: list[tuple[int, int, str]] = []
+    if characters:
+        unread = [char for char in characters if outside(char)]
+        if unread:
+            position = min(text.index(char) for char in unread)
+            found.append((position, ord(text[position]), ""))
+    if "&#" in text:
+        # Distinct spellings first: a flood of one reference decodes once.
+        unread_spellings = {
+            spelling
+            for spelling in set(_GATE_NUMERIC_REFERENCE_RE.findall(text))
+            if any(outside(char) for char in _reference_decoded(*spelling))
+        }
+        for match in (_GATE_NUMERIC_REFERENCE_RE.finditer(text)
+                      if unread_spellings else ()):
+            # findall gives "" for the group that did not take part.
+            spelling = match.groups("")
+            if spelling in unread_spellings:
+                decoded = _reference_decoded(*spelling)
+                code_point = ord(next(char for char in decoded
+                                      if outside(char)))
+                found.append((match.start(), code_point, " reference"))
+                break
+    if not found:
         return None
-    position = min(text.index(char) for char in outside)
+    position, code_point, kind = min(found)
     line = len(_ANY_LINE_BREAK_RE.findall(text, 0, position)) + 1
-    named = f"U+{ord(text[position]):04X} at line {line}"
+    named = f"U+{code_point:04X}{kind} at line {line}"
     if not current:
         table_version = ".".join(map(str, _GATE_UNICODE_DATA_VERSION))
         return (f"{named}: the interpreter's Unicode data "
@@ -4694,6 +4745,7 @@ def _analyze_review_file(
             detail=f"{REVIEW_BIDI_REASON}: {bidi} (name the character, "
                    f"never paste it)",
         )
+    characters = None
     if not text.isascii():
         characters = set(text)
         if len(characters) > _REVIEW_MAX_DISTINCT_CHARACTERS:
@@ -4703,15 +4755,16 @@ def _analyze_review_file(
                         f"{_REVIEW_MAX_DISTINCT_CHARACTERS} distinct "
                         f"characters"),
             )
-        # Task 3172 (R3169-01): before anything reads the interpreter's
-        # Unicode data, which differs between interpreters.
-        outside = _character_outside_gate_unicode_data(text, characters)
-        if outside is not None:
-            return ReviewCountAnalysis(
-                verdict=REVIEW_VERDICT_INCOMPLETE,
-                detail=(f"{REVIEW_UNICODE_DATA_REASON}: {outside} (name the "
-                        f"character, never paste it)"),
-            )
+    # Task 3172 (R3169-01): before anything reads the interpreter's Unicode
+    # data, which differs between interpreters. A character reference is
+    # decoded into the rendered views, so it counts as its character.
+    outside = _character_outside_gate_unicode_data(text, characters)
+    if outside is not None:
+        return ReviewCountAnalysis(
+            verdict=REVIEW_VERDICT_INCOMPLETE,
+            detail=(f"{REVIEW_UNICODE_DATA_REASON}: {outside} (name the "
+                    f"character, never paste it)"),
+        )
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised
