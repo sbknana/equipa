@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from equipa import agent_launcher, isolation
+from tests.host_timing import assert_linear_time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _GIT = shutil.which("git") or "/usr/bin/git"
@@ -151,18 +152,24 @@ def _finishes_within(seconds: float, action) -> tuple[bool, BaseException | None
 
 def test_a_one_megabyte_link_target_is_refused_in_under_0_2_seconds(
         repo: dict[str, Path], tmp_path: Path) -> None:
+    """Budget host-calibrated, growth from a 256 KiB target linear (task
+    3171)."""
     worktree = repo["worktree"]
-    target = b"a/" * (512 * 1024)                     # 1 MiB of components
-    state = _commit_with_links(worktree, tmp_path, {"docs/long": target})
     info = isolation.describe_worktree(str(worktree))
-    started = time.perf_counter()
-    finished, error = _finishes_within(
-        5.0, lambda: isolation.check_imported_links(info, state, ()))
-    elapsed = time.perf_counter() - started
-    assert finished, "the link check of a 1 MiB target did not finish in 5 s"
-    assert isinstance(error, isolation.AgentIsolationError)
-    assert "limit 4095" in str(error)
-    assert elapsed < 0.2, f"refusing a 1 MiB link target took {elapsed:.2f}s"
+
+    def seconds_at(size: int) -> float:
+        target = b"a/" * (size // 2)                  # SIZE bytes of components
+        state = _commit_with_links(worktree, tmp_path, {"docs/long": target})
+        started = time.perf_counter()
+        finished, error = _finishes_within(
+            5.0, lambda: isolation.check_imported_links(info, state, ()))
+        elapsed = time.perf_counter() - started
+        assert finished, f"the link check of a {size}-byte target did not finish in 5 s"
+        assert isinstance(error, isolation.AgentIsolationError)
+        assert "limit 4095" in str(error)
+        return elapsed
+
+    assert_linear_time(seconds_at, 1024 * 1024, 0.2, "refusing a 1 MiB link target")
 
 
 def test_a_link_target_longer_than_path_max_is_refused(
@@ -232,27 +239,32 @@ def test_walk_budget_spans_every_link_of_the_check(
 
 def test_trie_walk_is_linear_in_the_directory_depth() -> None:
     """A link deep in the tree, reached through a target that walks down
-    its whole directory chain: each component is one lookup."""
-    depth = 1000
-    deep = "/".join(["d"] * depth)
-    # l, at the bottom of the chain, points back up to the tree root.
-    links = {f"{deep}/l": "../" * depth, "start": "x"}
-    trie = isolation._LinkTrie.build(links)
-    calls: list[str] = []
+    its whole directory chain: each component is one lookup. Budget
+    host-calibrated, growth from a depth of 250 linear (task 3171)."""
+    def seconds_at(depth: int) -> float:
+        deep = "/".join(["d"] * depth)
+        # l, at the bottom of the chain, points back up to the tree root.
+        links = {f"{deep}/l": "../" * depth, "start": "x"}
+        trie = isolation._LinkTrie.build(links)
+        calls: list[str] = []
 
-    def lookup(path: str) -> str | None:
-        calls.append(path)
-        return links.get(path)
+        def lookup(path: str) -> str | None:
+            calls.append(path)
+            return links.get(path)
 
-    # CPU time: under `pytest -n auto` a wall clock also counts the time this
-    # worker waits for a core (task 3160).
-    started = time.process_time()
-    assert not isolation._link_escapes("start", f"{deep}/l/README", lookup,
+        # CPU time: under `pytest -n auto` a wall clock also counts the time
+        # this worker waits for a core (task 3160).
+        started = time.process_time()
+        assert not isolation._link_escapes("start", f"{deep}/l/README",
+                                           lookup, links=trie)
+        assert isolation._link_escapes("start", f"{deep}/l/..", lookup,
                                        links=trie)
-    assert isolation._link_escapes("start", f"{deep}/l/..", lookup, links=trie)
-    assert time.process_time() - started < 0.05
-    # Only real links are looked up by path.
-    assert calls == [f"{deep}/l", f"{deep}/l"]
+        elapsed = time.process_time() - started
+        # Only real links are looked up by path.
+        assert calls == [f"{deep}/l", f"{deep}/l"]
+        return elapsed
+
+    assert_linear_time(seconds_at, 1000, 0.05, "trie walk")
 
 
 def test_import_check_walks_every_link_through_the_trie(
