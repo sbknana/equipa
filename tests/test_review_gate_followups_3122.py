@@ -17,7 +17,11 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_production import production_seconds
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+    production_seconds,
+)
 from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
@@ -49,8 +53,14 @@ def analyze(text: str) -> loops.ReviewCountAnalysis:
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
 
 
+def blocked(text: str) -> loops.ReviewCountAnalysis:
+    """The parser's analysis of a review the merge gate blocks (task 3170,
+    IR67-02: every must-block case decides through the gate)."""
+    return blocked_by_the_gate(text, nonce=NONCE)
+
+
 def assert_blocks_behind_zero_footer(body: list[str]) -> None:
-    analysis = analyze(review("No findings.", body, ZERO, low_heading=False))
+    analysis = blocked(review("No findings.", body, ZERO, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         body, analysis.detail)
 
@@ -79,10 +89,25 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         for line in body
     ])
     if any(SEVERITY_TOKEN.search(line) for line in body):
-        analysis = analyze(review("1 finding.", body, ONE_LOW, low_heading=True))
-        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
-            body, analysis.detail)
+        assert_only_the_backstop_blocks(body)
+
+
+def assert_only_the_backstop_blocks(body: list[str]) -> None:
+    """The merge gate blocks ``body`` next to a counted LOW finding (task
+    3170, IR67-02): the rules trusted it (the backstop runs only then) and
+    the severity-token backstop blocked it."""
+    analysis = blocked(review("1 finding.", body, ONE_LOW, low_heading=True))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
+        body, analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks([AS_WRITTEN_ONLY_FINDINGS[finding]])
 
 
 # --- 1. trailing-severity list items -----------------------------------------
@@ -229,8 +254,8 @@ def test_upper_case_alias_counts_mid_sentence(line):
 ])
 def test_one_finding_is_counted_once_in_the_mismatch_detail(line):
     """A line several rules see still reports one finding, not two."""
-    analysis = analyze(review("No findings.", ["## Findings", "", line], ZERO,
-                             low_heading=False))
+    analysis = blocked(review("No findings.", ["## Findings", "", line], ZERO,
+                              low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
     assert analysis.detail.endswith("HIGH=1"), analysis.detail
 
@@ -299,12 +324,14 @@ def test_shape_counted_by_the_footer_merges_with_that_count(line):
     Those rows blocked the merge before too, by HIGH=1; now the review is
     not trusted. Title-case shapes are still counted by the footer.
     """
-    analysis = analyze(review("1 finding.", ["## Findings", "", line],
-                             ONE_HIGH, low_heading=False))
+    text = review("1 finding.", ["## Findings", "", line], ONE_HIGH,
+                  low_heading=False)
     if SEVERITY_TOKEN.search(line):
+        analysis = blocked(text)
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, line
         assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         return
+    analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, (line, analysis.detail)
     assert analysis.counts["HIGH"] == 1
 
@@ -325,15 +352,15 @@ def test_count_findings_returns_none_behind_zero_footer(line, monkeypatch):
 
 @pytest.mark.parametrize("line", COUNTED_SHAPES)
 def test_shape_after_the_footer_is_an_incomplete_review(line):
-    analysis = analyze(review("1 finding.", ["## Findings", "", line],
-                             ONE_HIGH, low_heading=False,
-                             after_footer=["", line]))
+    analysis = blocked(review("1 finding.", ["## Findings", "", line],
+                              ONE_HIGH, low_heading=False,
+                              after_footer=["", line]))
     assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, (
         line, analysis.detail)
 
 
 def test_unfinished_summary_still_blocks_with_counted_shape():
-    analysis = analyze(review(
+    analysis = blocked(review(
         "IN PROGRESS - initial skeleton",
         ["## Findings", "", "- SQL injection in the search endpoint - HIGH"],
         ONE_HIGH, low_heading=False))
