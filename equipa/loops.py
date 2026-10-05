@@ -3037,6 +3037,11 @@ _BACKSTOP_FOLD_MARKS = frozenset(
 )
 _BACKSTOP_NEW_FOLD_RE = re.compile(
     f"[{chr(_BACKSTOP_NEW_FOLD_MARK)}-{chr(_BACKSTOP_NEW_FOLD_MARK + 0xFF)}]")
+# A neighbour that can make a word of the separated reading its own (a GLUE
+# or lookalike mark), or begins a run of GONE marks to walk
+# (_backstop_mark_separates); any other neighbour leaves the word glued.
+_BACKSTOP_MARKED_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {
+    _BACKSTOP_GLUE_MARK, _BACKSTOP_GONE_MARK}
 # A private-use character as written becomes another one, so no mark is
 # ever read from the review itself.
 _BACKSTOP_FOREIGN_MARK = ""
@@ -3758,6 +3763,8 @@ class _LinkTails:
 
     def __init__(self, view: str) -> None:
         self.view = view
+        # An inline tail ends at a ")": a "(" after the last one opens none.
+        self.last_close_parenthesis = view.rfind(")")
         self._parentheses: list[int] | None = None
         self._partners: list[int] = []
         self._depths: list[int] = []
@@ -3839,7 +3846,8 @@ class _LinkTails:
         holds), so a rejected "]" after a long run of text costs nothing.
         """
         view = self.view
-        if view.startswith("(", position):
+        if (position < self.last_close_parenthesis
+                and view.startswith("(", position)):
             start = _LINK_TAIL_START_RE.match(view, position).end()
             destination_end = self._destination_end(start)
             if destination_end is not None:
@@ -3890,8 +3898,18 @@ def _backstop_link_reading(
     is kept in a running index, and each stretch of the view is searched for
     "[" once; rescanning back to the last link for every "]" that formed
     none was quadratic (23 s on 200 KB of "a[" and "b]").
+
+    Task 3169 (timing on Python 3.10): two runs of closes that cannot form
+    a link are passed over without reading each. With no label defined,
+    only an inline tail makes a link, and it ends at a ")": once no ")"
+    follows, no close does. With labels, a bare "]" (no "(" or "[" after
+    it) is a link only when its text names a label; when it cannot (no "["
+    before it and no empty label, or a text longer than any label), no bare
+    "]" before the next "[" can either, since each has that text or a longer
+    one (_link_reader_resume).
     """
     closes = _LINK_ANY_CLOSE_RE if labels else _LINK_CLOSE_RE
+    empty_label_defined = "" in labels
     kept: list[str] = []
     joined_spans: list[tuple[int, int]] = []
     copied = searched = 0
@@ -3899,20 +3917,29 @@ def _backstop_link_reading(
     scanned = 0
     saw_image = False
     while (close := closes.search(view, searched)) is not None:
-        bracket = close.end() - 1
+        close_end = close.end()
+        if not labels and close_end >= tails.last_close_parenthesis:
+            break
+        bracket = close_end - 1
         found = view.rfind("[", scanned, bracket)
         if found >= 0:
             last_open = found
-        scanned = max(scanned, bracket)
+        if bracket > scanned:
+            scanned = bracket
         image = view.startswith("!", close.start())
         if image:
             opener = close.start() + 1
         else:
             opener = last_open if last_open >= copied else -1
         text_span = (opener + 1, bracket) if opener >= 0 else (bracket, bracket)
-        end = tails.end(close.end(), text_span, labels)
+        end = tails.end(close_end, text_span, labels)
         if end is None:
-            searched = close.end()
+            searched = close_end
+            if (labels and not image
+                    and view[close_end:close_end + 1] not in ("(", "[")
+                    and (bracket - text_span[0] > _LINK_LABEL_LIMIT
+                         or (opener < 0 and not empty_label_defined))):
+                searched = _link_reader_resume(view, close_end)
             continue
         text = view[text_span[0]:text_span[1]]
         if image:
@@ -3935,6 +3962,26 @@ def _backstop_link_reading(
     origins = (_backstop_line_origins(view, joined_spans)
                if joined_spans else None)
     return _backstop_split_words_joined("".join(kept)), origins, saw_image
+
+
+def _link_reader_resume(view: str, position: int) -> int:
+    """Where the link reader resumes when no bare "]" from ``position`` up to
+    the next "[" forms a link: at the first close that can still form one
+    before it (a "]" with "(" or "[" after it, or an image), else at that
+    "[" (or the end of ``view``).
+
+    An image starts with "![", so the only one that can start before the
+    next "[" starts right before it: the search stops at that "[" (it may
+    still see it after a "]"), and the reader resumes one character early
+    to read such an image whole."""
+    next_open = view.find("[", position)
+    search_end = len(view) if next_open < 0 else next_open + 1
+    close = _LINK_CLOSE_RE.search(view, position, search_end)
+    if close is not None:
+        return close.start()
+    if next_open < 0:
+        return len(view)
+    return max(position, next_open - 1)
 
 
 def _backstop_links_read(view: str) -> list[tuple[str, list[int] | None]]:
@@ -3998,10 +4045,19 @@ def _backstop_tokens(
                       or (not separated
                           and view[start - 1] in _BACKSTOP_FOLD_MARKS)):
             continue
-        if separated and not _backstop_separated_counts(
-            match.group(0), view, start, end, new_folds=new_folds,
-        ):
-            continue
+        if separated:
+            # Task 3169 (timing): most words have no mark on either side,
+            # and then only a NEW_FOLD mark in the word adds it (what
+            # _backstop_separated_counts decides, without its calls).
+            if (view[start - 1:start] in _BACKSTOP_MARKED_NEIGHBOURS
+                    or view[end:end + 1] in _BACKSTOP_MARKED_NEIGHBOURS):
+                if not _backstop_separated_counts(
+                    match.group(0), view, start, end, new_folds=new_folds,
+                ):
+                    continue
+            elif not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
+                    match.group(0)) is not None):
+                continue
         if newlines is None:
             newlines = [line_break.start()
                         for line_break in _NEWLINE_RE.finditer(view)]
