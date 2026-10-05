@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import ast
 import math
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -24,9 +27,13 @@ from tests.host_timing import (
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
+    MAX_GROWTH_REPETITIONS,
+    MAX_HOST_FACTOR,
     REFERENCE_SECONDS,
     HostCalibration,
     HostFactorError,
+    HostTooSlowError,
+    TimingCheckFailed,
     assert_linear_time,
     assert_linear_times,
     budget,
@@ -34,6 +41,33 @@ from tests.host_timing import (
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
+# The session's calibration, before the fixture below replaces it.
+SESSION_CALIBRATION = host_timing.host_calibration
+
+
+def _force_factor(monkeypatch, factor: float) -> None:
+    """Every measurement scaled by ``factor``, as EQUIPA_TIMING_HOST_FACTOR
+    would force it, without running the reference workload."""
+    calibration = HostCalibration(factor=factor, measured_seconds=None,
+                                  forced=True)
+    monkeypatch.setattr(host_timing, "host_calibration", lambda: calibration)
+
+
+def _measure_load(monkeypatch, *factors: float) -> list[str]:
+    """Each reference run of the next measurements takes ``factors[i]``
+    times the development host's time, in turn; returns the log of calls."""
+    measured = HostCalibration(factor=1.0, measured_seconds=REFERENCE_SECONDS,
+                               forced=False)
+    monkeypatch.setattr(host_timing, "host_calibration", lambda: measured)
+    pending = list(factors)
+    log: list[str] = []
+
+    def samples(runs: int) -> list[float]:
+        log.append(f"reference x{runs}")
+        return [pending.pop(0) * REFERENCE_SECONDS for _ in range(runs)]
+
+    monkeypatch.setattr(host_timing, "reference_samples", samples)
+    return log
 
 
 @pytest.fixture(autouse=True)
@@ -41,9 +75,9 @@ def _development_host_speed(monkeypatch):
     """The model tests below time fake work against budgets set for the
     development host: the session's factor (measured on a slow runner, or
     forced by EQUIPA_TIMING_HOST_FACTOR) must not decide whether a model
-    meant to go over budget does. A test that needs another factor patches
-    ``host_factor`` itself; ``host_calibration`` is left unpatched."""
-    monkeypatch.setattr(host_timing, "host_factor", lambda: 1.0)
+    meant to go over budget does. A test that needs another factor or a
+    measured load patches the calibration itself."""
+    _force_factor(monkeypatch, 1.0)
 
 
 # --- The host factor ------------------------------------------------------------
@@ -67,11 +101,18 @@ def test_an_unset_or_blank_factor_is_measured(monkeypatch, raw):
     assert host_timing.forced_host_factor() is None
 
 
-@pytest.mark.parametrize("raw", ["fast", "0", "-1", "inf", "nan", "1e999"])
+@pytest.mark.parametrize("raw", ["fast", "0", "-1", "inf", "nan", "1e999",
+                                 "4.01", "100"])
 def test_a_malformed_factor_is_refused(monkeypatch, raw):
     monkeypatch.setenv(HOST_FACTOR_ENVIRONMENT_VARIABLE, raw)
     with pytest.raises(HostFactorError, match=HOST_FACTOR_ENVIRONMENT_VARIABLE):
         host_timing.forced_host_factor()
+
+
+def test_the_cap_itself_may_be_forced(monkeypatch):
+    assert MAX_HOST_FACTOR == 4.0
+    monkeypatch.setenv(HOST_FACTOR_ENVIRONMENT_VARIABLE, "4.0")
+    assert host_timing.forced_host_factor() == MAX_HOST_FACTOR
 
 
 def _calibrate(monkeypatch, measured: float) -> HostCalibration:
@@ -80,7 +121,7 @@ def _calibrate(monkeypatch, measured: float) -> HostCalibration:
     monkeypatch.delenv(HOST_FACTOR_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.setattr(host_timing, "measure_reference_seconds",
                         lambda: measured)
-    return host_timing.host_calibration.__wrapped__()
+    return SESSION_CALIBRATION.__wrapped__()
 
 
 def test_a_slower_host_loosens_every_budget(monkeypatch):
@@ -100,23 +141,137 @@ def test_a_forced_factor_replaces_the_measurement(monkeypatch):
 
     monkeypatch.setenv(HOST_FACTOR_ENVIRONMENT_VARIABLE, "0.5")
     monkeypatch.setattr(host_timing, "measure_reference_seconds", unexpected)
-    calibration = host_timing.host_calibration.__wrapped__()
+    monkeypatch.setattr(host_timing, "reference_samples", unexpected)
+    calibration = SESSION_CALIBRATION.__wrapped__()
     assert (calibration.factor, calibration.forced) == (0.5, True)
     assert HOST_FACTOR_ENVIRONMENT_VARIABLE in calibration.describe()
+    monkeypatch.setattr(host_timing, "host_calibration", lambda: calibration)
+    assert host_timing.measure_under_load(lambda: "work") == ("work", 0.5)
+    assert budget(1.0) == 0.5
 
 
 def test_the_session_factor_is_at_least_one_unless_forced():
-    calibration = host_timing.host_calibration()
+    calibration = SESSION_CALIBRATION()
     assert math.isfinite(calibration.factor) and calibration.factor > 0
     if not calibration.forced:
         assert calibration.factor >= 1.0
         assert calibration.measured_seconds > 0
+        assert f"capped at {MAX_HOST_FACTOR}" in calibration.describe()
+
+
+def test_a_session_start_over_the_cap_is_reported_not_refused(monkeypatch):
+    """The rest of the suite still runs on a very slow host; its timing
+    tests fail on their own measurements."""
+    calibration = _calibrate(monkeypatch, REFERENCE_SECONDS * 5)
+    assert calibration.factor == pytest.approx(5.0)
+    assert "OVER THE CAP" in calibration.describe()
 
 
 def test_budget_scales_by_the_host_factor(monkeypatch):
-    monkeypatch.setattr(host_timing, "host_factor", lambda: 2.0)
+    _force_factor(monkeypatch, 2.0)
     assert budget(0.5) == 1.0
     assert budget(0.2) == pytest.approx(0.4)
+
+
+# --- The factor is measured around each measurement (task 3175) ------------------
+
+
+def test_the_reference_runs_right_before_and_right_after_the_work(monkeypatch):
+    log = _measure_load(monkeypatch, 2.0, 2.0, 3.0, 3.0)
+
+    def work() -> str:
+        log.append("work")
+        return "result"
+
+    result, factor = host_timing.measure_under_load(work)
+    assert log == ["reference x2", "work", "reference x2"]
+    # The median of both sides: 2, 2, 3, 3.
+    assert (result, factor) == ("result", pytest.approx(2.5))
+
+
+def test_a_budget_is_scaled_by_the_load_the_measurement_ran_under(
+        monkeypatch):
+    """The session started on an idle host (factor 1.0); the workers then
+    loaded it so that the reference ran 1.5x slower around the work, and
+    the linear work 1.4x slower: it passes at the factor measured around
+    it, where the session-start factor would have failed it."""
+    _measure_load(monkeypatch, *[1.5] * 8)
+    timing = assert_linear_time(
+        lambda size: 0.7 if size == 40_000 else 0.175, 40_000, 0.5, "loaded")
+    assert timing.factor == pytest.approx(1.5)
+    assert timing.budget_seconds == pytest.approx(0.75)
+
+
+def test_linear_work_over_its_loaded_budget_still_fails(monkeypatch):
+    _measure_load(monkeypatch, *[1.5] * 8)
+    with pytest.raises(TimingCheckFailed, match="over the budget 0.7500 s"):
+        assert_linear_time(lambda size: 0.8 if size == 40_000 else 0.2,
+                           40_000, 0.5, "slow")
+
+
+def test_a_factor_over_the_cap_fails_loudly(monkeypatch):
+    """A budget loosened past the cap would hide a linear slowdown as
+    large; growth only sees superlinear work."""
+    _measure_load(monkeypatch, 4.5, 4.5, 4.5, 4.5)
+    with pytest.raises(HostTooSlowError, match="over the cap of 4.0x"):
+        assert_linear_time(lambda size: 0.001 * size / 40_000, 40_000, 0.5)
+    assert issubclass(HostTooSlowError, AssertionError)
+
+
+def test_the_cap_is_inclusive(monkeypatch):
+    _measure_load(monkeypatch, *[4.0] * 4)
+    assert host_timing.measure_under_load(lambda: None)[1] == MAX_HOST_FACTOR
+
+
+def test_a_faster_load_never_tightens_a_budget(monkeypatch):
+    _measure_load(monkeypatch, 0.5, 0.5, 0.5, 0.5)
+    assert host_timing.measure_under_load(lambda: None)[1] == 1.0
+
+
+def test_budget_reuses_a_recent_factor_and_measures_a_stale_one(monkeypatch):
+    log = _measure_load(monkeypatch, *[2.0] * 4)
+    monkeypatch.setattr(host_timing, "_last_load_factor",
+                        (time.monotonic(), 3.0))
+    assert budget(1.0) == 3.0
+    assert log == []
+    monkeypatch.setattr(host_timing, "_last_load_factor",
+                        (time.monotonic() - 10, 3.0))
+    assert budget(1.0) == pytest.approx(2.0)
+    assert log == ["reference x4"]
+    assert budget(0.5) == pytest.approx(1.0)
+    assert log == ["reference x4"]
+
+
+def test_the_checks_hold_under_python_optimize():
+    """IR71-01: ``python -O`` strips ``assert`` statements in modules pytest
+    does not rewrite; the helper's checks must still fail."""
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(TESTS_DIR.parent)!r})\n"
+        "from tests import host_timing\n"
+        "assert False, 'asserts run: not optimized'\n"
+        "failures = []\n"
+        "for name, seconds_at in [\n"
+        "        ('budget', lambda size: 1e-4 * size),\n"
+        "        ('growth', lambda size: 6.25e-10 * size ** 2)]:\n"
+        "    try:\n"
+        "        host_timing.assert_linear_time(seconds_at, 40_000, 2.0)\n"
+        "    except host_timing.TimingCheckFailed:\n"
+        "        failures.append(name)\n"
+        "try:\n"
+        "    host_timing.assert_linear_times(\n"
+        "        lambda size: {'part': 6.25e-10 * size ** 2}, 40_000, 2.0)\n"
+        "except host_timing.TimingCheckFailed:\n"
+        "    failures.append('parts')\n"
+        "print(','.join(failures))\n"
+    )
+    environment = {"PATH": "/usr/bin:/bin",
+                   HOST_FACTOR_ENVIRONMENT_VARIABLE: "1.0"}
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", script], capture_output=True, text=True,
+        env=environment, timeout=60, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "budget,growth,parts"
 
 
 def test_the_reference_workload_is_fixed_work():
@@ -144,8 +299,9 @@ def _model(per_unit: float, power: int, calls: list[int] | None = None):
 
 
 def test_linear_work_passes_and_reports_both_sizes():
+    # 0.04 s at the quarter size: over the floor, so each size runs once.
     calls: list[int] = []
-    timing = assert_linear_time(_model(1e-6, 1, calls), 40_000, 0.5, "lin")
+    timing = assert_linear_time(_model(4e-6, 1, calls), 40_000, 0.5, "lin")
     assert calls == [10_000, 40_000]
     assert (timing.small_size, timing.size) == (10_000, 40_000)
     assert timing.ratio == pytest.approx(4.0)
@@ -161,7 +317,7 @@ def test_quadratic_work_under_its_budget_still_fails_on_growth():
 def test_quadratic_work_fails_on_a_runner_forced_twice_as_slow(monkeypatch):
     """The factor loosens the budget, never the growth limit: the slow
     runner simulation must not hide a quadratic regression."""
-    monkeypatch.setattr(host_timing, "host_factor", lambda: 2.0)
+    _force_factor(monkeypatch, 2.0)
     with pytest.raises(AssertionError, match="superlinear growth"):
         assert_linear_time(_model(1e-9 / 1.6, 2), 40_000, 1.0, "quad")
 
@@ -191,15 +347,37 @@ def test_one_descheduled_run_is_measured_again():
 
 
 def test_work_below_the_floor_passes_the_growth_check():
-    # 0.0001 s and 0.01 s: 100x, but both are mostly clock noise.
+    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. Measured
+    # MAX_GROWTH_REPETITIONS times, the quarter size totals 3.2 ms and is
+    # still raised to the floor.
     timing = assert_linear_time(
-        lambda size: 0.0001 if size < 40_000 else 0.01, 40_000, 0.5, "tiny")
-    assert timing.ratio == 0.01 / GROWTH_FLOOR_SECONDS
+        lambda size: 0.0001 if size < 40_000 else 0.0006, 40_000, 0.5, "tiny")
+    assert timing.repetitions == MAX_GROWTH_REPETITIONS
+    assert timing.ratio == pytest.approx(
+        0.0006 * MAX_GROWTH_REPETITIONS / GROWTH_FLOOR_SECONDS)
+
+
+def test_a_quarter_size_under_the_floor_is_measured_until_it_reaches_it():
+    """Task 3175: a sub-millisecond ratio is noise. 5 ms at the quarter size
+    is measured 4 times (20 ms) at each size, and the means compared."""
+    calls: list[int] = []
+    timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
+    assert calls == [10_000, 40_000] + [10_000] * 3 + [40_000] * 3
+    assert timing.repetitions == 4
+    assert timing.small_seconds == pytest.approx(0.005)
+    assert timing.ratio == pytest.approx(4.0)
+
+
+def test_quadratic_work_under_the_floor_fails_once_repeated():
+    """5 ms then 80 ms: one 5 ms reading raised to the 20 ms floor would
+    read 4x; four of each (20 ms against 320 ms) read 16x."""
+    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+        assert_linear_time(_model(5e-11, 2), 40_000, 0.5, "quad")
 
 
 def test_compare_with_larger_times_the_size_and_four_times_it():
     calls: list[int] = []
-    assert_linear_time(_model(1e-7, 1, calls), 40_000, 0.5, "cap",
+    assert_linear_time(_model(1e-6, 1, calls), 40_000, 0.5, "cap",
                        compare_with_larger=True)
     assert calls == [40_000, 160_000]
 
@@ -221,8 +399,10 @@ def test_several_parts_are_each_checked():
 
 
 def test_growth_ratio_raises_the_small_time_to_the_floor():
+    assert GROWTH_FLOOR_SECONDS == 0.02
     assert growth_ratio(0.0, 0.004) == 0.004 / GROWTH_FLOOR_SECONDS
-    assert growth_ratio(0.01, 0.04) == pytest.approx(4.0)
+    assert growth_ratio(0.0006, 0.0052) == 0.0052 / GROWTH_FLOOR_SECONDS
+    assert growth_ratio(0.05, 0.2) == pytest.approx(4.0)
 
 
 # --- The fence: every timing test is calibrated or a listed deadline -------------
