@@ -59,8 +59,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
+import shlex
+import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -556,6 +560,15 @@ class GitRecorder:
             yield
         finally:
             self._active = False
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """The agent's own git calls, made by the test, are not recorded."""
+        was_active, self._active = self._active, False
+        try:
+            yield
+        finally:
+            self._active = was_active
 
     def discovery_in(self, directory: Path) -> list[tuple[str, ...]]:
         """git calls that found their repository from inside ``directory``."""
@@ -1059,6 +1072,26 @@ async def _run_non_git_loop(loop: str, project: Path, output: list[str]) -> str:
     return outcome
 
 
+def _record_gate_audit(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
+    """The durable GATE-AUDIT records (message, event) both loops write."""
+    records: list[tuple[str, str | None]] = []
+
+    def record(message: str, task_id: int | None = None, **kwargs: Any) -> None:
+        records.append((message, kwargs.get("event")))
+
+    monkeypatch.setattr(dispatch_mod, "log_gate_audit", record)
+    return records
+
+
+def _patch_non_git_loops(monkeypatch: pytest.MonkeyPatch, attempt: Any) -> None:
+    import equipa.cli as cli_mod
+
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: _task(task_id))
+    for module in (cli_mod, dispatch_mod):
+        monkeypatch.setattr(module, "run_dev_test_loop", attempt)
+
+
 @pytest.mark.parametrize("loop", ["cli", "dispatch"])
 def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, loop: str,
@@ -1067,32 +1100,39 @@ def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repositor
     ``git init`` during a failed attempt. ``cleanup_failed_attempt`` asked
     ``_is_git_repo`` by discovery, found the agent's repository and checked
     out its ``main``, which ran the agent's smudge filter in the
-    orchestrator. Now no git step runs there and the repository is reported.
-    ``loop`` is the single-task ``--task --dev-test`` loop (``cli``) or the
-    autoresearch wrapper the parallel and per-project loops share
-    (``dispatch``), each called without a task branch as production does."""
+    orchestrator. Now no git step runs there. ``loop`` is the single-task
+    ``--task --dev-test`` loop (``cli``) or the autoresearch wrapper the
+    parallel and per-project loops share (``dispatch``), each called without
+    a task branch as production does.
+
+    N1 (task #3168): the repository is no longer only reported and retried
+    in (a retry let the dev-test loop run git there). The task stops right
+    after the attempt, blocked, with a durable GATE-AUDIT record, before
+    any cleanup. The cleanup's own no-git path is checked on the agent's
+    repository by ``test_cleanup_of_a_non_git_project_runs_no_git_in_the_agents_repository``."""
     import equipa.cli as cli_mod
 
     project = _non_git_project(tmp_path)
     agent = Agent(project, None, tmp_path, monkeypatch)
-    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
-    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: _task(task_id))
+    audit = _record_gate_audit(monkeypatch)
     recorder = GitRecorder(monkeypatch)
     attempts: list[str] = []
+    cleanups: list[Any] = []
     real_cleanup = dispatch_mod.cleanup_failed_attempt
 
     async def attempt(task, project_dir, project_context, args, output=None):
         attempts.append(project_dir)
         if len(attempts) == 1:
-            _make_agent_repository(agent, project)
+            with recorder.paused():
+                _make_agent_repository(agent, project)
         return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
 
     async def recorded_cleanup(*args, **kwargs):
-        with recorder.recording():
-            return await real_cleanup(*args, **kwargs)
+        cleanups.append(kwargs)
+        return await real_cleanup(*args, **kwargs)
 
+    _patch_non_git_loops(monkeypatch, attempt)
     for module in (cli_mod, dispatch_mod):
-        monkeypatch.setattr(module, "run_dev_test_loop", attempt)
         monkeypatch.setattr(module, "cleanup_failed_attempt", recorded_cleanup)
     output: list[str] = []
 
@@ -1100,7 +1140,8 @@ def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repositor
     error: Exception | None = None
     outcome = None
     try:
-        outcome = _run(_run_non_git_loop(loop, project, output))
+        with recorder.recording():
+            outcome = _run(_run_non_git_loop(loop, project, output))
     except Exception as exc:  # re-raised below, after the markers
         error = exc
 
@@ -1108,14 +1149,109 @@ def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repositor
     if error is not None:
         raise error
     assert recorder.calls == [], [call.argv for call in recorder.calls]
-    # The cleanup went through: the retry ran and the retries ran out.
-    assert outcome == "tests_failed"
-    assert attempts == [str(project), str(project)]
+    # N1: blocked after the attempt, with no cleanup and no retry.
+    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert attempts == [str(project)]
+    assert cleanups == []
     # The agent's repository is as the agent left it.
     assert _git(project, "symbolic-ref", "HEAD") == f"refs/heads/{TASK_BRANCH}"
     assert _branch_exists(project)
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert (
+        f"after attempt 1 (tests_failed): a git repository appeared at {project / '.git'}"
+        in audit[0][0]
+    ), audit
     logged = "\n".join(output) + capsys.readouterr().out
-    assert f"A git repository appeared at {project / '.git'}" in logged, logged
+    assert f"[GATE-AUDIT] task={TASK_ID} event=repository-appeared" in logged, logged
+
+
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_a_repository_already_in_a_non_git_project_stops_the_task_before_any_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop: str,
+) -> None:
+    """N1 (task #3168): the per-project loop decides "not git" once per run,
+    so an earlier task's agent can leave a repository the next task would
+    run in, and a later dispatch would adopt as the project's checkout.
+    Found before the first attempt, the task stops there: no agent runs and
+    no git runs."""
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _make_agent_repository(agent, project)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    attempts: list[str] = []
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        attempts.append(project_dir)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    _patch_non_git_loops(monkeypatch, attempt)
+
+    with recorder.recording():
+        outcome = _run(_run_non_git_loop(loop, project, []))
+
+    _assert_nothing_ran(agent, NON_GIT_VECTOR, f"{loop}-before-attempt", agent.ran())
+    assert recorder.calls == [], [call.argv for call in recorder.calls]
+    assert attempts == []
+    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert f"before attempt 1: a git repository appeared at {project / '.git'}" in audit[0][0]
+
+
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_failed_attempt_in_a_non_git_project_without_a_repository_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, loop: str,
+) -> None:
+    """N1 stops only a task whose project gained a repository: a failed
+    attempt that left none is cleaned up (no git) and retried as before."""
+    project = _non_git_project(tmp_path)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    attempts: list[str] = []
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        attempts.append(project_dir)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
+
+    _patch_non_git_loops(monkeypatch, attempt)
+    output: list[str] = []
+
+    with recorder.recording():
+        outcome = _run(_run_non_git_loop(loop, project, output))
+
+    assert recorder.calls == [], [call.argv for call in recorder.calls]
+    assert outcome == "tests_failed"
+    assert attempts == [str(project), str(project)]
+    assert audit == []
+    logged = "\n".join(output) + capsys.readouterr().out
+    assert f"Reset task #{TASK_ID} to todo" in logged, logged
+
+
+def test_cleanup_of_a_non_git_project_runs_no_git_in_the_agents_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3165-01 at the cleanup itself, which N1 now keeps the loops from
+    reaching with a repository present: with the agent's repository in the
+    project, ``expect_repository=False`` starts no git process, runs none of
+    the agent's programs and reports the repository."""
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _make_agent_repository(agent, project)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    recorder = GitRecorder(monkeypatch)
+    output: list[str] = []
+
+    with recorder.recording():
+        _run(dispatch_mod.cleanup_failed_attempt(
+            TASK_ID, str(project), [], output=output, expect_repository=False,
+        ))
+
+    _assert_nothing_ran(agent, NON_GIT_VECTOR, "cleanup", agent.ran())
+    assert recorder.calls == [], [call.argv for call in recorder.calls]
+    assert any(
+        f"A git repository appeared at {project / '.git'}" in line for line in output
+    ), output
+    assert _git(project, "symbolic-ref", "HEAD") == f"refs/heads/{TASK_BRANCH}"
 
 
 def test_cleanup_of_a_non_git_project_without_a_repository_reports_nothing(
@@ -1148,6 +1284,174 @@ def test_checking_out_the_agents_main_does_run_its_filter(
     _git(project, "checkout", "-q", "main")
 
     assert f"{NON_GIT_VECTOR}-filter" in agent.ran()
+
+
+# --- R3166-01 (task #3168): the change checks during and after the agent ------
+
+CHANGE_CHECK_VECTOR = "non-git-change-check"
+
+# A fake Claude CLI that replays stream.jsonl from its own directory (the
+# agent env is allowlisted, so nothing comes through the environment). A
+# {"run": "<script>"} line is not printed: the agent runs that shell script,
+# as its Bash tool would, before the tool result that follows it.
+FAKE_AGENT_CLI = '''import json, os, subprocess, sys
+here = os.path.dirname(os.path.abspath(__file__))
+for line in open(os.path.join(here, "stream.jsonl"), encoding="utf-8"):
+    event = json.loads(line)
+    if "run" in event:
+        subprocess.run(["/bin/sh", os.path.join(here, event["run"])], check=True)
+        continue
+    sys.stdout.write(line)
+    sys.stdout.flush()
+'''
+
+
+def _plant_script(agent: Agent, project: Path) -> str:
+    """What the agent's first Bash call does: make ``project`` a repository
+    of its own whose clean filter, selected for every path, is a program of
+    the agent's, and leave a committed file changed (same size, so git has
+    to read it through the filter)."""
+    git = shlex.quote(shutil.which("git") or "git")
+    program = shlex.quote(agent.program(f"{CHANGE_CHECK_VECTOR}-filter", "exec cat"))
+    return "\n".join([
+        "set -e",
+        f"cd {shlex.quote(str(project))}",
+        f"{git} init -q -b main",
+        "printf '* filter=probe\\n' > .gitattributes",
+        f"{git} add .gitattributes app.py",
+        f"{git} -c user.name=agent -c user.email=agent@example.invalid commit -q -m agent",
+        # Defined after the commit, so planting never runs it.
+        f"{git} config filter.probe.clean {program}",
+        f"{git} config filter.probe.smudge {program}",
+        "mkdir -p .git/info",
+        "printf '* filter=probe\\n' > .git/info/attributes",
+        "printf '%s\\n' \"PRINT('project')\" > app.py",
+        "",
+    ])
+
+
+def _tool_call(tool_id: str, command: str) -> list[dict[str, Any]]:
+    return [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tool_id, "name": "Bash",
+             "input": {"command": command}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tool_id, "content": "",
+             "is_error": False}]}},
+    ]
+
+
+def _fake_agent(tmp_path: Path, agent: Agent, project: Path) -> list[str]:
+    """argv of a fake agent whose first Bash call runs :func:`_plant_script`
+    and whose second one changes nothing."""
+    directory = tmp_path / "fake-agent"
+    directory.mkdir()
+    (directory / "plant.sh").write_text(_plant_script(agent, project))
+    first, first_result = _tool_call("toolu_plant", "git init")
+    events = [
+        first, {"run": "plant.sh"}, first_result,
+        *_tool_call("toolu_status", "ls"),
+        {"type": "result", "subtype": "success", "result": "RESULT: success",
+         "num_turns": 2, "total_cost_usd": 0.0},
+    ]
+    (directory / "stream.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+    )
+    cli = directory / "fake_claude.py"
+    cli.write_text(FAKE_AGENT_CLI)
+    return [sys.executable, str(cli)]
+
+
+def _assert_planted(agent: Agent, project: Path) -> None:
+    """The fake agent did plant (so no marker is not a vacuous pass)."""
+    assert (project / ".git").is_dir(), "the fake agent made no repository"
+    assert _git(project, "config", "filter.probe.clean") == str(
+        agent.bin / f"{CHANGE_CHECK_VECTOR}-filter"
+    )
+
+
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_change_checks_run_no_git_in_a_repository_the_agent_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop: str,
+) -> None:
+    """R3166-01: in a project that was not git at dispatch, the agent runs
+    ``git init`` and plants a clean filter. After its next tool result the
+    streaming runner's ``_check_git_changes`` ran ``git diff --stat`` there
+    by discovery, which ran the filter in the orchestrator (no failed
+    attempt needed); so would the progress checks the dev-test loop makes
+    after an agent run. Now the attempt runs under the dispatch's non-git
+    record: the runner starts no git there, ends the run when the
+    repository appears, the checks after it run no git, and N1 blocks the
+    task. The agent is a real subprocess under the real streaming runner,
+    inside each loop as production calls it for a project that is not git."""
+    import equipa.agent_runner as agent_runner
+    from equipa.monitoring import _check_git_changes, has_branch_commits
+    from equipa.parsing import verify_files_changed
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    agent_cmd = _fake_agent(tmp_path, agent, project)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    attempts: list[str] = []
+    runs: list[dict[str, Any]] = []
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        """One dev-test attempt: the streamed agent run, then the change
+        checks made on its result."""
+        attempts.append(project_dir)
+        run = await agent_runner.run_agent_streaming(
+            agent_cmd, role="developer", output=output, max_turns=40,
+            project_dir=project_dir,
+        )
+        runs.append(run)
+        _check_git_changes(project_dir)
+        has_branch_commits(project_dir)
+        verify_files_changed(["app.py"], project_dir)
+        return run, 1, "early_terminated" if run.get("early_terminated") else "tests_failed"
+
+    _patch_non_git_loops(monkeypatch, attempt)
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    outcome = None
+    try:
+        with recorder.recording():
+            outcome = _run(_run_non_git_loop(loop, project, []))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, f"{loop}-change-check", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert recorder.discovery_in(project) == [], recorder.discovery_in(project)
+    assert len(runs) == 1, runs
+    assert runs[0].get("early_terminated"), runs[0]
+    assert (
+        f"a git repository appeared at {project / '.git'}" in runs[0]["early_term_reason"]
+    ), runs[0]
+    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert attempts == [str(project)]
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+
+
+def test_the_change_check_runs_the_agents_filter_when_nothing_records_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the plant above: without the dispatch's non-git
+    record, the orchestrator's change check does run the agent's filter."""
+    from equipa.monitoring import _check_git_changes
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _fake_agent(tmp_path, agent, project)
+    subprocess.run(["/bin/sh", str(tmp_path / "fake-agent" / "plant.sh")], check=True)
+    assert agent.ran() == [], "planting ran the filter"
+
+    assert _check_git_changes(str(project)) is True
+
+    assert f"{CHANGE_CHECK_VECTOR}-filter" in agent.ran()
 
 
 # --- The three remaining discovery calls, one by one ----------------------------
