@@ -76,6 +76,7 @@ from equipa.monitoring import (
     adjust_dynamic_budget,
     calculate_dynamic_budget,
     get_starting_sha,
+    git_checks_allowed,
     has_branch_commits,
     has_session_commits,
 )
@@ -5491,7 +5492,14 @@ async def _resolve_head_sha(
     the literal string "HEAD" so callers can pass the result straight to
     ``git diff <ref>`` without a None-check; the worst-case behavior is the
     legacy cumulative diff against the working HEAD.
+
+    S3168-01 (task #3173): runs no git, and returns "HEAD", in a project
+    that was not git at dispatch (:func:`equipa.monitoring.dispatched_without_git`).
+    A repository there is the agent's, possibly one with no ``.git`` entry
+    (an implicit bare layout) that no filesystem walk noticed.
     """
+    if not git_checks_allowed(project_dir):
+        return "HEAD"
     try:
         result = await git_run_async(
             ["rev-parse", "HEAD"], project_dir, timeout=5,
@@ -5548,7 +5556,13 @@ async def _git_diff_is_empty(project_dir: str, base_ref: str = "HEAD") -> bool:
     On any failure (timeout, missing git), conservatively returns False so
     the tester still runs — better a wasted tester cycle than a missed
     real-code-change task.
+
+    S3168-01 (task #3173): in a project that was not git at dispatch no git
+    runs (``git diff`` there ran an agent-made repository's clean filter in
+    the orchestrator), and the answer is False, as for any other failure.
     """
+    if not git_checks_allowed(project_dir):
+        return False
     try:
         result = await git_run_async(
             ["diff", base_ref], project_dir, timeout=10,
@@ -5576,7 +5590,19 @@ async def _capture_git_diff_context(
     so the 10s timeout cannot block the event loop. Returns an empty
     string when the diff is empty, the command fails, or times out. Diff is
     truncated at ``TESTER_GIT_DIFF_MAX_CHARS`` to avoid prompt bloat.
+
+    S3168-01 (task #3173): in a project that was not git at dispatch no git
+    runs and the context is empty. ``git diff`` there ran an agent-made
+    repository's clean filter in the orchestrator and handed the agent's
+    diff to the tester.
     """
+    if not git_checks_allowed(project_dir):
+        log(
+            f"  [Cycle {cycle}] Project was not git at dispatch; "
+            f"no git diff for the tester context",
+            output,
+        )
+        return ""
     try:
         result = await git_run_async(
             ["diff", base_ref], project_dir, timeout=10,

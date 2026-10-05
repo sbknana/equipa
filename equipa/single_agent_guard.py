@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from equipa.git_ops import git_run
+from equipa.monitoring import git_checks_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,16 @@ def _git_diff_files(repo_path: Path) -> list[str]:
     (e.g. when no upstream is configured). Returns an empty list on any
     error so the guard fails CLOSED — better to ask for explicit output
     proof than to silently accept a no-op run.
+
+    S3168-01 (task #3173): runs no git, and returns an empty list, in a
+    project that was not git at dispatch
+    (:func:`equipa.monitoring.dispatched_without_git`). A repository there
+    is the agent's; its ``git status`` fallback ran the agent's clean filter
+    in the orchestrator. The filesystem scan of
+    :func:`evaluate_single_agent_outcome` still finds the run's files.
     """
+    if not git_checks_allowed(repo_path):
+        return []
     try:
         # Prefer the diff against the merge-base of master/main if one exists.
         # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
