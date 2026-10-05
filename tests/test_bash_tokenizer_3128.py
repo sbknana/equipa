@@ -30,6 +30,7 @@ import pytest
 
 from equipa import bash_security
 from equipa.bash_security import CheckID, check_bash_command
+from tests.host_timing import assert_linear_time, budget
 
 scan = bash_security._scan_shell
 
@@ -195,21 +196,28 @@ class TestTokenizerModel:
         assert scan(command).error is None
 
     def test_scan_is_linear_at_the_cap(self):
-        """Deep nesting and long runs stay far below the hook budget."""
+        """Deep nesting and long runs stay far below the hook budget. Budget
+        host-calibrated, growth from a quarter of the cap linear (task
+        3171)."""
         cap = bash_security.MAX_COMMAND_BYTES
-        commands = [
-            "\"$(" * (cap // 3),
-            "$'\\'' " * (cap // 6),
-            "cat <<A\n" + "x\\\n" * (cap // 4),
-            "((" * (cap // 2),
-            "echo " + "\"$(echo '\"')\" " * (cap // 18),
+        builders = [
+            lambda size: "\"$(" * (size // 3),
+            lambda size: "$'\\'' " * (size // 6),
+            lambda size: "cat <<A\n" + "x\\\n" * (size // 4),
+            lambda size: "((" * (size // 2),
+            lambda size: "echo " + "\"$(echo '\"')\" " * (size // 18),
         ]
-        for command in commands:
-            # CPU time: under `pytest -n auto` a wall clock also counts the
-            # time this worker waits for a core (task 3160).
-            start = time.process_time()
-            scan(command + " ")  # bypass the lru_cache entry of a prior test
-            assert time.process_time() - start < 1.0, command[:20]
+        for build in builders:
+            def seconds_at(size, build=build):
+                command = build(size) + " "
+                scan.cache_clear()  # every measurement scans afresh
+                # CPU time: under `pytest -n auto` a wall clock also counts
+                # the time this worker waits for a core (task 3160).
+                start = time.process_time()
+                scan(command)
+                return time.process_time() - start
+
+            assert_linear_time(seconds_at, cap, 1.0, build(cap)[:20])
 
 
 class TestNewBypassShapes:
@@ -580,7 +588,9 @@ def test_tokenizer_agrees_with_bash_on_generated_commands(tmp_path: Path, seed: 
         else:
             assert [_tokenizer_heredoc_body(command, quoted, dash)] == bash_view, command
     assert position == len(fields) - 1  # trailing NUL
-    assert time.perf_counter() - start < 20
+    # A cap on the whole corpus run, not a linearity proof: host-calibrated
+    # only (task 3171).
+    assert time.perf_counter() - start < budget(20)
 
 
 def test_differential_corpus_exercises_the_tricky_forms():
@@ -981,7 +991,9 @@ def test_substitutions_bash_runs_are_never_proven_inert(
     assert ran_seen >= 150, ran_seen
     assert inert_seen >= 40, inert_seen
     assert ran_seen_interactive >= 40, ran_seen_interactive
-    assert time.perf_counter() - start < 20
+    # A cap on the whole corpus run, not a linearity proof: host-calibrated
+    # only (task 3171).
+    assert time.perf_counter() - start < budget(20)
 
 
 @pytest.mark.parametrize("interactive", [False, True], ids=["script", "interactive"])
@@ -1099,7 +1111,9 @@ def test_every_variable_assignment_bash_runs_in_a_fresh_bash_is_refused(
     # interactive one; the run is not vacuous.
     assert "SECONDS" in names_that_ran, sorted(names_that_ran)
     assert ("MAILCHECK" in names_that_ran) == interactive, sorted(names_that_ran)
-    assert time.perf_counter() - start < 60
+    # A cap on the whole corpus run, not a linearity proof: host-calibrated
+    # only (task 3171).
+    assert time.perf_counter() - start < budget(60)
 
 
 def test_substitution_corpus_exercises_every_template():
