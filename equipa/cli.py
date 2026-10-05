@@ -76,6 +76,7 @@ from equipa.dispatch import (
     load_goals_file,
     outcome_after_merge,
     parse_task_ids,
+    refuse_agent_made_repository,
     refuse_dispatch,
     run_auto_dispatch,
     run_parallel_goals,
@@ -388,8 +389,12 @@ def _is_git_project(project_dir: str) -> bool:
     R3119-02 (task #3126): a repository git cannot read is never run as a
     non-git project (no worktree, no guard, no gate); the CLI exits with
     ``EXIT_DISPATCH_REFUSED`` instead.
+
+    S3168-03 (task #3173): so is a project under a repository an N1 check
+    recorded, before any git runs there.
     """
     try:
+        refuse_agent_made_repository(project_dir)
         return _is_git_repo(project_dir)
     except GitRepositoryUnreadableError as exc:
         refuse_dispatch(str(exc))
