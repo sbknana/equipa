@@ -21,6 +21,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     blocked_by_the_gate,
@@ -592,50 +593,62 @@ def test_prompt_hash_in_skill_manifest_matches_the_file():
 REVIEW_BYTES = 200 * 1024
 
 
-def _padded_lines(line: str) -> list[str]:
-    return [line] * (REVIEW_BYTES // (len(line) + 1) + 1)
+def _padded_lines(rb: int, line: str) -> list[str]:
+    return [line] * (rb // (len(line) + 1) + 1)
 
 
-ADVERSARIAL_BODIES = {
-    "comment-openers": ["<!--" * (REVIEW_BYTES // 4)],
-    "comment-pairs": ["HI<!-- -->" * (REVIEW_BYTES // 10)],
-    "multiline-comments": _padded_lines("<!--") + ["-->"],
-    "comment-with-severity": ["<!--"] + _padded_lines("HIGH: x") + ["-->"],
-    "unterminated-comment": ["<!-- HIGH"] + _padded_lines("x " * 20),
-    "entity-flood": ["&#72;" * (REVIEW_BYTES // 5)],
-    "entity-almost": ["&#" * (REVIEW_BYTES // 2)],
-    "named-entity-flood": ["&amp;" * (REVIEW_BYTES // 5)],
-    "li-flood": ["<li>" * (REVIEW_BYTES // 4)],
-    "br-flood": ["x<br>" * (REVIEW_BYTES // 5)],
-    "confusable-flood": [ETA * (REVIEW_BYTES // 2)],
-    "blank-runs": ["Severity:" + " \t" * (REVIEW_BYTES // 2) + "x"],
-    "severity-is-runs": ["severity " + "is " * (REVIEW_BYTES // 3)],
-    "priority-lines": _padded_lines("Priority:" + " " * 7 + "*" * 3 + " maybe"),
-    "range-cells": ["| " + "HIGH/MEDIUMx | " * (REVIEW_BYTES // 15)],
-    "bracket-runs": ["[HIGH]" * (REVIEW_BYTES // 6)],
-    "id-tag-runs": _padded_lines("[S2] HIGH1 [S2] HIGH1 [S2] HIGH1"),
-    "double-dash-runs": ["- x" + " --" * (REVIEW_BYTES // 3)],
-    "title-case-lines": _padded_lines("High High High High High"),
-    "rated-runs": ["rated " * (REVIEW_BYTES // 6)],
-    "sentence-alias-runs": [". Risk:" * (REVIEW_BYTES // 7)],
-    "dash-severity-runs": [" \N{EM DASH} HIGH" * (REVIEW_BYTES // 7)],
-    "intraword-star-runs": ["a*" * (REVIEW_BYTES // 2)],
-    # The 3122 bodies, which must now also stay under 1 s.
-    "trailing-separators": ["- x" + " - a" * (REVIEW_BYTES // 4)],
-    "space-runs": ["- a" + " " * REVIEW_BYTES + "- HIGH x"],
-    "severity-paren-runs": ["severity (" * (REVIEW_BYTES // 10)],
-    "html-open-brackets": ["<" * REVIEW_BYTES],
-    "html-long-tags": _padded_lines("<summary " + "a" * 190 + ">HIGH"),
-    "table-lines": _padded_lines("| S1 | Risk:" + " " * 8 + "x | HIGHx |"),
-    "blockquote-runs": _padded_lines("> > > > > - x (HIGHx"),
-}
+def adversarial_bodies(rb: int) -> dict[str, list[str]]:
+    """The adversarial bodies built at ``rb`` bytes: timed at REVIEW_BYTES
+    and a quarter of it (task 3171)."""
+    return {
+        "comment-openers": ["<!--" * (rb // 4)],
+        "comment-pairs": ["HI<!-- -->" * (rb // 10)],
+        "multiline-comments": _padded_lines(rb, "<!--") + ["-->"],
+        "comment-with-severity": ["<!--"] + _padded_lines(rb, "HIGH: x") + ["-->"],
+        "unterminated-comment": ["<!-- HIGH"] + _padded_lines(rb, "x " * 20),
+        "entity-flood": ["&#72;" * (rb // 5)],
+        "entity-almost": ["&#" * (rb // 2)],
+        "named-entity-flood": ["&amp;" * (rb // 5)],
+        "li-flood": ["<li>" * (rb // 4)],
+        "br-flood": ["x<br>" * (rb // 5)],
+        "confusable-flood": [ETA * (rb // 2)],
+        "blank-runs": ["Severity:" + " \t" * (rb // 2) + "x"],
+        "severity-is-runs": ["severity " + "is " * (rb // 3)],
+        "priority-lines": _padded_lines(rb, "Priority:" + " " * 7 + "*" * 3 + " maybe"),
+        "range-cells": ["| " + "HIGH/MEDIUMx | " * (rb // 15)],
+        "bracket-runs": ["[HIGH]" * (rb // 6)],
+        "id-tag-runs": _padded_lines(rb, "[S2] HIGH1 [S2] HIGH1 [S2] HIGH1"),
+        "double-dash-runs": ["- x" + " --" * (rb // 3)],
+        "title-case-lines": _padded_lines(rb, "High High High High High"),
+        "rated-runs": ["rated " * (rb // 6)],
+        "sentence-alias-runs": [". Risk:" * (rb // 7)],
+        "dash-severity-runs": [" \N{EM DASH} HIGH" * (rb // 7)],
+        "intraword-star-runs": ["a*" * (rb // 2)],
+        # The 3122 bodies, which must now also stay under 1 s.
+        "trailing-separators": ["- x" + " - a" * (rb // 4)],
+        "space-runs": ["- a" + " " * rb + "- HIGH x"],
+        "severity-paren-runs": ["severity (" * (rb // 10)],
+        "html-open-brackets": ["<" * rb],
+        "html-long-tags": _padded_lines(rb, "<summary " + "a" * 190 + ">HIGH"),
+        "table-lines": _padded_lines(rb, "| S1 | Risk:" + " " * 8 + "x | HIGHx |"),
+        "blockquote-runs": _padded_lines(rb, "> > > > > - x (HIGHx"),
+    }
+
+
+ADVERSARIAL_BODIES = adversarial_bodies(REVIEW_BYTES)
+
+
+def _adversarial_review_seconds(name: str, rb: int) -> float:
+    text = review("No findings.", adversarial_bodies(rb)[name], ZERO,
+                  low_heading=False)
+    assert len(text.encode()) >= rb
+    return production_seconds(text)
 
 
 @timing_test
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
 def test_200kb_adversarial_review_parses_under_one_second(name):
-    text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
-                  low_heading=False)
-    assert len(text.encode()) >= REVIEW_BYTES
-    elapsed = production_seconds(text)
-    assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(lambda rb: _adversarial_review_seconds(name, rb),
+                       REVIEW_BYTES, 1.0, name)

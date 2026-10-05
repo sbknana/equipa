@@ -17,6 +17,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     blocked_by_the_gate,
@@ -370,35 +371,47 @@ def test_unfinished_summary_still_blocks_with_counted_shape():
 REVIEW_BYTES = 200 * 1024
 
 
-def _padded_lines(line: str) -> list[str]:
-    return [line] * (REVIEW_BYTES // (len(line) + 1) + 1)
+def _padded_lines(rb: int, line: str) -> list[str]:
+    return [line] * (rb // (len(line) + 1) + 1)
 
 
-ADVERSARIAL_BODIES = {
-    "trailing-separators": ["- x" + " - a" * (REVIEW_BYTES // 4)],
-    "trailing-no-severity": _padded_lines("- a, b: c - d — e – f, HIGHx"),
-    "space-runs": ["- a" + " " * REVIEW_BYTES + "- HIGH x"],
-    "severity-words": ["severity " * (REVIEW_BYTES // 9)],
-    "severity-colon-runs": ["Severity" + ":" * REVIEW_BYTES],
-    "severity-paren-runs": ["severity (" * (REVIEW_BYTES // 10)],
-    "alias-lines": _padded_lines("Risk:" + " " * 7 + "*" * 3 + " maybe"),
-    "id-runs": ["S1 " * (REVIEW_BYTES // 3)],
-    "bare-no-separator": _padded_lines("HIGH HIGH HIGH HIGH HIGH"),
-    "html-tags": ["<b>" * (REVIEW_BYTES // 3)],
-    "html-open-brackets": ["<" * REVIEW_BYTES],
-    "html-long-tags": _padded_lines("<summary " + "a" * 190 + ">HIGH"),
-    "table-cells": ["| " + "High riskx | " * (REVIEW_BYTES // 13)],
-    "table-lines": _padded_lines("| S1 | Risk:" + " " * 8 + "x | HIGHx |"),
-    "paren-list": ["- " + "(" * REVIEW_BYTES + "HIGH"],
-    "blockquote-runs": _padded_lines("> > > > > - x (HIGHx"),
-}
+def adversarial_bodies(rb: int) -> dict[str, list[str]]:
+    """The adversarial bodies built at ``rb`` bytes: timed at REVIEW_BYTES
+    and a quarter of it (task 3171)."""
+    return {
+        "trailing-separators": ["- x" + " - a" * (rb // 4)],
+        "trailing-no-severity": _padded_lines(rb, "- a, b: c - d — e – f, HIGHx"),
+        "space-runs": ["- a" + " " * rb + "- HIGH x"],
+        "severity-words": ["severity " * (rb // 9)],
+        "severity-colon-runs": ["Severity" + ":" * rb],
+        "severity-paren-runs": ["severity (" * (rb // 10)],
+        "alias-lines": _padded_lines(rb, "Risk:" + " " * 7 + "*" * 3 + " maybe"),
+        "id-runs": ["S1 " * (rb // 3)],
+        "bare-no-separator": _padded_lines(rb, "HIGH HIGH HIGH HIGH HIGH"),
+        "html-tags": ["<b>" * (rb // 3)],
+        "html-open-brackets": ["<" * rb],
+        "html-long-tags": _padded_lines(rb, "<summary " + "a" * 190 + ">HIGH"),
+        "table-cells": ["| " + "High riskx | " * (rb // 13)],
+        "table-lines": _padded_lines(rb, "| S1 | Risk:" + " " * 8 + "x | HIGHx |"),
+        "paren-list": ["- " + "(" * rb + "HIGH"],
+        "blockquote-runs": _padded_lines(rb, "> > > > > - x (HIGHx"),
+    }
+
+
+ADVERSARIAL_BODIES = adversarial_bodies(REVIEW_BYTES)
+
+
+def _adversarial_review_seconds(name: str, rb: int) -> float:
+    text = review("No findings.", adversarial_bodies(rb)[name], ZERO,
+                  low_heading=False)
+    assert len(text.encode()) >= rb
+    return production_seconds(text, nonce=NONCE)
 
 
 @timing_test
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
 def test_200kb_adversarial_review_parses_under_two_seconds(name):
-    text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
-                  low_heading=False)
-    assert len(text.encode()) >= REVIEW_BYTES
-    elapsed = production_seconds(text, nonce=NONCE)
-    assert elapsed < 2.0, f"{name}: {elapsed:.2f}s"
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(lambda rb: _adversarial_review_seconds(name, rb),
+                       REVIEW_BYTES, 2.0, name)
