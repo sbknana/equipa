@@ -67,7 +67,9 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   a budget. A ratio of sub-millisecond times is noise: the smaller time is
   raised to 20 ms, and a reading that could still reach the limit is
   measured repeatedly (or, for a regex scan, made larger) until the
-  smaller size takes 20 ms. Never raise a base budget.
+  smaller size takes 20 ms. Never raise a base budget. Build the input
+  before the clock starts: allocating a multi-megabyte string is page
+  faults, which grew 32x from 1 MB to 4 MB under load.
 - The factor is capped at 4.0. A budget loosened further would hide a
   linear slowdown as large (growth only sees superlinear work), so a
   measurement on a host or load more than 4x slower than the development
