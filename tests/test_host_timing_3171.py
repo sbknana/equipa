@@ -369,6 +369,17 @@ def test_a_quarter_size_under_the_floor_is_measured_until_it_reaches_it():
     assert timing.ratio == pytest.approx(4.0)
 
 
+def test_repetitions_are_bounded_by_what_a_call_costs():
+    """A call that builds an expensive shape around a 5 ms measurement is
+    repeated only as far as GROWTH_REPETITION_SECONDS pays for."""
+    budget_seconds = host_timing.GROWTH_REPETITION_SECONDS
+    assert host_timing.growth_repetitions(0.005) == 4
+    assert host_timing.growth_repetitions(0.005, budget_seconds / 2) == 3
+    assert host_timing.growth_repetitions(0.005, budget_seconds * 4) == 1
+    assert host_timing.growth_repetitions(0.0001) == MAX_GROWTH_REPETITIONS
+    assert host_timing.growth_repetitions(0.05, budget_seconds * 4) == 1
+
+
 def test_quadratic_work_under_the_floor_fails_once_repeated():
     """5 ms then 80 ms: one 5 ms reading raised to the 20 ms floor would
     read 4x; four of each (20 ms against 320 ms) read 16x."""

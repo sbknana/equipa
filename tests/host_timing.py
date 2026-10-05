@@ -37,7 +37,9 @@ timing test checks two things through this module:
    0.0052 s), so when the quarter size takes under ``GROWTH_FLOOR_SECONDS``
    both sizes are measured again, the same number of times, until the
    quarter size's total reaches it (at most ``MAX_GROWTH_REPETITIONS``
-   times); the totals are compared, the smaller raised to the floor.
+   times, and within ``GROWTH_REPETITION_SECONDS`` of wall time for the
+   whole calls, building the shape included); the totals are compared, the
+   smaller raised to the floor.
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
@@ -98,6 +100,10 @@ GROWTH_LIMIT = 8.0
 # smaller total is raised to it before the ratio is taken.
 GROWTH_FLOOR_SECONDS = 0.02
 MAX_GROWTH_REPETITIONS = 32
+# The wall time the extra measurements of both sizes may take in all. A
+# ``seconds_at`` that builds a 200 KB review and writes an artifact around
+# a 10 ms measurement repeats less (or not at all: the floor then holds).
+GROWTH_REPETITION_SECONDS = 0.5
 # A ratio over the limit is measured again (keeping the fastest total of
 # each size) before it counts: one descheduled run must not fail a test,
 # a quadratic one fails every time.
@@ -281,13 +287,19 @@ def growth_ratio(small_seconds: float, seconds: float) -> float:
     return seconds / max(small_seconds, GROWTH_FLOOR_SECONDS)
 
 
-def growth_repetitions(small_seconds: float) -> int:
+def growth_repetitions(small_seconds: float,
+                       pair_cost_seconds: float = 0.0) -> int:
     """How many times to measure each size so that the quarter size's total
-    reaches ``GROWTH_FLOOR_SECONDS`` (at most ``MAX_GROWTH_REPETITIONS``)."""
+    reaches ``GROWTH_FLOOR_SECONDS``: at most ``MAX_GROWTH_REPETITIONS``,
+    and no more extra pairs than ``GROWTH_REPETITION_SECONDS`` of wall time
+    pays for when one call of each size took ``pair_cost_seconds``."""
     if small_seconds >= GROWTH_FLOOR_SECONDS:
         return 1
     needed = math.ceil(GROWTH_FLOOR_SECONDS / max(small_seconds, 1e-6))
-    return max(1, min(MAX_GROWTH_REPETITIONS, needed))
+    affordable = MAX_GROWTH_REPETITIONS
+    if pair_cost_seconds > 0:
+        affordable = 1 + int(GROWTH_REPETITION_SECONDS / pair_cost_seconds)
+    return max(1, min(MAX_GROWTH_REPETITIONS, needed, affordable))
 
 
 def fail(message: str) -> None:
@@ -368,14 +380,24 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         small_size, large_size = size, size * GROWTH
     else:
         small_size, large_size = size // GROWTH, size
+    call_costs: list[float] = []
+
+    def costed(at_size: int) -> float:
+        """``seconds_at(at_size)``, keeping the wall time of the whole call
+        (building the shape included): what one more repetition costs."""
+        started = time.monotonic()
+        seconds_taken = seconds_at(at_size)
+        call_costs.append(time.monotonic() - started)
+        return seconds_taken
+
     small_seconds, small_factor = measure_under_load(
-        lambda: seconds_at(small_size))
+        lambda: costed(small_size))
     _check_budget(label, small_seconds, small_size, base_budget_seconds,
                   small_factor)
-    seconds, factor = measure_under_load(lambda: seconds_at(large_size))
+    seconds, factor = measure_under_load(lambda: costed(large_size))
     if not compare_with_larger:
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
-    repetitions = growth_repetitions(small_seconds)
+    repetitions = growth_repetitions(small_seconds, sum(call_costs))
     timing = LinearTiming(
         label, small_size,
         _mean_seconds(seconds_at, small_size, repetitions, small_seconds),
