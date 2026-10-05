@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -80,9 +81,37 @@ def hook_command(generated_settings) -> str:
     return generated_settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
 
 
-def _old_hook_command() -> str:
+def _old_hook_command(interpreter: str = sys.executable) -> str:
     """The pre-3144 command: no -I."""
-    return f"{shlex.quote(sys.executable)} {shlex.quote(str(PRETOOLUSE_HOOK_SCRIPT))}"
+    return f"{shlex.quote(interpreter)} {shlex.quote(str(PRETOOLUSE_HOOK_SCRIPT))}"
+
+
+def _user_site_interpreter() -> str:
+    """An interpreter of this Python version that reads the user site.
+
+    sys.executable, unless it belongs to a venv made without the system site
+    packages: site.py turns the user site off there, so a plant in it is
+    never loaded, with or without -I, and proves nothing (task 3169: the
+    3.10 suite runs from such a venv). The venv's base interpreter, under
+    sys.base_prefix, reads it.
+    """
+    if site.ENABLE_USER_SITE:
+        return sys.executable
+    major, minor = sys.version_info[:2]
+    for name in (f"python{major}.{minor}", f"python{major}"):
+        candidate = Path(sys.base_prefix) / "bin" / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    pytest.fail(f"no base interpreter of the venv {sys.prefix} under "
+                f"{sys.base_prefix}")
+
+
+def _with_interpreter(hook_command: str, interpreter: str) -> str:
+    """The generated hook command, flags and script as generated, run by
+    ``interpreter`` instead of sys.executable."""
+    generated = shlex.quote(sys.executable) + " -I "
+    assert hook_command.startswith(generated), hook_command
+    return shlex.quote(interpreter) + hook_command[len(generated) - 4:]
 
 
 def _run_hook(command: str, bash_command: str, env: dict[str, str],
@@ -227,9 +256,15 @@ def test_planted_user_site_pth_cannot_open_the_gate(hook_command, tmp_path):
     home.mkdir()
     _plant_user_site_pth(home)
     env = _base_env(home)
+    interpreter = _user_site_interpreter()
 
-    control = _run_hook(_old_hook_command(), BLOCKED_COMMAND, env, tmp_path)
+    control = _run_hook(_old_hook_command(interpreter), BLOCKED_COMMAND, env,
+                        tmp_path)
     assert control.returncode == 0, "control: the .pth opens a gate run without -I"
+    # The generated flags on that same interpreter: -I keeps the plant out.
+    isolated = _run_hook(_with_interpreter(hook_command, interpreter),
+                         BLOCKED_COMMAND, env, tmp_path)
+    assert isolated.returncode == 2, isolated.stderr
 
     blocked = _run_hook(hook_command, BLOCKED_COMMAND, env, tmp_path)
     assert blocked.returncode == 2, blocked.stderr
