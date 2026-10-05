@@ -57,6 +57,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import inspect
 import json
@@ -1681,6 +1682,93 @@ def test_parallel_reviewer_of_a_non_git_task_starts_no_git_in_a_repository_made_
     assert review["early_terminated"], review
     assert f"a git repository appeared at {project / '.git'}" in review["early_term_reason"]
     assert run.statuses[TASK_ID] != "tests_passed", run.statuses
+
+
+# --- R3166-01 / N1 (task #3168): the CLI's single-agent mode -------------------
+
+
+def test_single_agent_run_in_a_non_git_project_runs_no_git_in_the_agents_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """R3166-01 / N1 in ``--task`` without ``--dev-test``: the agent of a
+    project that was not git at dispatch made it a repository with a clean
+    filter of its own and reported success. The no-output guard then asked
+    git for the changed files (``single_agent_guard._git_diff_files``: no
+    ``main...HEAD`` change and no ``HEAD~1``, so ``git status --porcelain``),
+    which ran the agent's filter in the orchestrator. Now the task stops
+    after the agent, blocked with a durable GATE-AUDIT record, and no git
+    runs in the project. Driven through ``run_mode_task`` as production
+    calls it."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = ParallelNonGitRun()
+    outcomes: list[str] = []
+    task = _task(TASK_ID)
+
+    for name, value in {
+        "fetch_task": lambda _id: task,
+        "resolve_project_dir": lambda _task: str(project),
+        "fetch_project_context": lambda _pid: {},
+        "_auto_snapshot_dispatch": lambda *a, **k: None,
+        "get_task_complexity": lambda _task: "medium",
+        "get_role_model": lambda *a, **k: "claude-test",
+        "get_role_turns": lambda *a, **k: 20,
+        "calculate_dynamic_budget": lambda turns, **k: (turns, turns),
+        "load_checkpoint": lambda *a, **k: (None, None),
+        "verify_task_updated": lambda _id: (True, "ok"),
+        "print_summary": lambda *a, **k: None,
+        "build_system_prompt": lambda *a, **k: "prompt",
+    }.items():
+        monkeypatch.setattr(cli_mod, name, value)
+
+    async def record_outcome(task, result, outcome, *args, **kwargs):
+        outcomes.append(outcome)
+
+    @contextmanager
+    def fake_build_cli_command(system_prompt, project_dir, *args, **kwargs):
+        yield ["fake-claude", project_dir]
+
+    async def fake_agent(cmd, *args, **kwargs):
+        """The agent's Bash calls made the repository; its run succeeded."""
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        result = {
+            "success": True, "result_text": "RESULT: success", "stdout": "",
+            "cost": 0.0, "duration": 0.0, "files_changed": ["app.py"],
+        }
+        return result if "role" in kwargs else (result, 1)
+
+    monkeypatch.setattr(cli_mod, "_post_task_telemetry", record_outcome)
+    monkeypatch.setattr(cli_mod, "build_cli_command", fake_build_cli_command)
+    monkeypatch.setattr(cli_mod, "run_agent_streaming", fake_agent)
+    monkeypatch.setattr(cli_mod, "run_agent_with_retries", fake_agent)
+    args = argparse.Namespace(
+        task=TASK_ID, project=None, role="developer", dev_test=False, dry_run=False,
+        yes=True, retries=0, dispatch_config={}, security_review=True,
+    )
+
+    error: Exception | None = None
+    try:
+        with recorder.recording():
+            _run(cli_mod.run_mode_task(args))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "cli-single-agent", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert outcomes == [REPOSITORY_APPEARED]
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert (
+        f"after the developer agent: a git repository appeared at {project / '.git'}"
+        in audit[0][0]
+    ), audit
+    assert f"[GATE-AUDIT] task={TASK_ID} event=repository-appeared" in capsys.readouterr().out
 
 
 # --- The three remaining discovery calls, one by one ----------------------------
