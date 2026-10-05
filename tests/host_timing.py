@@ -177,8 +177,8 @@ class LinearTiming:
 
 
 def assert_linear_time(seconds_at: Callable[[int], float], size: int,
-                       base_budget_seconds: float,
-                       label: str = "") -> LinearTiming:
+                       base_budget_seconds: float, label: str = "", *,
+                       compare_with_larger: bool = False) -> LinearTiming:
     """Assert that the work ``seconds_at(size)`` times stays within its
     host-calibrated budget and grows linearly.
 
@@ -186,29 +186,39 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     seconds the work took, measured the way the test measures it (CPU time,
     a median, a best of several). It must not be answered from a cache.
 
-    The quarter size runs first, so a quadratic regression fails on its
-    budget before the full size takes seconds; any time series that grows
-    with the input then fails at the full size too."""
+    The growth is measured from a quarter of ``size`` to ``size``, both held
+    to the budget. A shape that only exists from ``size`` on (more distinct
+    characters than a table keeps, which a quarter of the text cannot hold)
+    passes ``compare_with_larger``: the growth is then measured from ``size``
+    to four times it, and the budget holds at ``size``.
+
+    The smaller size runs first, so a quadratic regression fails on its
+    budget before the larger size takes seconds; any time series that grows
+    with the input then fails at the larger size too."""
     if size < GROWTH:
         raise ValueError(f"size {size} has no quarter to compare against")
-    small_size = size // GROWTH
+    if compare_with_larger:
+        small_size, large_size = size, size * GROWTH
+    else:
+        small_size, large_size = size // GROWTH, size
     budget_seconds = budget(base_budget_seconds)
     small_seconds = seconds_at(small_size)
     assert small_seconds < budget_seconds, (
-        f"{label}: {small_seconds:.4f} s at a quarter of the size "
-        f"({small_size}), over the budget {budget_seconds:.4f} s at host "
-        f"factor {host_factor():.2f}")
-    seconds = seconds_at(size)
-    timing = LinearTiming(label, small_size, small_seconds, size, seconds,
-                          budget_seconds)
-    assert timing.seconds < budget_seconds, timing.describe()
+        f"{label}: {small_seconds:.4f} s at size {small_size}, over the "
+        f"budget {budget_seconds:.4f} s at host factor {host_factor():.2f}")
+    seconds = seconds_at(large_size)
+    timing = LinearTiming(label, small_size, small_seconds, large_size,
+                          seconds, budget_seconds)
+    if not compare_with_larger:
+        assert timing.seconds < budget_seconds, timing.describe()
     for _ in range(GROWTH_RETRIES):
         if timing.ratio < GROWTH_LIMIT:
             break
         timing = LinearTiming(
             label, small_size, min(timing.small_seconds,
                                    seconds_at(small_size)),
-            size, min(timing.seconds, seconds_at(size)), budget_seconds)
+            large_size, min(timing.seconds, seconds_at(large_size)),
+            budget_seconds)
     assert timing.ratio < GROWTH_LIMIT, (
         f"superlinear growth: {timing.describe()}")
     return timing

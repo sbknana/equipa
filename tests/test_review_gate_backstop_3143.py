@@ -29,8 +29,10 @@ Also covered, each with rows that fail before this task:
 Copyright 2026 Forgeborn
 """
 
+import functools
 import hashlib
 import json
+import math
 import random
 import unicodedata
 from pathlib import Path
@@ -43,6 +45,7 @@ from equipa.security_gate import (
     review_complete_line,
     reviewer_nonce_line,
 )
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     decision_and_analysis,
     production_seconds,
@@ -623,129 +626,156 @@ def test_skill_manifest_hash_matches_the_prompt():
 RB = 200 * 1024
 
 
-def pad(line):
-    return [line] * (RB // (len(line.encode()) + 1) + 1)
+def pad(rb, line):
+    return [line] * (rb // (len(line.encode()) + 1) + 1)
 
 
-# The 40 families of the independent review of 3137 ...
-REVIEWER_FAMILIES = {
-    "nl_only": ["\n" * RB],
-    "cr_only": ["\r" * RB],
-    "u2028_only": ["\N{LINE SEPARATOR}" * (RB // 3)],
-    "crlf_only": ["\r\n" * (RB // 2)],
-    "ff_only": ["\x0c" * RB],
-    "sp_nl": ["    \n" * (RB // 5)],
-    "dash_nl": ["-\n" * (RB // 2)],
-    "bt_nl": ["`\n" * (RB // 2)],
-    "gt_nl": [">\n" * (RB // 2)],
-    "high_nl": ["HIGH\n" * (RB // 5)],
-    "esc_bt": ["\\`" * (RB // 2)],
-    "bt_runs_inc": ["".join("`" * i + "x" for i in range(1, 640))],
-    "cmt_open": ["<!--" * (RB // 4)],
-    "cmt_open_nl": ["<!--\n" * (RB // 5)],
-    "cmt_empty": ["<!-->" * (RB // 5)],
-    "cmt_bang": ["<!-- a --!>" * (RB // 11)],
-    "tag_open": ["<a" * (RB // 2)],
-    "tag_long": [("<a" + "x" * 498) * (RB // 500)],
-    "li_html": ["<li>> " * (RB // 6)],
-    "fn_flood": ["[^1]: " * (RB // 6)],
-    "fn_lines": pad("[^1]: [^2]: HIGH"),
-    "list_markers": ["- " * (RB // 2) + "HIGH: x"],
-    "ol_markers": ["1. " * (RB // 3) + "HIGH: x"],
-    "quote_markers": ["> " * (RB // 2) + "HIGH: x"],
-    "quote_lines_nested": pad("> " * 50 + "HIGH: x"),
-    "fence_lines": pad("```"),
-    "fence_li_lines": pad("- ```"),
-    "div_lines": pad("<div>"),
-    "pipe_rows": ["| a | b |", "|---|---|"] + pad("|" * 200),
-    "pipe_hi_rows": ["| a | b |", "|---|---|"]
-    + pad("| HIGH to | MEDIUM or | HIGH |"),
-    "comb_flood": ["H" + "\N{COMBINING LOW LINE}" * (RB // 2)],
-    "comb_mixed": ["a\N{COMBINING ACUTE ACCENT}" * (RB // 3)],
-    "amp_flood": ["&#72;" * (RB // 5)],
-    "amp_bad": ["&#x" * (RB // 3)],
-    "nbsp_runs": ["Severity:" + "\N{NO-BREAK SPACE}" * (RB // 2) + "HIGH"],
-    "sev_clause": [", severity HIGH" * (RB // 15)],
-    "title_runs": ["HIGH SQL " * (RB // 9)],
-    "indent_cont": ["Finding"] + pad("    HIGH: x"),
-    "marker_lines": pad("<!-- EQUIPA-X -->"),
-    "marker_inline": ["HI<!-- EQUIPA-X -->" * (RB // 19)],
-}
-# ... and floods aimed at the backstop. Most hide their words from the shape
-# rules (code spans, tallies, negations), so the backstop runs on all of it.
-BACKSTOP_FAMILIES = {
-    "code_tokens": ["`HIGH` " * (RB // 7)],
-    "code_token_lines": pad("`MEDIUM` `CRITICAL`"),
-    "tally_flood": ["0 HIGH, " * (RB // 8)],
-    "tally_after_flood": ["HIGH: 0 | " * (RB // 10)],
-    "negation_flood": ["no HIGH or " * (RB // 11)],
-    "list_join_flood": ["0 CRITICAL" + "/HIGH" * (RB // 5)],
-    "overall_risk_flood": ["Overall risk: MEDIUM. " * (RB // 22)],
-    "tag_flood": ["<b>" * (RB // 3)],
-    "tag_split_tokens": ["HI<b>GH " * (RB // 8)],
-    "multiline_tags": ["<a\nb>" * (RB // 5)],
-    "comment_split_lines": ["HI<!--\n-->GH " * (RB // 13)],
-    "bogus_comments": ["<!x><?y></ z>" * (RB // 13)],
-    "entity_no_semicolon": ["&#72IGH " * (RB // 8)],
-    "named_entity": ["&ampHIGH " * (RB // 9)],
-    "entity_newlines": ["&#10;" * (RB // 5)],
-    "fullwidth": ["ＨＩＧＨ " * (RB // 13)],
-    "small_caps": ["ʜɪɢʜ " * (RB // 9)],
-    "negative_squared": ["\U0001F177\U0001F178\U0001F176\U0001F177 "
-                         * (RB // 17)],
-    # More distinct code points than the backstop's translate table keeps,
-    # surrogates skipped (they cannot be written as UTF-8).
-    "distinct_code_points": ["".join(
-        chr(code_point) for code_point in range(0x4E00, 0x4E00 + RB // 3 + 2048)
-        if not 0xD800 <= code_point <= 0xDFFF
-    )],
-    "format_chars": ["H​I­G\U0001D173H " * (RB // 14)],
-    "counts_headings": pad("## Counts"),
-    "counts_tally_long": ["## Counts", "CRITICAL: 0 " * (RB // 12)],
-    "finding_headings": pad(f"### [S1] MEDIUM {E} x MEDIUM"),
-    "id_lines": [f"### [S{index}] MEDIUM {E} x" for index in range(2000)]
-    + pad("S7 MEDIUM S9 MEDIUM"),
-    # Task 3152 (R3149-05): the link reader over a "]" that forms no link,
-    # after one "[" far back (23 s on 200 KB on branch 3149).
-    "link_definition_then_closes": ["[a]: x", "", "a[" + "b]" * (RB // 2)],
-    "link_open_then_inline_tails": ["a[" + "b](" * (RB // 3)],
-    "link_definition_then_bare_closes": ["[a]: x", "", "a]" * (RB // 2)],
-    # Task 3152 (R3149-04): a reference reads every digit, and U+FFFD is
-    # decided by the digit count (no int() of 200 000 digits).
-    "reference_of_200kb_digits": ["&#" + "9" * RB + "HIGH"],
-    "hex_reference_of_200kb_digits": ["&#x" + "f" * RB + "HIGH"],
-    "zero_padded_reference_of_200kb": ["&#" + "0" * RB + "72;IGH"],
-    # Task 3164 (R3161-02): a lookalike capital eta leading each word (0.53
-    # to 0.57 s before), and a combining mark after each letter or each word
-    # (one mark-stripper callback per short non-ASCII run).
-    "eta_led": ["\N{GREEK CAPITAL LETTER ETA}IGH " * (RB // 6)],
-    "mark_after_each_letter": [
-        ("".join(f"{letter}\N{COMBINING ACUTE ACCENT}" for letter in "HIGH")
-         + " ") * (RB // 13)],
-    "mark_after_each_word": ["HIGH\N{COMBINING ACUTE ACCENT} " * (RB // 7)],
-    # Task 3167 (I3164-01): a finding heading followed by a run of "(" or
-    # "[" made the resolved-status regex read the rest of the line from
-    # every bracket (100 KB took 170 s in the gate).
-    "heading_then_open_parens": ["### [S1] HIGH " + "(" * RB],
-    "heading_then_open_brackets": ["### [S1] HIGH " + "([" * (RB // 2)],
-    "low_heading_then_open_parens": ["### [S1] LOW " + "(" * RB],
-    "heading_then_not_counted_runs": [
-        "### [S1] HIGH " + "(not counted " * (RB // 13)],
-    # Task 3167 (R3164-03): references to distinct characters, which the
-    # rendered view decodes into more distinct characters than the raw
-    # text's cap allows, alone and after a lookalike capital eta.
-    "distinct_hex_references": ["".join(
-        f"&#x{code_point:x}; " for code_point in range(0x4E00, 0x4E00 + RB // 9))],
-    "eta_then_distinct_reference": ["".join(
-        f"\N{GREEK CAPITAL LETTER ETA}IGH &#x{code_point:x}; "
-        for code_point in range(0x4E00, 0x4E00 + RB // 15))],
-    # Task 3170 (IR67-03): a finding heading followed by a run of resolved
-    # statuses, each separator a place the resolved-status regex tried (0.42
-    # and 0.44 s through the gate in the independent review of 3167).
-    "heading_then_dash_fixed_runs": ["### [S1] HIGH " + " - FIXED" * (RB // 8)],
-    "heading_then_em_dash_fixed_runs": [
-        "### [S1] HIGH " + f" {E} FIXED" * (RB // 10)],
-}
+# Each family is built at a size in bytes ``rb``: the timing test times it at
+# RB and at a quarter of RB (task 3171), so a superlinear scan fails on its
+# growth as well as on its host-calibrated budget.
+@functools.lru_cache(maxsize=None)
+def reviewer_families(rb=RB):
+    """The 40 families of the independent review of 3137 ..."""
+    return {
+        "nl_only": ["\n" * rb],
+        "cr_only": ["\r" * rb],
+        "u2028_only": ["\N{LINE SEPARATOR}" * (rb // 3)],
+        "crlf_only": ["\r\n" * (rb // 2)],
+        "ff_only": ["\x0c" * rb],
+        "sp_nl": ["    \n" * (rb // 5)],
+        "dash_nl": ["-\n" * (rb // 2)],
+        "bt_nl": ["`\n" * (rb // 2)],
+        "gt_nl": [">\n" * (rb // 2)],
+        "high_nl": ["HIGH\n" * (rb // 5)],
+        "esc_bt": ["\\`" * (rb // 2)],
+        "bt_runs_inc": ["".join("`" * i + "x" for i in range(1, math.isqrt(2 * rb)))],
+        "cmt_open": ["<!--" * (rb // 4)],
+        "cmt_open_nl": ["<!--\n" * (rb // 5)],
+        "cmt_empty": ["<!-->" * (rb // 5)],
+        "cmt_bang": ["<!-- a --!>" * (rb // 11)],
+        "tag_open": ["<a" * (rb // 2)],
+        "tag_long": [("<a" + "x" * 498) * (rb // 500)],
+        "li_html": ["<li>> " * (rb // 6)],
+        "fn_flood": ["[^1]: " * (rb // 6)],
+        "fn_lines": pad(rb, "[^1]: [^2]: HIGH"),
+        "list_markers": ["- " * (rb // 2) + "HIGH: x"],
+        "ol_markers": ["1. " * (rb // 3) + "HIGH: x"],
+        "quote_markers": ["> " * (rb // 2) + "HIGH: x"],
+        "quote_lines_nested": pad(rb, "> " * 50 + "HIGH: x"),
+        "fence_lines": pad(rb, "```"),
+        "fence_li_lines": pad(rb, "- ```"),
+        "div_lines": pad(rb, "<div>"),
+        "pipe_rows": ["| a | b |", "|---|---|"] + pad(rb, "|" * 200),
+        "pipe_hi_rows": ["| a | b |", "|---|---|"]
+        + pad(rb, "| HIGH to | MEDIUM or | HIGH |"),
+        "comb_flood": ["H" + "\N{COMBINING LOW LINE}" * (rb // 2)],
+        "comb_mixed": ["a\N{COMBINING ACUTE ACCENT}" * (rb // 3)],
+        "amp_flood": ["&#72;" * (rb // 5)],
+        "amp_bad": ["&#x" * (rb // 3)],
+        "nbsp_runs": ["Severity:" + "\N{NO-BREAK SPACE}" * (rb // 2) + "HIGH"],
+        "sev_clause": [", severity HIGH" * (rb // 15)],
+        "title_runs": ["HIGH SQL " * (rb // 9)],
+        "indent_cont": ["Finding"] + pad(rb, "    HIGH: x"),
+        "marker_lines": pad(rb, "<!-- EQUIPA-X -->"),
+        "marker_inline": ["HI<!-- EQUIPA-X -->" * (rb // 19)],
+    }
+
+
+@functools.lru_cache(maxsize=None)
+def backstop_families(rb=RB):
+    """... and floods aimed at the backstop. Most hide their words from the
+    shape rules (code spans, tallies, negations), so the backstop runs on all
+    of it."""
+    return {
+        "code_tokens": ["`HIGH` " * (rb // 7)],
+        "code_token_lines": pad(rb, "`MEDIUM` `CRITICAL`"),
+        "tally_flood": ["0 HIGH, " * (rb // 8)],
+        "tally_after_flood": ["HIGH: 0 | " * (rb // 10)],
+        "negation_flood": ["no HIGH or " * (rb // 11)],
+        "list_join_flood": ["0 CRITICAL" + "/HIGH" * (rb // 5)],
+        "overall_risk_flood": ["Overall risk: MEDIUM. " * (rb // 22)],
+        "tag_flood": ["<b>" * (rb // 3)],
+        "tag_split_tokens": ["HI<b>GH " * (rb // 8)],
+        "multiline_tags": ["<a\nb>" * (rb // 5)],
+        "comment_split_lines": ["HI<!--\n-->GH " * (rb // 13)],
+        "bogus_comments": ["<!x><?y></ z>" * (rb // 13)],
+        "entity_no_semicolon": ["&#72IGH " * (rb // 8)],
+        "named_entity": ["&ampHIGH " * (rb // 9)],
+        "entity_newlines": ["&#10;" * (rb // 5)],
+        "fullwidth": ["ＨＩＧＨ " * (rb // 13)],
+        "small_caps": ["ʜɪɢʜ " * (rb // 9)],
+        "negative_squared": ["\U0001F177\U0001F178\U0001F176\U0001F177 "
+                             * (rb // 17)],
+        # More distinct code points than the backstop's translate table keeps,
+        # surrogates skipped (they cannot be written as UTF-8).
+        "distinct_code_points": ["".join(
+            chr(code_point) for code_point in range(0x4E00, 0x4E00 + rb // 3 + 2048)
+            if not 0xD800 <= code_point <= 0xDFFF
+        )],
+        "format_chars": ["H​I­G\U0001D173H " * (rb // 14)],
+        "counts_headings": pad(rb, "## Counts"),
+        "counts_tally_long": ["## Counts", "CRITICAL: 0 " * (rb // 12)],
+        "finding_headings": pad(rb, f"### [S1] MEDIUM {E} x MEDIUM"),
+        "id_lines": [f"### [S{index}] MEDIUM {E} x" for index in range(2000)]
+        + pad(rb, "S7 MEDIUM S9 MEDIUM"),
+        # Task 3152 (R3149-05): the link reader over a "]" that forms no link,
+        # after one "[" far back (23 s on 200 KB on branch 3149).
+        "link_definition_then_closes": ["[a]: x", "", "a[" + "b]" * (rb // 2)],
+        "link_open_then_inline_tails": ["a[" + "b](" * (rb // 3)],
+        "link_definition_then_bare_closes": ["[a]: x", "", "a]" * (rb // 2)],
+        # Task 3152 (R3149-04): a reference reads every digit, and U+FFFD is
+        # decided by the digit count (no int() of 200 000 digits).
+        "reference_of_200kb_digits": ["&#" + "9" * rb + "HIGH"],
+        "hex_reference_of_200kb_digits": ["&#x" + "f" * rb + "HIGH"],
+        "zero_padded_reference_of_200kb": ["&#" + "0" * rb + "72;IGH"],
+        # Task 3164 (R3161-02): a lookalike capital eta leading each word (0.53
+        # to 0.57 s before), and a combining mark after each letter or each word
+        # (one mark-stripper callback per short non-ASCII run).
+        "eta_led": ["\N{GREEK CAPITAL LETTER ETA}IGH " * (rb // 6)],
+        "mark_after_each_letter": [
+            ("".join(f"{letter}\N{COMBINING ACUTE ACCENT}" for letter in "HIGH")
+             + " ") * (rb // 13)],
+        "mark_after_each_word": ["HIGH\N{COMBINING ACUTE ACCENT} " * (rb // 7)],
+        # Task 3167 (I3164-01): a finding heading followed by a run of "(" or
+        # "[" made the resolved-status regex read the rest of the line from
+        # every bracket (100 KB took 170 s in the gate).
+        "heading_then_open_parens": ["### [S1] HIGH " + "(" * rb],
+        "heading_then_open_brackets": ["### [S1] HIGH " + "([" * (rb // 2)],
+        "low_heading_then_open_parens": ["### [S1] LOW " + "(" * rb],
+        "heading_then_not_counted_runs": [
+            "### [S1] HIGH " + "(not counted " * (rb // 13)],
+        # Task 3167 (R3164-03): references to distinct characters, which the
+        # rendered view decodes into more distinct characters than the raw
+        # text's cap allows, alone and after a lookalike capital eta.
+        "distinct_hex_references": ["".join(
+            f"&#x{code_point:x}; " for code_point in range(0x4E00, 0x4E00 + rb // 9))],
+        "eta_then_distinct_reference": ["".join(
+            f"\N{GREEK CAPITAL LETTER ETA}IGH &#x{code_point:x}; "
+            for code_point in range(0x4E00, 0x4E00 + rb // 15))],
+        # Task 3170 (IR67-03): a finding heading followed by a run of resolved
+        # statuses, each separator a place the resolved-status regex tried (0.42
+        # and 0.44 s through the gate in the independent review of 3167).
+        "heading_then_dash_fixed_runs": ["### [S1] HIGH " + " - FIXED" * (rb // 8)],
+        "heading_then_em_dash_fixed_runs": [
+            "### [S1] HIGH " + f" {E} FIXED" * (rb // 10)],
+    }
+
+
+REVIEWER_FAMILIES = reviewer_families(RB)
+BACKSTOP_FAMILIES = backstop_families(RB)
+# Families holding more distinct characters than the backstop's translate
+# table keeps (loops._BACKSTOP_TABLE_LIMIT): a quarter of 200 KB cannot, so
+# their growth is measured from 200 KB to 800 KB.
+LARGER_ONLY_FAMILIES = frozenset({"distinct_code_points"})
+
+
+def family_review_seconds(name, rb):
+    """The merge gate's time on the review holding family ``name`` built at
+    ``rb`` bytes."""
+    body = {**reviewer_families(rb), **backstop_families(rb)}[name]
+    text = review("No findings.", body, ZERO)
+    assert len(text.encode()) >= rb * 0.99, name
+    return production_seconds(text)
 
 
 @timing_test
@@ -753,12 +783,11 @@ BACKSTOP_FAMILIES = {
                                          **BACKSTOP_FAMILIES}))
 def test_200kb_adversarial_review_parses_in_half_a_second(name):
     """Timed through the merge gate itself (task 3167, I3164-03): provenance
-    reads, hashes and normalises the artifact before the parser runs."""
-    body = {**REVIEWER_FAMILIES, **BACKSTOP_FAMILIES}[name]
-    text = review("No findings.", body, ZERO)
-    assert len(text.encode()) >= RB * 0.99, name
-    elapsed = production_seconds(text)
-    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    reads, hashes and normalises the artifact before the parser runs. The
+    0.5 s budget is scaled by the host factor and the time must grow
+    linearly from 50 KB to 200 KB (task 3171)."""
+    assert_linear_time(lambda rb: family_review_seconds(name, rb), RB, 0.5,
+                       name, compare_with_larger=name in LARGER_ONLY_FAMILIES)
 
 
 def test_the_reviewer_timing_set_has_forty_families():
