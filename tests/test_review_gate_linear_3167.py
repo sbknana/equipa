@@ -29,6 +29,7 @@ import dataclasses
 import itertools
 import random
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -47,6 +48,7 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
+    GROWTH_RETRIES,
     assert_linear_time,
     budget,
     growth_ratio,
@@ -262,28 +264,102 @@ def _best_scan_seconds(pattern, anchored, text, runs=3):
     return min(_scan_seconds(pattern, anchored, text) for _ in range(runs))
 
 
+SCAN_RUNS = 3
+# The larger text of a growth pair stays under this many characters.
+MAX_GROWTH_SCAN_CHARACTERS = 4 * 1024 * 1024
+
+
+def _median_scan_seconds(pattern, anchored, text, runs=SCAN_RUNS):
+    return statistics.median(_scan_seconds(pattern, anchored, text)
+                             for _ in range(runs))
+
+
+@dataclasses.dataclass(frozen=True)
+class ScanGrowth:
+    quarter_count: int
+    quarter_seconds: float
+    seconds: float
+
+    @property
+    def ratio(self):
+        return growth_ratio(self.quarter_seconds, self.seconds)
+
+
+def scan_growth(pattern, anchored, prefix, unit, count):
+    """How a scan of ``prefix + unit * n`` grows from a quarter size to four
+    times it (task 3175). A ratio of sub-millisecond scans is noise (CI read
+    0.0006 s against 0.0052 s on a linear regex), so the quarter size starts
+    at ``count`` units and doubles until one scan of it takes
+    ``GROWTH_FLOOR_SECONDS`` (or the larger text would pass
+    ``MAX_GROWTH_SCAN_CHARACTERS``). Each size is the median of
+    ``SCAN_RUNS`` scans, measured again (keeping the faster median) while
+    the ratio is over the limit."""
+    quarter_count = count
+    while True:
+        quarter_text = prefix + unit * quarter_count
+        if (_scan_seconds(pattern, anchored, quarter_text)
+                >= GROWTH_FLOOR_SECONDS
+                or len(quarter_text) * GROWTH * 2
+                > MAX_GROWTH_SCAN_CHARACTERS):
+            break
+        quarter_count *= 2
+    text = prefix + unit * (quarter_count * GROWTH)
+    growth = ScanGrowth(quarter_count,
+                        _median_scan_seconds(pattern, anchored, quarter_text),
+                        _median_scan_seconds(pattern, anchored, text))
+    for _ in range(GROWTH_RETRIES):
+        if growth.ratio < GROWTH_LIMIT:
+            break
+        growth = ScanGrowth(
+            quarter_count,
+            min(growth.quarter_seconds,
+                _median_scan_seconds(pattern, anchored, quarter_text)),
+            min(growth.seconds, _median_scan_seconds(pattern, anchored, text)))
+    return growth
+
+
+def superlinear_scan(pattern, anchored, prefix, unit, count, seconds):
+    """The ``ScanGrowth`` of a pair that grows faster than linear, or None.
+    ``seconds`` is the pair's time at ``count`` units (a best of three, over
+    a screening floor of milliseconds). A first look times one scan of four
+    times as many units: linear work reads about 4x and passes. A pair that
+    reads ``GROWTH_LIMIT`` or more there is decided by ``scan_growth``, on
+    scans of at least ``GROWTH_FLOOR_SECONDS``, never by the first look."""
+    larger = prefix + unit * (count * GROWTH)
+    if _scan_seconds(pattern, anchored, larger) < seconds * GROWTH_LIMIT:
+        return None
+    growth = scan_growth(pattern, anchored, prefix, unit, count)
+    return growth if growth.ratio >= GROWTH_LIMIT else None
+
+
+# A pair whose scan at the test's size takes less than this is fast whatever
+# its growth, and is not measured further (the value the shared floor had
+# when this scan was written, task 3171).
+SCAN_SCREEN_SECONDS = 0.002
+
+
 @timing_test
 def test_no_loops_regex_is_slow_on_a_bracket_run():
-    """Each (prefix, unit) pair is held to a host-calibrated 0.1 s at 50 KB,
-    and one that takes measurable time must grow linearly from 12.5 KB to
-    50 KB (task 3171); a slow or superlinear-looking pair is timed again
-    (best of three) before it counts."""
+    """Each (prefix, unit) pair is held to a host-calibrated 0.1 s at 50 KB
+    (best of three), and one that takes measurable time must grow linearly
+    from 50 KB on, decided on scans of at least GROWTH_FLOOR_SECONDS
+    (``superlinear_scan``; tasks 3171, 3175)."""
     slow = []
     for name, pattern in sorted(_module_patterns().items()):
         anchored = _called_anchored_only(name)
         for prefix, unit in itertools.product(SCAN_PREFIXES, SCAN_UNITS):
             count = SCAN_BYTES // len(unit)
             text = prefix + unit * count
-            elapsed = _scan_seconds(pattern, anchored, text)
-            if elapsed < GROWTH_FLOOR_SECONDS:
+            if _scan_seconds(pattern, anchored, text) < SCAN_SCREEN_SECONDS:
                 continue
             elapsed = _best_scan_seconds(pattern, anchored, text)
-            quarter = prefix + unit * (count // GROWTH)
-            quarter_elapsed = _best_scan_seconds(pattern, anchored, quarter)
-            if (elapsed > budget(0.1)
-                    or growth_ratio(quarter_elapsed, elapsed) >= GROWTH_LIMIT):
-                slow.append((name, prefix, unit, round(quarter_elapsed, 4),
-                             round(elapsed, 4)))
+            if elapsed > budget(0.1):
+                slow.append((name, prefix, unit, "budget", round(elapsed, 4)))
+                continue
+            growth = superlinear_scan(pattern, anchored, prefix, unit, count,
+                                      elapsed)
+            if growth is not None:
+                slow.append((name, prefix, unit, growth))
     assert slow == []
 
 

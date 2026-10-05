@@ -29,7 +29,13 @@ import random
 import pytest
 
 from equipa import loops
-from tests.host_timing import GROWTH, GROWTH_LIMIT, assert_linear_time, budget
+from tests.host_timing import (
+    GROWTH,
+    GROWTH_FLOOR_SECONDS,
+    GROWTH_LIMIT,
+    assert_linear_time,
+    budget,
+)
 from tests.review_gate_production import blocked_by_the_gate
 from tests.review_gate_timing import median_cpu_seconds, timing_test
 from tests.test_review_gate_backstop_3143 import (
@@ -43,6 +49,8 @@ from tests.test_review_gate_linear_3167 import (
     _called_anchored_only,
     _module_patterns,
     _scan_seconds,
+    scan_growth,
+    superlinear_scan,
 )
 
 EM_DASH = "\N{EM DASH}"
@@ -230,8 +238,9 @@ GROWTH_UNITS = [
     "a\N{COMBINING ACUTE ACCENT}", "\N{NO-BREAK SPACE}",
 ]
 SMALL_BYTES = 8 * 1024
-# Below this a scan's time is mostly noise, and fast whatever its growth.
-GROWTH_FLOOR_SECONDS = 0.004
+# A pair whose scan at 32 KB takes less than this is fast whatever its
+# growth, and is not measured further.
+SCREEN_FLOOR_SECONDS = 0.004
 # Scaled by the host factor (tests/host_timing.py, task 3171); GROWTH and
 # GROWTH_LIMIT are the shared ones.
 LARGE_BUDGET_SECONDS = 0.05
@@ -250,29 +259,31 @@ def test_the_growth_scan_sees_every_gate_regex():
 @timing_test
 def test_no_loops_regex_grows_faster_than_linear():
     """Timed the way loops.py calls each regex (see
-    tests/test_review_gate_linear_3167.py), at 8 KB and 32 KB of every
-    (prefix, unit) pair. A pair that looks superlinear or slow once is timed
-    again (best of three) before it counts."""
+    tests/test_review_gate_linear_3167.py) on every (prefix, unit) pair.
+    A pair that takes measurable time at 32 KB is held there to its budget
+    (best of three) and must grow linearly from 32 KB on, decided on scans
+    of at least GROWTH_FLOOR_SECONDS (``superlinear_scan``). CI flagged
+    _INLINE_CODE_RE at 0.0006 s against 0.0052 s: a sub-millisecond ratio
+    of a linear regex (task 3175)."""
     slow = []
     for name, pattern in sorted(_module_patterns().items()):
         if name in KNOWN_SUPERLINEAR:
             continue
         anchored = _called_anchored_only(name)
         for prefix, unit in itertools.product(GROWTH_PREFIXES, GROWTH_UNITS):
-            count = SMALL_BYTES // len(unit.encode())
-            small = prefix + unit * count
-            large = prefix + unit * (count * GROWTH)
-            large_seconds = _scan_seconds(pattern, anchored, large)
-            if large_seconds < GROWTH_FLOOR_SECONDS:
+            count = SMALL_BYTES // len(unit.encode()) * GROWTH
+            large = prefix + unit * count
+            if _scan_seconds(pattern, anchored, large) < SCREEN_FLOOR_SECONDS:
                 continue
             large_seconds = _best_scan_seconds(pattern, anchored, large)
-            small_seconds = _best_scan_seconds(pattern, anchored, small)
-            ratio = large_seconds / max(small_seconds, 1e-6)
-            if (large_seconds > budget(LARGE_BUDGET_SECONDS)
-                    or (large_seconds >= GROWTH_FLOOR_SECONDS
-                        and ratio > GROWTH_LIMIT)):
-                slow.append((name, prefix, unit, round(small_seconds, 4),
+            if large_seconds > budget(LARGE_BUDGET_SECONDS):
+                slow.append((name, prefix, unit, "budget",
                              round(large_seconds, 4)))
+                continue
+            growth = superlinear_scan(pattern, anchored, prefix, unit, count,
+                                      large_seconds)
+            if growth is not None:
+                slow.append((name, prefix, unit, growth))
     assert slow == []
 
 
@@ -281,12 +292,38 @@ CONTROL_SMALL_BYTES = 1024
 
 def test_the_growth_scan_flags_a_quadratic_regex():
     """The scan's own control: the known quadratic regex on a digit run
-    (1 KB and 4 KB, already well over the floor; 32 KB takes seconds)."""
+    (from 1 KB, doubled until a scan takes the floor; 32 KB takes
+    seconds)."""
     pattern = loops._SHORTSTAT_RE
     anchored = _called_anchored_only("_SHORTSTAT_RE")
-    small = "1" * CONTROL_SMALL_BYTES
-    large = "1" * (CONTROL_SMALL_BYTES * GROWTH)
-    large_seconds = _best_scan_seconds(pattern, anchored, large)
-    small_seconds = _best_scan_seconds(pattern, anchored, small)
-    assert large_seconds >= GROWTH_FLOOR_SECONDS
-    assert large_seconds / max(small_seconds, 1e-6) > GROWTH_LIMIT
+    growth = scan_growth(pattern, anchored, "", "1", CONTROL_SMALL_BYTES)
+    assert growth.quarter_seconds >= GROWTH_FLOOR_SECONDS
+    assert growth.ratio > GROWTH_LIMIT
+    seconds = _best_scan_seconds(pattern, anchored, "1" * CONTROL_SMALL_BYTES)
+    flagged = superlinear_scan(pattern, anchored, "", "1",
+                               CONTROL_SMALL_BYTES, seconds)
+    assert flagged is not None and flagged.ratio > GROWTH_LIMIT
+
+
+CI_PREFIX = "- **[S1] HIGH** "
+
+
+def test_the_growth_scan_never_compares_sub_millisecond_scans():
+    """The CI shape: one scan of the quarter size takes under a millisecond,
+    so the size doubles until it takes the floor, and the linear regex reads
+    about 4x."""
+    pattern = loops._INLINE_CODE_RE
+    anchored = _called_anchored_only("_INLINE_CODE_RE")
+    growth = scan_growth(pattern, anchored, CI_PREFIX, "`", SMALL_BYTES)
+    assert growth.quarter_count > SMALL_BYTES
+    assert growth.quarter_seconds >= GROWTH_FLOOR_SECONDS / 2
+    assert growth.ratio < GROWTH_LIMIT
+
+
+def test_a_noisy_first_look_is_not_the_verdict():
+    """CI's reading (0.0006 s at the smaller size, 8.7x) only sends the pair
+    to ``scan_growth``, which reads the linear regex as linear."""
+    pattern = loops._INLINE_CODE_RE
+    anchored = _called_anchored_only("_INLINE_CODE_RE")
+    assert superlinear_scan(pattern, anchored, CI_PREFIX, "`",
+                            SMALL_BYTES * GROWTH, 0.0006) is None
