@@ -211,12 +211,13 @@ def _module_patterns():
 
 
 def _called_anchored_only(name):
-    """True when every use of ``name`` in loops.py is ``.match(`` or
-    ``.fullmatch(`` (one attempt from a given position)."""
-    uses = re.findall(rf"\b{re.escape(name)}\b(\.\w+\()?", LOOPS_SOURCE)
-    calls = [use for use in uses[1:]]  # uses[0] is the definition
-    return bool(calls) and all(call in (".match(", ".fullmatch(")
-                               for call in calls)
+    """True when every use of ``name`` in loops.py (its definition aside) is
+    ``.match(`` or ``.fullmatch(`` (one attempt from a given position). A
+    bare mention (passed on by name, or a comment) counts as unanchored."""
+    uses = re.findall(rf"\b{re.escape(name)}\b(?! = )(\.\w+\()?",
+                      LOOPS_SOURCE)
+    return bool(uses) and all(use in (".match(", ".fullmatch(")
+                              for use in uses)
 
 
 def test_the_scan_sees_the_gate_regexes():
