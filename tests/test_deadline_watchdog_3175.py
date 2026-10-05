@@ -49,26 +49,47 @@ def test_tests_run_on_the_main_thread_the_handler_runs_on():
 
 def test_a_watchdog_thread_could_not_have_cut_a_regex():
     """Why the soft stage is a kernel timer: the regex engine holds the GIL,
-    so a thread waiting to send a signal never runs during the match."""
-    ticks = []
+    so a thread waiting to send a signal never runs during the match.
+
+    Each tick records how much CPU time the main thread had used, not the
+    wall clock. The deadline handler runs Python code near the end of the
+    match (and again on an early re-arm), and the tick thread may take the
+    GIL there; on a loaded host the main thread can then wait in the run
+    queue long after that tick. On the main thread's CPU clock the wait
+    costs nothing, so a tick between 0.05 s and 0.35 s of the match's CPU
+    time can only mean the GIL was let go while the engine backtracked."""
+    main_cpu_clock = time.pthread_getcpuclockid(threading.main_thread().ident)
+    ticks: list[float] = []
     stop = threading.Event()
 
     def tick() -> None:
         while not stop.wait(0.01):
-            ticks.append(time.monotonic())
+            ticks.append(time.clock_gettime(main_cpu_clock))
 
     thread = threading.Thread(target=tick, daemon=True)
     thread.start()
-    time.sleep(0.05)
+    # The tick thread runs and reads the main thread's clock (bounded wait,
+    # so a loaded host only makes this slower).
+    for _ in range(1000):
+        if ticks:
+            break
+        time.sleep(0.01)
+    assert ticks, "the tick thread never ran"
     with pytest.raises(DeadlineExceeded):
         with deadline(0.5, "gil probe"):
             started = time.monotonic()
+            cpu_started = time.clock_gettime(main_cpu_clock)
             CATASTROPHIC.match(CATASTROPHIC_INPUT)
     ended = time.monotonic()
+    cpu_ended = time.clock_gettime(main_cpu_clock)
     stop.set()
     thread.join()
     assert ended - started >= 0.4
-    assert not [tick for tick in ticks if started + 0.05 < tick < ended - 0.05]
+    # The deadline is 0.5 s of the process's CPU time; the tick thread and
+    # the xdist thread use next to none of it while the match runs.
+    assert cpu_ended - cpu_started >= 0.4
+    assert not [tick for tick in ticks
+                if cpu_started + 0.05 < tick < cpu_started + 0.35]
 
 
 def test_every_test_phase_runs_under_a_deadline(request):
