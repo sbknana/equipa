@@ -3,7 +3,8 @@
 A quadratic regression put back into a timing test ran past 40 minutes; on
 CI that is a job timeout naming no test. Every test now runs under a
 deadline that fails it by name: a signal raises ``DeadlineExceeded`` into
-the test, and a faulthandler stop ends the process if that is swallowed.
+the test, and a timer signal (faulthandler writing every traceback first)
+ends the process if that is swallowed.
 
 The child pytest runs below load the plugin with ``-p`` in a scratch
 directory, so their tiny deadlines never touch this session.
@@ -27,6 +28,7 @@ import pytest
 from tests import deadline_watchdog
 from tests.deadline_watchdog import (
     AFTER_A_HANG_DEADLINE_SECONDS,
+    HARD_STOP_SIGNAL,
     TEST_DEADLINE_SECONDS,
     TIMING_TEST_DEADLINE_SECONDS,
     DeadlineExceeded,
@@ -297,8 +299,38 @@ def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
 
 
 def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):
+    """The deadline is 1 s, so the hard stop comes 2 s in on the wall
+    clock: the timer's signal ends the pytest process after faulthandler
+    has written the test's frame."""
     started = time.monotonic()
     completed = _run_scratch(tmp_path, "-k", "swallows", swallow=True)
+    assert completed.returncode == -HARD_STOP_SIGNAL, (
+        completed.stdout + completed.stderr)
+    assert "(most recent call first)" in completed.stderr, completed.stderr
+    assert re.search(r'File ".*test_scratch.py", line \d+ in '
+                     r"test_swallows_the_deadline", completed.stderr), (
+        completed.stderr)
+    assert time.monotonic() - started < 60
+
+
+IGNORE_HARD_STOP_SIGNAL_PLUGIN = '''
+import signal
+from tests.deadline_watchdog import HARD_STOP_SIGNAL
+
+signal.signal(HARD_STOP_SIGNAL, signal.SIG_IGN)
+'''
+
+
+def test_with_the_signal_taken_the_thread_stops_a_swallowed_deadline(
+        tmp_path):
+    """A process whose hard-stop signal is not at its default disposition
+    (here: ignored, as a parent could leave it) falls back to faulthandler's
+    watchdog thread, which stops the process as well."""
+    (tmp_path / "ignore_hard_stop_signal.py").write_text(
+        IGNORE_HARD_STOP_SIGNAL_PLUGIN, encoding="utf-8")
+    started = time.monotonic()
+    completed = _run_scratch(tmp_path, "-p", "ignore_hard_stop_signal", "-k",
+                             "swallows", swallow=True)
     assert completed.returncode == 1, completed.stdout + completed.stderr
     assert re.search(r"^Timeout \(0:00:0[0-2][.\d]*\)!$", completed.stderr,
                      re.MULTILINE), completed.stderr
@@ -306,6 +338,35 @@ def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):
                      r"test_swallows_the_deadline", completed.stderr), (
         completed.stderr)
     assert time.monotonic() - started < 60
+
+
+def test_this_session_stops_a_hang_without_a_thread():
+    assert deadline_watchdog.hard_stop_mechanism() == "signal timer"
+
+
+NO_HIDDEN_THREAD_SCRATCH_TESTS = '''
+import os
+import threading
+
+from tests import deadline_watchdog
+
+
+def test_no_hidden_thread_while_a_deadline_is_armed():
+    """faulthandler's watchdog thread is a C thread: the kernel counts it,
+    the threading module does not."""
+    assert deadline_watchdog.active_deadlines()
+    assert len(os.listdir("/proc/self/task")) == threading.active_count()
+'''
+
+
+def test_an_armed_deadline_costs_the_process_no_task(tmp_path):
+    """A thread per armed deadline is a task per xdist worker: at -n 16
+    under systemd TasksMax=64 the run peaked at 69 tasks without one."""
+    completed = _run_scratch(tmp_path,
+                             source=NO_HIDDEN_THREAD_SCRATCH_TESTS)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "1 passed" in output, output
 
 
 def test_under_xdist_a_swallowed_deadline_is_a_named_crash(tmp_path):

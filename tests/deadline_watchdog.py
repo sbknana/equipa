@@ -20,11 +20,17 @@ the standard library, in two stages:
    uses it.
 2. **Hard, on wall time.** A test that swallows that exception, sits in C
    code that never checks for signals, or waits without using CPU is
-   stopped by ``faulthandler.dump_traceback_later(exit=True)`` once the
-   deadline plus a grace has passed on the wall clock: every thread's
-   traceback (the test's frame included) goes to the session's stderr and
-   the process exits. Under xdist the controller reports "worker crashed
-   while running <test>".
+   stopped once the deadline plus a grace has passed on the wall clock: a
+   POSIX timer on ``CLOCK_MONOTONIC`` (``timer_create`` through ``ctypes``)
+   sends ``HARD_STOP_SIGNAL``, ``faulthandler`` writes every thread's
+   traceback (the test's frame included) to the session's stderr from C,
+   and the signal's default action then ends the process. Under xdist the
+   controller reports "worker crashed while running <test>". The timer
+   runs no thread. ``faulthandler.dump_traceback_later`` starts one each
+   time it is armed: one more task per xdist worker, and at ``-n 16``
+   under a task cap (systemd ``TasksMax=64``) the run had already peaked
+   at 69 tasks without it. Where ``timer_create`` is missing (not 64-bit
+   Linux), that thread is the hard stop.
 
 A test gets ``TEST_DEADLINE_SECONDS``, a test of a module that imports
 ``tests/host_timing.py`` gets ``TIMING_TEST_DEADLINE_SECONDS``, and
@@ -42,18 +48,25 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import faulthandler
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pytest
 
 DEADLINE_TIMER = signal.ITIMER_PROF
 DEADLINE_SIGNAL = signal.SIGPROF
+# The hard stop's signal: a real-time one nothing else here uses (glibc
+# keeps the lowest ones for its threads), whose default action ends the
+# process. None where the platform has no real-time signals.
+HARD_STOP_SIGNAL: int | None = (
+    signal.SIGRTMAX - 3 if hasattr(signal, "SIGRTMAX") else None)
 # The slowest test took 92 s of wall time with every core busy (16
 # workers); a CI runner is slower, and the CI job stops at 30 minutes.
 TEST_DEADLINE_SECONDS = 600.0
@@ -109,6 +122,131 @@ class Deadline:
                 f"superlinear regression?")
 
 
+# --- The hard stop ------------------------------------------------------------
+
+_CLOCK_MONOTONIC = 1
+_SIGEV_SIGNAL = 0
+_SIGEVENT_BYTES = 64
+
+
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+class _Itimerspec(ctypes.Structure):
+    _fields_ = [("it_interval", _Timespec), ("it_value", _Timespec)]
+
+
+class _Sigevent(ctypes.Structure):
+    """``struct sigevent`` on 64-bit Linux: the ``sigval`` union, the signal,
+    the notification kind, then a union padding the struct to 64 bytes."""
+
+    _fields_ = [("sigev_value", ctypes.c_void_p),
+                ("sigev_signo", ctypes.c_int),
+                ("sigev_notify", ctypes.c_int),
+                ("_padding", ctypes.c_int * 12)]
+
+
+def _timer_functions() -> tuple[Callable[..., int], Callable[..., int]]:
+    """``timer_create`` and ``timer_settime``: in the C library since glibc
+    2.34, in librt before. Raises ``OSError`` where they cannot be used."""
+    if not (sys.platform.startswith("linux")
+            and ctypes.sizeof(ctypes.c_void_p) == 8
+            and ctypes.sizeof(ctypes.c_long) == 8
+            and ctypes.sizeof(_Sigevent) == _SIGEVENT_BYTES):
+        raise OSError("POSIX timers are only used on 64-bit Linux here")
+    for library_name in (None, "librt.so.1"):
+        try:
+            library = ctypes.CDLL(library_name, use_errno=True)
+            create, settime = library.timer_create, library.timer_settime
+        except (OSError, AttributeError):
+            continue
+        create.argtypes = [ctypes.c_int, ctypes.POINTER(_Sigevent),
+                           ctypes.POINTER(ctypes.c_void_p)]
+        create.restype = ctypes.c_int
+        settime.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                            ctypes.POINTER(_Itimerspec), ctypes.c_void_p]
+        settime.restype = ctypes.c_int
+        return create, settime
+    raise OSError("timer_create was not found in the C library or librt")
+
+
+def _raise_errno(call: str) -> None:
+    error = ctypes.get_errno()
+    raise OSError(error, f"{call}: {os.strerror(error)}")
+
+
+class _SignalTimerHardStop:
+    """A one-shot POSIX timer on the monotonic clock that sends
+    ``HARD_STOP_SIGNAL`` to this process, on which ``faulthandler`` dumps
+    every thread's traceback and then lets the default action end the
+    process (``chain=True`` restores the default disposition and raises
+    the signal again). No thread is started."""
+
+    mechanism = "signal timer"
+
+    def __init__(self, file_descriptor: int) -> None:
+        if HARD_STOP_SIGNAL is None:
+            raise OSError("no real-time signal for the hard stop")
+        if signal.getsignal(HARD_STOP_SIGNAL) != signal.SIG_DFL:
+            raise OSError(f"signal {HARD_STOP_SIGNAL} is already in use")
+        create, self._settime = _timer_functions()
+        event = _Sigevent(sigev_signo=HARD_STOP_SIGNAL,
+                          sigev_notify=_SIGEV_SIGNAL)
+        self._timer_id = ctypes.c_void_p()
+        if create(_CLOCK_MONOTONIC, ctypes.byref(event),
+                  ctypes.byref(self._timer_id)) != 0:
+            _raise_errno("timer_create")
+        # A forked child inherits neither the timer nor its id's meaning.
+        self._owner_pid = os.getpid()
+        faulthandler.register(HARD_STOP_SIGNAL, file=file_descriptor,
+                              all_threads=True, chain=True)
+
+    def _set(self, seconds: float) -> None:
+        if os.getpid() != self._owner_pid:
+            return
+        whole = int(seconds)
+        expiry = _Itimerspec(it_value=_Timespec(
+            whole, min(int((seconds - whole) * 1e9), 999_999_999)))
+        if self._settime(self._timer_id, 0, ctypes.byref(expiry), None) != 0:
+            _raise_errno("timer_settime")
+
+    def arm(self, seconds: float) -> None:
+        self._set(seconds)
+
+    def cancel(self) -> None:
+        # An all-zero expiry disarms the timer.
+        self._set(0.0)
+
+
+class _ThreadHardStop:
+    """``faulthandler.dump_traceback_later(exit=True)``: a watchdog thread,
+    started again each time the stop is armed."""
+
+    mechanism = "faulthandler thread"
+
+    def __init__(self, file_descriptor: int) -> None:
+        self._file_descriptor = file_descriptor
+
+    def arm(self, seconds: float) -> None:
+        faulthandler.dump_traceback_later(seconds, exit=True,
+                                          file=self._file_descriptor)
+
+    def cancel(self) -> None:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _hard_stop(file_descriptor: int
+               ) -> _SignalTimerHardStop | _ThreadHardStop:
+    try:
+        return _SignalTimerHardStop(file_descriptor)
+    except OSError:
+        return _ThreadHardStop(file_descriptor)
+
+
+# --- Deadlines ----------------------------------------------------------------
+
+
 class _Deadlines:
     """The deadlines armed in this process, innermost last. Only the main
     thread touches them; the signal handler runs on it too, between any
@@ -116,7 +254,8 @@ class _Deadlines:
 
     def __init__(self, hard_stop_fd: int | None) -> None:
         self.armed: list[Deadline] = []
-        self.hard_stop_fd = hard_stop_fd
+        self.hard_stop = (None if hard_stop_fd is None
+                          else _hard_stop(hard_stop_fd))
         self.bookkeeping = False
         # The first test phase of this process that ran past its own
         # deadline (a ``deadline`` block a test sets and expects to expire
@@ -148,15 +287,13 @@ class _Deadlines:
                 min(pending) - time.process_time(), 0.001))
         else:
             signal.setitimer(DEADLINE_TIMER, 0)
-        if self.hard_stop_fd is None:
+        if self.hard_stop is None:
             return
         if not self.armed:
-            faulthandler.cancel_dump_traceback_later()
+            self.hard_stop.cancel()
             return
         hard_at = min(deadline.hard_at for deadline in self.armed)
-        faulthandler.dump_traceback_later(
-            max(hard_at - time.monotonic(), 0.001), exit=True,
-            file=self.hard_stop_fd)
+        self.hard_stop.arm(max(hard_at - time.monotonic(), 0.001))
 
     def on_signal(self, signum: int, frame: object) -> None:
         if self.bookkeeping:
@@ -197,6 +334,14 @@ def install(hard_stop_fd: int | None = None) -> None:
 
 def active_deadlines() -> list[Deadline]:
     return [] if _deadlines is None else list(_deadlines.armed)
+
+
+def hard_stop_mechanism() -> str | None:
+    """How this process stops a test past its hard deadline: "signal
+    timer", "faulthandler thread", or None (no hard stop installed)."""
+    if _deadlines is None or _deadlines.hard_stop is None:
+        return None
+    return _deadlines.hard_stop.mechanism
 
 
 @contextlib.contextmanager
