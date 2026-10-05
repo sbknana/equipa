@@ -170,6 +170,46 @@ def decision_and_analysis(
     return decision, analysis
 
 
+def blocked_by_the_gate(text: str, *,
+                        nonce: str = NONCE) -> loops.ReviewCountAnalysis:
+    """Assert that the merge gate blocks ``text`` on the parser's reading of
+    it, and return that analysis for the asserts on the reason (task 3170,
+    IR67-02: the suites' own must-block helpers decide here).
+
+    Provenance must trust the review, or refuse it for a bidi control the
+    text holds on purpose (production's first check, see ``gate_blocks``),
+    so a block never comes from a test artifact missing its nonce or
+    completion line. Callers assert the analysis blocks too."""
+    decision, analysis = decision_and_analysis(text, nonce=nonce)
+    if not decision.provenance.trusted:
+        reason = decision.provenance.reason
+        assert reason.startswith(REVIEW_BIDI_CONTROL_REASON), reason
+    assert decision.blocks, (analysis.verdict, analysis.detail)
+    return analysis
+
+
+def review_as_written(path: Path) -> str:
+    """The review at ``path`` as production reads it: its bytes decoded,
+    with no newline translation (``Path.read_text`` turns a CR into a line
+    feed, so a fixture holding one was decided on another text; R3167-02).
+    """
+    return Path(path).read_bytes().decode("utf-8")
+
+
+# Task 3170 (IR67-02): finding lines only the review as written shows a
+# severity in. Normalisation deletes the filler and glues "Rated" to the
+# word, so with provenance handing the parser the normalised text (the
+# R3161-01 regression) each merges behind a zero footer. Every must-block
+# suite decides them through its own helpers, so that regression fails each
+# suite, not only the ones whose shapes happen to hold such a character.
+AS_WRITTEN_ONLY_FINDINGS = {
+    "hangul-filler-high": ("Rated\N{HANGUL FILLER}HIGH remote code "
+                           "execution in upload."),
+    "halfwidth-filler-critical": ("Rated\N{HALFWIDTH HANGUL FILLER}CRITICAL: "
+                                  "RCE in upload."),
+}
+
+
 def production_seconds(text: str, *, nonce: str = NONCE,
                        before: Callable[[], Any] | None = None) -> float:
     """Median CPU time of the merge gate on ``text`` (provenance, parse and

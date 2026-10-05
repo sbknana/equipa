@@ -21,7 +21,11 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_production import production_seconds
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+    production_seconds,
+)
 from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
@@ -61,7 +65,10 @@ def analyze(text: str) -> loops.ReviewCountAnalysis:
 
 def assert_blocks_behind_zero_footer(body: list[str],
                                      severity: str = "HIGH") -> None:
-    analysis = analyze(review("No findings.", body, ZERO, low_heading=False))
+    """The merge gate blocks ``body`` behind a zero footer (task 3170,
+    IR67-02), and the parser counted the severity."""
+    analysis = blocked_by_the_gate(
+        review("No findings.", body, ZERO, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         body, analysis.detail)
     # Either a candidate rule saw the severity, or a strict finding heading
@@ -86,13 +93,24 @@ def lowercase_severity_words(line: str) -> str:
 
 
 def assert_only_the_backstop_blocks(text: str) -> loops.ReviewCountAnalysis:
-    """The rules trusted ``text`` (the backstop runs only then) and the
-    severity-token backstop blocked it."""
-    analysis = analyze(text)
+    """The merge gate blocks ``text`` (task 3170, IR67-02): the rules
+    trusted it (the backstop runs only then) and the severity-token backstop
+    blocked it."""
+    analysis = blocked_by_the_gate(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
     return analysis
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks(review(
+        "No findings.", [AS_WRITTEN_ONLY_FINDINGS[finding]], ZERO,
+        low_heading=False))
 
 
 def assert_compliant_prose_merges(body: list[str]) -> None:
