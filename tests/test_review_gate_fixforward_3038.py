@@ -31,6 +31,7 @@ from equipa.loops import (
     backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
@@ -341,24 +342,30 @@ def test_non_zero_tally_or_blocking_risk_heading_still_blocks(
 
 
 @pytest.mark.parametrize(
-    "adversarial_line",
+    "prefix, unit, count, suffix",
     [
-        "- **[S1] HIGH — " + "(" * 20_000 + "**",
-        "## [S1] HIGH — " + "[" * 20_000,
-        "#### [S1] CRITICAL — " + "(x" * 10_000,
+        ("- **[S1] HIGH — ", "(", 20_000, "**"),
+        ("## [S1] HIGH — ", "[", 20_000, ""),
+        ("#### [S1] CRITICAL — ", "(x", 10_000, ""),
     ],
     ids=["bold-parens", "l2-brackets", "l4-paren-x"],
 )
 @timing_test
 def test_long_candidate_title_parses_quickly_and_still_blocks(
-    tmp_path: Path, adversarial_line: str,
+    tmp_path: Path, prefix: str, unit: str, count: int, suffix: str,
 ) -> None:
-    path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
+    """Budget host-calibrated, growth from a quarter of the run to the
+    whole run linear (task 3171)."""
+    def write(units: int) -> Path:
+        return _write(tmp_path, BODY + prefix + unit * units + suffix + "\n"
+                      + _footer())
 
-    blocked = _blocks_merge(path)
-    elapsed = production_seconds(as_reviewer_artifact(review_as_written(path)))
+    blocked = _blocks_merge(write(count))
 
-    assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
+    assert_linear_time(
+        lambda units: production_seconds(
+            as_reviewer_artifact(review_as_written(write(units)))),
+        count, 1.0, prefix + unit)
     assert blocked
 
 
