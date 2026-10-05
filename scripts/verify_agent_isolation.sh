@@ -111,8 +111,14 @@ check_shared_tmp() {
 # enter but not list). Each candidate on $1's filesystem is probed with a
 # real file create, removed again at once: access(2) and the mode bits do
 # not tell the whole story (ACLs, read-only mounts).
+# The search runs at most WORLD_WRITABLE_SCAN_SECONDS (task 3169: a root
+# filesystem holding millions of directories, such as a CI runner's
+# toolchains, took longer than any caller waits). A search cut short, or one
+# that could not run, fails: the directories it did not reach were not
+# probed. The candidates it did report are probed all the same.
+WORLD_WRITABLE_SCAN_SECONDS=600
 check_world_writable_dirs() {
-    local root="$1" root_device directory probe count=0
+    local root="$1" root_device directory probe count=0 status
     local -a candidates=() writable=()
     local -A seen=()
     shift
@@ -123,7 +129,15 @@ check_world_writable_dirs() {
     fi
     while IFS= read -r -d '' directory; do
         candidates+=("$directory")
-    done < <(find "$root" -xdev -type d -perm -0002 -print0 2>/dev/null)
+    done < <(timeout --kill-after=5 "$WORLD_WRITABLE_SCAN_SECONDS" \
+                 find "$root" -xdev -type d -perm -0002 -print0 2>/dev/null)
+    wait "$!"
+    status=$?
+    # find exits 1 for the directories the agent cannot read: expected.
+    case "$status" in
+        124|137) fail "the search of the root filesystem $root for world-writable directories did not finish within $WORLD_WRITABLE_SCAN_SECONDS s: the directories it did not reach were not probed" ;;
+        125|126|127) fail "the search of the root filesystem $root for world-writable directories could not run (exit $status)" ;;
+    esac
     candidates+=("$@")
     for directory in "${candidates[@]}"; do
         [ -n "${seen["$directory"]:-}" ] && continue
@@ -541,6 +555,7 @@ check_loaded_firewall() {
 inside() {
     local orchestrator_pid="" orchestrator_home="" database="" runtime=""
     local launcher="" pids_expected="" view_db="" mcp_config=""
+    local root_fs=/ scan_seconds=""
     local -a git_dirs=() excluded_tables=() deny_dirs=() db_copies=()
     local -a secret_roots=() deny_ports=() host_addresses=() lan_targets=()
     while [ "$#" -gt 0 ]; do
@@ -561,10 +576,22 @@ inside() {
             --view-db) view_db="$2"; shift 2 ;;
             --exclude-table) excluded_tables+=("$2"); shift 2 ;;
             --mcp-config) mcp_config="$2"; shift 2 ;;
+            # The root filesystem the disk checks search, and the bound on
+            # that search (task 3169). The orchestrator passes neither, so a
+            # real host is checked at / with the default bound; the tests
+            # name a directory of their own and finish in seconds.
+            --root-fs) root_fs="$2"; shift 2 ;;
+            --scan-seconds) scan_seconds="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     local failures=0
+    if [ -n "$scan_seconds" ]; then
+        case "$scan_seconds" in
+            *[!0-9]*|0*) fail "--scan-seconds '$scan_seconds' is not a positive whole number (the default $WORLD_WRITABLE_SCAN_SECONDS s applies)" ;;
+            *) WORLD_WRITABLE_SCAN_SECONDS="$scan_seconds" ;;
+        esac
+    fi
 
     # --- identity: not root, no sudo, no privileged group -------------------
     local uid user
@@ -733,10 +760,13 @@ inside() {
     check_broadcast 255.255.255.255
 
     # --- disk: a TMPDIR of its own, no shared /tmp on / (F8, SR3147-01) ------
-    check_unit_tmpdir /
-    check_shared_tmp / /tmp /var/tmp
-    check_world_writable_dirs / "${WELL_KNOWN_WORLD_WRITABLE[@]}"
-    note_search_only_dirs /tmp /var/tmp
+    # $root_fs is / unless --root-fs names another root; every directory
+    # below is then read below that root ($root_prefix is empty for /).
+    local root_prefix="${root_fs%/}"
+    check_unit_tmpdir "$root_fs"
+    check_shared_tmp "$root_fs" "$root_prefix/tmp" "$root_prefix/var/tmp"
+    check_world_writable_dirs "$root_fs" "${WELL_KNOWN_WORLD_WRITABLE[@]/#/$root_prefix}"
+    note_search_only_dirs "$root_prefix/tmp" "$root_prefix/var/tmp"
     check_shm_cap /dev/shm "$AGENT_SHM_CAP_MB"
 
     # --- cannot signal the orchestrator --------------------------------------
