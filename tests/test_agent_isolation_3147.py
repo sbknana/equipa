@@ -212,9 +212,14 @@ def test_verify_inside_checks_the_groups_id_reports(tmp_path: Path) -> None:
         script = fake_bin / tool
         script.write_text(f"#!/bin/sh\n{body}\n")
         script.chmod(0o755)
+    # Task 3169: a root filesystem of the test's own; searching the host's
+    # whole / outlasted the timeout on a CI runner (/ is the default,
+    # tests/test_agent_isolation_3169.py).
+    root_fs = tmp_path / "rootfs"
+    root_fs.mkdir()
     result = subprocess.run(
-        ["bash", str(VERIFY_SCRIPT), "--inside"], capture_output=True,
-        text=True, timeout=120,
+        ["bash", str(VERIFY_SCRIPT), "--inside", "--root-fs", str(root_fs)],
+        capture_output=True, text=True, timeout=120,
         env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"})
     lines = result.stdout.splitlines()
     assert "FAIL agent user is in the privileged group docker" in lines
