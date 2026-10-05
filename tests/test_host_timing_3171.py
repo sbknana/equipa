@@ -602,6 +602,10 @@ DEADLINE_TESTS = {
     "test_a_swallowed_deadline_stops_the_process_and_names_the_test":
         "the child is stopped 2 s in, not after its endless loop",
     "test_deadline_watchdog_3175.py::"
+    "test_with_the_signal_taken_the_thread_stops_a_swallowed_deadline":
+        "the child is stopped 2 s in by the fallback thread, not after its "
+        "endless loop",
+    "test_deadline_watchdog_3175.py::"
     "test_after_a_hang_the_next_hang_is_cut_short_and_named":
         "the second hang is cut to 1 s (about 5 s in all), not left to its "
         "60 s spin",
