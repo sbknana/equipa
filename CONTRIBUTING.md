@@ -54,6 +54,19 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   runs a worker, so a wall clock also counts the time a worker waits for a
   core, and such budgets fail whenever the host is busy. Keep the wall clock
   only for what really waits: subprocesses, threads, sockets, timeouts.
+- A timing test proves that work grows linearly, not that the machine is
+  fast. Check it through `tests/host_timing.py`: `assert_linear_time` holds
+  the work to its budget times a host factor (each process times a fixed
+  reference workload at session start; a faster host never tightens a
+  budget), and times the same shape at the test's size and a quarter of it,
+  failing at a growth ratio of 8 or more (linear is about 4, quadratic 16).
+  Never raise a base budget. A bound that tells "returned at once" from
+  "waited out a timeout" is not scaled; list it in `DEADLINE_TESTS` in
+  `tests/test_host_timing_3171.py`, which fails on any other unscaled timing
+  test.
+- Set `EQUIPA_TIMING_HOST_FACTOR` (a number > 0) to force the host factor,
+  e.g. `EQUIPA_TIMING_HOST_FACTOR=2.0` to run the timing tests as on a runner
+  twice as slow. The factor is printed in the pytest header.
 - Run a single file or test without `-n`, e.g.
   `python3 -m pytest -q -p no:cacheprovider tests/test_gen_module_report.py::test_generation_is_deterministic`.
 
