@@ -468,9 +468,21 @@ HOSTILE_REVIEW_DISTINCT = 4_000
 
 
 def _hostile_reviews() -> list[str]:
-    return [_distinct_review(0x20000 + index * HOSTILE_REVIEW_DISTINCT,
-                             HOSTILE_REVIEW_DISTINCT)
-            for index in range(HOSTILE_REVIEW_COUNT)]
+    # Task 3172 (R3169-01): only code points of the gate's Unicode table; the
+    # gaps Unicode 14 and 15 filled (U+2A6DE, U+2B735, U+2CEA2 ...) would
+    # have each review refused before it fills any table.
+    code_points = [code_point for code_point in range(0x20000, 0x30000)
+                   if loops._in_gate_unicode_table(chr(code_point))]
+    reviews = []
+    for index in range(HOSTILE_REVIEW_COUNT):
+        chunk = code_points[index * HOSTILE_REVIEW_DISTINCT:
+                            (index + 1) * HOSTILE_REVIEW_DISTINCT]
+        assert len(chunk) == HOSTILE_REVIEW_DISTINCT
+        characters = "".join(map(chr, chunk))
+        reviews.append(build_review(
+            [characters[start:start + 100]
+             for start in range(0, len(characters), 100)], "zero"))
+    return reviews
 
 
 def _hangul_review() -> str:

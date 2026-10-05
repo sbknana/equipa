@@ -80,6 +80,21 @@ def _unaccounted(text: str, severity: str, body_line: str) -> str | None:
     refuse for a bidi control, its first check)."""
     decision, analysis = decision_and_analysis(text)
     provenance = decision.provenance
+    # Task 3172 (R3169-01): a lookalike outside the gate's Unicode table
+    # (assigned after Unicode 13.0, such as U+1CCD6) has the review refused
+    # before it is parsed, naming that character on this line.
+    unread = [char for char in body_line
+              if not loops._in_gate_unicode_table(char)]
+    if unread:
+        refused = (f"{loops.REVIEW_UNICODE_DATA_REASON}: "
+                   f"U+{ord(unread[0]):04X} at line "
+                   f"{_line_of(text, body_line)} (name the character, never "
+                   f"paste it)")
+        if (analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE
+                and analysis.detail == refused and decision.blocks
+                and provenance.trusted):
+            return None
+        return f"{analysis.verdict}: {analysis.detail[:120]}"
     expected = (f"{loops.backstop_reason(severity)} at line "
                 f"{_line_of(text, body_line)}")
     if (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH

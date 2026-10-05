@@ -733,9 +733,13 @@ BACKSTOP_FAMILIES = {
         "### [S1] HIGH " + "(not counted " * (RB // 13)],
     # Task 3167 (R3164-03): references to distinct characters, which the
     # rendered view decodes into more distinct characters than the raw
-    # text's cap allows, alone and after a lookalike capital eta.
+    # text's cap allows, alone and after a lookalike capital eta. Task 3172:
+    # each a character of the gate's Unicode table (U+9FFD-U+9FFF, from
+    # Unicode 14, would have the review refused before it is parsed).
     "distinct_hex_references": ["".join(
-        f"&#x{code_point:x}; " for code_point in range(0x4E00, 0x4E00 + RB // 9))],
+        f"&#x{code_point:x}; " for code_point in
+        [code_point for code_point in range(0x4E00, 0x4E00 + RB // 9 + 3)
+         if loops._in_gate_unicode_table(chr(code_point))])],
     "eta_then_distinct_reference": ["".join(
         f"\N{GREEK CAPITAL LETTER ETA}IGH &#x{code_point:x}; "
         for code_point in range(0x4E00, 0x4E00 + RB // 15))],
