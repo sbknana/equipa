@@ -59,12 +59,15 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   the work to its budget times a host factor, and times the same shape at
   the test's size and a quarter of it, failing at a growth ratio of 8 or
   more (linear is about 4, quadratic 16). The factor is measured around
-  each measurement: a fixed reference workload runs in the same process
-  right before and right after it, so contention between xdist workers
-  loosens the budget of exactly the work it slowed. A faster host never
-  tightens a budget. A ratio of sub-millisecond times is noise: below 20 ms
-  the quarter size is measured repeatedly (or, for a regex scan, made
-  larger) until it takes 20 ms. Never raise a base budget.
+  each measurement over its base budget: that measurement is taken again
+  with a fixed reference workload run in the same process right before and
+  right after it, so contention between xdist workers loosens the budget
+  of exactly the work it slowed. A measurement within its base budget
+  passes at any factor and runs no reference. A faster host never tightens
+  a budget. A ratio of sub-millisecond times is noise: the smaller time is
+  raised to 20 ms, and a reading that could still reach the limit is
+  measured repeatedly (or, for a regex scan, made larger) until the
+  smaller size takes 20 ms. Never raise a base budget.
 - The factor is capped at 4.0. A budget loosened further would hide a
   linear slowdown as large (growth only sees superlinear work), so a
   measurement on a host or load more than 4x slower than the development
