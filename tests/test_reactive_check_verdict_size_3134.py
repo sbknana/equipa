@@ -104,8 +104,9 @@ def test_oversize_command_is_blocked_without_reaching_the_worker(shaped):
     command = "echo " + "a" * MAX_COMMAND_BYTES
 
     def seconds_at(size):
+        oversize = "echo " + "a" * size  # built off the clock, as below
         started = time.monotonic()
-        verdict = checker.check_blocking("echo " + "a" * size, 5.0)
+        verdict = checker.check_blocking(oversize, 5.0)
         elapsed = time.monotonic() - started
         assert verdict.check_id == CheckID.COMMAND_TOO_LONG
         return elapsed
@@ -150,8 +151,12 @@ def test_four_mb_command_with_the_real_checker_is_blocked_immediately():
     verdicts = []
 
     def seconds_at(size):
+        # Built before the clock starts: allocating a fresh 4 MB string is
+        # page faults and allocator thresholds, not the checker's work, and
+        # it grew 32x from 1 MB under load (task 3175).
+        command = "cat <<EOF\n" + "x" * size
         started = time.monotonic()
-        verdicts.append(checker.check_blocking("cat <<EOF\n" + "x" * size, 5.0))
+        verdicts.append(checker.check_blocking(command, 5.0))
         return time.monotonic() - started
 
     try:
