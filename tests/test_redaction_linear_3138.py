@@ -48,6 +48,7 @@ from equipa.redact import (
     redact_tool_input,
     redacted_json_preview,
 )
+from tests.host_timing import assert_linear_time, budget
 
 SIXTY_FOUR_KB = 64 * 1024
 FOUR_MB = 4 * 1024 * 1024
@@ -148,6 +149,27 @@ def _best_time(func, *args, limit: float) -> float:
     return elapsed
 
 
+def _assert_linear(func, build, size: int, limit: float, label: str) -> None:
+    """``func(*build(n))`` within the host-calibrated *limit* at *size* and a
+    quarter of it, and linear between them (task 3171). The arguments are
+    built before the clock starts."""
+    def seconds_at(at_size: int) -> float:
+        return _best_time(func, *build(at_size), limit=budget(limit))
+
+    assert_linear_time(seconds_at, size, limit, label)
+
+
+def _linear_problem(func, build, size: int, limit: float,
+                    label: str) -> str | None:
+    """``_assert_linear``'s failure, or None: a loop over many units reports
+    every slow one, not the first."""
+    try:
+        _assert_linear(func, build, size, limit, label)
+    except AssertionError as failure:
+        return str(failure)
+    return None
+
+
 def _pattern_id(index: int) -> str:
     return f"{index}:{redact._PATTERNS[index][0].pattern[:40]}"
 
@@ -178,32 +200,34 @@ def test_every_pattern_is_fast_on_64kb_adversarial_repeats(index):
     units = set(REVIEW_UNITS + PAIR_UNITS) | set(_derived_units(index))
     if hasattr(replacement, "flags"):
         units |= set(COMMAND_UNITS)
-    slow = []
-    for unit in sorted(units):
-        elapsed = _best_time(pattern.sub, replacement, _repeat(unit),
-                             limit=PATTERN_LIMIT_SECONDS)
-        if elapsed >= PATTERN_LIMIT_SECONDS:
-            slow.append(f"{unit!r}: {elapsed:.3f}s")
+    problems = [
+        _linear_problem(pattern.sub,
+                        lambda size, unit=unit: (replacement,
+                                                 _repeat(unit, size)),
+                        SIXTY_FOUR_KB, PATTERN_LIMIT_SECONDS, repr(unit))
+        for unit in sorted(units)
+    ]
+    slow = [problem for problem in problems if problem]
     assert not slow, f"pattern {_pattern_id(index)} is slow on {slow}"
 
 
 @pytest.mark.parametrize("unit", sorted(set(REVIEW_UNITS + COMMAND_UNITS)))
 def test_redact_secrets_on_64kb_adversarial_input_is_fast(unit):
-    elapsed = _best_time(redact_secrets, _repeat(unit),
-                         limit=REDACT_LIMIT_SECONDS)
-    assert elapsed < REDACT_LIMIT_SECONDS, f"{unit!r}: {elapsed:.3f}s"
+    _assert_linear(redact_secrets, lambda size: (_repeat(unit, size),),
+                   SIXTY_FOUR_KB, REDACT_LIMIT_SECONDS, repr(unit))
 
 
 @pytest.mark.parametrize("index", PATTERN_INDEXES,
                          ids=[_pattern_id(i) for i in PATTERN_INDEXES])
 def test_redact_secrets_on_each_patterns_own_words_is_fast(index):
     tokens = _pattern_tokens(index)
-    slow = []
-    for unit in [f"{token} " for token in tokens] + [" ".join(tokens) + " "]:
-        elapsed = _best_time(redact_secrets, _repeat(unit),
-                             limit=REDACT_LIMIT_SECONDS)
-        if elapsed >= REDACT_LIMIT_SECONDS:
-            slow.append(f"{unit!r}: {elapsed:.3f}s")
+    problems = [
+        _linear_problem(redact_secrets,
+                        lambda size, unit=unit: (_repeat(unit, size),),
+                        SIXTY_FOUR_KB, REDACT_LIMIT_SECONDS, repr(unit))
+        for unit in [f"{token} " for token in tokens] + [" ".join(tokens) + " "]
+    ]
+    slow = [problem for problem in problems if problem]
     assert not slow, f"pattern {_pattern_id(index)}: {slow}"
 
 
@@ -212,28 +236,30 @@ def test_redact_secrets_with_every_hint_present_is_fast():
     hints = sorted({hint for _, _, pattern_hints in redact._PATTERNS
                     for hint in pattern_hints})
     unit = " ".join(hints) + " "
-    elapsed = _best_time(redact_secrets, _repeat(unit),
-                         limit=REDACT_LIMIT_SECONDS)
-    assert elapsed < REDACT_LIMIT_SECONDS, f"{elapsed:.3f}s"
+    _assert_linear(redact_secrets, lambda size: (_repeat(unit, size),),
+                   SIXTY_FOUR_KB, REDACT_LIMIT_SECONDS, "every hint")
 
 
-def _four_mb_inputs(unit: str) -> list[dict]:
-    """A Bash command and a MultiEdit, each rendering to about 4 MB."""
+def _four_mb_inputs(unit: str, size: int = FOUR_MB) -> list[dict]:
+    """A Bash command and a MultiEdit, each rendering to about *size*."""
     edit = {"old_string": unit, "new_string": unit}
     edit_size = len(json.dumps(edit)) + 2
     return [
-        {"command": _repeat(unit, FOUR_MB)},
+        {"command": _repeat(unit, size)},
         {"file_path": "/srv/app/x.py",
-         "edits": [edit] * (FOUR_MB // edit_size)},
+         "edits": [edit] * (size // edit_size)},
     ]
 
 
 def _assert_four_mb_is_fast(unit: str) -> None:
-    for tool_input in _four_mb_inputs(unit):
+    """Each 4 MB tool input within the host-calibrated limit, and linear
+    from 1 MB (task 3171)."""
+    for shape, tool_input in enumerate(_four_mb_inputs(unit)):
         assert len(json.dumps(tool_input)) > 3_500_000
-        elapsed = _best_time(redact_tool_input, tool_input, 200,
-                             limit=TOOL_INPUT_LIMIT_SECONDS)
-        assert elapsed < TOOL_INPUT_LIMIT_SECONDS, f"{unit!r}: {elapsed:.3f}s"
+        _assert_linear(
+            redact_tool_input,
+            lambda size, shape=shape: (_four_mb_inputs(unit, size)[shape], 200),
+            FOUR_MB, TOOL_INPUT_LIMIT_SECONDS, f"{unit!r} input {shape}")
 
 
 @pytest.mark.parametrize("index", PATTERN_INDEXES,
