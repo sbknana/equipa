@@ -2352,15 +2352,23 @@ _HTML_BLOCK_START_RE = re.compile(
 # cannot interrupt a paragraph. Like a type 6 block it runs to the next
 # blank line, so "<span>" / "```" / "Risk: High" / "```" / "</span>" shows
 # the backticks and the label as text.
+#
+# The attributes are read in batches of up to 64, each committed (_atomic):
+# re drops a batch's backtracking entries when it ends, so a line of 800,000
+# attributes keeps one entry per batch instead of one per attribute (200 MB;
+# task 3169). Committing loses no match, as in the possessive original:
+# what follows the attributes ("[ \t]*/?>") cannot match where an attribute
+# starts (blanks, then a name character), so no give-back lets it match.
+_HTML_ATTRIBUTE = (
+    r"[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+(?![^ \t\"'=<>`])"
+    r"|'[^'\n]*'|\"[^\"\n]*\"))?"
+)
 _HTML_BLOCK_TYPE7_RE = re.compile(
     r"<(?!(?:script|style|pre|textarea)(?![A-Za-z0-9-]))"
     r"(?:[A-Za-z][A-Za-z0-9-]*"
-    + _atomic(
-        r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
-        + _atomic(r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+(?![^ \t\"'=<>`])"
-                  r"|'[^'\n]*'|\"[^\"\n]*\"))?")
-        + r")*")
-    + r"[ \t]*/?"
+    r"(?:" + _atomic(r"(?:" + _HTML_ATTRIBUTE + r"){1,64}") + r")*"
+    r"[ \t]*/?"
     r"|/[A-Za-z][A-Za-z0-9-]*[ \t]*)>[ \t]*",
     re.IGNORECASE,
 )
@@ -3694,8 +3702,16 @@ _LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
 # A link reference definition ("[label]: destination"), also inside a quote
 # or list item. Read loosely: a reading that trusts these is paired with one
 # that trusts none, since a "definition" inside a paragraph or code is text.
+# The quote markers (">" with at most one blank after each, "(?:>[ \t]?)*")
+# are read as one run of ">" and blanks, which re keeps no backtracking
+# entry for (a loop over the group kept one per ">"; task 3169). The run
+# starts with ">" (a blank after the indent can begin nothing that follows)
+# and holds no two blanks in a row, which is exactly what that loop reads;
+# what follows never begins with ">" or a blank, so the run ends where the
+# loop did.
 _LINK_DEFINITION_RE = re.compile(
-    r"^[ \t]{0,3}(?:>[ \t]?)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
+    r"^[ \t]{0,3}(?![ \t])(?![> \t]*?[ \t][ \t])[> \t]*"
+    r"(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
     r"\[((?:\\[^\n]|[^\[\]\\]){1,999})\]:",
     re.MULTILINE,
 )
