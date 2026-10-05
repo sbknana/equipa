@@ -384,6 +384,65 @@ def test_named_and_replaced_references_decode_to_table_characters():
     assert all(loops._in_gate_unicode_table(char) for char in decoded)
 
 
+def _sha256(value: object) -> str:
+    return hashlib.sha256(
+        repr(value).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _extra_case_table() -> dict[int, tuple[int, ...]]:
+    """sre's IGNORECASE equivalences beyond lower-casing each character (for
+    example LATIN SMALL LETTER LONG S matching "s"): ``re._casefix`` from
+    Python 3.11 on, ``sre_compile._ignorecase_fixes`` before."""
+    try:
+        from re import _casefix
+    except ImportError:  # Python 3.10
+        import sre_compile
+        return dict(sre_compile._ignorecase_fixes)
+    return dict(_casefix._EXTRA_CASES)
+
+
+_SIGMA = "\N{GREEK CAPITAL LETTER SIGMA}"
+
+
+def _case_context(char: str) -> tuple[str, ...]:
+    """How ``str.lower`` reads ``char`` as a neighbour of a capital sigma
+    (final or not): it reads the Cased and Case_Ignorable properties, which
+    no single-character result shows."""
+    return ((char + _SIGMA).lower(), ("A" + char + _SIGMA).lower(),
+            ("A" + _SIGMA + char).lower(), ("A" + _SIGMA + char + "B").lower())
+
+
+# Interpreter data the gate reads besides each character's own properties,
+# computed on Python 3.10.20 and 3.12.3: the same on both. The named
+# character references (``html.unescape`` in the rendered views), the
+# IGNORECASE equivalences (46 IGNORECASE patterns in loops.py) and the case
+# context of every table character. A new interpreter that changes one of
+# them changes what a review reads as; it fails here instead.
+NAMED_REFERENCES_DIGEST = (
+    "cce279ce7b21206dbf91830cf183e501355914670261c1b05458c07310915de7"
+)
+EXTRA_CASES_DIGEST = (
+    "e8c106a563d19c0a98a3766224cc5ce9b4ccd95ab55cea3ace5d2be2ac9c0f97"
+)
+CASE_CONTEXT_DIGEST = (
+    "f7ce99e0abe99117a68bfbb6529103732ee0fb5cf71f439b2ace72b52b36d394"
+)
+
+
+def test_the_named_references_and_case_tables_are_pinned():
+    assert len(html.entities.html5) == 2_231
+    assert _sha256(sorted(html.entities.html5.items())) == (
+        NAMED_REFERENCES_DIGEST)
+    extra_cases = _extra_case_table()
+    assert len(extra_cases) == 50
+    assert all(map(loops._in_gate_unicode_table,
+                   map(chr, itertools.chain(extra_cases, *extra_cases.values()))))
+    assert _sha256(sorted(extra_cases.items())) == EXTRA_CASES_DIGEST
+    contexts = [_case_context(chr(code_point))
+                for code_point in _table_code_points()]
+    assert _sha256(contexts) == CASE_CONTEXT_DIGEST
+
+
 # Distinct references to table characters (CJK ideographs and the Hangul
 # syllables, all assigned before Unicode 13) fill a 200 KB review: the
 # check decodes each spelling once.
