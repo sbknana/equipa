@@ -22,6 +22,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import shutil
@@ -372,3 +373,235 @@ def test_one_record_is_read_by_the_guard_and_the_change_checks() -> None:
 
     assert monitoring.dispatched_without_git is git_ops.dispatched_without_git
     assert monitoring.git_checks_allowed is git_ops.git_checks_allowed
+
+
+# --- IR73-02: the git_ops runners are the only place git is started ---------------
+
+# The guard is in the git_ops runners, so a helper that started git or gh
+# itself would still run it in a project that was not git. These tests read
+# the orchestrator's source (as a syntax tree: a comment or docstring that
+# mentions git satisfies nothing) for any other place git or gh is started.
+GIT_PROGRAMS = frozenset({"git", "gh", "git.exe", "gh.exe"})
+RUNNERS_MODULE = REPO_ROOT / "equipa" / "git_ops.py"
+
+# The calls that start a program named by one of their positional arguments
+# (an argv, a program, or a shell command line).
+PROCESS_STARTERS = frozenset({
+    *(f"subprocess.{name}" for name in (
+        "run", "Popen", "call", "check_call", "check_output",
+        "getoutput", "getstatusoutput",
+    )),
+    *(f"{module}.{name}" for module in ("asyncio", "asyncio.subprocess")
+      for name in ("create_subprocess_exec", "create_subprocess_shell")),
+    *(f"os.{name}" for name in (
+        "system", "popen", "posix_spawn", "posix_spawnp",
+        "execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe",
+        "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp",
+        "spawnlpe",
+    )),
+})
+# Event-loop methods, called on a loop object whose name the source does
+# not fix.
+LOOP_PROCESS_STARTERS = frozenset({"subprocess_exec", "subprocess_shell"})
+
+
+def _imported_names(tree: ast.Module) -> dict[str, str]:
+    """Each name a module binds by an absolute import, mapped to what it
+    names (``from subprocess import run as start`` binds start to
+    subprocess.run)."""
+    names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    names[alias.asname] = alias.name
+                else:
+                    head = alias.name.split(".")[0]
+                    names[head] = head
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return names
+
+
+def _called_name(function: ast.expr, imported: dict[str, str]) -> str | None:
+    """The dotted name a call's function resolves to, through the module's
+    imports; None for a call of anything but a (dotted) name."""
+    parts: list[str] = []
+    while isinstance(function, ast.Attribute):
+        parts.append(function.attr)
+        function = function.value
+    if not isinstance(function, ast.Name):
+        return parts[0] if parts else None
+    parts.append(imported.get(function.id, function.id))
+    return ".".join(reversed(parts))
+
+
+class _GitNaming:
+    """Decides whether an expression names git or gh as the program to
+    start, following the names a module binds to one."""
+
+    def __init__(self, tree: ast.Module, imported: dict[str, str]) -> None:
+        self._imported = imported
+        self._names: set[str] = set()
+        # A name bound to git, to a git argv, or to another such name: bind
+        # until nothing changes, so the order of the assignments is free.
+        assignments = [
+            (target.id, node.value)
+            for node in ast.walk(tree) if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+        ]
+        changed = True
+        while changed:
+            changed = False
+            for name, value in assignments:
+                if name not in self._names and (
+                    self.names_git(value, command_line=False) or self._finds_git(value)
+                ):
+                    self._names.add(name)
+                    changed = True
+
+    def _finds_git(self, node: ast.expr) -> bool:
+        """``shutil.which("git")`` and the like."""
+        return (
+            isinstance(node, ast.Call)
+            and _called_name(node.func, self._imported) == "shutil.which"
+            and any(self.names_git(argument, command_line=False) for argument in node.args)
+        )
+
+    def names_git(self, node: ast.expr, *, command_line: bool) -> bool:
+        """True when ``node`` names git or gh: a string that is the program
+        (``git``, ``/usr/bin/git``) or, with ``command_line``, starts with
+        it (``git status``); a list or tuple whose first item names it (an
+        argv); or a name bound to one of those."""
+        if isinstance(node, ast.Starred):
+            return self.names_git(node.value, command_line=command_line)
+        if isinstance(node, ast.Name):
+            return node.id in self._names
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return bool(node.elts) and self.names_git(node.elts[0], command_line=False)
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            return False
+        words = node.value.split() if command_line else [node.value]
+        return bool(words) and os.path.basename(words[0]) in GIT_PROGRAMS
+
+
+def _git_started_outside_the_runners(source: str, filename: str) -> list[str]:
+    """``filename:line`` of each call in ``source`` that starts a process
+    and is given git or gh as the program: in an argv, as the program
+    argument, or at the start of a command line."""
+    tree = ast.parse(source, filename=filename)
+    imported = _imported_names(tree)
+    naming = _GitNaming(tree, imported)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = _called_name(node.func, imported)
+        starts_a_process = called in PROCESS_STARTERS or (
+            called is not None and called.rsplit(".", 1)[-1] in LOOP_PROCESS_STARTERS
+        )
+        if starts_a_process and any(
+            naming.names_git(argument, command_line=True) for argument in node.args
+        ):
+            found.append(f"{filename}:{node.lineno}: {called} starts git")
+    return found
+
+
+def _orchestrator_sources() -> list[Path]:
+    """Every Python file of the orchestrator: the equipa package and its
+    entry point."""
+    sources = sorted((REPO_ROOT / "equipa").rglob("*.py"))
+    entry_point = REPO_ROOT / "forge_orchestrator.py"
+    if entry_point.is_file():
+        sources.append(entry_point)
+    return sources
+
+
+HELPERS_THAT_START_GIT_THEMSELVES = {
+    "subprocess.run-list": 'import subprocess\nsubprocess.run(["git", "diff"], cwd=p)\n',
+    "subprocess.Popen-tuple": 'import subprocess\nsubprocess.Popen(("gh", "pr", "list"))\n',
+    "check_output-absolute-path":
+        'import subprocess\nsubprocess.check_output(["/usr/bin/git", "status"])\n',
+    "from-import-alias": 'from subprocess import run as start\nstart(["git", "log"])\n',
+    "module-alias": 'import subprocess as sp\nsp.call(["git", "fetch"])\n',
+    "argv-built-first":
+        'import subprocess\nargv = ["git", "diff", "--stat"]\nsubprocess.run(argv, cwd=p)\n',
+    "argv-through-two-names":
+        'import subprocess\ncommand = base\nbase = ["git"]\nsubprocess.run([*command, "gc"])\n',
+    "program-found-with-which":
+        'import shutil, subprocess\nGIT = shutil.which("git")\nsubprocess.run([GIT, "status"])\n',
+    "create_subprocess_exec":
+        'import asyncio\nawait asyncio.create_subprocess_exec("git", "status")\n',
+    "loop.subprocess_exec": 'await loop.subprocess_exec(factory, "git", "status")\n',
+    "os.system-command-line": 'import os\nos.system("git status --short")\n',
+    "shell-command-line":
+        'import subprocess\nsubprocess.run("gh pr list", shell=True, cwd=p)\n',
+    "os.execvp": 'import os\nos.execvp("git", ["git", "gc"])\n',
+    "windows-program": 'import subprocess\nsubprocess.run(["git.exe", "diff"])\n',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(HELPERS_THAT_START_GIT_THEMSELVES))
+def test_the_fence_finds_a_helper_that_starts_git_itself(shape: str) -> None:
+    """Positive control: each way a new helper could start git without the
+    runners is found."""
+    source = HELPERS_THAT_START_GIT_THEMSELVES[shape]
+
+    assert _git_started_outside_the_runners(source, f"{shape}.py") != []
+
+
+CODE_THAT_DOES_NOT_START_GIT = {
+    "the-runners": 'from equipa.git_ops import git_run\ngit_run(["diff", "--stat"], p)\n',
+    "another-program": 'import subprocess\nsubprocess.run(["python3", "-c", "pass"])\n',
+    "comment": '# subprocess.run(["git", "diff"])\nx = 1\n',
+    "docstring": 'def f():\n    """subprocess.run(["git", "diff"]) is not used."""\n',
+    "message-mentioning-git": 'log(["git status failed", detail])\n',
+    "a-list-of-command-names": 'SAFE = frozenset(["git", "go", "date"])\n',
+    "an-argv-that-is-not-started": 'DIFF = ("git", "diff")\nprint(" ".join(DIFF))\n',
+    "git-as-an-argument": 'import subprocess\nsubprocess.run(["grep", "git", path])\n',
+    "a-word-starting-with-git":
+        'import subprocess\nsubprocess.run(["gitleaks", "detect"])\n',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(CODE_THAT_DOES_NOT_START_GIT))
+def test_the_fence_passes_code_that_does_not_start_git(shape: str) -> None:
+    """Negative control: mentions of git that start nothing are not found."""
+    source = CODE_THAT_DOES_NOT_START_GIT[shape]
+
+    assert _git_started_outside_the_runners(source, f"{shape}.py") == []
+
+
+def test_the_fence_finds_git_started_in_a_real_module() -> None:
+    """Control on real code: monitoring.py with each of its ``git_run([...])``
+    change checks rewritten to start git itself is found once per call, so
+    the scan below is not vacuous on the shape of the orchestrator's code."""
+    module = REPO_ROOT / "equipa" / "monitoring.py"
+    source = module.read_text(encoding="utf-8")
+    calls = source.count("git_run([")
+    started_itself = source.replace("git_run([", 'subprocess.run(["git", ')
+
+    assert calls > 0
+    assert _git_started_outside_the_runners(source, module.name) == []
+    assert len(_git_started_outside_the_runners(started_itself, module.name)) == calls
+
+
+def test_no_orchestrator_module_starts_git_outside_the_runners() -> None:
+    """IR73-02: every git and gh process the orchestrator starts goes
+    through the git_ops runners, which refuse a project that was not git, so
+    a helper that forgets to ask cannot run git there by starting it
+    itself either."""
+    sources = _orchestrator_sources()
+    found = [
+        place
+        for source in sources
+        if source != RUNNERS_MODULE
+        for place in _git_started_outside_the_runners(
+            source.read_text(encoding="utf-8"), str(source.relative_to(REPO_ROOT)),
+        )
+    ]
+
+    assert RUNNERS_MODULE in sources
+    assert len(sources) > 50, [str(source) for source in sources]
+    assert found == []
