@@ -47,6 +47,7 @@ from equipa.severity_confusables import (
     CONFUSABLES_LETTER_MAPPINGS,
     SEVERITY_LETTER_CONFUSABLES,
 )
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import production_seconds
 from tests.review_gate_timing import timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
@@ -413,15 +414,17 @@ def test_markdown_outside_an_html_block_keeps_its_rendering(body, context):
 
 
 @pytest.mark.parametrize("flood", [
-    "<span " + " a=b" * (RB // 4) + ">",
-    "<div>" + "&#1" * (RB // 3),
-    "<span>\n" + "&#x4" * (RB // 4),
-])
+    lambda rb: "<span " + " a=b" * (rb // 4) + ">",
+    lambda rb: "<div>" + "&#1" * (rb // 3),
+    lambda rb: "<span>\n" + "&#x4" * (rb // 4),
+], ids=["span-attributes", "div-decimal-references", "span-hex-references"])
 @timing_test
 def test_html_block_floods_parse_in_half_a_second(flood):
-    text = build_review([flood], "zero")
-    elapsed = production_seconds(text)
-    assert elapsed < 0.5, elapsed
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(
+        lambda rb: production_seconds(build_review([flood(rb)], "zero")),
+        RB, 0.5, flood(8))
 
 
 # --- R3154-05: the shared lookup tables start over when full ---------------------
@@ -473,11 +476,11 @@ def _hostile_reviews() -> list[str]:
             for index in range(HOSTILE_REVIEW_COUNT)]
 
 
-def _hangul_review() -> str:
-    """200 KB of Hangul syllables (decomposed by rule), 4,000 of them
+def _hangul_review(rb: int = RB) -> str:
+    """``rb`` bytes of Hangul syllables (decomposed by rule), 4,000 of them
     distinct (under the distinct-character cap)."""
     syllables = "".join(chr(0xAC00 + offset % 4000)
-                        for offset in range(RB // 3))
+                        for offset in range(rb // 3))
     return build_review([syllables[start:start + 80]
                          for start in range(0, len(syllables), 80)], "zero")
 
@@ -510,24 +513,31 @@ def test_the_hostile_reviews_fill_the_shared_tables(monkeypatch):
 @timing_test
 @pytest.mark.parametrize("later", [
     _hangul_review,
-    lambda: build_review([f"HIGH{SUPERSCRIPT_ONE} " * (RB // 6)], "zero"),
-])
+    lambda rb: build_review([f"HIGH{SUPERSCRIPT_ONE} " * (rb // 6)], "zero"),
+], ids=["hangul", "superscript-one"])
 def test_a_hostile_review_does_not_slow_the_next_one(later):
+    """Budget host-calibrated, growth of the later review from 50 KB to
+    200 KB linear (task 3171)."""
     hostile = _hostile_reviews()
-    text = later()
-    elapsed = production_seconds(text, before=lambda: _fill_tables(hostile))
-    assert elapsed < 0.5, elapsed
+    assert_linear_time(
+        lambda rb: production_seconds(
+            later(rb), before=lambda: _fill_tables(hostile)),
+        RB, 0.5, "after the hostile reviews")
 
 
 @timing_test
 def test_a_review_of_too_many_distinct_characters_fails_closed_fast():
     # 61,000 distinct code points: not parsed, so not trusted, in well under
-    # the 0.5 s budget (task 3161 target: 0.25 s).
+    # the 0.5 s budget (task 3161 target: 0.25 s). A quarter of them is
+    # still over the distinct-character cap (task 3171: growth linear).
     text = _distinct_review(0x20000, 61_000)
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
     assert not analysis.trusted
-    assert production_seconds(text) < 0.25
+    assert 61_000 // 4 > loops._REVIEW_MAX_DISTINCT_CHARACTERS
+    assert_linear_time(
+        lambda count: production_seconds(_distinct_review(0x20000, count)),
+        61_000, 0.25, "distinct code points")
 
 
 # --- R3154-06: the confusables table against independent properties --------------
