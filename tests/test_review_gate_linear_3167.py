@@ -43,6 +43,14 @@ from equipa.security_gate import (
     _INVISIBLE_CHARS_RE,
     normalize_review_text,
 )
+from tests.host_timing import (
+    GROWTH,
+    GROWTH_FLOOR_SECONDS,
+    GROWTH_LIMIT,
+    assert_linear_time,
+    budget,
+    growth_ratio,
+)
 from tests.review_gate_production import (
     gate_blocks,
     production_decision,
@@ -164,10 +172,15 @@ def _search_seconds(pattern, text):
 @timing_test
 @pytest.mark.parametrize("name", sorted(BRACKET_RUNS))
 def test_a_200kb_heading_tail_is_searched_in_linear_time(name):
-    """The old regex took 6.7 s on 20 KB of "(" (quadratic)."""
+    """The old regex took 6.7 s on 20 KB of "(" (quadratic). Budget
+    host-calibrated, growth from 50 KB to 200 KB linear (task 3171)."""
     unit = BRACKET_RUNS[name]
-    text = "### [S1] HIGH " + unit * (RB // len(unit))
-    assert min(_search_seconds(RESOLVED_RE, text) for _ in range(3)) < 0.1
+
+    def seconds_at(size):
+        text = "### [S1] HIGH " + unit * (size // len(unit))
+        return min(_search_seconds(RESOLVED_RE, text) for _ in range(3))
+
+    assert_linear_time(seconds_at, RB, 0.1, name)
 
 
 @pytest.mark.parametrize("heading", [
@@ -186,7 +199,10 @@ def test_the_i3164_01_review_is_decided_by_the_gate_in_half_a_second(
 
     assert decision.provenance.trusted, decision.provenance.reason
     assert decision.blocks is True
-    assert production_seconds(text) < 0.5
+    assert_linear_time(
+        lambda size: production_seconds(
+            build_review([heading + unit * (size // len(unit))], "zero")),
+        RB, 0.5, f"{heading}{unit}")
 
 
 # Bracket-run shapes for every module-level regex of loops.py (I3164-01 Fix:
@@ -232,22 +248,42 @@ def test_the_scan_sees_the_gate_regexes():
     assert not _called_anchored_only("_SHORTSTAT_RE")
 
 
+def _scan_seconds(pattern, anchored, text):
+    started = time.process_time()
+    if anchored:
+        pattern.match(text)
+    else:
+        for _ in pattern.finditer(text):
+            pass
+    return time.process_time() - started
+
+
+def _best_scan_seconds(pattern, anchored, text, runs=3):
+    return min(_scan_seconds(pattern, anchored, text) for _ in range(runs))
+
+
 @timing_test
 def test_no_loops_regex_is_slow_on_a_bracket_run():
+    """Each (prefix, unit) pair is held to a host-calibrated 0.1 s at 50 KB,
+    and one that takes measurable time must grow linearly from 12.5 KB to
+    50 KB (task 3171); a slow or superlinear-looking pair is timed again
+    (best of three) before it counts."""
     slow = []
     for name, pattern in sorted(_module_patterns().items()):
         anchored = _called_anchored_only(name)
         for prefix, unit in itertools.product(SCAN_PREFIXES, SCAN_UNITS):
-            text = prefix + unit * (SCAN_BYTES // len(unit))
-            started = time.process_time()
-            if anchored:
-                pattern.match(text)
-            else:
-                for _ in pattern.finditer(text):
-                    pass
-            elapsed = time.process_time() - started
-            if elapsed > 0.1:
-                slow.append((name, prefix, unit, round(elapsed, 3)))
+            count = SCAN_BYTES // len(unit)
+            text = prefix + unit * count
+            elapsed = _scan_seconds(pattern, anchored, text)
+            if elapsed < GROWTH_FLOOR_SECONDS:
+                continue
+            elapsed = _best_scan_seconds(pattern, anchored, text)
+            quarter = prefix + unit * (count // GROWTH)
+            quarter_elapsed = _best_scan_seconds(pattern, anchored, quarter)
+            if (elapsed > budget(0.1)
+                    or growth_ratio(quarter_elapsed, elapsed) >= GROWTH_LIMIT):
+                slow.append((name, prefix, unit, round(quarter_elapsed, 4),
+                             round(elapsed, 4)))
     assert slow == []
 
 

@@ -153,6 +153,14 @@ def budget(seconds: float) -> float:
     return seconds * host_factor()
 
 
+def growth_ratio(small_seconds: float, seconds: float) -> float:
+    """How much longer the larger size took than the smaller one, the
+    smaller time raised to ``GROWTH_FLOOR_SECONDS`` first. A scan over many
+    shapes compares this with ``GROWTH_LIMIT`` itself rather than asserting
+    per shape through ``assert_linear_time``."""
+    return seconds / max(small_seconds, GROWTH_FLOOR_SECONDS)
+
+
 @dataclass(frozen=True)
 class LinearTiming:
     """The two measurements of one ``assert_linear_time`` call."""
@@ -166,7 +174,7 @@ class LinearTiming:
 
     @property
     def ratio(self) -> float:
-        return self.seconds / max(self.small_seconds, GROWTH_FLOOR_SECONDS)
+        return growth_ratio(self.small_seconds, self.seconds)
 
     def describe(self) -> str:
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "

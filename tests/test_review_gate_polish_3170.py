@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import itertools
 import random
-import time
 
 import pytest
 
@@ -40,8 +39,10 @@ from tests.test_review_gate_backstop_3143 import (
     review,
 )
 from tests.test_review_gate_linear_3167 import (
+    _best_scan_seconds,
     _called_anchored_only,
     _module_patterns,
+    _scan_seconds,
 )
 
 EM_DASH = "\N{EM DASH}"
@@ -236,20 +237,6 @@ GROWTH_FLOOR_SECONDS = 0.004
 LARGE_BUDGET_SECONDS = 0.05
 # Quadratic on a digit run, and only ever reads `git diff --shortstat`.
 KNOWN_SUPERLINEAR = {"_SHORTSTAT_RE"}
-
-
-def _scan_seconds(pattern, anchored, text):
-    started = time.process_time()
-    if anchored:
-        pattern.match(text)
-    else:
-        for _ in pattern.finditer(text):
-            pass
-    return time.process_time() - started
-
-
-def _best_scan_seconds(pattern, anchored, text, runs=3):
-    return min(_scan_seconds(pattern, anchored, text) for _ in range(runs))
 
 
 def test_the_growth_scan_sees_every_gate_regex():
