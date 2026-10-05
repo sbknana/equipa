@@ -544,6 +544,10 @@ DEADLINE_TESTS = {
     "test_deadline_watchdog_3175.py::"
     "test_a_swallowed_deadline_stops_the_process_and_names_the_test":
         "the child is stopped 2 s in, not after its endless loop",
+    "test_deadline_watchdog_3175.py::"
+    "test_after_a_hang_the_next_hang_is_cut_short_and_named":
+        "the second hang is cut to 1 s (about 5 s in all), not left to its "
+        "60 s spin",
     "test_agent_isolation_3172.py::"
     "test_a_search_cut_short_at_the_default_bound_reports_before_the_caller_stops":
         "the cut-short search is reported within the 25 s the default bound "
