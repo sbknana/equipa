@@ -487,11 +487,24 @@ def _fill_tables(hostile: list[str]) -> None:
         analyze(text)
 
 
-def test_the_hostile_reviews_fill_the_shared_tables():
+def test_the_hostile_reviews_fill_the_shared_tables(monkeypatch):
+    # Task 3169: the table is shared by every test of an xdist worker, so
+    # what it held before depended on which files the worker ran first; one
+    # that already held more than 5,496 entries started over part way and
+    # ended with about 16,000 (seen on a clean CI runner). The property is
+    # that these reviews alone fill a table to near its limit, so they start
+    # from an empty one, as in a fresh process (the shared one is restored).
+    table = loops._BackstopCharacterTable()
+    monkeypatch.setattr(loops, "_BACKSTOP_CHARACTERS", table)
     hostile = _hostile_reviews()
     assert all(analyze(text).verdict != loops.REVIEW_VERDICT_INCOMPLETE
                for text in hostile)
-    assert len(loops._BACKSTOP_CHARACTERS) >= 50_000
+    hostile_code_points = {ord(char) for text in hostile for char in text
+                           if ord(char) >= 0x20000}
+    assert len(hostile_code_points) == (HOSTILE_REVIEW_COUNT
+                                        * HOSTILE_REVIEW_DISTINCT)
+    assert hostile_code_points <= table.keys()
+    assert 50_000 <= len(table) <= loops._BACKSTOP_TABLE_LIMIT
 
 
 @timing_test
