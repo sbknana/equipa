@@ -22,7 +22,7 @@ import contextlib
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import equipa.db as equipa_db
 from equipa import loops
@@ -34,6 +34,9 @@ from equipa.security_gate import (
     ReviewerRunRecord,
     fingerprint_artifact,
     record_reviewer_run,
+    review_complete_line,
+    review_completion_nonce,
+    reviewer_nonce_line,
     verify_reviewer_provenance,
 )
 from tests.review_gate_timing import median_cpu_seconds
@@ -63,6 +66,17 @@ def gate_project() -> Path:
         _scratch_projects["project"] = tempfile.TemporaryDirectory(
             prefix="review-gate-production-")
     return Path(_scratch_projects["project"].name)
+
+
+def as_reviewer_artifact(text: str, *, nonce: str = NONCE) -> str:
+    """``text`` as a reviewer run writes it: its provenance line first and
+    its completion line last, each added only when missing (older suites
+    build bare reviews)."""
+    if reviewer_nonce_line(nonce) not in text:
+        text = f"{reviewer_nonce_line(nonce)}\n{text}"
+    if review_completion_nonce(text) != nonce:
+        text = f"{text.rstrip()}\n{review_complete_line(nonce)}\n"
+    return text
 
 
 def write_recorded_review(project_dir: Path, task_id: int, text: str, *,
@@ -120,10 +134,25 @@ def gate_blocks(text: str, *, nonce: str = NONCE) -> bool:
     text holds on purpose (production's own first check), so a block never
     comes from a test artifact missing its nonce or completion line."""
     decision = production_decision(text, nonce=nonce)
+    if decision.provenance.trusted:
+        return decision.blocks
     reason = decision.provenance.reason
-    assert (decision.provenance.trusted
-            or reason.startswith(REVIEW_BIDI_CONTROL_REASON)), reason
-    return decision.blocks
+    assert reason.startswith(REVIEW_BIDI_CONTROL_REASON), reason
+    # Production refuses the bidi control before parsing; the suites also
+    # held the parser to blocking these texts, and still do.
+    return decision.blocks and parser_blocks(decision.provenance.text)
+
+
+def parser_blocks(text: str) -> bool:
+    """The merge rule applied to the parser alone (an untrusted review
+    blocks; a trusted one blocks on CRITICAL or HIGH), for a text the
+    production gate refuses before parsing it."""
+    analysis = loops._analyze_review_file(
+        Path(f"SECURITY-REVIEW-{GATE_TASK_ID}.md"), text=text)
+    if not analysis.trusted:
+        return True
+    counts = analysis.counts or {}
+    return counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
 
 
 def decision_and_analysis(
@@ -141,16 +170,21 @@ def decision_and_analysis(
     return decision, analysis
 
 
-def production_seconds(text: str, *, nonce: str = NONCE) -> float:
+def production_seconds(text: str, *, nonce: str = NONCE,
+                       before: Callable[[], Any] | None = None) -> float:
     """Median CPU time of the merge gate on ``text`` (provenance, parse and
-    audit line), the artifact written once beforehand. Provenance must trust
-    the artifact, so the time is never that of an early rejection."""
+    audit line), the artifact written once beforehand; ``before`` (untimed)
+    runs ahead of each call. Provenance must trust the artifact (or reject a
+    bidi control the text holds on purpose, production's first check), so
+    the time is never that of a malformed test artifact's early rejection."""
     project = gate_project()
     path = write_recorded_review(project, GATE_TASK_ID, text, nonce=nonce)
     provenance = verify_reviewer_provenance(GATE_TASK_ID, path)
-    assert provenance.trusted, provenance.reason
+    assert (provenance.trusted
+            or provenance.reason.startswith(REVIEW_BIDI_CONTROL_REASON)), (
+        provenance.reason)
     with audit_rows_not_persisted():
         return median_cpu_seconds(
             _security_review_blocks_merge, str(project), GATE_TASK_ID,
-            block_on_missing=True,
+            block_on_missing=True, before=before,
         )

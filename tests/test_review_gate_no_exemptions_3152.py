@@ -40,6 +40,7 @@ from equipa.security_gate import review_complete_line, reviewer_nonce_line
 from tests.review_gate_production import (
     decision_and_analysis,
     gate_blocks,
+    parser_blocks,
     production_decision,
     production_seconds,
 )
@@ -93,17 +94,6 @@ def analyze(text):
     """The parser alone: for assertions on a verdict's reason. Merge
     decisions go through ``gate_blocks`` (the production entry point)."""
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
-
-
-def parser_blocks(text):
-    """The merge rule applied to the parser alone (an untrusted review
-    blocks; a trusted one blocks on CRITICAL or HIGH), for a text the
-    production gate rejects before parsing it."""
-    analysis = analyze(text)
-    if not analysis.trusted:
-        return True
-    counts = analysis.counts or {}
-    return counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
 
 
 def assert_backstop_blocks(text):

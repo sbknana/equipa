@@ -25,7 +25,11 @@ from equipa.loops import (
     _analyze_review_file,
     _count_findings_in_review_file,
 )
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import (
+    as_reviewer_artifact,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
 
 BODY = "# Security Review\n\n## Summary\nNo findings.\n\n## Findings\n\n"
 ZERO_FOOTER = (
@@ -57,7 +61,8 @@ def test_long_bold_tag_line_parses_in_linear_time(
     path = _write(tmp_path, BODY + adversarial_line + "\n" + ZERO_FOOTER)
 
     analysis = _analyze_review_file(path)
-    elapsed = median_cpu_seconds(_analyze_review_file, path)
+    elapsed = production_seconds(
+        as_reviewer_artifact(path.read_text(encoding="utf-8")))
 
     assert elapsed < PARSE_BOUND_SECONDS, f"parse took {elapsed:.2f}s"
     assert analysis.verdict == REVIEW_VERDICT_OK

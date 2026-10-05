@@ -32,7 +32,7 @@ from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
 from tests.review_gate_production import gate_blocks as production_gate_blocks
 from tests.review_gate_production import production_seconds
-from tests.review_gate_timing import timing_test
+from tests.review_gate_timing import median_cpu_seconds, timing_test
 
 REPO = Path(__file__).resolve().parent.parent
 NONCE = "fedcba9876543210fedcba9876543210"
@@ -312,6 +312,9 @@ TIMING_FAMILIES.update({
 })
 
 
+PROVENANCE_REFUSED_FAMILIES = {"bidi_override_flood", "entity_bidi_flood"}
+
+
 @timing_test
 @pytest.mark.parametrize("name", sorted(TIMING_FAMILIES))
 def test_200kb_flood_on_a_3149_path_parses_in_half_a_second(name):
@@ -319,3 +322,8 @@ def test_200kb_flood_on_a_3149_path_parses_in_half_a_second(name):
     assert len(text.encode()) >= RB * 0.99, name
     elapsed = production_seconds(text, nonce=NONCE)
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    if name in PROVENANCE_REFUSED_FAMILIES:
+        # Provenance refuses a bidi control before the parser runs, so the
+        # parser's own reading of the flood is timed as well.
+        elapsed = median_cpu_seconds(analyze, text)
+        assert elapsed < 0.5, f"{name} (parser): {elapsed:.2f}s"

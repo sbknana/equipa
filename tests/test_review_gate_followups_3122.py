@@ -17,7 +17,8 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import production_seconds
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -372,5 +373,5 @@ def test_200kb_adversarial_review_parses_under_two_seconds(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text, nonce=NONCE)
     assert elapsed < 2.0, f"{name}: {elapsed:.2f}s"

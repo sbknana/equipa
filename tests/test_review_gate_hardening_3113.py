@@ -46,7 +46,11 @@ from equipa.security_gate import (
     reviewer_run_failure,
     verify_reviewer_provenance,
 )
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import (
+    as_reviewer_artifact,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -430,8 +434,7 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
     path = tmp_path / "SECURITY-REVIEW-94400.md"
     path.write_text(text, encoding="utf-8")
     analysis = loops._analyze_review_file(path, text=text)
-    assert median_cpu_seconds(loops._analyze_review_file, path,
-                              text=text) < 2.0
+    assert production_seconds(as_reviewer_artifact(text)) < 2.0
     if SEVERITY_TOKEN.search(line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
         # only; the rules still read the padded line as prose.
@@ -439,8 +442,7 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
         assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         text = lowercase_severity_words(text)
         analysis = loops._analyze_review_file(path, text=text)
-        assert median_cpu_seconds(loops._analyze_review_file, path,
-                                  text=text) < 2.0
+        assert production_seconds(as_reviewer_artifact(text)) < 2.0
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 

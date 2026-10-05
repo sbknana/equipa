@@ -47,7 +47,8 @@ from equipa.severity_confusables import (
     CONFUSABLES_LETTER_MAPPINGS,
     SEVERITY_LETTER_CONFUSABLES,
 )
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import production_seconds
+from tests.review_gate_timing import timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
     CONTEXTS,
     RB,
@@ -419,7 +420,7 @@ def test_markdown_outside_an_html_block_keeps_its_rendering(body, context):
 @timing_test
 def test_html_block_floods_parse_in_half_a_second(flood):
     text = build_review([flood], "zero")
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert elapsed < 0.5, elapsed
 
 
@@ -501,8 +502,7 @@ def test_the_hostile_reviews_fill_the_shared_tables():
 def test_a_hostile_review_does_not_slow_the_next_one(later):
     hostile = _hostile_reviews()
     text = later()
-    elapsed = median_cpu_seconds(analyze, text,
-                                 before=lambda: _fill_tables(hostile))
+    elapsed = production_seconds(text, before=lambda: _fill_tables(hostile))
     assert elapsed < 0.5, elapsed
 
 
@@ -514,7 +514,7 @@ def test_a_review_of_too_many_distinct_characters_fails_closed_fast():
     analysis = analyze(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
     assert not analysis.trusted
-    assert median_cpu_seconds(analyze, text) < 0.25
+    assert production_seconds(text) < 0.25
 
 
 # --- R3154-06: the confusables table against independent properties --------------

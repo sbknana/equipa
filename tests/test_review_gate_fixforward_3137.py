@@ -27,7 +27,8 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import production_seconds
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -522,7 +523,7 @@ def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     text = review("No findings.", body, ZERO, low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
     analysis = analyze(text)
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
 
@@ -584,7 +585,7 @@ def test_200kb_adversarial_review_parses_under_one_second(name):
     text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
                   low_heading=False)
     assert len(text.encode()) >= REVIEW_BYTES
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
 
 
@@ -607,7 +608,7 @@ def test_blanks_after_a_bold_opener_parse_in_linear_time(line):
     text = review("No findings.", ["## Findings", "", line], ZERO,
                   low_heading=False)
     analysis = analyze(text)
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{line[:12]!r}: {elapsed:.2f}s"
 
@@ -645,7 +646,7 @@ def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
     text = review("No findings.", section + [PIPE_FLOODS[name]], ZERO,
                   low_heading=False)
     analysis = analyze(text)
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 
@@ -670,7 +671,7 @@ def test_200kb_line_of_comments_parses_in_half_a_second(name, section):
     text = review("No findings.", section + [COMMENT_LINE_FLOODS[name]], ZERO,
                   low_heading=False)
     analysis = analyze(text)
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
 

@@ -31,7 +31,12 @@ from equipa.loops import (
     backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import (
+    as_reviewer_artifact,
+    gate_blocks,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -73,11 +78,10 @@ def _write(tmp_path: Path, markdown: str) -> Path:
 
 
 def _blocks_merge(path: Path) -> bool:
-    """Mirror dispatch._security_review_blocks_merge: untrusted or C+H > 0."""
-    counts = _count_findings_in_review_file(path)
-    if counts is None:
-        return True
-    return counts["CRITICAL"] + counts["HIGH"] > 0
+    """dispatch._security_review_blocks_merge itself (task 3167) on the
+    review at ``path``, written as this cycle's reviewer artifact: untrusted
+    or C+H > 0."""
+    return gate_blocks(as_reviewer_artifact(path.read_text(encoding="utf-8")))
 
 
 def _rules_counts(path: Path) -> dict[str, int] | None:
@@ -324,7 +328,8 @@ def test_long_candidate_title_parses_quickly_and_still_blocks(
     path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
 
     blocked = _blocks_merge(path)
-    elapsed = median_cpu_seconds(_blocks_merge, path)
+    elapsed = production_seconds(
+        as_reviewer_artifact(path.read_text(encoding="utf-8")))
 
     assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
     assert blocked
