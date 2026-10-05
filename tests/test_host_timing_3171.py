@@ -36,6 +36,16 @@ from tests.host_timing import (
 TESTS_DIR = Path(__file__).resolve().parent
 
 
+@pytest.fixture(autouse=True)
+def _development_host_speed(monkeypatch):
+    """The model tests below time fake work against budgets set for the
+    development host: the session's factor (measured on a slow runner, or
+    forced by EQUIPA_TIMING_HOST_FACTOR) must not decide whether a model
+    meant to go over budget does. A test that needs another factor patches
+    ``host_factor`` itself; ``host_calibration`` is left unpatched."""
+    monkeypatch.setattr(host_timing, "host_factor", lambda: 1.0)
+
+
 # --- The host factor ------------------------------------------------------------
 
 
