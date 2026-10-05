@@ -27,7 +27,12 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_production import production_seconds
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+    decision_and_analysis,
+    production_seconds,
+)
 from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
@@ -59,8 +64,10 @@ def analyze(text: str) -> loops.ReviewCountAnalysis:
 
 def assert_blocks_behind_zero_footer(body: list[str],
                                      severity: str = "HIGH") -> None:
-    analysis = analyze(review("No findings.", ["## Findings", ""] + body, ZERO,
-                              low_heading=False))
+    """The merge gate blocks ``body`` behind a zero footer (task 3170,
+    IR67-02), and the parser counted the severity."""
+    analysis = blocked_by_the_gate(review(
+        "No findings.", ["## Findings", ""] + body, ZERO, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
         body, analysis.detail)
     # Either a candidate rule saw the severity, or a strict finding heading
@@ -91,11 +98,26 @@ def assert_compliant_prose_merges(body: list[str]) -> None:
         for line in body
     ])
     if any(SEVERITY_TOKEN.search(line) for line in body):
-        analysis = analyze(review("1 finding.", ["## Notes", ""] + body,
-                                  ONE_LOW, low_heading=True))
-        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
-        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
-            body, analysis.detail)
+        assert_only_the_backstop_blocks(body)
+
+
+def assert_only_the_backstop_blocks(body: list[str]) -> None:
+    """The merge gate blocks ``body`` next to a counted LOW finding (task
+    3170, IR67-02): the rules trusted it (the backstop runs only then) and
+    the severity-token backstop blocked it."""
+    analysis = blocked_by_the_gate(review("1 finding.", ["## Notes", ""] + body,
+                                          ONE_LOW, low_heading=True))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
+        body, analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks([AS_WRITTEN_ONLY_FINDINGS[finding]])
 
 
 # --- M1 (SR3130-01): list items that open with their own marker ---------------
@@ -338,8 +360,8 @@ def test_markdown_the_renderer_hides_or_shows_as_prose_merges(body):
 
 
 def test_rendered_view_counts_a_nested_finding_once():
-    analysis = analyze(review("No findings.", ["- 1. HIGH: SQL injection"],
-                              ZERO, low_heading=False))
+    analysis = blocked_by_the_gate(review(
+        "No findings.", ["- 1. HIGH: SQL injection"], ZERO, low_heading=False))
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
     assert analysis.detail.endswith("HIGH=1"), analysis.detail
 
@@ -361,7 +383,8 @@ def test_honest_review_of_the_new_shapes_merges():
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
     assert analysis.counts["HIGH"] == 1
     upper = [line.replace("high:", "HIGH:") for line in body]
-    blocked = analyze(review("1 finding.", upper, footer, low_heading=False))
+    blocked = blocked_by_the_gate(
+        review("1 finding.", upper, footer, low_heading=False))
     assert blocked.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, blocked
     assert blocked.detail.startswith(BLOCKING_TOKEN_REASONS)
 
@@ -472,9 +495,12 @@ def _prompt_positions(line: str, is_list_item: bool) -> list[list[str]]:
 
 
 def _counts_as_high(body: list[str]) -> bool:
-    analysis = analyze(review("No findings.", ["## Findings", ""] + body, ZERO,
-                              low_heading=False))
-    return analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    """The merge gate blocks ``body`` behind a zero footer, and the parser
+    found it uncounted (task 3170, IR67-02: decided through the gate)."""
+    decision, analysis = decision_and_analysis(review(
+        "No findings.", ["## Findings", ""] + body, ZERO, low_heading=False))
+    return (decision.blocks
+            and analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH)
 
 
 @pytest.mark.parametrize("spelling", sorted(PROMPT_SPELLINGS_OF_HIGH))
