@@ -1204,8 +1204,21 @@ def _repository_appeared_in_non_git_project(
     later dispatch of a project that would discover it is refused
     (:func:`refuse_agent_made_repository`) until the operator deletes the
     record; before, the next dispatch adopted it as the project's checkout.
+
+    S3168-04 (task #3172, kept with the S3168-01 walk by task #3174): a
+    symlink loop at or above ``project_dir`` cannot be walked, so nothing
+    shows that no repository is reachable through it. It is reported as the
+    repository (fail closed): the task is blocked, never retried, and the
+    check does not raise.
     """
     repository = _nearest_repository(project_dir)
+    if repository is None:
+        # ``_nearest_repository`` walks ``os.path.realpath``, which returns
+        # on a loop without seeing past it, so a loop read as "no
+        # repository". ``_nearest_git_entry`` returns the looping path
+        # itself; anything else it returns is a ``.git`` entry, which blocks
+        # the task as well.
+        repository = _nearest_git_entry(Path(project_dir))
     if repository is None:
         return False
     try:
