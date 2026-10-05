@@ -2361,6 +2361,63 @@ def test_a_later_dispatch_of_a_project_blocked_by_n1_runs_no_git_there(
     assert f"Refusing to run git there: inspect or remove that repository, then delete {record}" in refusal, refusal
 
 
+def test_an_n1_block_in_cli_dev_test_mode_is_recorded_with_no_git_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3168-03 inside one dispatch: ``--task --dev-test`` on a project
+    that was not git at dispatch. The attempt's agent makes a repository,
+    so N1 blocks the task (and records the repository). The merge step
+    after the loop asked ``_is_git_project`` again: by discovery in the
+    agent's repository, and with the refusal record it must not end the
+    dispatch before the task's outcome is recorded. It answers "not git"
+    for the dispatch that recorded the project as such: no git, the block
+    recorded."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = ParallelNonGitRun()
+    task = _task(TASK_ID)
+    recorded: list[str] = []
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
+
+    async def record_telemetry(task, result, outcome, *args, **kwargs):
+        recorded.append(outcome)
+
+    _patch_non_git_loops(monkeypatch, attempt)
+    for name, value in {
+        "fetch_task": lambda _id: task,
+        "resolve_project_dir": lambda _task: str(project),
+        "fetch_project_context": lambda _pid: {},
+        "_auto_snapshot_dispatch": lambda *a, **k: None,
+        "_record_task_telemetry": record_telemetry,
+    }.items():
+        monkeypatch.setattr(cli_mod, name, value)
+    args = argparse.Namespace(
+        task=TASK_ID, project=None, role="developer", dev_test=True, dry_run=False,
+        yes=True, retries=0, dispatch_config={}, security_review=True,
+    )
+
+    error: BaseException | None = None
+    try:
+        with recorder.recording():
+            _run(cli_mod.run_mode_task(args))
+    except (Exception, SystemExit) as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "cli-dev-test-merge-step", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert recorded == [REPOSITORY_APPEARED]
+
+
 def test_acknowledging_the_record_lets_the_project_be_dispatched_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

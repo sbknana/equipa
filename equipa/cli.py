@@ -391,8 +391,13 @@ def _is_git_project(project_dir: str) -> bool:
     ``EXIT_DISPATCH_REFUSED`` instead.
 
     S3168-03 (task #3173): so is a project under a repository an N1 check
-    recorded, before any git runs there.
+    recorded, before any git runs there. A project this dispatch already
+    recorded as not git (:func:`dispatched_without_git`) stays not git: the
+    merge step after an N1 block then runs no git in the agent's repository
+    and is not refused, so the block is still recorded for the task.
     """
+    if not git_checks_allowed(project_dir):
+        return False
     try:
         refuse_agent_made_repository(project_dir)
         return _is_git_repo(project_dir)
