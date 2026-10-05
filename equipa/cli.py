@@ -58,16 +58,19 @@ from equipa.merge_safety import (
 from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
     EXIT_DISPATCH_REFUSED,
+    REPOSITORY_APPEARED_OUTCOME,
     AttemptCleanupError,
     IsolatedTaskRun,
     _audit_task_abort,
     _build_dispatch_attempt_reflection,
     _gated_merge_task,
+    _repository_appeared_in_non_git_project,
     _require_task_branch,
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
     collect_refusals,
+    escape_audit_detail,
     is_feature_enabled,
     load_dispatch_config,
     load_goals_file,
@@ -104,7 +107,7 @@ from equipa.loops import (
 )
 from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.mcp_server import run_server
-from equipa.monitoring import calculate_dynamic_budget
+from equipa.monitoring import calculate_dynamic_budget, dispatched_without_git
 from equipa.output import (
     log,
     print_dev_test_summary,
@@ -1535,7 +1538,27 @@ async def _run_dev_test_mode(
     attempt, and a failed attempt is reset to the commit it started from.
     A reset that fails (:class:`AttemptCleanupError`) stops the retries and
     leaves the task blocked with outcome ``attempt_cleanup_failed`` instead
-    of crashing with the task stuck in_progress."""
+    of crashing with the task stuck in_progress.
+
+    Without ``task_branch`` the project was not git at dispatch. R3166-01 /
+    N1 (task #3168): the attempts run under ``dispatched_without_git``, and
+    a repository found there before or after an attempt stops the task with
+    outcome ``REPOSITORY_APPEARED_OUTCOME``, as in
+    :func:`equipa.dispatch.run_dev_test_loop_with_autoresearch`."""
+    if task_branch is not None:
+        return await _run_dev_test_attempts(
+            task, project_dir, project_context, args, task_branch,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_dev_test_attempts(
+            task, project_dir, project_context, args, None,
+        )
+
+
+async def _run_dev_test_attempts(
+    task, project_dir, project_context, args, task_branch: str | None,
+):
+    """The retry loop of :func:`_run_dev_test_mode`."""
     # Dev+Tester iteration loop (Phase 2) with autoresearch retry
     print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
 
@@ -1559,6 +1582,11 @@ async def _run_dev_test_mode(
                 break
             if base_sha is None:
                 base_sha = head_sha
+        elif _repository_appeared_in_non_git_project(
+            task["id"], project_dir, f"before attempt {retry_count + 1}", None,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args,
@@ -1607,6 +1635,11 @@ async def _run_dev_test_mode(
                 )
                 outcome = "worktree_branch_mismatch"
                 break
+        elif _repository_appeared_in_non_git_project(
+            task["id"], project_dir, f"after attempt {retry_count + 1} ({outcome})", None,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
 
         # Success - break out
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
@@ -1643,9 +1676,11 @@ async def _run_dev_test_mode(
             )
         except AttemptCleanupError as exc:
             _audit_task_abort(task["id"], "attempt-cleanup-failed", exc, None)
+            # R3166-04 (task #3168): escaped like the audit line just above,
+            # which raw control characters here could otherwise redraw.
             print(
                 f"  [Autoresearch] Task #{task['id']}: resetting the failed "
-                f"attempt failed ({' '.join(str(exc).split())}); no further "
+                f"attempt failed ({escape_audit_detail(exc)}); no further "
                 f"retries, task left blocked."
             )
             outcome = "attempt_cleanup_failed"
@@ -2207,26 +2242,29 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         await _run_task_isolated(task, project_dir, project_context, args)
         return
 
-    # Not a git repo: there are no branches to protect or merge.
-    if args.dev_test:
-        # dispatch-03 (task #3111): pin the default branch before any agent
-        # runs; only the gated merge below may move it.
-        merge_guard = await _snapshot_merge_guard(project_dir)
-        result, cycles, outcome = await _run_dev_test_mode(
-            task, project_dir, project_context, args,
-        )
-        outcome = await _run_security_review_and_gate(
-            task, project_dir, project_context, args, outcome,
-            guard=merge_guard,
-        )
-        await _record_task_telemetry(
-            task, result, outcome, cycles, args,
-            merged_sha=_merged_sha_for(merge_guard, task["id"], outcome),
-        )
-    else:
-        await _run_single_agent_mode(
-            task, project_dir, project_context, args,
-        )
+    # Not a git repo: there are no branches to protect or merge. R3166-01
+    # (task #3168): no change check runs git in it for the rest of this
+    # dispatch, the security review and the single-agent mode included.
+    with dispatched_without_git(project_dir):
+        if args.dev_test:
+            # dispatch-03 (task #3111): pin the default branch before any agent
+            # runs; only the gated merge below may move it.
+            merge_guard = await _snapshot_merge_guard(project_dir)
+            result, cycles, outcome = await _run_dev_test_mode(
+                task, project_dir, project_context, args,
+            )
+            outcome = await _run_security_review_and_gate(
+                task, project_dir, project_context, args, outcome,
+                guard=merge_guard,
+            )
+            await _record_task_telemetry(
+                task, result, outcome, cycles, args,
+                merged_sha=_merged_sha_for(merge_guard, task["id"], outcome),
+            )
+        else:
+            await _run_single_agent_mode(
+                task, project_dir, project_context, args,
+            )
 
 
 # --- Mode Dispatcher ---
