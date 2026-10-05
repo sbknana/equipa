@@ -17,6 +17,7 @@ import math
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -425,9 +426,18 @@ DEADLINE_TESTS = {
         "a hanging find is cut at its 1 s scan bound, not the 120 s timeout",
     "test_agent_isolation_3169.py::test_the_bound_fails_even_when_nothing_else_does":
         "a hanging find is cut at its 1 s scan bound",
+    "test_agent_env_cwd_redaction_3120.py::"
+    "test_slow_reactive_check_times_out_as_a_block_without_freezing":
+        "the event loop keeps beating (stall < 1 s) while the check sleeps 2 s",
+    "test_reactive_check_process_3127.py::"
+    "test_streaming_agent_is_blocked_when_the_check_misses_its_deadline":
+        "the event loop keeps beating while the check misses its deadline",
     "test_deadline_watchdog_3175.py::"
     "test_a_catastrophic_regex_is_cut_at_its_deadline":
         "the regex is cut at its 0.5 s deadline, not after its minutes",
+    "test_deadline_watchdog_3175.py::"
+    "test_a_watchdog_thread_could_not_have_cut_a_regex":
+        "the match runs to its 0.5 s deadline with no thread tick inside it",
     "test_deadline_watchdog_3175.py::"
     "test_a_swallowed_deadline_stops_the_process_and_names_the_test":
         "the child is stopped 2 s in, not after its endless loop",
@@ -476,40 +486,88 @@ NOT_TIMING_TESTS = {
         "counts the parses production_seconds makes",
 }
 
+# Tests that hold their own measurement to ``budget()`` with no growth check:
+# whole-corpus caps that bound a run, not a proof of linear time (IR71-02:
+# a budget alone is not a calibrated timing test unless it is listed here).
+CORPUS_CAPS = {
+    "test_bash_tokenizer_3128.py::"
+    "test_tokenizer_agrees_with_bash_on_generated_commands":
+        "a seed's whole generated corpus against bash, capped at 20 s",
+    "test_bash_tokenizer_3128.py::"
+    "test_substitutions_bash_runs_are_never_proven_inert":
+        "the whole substitution corpus against bash, capped at 20 s",
+    "test_bash_tokenizer_3128.py::"
+    "test_every_variable_assignment_bash_runs_in_a_fresh_bash_is_refused":
+        "the whole assignment corpus, each run in a fresh bash, capped at 60 s",
+}
+
+# Clock readings, as ``time.<clock>()``, ``<clock>()`` once imported, or
+# ``<event loop>.time()``; the ``_ns`` variants too.
 CLOCKS = {"process_time", "perf_counter", "monotonic", "time", "thread_time"}
-CALIBRATED = {"assert_linear_time", "assert_linear_times", "budget",
-              "growth_ratio", "host_factor", "GROWTH_LIMIT"}
+CLOCKS |= {f"{clock}_ns" for clock in CLOCKS}
+# Calls that time work themselves: ``timeit.timeit``/``timeit.repeat`` and
+# a Timer's ``timeit``/``autorange``.
+TIMEIT_METHODS = {"timeit", "autorange"}
+# A test is calibrated when it reaches a growth check (IR71-02: only a
+# call counts, not a mention of a name such as GROWTH_LIMIT).
+GROWTH_CHECKS = {"assert_linear_time", "assert_linear_times", "growth_ratio"}
+BUDGETS = {"budget", "host_factor", "measure_under_load"}
 # Modules whose functions are followed when a test calls them.
 HELPER_MODULES = {"review_gate_timing", "review_gate_production"}
 
 
 def _is_clock_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
         return False
     function = node.func
     if isinstance(function, ast.Attribute):
-        if function.attr == "time":
-            return isinstance(function.value, ast.Name) and function.value.id == "time"
-        return function.attr in CLOCKS - {"time"}
-    return isinstance(function, ast.Name) and function.id in CLOCKS - {"time"}
+        return function.attr in CLOCKS
+    return isinstance(function, ast.Name) and function.id in CLOCKS
+
+
+def _reading_key(node: ast.AST) -> str | None:
+    """``started`` or ``self.started``: what a clock reading is kept in."""
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return ast.unparse(node)
+    return None
 
 
 def _clock_names(function: ast.AST) -> set[str]:
-    """The names *function* (nested functions included) sets to a clock
-    reading, as in ``started = time.process_time()``."""
-    return {target.id for node in ast.walk(function)
-            if isinstance(node, ast.Assign) and _is_clock_call(node.value)
-            for target in node.targets if isinstance(target, ast.Name)}
+    """What *function* (nested functions and methods included) sets to a
+    clock reading: ``started = time.process_time()``, ``self.start =
+    perf_counter()``, ``start, n = monotonic(), 0``, ``start: float =
+    monotonic()``."""
+    names: set[str] = set()
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            pairs = [(target, node.value) for target in node.targets]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pairs = [(node.target, node.value)]
+        else:
+            continue
+        for target, value in pairs:
+            if (isinstance(target, (ast.Tuple, ast.List))
+                    and isinstance(value, (ast.Tuple, ast.List))
+                    and len(target.elts) == len(value.elts)):
+                pairs_of_items = zip(target.elts, value.elts)
+            else:
+                pairs_of_items = [(target, value)]
+            for item_target, item_value in pairs_of_items:
+                key = _reading_key(item_target)
+                if key is not None and _is_clock_call(item_value):
+                    names.add(key)
+    return names
 
 
 def _measures_elapsed(node: ast.AST, clock_names: set[str]) -> bool:
-    """``clock() - started`` with ``started`` itself a clock reading: a
-    deadline ``clock() + timeout`` or a timestamp ``clock() - AGE`` is not
-    a measurement."""
-    return (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)
-            and _is_clock_call(node.left)
-            and isinstance(node.right, ast.Name)
-            and node.right.id in clock_names)
+    """``clock() - started`` or ``now - started`` with both sides clock
+    readings: a deadline ``clock() + timeout`` or a timestamp ``clock() -
+    AGE`` is not a measurement."""
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
+        return False
+    left_is_reading = (_is_clock_call(node.left)
+                       or _reading_key(node.left) in clock_names)
+    return left_is_reading and _reading_key(node.right) in clock_names
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -520,26 +578,39 @@ def _called_name(call: ast.Call) -> str | None:
     return None
 
 
+def _times_with_timeit(call: ast.Call, imports: dict[str, tuple[str, str]]) -> bool:
+    function = call.func
+    if isinstance(function, ast.Attribute):
+        return ((isinstance(function.value, ast.Name)
+                 and function.value.id == "timeit")
+                or function.attr in TIMEIT_METHODS)
+    return (isinstance(function, ast.Name) and function.id in imports
+            and imports[function.id][0] == "timeit")
+
+
 class _Module:
     """The functions of one module: which measure, which reach the helper,
-    and what each calls (by the name it is called under)."""
+    and what each calls (by the name it is called under). A class counts as
+    a function: calling it follows every method (a timer context manager)."""
 
-    def __init__(self, path: Path) -> None:
-        self.name = path.stem
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    def __init__(self, name: str, source: str) -> None:
+        self.name = name
+        tree = ast.parse(source)
         self.imports: dict[str, tuple[str, str]] = {}
         self.functions: dict[str, ast.AST] = {}
         self.tests: dict[str, ast.AST] = {}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module:
-                source = node.module.rpartition(".")[2]
+                source_module = node.module.rpartition(".")[2]
                 for alias in node.names:
-                    self.imports[alias.asname or alias.name] = (source, alias.name)
+                    self.imports[alias.asname or alias.name] = (
+                        source_module, alias.name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions[node.name] = node
                 if node.name.startswith("test_"):
                     self.tests[node.name] = node
             elif isinstance(node, ast.ClassDef):
+                self.functions[node.name] = node
                 for member in node.body:
                     if (isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                             and member.name.startswith("test_")):
@@ -549,14 +620,33 @@ class _Module:
 def _load_modules() -> dict[str, _Module]:
     paths = sorted(TESTS_DIR.glob("test_*.py"))
     paths += [TESTS_DIR / f"{name}.py" for name in sorted(HELPER_MODULES)]
-    return {path.stem: _Module(path) for path in paths}
+    return {path.stem: _Module(path.stem, path.read_text(encoding="utf-8"))
+            for path in paths}
+
+
+@dataclass(frozen=True)
+class _Reach:
+    """What a test does, its called functions included."""
+
+    measures: bool
+    growth_checked: bool
+    budgeted: bool
+
+    @property
+    def verdict(self) -> str:
+        if not self.measures:
+            return "not timing"
+        if self.growth_checked:
+            return "calibrated"
+        return "budget only" if self.budgeted else "unscaled"
 
 
 def _reach(modules: dict[str, _Module], module: _Module,
-           node: ast.AST) -> tuple[bool, bool]:
-    """(measures elapsed time, reaches the calibrated helper) for *node*
-    and every function it calls in this module or a followed one."""
-    measures = calibrated = False
+           node: ast.AST) -> _Reach:
+    """What *node* and every function it calls (or passes on by name, as
+    ``assert_linear_time(seconds_at, ...)``) in this module or a followed
+    one do: measure elapsed time, reach a growth check, reach a budget."""
+    measures = growth_checked = budgeted = False
     seen: set[tuple[str, str]] = set()
     pending = [(module, node)]
     while pending:
@@ -564,30 +654,33 @@ def _reach(modules: dict[str, _Module], module: _Module,
         clock_names = _clock_names(function)
         for child in ast.walk(function):
             measures = measures or _measures_elapsed(child, clock_names)
-            if isinstance(child, ast.Name) and child.id in CALIBRATED:
-                calibrated = True
-            if not isinstance(child, ast.Call):
-                continue
-            name = _called_name(child)
-            if name in CALIBRATED:
-                calibrated = True
+            referenced = None
+            if isinstance(child, ast.Call):
+                measures = measures or _times_with_timeit(child, current.imports)
+                name = _called_name(child)
+                growth_checked = growth_checked or name in GROWTH_CHECKS
+                budgeted = budgeted or name in BUDGETS
+                if name in current.imports:
+                    referenced = name
+            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                referenced = child.id
             target = None
-            if name in current.imports:
-                source, original = current.imports[name]
+            if referenced in current.imports:
+                source, original = current.imports[referenced]
                 if source in modules and source != "host_timing":
                     target = (source, original)
-            elif isinstance(child.func, ast.Name) and name in current.functions:
-                target = (current.name, name)
+            elif referenced in current.functions:
+                target = (current.name, referenced)
             if target and target not in seen:
                 seen.add(target)
                 callee = modules[target[0]]
                 if target[1] in callee.functions:
                     pending.append((callee, callee.functions[target[1]]))
-    return measures, calibrated
+    return _Reach(measures, growth_checked, budgeted)
 
 
 @pytest.fixture(scope="module")
-def timing_reach() -> dict[str, tuple[bool, bool]]:
+def timing_reach() -> dict[str, _Reach]:
     modules = _load_modules()
     return {
         f"{module.name}.py::{test}": _reach(modules, module, node)
@@ -598,8 +691,8 @@ def timing_reach() -> dict[str, tuple[bool, bool]]:
 
 def test_every_timing_test_is_calibrated_or_a_listed_deadline(timing_reach):
     uncalibrated = sorted(
-        key for key, (measures, calibrated) in timing_reach.items()
-        if measures and not calibrated
+        key for key, reach in timing_reach.items()
+        if reach.verdict == "unscaled"
         and key not in DEADLINE_TESTS and key not in NOT_TIMING_TESTS)
     assert not uncalibrated, (
         "these tests time work without tests/host_timing.py (use "
@@ -607,43 +700,212 @@ def test_every_timing_test_is_calibrated_or_a_listed_deadline(timing_reach):
         f"{uncalibrated}")
 
 
-@pytest.mark.parametrize("listed", [DEADLINE_TESTS, NOT_TIMING_TESTS],
-                         ids=["deadlines", "not-timing"])
-def test_every_listed_test_measures_and_is_not_scaled(timing_reach, listed):
+def test_a_budget_without_a_growth_check_is_a_listed_corpus_cap(timing_reach):
+    unlisted = sorted(key for key, reach in timing_reach.items()
+                      if reach.verdict == "budget only"
+                      and key not in CORPUS_CAPS)
+    assert not unlisted, (
+        "these tests hold work to budget() without a growth check (use "
+        "assert_linear_time, or list a corpus cap in CORPUS_CAPS): "
+        f"{unlisted}")
+
+
+@pytest.mark.parametrize("listed, verdict", [
+    (DEADLINE_TESTS, "unscaled"), (NOT_TIMING_TESTS, "unscaled"),
+    (CORPUS_CAPS, "budget only"),
+], ids=["deadlines", "not-timing", "corpus-caps"])
+def test_every_listed_test_has_the_verdict_it_is_listed_for(
+        timing_reach, listed, verdict):
     assert not set(DEADLINE_TESTS) & set(NOT_TIMING_TESTS)
-    stale = sorted(key for key in listed
-                   if timing_reach.get(key, (False, True)) != (True, False))
-    assert not stale, f"not an unscaled timing test (renamed?): {stale}"
+    assert not (set(DEADLINE_TESTS) | set(NOT_TIMING_TESTS)) & set(CORPUS_CAPS)
+    stale = sorted(key for key in listed if key not in timing_reach
+                   or timing_reach[key].verdict != verdict)
+    assert not stale, f"not a {verdict} timing test (renamed?): {stale}"
 
 
 def test_the_fence_sees_the_shapes_it_must(timing_reach):
     """The fence is not vacuous: in-module helpers, imported helpers and
     nested ``seconds_at`` functions are followed."""
-    assert timing_reach[
-        "test_review_gate_polish_3170.py::"
-        "test_a_200kb_heading_status_is_read_in_one_pass"] == (True, True)
-    assert timing_reach[
-        "test_redaction_linear_3138.py::"
-        "test_redact_secrets_on_64kb_adversarial_input_is_fast"] == (True, True)
-    assert timing_reach[
-        "test_sanitizer_3163.py::test_the_tail_judge_stays_linear"] == (True, True)
+    for key in [
+            "test_review_gate_polish_3170.py::"
+            "test_a_200kb_heading_status_is_read_in_one_pass",
+            "test_redaction_linear_3138.py::"
+            "test_redact_secrets_on_64kb_adversarial_input_is_fast",
+            "test_sanitizer_3163.py::test_the_tail_judge_stays_linear"]:
+        assert timing_reach[key].verdict == "calibrated", key
+    # The event-loop heartbeats (``now - last``) are seen, and listed.
+    for key in [
+            "test_agent_env_cwd_redaction_3120.py::"
+            "test_slow_reactive_check_times_out_as_a_block_without_freezing",
+            "test_reactive_check_process_3127.py::"
+            "test_catastrophic_regex_checker_does_not_freeze_the_event_loop"]:
+        assert timing_reach[key].verdict == "unscaled", key
     # 69 test functions time work in process when this fence was written.
-    assert sum(measures for measures, _ in timing_reach.values()) >= 60
+    assert sum(reach.measures for reach in timing_reach.values()) >= 60
 
 
 @pytest.mark.parametrize("source, measures", [
     ("started = time.process_time()\nx = time.process_time() - started", True),
     ("start = perf_counter()\nx = perf_counter() - start", True),
+    ("t0 = time.perf_counter()\nt1 = time.perf_counter()\nx = t1 - t0", True),
     ("deadline = time.monotonic() + 5", False),
     ("old = time.time() - 3600", False),
     ("old = time.time() - AGE_SECONDS", False),
     ("began = time.time() - 61\nx = time.time() - began", False),
+    ("began = time.time() - 61\nnow = time.time()\nx = now - began", False),
+    ("x = time.time(5) - time.time(3)", False),
 ])
 def test_a_clock_subtraction_is_found_and_a_deadline_is_not(source, measures):
     tree = ast.parse(source)
     names = _clock_names(tree)
     assert any(_measures_elapsed(node, names)
                for node in ast.walk(tree)) is measures
+
+
+# Each shape is a scratch test module; the fence must give it the verdict.
+# The first eleven are the uncalibrated shapes of the independent review of
+# task 3171 (IR71-02), only three of which the first fence saw.
+PLANTED_SHAPES = {
+    "process-time-minus-start": ("unscaled", """
+import time
+def test_shape():
+    start = time.process_time()
+    work()
+    assert time.process_time() - start < 0.5
+"""),
+    "bare-perf-counter-import": ("unscaled", """
+from time import perf_counter
+def test_shape():
+    start = perf_counter()
+    work()
+    assert perf_counter() - start < 0.5
+"""),
+    "elapsed-monotonic": ("unscaled", """
+from time import monotonic
+def test_shape():
+    start = monotonic()
+    work()
+    elapsed = monotonic() - start
+    assert elapsed < 0.5
+"""),
+    "two-readings": ("unscaled", """
+import time
+def test_shape():
+    t0 = time.perf_counter()
+    work()
+    t1 = time.perf_counter()
+    assert t1 - t0 < 0.5
+"""),
+    "timeit-module": ("unscaled", """
+import timeit
+def test_shape():
+    assert timeit.timeit(work, number=10) < 0.5
+"""),
+    "timeit-imported-repeat": ("unscaled", """
+from timeit import repeat
+def test_shape():
+    assert min(repeat(work, number=1, repeat=3)) < 0.5
+"""),
+    "timer-autorange": ("unscaled", """
+from timeit import Timer
+def test_shape():
+    loops, seconds = Timer(work).autorange()
+    assert seconds / loops < 0.5
+"""),
+    "tuple-assigned-start": ("unscaled", """
+import time
+def test_shape():
+    start, runs = time.perf_counter(), 3
+    work()
+    assert time.perf_counter() - start < 0.5 * runs
+"""),
+    "nanosecond-clock": ("unscaled", """
+import time
+def test_shape():
+    start = time.perf_counter_ns()
+    work()
+    assert time.perf_counter_ns() - start < 500_000_000
+"""),
+    "timer-context-manager": ("unscaled", """
+import time
+class Stopwatch:
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+    def __exit__(self, *exc):
+        self.elapsed = time.perf_counter() - self.start
+def test_shape():
+    with Stopwatch() as watch:
+        work()
+    assert watch.elapsed < 0.5
+"""),
+    "budget-only": ("budget only", """
+import time
+from tests.host_timing import budget
+def test_shape():
+    start = time.process_time()
+    work()
+    assert time.process_time() - start < budget(0.5)
+"""),
+    "unrelated-growth-limit": ("unscaled", """
+import time
+from tests.host_timing import GROWTH_LIMIT
+def test_shape():
+    start = time.process_time()
+    work()
+    assert time.process_time() - start < 0.5
+    assert GROWTH_LIMIT == 8.0
+"""),
+    "event-loop-heartbeat": ("unscaled", """
+import asyncio
+async def beat(gaps, done):
+    loop = asyncio.get_running_loop()
+    last = loop.time()
+    while not done.is_set():
+        await asyncio.sleep(0.02)
+        now = loop.time()
+        gaps.append(now - last)
+        last = now
+def test_shape():
+    gaps = []
+    asyncio.run(beat(gaps, asyncio.Event()))
+    assert max(gaps) < 1.0
+"""),
+    "annotated-start": ("unscaled", """
+import time
+def test_shape():
+    start: float = time.thread_time()
+    work()
+    assert time.thread_time() - start < 0.5
+"""),
+    "growth-checked": ("calibrated", """
+import time
+from tests.host_timing import assert_linear_time
+def seconds_at(size):
+    start = time.process_time()
+    work(size)
+    return time.process_time() - start
+def test_shape():
+    assert_linear_time(seconds_at, 4096, 0.5)
+"""),
+    "a-deadline-is-not-timing": ("not timing", """
+import time
+def test_shape():
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if poll():
+            break
+"""),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(PLANTED_SHAPES))
+def test_the_fence_gives_each_planted_shape_its_verdict(shape):
+    verdict, source = PLANTED_SHAPES[shape]
+    scratch = _Module("test_scratch_shape", source)
+    reach = _reach({"test_scratch_shape": scratch}, scratch,
+                   scratch.tests["test_shape"])
+    assert reach.verdict == verdict
 
 
 @pytest.mark.parametrize("path", sorted(TESTS_DIR.glob("test_*.py")),
