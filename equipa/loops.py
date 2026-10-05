@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import html
+import itertools
 import json
 import logging
 import os
@@ -1141,6 +1142,38 @@ _SUMMARY_FIELD_RE = re.compile(
 )
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 
+# Task 3169: Python 3.10 has no possessive quantifiers ("*+", "{m,n}+") and
+# no atomic groups ("(?>...)"); re.compile rejects them, so one such pattern
+# made this module unimportable there. The regexes below commit the same
+# way in 3.10 syntax, matching exactly what the 3.11 forms matched:
+#   * a plain quantifier when what follows the run (in every use) can never
+#     begin with a character the run itself reads, or is the end of the
+#     pattern: a shorter run leaves such a character next, so a give-back
+#     never matches. "[^)\]\n]*[)\]]" and "[ \t]*:" are of this kind.
+#   * "C+(?!C)" (or "C*", "C{m,}") for a run of one character class C that
+#     what follows could read on from: only the full run passes the
+#     lookahead.
+#   * _atomic(body) for an atomic group, and for a possessive group whose
+#     follower could match where the group gives back.
+# Every rewrite keeps the original's linear time: a give-back fails at once.
+# tests/test_regex_py310_compat_3169.py compares each with its 3.11 form.
+_ATOMIC_GROUP_NUMBERS = itertools.count(1)
+
+
+def _atomic(body: str) -> str:
+    """``(?>body)`` in syntax Python 3.10 compiles.
+
+    A lookahead is atomic in ``re``: once it has matched, a later failure
+    does not re-enter it. So ``(?=(body))`` commits to body's first match,
+    and the backreference after it consumes exactly that text. Each call
+    names its group afresh, so one pattern may hold many; the group still
+    takes a number, so a pattern built with this one is read by group name
+    or whole match only.
+    """
+    name = f"_atomic{next(_ATOMIC_GROUP_NUMBERS)}"
+    return f"(?=(?P<{name}>{body}))(?P={name})"
+
+
 # Task #3033: fix-verification re-reviews keep the prior finding's heading
 # but mark it resolved and leave it out of the footer, e.g.
 #   ### SR29-00 HIGH (fixed, verified, not counted) — ...
@@ -1161,18 +1194,19 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 # followed by 100 KB of "(" took 170 s in the gate (quadratic). Each now
 # starts only where a bracket segment starts (the start of the text or the
 # character after ")", "]" or a newline; no bracket group crosses one), so
-# a segment is read once. Inside it an atomic group commits to the FIRST
-# opener that reads "fixed"/"resolved", or to the first opener and the
-# first "not counted" after it: every later choice ends at the same closing
-# bracket, so committing loses no match. The matches are exactly the old
-# ones (tests/test_review_gate_linear_3167.py compares them).
+# a segment is read once. Inside it an atomic group (_atomic) commits to
+# the FIRST opener that reads "fixed"/"resolved", or to the first opener
+# and the first "not counted" after it: every later choice ends at the same
+# closing bracket, so committing loses no match. The matches are exactly
+# the old ones (tests/test_review_gate_linear_3167.py compares them).
 _RESOLVED_FINDING_HEADER_RE = re.compile(
     r"(?:"
-    r"(?<![^)\]\n])(?>[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b)"
-    r"[^)\]\n]*+[)\]]"
+    r"(?<![^)\]\n])"
+    + _atomic(r"[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b")
+    + r"[^)\]\n]*[)\]]"
     r"|(?<![^)\]\n])"
-    r"(?>[^()\[\]\n]*+[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b)"
-    r"[^)\]\n]*+[)\]]"
+    + _atomic(r"[^()\[\]\n]*[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b")
+    + r"[^)\]\n]*[)\]]"
     r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
     r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
     r"(?:[ \t]*\([^()\n]{0,60}\))?"
@@ -2320,11 +2354,14 @@ _HTML_BLOCK_START_RE = re.compile(
 # the backticks and the label as text.
 _HTML_BLOCK_TYPE7_RE = re.compile(
     r"<(?!(?:script|style|pre|textarea)(?![A-Za-z0-9-]))"
-    r"(?:[A-Za-z][A-Za-z0-9-]*+"
-    r"(?:[ \t]++[A-Za-z_:][A-Za-z0-9_.:-]*+"
-    r"(?:[ \t]*+=[ \t]*+(?:[^ \t\"'=<>`]++|'[^'\n]*+'|\"[^\"\n]*+\"))?+)*+"
-    r"[ \t]*+/?"
-    r"|/[A-Za-z][A-Za-z0-9-]*+[ \t]*+)>[ \t]*",
+    r"(?:[A-Za-z][A-Za-z0-9-]*"
+    + _atomic(
+        r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+        + _atomic(r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+(?![^ \t\"'=<>`])"
+                  r"|'[^'\n]*'|\"[^\"\n]*\"))?")
+        + r")*")
+    + r"[ \t]*/?"
+    r"|/[A-Za-z][A-Za-z0-9-]*[ \t]*)>[ \t]*",
     re.IGNORECASE,
 )
 # Inside an HTML block a browser decodes a numeric character reference
@@ -2333,11 +2370,14 @@ _HTML_BLOCK_TYPE7_RE = re.compile(
 # Each is given its ";" by a template (no callback per reference); one with
 # more significant digits than any code point is U+FFFD, as in a browser.
 _OVERLONG_NUMERIC_REFERENCE_RE = re.compile(
-    r"&#(?:0*+[0-9]{8,}+|[xX]0*+[0-9A-Fa-f]{7,}+)(?!;)",
+    r"&#(?:0*(?!0)[0-9]{8,}(?![0-9])"
+    r"|[xX]0*(?!0)[0-9A-Fa-f]{7,}(?![0-9A-Fa-f]))(?!;)",
 )
-_UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(r"&#0*+([0-9]{1,7}+)(?![0-9;])")
+_UNTERMINATED_DECIMAL_REFERENCE_RE = re.compile(
+    r"&#0*(?!0)([0-9]{1,7})(?![0-9;])",
+)
 _UNTERMINATED_HEX_REFERENCE_RE = re.compile(
-    r"&#([xX])0*+([0-9A-Fa-f]{1,6}+)(?![0-9A-Fa-f;])",
+    r"&#([xX])0*(?!0)([0-9A-Fa-f]{1,6})(?![0-9A-Fa-f;])",
 )
 
 
@@ -3033,7 +3073,7 @@ _BACKSTOP_TOKEN_RE = re.compile(
 # U+10FFFF and decodes to U+FFFD without int() (see
 # _backstop_decoded_reference), so thousands of digits cost nothing.
 _BACKSTOP_REFERENCE_RE = re.compile(
-    r"&(?:#(0*)([0-9]++);?|#[xX](0*)([0-9A-Fa-f]++);?"
+    r"&(?:#(0*)([0-9]+)(?![0-9]);?|#[xX](0*)([0-9A-Fa-f]+)(?![0-9A-Fa-f]);?"
     r"|[A-Za-z][A-Za-z0-9]{0,31};?)",
 )
 _BACKSTOP_MAX_DECIMAL_DIGITS = 7
@@ -3551,7 +3591,7 @@ _BACKSTOP_INLINE_MARKS = frozenset("[*_~`\\")
 # letters also merged a word into its neighbour: "a_*HIGH" became "aHIGH",
 # no token, where a renderer shows "a_*" and a standalone HIGH.
 _BACKSTOP_SPLIT_WORD_RE = re.compile("|".join(
-    _backstop_marked_word(word, r"[*_~`\\]*+")
+    _backstop_marked_word(word, r"[*_~`\\]*")
     for word in ("CRITICAL", "HIGH", "MEDIUM")
 ))
 _BACKSTOP_WORD_MARKS = str.maketrans("", "", "*_~`\\")
@@ -3616,18 +3656,18 @@ def _backstop_math_joined(view: str) -> str | None:
 # destination is read by jumping from each top-level "(" to its partner, so
 # no character is read twice per destination (a 32-level regex read each
 # character up to 32 times, 0.3 s on 200 KB of "a[a](").
-_LINK_SPACE = r"[ \t]*+(?:\n[ \t]*+)?+"
+_LINK_SPACE = r"[ \t]*(?:\n[ \t]*)?"
 _LINK_TITLE = (
-    r"\"(?:\\[\s\S]|[^\"\\])*+\"|'(?:\\[\s\S]|[^'\\])*+'"
-    r"|\((?:\\[\s\S]|[^()\\])*+\)"
+    r"\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'"
+    r"|\((?:\\[\s\S]|[^()\\])*\)"
 )
 _LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
-_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*+>")
+_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*>")
 _LINK_TAIL_END_RE = re.compile(
-    r"(?:(?:[ \t]++(?:\n[ \t]*+)?+|\n[ \t]*+)(?:" + _LINK_TITLE + r"))?+"
+    _atomic(r"(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)(?:" + _LINK_TITLE + r"))?")
     + _LINK_SPACE + r"\)",
 )
-_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}+\]")
+_LINK_LABEL_RE = re.compile(r"\[(?:\\[^\n]|[^\[\]\\]){0,999}\]")
 # The longest label a definition holds (_LINK_DEFINITION_RE); in characters,
 # so an escape counts two and a longer text is never a defined label.
 _LINK_LABEL_LIMIT = 2 * 999
@@ -3640,23 +3680,23 @@ _LINK_PARENTHESES_DEPTH = 32
 # the review defines a reference, which a shortcut "[text]" may name). The
 # alt text stops at another "![" or a blank line, so a flood of unclosed
 # "![" is read once.
-_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*+\n))*+\]"
+_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*\n))*\]"
 _LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
 _LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
 # A link reference definition ("[label]: destination"), also inside a quote
 # or list item. Read loosely: a reading that trusts these is paired with one
 # that trusts none, since a "definition" inside a paragraph or code is text.
 _LINK_DEFINITION_RE = re.compile(
-    r"^[ \t]{0,3}(?:>[ \t]?)*+(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?+"
-    r"\[((?:\\[^\n]|[^\[\]\\]){1,999}+)\]:",
+    r"^[ \t]{0,3}(?:>[ \t]?)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
+    r"\[((?:\\[^\n]|[^\[\]\\]){1,999})\]:",
     re.MULTILINE,
 )
 # Link markup a removal can join a word across: a letter or digit (or the
 # "|" drawn as I, or a lookalike's FOLD mark) right before "[" or "![", or
 # right after "]" or ")", emphasis marks and further brackets between.
 _BACKSTOP_LINK_JOIN_RE = re.compile(
-    r"(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])[*_~`\\]*+!?\["
-    r"|[\])][*_~`\\!\[]*+(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])",
+    r"(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])[*_~`\\]*!?\["
+    r"|[\])][*_~`\\!\[]*(?:[^\W_]|[|" + _BACKSTOP_FOLD_MARK_CLASS + r"])",
 )
 
 
@@ -3933,15 +3973,15 @@ def _blank_like(match: re.Match[str]) -> str:
 # footer of any other shape (fields over several lines, prose or emphasis on
 # the tally line) credits none, so its UPPER-case labels block. Possessive
 # blank runs keep a long line linear.
-_STRICT_COUNTS_HEADING_RE = re.compile(r"##[ \t]++Counts[ \t]*+",
+_STRICT_COUNTS_HEADING_RE = re.compile(r"##[ \t]+Counts[ \t]*",
                                        re.IGNORECASE)
 _STRICT_COUNTS_LINE_RE = re.compile(
-    r"[ \t]*+(?:\|[ \t]*+)?+"
-    + r"[ \t]*+(?:[|,;][ \t]*+)?+".join(
-        r"(?i:" + severity + r")[ \t]*+:[ \t]*+[0-9]{1,6}+(?![0-9])"
+    r"[ \t]*(?:\|[ \t]*)?"
+    + r"[ \t]*(?:[|,;][ \t]*)?".join(
+        r"(?i:" + severity + r")[ \t]*:[ \t]*[0-9]{1,6}(?![0-9])"
         for severity in _REVIEW_SEVERITIES
     )
-    + r"[ \t]*+(?:\|[ \t]*+)?+",
+    + r"[ \t]*(?:\|[ \t]*)?",
 )
 # The two marker lines the backstop blanks, exactly as the gate writes them:
 # a longer marker name ("EQUIPA-REVIEW-COMPLETE-HIGH") is read as text.
