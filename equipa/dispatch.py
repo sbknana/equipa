@@ -4730,6 +4730,20 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         agent_dirs[task_id] = agent_dir
 
     async def run_one_task(task):
+        # R3166-01 (task #3168): in a project that was not git at dispatch
+        # the whole of a task's turn runs under the dispatch's non-git
+        # record, its security review included. The attempts already did
+        # (run_dev_test_loop_with_autoresearch); the reviewer run after them
+        # did not, so in a repository a concurrent task's agent made in the
+        # shared project its change checks ran git, and the agent's filter.
+        # Each task of the gather is its own asyncio task, so the record
+        # covers only this task's turn.
+        if use_worktrees:
+            return await _run_one_task(task)
+        with dispatched_without_git(project_dir):
+            return await _run_one_task(task)
+
+    async def _run_one_task(task):
         output = []
         task_dir = agent_dirs.get(task["id"])
         if task_dir is None and use_worktrees:
@@ -4817,6 +4831,20 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                         f"agent reported no changes needed, but {claim_problem}; "
                         f"branch kept", output,
                     )
+
+            # N1 (task #3168): every non-git task of this run shares the
+            # project. A repository that another task's agent made there
+            # after this task's last attempt blocks this task too, before
+            # the review starts an agent in the project.
+            if (
+                not use_worktrees
+                and outcome in MERGE_ELIGIBLE_OUTCOMES
+                and _repository_appeared_in_non_git_project(
+                    task["id"], project_dir, f"before the security review ({outcome})",
+                    output,
+                )
+            ):
+                outcome = REPOSITORY_APPEARED_OUTCOME
 
             # Bug 2321: review BEFORE the task can be marked done; CRITICAL/
             # HIGH findings demote the outcome so the task stays blocked and
