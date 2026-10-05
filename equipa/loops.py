@@ -15,6 +15,7 @@ import html
 import itertools
 import json
 import logging
+import operator
 import os
 import re
 import subprocess
@@ -1884,6 +1885,43 @@ def _reference_decoded(decimal: str, hexadecimal: str) -> str:
     return html.unescape(f"&#x{hexadecimal};")
 
 
+# The two halves of _GATE_NUMERIC_REFERENCE_RE, each finding the same
+# references and digits as its group there; one group gives plain strings
+# (no tuple per reference for the garbage collector to track).
+_GATE_DECIMAL_REFERENCE_RE = re.compile(r"&#0*([0-9]+)")
+_GATE_HEX_REFERENCE_RE = re.compile(r"&#[xX]0*([0-9A-Fa-f]+)")
+# _GATE_UNICODE_EDGES plus one more start: every code point past U+10FFFF,
+# which ``html.unescape`` shows as U+FFFD (a table character).
+_GATE_REFERENCE_EDGES = _GATE_UNICODE_EDGES + (0x110000,)
+
+
+def _references_name_only_table_code_points(text: str) -> bool:
+    """Whether every numeric reference in ``text`` names a code point of the
+    gate's table, or one past U+10FFFF.
+
+    Task 3172 (timing): decoding each of 22,000 distinct spellings with
+    ``html.unescape`` cost a 200 KB review 0.09 s. A reference to a table
+    code point decodes to table characters (U+FFFD for NUL and a surrogate,
+    Windows-1252 for a C1 control, nothing for a control or noncharacter
+    html drops, the character itself otherwise), so a review whose
+    references all name one needs no decoding. A digit run longer than any
+    code point's is past U+10FFFF without int()."""
+    code_points = {
+        int(digits) for digits in set(_GATE_DECIMAL_REFERENCE_RE.findall(text))
+        if len(digits) <= _BACKSTOP_MAX_DECIMAL_DIGITS
+    }
+    code_points.update(
+        int(digits, 16)
+        for digits in set(_GATE_HEX_REFERENCE_RE.findall(text))
+        if len(digits) <= _BACKSTOP_MAX_HEX_DIGITS
+    )
+    # In the table when an odd number of edges are at or below it; map keeps
+    # the per-code-point loop in C.
+    edges_at_or_below = map(bisect.bisect_right,
+                            itertools.repeat(_GATE_REFERENCE_EDGES), code_points)
+    return all(map(operator.mod, edges_at_or_below, itertools.repeat(2)))
+
+
 def _character_outside_gate_unicode_data(
         text: str, characters: set[str] | None) -> str | None:
     """Why the gate does not parse ``text``, or None when it reads every
@@ -1909,7 +1947,8 @@ def _character_outside_gate_unicode_data(
         if unread:
             position = min(text.index(char) for char in unread)
             found.append((position, ord(text[position]), ""))
-    if "&#" in text:
+    if "&#" in text and not (
+            current and _references_name_only_table_code_points(text)):
         # Distinct spellings first: a flood of one reference decodes once.
         unread_spellings = {
             spelling
