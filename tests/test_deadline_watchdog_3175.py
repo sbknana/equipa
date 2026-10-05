@@ -26,6 +26,7 @@ import pytest
 
 from tests import deadline_watchdog
 from tests.deadline_watchdog import (
+    AFTER_A_HANG_DEADLINE_SECONDS,
     TEST_DEADLINE_SECONDS,
     TIMING_TEST_DEADLINE_SECONDS,
     DeadlineExceeded,
@@ -144,6 +145,34 @@ def test_the_outer_deadline_is_back_after_an_inner_one(request):
     assert deadline_watchdog.active_deadlines() == before
 
 
+def test_after_a_hang_every_later_phase_is_cut(request, monkeypatch):
+    monkeypatch.setattr(deadline_watchdog._deadlines, "first_hung_phase",
+                        "tests/test_x.py::test_hung (call)")
+    seconds, label = deadline_watchdog.phase_deadline(request.node, "call")
+    assert seconds == AFTER_A_HANG_DEADLINE_SECONDS
+    assert label == (f"{request.node.nodeid} (call; cut to 30 s because "
+                     f"tests/test_x.py::test_hung (call) ran past its "
+                     f"deadline first)")
+    assert AFTER_A_HANG_DEADLINE_SECONDS < TIMING_TEST_DEADLINE_SECONDS
+
+
+@pytest.mark.deadline(10)
+def test_a_deadline_under_the_cut_is_kept(request, monkeypatch):
+    monkeypatch.setattr(deadline_watchdog._deadlines, "first_hung_phase",
+                        "tests/test_x.py::test_hung (call)")
+    assert deadline_watchdog.phase_deadline(request.node, "setup") == (
+        10, f"{request.node.nodeid} (setup)")
+
+
+def test_a_deadline_a_test_expects_to_expire_is_not_a_hang():
+    before = deadline_watchdog._deadlines.first_hung_phase
+    with pytest.raises(DeadlineExceeded):
+        with deadline(0.2, "expected"):
+            while True:
+                pass
+    assert deadline_watchdog._deadlines.first_hung_phase == before
+
+
 @pytest.mark.parametrize("seconds", [0, -1, float("nan")])
 def test_a_deadline_must_be_positive(seconds):
     with pytest.raises(ValueError):
@@ -185,10 +214,50 @@ def test_swallows_the_deadline():
 '''
 
 
-def _run_scratch(tmp_path: Path, *options: str,
-                 swallow: bool = False) -> subprocess.CompletedProcess:
+AFTER_A_HANG_SCRATCH_TESTS = '''
+import pytest
+from tests import deadline_watchdog
+from tests.deadline_watchdog import DeadlineExceeded, deadline
+
+deadline_watchdog.AFTER_A_HANG_DEADLINE_SECONDS = 1.0
+
+
+def spin(seconds):
+    busy_until = deadline_watchdog.time.process_time() + seconds
+    while deadline_watchdog.time.process_time() < busy_until:
+        pass
+
+
+def test_0_expects_its_own_deadline_to_expire():
+    with pytest.raises(DeadlineExceeded):
+        with deadline(0.2, "expected"):
+            spin(5)
+
+
+def test_1_runs_past_the_cut_before_any_hang():
+    spin(1.5)
+
+
+@pytest.mark.deadline(2)
+def test_2_hangs():
+    spin(60)
+
+
+def test_3_hangs_too():
+    spin(60)
+
+
+@pytest.mark.deadline(0.5)
+def test_4_keeps_a_shorter_deadline():
+    spin(0.1)
+'''
+
+
+def _run_scratch(tmp_path: Path, *options: str, swallow: bool = False,
+                 source: str = SCRATCH_TESTS) -> subprocess.CompletedProcess:
     (tmp_path / "test_scratch.py").write_text(
-        SCRATCH_TESTS.format(swallow=swallow), encoding="utf-8")
+        source.format(swallow=swallow) if source is SCRATCH_TESTS else source,
+        encoding="utf-8")
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(("PYTEST_", "EQUIPA_"))}
     environment["PYTHONPATH"] = str(REPO_ROOT)
@@ -208,6 +277,23 @@ def test_a_hung_test_fails_by_name_and_the_run_goes_on(tmp_path):
         assert f"FAILED test_scratch.py::{name} - " in output, output
         assert (f"DeadlineExceeded: test_scratch.py::{name} (call) ran past "
                 f"its deadline of 1 s of CPU time") in output, output
+
+
+def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
+    """A regression that hangs every test of a module costs one full
+    deadline, then the short one per test, and each fails by name."""
+    started = time.monotonic()
+    completed = _run_scratch(tmp_path, source=AFTER_A_HANG_SCRATCH_TESTS)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 1, output
+    assert "2 failed, 3 passed" in output, output
+    assert ("DeadlineExceeded: test_scratch.py::test_2_hangs (call) ran past "
+            "its deadline of 2 s of CPU time") in output, output
+    assert ("DeadlineExceeded: test_scratch.py::test_3_hangs_too (call; cut "
+            "to 1 s because test_scratch.py::test_2_hangs (call) ran past its "
+            "deadline first) ran past its deadline of 1 s of CPU time"
+            ) in output, output
+    assert time.monotonic() - started < 60
 
 
 def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):

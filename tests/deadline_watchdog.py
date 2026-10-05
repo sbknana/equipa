@@ -28,8 +28,12 @@ the standard library, in two stages:
 
 A test gets ``TEST_DEADLINE_SECONDS``, a test of a module that imports
 ``tests/host_timing.py`` gets ``TIMING_TEST_DEADLINE_SECONDS``, and
-``@pytest.mark.deadline(seconds)`` sets any other. Deadlines nest: the
-earliest one active is enforced. ``tests/conftest.py`` registers this
+``@pytest.mark.deadline(seconds)`` sets any other. Once a test phase has
+run past its deadline, every later phase of that process gets at most
+``AFTER_A_HANG_DEADLINE_SECONDS``: a regression that hangs every test of a
+module costs one full deadline, then that much per test, and the run still
+ends in named failures. Deadlines nest: the earliest one active is
+enforced. ``tests/conftest.py`` registers this
 plugin; ``-p tests.deadline_watchdog`` loads it into any other run.
 
 Copyright 2026 Forgeborn
@@ -56,6 +60,12 @@ TEST_DEADLINE_SECONDS = 600.0
 # The slowest timing test took 19 s here. A budget-only corpus cap of 60 s
 # at the highest host factor (4.0) is 240 s, still inside it.
 TIMING_TEST_DEADLINE_SECONDS = 300.0
+# Once a phase of this process has run past its deadline, the run has failed
+# and named that test, and every later phase gets at most this much. A
+# reintroduced quadratic regex hangs many tests of one module, and
+# ``--dist loadfile`` runs them one after another in one worker: at a full
+# deadline each, six of them were a 30-minute CI job timeout again.
+AFTER_A_HANG_DEADLINE_SECONDS = 30.0
 # The hard stop comes this long after the deadline on the wall clock (or as
 # long again as a shorter deadline): a phase that waits uses no CPU time.
 HARD_DEADLINE_GRACE_SECONDS = 300.0
@@ -106,6 +116,10 @@ class _Deadlines:
         self.armed: list[Deadline] = []
         self.hard_stop_fd = hard_stop_fd
         self.bookkeeping = False
+        # The first test phase of this process that ran past its own
+        # deadline (a ``deadline`` block a test sets and expects to expire
+        # does not count).
+        self.first_hung_phase: str | None = None
 
     def push(self, deadline: Deadline) -> None:
         self.bookkeeping = True
@@ -239,10 +253,32 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     install(hard_stop_fd=os.dup(2))
 
 
-def _phase(item: pytest.Item, phase: str) -> contextlib.AbstractContextManager:
+def phase_deadline(item: pytest.Item, phase: str) -> tuple[float, str]:
+    """The deadline and label of one test phase: ``deadline_seconds``, cut
+    to ``AFTER_A_HANG_DEADLINE_SECONDS`` once a phase of this process has
+    run past its own (the label then names that one)."""
+    seconds = deadline_seconds(item)
+    label = f"{item.nodeid} ({phase})"
+    hung = None if _deadlines is None else _deadlines.first_hung_phase
+    if hung is not None and seconds > AFTER_A_HANG_DEADLINE_SECONDS:
+        seconds = AFTER_A_HANG_DEADLINE_SECONDS
+        label = (f"{item.nodeid} ({phase}; cut to {seconds:g} s because "
+                 f"{hung} ran past its deadline first)")
+    return seconds, label
+
+
+@contextlib.contextmanager
+def _phase(item: pytest.Item, phase: str) -> Iterator[None]:
     if _deadlines is None:
-        return contextlib.nullcontext()
-    return deadline(deadline_seconds(item), f"{item.nodeid} ({phase})")
+        yield
+        return
+    seconds, label = phase_deadline(item, phase)
+    with deadline(seconds, label) as armed:
+        try:
+            yield
+        finally:
+            if armed.raised and _deadlines.first_hung_phase is None:
+                _deadlines.first_hung_phase = f"{item.nodeid} ({phase})"
 
 
 @pytest.hookimpl(hookwrapper=True)
