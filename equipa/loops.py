@@ -1709,7 +1709,15 @@ _REVIEW_MAX_DISTINCT_CHARACTERS = 4_096
 # Unicode data predates 13.0 does not know every character of the table, so
 # it parses no review that is not ASCII. Each "XXXX-YYYY" is an inclusive
 # range of code points in hexadecimal.
+#
+# Task 3177 (IR3174-03): a later version can change a table character too
+# (Unicode 16.0, Python 3.14, made U+1171E a spacing mark, so
+# "CRITI<U+1171E>CAL" blocked on 3.12 and merged on 3.14). The digest pins
+# the table only on the versions CI runs it on, so the gate reads non-ASCII
+# text only under one of _GATE_PROVEN_UNICODE_VERSIONS; under any other it
+# parses no review that is not ASCII, as under one older than the table.
 _GATE_UNICODE_DATA_VERSION = (13, 0, 0)
+_GATE_PROVEN_UNICODE_VERSIONS = ("13.0.0", "15.0.0")
 _GATE_UNICODE_RANGES = (
     "0000-0377 037A-037F 0384-038A 038C-038C 038E-03A1 03A3-052F "
     "0531-0556 0559-058A 058D-058F 0591-05C7 05D0-05EA 05EF-05F4 "
@@ -1848,19 +1856,69 @@ REVIEW_UNICODE_DATA_REASON = "character outside the gate's Unicode data"
 
 
 def _gate_unicode_data_is_current() -> bool:
-    """Whether the running interpreter's Unicode data is at least the version
-    the gate's character table was built from (_GATE_UNICODE_DATA_VERSION)."""
-    try:
-        version = tuple(int(part)
-                        for part in unicodedata.unidata_version.split("."))
-    except ValueError:
-        return False
-    return version >= _GATE_UNICODE_DATA_VERSION
+    """Whether the running interpreter's Unicode data is one the gate's
+    character table is proven on (_GATE_PROVEN_UNICODE_VERSIONS), the exact
+    version string and nothing near it."""
+    return unicodedata.unidata_version in _GATE_PROVEN_UNICODE_VERSIONS
 
 
 def _in_gate_unicode_table(char: str) -> bool:
     """Whether the gate reads ``char`` (see _GATE_UNICODE_RANGES)."""
     return bisect.bisect_right(_GATE_UNICODE_EDGES, ord(char)) % 2 == 1
+
+
+def _gate_refuses_character(char: str, current: bool) -> bool:
+    """Whether the gate does not read ``char``: outside the table, or not
+    ASCII when the Unicode data is not ``current`` (see
+    _gate_unicode_data_is_current)."""
+    if current:
+        return not _in_gate_unicode_table(char)
+    return not char.isascii()
+
+
+def _unicode_data_named(named: str) -> str:
+    """``named`` ("U+A7F2 at line 3"), with the interpreter's Unicode data
+    version when it is not one the table is proven on."""
+    if _gate_unicode_data_is_current():
+        return named
+    proven = ", ".join(_GATE_PROVEN_UNICODE_VERSIONS)
+    return (f"{named}: the interpreter's Unicode data "
+            f"{unicodedata.unidata_version} is not one the gate's table is "
+            f"proven on ({proven})")
+
+
+class _ReferenceOutsideGateUnicodeData(Exception):
+    """A character reference the gate decoded names a character it does not
+    read (task 3177, IR3174-01); the review is not parsed."""
+
+    def __init__(self, code_point: int) -> None:
+        super().__init__(f"U+{code_point:04X}")
+        self.code_point = code_point
+
+
+def _gate_unescaped(reference: str) -> str:
+    """``html.unescape(reference)``, refused with
+    _ReferenceOutsideGateUnicodeData when the text decodes to a character
+    the gate does not read.
+
+    Task 3177 (IR3174-01): the table was checked on the review as written
+    only, but NFKC and the deletion of invisible characters form references
+    the text as written does not hold ("<FULLWIDTH AMPERSAND>#x1AC1;",
+    "&<ZWSP>#x1AC1;"), and so do the renderer's removal of comments and
+    markup and the decoding of "&amp;". U+1AC1 is a mark the backstop
+    deletes on 3.12 and unassigned on 3.10, so "CRI" + such a reference +
+    "TICAL" blocked on 3.12 and merged on 3.10. Every reader of the gate
+    that decodes a reference decodes it here, so no character outside the
+    table reaches the interpreter's Unicode data, however the reference
+    came to be."""
+    decoded = html.unescape(reference)
+    if decoded.isascii():
+        return decoded
+    current = _gate_unicode_data_is_current()
+    for char in decoded:
+        if _gate_refuses_character(char, current):
+            raise _ReferenceOutsideGateUnicodeData(ord(char))
+    return decoded
 
 
 # Every numeric character reference the gate's views decode (see
@@ -1924,23 +1982,23 @@ def _references_name_only_table_code_points(text: str) -> bool:
 
 
 def _character_outside_gate_unicode_data(
-        text: str, characters: set[str] | None) -> str | None:
+        text: str, characters: set[str] | None,
+        where: str = "") -> str | None:
     """Why the gate does not parse ``text``, or None when it reads every
     character the same way on every interpreter.
 
     ``characters`` is ``set(text)``, or None for an ASCII text. Names the
     first character outside the table as ``"U+A7F2 at line 3"``, or a
     numeric reference that decodes to one as ``"U+A7F2 reference at line
-    3"`` (every line-break form counts as one break), whichever comes first.
-    On an interpreter older than the table, the first non-ASCII character
-    (or reference to one) is named, with the interpreter's version. Reads
-    only the checked-in table, never the interpreter's Unicode data."""
+    3"`` (every line-break form counts as one break), whichever comes first;
+    ``where`` follows the line number. Under Unicode data the table is not
+    proven on, the first non-ASCII character (or reference to one) is
+    named, with the interpreter's version. Reads only the checked-in table,
+    never the interpreter's Unicode data."""
     current = _gate_unicode_data_is_current()
 
     def outside(char: str) -> bool:
-        if current:
-            return not _in_gate_unicode_table(char)
-        return not char.isascii()
+        return _gate_refuses_character(char, current)
 
     found: list[tuple[int, int, str]] = []
     if characters:
@@ -1970,12 +2028,8 @@ def _character_outside_gate_unicode_data(
         return None
     position, code_point, kind = min(found)
     line = len(_ANY_LINE_BREAK_RE.findall(text, 0, position)) + 1
-    named = f"U+{code_point:04X}{kind} at line {line}"
-    if not current:
-        table_version = ".".join(map(str, _GATE_UNICODE_DATA_VERSION))
-        return (f"{named}: the interpreter's Unicode data "
-                f"{unicodedata.unidata_version} predates {table_version}")
-    return named
+    return _unicode_data_named(f"U+{code_point:04X}{kind} at line {line}"
+                               f"{where}")
 
 
 REVIEW_VERDICT_OK = "ok"
@@ -3304,7 +3358,7 @@ def _references_replaced(text: str, references: re.Pattern[str],
 
 def _decoded_reference_text(reference: str) -> str:
     """``reference`` ("&#72;", "&Eta;") as the text the parser should see."""
-    decoded = html.unescape(reference)
+    decoded = _gate_unescaped(reference)
     if decoded == reference:
         return reference  # unknown name: the renderer shows it literally
     # Fullwidth letters fold to ASCII; a zero-width space or soft hyphen
@@ -3728,7 +3782,8 @@ _BACKSTOP_REFERENCE_TRANSLATION = {
 
 def _backstop_reference_text(reference: str) -> str:
     """``reference`` as a browser shows it, on the same line."""
-    return html.unescape(reference).translate(_BACKSTOP_REFERENCE_TRANSLATION)
+    return _gate_unescaped(reference).translate(
+        _BACKSTOP_REFERENCE_TRANSLATION)
 
 
 _BACKSTOP_REFERENCES = _ReferenceTable(_backstop_reference_text)
@@ -4862,11 +4917,32 @@ def _analyze_review_file(
     # decoded into the rendered views, so it counts as its character.
     outside = _character_outside_gate_unicode_data(text, characters)
     if outside is not None:
-        return ReviewCountAnalysis(
-            verdict=REVIEW_VERDICT_INCOMPLETE,
-            detail=(f"{REVIEW_UNICODE_DATA_REASON}: {outside} (name the "
-                    f"character, never paste it)"),
-        )
+        return _unicode_data_refusal(outside)
+    # Task 3177 (IR3174-01): the steps below form references the text as
+    # written does not hold; one that decodes to a character outside the
+    # table is refused where it is decoded (_gate_unescaped), and the
+    # review with it.
+    try:
+        return _analyze_review_in_table(text)
+    except _ReferenceOutsideGateUnicodeData as refused:
+        return _unicode_data_refusal(
+            _unicode_data_named(f"{refused} reference once decoded"))
+
+
+def _unicode_data_refusal(named: str) -> ReviewCountAnalysis:
+    """The verdict on a review holding ``named``, a character the gate's
+    table does not read (see _character_outside_gate_unicode_data)."""
+    return ReviewCountAnalysis(
+        verdict=REVIEW_VERDICT_INCOMPLETE,
+        detail=(f"{REVIEW_UNICODE_DATA_REASON}: {named} (name the "
+                f"character, never paste it)"),
+    )
+
+
+def _analyze_review_in_table(text: str) -> ReviewCountAnalysis:
+    """The rest of :func:`_analyze_review_file`, on a review as written
+    whose characters and references the gate's table reads."""
+    written_is_ascii = text.isascii()
     # gate-06 / gate-14: fullwidth "ＨＩＧＨ", a zero-width "HI​GH" and a
     # heading after a lone CR or U+2028 were all invisible to the regexes
     # below. Idempotent, so text the provenance check already normalised
@@ -4887,6 +4963,18 @@ def _analyze_review_file(
     # folded (see _backstop_separated_text).
     separated_text = _backstop_separated_text(text)
     text = normalize_review_text(text)
+    if not written_is_ascii:
+        # Task 3177 (IR3174-01): NFKC and the deletion of invisible
+        # characters can form a reference ("<FULLWIDTH AMPERSAND>#x1AC1;"
+        # is "&#x1AC1;"), so the table is applied again to each normalised
+        # text the views decode. An ASCII text only has its line breaks
+        # mapped, which forms none.
+        for normalized in (text, folded_first):
+            outside = (None if normalized is None
+                       else _character_outside_gate_unicode_data(
+                           normalized, set(normalized), " once normalized"))
+            if outside is not None:
+                return _unicode_data_refusal(outside)
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
     # structured artifacts — the merge gate must still fail-closed on them.
