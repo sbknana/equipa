@@ -19,6 +19,7 @@ Benign prose of the same look must still merge.
 Copyright 2026 Forgeborn
 """
 
+import math
 import random
 import re
 from pathlib import Path
@@ -27,6 +28,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     AS_WRITTEN_ONLY_FINDINGS,
     blocked_by_the_gate,
@@ -545,74 +547,94 @@ def test_200kb_of_line_breaks_parses_in_half_a_second(line_break, section):
     # Inside the Summary section, and after a heading that ends it (where
     # every line is also checked for a "Summary:" field).
     # Sized in UTF-8 bytes, so a U+2028 flood is 200 KB like the others.
-    body = section + [line_break * (REVIEW_BYTES // len(line_break.encode()))]
-    text = review("No findings.", body, ZERO, low_heading=False)
-    assert len(text.encode()) >= REVIEW_BYTES
-    analysis = analyze(text)
-    elapsed = production_seconds(text)
+    # Budget host-calibrated, growth from 50 KB to 200 KB linear (task 3171).
+    def flood_review(rb):
+        body = section + [line_break * (rb // len(line_break.encode()))]
+        text = review("No findings.", body, ZERO, low_heading=False)
+        assert len(text.encode()) >= rb
+        return text
+
+    analysis = analyze(flood_review(REVIEW_BYTES))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
-    assert elapsed < 0.5, f"{line_break!r}: {elapsed:.2f}s"
+    assert_linear_time(lambda rb: production_seconds(flood_review(rb)),
+                       REVIEW_BYTES, 0.5, repr(line_break))
 
 
-def _padded_lines(line: str) -> list[str]:
-    return [line] * (REVIEW_BYTES // (len(line) + 1) + 1)
+def _padded_lines(rb: int, line: str) -> list[str]:
+    return [line] * (rb // (len(line) + 1) + 1)
 
 
-# Adversarial bodies for every pass and rule task 3137 added. Each is parsed
-# as written and as rendered, so each must stay well inside the budget.
-ADVERSARIAL_BODIES = {
-    "backtick-lines": _padded_lines("`"),
-    "backtick-pairs": ["` " * (REVIEW_BYTES // 2)],
-    "backtick-run-lengths": [" ".join("`" * length for length in range(1, 640))],
-    "unclosed-double-runs": ["`` x " * (REVIEW_BYTES // 5)],
-    "escaped-backticks": ["\\`" * (REVIEW_BYTES // 2)],
-    "backslash-runs": ["\\" * REVIEW_BYTES + "`"],
-    "fence-with-backtick-info": _padded_lines("```x`y"),
-    "fence-pairs": _padded_lines("```"),
-    "unclosed-tilde-fences": _padded_lines("~~~ x"),
-    "comment-lines": _padded_lines("<!--"),
-    "midline-comment-openers": _padded_lines("x <!-- y"),
-    "comment-in-code": _padded_lines("`<!--` x `-->`"),
-    "nested-markers": ["- " * (REVIEW_BYTES // 2) + "HIGH: x"],
-    "nested-marker-lines": _padded_lines("- 1. > - x"),
-    "deep-blockquotes": [">" * REVIEW_BYTES + " HIGH: x"],
-    "list-continuations": ["- a", ""] + _padded_lines("    b"),
-    "list-items-and-paragraphs": _padded_lines("- a\n\n    b"),
-    "deep-list-nesting": ["  " * depth + "- x" for depth in range(300)] * 3,
-    "footnote-lines": _padded_lines("[^1]: x"),
-    "table-code-cells": ["| a | b |", "|---|---|"]
-    + _padded_lines("| `x | y` | \\| z |"),
-    "html-block-lines": ["<div>"] + _padded_lines("`x` HIGHx"),
-    "combining-marks": ["H̲" * (REVIEW_BYTES // 3)],
-    "accented-letters": ["\N{LATIN CAPITAL LETTER I WITH ACUTE}" * (REVIEW_BYTES // 2)],
-    "severity-clause-runs": [", severity " * (REVIEW_BYTES // 11)],
-    "title-lead-in-lines": _padded_lines("HIGH HIGH HIGH HIGH Hx"),
-    "marker-comment-splits": ["HI<!-- EQUIPA-X -->" * (REVIEW_BYTES // 19)],
-    "inline-tags-with-backticks": ["<a title='`'> `x` " * (REVIEW_BYTES // 18)],
-    "unclosed-tag-openers": ["<a`" * (REVIEW_BYTES // 3)],
-    "long-unclosed-tags": _padded_lines("<a " + "`" * 600),
-    # Long blank runs, which folding turns into one blank line, split every
-    # possible way by "[ \t]*\**[ \t]*" before task 3137 (quadratic).
-    "blank-line-after-heading": ["## Findings", " " * REVIEW_BYTES],
-    "tab-line-after-heading": ["## Findings", "\t" * REVIEW_BYTES],
-    "bullet-then-blanks": ["## Findings", "- " + " " * REVIEW_BYTES + "x"],
-    "hash-then-blanks": ["#" + " " * REVIEW_BYTES + "x"],
-    "summary-status-blanks": ["status" + " " * REVIEW_BYTES + "x"],
-    "summary-draft-blanks": ["DRAFT" + " " * REVIEW_BYTES + "x"],
-    "summary-field-blanks": ["## Notes", "Summary" + " " * REVIEW_BYTES + "x"],
-    "marker-comment-blanks": ["<!-- EQUIPA-X" + " " * REVIEW_BYTES + "x"],
-    "table-delimiter-blanks": ["| a | b |", "|---" + " " * REVIEW_BYTES + "| x"],
-}
+def adversarial_bodies(rb: int) -> dict[str, list[str]]:
+    """Adversarial bodies for every pass and rule task 3137 added, built at
+    ``rb`` bytes (timed at REVIEW_BYTES and a quarter of it, task 3171).
+    Each is parsed as written and as rendered, so each must stay well inside
+    the budget."""
+    return {
+        "backtick-lines": _padded_lines(rb, "`"),
+        "backtick-pairs": ["` " * (rb // 2)],
+        "backtick-run-lengths": [" ".join(
+            "`" * length for length in range(1, math.isqrt(2 * rb)))],
+        "unclosed-double-runs": ["`` x " * (rb // 5)],
+        "escaped-backticks": ["\\`" * (rb // 2)],
+        "backslash-runs": ["\\" * rb + "`"],
+        "fence-with-backtick-info": _padded_lines(rb, "```x`y"),
+        "fence-pairs": _padded_lines(rb, "```"),
+        "unclosed-tilde-fences": _padded_lines(rb, "~~~ x"),
+        "comment-lines": _padded_lines(rb, "<!--"),
+        "midline-comment-openers": _padded_lines(rb, "x <!-- y"),
+        "comment-in-code": _padded_lines(rb, "`<!--` x `-->`"),
+        "nested-markers": ["- " * (rb // 2) + "HIGH: x"],
+        "nested-marker-lines": _padded_lines(rb, "- 1. > - x"),
+        "deep-blockquotes": [">" * rb + " HIGH: x"],
+        "list-continuations": ["- a", ""] + _padded_lines(rb, "    b"),
+        "list-items-and-paragraphs": _padded_lines(rb, "- a\n\n    b"),
+        # 300 levels at REVIEW_BYTES: the bytes grow with the square of the
+        # depth, so a quarter of the size is half the depth.
+        "deep-list-nesting": ["  " * depth + "- x" for depth in range(
+            math.isqrt(300 * 300 * rb // REVIEW_BYTES))] * 3,
+        "footnote-lines": _padded_lines(rb, "[^1]: x"),
+        "table-code-cells": ["| a | b |", "|---|---|"]
+        + _padded_lines(rb, "| `x | y` | \\| z |"),
+        "html-block-lines": ["<div>"] + _padded_lines(rb, "`x` HIGHx"),
+        "combining-marks": ["H̲" * (rb // 3)],
+        "accented-letters": ["\N{LATIN CAPITAL LETTER I WITH ACUTE}" * (rb // 2)],
+        "severity-clause-runs": [", severity " * (rb // 11)],
+        "title-lead-in-lines": _padded_lines(rb, "HIGH HIGH HIGH HIGH Hx"),
+        "marker-comment-splits": ["HI<!-- EQUIPA-X -->" * (rb // 19)],
+        "inline-tags-with-backticks": ["<a title='`'> `x` " * (rb // 18)],
+        "unclosed-tag-openers": ["<a`" * (rb // 3)],
+        "long-unclosed-tags": _padded_lines(rb, "<a " + "`" * 600),
+        # Long blank runs, which folding turns into one blank line, split every
+        # possible way by "[ \t]*\**[ \t]*" before task 3137 (quadratic).
+        "blank-line-after-heading": ["## Findings", " " * rb],
+        "tab-line-after-heading": ["## Findings", "\t" * rb],
+        "bullet-then-blanks": ["## Findings", "- " + " " * rb + "x"],
+        "hash-then-blanks": ["#" + " " * rb + "x"],
+        "summary-status-blanks": ["status" + " " * rb + "x"],
+        "summary-draft-blanks": ["DRAFT" + " " * rb + "x"],
+        "summary-field-blanks": ["## Notes", "Summary" + " " * rb + "x"],
+        "marker-comment-blanks": ["<!-- EQUIPA-X" + " " * rb + "x"],
+        "table-delimiter-blanks": ["| a | b |", "|---" + " " * rb + "| x"],
+    }
+
+
+ADVERSARIAL_BODIES = adversarial_bodies(REVIEW_BYTES)
+
+
+def _adversarial_review_seconds(name: str, rb: int) -> float:
+    text = review("No findings.", adversarial_bodies(rb)[name], ZERO,
+                  low_heading=False)
+    assert len(text.encode()) >= rb
+    return production_seconds(text)
 
 
 @timing_test
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
 def test_200kb_adversarial_review_parses_under_one_second(name):
-    text = review("No findings.", ADVERSARIAL_BODIES[name], ZERO,
-                  low_heading=False)
-    assert len(text.encode()) >= REVIEW_BYTES
-    elapsed = production_seconds(text)
-    assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(lambda rb: _adversarial_review_seconds(name, rb),
+                       REVIEW_BYTES, 1.0, name)
 
 
 # Found by a generated search over token pairs (a + b*n at 4 KB and 16 KB):
@@ -622,21 +644,26 @@ def test_200kb_adversarial_review_parses_under_one_second(name):
 BOLD_OPENER_BYTES = 32 * 1024
 
 
-@pytest.mark.parametrize("line", [
-    "**" + " " * BOLD_OPENER_BYTES + "x",
-    "- **" + "\t" * BOLD_OPENER_BYTES,
-    "<b>" + " " * BOLD_OPENER_BYTES,
-    "<strong>" + "\N{NO-BREAK SPACE}" * BOLD_OPENER_BYTES,
-    "<b>" + "`` " * (BOLD_OPENER_BYTES // 3),
-])
+@pytest.mark.parametrize("make_line", [
+    lambda size: "**" + " " * size + "x",
+    lambda size: "- **" + "\t" * size,
+    lambda size: "<b>" + " " * size,
+    lambda size: "<strong>" + "\N{NO-BREAK SPACE}" * size,
+    lambda size: "<b>" + "`` " * (size // 3),
+], ids=["bold-spaces", "list-bold-tabs", "b-tag-spaces", "strong-nbsp",
+        "b-tag-backtick-pairs"])
 @timing_test
-def test_blanks_after_a_bold_opener_parse_in_linear_time(line):
-    text = review("No findings.", ["## Findings", "", line], ZERO,
-                  low_heading=False)
-    analysis = analyze(text)
-    elapsed = production_seconds(text)
+def test_blanks_after_a_bold_opener_parse_in_linear_time(make_line):
+    """Budget host-calibrated, growth from 8 KB to 32 KB linear (task
+    3171)."""
+    def bold_review(size):
+        return review("No findings.", ["## Findings", "", make_line(size)],
+                      ZERO, low_heading=False)
+
+    analysis = analyze(bold_review(BOLD_OPENER_BYTES))
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
-    assert elapsed < 0.5, f"{line[:12]!r}: {elapsed:.2f}s"
+    assert_linear_time(lambda size: production_seconds(bold_review(size)),
+                       BOLD_OPENER_BYTES, 0.5, repr(make_line(3)))
 
 
 @pytest.mark.parametrize("line, severity", [
@@ -654,14 +681,32 @@ def test_bold_lead_ins_with_blanks_and_brackets_still_fail_closed(line, severity
 # cells ran all six table severity-cell rules on every cell, in every scan of
 # both views. A marker comment that shares its line forces both views, so it
 # took about 1 s. A row without a severity word now skips the rules.
-PIPE_FLOODS = {
-    "pipes": "|" * REVIEW_BYTES,
-    "marker-comment-then-pipes": "<!-- EQUIPA-X -->" + "|" * REVIEW_BYTES,
-    "pipes-then-marker-comment": "|" * REVIEW_BYTES + "<!-- EQUIPA-X -->",
-    "tilde-fence-then-pipes": "~~~" + "|" * REVIEW_BYTES,
-    "spaced-cells": "| " * (REVIEW_BYTES // 2),
-    "word-cells": "| x " * (REVIEW_BYTES // 4),
-}
+def pipe_floods(rb: int) -> dict[str, str]:
+    return {
+        "pipes": "|" * rb,
+        "marker-comment-then-pipes": "<!-- EQUIPA-X -->" + "|" * rb,
+        "pipes-then-marker-comment": "|" * rb + "<!-- EQUIPA-X -->",
+        "tilde-fence-then-pipes": "~~~" + "|" * rb,
+        "spaced-cells": "| " * (rb // 2),
+        "word-cells": "| x " * (rb // 4),
+    }
+
+
+PIPE_FLOODS = pipe_floods(REVIEW_BYTES)
+
+
+def _assert_one_line_flood_parses_in_linear_time(floods, name, section):
+    """The review holding line ``floods(rb)[name]`` after ``section`` is
+    trusted at REVIEW_BYTES, and the gate's time on it stays within a
+    host-calibrated 0.5 s and grows linearly from 50 KB (task 3171)."""
+    def flood_review(rb):
+        return review("No findings.", section + [floods(rb)[name]], ZERO,
+                      low_heading=False)
+
+    analysis = analyze(flood_review(REVIEW_BYTES))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
+    assert_linear_time(lambda rb: production_seconds(flood_review(rb)),
+                       REVIEW_BYTES, 0.5, name)
 
 
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
@@ -669,37 +714,32 @@ PIPE_FLOODS = {
 @timing_test
 def test_200kb_row_of_cells_without_a_severity_parses_in_half_a_second(
         name, section):
-    text = review("No findings.", section + [PIPE_FLOODS[name]], ZERO,
-                  low_heading=False)
-    analysis = analyze(text)
-    elapsed = production_seconds(text)
-    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
-    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    _assert_one_line_flood_parses_in_linear_time(pipe_floods, name, section)
 
 
 # Found by the same search: on a line that opens an HTML comment block, every
 # later comment on the line rescanned the line from its start to see whether
 # it was the block's opener, so 200 KB of comments took about 0.6 s and
 # 512 KB 3.5 s (quadratic).
-COMMENT_LINE_FLOODS = {
-    "marker-comments-then-backticks":
-        "<!-- EQUIPA-X -->" * (REVIEW_BYTES // 17) + "``",
-    "comments": "<!-- x -->" * (REVIEW_BYTES // 10),
-    "indented-comments": "   " + "<!-- x -->" * (REVIEW_BYTES // 10),
-    "comments-then-unclosed": "<!-- x -->" * (REVIEW_BYTES // 10) + "<!--",
-}
+def comment_line_floods(rb: int) -> dict[str, str]:
+    return {
+        "marker-comments-then-backticks":
+            "<!-- EQUIPA-X -->" * (rb // 17) + "``",
+        "comments": "<!-- x -->" * (rb // 10),
+        "indented-comments": "   " + "<!-- x -->" * (rb // 10),
+        "comments-then-unclosed": "<!-- x -->" * (rb // 10) + "<!--",
+    }
+
+
+COMMENT_LINE_FLOODS = comment_line_floods(REVIEW_BYTES)
 
 
 @pytest.mark.parametrize("section", [[], ["## Findings"]])
 @pytest.mark.parametrize("name", sorted(COMMENT_LINE_FLOODS))
 @timing_test
 def test_200kb_line_of_comments_parses_in_half_a_second(name, section):
-    text = review("No findings.", section + [COMMENT_LINE_FLOODS[name]], ZERO,
-                  low_heading=False)
-    analysis = analyze(text)
-    elapsed = production_seconds(text)
-    assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis.detail
-    assert elapsed < 0.5, f"{name}: {elapsed:.2f}s"
+    _assert_one_line_flood_parses_in_linear_time(comment_line_floods, name,
+                                                 section)
 
 
 def test_only_the_comment_opening_a_line_may_run_across_blank_lines():
