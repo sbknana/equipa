@@ -34,6 +34,12 @@ program ran while the cleanup still did its job.
   the agent runs ``git init`` during a failed attempt. Both retry loops are
   driven as production calls them (no task branch). The cleanup must start
   no git process at all and must report the repository instead.
+* S3168-01/02/03 (task #3173): in such a project the agent leaves an
+  implicit bare repository (no ``.git`` anywhere; the real dev-test loop in
+  both retry loops, and the CLI single-agent mode), the goal loop runs it,
+  and a later dispatch (``--tasks``, ``--task``, ``--auto-run``, ``--goal``)
+  meets a repository an earlier N1 check blocked. No planted program may run,
+  and the later dispatch must start no git in the project.
 
 Every check snapshots the markers right after the orchestrator's call; a
 failure reads ``EXECUTED <vector>/<operation>: [<markers>]``.
@@ -1684,11 +1690,256 @@ def test_parallel_reviewer_of_a_non_git_task_starts_no_git_in_a_repository_made_
     assert run.statuses[TASK_ID] != "tests_passed", run.statuses
 
 
+# --- S3168-01 (task #3173): an implicit bare repository -------------------------
+
+BARE_VECTOR = "implicit-bare-repository"
+# Where the agent's work tree is: git discovers the repository from the
+# project directory either way.
+BARE_LAYOUTS = ("work-tree-in-subdirectory", "work-tree-at-root")
+
+
+def _plant_implicit_bare_repository(agent: Agent, project: Path, layout: str) -> None:
+    """S3168-01: what an agent can leave instead of a ``.git``. It runs
+    ``git init`` in a work tree, commits, moves the repository's own files
+    (``HEAD``, ``objects``, ``refs``, ``config``, ...) up into the project
+    directory and names the work tree in ``core.worktree``. No ``.git``
+    exists anywhere, yet git run in the project takes the project directory
+    for a git directory. Its clean and smudge filter is a program of the
+    agent's, selected for every path (work tree and ``info/attributes``),
+    and a committed file is left changed (same size)."""
+    work_tree = project / "src" if layout == "work-tree-in-subdirectory" else project
+    work_tree.mkdir(exist_ok=True)
+    if work_tree != project:
+        shutil.copy2(project / "app.py", work_tree / "app.py")
+    _git(work_tree, "init", "-q", "-b", "main")
+    (work_tree / ".gitattributes").write_text("* filter=probe\n")
+    _git(work_tree, "add", ".gitattributes", "app.py")
+    _git(work_tree, "-c", "user.name=agent", "-c", "user.email=agent@example.invalid",
+         "commit", "-q", "-m", "agent")
+    git_dir = work_tree / ".git"
+    for entry in list(git_dir.iterdir()):
+        entry.rename(project / entry.name)
+    git_dir.rmdir()
+    # Defined after the commit, so planting never runs it.
+    program = agent.program(f"{BARE_VECTOR}-filter", "exec cat")
+    for key, value in (
+        ("core.worktree", str(work_tree)),
+        ("filter.probe.clean", program),
+        ("filter.probe.smudge", program),
+    ):
+        _git(project, f"--git-dir={project}", "config", key, value)
+    (project / "info").mkdir(exist_ok=True)
+    (project / "info" / "attributes").write_text("* filter=probe\n")
+    (work_tree / "app.py").write_text("PRINT('project')\n")
+    agent.ran_while_planting = agent.ran()
+
+
+def _plant_bare_repository_during_run(
+    agent: Agent, project: Path, layout: str, recorder: GitRecorder,
+    run: ParallelNonGitRun,
+) -> None:
+    """:func:`_plant_implicit_bare_repository` as the agent's Bash calls do
+    it, during a run the recorder is watching."""
+    with recorder.paused():
+        _plant_implicit_bare_repository(agent, project, layout)
+    run.planted_at = len(recorder.calls)
+
+
+def _assert_bare_planted(agent: Agent, project: Path) -> None:
+    """The plant happened, and it is one the ``.git`` walk N1 used misses."""
+    assert not os.path.lexists(project / ".git")
+    assert (project / "HEAD").is_file() and (project / "refs").is_dir()
+    assert git_ops_mod._nearest_git_entry(project) is None
+    assert _git(project, f"--git-dir={project}", "config", "filter.probe.clean") == str(
+        agent.bin / f"{BARE_VECTOR}-filter"
+    )
+
+
+def _overloaded_tester_result() -> dict[str, Any]:
+    """A tester run that ends the dev-test cycle (the 529 shape)."""
+    import equipa.agent_runner as agent_runner
+
+    return agent_runner._fail_overloaded(
+        {"success": False, "result_text": "", "num_turns": 0, "cost": 0.0,
+         "duration": 0.0, "errors": ["API Error: 529 overloaded_error: Overloaded"]},
+        ["claude"], 10, 10,
+    )
+
+
+def _stub_dev_test_agents(
+    monkeypatch: pytest.MonkeyPatch,
+    developer: Callable[[str], None],
+    tester: Callable[[str, Any], Any] | None = None,
+) -> list[str]:
+    """The real ``run_dev_test_loop`` with its agents, DB, prompts and budget
+    stubbed. Everything that runs git in the project is the loop's own: the
+    HEAD anchor (``_resolve_head_sha``), the audit-task diff check
+    (``_git_diff_is_empty``) and the tester's diff context
+    (``_capture_git_diff_context``). ``developer(project_dir)`` is what the
+    developer agent does; ``tester(project_dir, output)`` returns the tester
+    result (by default a 529, which ends the cycle). Returns the roles
+    dispatched, in order."""
+    import equipa.loops as loops
+
+    dispatched: list[str] = []
+
+    async def async_none(*args, **kwargs):
+        return None
+
+    async def preflight_ok(*args, **kwargs):
+        return (True, "python", None)
+
+    async def fake_dispatch(cmd, *, role, project_dir, output=None, **kwargs):
+        dispatched.append(role)
+        if role == "tester":
+            if tester is None:
+                return _overloaded_tester_result()
+            return await tester(project_dir, output)
+        developer(project_dir)
+        return {
+            "success": True, "result_text": "RESULT: success\nFILES_CHANGED: app.py",
+            "num_turns": 3, "cost": 0.0, "duration": 0.0, "errors": [],
+            "has_file_changes": True,
+        }
+
+    @contextmanager
+    def fake_cli(*args, **kwargs):
+        yield ["claude"]
+
+    for name, value in {
+        "auto_install_dependencies": async_none,
+        "preflight_build_check": preflight_ok,
+        "get_db_connection": lambda *a, **k: _NoDb(),
+        "get_task_complexity": lambda _task: "simple",
+        "get_role_model": lambda *a, **k: "claude-test",
+        "get_role_turns": lambda *a, **k: 10,
+        "calculate_dynamic_budget": lambda max_turns, effort=None: (max_turns, max_turns),
+        "load_checkpoint": lambda *a, **k: ("", 0),
+        "fire_hook": async_none,
+        "read_agent_messages": lambda *a, **k: [],
+        "build_system_prompt": lambda *a, **k: "prompt",
+        "build_cli_command": fake_cli,
+        "_accumulate_cost": lambda *a, **k: 0.0,
+        "_check_cost_limit": lambda *a, **k: None,
+        "_get_task_status": lambda _task_id: "in_progress",
+        "_check_dev_progress": lambda *a, **k: ("continue", 0, None),
+        "dispatch_agent": fake_dispatch,
+    }.items():
+        monkeypatch.setattr(loops, name, value)
+    return dispatched
+
+
+def _audit_task(task_id: int) -> dict[str, Any]:
+    """A review task: the dev-test loop asks git whether the developer
+    changed code (``_git_diff_is_empty``) before giving the tester its diff."""
+    return {**_task(task_id), "task_type": "review"}
+
+
+@pytest.mark.parametrize("layout", BARE_LAYOUTS)
+@pytest.mark.parametrize("loop", ["cli", "dispatch"])
+def test_dev_test_loop_runs_no_git_in_an_implicit_bare_repository_the_agent_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop: str, layout: str,
+) -> None:
+    """S3168-01: in a project that was not git at dispatch, the developer
+    agent leaves an implicit bare repository (no ``.git`` at all). The N1
+    walk looked for ``.git`` only, so the attempt was not stopped, and the
+    dev-test loop's own diff helpers, which never consulted the non-git
+    record, ran ``git diff`` there by discovery: the agent's clean filter
+    ran in the orchestrator, and its diff went into the tester's prompt.
+    With the work tree at the project root, ``HEAD`` is ambiguous with the
+    git directory's own ``HEAD`` file, so it was the retried attempt
+    (``_resolve_head_sha`` named the agent's commit) that ran it. Now the
+    helpers run no git under the record and N1 finds the repository after
+    the attempt: blocked, audited, never retried. The real
+    ``run_dev_test_loop`` runs inside each retry loop as production calls
+    it for a project that is not git."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    planted: list[str] = []
+
+    def developer(project_dir: str) -> None:
+        if not planted:
+            with recorder.paused():
+                _plant_implicit_bare_repository(agent, project, layout)
+            planted.append(project_dir)
+
+    dispatched = _stub_dev_test_agents(monkeypatch, developer)
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _NoDb)
+    monkeypatch.setattr(dispatch_mod, "fetch_task", lambda task_id: _audit_task(task_id))
+    output: list[str] = []
+
+    async def run_loop() -> str:
+        autoresearch = {"features": {"autoresearch": True}, "autoresearch_max_retries": 1}
+        if loop == "cli":
+            args = SimpleNamespace(dispatch_config=autoresearch)
+            _, _, outcome = await cli_mod._run_dev_test_mode(
+                _audit_task(TASK_ID), str(project), {}, args,
+            )
+            return outcome
+        _, _, outcome, _, _, _ = await dispatch_mod.run_dev_test_loop_with_autoresearch(
+            _audit_task(TASK_ID), str(project), {}, SimpleNamespace(), autoresearch,
+            output=output,
+        )
+        return outcome
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    outcome = None
+    try:
+        with recorder.recording():
+            outcome = _run(run_loop())
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, BARE_VECTOR, f"{loop}-dev-test-loop/{layout}", agent.ran())
+    if error is not None:
+        raise error
+    assert planted == [str(project)], "the developer never planted"
+    _assert_bare_planted(agent, project)
+    assert recorder.discovery_in(project) == [], recorder.discovery_in(project)
+    assert not any("Captured git diff" in line for line in output), output
+    # N1 after the attempt: one developer and one tester run, then blocked.
+    assert dispatched == ["developer", "tester"], dispatched
+    assert outcome == REPOSITORY_APPEARED
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert f"a git repository appeared at {project} in a project" in audit[0][0], audit
+
+
+@pytest.mark.parametrize("layout", BARE_LAYOUTS)
+def test_the_dev_test_loop_helpers_run_the_filter_of_an_implicit_bare_repository_without_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str,
+) -> None:
+    """Positive control for the plant above: without the dispatch's non-git
+    record, the dev-test loop's diff helpers do discover the repository and
+    run the agent's filter, though no ``.git`` exists."""
+    import equipa.loops as loops
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _plant_implicit_bare_repository(agent, project, layout)
+    assert agent.ran() == [], "planting ran the filter"
+
+    base = _run(loops._resolve_head_sha(str(project)))
+    if layout == "work-tree-at-root":
+        # The retried attempt's anchor: the agent's own commit.
+        assert base == _git(project, f"--git-dir={project}", "rev-parse", "HEAD")
+    assert _run(loops._git_diff_is_empty(str(project), base_ref=base)) is False
+    assert "PRINT('project')" in _run(loops._capture_git_diff_context(str(project), 1, None, base))
+
+    assert f"{BARE_VECTOR}-filter" in agent.ran()
+    _assert_bare_planted(agent, project)
+
+
 # --- R3166-01 / N1 (task #3168): the CLI's single-agent mode -------------------
 
 
+@pytest.mark.parametrize("layout", ["dot-git", *BARE_LAYOUTS])
 def test_single_agent_run_in_a_non_git_project_runs_no_git_in_the_agents_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, layout: str,
 ) -> None:
     """R3166-01 / N1 in ``--task`` without ``--dev-test``: the agent of a
     project that was not git at dispatch made it a repository with a clean
@@ -1698,7 +1949,11 @@ def test_single_agent_run_in_a_non_git_project_runs_no_git_in_the_agents_reposit
     which ran the agent's filter in the orchestrator. Now the task stops
     after the agent, blocked with a durable GATE-AUDIT record, and no git
     runs in the project. Driven through ``run_mode_task`` as production
-    calls it."""
+    calls it.
+
+    S3168-01 (task #3173): ``layout`` ``dot-git`` is the repository above;
+    the others are an implicit bare repository (no ``.git``), which the N1
+    walk missed, so the guard's ``git status`` ran its filter."""
     import equipa.cli as cli_mod
 
     project = _non_git_project(tmp_path)
@@ -1734,7 +1989,10 @@ def test_single_agent_run_in_a_non_git_project_runs_no_git_in_the_agents_reposit
 
     async def fake_agent(cmd, *args, **kwargs):
         """The agent's Bash calls made the repository; its run succeeded."""
-        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        if layout == "dot-git":
+            _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        else:
+            _plant_bare_repository_during_run(agent, project, layout, recorder, run)
         result = {
             "success": True, "result_text": "RESULT: success", "stdout": "",
             "cost": 0.0, "duration": 0.0, "files_changed": ["app.py"],
@@ -1757,18 +2015,456 @@ def test_single_agent_run_in_a_non_git_project_runs_no_git_in_the_agents_reposit
     except Exception as exc:  # re-raised below, after the markers
         error = exc
 
-    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "cli-single-agent", agent.ran())
+    vector = CHANGE_CHECK_VECTOR if layout == "dot-git" else f"{BARE_VECTOR}/{layout}"
+    _assert_nothing_ran(agent, vector, "cli-single-agent", agent.ran())
     if error is not None:
         raise error
-    _assert_planted(agent, project)
+    if layout == "dot-git":
+        _assert_planted(agent, project)
+        repository = project / ".git"
+    else:
+        _assert_bare_planted(agent, project)
+        repository = project
     assert _discovery_after_planting(recorder, run, project) == []
     assert outcomes == [REPOSITORY_APPEARED]
     assert [event for _, event in audit] == ["repository-appeared"], audit
     assert (
-        f"after the developer agent: a git repository appeared at {project / '.git'}"
+        f"after the developer agent: a git repository appeared at {repository} in a project"
         in audit[0][0]
     ), audit
     assert f"[GATE-AUDIT] task={TASK_ID} event=repository-appeared" in capsys.readouterr().out
+
+
+# --- S3168-02 (task #3173): the goal (manager) loop -----------------------------
+
+GOAL_SECOND_TASK_ID = TASK_ID + 2
+
+
+@dataclass
+class GoalRun:
+    """What the goal loop did."""
+
+    statuses: dict[int, str] = field(default_factory=dict)
+    evaluator_runs: int = 0
+
+
+def _patch_goal_planner(monkeypatch: pytest.MonkeyPatch, task_ids: list[int]) -> GoalRun:
+    """``run_manager_loop`` with its planner and evaluator agents replaced:
+    the planner plans ``task_ids``, the evaluator calls the goal complete.
+    Each task runs through the real ``run_dev_test_loop``."""
+    import equipa.manager as manager_mod
+
+    goal = GoalRun()
+
+    async def planner(goal_text, project_id, project_dir, project_context, args, output=None):
+        return {"cost": 0.0, "duration": 0.0}, list(task_ids)
+
+    async def evaluator(goal_text, project_id, project_dir, project_context,
+                        completed, blocked, args, output=None):
+        goal.evaluator_runs += 1
+        return ({"cost": 0.0, "duration": 0.0},
+                {"goal_status": "complete", "tasks_created": [],
+                 "evaluation": "done", "blockers": "none"})
+
+    def update_status(task_id, outcome, **kwargs):
+        goal.statuses[task_id] = outcome
+
+    monkeypatch.setattr(manager_mod, "run_planner_agent", planner)
+    monkeypatch.setattr(manager_mod, "run_evaluator_agent", evaluator)
+    monkeypatch.setattr(
+        manager_mod, "fetch_tasks_by_ids",
+        lambda ids: [_task(task_id) for task_id in task_ids if task_id in ids],
+    )
+    monkeypatch.setattr(manager_mod, "_get_task_status", lambda _task_id: "todo")
+    monkeypatch.setattr(manager_mod, "update_task_status", update_status)
+    return goal
+
+
+def _goal_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        max_rounds=1, manager_cost_limit=100.0, dispatch_config={}, model="m",
+        max_turns=10,
+    )
+
+
+def test_goal_loop_in_a_non_git_project_runs_no_git_in_a_repository_its_agent_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """S3168-02: ``--goal`` on a project that was not git at dispatch. The
+    first task's developer made the project a repository with a clean
+    filter of its own. The goal loop had neither the non-git record nor the
+    N1 check, so the loop's tester diff ran ``git diff`` there, the
+    tester's streaming runner (its run started with ``.git`` present, so it
+    took the project for git) ran its change check, and the next task ran
+    in the agent's repository: each ran the filter in the orchestrator. Now
+    the whole goal runs under the record and N1 stops it after the task:
+    blocked, audited, no further task or evaluator. The developer's work is
+    stubbed; the dev-test loop and the tester's streaming runner are real."""
+    import equipa.agent_runner as agent_runner
+    import equipa.manager as manager_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    tester_cmd = _reviewer_agent(tmp_path)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = ParallelNonGitRun()
+    tester_runs: list[dict[str, Any]] = []
+
+    def developer(project_dir: str) -> None:
+        if run.planted_at is None:
+            _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+
+    async def tester(project_dir: str, output: Any) -> dict[str, Any]:
+        tester_runs.append(await agent_runner.run_agent_streaming(
+            tester_cmd, role="tester", output=output, max_turns=40,
+            project_dir=project_dir,
+        ))
+        return _overloaded_tester_result()
+
+    dispatched = _stub_dev_test_agents(monkeypatch, developer, tester)
+    goal = _patch_goal_planner(monkeypatch, [TASK_ID, GOAL_SECOND_TASK_ID])
+    output: list[str] = []
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    result = None
+    try:
+        with recorder.recording():
+            result = _run(manager_mod.run_manager_loop(
+                "ship it", 9001, str(project), {}, _goal_args(), output,
+            ))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "goal-loop", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert result is not None and result[0] == REPOSITORY_APPEARED, result
+    assert REPOSITORY_APPEARED in manager_mod.GOAL_REFUSED_OUTCOMES
+    # One task ran (developer, then a tester the runner never started).
+    assert dispatched == ["developer", "tester"], dispatched
+    [tester_run] = tester_runs
+    assert tester_run["early_terminated"], tester_run
+    assert goal.statuses == {TASK_ID: REPOSITORY_APPEARED}, goal.statuses
+    assert goal.evaluator_runs == 0
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert (
+        f"after the task (agent_overloaded): a git repository appeared at {project / '.git'}"
+        in audit[0][0]
+    ), audit
+    logged = "\n".join(output) + capsys.readouterr().out
+    assert f"[GATE-AUDIT] task={TASK_ID} event=repository-appeared" in logged, logged
+
+
+def test_goal_loop_stops_before_a_task_when_a_repository_is_already_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3168-02: a repository found before a task (left by the planner, or
+    by an earlier goal of the same run that decided "not git" first) stops
+    the goal before any agent of that task runs, and no git runs there."""
+    import equipa.manager as manager_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = ParallelNonGitRun()
+
+    async def planner(goal_text, project_id, project_dir, project_context, args, output=None):
+        # The planner's turn: a repository appears before the first task.
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        return {"cost": 0.0, "duration": 0.0}, [TASK_ID]
+
+    dispatched = _stub_dev_test_agents(monkeypatch, lambda project_dir: None)
+    goal = _patch_goal_planner(monkeypatch, [TASK_ID])
+    monkeypatch.setattr(manager_mod, "run_planner_agent", planner)
+
+    error: Exception | None = None
+    result = None
+    try:
+        with recorder.recording():
+            result = _run(manager_mod.run_manager_loop(
+                "ship it", 9001, str(project), {}, _goal_args(), [],
+            ))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "goal-before-task", agent.ran())
+    if error is not None:
+        raise error
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert result is not None and result[0] == REPOSITORY_APPEARED, result
+    assert dispatched == []
+    assert goal.statuses == {TASK_ID: REPOSITORY_APPEARED}
+    assert goal.evaluator_runs == 0
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert f"before the task: a git repository appeared at {project / '.git'}" in audit[0][0]
+
+
+# --- S3168-03 (task #3173): the next dispatch after an N1 block -----------------
+
+NEXT_TASK_ID = TASK_ID + 3
+NEXT_DISPATCHERS = ("parallel", "cli-task", "auto-run", "goal")
+
+
+def _block_with_n1(
+    agent: Agent, project: Path, tmp_path: Path, recorder: GitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ParallelNonGitRun:
+    """A task of the project, not git at dispatch, whose agent made it a
+    repository: committed ``.gitattributes`` selecting a filter whose
+    smudge is the agent's program. N1 blocks the task after its attempt."""
+    run = ParallelNonGitRun()
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
+
+    _patch_non_git_loops(monkeypatch, attempt)
+    assert _run(_run_non_git_loop("dispatch", project, [])) == REPOSITORY_APPEARED
+    return run
+
+
+async def _dispatch_next_task(
+    dispatcher: str, project: Path, monkeypatch: pytest.MonkeyPatch,
+    attempts: list[int], output: list[str],
+) -> Any:
+    """Dispatch another task of the same project, as each mode does; the
+    goal logs to ``output``."""
+    import equipa.cli as cli_mod
+    import equipa.constants as constants_mod
+    import equipa.manager as manager_mod
+
+    task = _task(NEXT_TASK_ID)
+
+    async def attempt(task, project_dir, project_context, args, output=None, **kwargs):
+        attempts.append(task["id"])
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
+
+    for module in (cli_mod, dispatch_mod, manager_mod):
+        monkeypatch.setattr(module, "run_dev_test_loop", attempt)
+    if dispatcher == "parallel":
+        async def wrapped(task, *args, **kwargs):
+            return (*await attempt(task, ""), 0.0, 0.0, task)
+
+        _patch_parallel_non_git_review(
+            monkeypatch, project, [NEXT_TASK_ID], wrapped, wrapped,
+        )
+        return await dispatch_mod.run_parallel_tasks([NEXT_TASK_ID], _parallel_args())
+    if dispatcher == "cli-task":
+        async def no_telemetry(*args, **kwargs):
+            return None
+
+        for name, value in {
+            "fetch_task": lambda _id: task,
+            "resolve_project_dir": lambda _task: str(project),
+            "fetch_project_context": lambda _pid: {},
+            "_auto_snapshot_dispatch": lambda *a, **k: None,
+            # Reached only when the project is dispatched (before the fix):
+            # no reflexion agent, no telemetry rows.
+            "_post_task_telemetry": no_telemetry,
+            "_record_task_telemetry": no_telemetry,
+        }.items():
+            monkeypatch.setattr(cli_mod, name, value)
+        args = argparse.Namespace(
+            task=NEXT_TASK_ID, project=None, role="developer", dev_test=True,
+            dry_run=False, yes=True, retries=0, dispatch_config={}, security_review=True,
+        )
+        return await cli_mod.run_mode_task(args)
+    if dispatcher == "auto-run":
+        async def no_op(*args, **kwargs):
+            return None
+
+        monkeypatch.setitem(constants_mod.PROJECT_DIRS, "nongitproj", str(project))
+        for name, value in {
+            "fetch_task": lambda _id: dict(task),
+            "fetch_project_context": lambda _pid: {},
+            "fire_hook": no_op,
+            "update_task_status": lambda *a, **k: None,
+            "record_agent_run": lambda *a, **k: None,
+            "run_quality_scoring": lambda *a, **k: None,
+            "maybe_run_reflexion": no_op,
+            "update_injected_episode_q_values_for_task": lambda *a, **k: None,
+            "get_role_model": lambda *a, **k: "claude-test",
+            "get_role_turns": lambda *a, **k: 20,
+        }.items():
+            monkeypatch.setattr(dispatch_mod, name, value)
+        monkeypatch.setattr("equipa.scaffold.ensure_scaffold", lambda *a, **k: False)
+        summary = {"project_id": 9001, "codename": "nongitproj", "total_todo": 1,
+                   "tasks": [{"id": NEXT_TASK_ID, "title": "next"}]}
+        args = SimpleNamespace(model="m", max_turns=10, max_tasks_per_project=None,
+                               security_review=True)
+        return await dispatch_mod.run_project_tasks(
+            summary, {"features": {"autoresearch": False}}, args,
+        )
+    _patch_goal_planner(monkeypatch, [NEXT_TASK_ID])
+    return await manager_mod.run_manager_loop(
+        "ship it", 9001, str(project), {}, _goal_args(), output,
+    )
+
+
+@pytest.mark.parametrize("dispatcher", NEXT_DISPATCHERS)
+def test_a_later_dispatch_of_a_project_blocked_by_n1_runs_no_git_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatcher: str,
+) -> None:
+    """S3168-03: N1 blocked a task whose agent made the project (not git at
+    dispatch) a repository, and left that repository for the operator.
+    Nothing recorded it, so the next dispatch of any task of the project
+    found it by discovery and took it for the project's checkout: ``git
+    worktree add`` there ran the agent's smudge filter in the orchestrator,
+    the R3166-01 execution only deferred. Now N1 records the repository
+    outside the project, and every dispatch mode (``--tasks``, ``--task``,
+    ``--auto-run``, ``--goal``) refuses the project before any git runs
+    there, naming the record the operator deletes to acknowledge it."""
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = _block_with_n1(agent, project, tmp_path, recorder, monkeypatch)
+    assert agent.ran() == [], "the first dispatch ran the agent's filter"
+    attempts: list[int] = []
+    output: list[str] = []
+
+    # The markers are read before an exception from the dispatch is raised.
+    error: BaseException | None = None
+    result = None
+    with recorder.recording():
+        next_dispatch_at = len(recorder.calls)
+        try:
+            result = _run(_dispatch_next_task(
+                dispatcher, project, monkeypatch, attempts, output,
+            ))
+        except (Exception, SystemExit) as exc:  # judged below, after the markers
+            error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, f"next-dispatch/{dispatcher}", agent.ran())
+    run.planted_at = next_dispatch_at
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert attempts == []
+    if dispatcher in ("parallel", "cli-task"):
+        # Both exit the CLI with EXIT_DISPATCH_REFUSED.
+        assert isinstance(error, dispatch_mod.DispatchRefused), error
+        refusal = error.message
+    elif error is not None:
+        raise error
+    elif dispatcher == "auto-run":
+        assert result["tasks_attempted"] == 0, result
+        refusal = "\n".join(result["refusals"])
+    else:
+        assert result is not None and result[0] in dispatch_mod.GOAL_REFUSED_OUTCOMES, result
+        refusal = "\n".join(output)
+    record = dispatch_mod._agent_made_repository_record(str(project))
+    assert record is not None and record.is_file()
+    assert f"Refusing to run git there: inspect or remove that repository, then delete {record}" in refusal, refusal
+
+
+def test_an_n1_block_in_cli_dev_test_mode_is_recorded_with_no_git_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3168-03 inside one dispatch: ``--task --dev-test`` on a project
+    that was not git at dispatch. The attempt's agent makes a repository,
+    so N1 blocks the task (and records the repository). The merge step
+    after the loop asked ``_is_git_project`` again: by discovery in the
+    agent's repository, and with the refusal record it must not end the
+    dispatch before the task's outcome is recorded. It answers "not git"
+    for the dispatch that recorded the project as such: no git, the block
+    recorded."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run = ParallelNonGitRun()
+    task = _task(TASK_ID)
+    recorded: list[str] = []
+
+    async def attempt(task, project_dir, project_context, args, output=None):
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_failed"
+
+    async def record_telemetry(task, result, outcome, *args, **kwargs):
+        recorded.append(outcome)
+
+    _patch_non_git_loops(monkeypatch, attempt)
+    for name, value in {
+        "fetch_task": lambda _id: task,
+        "resolve_project_dir": lambda _task: str(project),
+        "fetch_project_context": lambda _pid: {},
+        "_auto_snapshot_dispatch": lambda *a, **k: None,
+        "_record_task_telemetry": record_telemetry,
+    }.items():
+        monkeypatch.setattr(cli_mod, name, value)
+    args = argparse.Namespace(
+        task=TASK_ID, project=None, role="developer", dev_test=True, dry_run=False,
+        yes=True, retries=0, dispatch_config={}, security_review=True,
+    )
+
+    error: BaseException | None = None
+    try:
+        with recorder.recording():
+            _run(cli_mod.run_mode_task(args))
+    except (Exception, SystemExit) as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "cli-dev-test-merge-step", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert recorded == [REPOSITORY_APPEARED]
+
+
+def test_acknowledging_the_record_lets_the_project_be_dispatched_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3168-03: the refusal lasts until the operator, having removed (or
+    inspected) the agent's repository, deletes the record named in it."""
+    import equipa.cli as cli_mod
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    _block_with_n1(agent, project, tmp_path, recorder, monkeypatch)
+    with pytest.raises(dispatch_mod.DispatchRefused):
+        cli_mod._is_git_project(str(project))
+    record = dispatch_mod._agent_made_repository_record(str(project))
+    assert record is not None
+
+    shutil.rmtree(project / ".git")
+    for leftover in record.parent.glob("*.json"):
+        if json.loads(leftover.read_text())["project_dir"] == str(project):
+            leftover.unlink()
+
+    assert dispatch_mod._agent_made_repository_record(str(project)) is None
+    assert cli_mod._is_git_project(str(project)) is False
+    assert agent.ran() == []
+
+
+def test_adopting_the_agents_repository_at_the_next_dispatch_runs_its_smudge_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the vector above: the worktree a git project's
+    dispatch makes (``git worktree add`` from the main checkout's HEAD,
+    hardened as production runs it) runs the agent's smudge filter."""
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    _fake_agent(tmp_path, agent, project)
+    subprocess.run(["/bin/sh", str(tmp_path / "fake-agent" / "plant.sh")], check=True)
+    assert agent.ran() == [], "planting ran the filter"
+
+    added = git_run(
+        ["worktree", "add", "-b", f"forge-task-{NEXT_TASK_ID}",
+         str(tmp_path / "next-worktree"), "HEAD"],
+        str(project),
+    )
+
+    assert added.returncode == 0, added.stderr
+    assert f"{CHANGE_CHECK_VECTOR}-filter" in agent.ran()
 
 
 # --- The three remaining discovery calls, one by one ----------------------------

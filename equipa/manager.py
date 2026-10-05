@@ -31,6 +31,7 @@ from equipa.git_ops import GitRepositoryUnreadableError, _is_git_repo
 from equipa.loops import run_dev_test_loop
 from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
 from equipa.merge_safety import report_leftover_dispatch_state, shutdown_requested
+from equipa.monitoring import dispatched_without_git
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
@@ -50,10 +51,14 @@ GOAL_AGENT_READ_ONLY_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 # Goal outcomes that mean the dispatch was refused rather than run to an
 # end: the default branch moved outside the gated merge or could not be
 # pinned, or a task was refused its isolation worktree. The CLI exits with
-# EXIT_DISPATCH_REFUSED for these (3112 review, task #3119).
+# EXIT_DISPATCH_REFUSED for these (3112 review, task #3119). S3168-02 (task
+# #3173): so does a goal stopped because a repository appeared in a project
+# that was not git at dispatch (equipa.dispatch.REPOSITORY_APPEARED_OUTCOME,
+# spelled out here: equipa.dispatch imports this module).
 GOAL_REFUSED_OUTCOMES: frozenset[str] = frozenset({
     "merge_integrity_failed",
     "worktree_refused",
+    "repository_appeared",
 })
 
 
@@ -493,8 +498,51 @@ async def run_manager_loop(
 ) -> tuple[str, int, list[dict], list[dict], float, float]:
     """Run the full Manager loop: Plan -> Execute -> Evaluate -> Repeat.
 
+    S3168-02 (task #3173): a project that is not git at dispatch runs the
+    whole goal (planner, tasks and evaluator) under
+    :func:`equipa.monitoring.dispatched_without_git`, as the retry loops
+    do, so no change check runs git in a repository an agent makes there.
+    Before and after each task the N1 check looks for such a repository;
+    one found blocks the task and stops the goal with outcome
+    ``repository_appeared`` (in ``GOAL_REFUSED_OUTCOMES``).
+
     Returns (outcome, total_rounds, all_completed, all_blocked, total_cost, total_duration).
     """
+    # Imported here: equipa.dispatch imports this module.
+    from equipa.dispatch import refuse_agent_made_repository
+
+    try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
+        is_git_project = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        log(f"\n  [Manager] {exc} Not running the goal.", output)
+        return "merge_integrity_failed", 0, [], [], 0.0, 0.0
+    if is_git_project:
+        return await _run_goal_rounds(
+            goal, project_id, project_dir, project_context, args, output,
+            is_git_project=True,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_goal_rounds(
+            goal, project_id, project_dir, project_context, args, output,
+            is_git_project=False,
+        )
+
+
+async def _run_goal_rounds(
+    goal: str,
+    project_id: int,
+    project_dir: str,
+    project_context: dict[str, Any],
+    args: Any,
+    output: Any,
+    *,
+    is_git_project: bool,
+) -> tuple[str, int, list[dict], list[dict], float, float]:
+    """The rounds of :func:`run_manager_loop`, once the project is known to
+    be git (``is_git_project``) or not."""
     max_rounds = args.max_rounds
     cost_limit = getattr(args, "manager_cost_limit", None)
     if cost_limit is None:
@@ -512,12 +560,6 @@ async def run_manager_loop(
     # branch moved anyway, the goal stops, nothing further is merged and the
     # CLI exits non-zero (GOAL_REFUSED_OUTCOMES).
     goal_guard: DefaultBranchGuard | None = None
-    try:
-        is_git_project = _is_git_repo(project_dir)
-    except GitRepositoryUnreadableError as exc:
-        # R3119-02 (task #3126): never run an unreadable repo ungated.
-        log(f"\n  [Manager] {exc} Not running the goal.", output)
-        return "merge_integrity_failed", 0, all_completed, all_blocked, total_cost, total_duration
     if is_git_project:
         # Imported here: equipa.dispatch imports this module.
         from equipa.dispatch import run_task_in_isolation
@@ -631,15 +673,43 @@ async def run_manager_loop(
                         total_cost, total_duration,
                     )
             else:
-                # Not a git repo: there are no branches to protect.
-                result, cycles, outcome = await run_dev_test_loop(
-                    task, project_dir, project_context, args, output=output,
+                # Not a git repo: there are no branches to protect. S3168-02
+                # (task #3173): the goal runs under the non-git record (see
+                # run_manager_loop), and N1 stops it on a repository found
+                # before or after the task: the planner's or an earlier
+                # task's, or this task's own.
+                from equipa.dispatch import (
+                    REPOSITORY_APPEARED_OUTCOME,
+                    _repository_appeared_in_non_git_project,
                 )
-                total_duration += result.get("duration", 0)
-                if result.get("cost"):
-                    total_cost += result["cost"]
+
+                if _repository_appeared_in_non_git_project(
+                    task["id"], project_dir, "before the task", output,
+                ):
+                    outcome = REPOSITORY_APPEARED_OUTCOME
+                else:
+                    result, cycles, outcome = await run_dev_test_loop(
+                        task, project_dir, project_context, args, output=output,
+                    )
+                    total_duration += result.get("duration", 0)
+                    if result.get("cost"):
+                        total_cost += result["cost"]
+                    if _repository_appeared_in_non_git_project(
+                        task["id"], project_dir, f"after the task ({outcome})", output,
+                    ):
+                        outcome = REPOSITORY_APPEARED_OUTCOME
 
                 update_task_status(task["id"], outcome, output=output)
+                if outcome == REPOSITORY_APPEARED_OUTCOME:
+                    log(f"\n  [Manager] Task #{task['id']} {outcome}: a git repository "
+                        f"appeared in a project that was not git at dispatch. "
+                        f"Stopping the goal.", output)
+                    all_completed.extend(round_completed)
+                    all_blocked.extend([*round_blocked, task])
+                    return (
+                        outcome, round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
 
             if outcome in ("tests_passed", "no_tests"):
                 round_completed.append(task)
