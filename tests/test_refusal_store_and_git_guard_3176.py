@@ -278,6 +278,22 @@ def _forgetful_git_dir_variable(project: Path, tmp_path: Path) -> subprocess.Com
     )
 
 
+def _another_repository_with_a_change(tmp_path: Path) -> None:
+    other = _init_repo(tmp_path / "other")
+    (other / "README.md").write_text("SEED\n")
+
+
+def _forgetful_git_common_dir_variable(
+    project: Path, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    """git run in a repository of its own outside the project still reads
+    config and info/attributes, so the agent's filter, from GIT_COMMON_DIR."""
+    return git_run(
+        ["diff", "--stat"], tmp_path / "other",
+        env={"GIT_COMMON_DIR": str(project / ".git")},
+    )
+
+
 def _forgetful_async(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
     return asyncio.run(git_run_async(["diff", "--stat"], project))
 
@@ -297,8 +313,14 @@ FORGETFUL_HELPERS = {
     "git_run-dash-C": _forgetful_change_directory,
     "git_run-git-dir-option": _forgetful_git_dir_option,
     "git_run-GIT_DIR": _forgetful_git_dir_variable,
+    "git_run-GIT_COMMON_DIR": _forgetful_git_common_dir_variable,
     "git_run_async": _forgetful_async,
     "process-runner": _forgetful_process_runner,
+}
+
+# Set up before git is recorded: the test's own git is not the helper's.
+FORGETFUL_HELPER_PREPARATIONS = {
+    "git_run-GIT_COMMON_DIR": _another_repository_with_a_change,
 }
 
 
@@ -307,6 +329,9 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, helper: str,
 ) -> None:
     project, agent = _planted_project(tmp_path, monkeypatch)
+    prepare = FORGETFUL_HELPER_PREPARATIONS.get(helper)
+    if prepare is not None:
+        prepare(tmp_path)
     recorder = GitRecorder(monkeypatch)
 
     with dispatched_without_git(project), recorder.recording():
@@ -319,8 +344,31 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     assert "not a git repository at dispatch" in result.stderr
 
 
+def _gh_in_the_project(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    return git_ops._gh_run(["pr", "list"], cwd=str(project))
+
+
+def _gh_given_the_projects_git_dir(
+    project: Path, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    """A helper that starts gh elsewhere with its own environment: gh passes
+    GIT_DIR on to the git it runs."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    return git_ops._run_with_env(
+        ["gh", "pr", "list"], elsewhere, 30, {"GIT_DIR": str(project / ".git")},
+    )
+
+
+GH_HELPERS = {
+    "gh-in-the-project": _gh_in_the_project,
+    "gh-given-GIT_DIR": _gh_given_the_projects_git_dir,
+}
+
+
+@pytest.mark.parametrize("helper", sorted(GH_HELPERS))
 def test_gh_is_not_started_in_a_non_git_project(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, helper: str,
 ) -> None:
     """gh runs git by discovery too."""
     project = tmp_path / "project"
@@ -331,10 +379,11 @@ def test_gh_is_not_started_in_a_non_git_project(
     )
 
     with dispatched_without_git(project):
-        result = git_ops._gh_run(["pr", "list"], cwd=str(project))
+        result = GH_HELPERS[helper](project, tmp_path)
 
     assert started == []
     assert result.returncode == NOT_A_REPOSITORY
+    assert "not a git repository at dispatch" in result.stderr
 
 
 def test_git_still_runs_outside_the_recorded_project(tmp_path: Path) -> None:
