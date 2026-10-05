@@ -43,6 +43,7 @@ import pytest
 
 import equipa.security_gate as security_gate
 from equipa import loops
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     as_reviewer_artifact,
     decision_and_analysis,
@@ -443,27 +444,52 @@ def test_the_named_references_and_case_tables_are_pinned():
     assert _sha256(contexts) == CASE_CONTEXT_DIGEST
 
 
+# The size of the timed reference bodies: each body below is built at a
+# size, and at this one it is the 200 KB body the timing test was written
+# with.
+REFERENCES_SIZE = 200_000
+
 # Distinct references to table characters (CJK ideographs and the Hangul
 # syllables, all assigned before Unicode 13) fill a 200 KB review: the
 # check decodes each spelling once.
-DISTINCT_REFERENCES = "".join(
-    f"&#x{code_point:X};"
-    for code_point in itertools.chain(range(0x4E00, 0x4E00 + 14_000),
-                                      range(0xAC00, 0xD7A4))
-)
+_DISTINCT_REFERENCE_CODE_POINTS = tuple(itertools.chain(
+    range(0x4E00, 0x4E00 + 14_000), range(0xAC00, 0xD7A4)))
+
+
+def distinct_references(size: int = REFERENCES_SIZE) -> str:
+    """The first ``size / REFERENCES_SIZE`` of the distinct references:
+    at ``REFERENCES_SIZE``, all 25,172 of them."""
+    count = len(_DISTINCT_REFERENCE_CODE_POINTS) * size // REFERENCES_SIZE
+    return "".join(f"&#x{code_point:X};"
+                   for code_point in _DISTINCT_REFERENCE_CODE_POINTS[:count])
+
+
+DISTINCT_REFERENCES = distinct_references()
+
+REFERENCE_BODIES = {
+    "distinct-references": distinct_references,
+    "one-reference-flood": lambda size: "&#x2014;" * (size // 8),
+    "zero-run": lambda size: "&#" + "0" * size + "65;",
+}
 
 
 @timing_test
-@pytest.mark.parametrize("body", [
-    DISTINCT_REFERENCES,
-    "&#x2014;" * 25_000,
-    "&#" + "0" * 200_000 + "65;",
-], ids=["distinct-references", "one-reference-flood", "zero-run"])
-def test_200kb_of_references_is_checked_in_time(body):
-    text = review(body)
+@pytest.mark.parametrize("name", list(REFERENCE_BODIES))
+def test_200kb_of_references_is_checked_in_time(name):
+    """Timed through the merge gate. The 0.5 s budget is scaled by the host
+    factor and the time must grow linearly from 50 KB to 200 KB (task 3174,
+    as task 3171 requires of every timing test)."""
+    build = REFERENCE_BODIES[name]
+    text = review(build(REFERENCES_SIZE))
     assert len(text) > 200_000
     assert loops._character_outside_gate_unicode_data(text, None) is None
-    assert production_seconds(text) < 0.5
+
+    def seconds_at(size: int) -> float:
+        sized = review(build(size))
+        assert loops._character_outside_gate_unicode_data(sized, None) is None
+        return production_seconds(sized)
+
+    assert_linear_time(seconds_at, REFERENCES_SIZE, 0.5, name)
 
 
 def test_references_to_table_code_points_are_not_decoded(monkeypatch):
