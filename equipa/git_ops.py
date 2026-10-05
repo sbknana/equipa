@@ -1248,6 +1248,139 @@ def _get_repo_env() -> dict[str, str]:
     return env
 
 
+# --- Projects that were not git at dispatch (R3166-01, task #3168) ---
+
+# The given and the resolved form of every project directory a dispatch in
+# this context recorded as not git. A ContextVar, so each task of the
+# parallel loop (its own asyncio task) sees only the records of its own run.
+_NON_GIT_PROJECT_ROOTS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "equipa_non_git_project_roots", default=frozenset(),
+)
+
+# The environment variables that point git at a repository or work tree
+# other than the one it would discover from its working directory.
+_GIT_LOCATION_ENV_KEYS: tuple[str, ...] = ("GIT_DIR", "GIT_WORK_TREE")
+
+
+def _path_forms(directory: str | os.PathLike[str]) -> set[str]:
+    """The absolute and the symlink-resolved form of ``directory``."""
+    path = os.fspath(directory)
+    return {os.path.abspath(path), os.path.realpath(path)}
+
+
+@contextlib.contextmanager
+def dispatched_without_git(project_dir: str | os.PathLike[str]) -> Iterator[None]:
+    """Record, while the block runs, that ``project_dir`` was not a git
+    repository when its task was dispatched.
+
+    R3166-01 (task #3168): a ``.git`` found there later is one an agent
+    made. Git run there by discovery reads the agent's config and
+    attributes, so a work-tree ``git diff`` runs the agent's clean filter
+    as a child of the orchestrator, outside agent containment. While the
+    record is active, no git or gh process this module starts runs at or
+    under ``project_dir``, in its given or its resolved form (IR73-02, task
+    #3176: enforced in the process runners, so a helper that does not ask
+    :func:`git_checks_allowed` first still runs no git there). Nesting is
+    safe: an inner record only adds paths.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get() | _path_forms(project_dir)
+    token = _NON_GIT_PROJECT_ROOTS.set(frozenset(roots))
+    try:
+        yield
+    finally:
+        _NON_GIT_PROJECT_ROOTS.reset(token)
+
+
+def git_checks_allowed(directory: str | os.PathLike[str] | None) -> bool:
+    """False when ``directory`` lies in a project :func:`dispatched_without_git`
+    recorded; True otherwise, including when nothing is recorded.
+
+    Both forms of ``directory`` are compared with both recorded forms, so an
+    agent that swaps the project path for a symlink is still matched by the
+    path as given.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get()
+    if not roots or not directory:
+        return True
+    for candidate in _path_forms(directory):
+        for root in roots:
+            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+                return False
+    return True
+
+
+def _git_call_directories(
+    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
+) -> list[str]:
+    """Every directory the process ``argv`` runs in or takes a repository
+    from: ``cwd``, and for git each ``-C`` applied in turn and every
+    ``--git-dir`` / ``--work-tree`` option or ``GIT_DIR`` / ``GIT_WORK_TREE``
+    variable, resolved as git resolves them."""
+    directory = os.path.abspath(os.fspath(cwd))
+    directories = [directory]
+    if not argv or os.path.basename(os.fspath(argv[0])) != "git":
+        return directories
+    options = [os.fspath(token) for token in argv[1:]]
+    index = 0
+    while index < len(options):
+        token = options[index]
+        name, separator, value = token.partition("=")
+        if separator and name in ("--git-dir", "--work-tree"):
+            directories.append(os.path.join(directory, value))
+            index += 1
+        elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            if index + 1 < len(options):
+                value = options[index + 1]
+                if token == "-C":
+                    directory = os.path.join(directory, value)
+                    directories.append(directory)
+                elif token in ("--git-dir", "--work-tree"):
+                    directories.append(os.path.join(directory, value))
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            break
+    directories.extend(
+        os.path.join(directory, env[key]) for key in _GIT_LOCATION_ENV_KEYS if env.get(key)
+    )
+    return directories
+
+
+def _directory_in_non_git_project(
+    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
+) -> str | None:
+    """The first directory of the process ``argv`` that lies in a project
+    :func:`dispatched_without_git` recorded, None when there is none (or
+    nothing is recorded, the common case, decided without touching
+    ``argv``)."""
+    if not _NON_GIT_PROJECT_ROOTS.get():
+        return None
+    for directory in _git_call_directories(argv, cwd, env or {}):
+        if not git_checks_allowed(directory):
+            return directory
+    return None
+
+
+def _non_git_refused_result(
+    argv: Sequence[str], directory: str, text: bool,
+) -> subprocess.CompletedProcess:
+    """The result of a process refused by IR73-02: git's own "not a git
+    repository" status, which is what EQUIPA knows the project to be, so a
+    caller reads it the way it reads a project that has no repository."""
+    message = (
+        f"equipa: refused to run {os.path.basename(os.fspath(argv[0]))} at {directory}: "
+        f"it is in a project that was not a git repository at dispatch, so a "
+        f"repository there is an agent's"
+    )
+    logger.warning("[git] %r", message)
+    return subprocess.CompletedProcess(
+        args=list(argv), returncode=_REFUSED_RETURNCODE,
+        stdout="" if text else b"",
+        stderr=f"{message}\n" if text else f"{message}\n".encode("utf-8", "replace"),
+    )
+
+
 def _run_with_env(
     args_list: list[str],
     cwd: str | Path,
@@ -1261,7 +1394,12 @@ def _run_with_env(
 
     ``env`` replaces the default :func:`_get_repo_env` environment when given.
     ``pass_fds`` are kept open, at the same numbers, in the child.
+    Starts nothing, and returns a failed result, when the process would run
+    in a project :func:`dispatched_without_git` recorded (IR73-02).
     """
+    refused_in = _directory_in_non_git_project(args_list, cwd, env)
+    if refused_in is not None:
+        return _non_git_refused_result(args_list, refused_in, text)
     return subprocess.run(
         args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
@@ -1373,8 +1511,13 @@ async def _run_git_process_async(
 
     The process half of :func:`git_run_async`, for callers that build their
     own hardened argv and environment. Raises ``subprocess.TimeoutExpired``
-    (the child killed first) after ``timeout`` seconds.
+    (the child killed first) after ``timeout`` seconds. Starts nothing, and
+    returns a failed result, when git would run in a project
+    :func:`dispatched_without_git` recorded (IR73-02).
     """
+    refused_in = _directory_in_non_git_project(argv, cwd, env)
+    if refused_in is not None:
+        return _non_git_refused_result(argv, refused_in, text)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
