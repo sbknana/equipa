@@ -3656,13 +3656,20 @@ def _backstop_math_joined(view: str) -> str | None:
 # destination is read by jumping from each top-level "(" to its partner, so
 # no character is read twice per destination (a 32-level regex read each
 # character up to 32 times, 0.3 s on 200 KB of "a[a](").
+#
+# The runs of escapes and plain characters below are unrolled ("plain*
+# (escape plain*)*", same texts as "(escape|plain)*"): a loop over a group
+# keeps one backtracking entry per pass (about 115 bytes in re, 366 MB for a
+# 3.2 MB title; task 3169), a run of one character class keeps none, so
+# only an escape costs a pass.
 _LINK_SPACE = r"[ \t]*(?:\n[ \t]*)?"
 _LINK_TITLE = (
-    r"\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'"
-    r"|\((?:\\[\s\S]|[^()\\])*\)"
+    r"\"[^\"\\]*(?:\\[\s\S][^\"\\]*)*\"|'[^'\\]*(?:\\[\s\S][^'\\]*)*'"
+    r"|\([^()\\]*(?:\\[\s\S][^()\\]*)*\)"
 )
 _LINK_TAIL_START_RE = re.compile(r"\(" + _LINK_SPACE)
-_LINK_POINTY_DESTINATION_RE = re.compile(r"<(?:\\[^\n]|[^<>\n\\])*>")
+_LINK_POINTY_DESTINATION_RE = re.compile(
+    r"<[^<>\n\\]*(?:\\[^\n][^<>\n\\]*)*>")
 _LINK_TAIL_END_RE = re.compile(
     _atomic(r"(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)(?:" + _LINK_TITLE + r"))?")
     + _LINK_SPACE + r"\)",
@@ -3680,7 +3687,8 @@ _LINK_PARENTHESES_DEPTH = 32
 # the review defines a reference, which a shortcut "[text]" may name). The
 # alt text stops at another "![" or a blank line, so a flood of unclosed
 # "![" is read once.
-_LINK_IMAGE = r"!\[(?:\\[^\n]|[^\]!\n\\]|!(?!\[)|\n(?![ \t]*\n))*\]"
+_LINK_IMAGE = (r"!\[[^\]!\n\\]*"
+               r"(?:(?:\\[^\n]|!(?!\[)|\n(?![ \t]*\n))[^\]!\n\\]*)*\]")
 _LINK_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\](?=[(\[])")
 _LINK_ANY_CLOSE_RE = re.compile(_LINK_IMAGE + r"|\]")
 # A link reference definition ("[label]: destination"), also inside a quote
