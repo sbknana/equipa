@@ -607,8 +607,8 @@ DEADLINE_TESTS = {
         "endless loop",
     "test_deadline_watchdog_3175.py::"
     "test_after_a_hang_the_next_hang_is_cut_short_and_named":
-        "the second hang is cut to 1 s (about 5 s in all), not left to its "
-        "60 s spin",
+        "the second hang is cut to 1 s (6-7 s of the child's CPU time in "
+        "all), not left to its 60 s spin",
     "test_agent_isolation_3172.py::"
     "test_a_search_cut_short_at_the_default_bound_reports_before_the_caller_stops":
         "the cut-short search is reported within the 25 s the default bound "
@@ -673,6 +673,12 @@ CORPUS_CAPS = {
 # ``<event loop>.time()``; the ``_ns`` variants too.
 CLOCKS = {"process_time", "perf_counter", "monotonic", "time", "thread_time"}
 CLOCKS |= {f"{clock}_ns" for clock in CLOCKS}
+# Readings that carry CPU (or elapsed) seconds in fields: ``os.times()`` and
+# ``resource.getrusage(who)``, compared as ``after.ru_utime -
+# before.ru_utime`` (a child process's CPU time, task 3175).
+USAGE_CLOCKS = {"times", "getrusage"}
+USAGE_SECONDS = {"ru_utime", "ru_stime", "user", "system", "children_user",
+                 "children_system", "elapsed"}
 # Calls that time work themselves: ``timeit.timeit``/``timeit.repeat`` and
 # a Timer's ``timeit``/``autorange``.
 TIMEIT_METHODS = {"timeit", "autorange"}
@@ -685,12 +691,19 @@ HELPER_MODULES = {"review_gate_timing", "review_gate_production"}
 
 
 def _is_clock_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call) or node.args or node.keywords:
+    if not isinstance(node, ast.Call):
         return False
     function = node.func
     if isinstance(function, ast.Attribute):
-        return function.attr in CLOCKS
-    return isinstance(function, ast.Name) and function.id in CLOCKS
+        name = function.attr
+    elif isinstance(function, ast.Name):
+        name = function.id
+    else:
+        return False
+    if name == "getrusage":
+        return True
+    return not node.args and not node.keywords and (
+        name in CLOCKS or name in USAGE_CLOCKS)
 
 
 def _reading_key(node: ast.AST) -> str | None:
@@ -733,9 +746,14 @@ def _measures_elapsed(node: ast.AST, clock_names: set[str]) -> bool:
     AGE`` is not a measurement."""
     if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
         return False
-    left_is_reading = (_is_clock_call(node.left)
-                       or _reading_key(node.left) in clock_names)
-    return left_is_reading and _reading_key(node.right) in clock_names
+    left, right = node.left, node.right
+    if (isinstance(left, ast.Attribute) and isinstance(right, ast.Attribute)
+            and left.attr in USAGE_SECONDS and right.attr in USAGE_SECONDS):
+        # ``after.ru_utime - before.ru_utime``: fields of two readings.
+        left, right = left.value, right.value
+    left_is_reading = (_is_clock_call(left)
+                       or _reading_key(left) in clock_names)
+    return left_is_reading and _reading_key(right) in clock_names
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -922,6 +940,15 @@ def test_the_fence_sees_the_shapes_it_must(timing_reach):
     ("began = time.time() - 61\nx = time.time() - began", False),
     ("began = time.time() - 61\nnow = time.time()\nx = now - began", False),
     ("x = time.time(5) - time.time(3)", False),
+    ("before = resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+     "after = resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+     "x = after.ru_utime - before.ru_utime", True),
+    ("before = os.times()\nx = os.times().children_user - before.children_user",
+     True),
+    ("before = resource.getrusage(resource.RUSAGE_SELF)\n"
+     "after = resource.getrusage(resource.RUSAGE_SELF)\n"
+     "x = after.ru_maxrss - before.ru_maxrss", False),
+    ("x = usage.ru_utime - baseline.ru_utime", False),
 ])
 def test_a_clock_subtraction_is_found_and_a_deadline_is_not(source, measures):
     tree = ast.parse(source)
@@ -1023,6 +1050,23 @@ def test_shape():
     work()
     assert time.process_time() - start < 0.5
     assert GROWTH_LIMIT == 8.0
+"""),
+    "child-cpu-rusage": ("unscaled", """
+import resource
+import subprocess
+def test_shape():
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    subprocess.run(["work"], check=False)
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    assert ((after.ru_utime - before.ru_utime)
+            + (after.ru_stime - before.ru_stime)) < 60
+"""),
+    "child-cpu-os-times": ("unscaled", """
+import os
+def test_shape():
+    before = os.times()
+    work()
+    assert os.times().children_user - before.children_user < 60
 """),
     "event-loop-heartbeat": ("unscaled", """
 import asyncio

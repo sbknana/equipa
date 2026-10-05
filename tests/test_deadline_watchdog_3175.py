@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -299,9 +300,15 @@ def test_a_hung_test_fails_by_name_and_the_run_goes_on(tmp_path):
 
 def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
     """A regression that hangs every test of a module costs one full
-    deadline, then the short one per test, and each fails by name."""
-    started = time.monotonic()
+    deadline, then the short one per test, and each fails by name.
+
+    The run is bounded in the child's CPU time, the clock the deadlines
+    use: uncut, the second hang spins 60 s of it. On the wall clock, a busy
+    host stretched the run's 6-7 s of CPU time past 60 s (task 3175: 64 s
+    with 16 CPU burners beside 16 workers at a host load near 100)."""
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
     completed = _run_scratch(tmp_path, source=AFTER_A_HANG_SCRATCH_TESTS)
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
     output = completed.stdout + completed.stderr
     assert completed.returncode == 1, output
     assert "2 failed, 3 passed" in output, output
@@ -311,7 +318,9 @@ def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
             "to 1 s because test_scratch.py::test_2_hangs (call) ran past its "
             "deadline first) ran past its deadline of 1 s of CPU time"
             ) in output, output
-    assert time.monotonic() - started < 60
+    child_cpu_seconds = ((after.ru_utime - before.ru_utime)
+                         + (after.ru_stime - before.ru_stime))
+    assert child_cpu_seconds < 60, child_cpu_seconds
 
 
 def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):
