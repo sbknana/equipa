@@ -26,6 +26,7 @@ import signal
 import stat
 import subprocess
 import sys
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +110,7 @@ from equipa.merge_integrity import (
     resolve_commit,
     reviewed_commit_refusal,
 )
+from equipa.monitoring import dispatched_without_git
 from equipa.loops import (
     _count_findings_in_review_file,
     ensure_artifacts_dir,
@@ -715,7 +717,7 @@ async def cleanup_failed_attempt(
     output: list[str] | None = None,
     *,
     base_sha: str | None = None,
-    expect_repository: bool = True,
+    expect_repository: bool,
 ) -> None:
     """Reset a failed task for a fresh autoresearch attempt.
 
@@ -753,6 +755,8 @@ async def cleanup_failed_attempt(
         base_sha: Commit the task worktree was created on.
         expect_repository: False when the project was not a git repository
             at dispatch; both loops pass ``task_branch is not None``.
+            Required, with no default (R3166-05, task #3168): a caller that
+            omitted it got discovery in a non-git project again.
 
     Raises:
         AttemptCleanupError: a git step failed or the worktree is not on
@@ -979,6 +983,33 @@ async def _require_task_branch(worktree_dir: str, task_branch: str) -> str:
     return head
 
 
+def escape_audit_detail(detail: object) -> str:
+    """``detail`` as one audit-safe line.
+
+    git stderr can span lines, so whitespace runs are collapsed. R3165-02
+    (task #3166): the detail can carry agent-written text (a branch name
+    read from the worktree's HEAD); its control characters are escaped
+    (:func:`escape_audit_text`) so a terminal cannot redraw the line as
+    another event (N-01). R3166-03 (task #3168): so is every Unicode format
+    character (category Cf: bidi controls such as U+202E, zero-width
+    characters), which a viewer that renders bidi text, such as an editor
+    or a dashboard of GATE-AUDIT rows, would otherwise use to show the line
+    reordered.
+    """
+    escaped = escape_audit_text(" ".join(str(detail).split()))
+    if escaped.isascii():
+        return escaped
+    return "".join(
+        _escaped_code_point(char) if unicodedata.category(char) == "Cf" else char
+        for char in escaped
+    )
+
+
+def _escaped_code_point(char: str) -> str:
+    code = ord(char)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+
+
 def _audit_task_abort(
     task_id: int,
     event: str,
@@ -986,14 +1017,45 @@ def _audit_task_abort(
     output: list[str] | None,
 ) -> None:
     """Log a task abort to the operator output and the durable gate audit."""
-    # git stderr can span lines; keep each audit record on one line.
-    # R3165-02 (task #3166): the detail can carry agent-written text (a
-    # branch name read from the worktree's HEAD); its control characters are
-    # escaped so a terminal cannot redraw the line as another event (N-01).
-    single_line_detail = escape_audit_text(" ".join(str(detail).split()))
-    line = f"task={task_id} event={event} detail={single_line_detail}"
+    line = f"task={task_id} event={event} detail={escape_audit_detail(detail)}"
     log(f"  [GATE-AUDIT] {line}", output)
     log_gate_audit(line, task_id, event=event)
+
+
+# N1 (task #3168): the outcome of a task whose project was not git at
+# dispatch and now holds a repository, made by one of its agents or by an
+# earlier task of the same run. Not a success outcome, so the task is
+# recorded blocked; it is never retried.
+REPOSITORY_APPEARED_OUTCOME = "repository_appeared"
+
+
+def _repository_appeared_in_non_git_project(
+    task_id: int,
+    project_dir: str,
+    when: str,
+    output: list[str] | None,
+) -> bool:
+    """True, with a durable GATE-AUDIT record, when a ``.git`` is at or above
+    ``project_dir``, a project that was not git at dispatch.
+
+    N1 (task #3168): found by a filesystem walk; no git runs. Such a
+    repository is the agent's: before this check it was only reported, the
+    task was retried in it, and the dev-test loop ran ``git diff`` there.
+    The repository is left as it is for the operator. A later dispatch of
+    the project still finds it by discovery and treats it as the project's
+    main checkout; the blocked task and the audit record are the signal to
+    inspect (or remove) it first.
+    """
+    git_entry = _nearest_git_entry(Path(project_dir))
+    if git_entry is None:
+        return False
+    _audit_task_abort(
+        task_id, "repository-appeared",
+        f"{when}: a git repository appeared at {git_entry} in a project that "
+        f"was not git at dispatch; no git runs there, task blocked, not retried",
+        output,
+    )
+    return True
 
 
 async def run_dev_test_loop_with_autoresearch(
@@ -1022,6 +1084,14 @@ async def run_dev_test_loop_with_autoresearch(
     with outcome ``attempt_cleanup_failed``. Both outcomes leave the task
     blocked.
 
+    Without ``task_branch`` the project was not git at dispatch (every loop
+    gives a git project's task a worktree and a branch). R3166-01 (task
+    #3168): the attempts then run under
+    :func:`equipa.monitoring.dispatched_without_git`, so no change check
+    runs git there. N1: a repository found there before or after an attempt
+    is the agent's; the task stops with outcome
+    ``REPOSITORY_APPEARED_OUTCOME`` (blocked, audited, never retried).
+
     Returns:
         (result, cycles, outcome, loop_total_cost, loop_total_duration, task)
 
@@ -1030,6 +1100,26 @@ async def run_dev_test_loop_with_autoresearch(
     The task dict is returned because autoresearch may re-fetch it
     between attempts to pick up reflection-injected context.
     """
+    if task_branch is not None:
+        return await _run_attempts_with_autoresearch(
+            task, project_dir, project_context, args, config, output, task_branch,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_attempts_with_autoresearch(
+            task, project_dir, project_context, args, config, output, None,
+        )
+
+
+async def _run_attempts_with_autoresearch(
+    task: dict,
+    project_dir: str,
+    project_context: dict,
+    args,
+    config: dict,
+    output: list[str] | None,
+    task_branch: str | None,
+):
+    """The retry loop of :func:`run_dev_test_loop_with_autoresearch`."""
     task_id = task["id"]
     autoresearch_on = is_feature_enabled(config, "autoresearch")
     max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
@@ -1051,6 +1141,11 @@ async def run_dev_test_loop_with_autoresearch(
                 break
             if base_sha is None:
                 base_sha = head_sha
+        elif _repository_appeared_in_non_git_project(
+            task_id, project_dir, f"before attempt {retry_count + 1}", output,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args, output=output,
@@ -1103,6 +1198,11 @@ async def run_dev_test_loop_with_autoresearch(
                 )
                 outcome = "worktree_branch_mismatch"
                 break
+        elif _repository_appeared_in_non_git_project(
+            task_id, project_dir, f"after attempt {retry_count + 1} ({outcome})", output,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
 
         # Success - break out of retry loop
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
