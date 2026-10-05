@@ -1218,19 +1218,57 @@ def _committed_loop(body: str) -> str:
 # and the first "not counted" after it: every later choice ends at the same
 # closing bracket, so committing loses no match. The matches are exactly
 # the old ones (tests/test_review_gate_linear_3167.py compares them).
-_RESOLVED_FINDING_HEADER_RE = re.compile(
-    r"(?:"
+_RESOLVED_BRACKET_STATUS = (
     r"(?<![^)\]\n])"
     + _atomic(r"[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b")
     + r"[^)\]\n]*[)\]]"
     r"|(?<![^)\]\n])"
     + _atomic(r"[^()\[\]\n]*[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b")
     + r"[^)\]\n]*[)\]]"
-    r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
+)
+_RESOLVED_DASH_STATUS = (
+    r"[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
     r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
     r"(?:[ \t]*\([^()\n]{0,60}\))?"
-    r")[ \t*_.\r]*$",
 )
+_RESOLVED_STATUS_END = r"[ \t*_.\r]*$"
+_RESOLVED_FINDING_HEADER_RE = re.compile(
+    "(?:" + _RESOLVED_BRACKET_STATUS + "|" + _RESOLVED_DASH_STATUS + ")"
+    + _RESOLVED_STATUS_END,
+)
+# Task 3170 (IR67-03): searched as one regex, the status tried all three
+# alternatives at every character of a heading line, about 0.04 s per
+# 200 KB heading on Python 3.10, twice per review (as written and as
+# rendered). _ends_in_resolved_status gives the same answer from the two
+# halves below.
+_RESOLVED_BRACKET_STATUS_RE = re.compile(
+    "(?:" + _RESOLVED_BRACKET_STATUS + ")" + _RESOLVED_STATUS_END,
+)
+_RESOLVED_DASH_STATUS_RE = re.compile(
+    _RESOLVED_DASH_STATUS + _RESOLVED_STATUS_END,
+)
+_RESOLVED_STATUS_END_CHARS = " \t*_.\r"
+
+
+def _ends_in_resolved_status(line: str) -> bool:
+    """``bool(_RESOLVED_FINDING_HEADER_RE.search(line))``, in one pass.
+
+    The dash alternative is searched on its own: it opens with one
+    character class, so re skips to each separator instead of trying every
+    position. A bracket alternative holds exactly one ")" or "]", the one
+    that ends the line before the status end characters (and a final line
+    feed, which "$" also allows), and starts where that bracket segment
+    starts (its lookbehind). So it can only match from that one position.
+    """
+    if _RESOLVED_DASH_STATUS_RE.search(line):
+        return True
+    body = line[:-1] if line.endswith("\n") else line
+    closer = len(body.rstrip(_RESOLVED_STATUS_END_CHARS)) - 1
+    if closer < 0 or body[closer] not in ")]":
+        return False
+    segment_start = max(body.rfind(")", 0, closer), body.rfind("]", 0, closer),
+                        body.rfind("\n", 0, closer)) + 1
+    return _RESOLVED_BRACKET_STATUS_RE.match(line, segment_start) is not None
 
 # Task #3038 (S3033-02): detection-only tally of finding-shaped lines the
 # strict level-3 header regex cannot see: a severity word (any case)
@@ -4598,7 +4636,7 @@ def _analyze_review_text(text: str, nonblank_lines: int) -> ReviewCountAnalysis:
         # Task 3152: the offset of the severity label itself, the one token
         # of the heading the backstop credits.
         heading_offsets.append((match.start(1), match.group(1)))
-        if _RESOLVED_FINDING_HEADER_RE.search(header_line):
+        if _ends_in_resolved_status(header_line):
             resolved_counts[match.group(1)] += 1
         else:
             header_counts[match.group(1)] += 1
