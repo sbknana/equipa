@@ -275,6 +275,28 @@ def test_the_checks_hold_under_python_optimize():
     assert completed.stdout.strip() == "budget,growth,parts"
 
 
+def _asserts_in(node: ast.AST) -> list[int]:
+    return [child.lineno for child in ast.walk(node)
+            if isinstance(child, ast.Assert)]
+
+
+def test_the_timing_helpers_raise_instead_of_asserting():
+    """IR71-01: pytest rewrites only test modules and conftest, so an
+    ``assert`` in a helper the timing tests call is stripped by ``python
+    -O``. ``production_seconds`` refuses to time an artifact provenance
+    rejected (its early rejection is not the parse)."""
+    for name in ("host_timing", "review_gate_timing", "deadline_watchdog"):
+        source = (TESTS_DIR / f"{name}.py").read_text(encoding="utf-8")
+        assert _asserts_in(ast.parse(source)) == [], name
+    source = (TESTS_DIR / "review_gate_production.py").read_text(
+        encoding="utf-8")
+    timed = [node for node in ast.parse(source).body
+             if isinstance(node, ast.FunctionDef)
+             and node.name == "production_seconds"]
+    assert len(timed) == 1
+    assert _asserts_in(timed[0]) == []
+
+
 def test_the_reference_workload_is_fixed_work():
     assert host_timing.reference_workload() == host_timing.reference_workload()
     assert host_timing.reference_workload(10) != host_timing.reference_workload()

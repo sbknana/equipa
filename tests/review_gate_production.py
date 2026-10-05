@@ -234,7 +234,12 @@ def production_seconds(text: str, *, nonce: str = NONCE,
     refused_before_parsing = (
         not provenance.trusted
         and provenance.reason.startswith(REVIEW_BIDI_CONTROL_REASON))
-    assert provenance.trusted or refused_before_parsing, provenance.reason
+    # Raised, not asserted: pytest does not rewrite this module, so
+    # ``python -O`` would strip an assert and time the early rejection
+    # (task 3175, IR71-01).
+    if not (provenance.trusted or refused_before_parsing):
+        raise AssertionError(
+            f"provenance refused the timed artifact: {provenance.reason}")
     with audit_rows_not_persisted():
         gate_seconds = median_cpu_seconds(
             _security_review_blocks_merge, str(project), GATE_TASK_ID,
