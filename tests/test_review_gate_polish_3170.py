@@ -24,7 +24,9 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import itertools
+import math
 import random
+import statistics
 
 import pytest
 
@@ -33,8 +35,11 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
+    GROWTH_RETRIES,
     assert_linear_time,
     budget,
+    collector_paused,
+    growth_ratio,
 )
 from tests.review_gate_production import blocked_by_the_gate
 from tests.review_gate_timing import median_cpu_seconds, timing_test
@@ -45,6 +50,7 @@ from tests.test_review_gate_backstop_3143 import (
     review,
 )
 from tests.test_review_gate_linear_3167 import (
+    SCAN_RUNS,
     _best_scan_seconds,
     _called_anchored_only,
     _module_patterns,
@@ -327,3 +333,62 @@ def test_a_noisy_first_look_is_not_the_verdict():
     anchored = _called_anchored_only("_INLINE_CODE_RE")
     assert superlinear_scan(pattern, anchored, CI_PREFIX, "`",
                             SMALL_BYTES * GROWTH, 0.0006) is None
+
+
+# The CI shape at 50 KB, 200 KB and 2 MB (task 3175). One run scans a size
+# as many times as covers CI_SHAPE_RUN_BYTES, so every compared time is a
+# run of about 0.14 s, never one sub-millisecond scan.
+CI_SHAPE_KILOBYTES = (50, 200, 2048)
+CI_SHAPE_RUN_BYTES = 1024 * 1024
+# Measured on the development host: 0.137 s per MB on Python 3.12, 0.128 s
+# on 3.10, at every size from 50 KB to 8 MB.
+CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE = 0.5
+# Linear work costs the same per megabyte at every size; the shared growth
+# check allows GROWTH_LIMIT for GROWTH times the input, so 2x per unit.
+CI_SHAPE_PER_MEGABYTE_LIMIT = GROWTH_LIMIT / GROWTH
+
+
+def _ci_shape_seconds_per_megabyte(pattern, anchored, text):
+    """The median CPU time of SCAN_RUNS runs, each scanning ``text`` as many
+    times as covers CI_SHAPE_RUN_BYTES, per megabyte scanned. A first scan
+    over the budget is returned at once: a quadratic regex must fail on it,
+    not be scanned again for minutes."""
+    megabytes = len(text) / (1024 * 1024)
+    with collector_paused():
+        first = _scan_seconds(pattern, anchored, text)
+    if first / megabytes >= budget(CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE):
+        return first / megabytes
+    scans = math.ceil(CI_SHAPE_RUN_BYTES / len(text))
+    runs = []
+    for _ in range(SCAN_RUNS):
+        with collector_paused():
+            runs.append(sum(_scan_seconds(pattern, anchored, text)
+                            for _ in range(scans)))
+    return statistics.median(runs) / (scans * megabytes)
+
+
+@timing_test
+def test_the_ci_shape_is_linear_from_50kb_to_2mb():
+    """_INLINE_CODE_RE on the shape CI flagged costs the same per megabyte
+    at 50 KB, 200 KB and 2 MB (a quadratic regex costs 4x and 41x as much
+    per megabyte at the larger sizes), within a host-calibrated budget.
+    Sizes run smallest first, each checked before the next is scanned; one
+    over the growth limit is measured again (keeping the faster time)
+    before it counts."""
+    pattern = loops._INLINE_CODE_RE
+    anchored = _called_anchored_only("_INLINE_CODE_RE")
+    per_megabyte = {}
+    for kilobytes in CI_SHAPE_KILOBYTES:
+        text = CI_PREFIX + "`" * (kilobytes * 1024)
+        seconds = _ci_shape_seconds_per_megabyte(pattern, anchored, text)
+        assert seconds < budget(CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE), (
+            kilobytes, seconds)
+        smallest = per_megabyte.setdefault(CI_SHAPE_KILOBYTES[0], seconds)
+        for _ in range(GROWTH_RETRIES):
+            if growth_ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT:
+                break
+            seconds = min(seconds, _ci_shape_seconds_per_megabyte(
+                pattern, anchored, text))
+        per_megabyte[kilobytes] = seconds
+        assert growth_ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT, (
+            per_megabyte)
