@@ -31,6 +31,7 @@ import pytest
 
 import equipa.config as equipa_config
 from equipa import agent_runner
+from tests.system_node import install_system_node
 
 PY = "/usr/bin/python3"
 
@@ -49,8 +50,11 @@ def _executable(path: Path) -> Path:
 
 
 @pytest.fixture
-def layout(tmp_path: Path) -> dict[str, Path]:
-    """A project, and an install directory of fake programs outside it."""
+def layout(tmp_path: Path, monkeypatch) -> dict[str, Path]:
+    """A project, and an install directory of fake programs outside it.
+    {node} is a system node of the test's own (task 3169: a clean CI
+    runner has no /usr/bin/node)."""
+    system_node = install_system_node(monkeypatch, tmp_path / "system-bin")
     project = tmp_path / "project"
     (project / "pkg").mkdir(parents=True)
     installed = tmp_path / "installed" / "bin"
@@ -68,12 +72,14 @@ def layout(tmp_path: Path) -> dict[str, Path]:
     (installed / "bash-link").symlink_to("/bin/bash")
     (installed / "trusted-link").symlink_to(installed / "mcp-server")
     (installed / "notexec").write_text("data", encoding="utf-8")
-    return {"project": project, "bin": installed, "tmp": tmp_path}
+    return {"project": project, "bin": installed, "tmp": tmp_path,
+            "node": Path(system_node["node"])}
 
 
 def _fill(value, layout: dict[str, Path]):
     if isinstance(value, str):
-        return value.format(bin=layout["bin"], project=layout["project"])
+        return value.format(bin=layout["bin"], project=layout["project"],
+                            node=layout["node"])
     if isinstance(value, list):
         return [_fill(item, layout) for item in value]
     if isinstance(value, dict):
@@ -208,7 +214,7 @@ REFUSED = {
                               "args": ["--config={project}/srv.toml"]},
     "absolute arg in project": {"command": "{bin}/mcp-server",
                                 "args": ["--data", "{project}/state"]},
-    "node --opt=project": {"command": "/usr/bin/node",
+    "node --opt=project": {"command": "{node}",
                            "args": ["/abs/s.js", "--root={project}"]},
 }
 
@@ -293,7 +299,7 @@ ACCEPTED = {
                                  "args": ["--stdio"],
                                  "trust": ["{bin}/mcp-server"]},
     "python -I absolute script": {"command": PY, "args": ["-I", "/abs/s.py"]},
-    "node absolute script": {"command": "/usr/bin/node",
+    "node absolute script": {"command": "{node}",
                              "args": ["/abs/s.js", "--port=8080"]},
 }
 

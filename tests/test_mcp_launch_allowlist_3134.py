@@ -30,9 +30,12 @@ import pytest
 
 import equipa.config as equipa_config
 from equipa import agent_runner
+from tests.system_node import install_system_node
 
 PY = "/usr/bin/python3"
-NODE = "/usr/bin/node"
+# Task 3169: a system node of the test's own (tests/system_node.py), filled
+# in by _fill; a clean CI runner has no /usr/bin/node.
+NODE = "{node}"
 
 
 @pytest.fixture(autouse=True)
@@ -42,8 +45,10 @@ def _isolated_dispatch_config(monkeypatch):
 
 
 @pytest.fixture
-def layout(tmp_path: Path) -> dict[str, Path]:
-    """A project directory and a trusted install directory next to it."""
+def layout(tmp_path: Path, monkeypatch) -> dict[str, Path]:
+    """A project directory and a trusted install directory next to it,
+    and a system node and nodejs of the test's own."""
+    system_node = install_system_node(monkeypatch, tmp_path / "system-bin")
     project = tmp_path / "project"
     (project / "bin").mkdir(parents=True)
     (project / ".venv" / "bin").mkdir(parents=True)
@@ -56,13 +61,17 @@ def layout(tmp_path: Path) -> dict[str, Path]:
     (trusted / "notexec").write_text("data", encoding="utf-8")
     (trusted / "bin" / "link-into-project").symlink_to(project / "bin" / "server")
     (trusted / "bin" / "srv-python").symlink_to(sys.executable)
-    return {"project": project, "trusted": trusted, "tmp": tmp_path}
+    return {"project": project, "trusted": trusted, "tmp": tmp_path,
+            "node": Path(system_node["node"]),
+            "nodejs": Path(system_node["nodejs"])}
 
 
 def _fill(value, layout: dict[str, Path]):
-    """Replace {project} / {trusted} placeholders in a server definition."""
+    """Replace {project} / {trusted} / {node} / {nodejs} placeholders in a
+    server definition."""
     if isinstance(value, str):
-        return value.format(project=layout["project"], trusted=layout["trusted"])
+        return value.format(project=layout["project"], trusted=layout["trusted"],
+                            node=layout["node"], nodejs=layout["nodejs"])
     if isinstance(value, list):
         return [_fill(item, layout) for item in value]
     if isinstance(value, dict):
@@ -143,7 +152,7 @@ REFUSED = {
     "node --inspect": {"command": NODE, "args": ["--inspect=0.0.0.0:9229", "/abs/s.js"]},
     "node relative script": {"command": NODE, "args": ["dist/index.js"]},
     "node no script": {"command": NODE, "args": []},
-    "nodejs -r": {"command": "/usr/bin/nodejs", "args": ["-r", "x", "/abs/s.js"]},
+    "nodejs -r": {"command": "{nodejs}", "args": ["-r", "x", "/abs/s.js"]},
     # --- code-loading variables in the server env ---
     "env NODE_OPTIONS": {"command": NODE, "args": ["/abs/s.js"],
                          "env": {"NODE_OPTIONS": "-r planted"}},

@@ -26,6 +26,7 @@ import pytest
 
 import equipa.config as equipa_config
 from equipa import agent_runner
+from tests.system_node import install_system_node
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FAKE_TOKEN = "FAKE-3127-mcp-token-sentinel"
@@ -48,6 +49,13 @@ print(json.dumps({"type": "result", "subtype": "success", "result": "done",
 @pytest.fixture(autouse=True)
 def _isolated_dispatch_config(monkeypatch):
     monkeypatch.setattr(equipa_config, "_active_dispatch_config", {})
+
+
+@pytest.fixture
+def system_node(tmp_path, monkeypatch) -> dict[str, str]:
+    """A system node of the test's own, the {node} of the rows (task 3169:
+    a clean CI runner has no /usr/bin/node)."""
+    return install_system_node(monkeypatch, tmp_path / "system-bin")
 
 
 @pytest.fixture
@@ -135,7 +143,7 @@ REFUSED = {
     "empty PYTHONPATH entry": {"command": PY, "args": ["-P", "-m", "x"],
                                "cwd": "/abs/checkout",
                                "env": {"PYTHONPATH": ":/abs/checkout"}},
-    "node relative script": {"command": "/usr/bin/node",
+    "node relative script": {"command": "{node}",
                              "args": ["dist/index.js"]},
     "bash -c": {"command": "/bin/bash", "args": ["-c", "python3 -m x"]},
     "bash relative script": {"command": "/bin/bash", "args": ["run-server"]},
@@ -163,7 +171,9 @@ REFUSED = {
 
 
 @pytest.mark.parametrize("server", REFUSED.values(), ids=REFUSED.keys())
-def test_cwd_relative_server_is_refused(tmp_path, server):
+def test_cwd_relative_server_is_refused(tmp_path, server, system_node):
+    server = {**server,
+              "command": server["command"].format(node=system_node["node"])}
     config = _write_config(tmp_path, {"srv": {"type": "stdio", **server}})
     with pytest.raises(agent_runner.AgentDispatchRefused, match="'srv'"):
         agent_runner._check_mcp_servers(config)
@@ -180,7 +190,7 @@ ACCEPTED = {
     # that does not exist is refused.
     "uvx package": {"command": "{installed}/uvx",
                     "args": ["mcp-server-sqlite", "--db-path", "/abs/t.db"]},
-    "node absolute script": {"command": "/usr/bin/node",
+    "node absolute script": {"command": "{node}",
                              "args": ["/abs/dist/index.js", "--port", "8080"]},
 }
 
@@ -202,11 +212,13 @@ def _list_as_trusted(monkeypatch, *paths: Path) -> None:
 
 
 @pytest.mark.parametrize("server", ACCEPTED.values(), ids=ACCEPTED.keys())
-def test_absolute_isolated_server_is_accepted(tmp_path, server, monkeypatch):
+def test_absolute_isolated_server_is_accepted(tmp_path, server, monkeypatch,
+                                              system_node):
     installed = _installed(tmp_path, "uvx").parent
     _list_as_trusted(monkeypatch, installed / "uvx")
     server = {**server,
-              "command": server["command"].format(installed=installed)}
+              "command": server["command"].format(installed=installed,
+                                                  node=system_node["node"])}
     config = _write_config(tmp_path, {"srv": {"type": "stdio", **server}})
     agent_runner._check_mcp_servers(config)
 
