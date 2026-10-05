@@ -1156,10 +1156,23 @@ _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
 # ", verified" tail. So "Fixed-size buffer overflow", "nonce (fixed at zero)
 # allows forgery", "key: FIXED string in config.py" and StockForge #3032's
 # "### [S1] LOW (latent; re-rate MEDIUM when S2 is fixed)" stay live.
+# Task 3167 (I3164-01): the two bracket alternatives began at EVERY "(" or
+# "[" and read on to the closing bracket from each one, so a heading
+# followed by 100 KB of "(" took 170 s in the gate (quadratic). Each now
+# starts only where a bracket segment starts (the start of the text or the
+# character after ")", "]" or a newline; no bracket group crosses one), so
+# a segment is read once. Inside it an atomic group commits to the FIRST
+# opener that reads "fixed"/"resolved", or to the first opener and the
+# first "not counted" after it: every later choice ends at the same closing
+# bracket, so committing loses no match. The matches are exactly the old
+# ones (tests/test_review_gate_linear_3167.py compares them).
 _RESOLVED_FINDING_HEADER_RE = re.compile(
     r"(?:"
-    r"[(\[][ \t]*(?i:fixed|resolved)\b[^)\]\n]*[)\]]"
-    r"|[(\[][^)\]\n]*\b(?i:not[ \t]+counted)\b[^)\]\n]*[)\]]"
+    r"(?<![^)\]\n])(?>[^)\]\n]*?[(\[][ \t]*(?i:fixed|resolved)\b)"
+    r"[^)\]\n]*+[)\]]"
+    r"|(?<![^)\]\n])"
+    r"(?>[^()\[\]\n]*+[(\[][^)\]\n]*?\b(?i:not[ \t]+counted)\b)"
+    r"[^)\]\n]*+[)\]]"
     r"|[—–:→-][ \t]*[*_]{0,2}(?:FIXED|RESOLVED)\b[*_]{0,2}"
     r"(?:[ \t]*[,;][ \t]*[A-Za-z][A-Za-z \t,;-]{0,40})?"
     r"(?:[ \t]*\([^()\n]{0,60}\))?"
