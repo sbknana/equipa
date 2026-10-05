@@ -21,7 +21,7 @@ import re
 import subprocess
 import time
 import unicodedata
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -3476,6 +3476,13 @@ _BACKSTOP_NEW_FOLD_RE = re.compile(
 # (_backstop_mark_separates); any other neighbour leaves the word glued.
 _BACKSTOP_MARKED_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {
     _BACKSTOP_GLUE_MARK, _BACKSTOP_GONE_MARK}
+# Task 3172 (timing): a neighbour that makes a word of the separated reading
+# its own with no GONE run to walk (_backstop_mark_separates).
+_BACKSTOP_SEPARATING_NEIGHBOURS = _BACKSTOP_FOLD_MARKS | {_BACKSTOP_GLUE_MARK}
+# A character before a word that glues it to the text before, in the views
+# other than the separated reading: an ASCII letter or digit, or a
+# lookalike's FOLD or NEW_FOLD mark (task 3157).
+_BACKSTOP_GLUING_BEFORE = _BACKSTOP_ASCII_ALNUM | _BACKSTOP_FOLD_MARKS
 # A private-use character as written becomes another one, so no mark is
 # ever read from the review itself.
 _BACKSTOP_FOREIGN_MARK = ""
@@ -4472,6 +4479,17 @@ def _backstop_severity(word: str) -> str:
     return _BACKSTOP_SEVERITY_BY_INITIAL[chr(initial)]
 
 
+# Task 3172 (timing): _backstop_severity of every character a token can
+# begin with (C, H or M, or the FOLD or NEW_FOLD mark of one), looked up
+# instead of computed for each word.
+_BACKSTOP_SEVERITY_BY_FIRST_CHARACTER = {
+    first: _backstop_severity(first)
+    for initial in _BACKSTOP_SEVERITY_BY_INITIAL
+    for first in (initial, chr(_BACKSTOP_FOLD_MARK + ord(initial)),
+                  chr(_BACKSTOP_NEW_FOLD_MARK + ord(initial)))
+}
+
+
 def _backstop_tokens(
     view: str, origins: list[int] | None, *, separated: bool = False,
 ) -> dict[tuple[int, str], int]:
@@ -4482,44 +4500,53 @@ def _backstop_tokens(
     With ``separated`` the view is one of the separated reading
     (_backstop_separated_text), whose marks may sit inside a word, and only
     the words it adds are counted (_backstop_separated_counts).
+
+    Task 3172 (timing): a word costs no Python call unless a GONE run sits
+    next to it. The words counted are numbered and tallied in C at the end
+    (a 200 KB flood of marked words took 0.14 s of its 0.5 s gate budget on
+    Python 3.10).
     """
-    found: dict[tuple[int, str], int] = {}
-    newlines: list[int] | None = None
     token_re = (_BACKSTOP_SEPARATED_TOKEN_RE if separated
                 else _BACKSTOP_TOKEN_RE)
+    # A lookalike's FOLD mark before the word glues it as the letter did;
+    # in the separated reading a mark separates (task 3157).
+    gluing = _BACKSTOP_ASCII_ALNUM if separated else _BACKSTOP_GLUING_BEFORE
     # Task 3164 (R3161-02): one search of the view instead of one per word.
     new_folds = separated and _BACKSTOP_NEW_FOLD_RE.search(view) is not None
+    starts: list[int] = []
     for match in token_re.finditer(view):
         start, end = match.span()
-        # A lookalike's FOLD mark before the word glues it as the letter
-        # did; in the separated reading a mark separates (task 3157).
-        if start and (view[start - 1] in _BACKSTOP_ASCII_ALNUM
-                      or (not separated
-                          and view[start - 1] in _BACKSTOP_FOLD_MARKS)):
+        if start and view[start - 1] in gluing:
             continue
-        if separated:
-            # Task 3169 (timing): most words have no mark on either side,
-            # and then only a NEW_FOLD mark in the word adds it (what
-            # _backstop_separated_counts decides, without its calls).
-            if (view[start - 1:start] in _BACKSTOP_MARKED_NEIGHBOURS
-                    or view[end:end + 1] in _BACKSTOP_MARKED_NEIGHBOURS):
-                if not _backstop_separated_counts(
-                    match.group(0), view, start, end, new_folds=new_folds,
-                ):
-                    continue
-            elif not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
-                    match.group(0)) is not None):
+        if separated and not (new_folds and _BACKSTOP_NEW_FOLD_RE.search(
+                view, start, end) is not None):
+            # What _backstop_separated_counts decides, without its calls
+            # (tasks 3169 and 3172): most words have no mark on either side
+            # and are not added; a GLUE or lookalike mark next to the word
+            # adds it; a GONE run is walked only where one is.
+            before = view[start - 1:start]
+            after = view[end:end + 1]
+            if (before not in _BACKSTOP_MARKED_NEIGHBOURS
+                    and after not in _BACKSTOP_MARKED_NEIGHBOURS):
                 continue
-        if newlines is None:
-            newlines = [line_break.start()
-                        for line_break in _NEWLINE_RE.finditer(view)]
-        severity = _backstop_severity(match.group(0))
-        line = bisect.bisect_left(newlines, start)
-        if origins is not None:
-            line = origins[line]
-        key = (line, severity)
-        found[key] = found.get(key, 0) + 1
-    return found
+            if not (before in _BACKSTOP_SEPARATING_NEIGHBOURS
+                    or after in _BACKSTOP_SEPARATING_NEIGHBOURS
+                    or (before == _BACKSTOP_GONE_MARK
+                        and _backstop_mark_separates(view, start - 1, -1))
+                    or (after == _BACKSTOP_GONE_MARK
+                        and _backstop_mark_separates(view, end, 1))):
+                continue
+        starts.append(start)
+    if not starts:
+        return {}
+    newlines = [line_break.start()
+                for line_break in _NEWLINE_RE.finditer(view)]
+    lines = map(bisect.bisect_left, itertools.repeat(newlines), starts)
+    if origins is not None:
+        lines = map(origins.__getitem__, lines)
+    severities = map(_BACKSTOP_SEVERITY_BY_FIRST_CHARACTER.__getitem__,
+                     map(view.__getitem__, starts))
+    return Counter(zip(lines, severities))
 
 
 def _blank_like(match: re.Match[str]) -> str:
