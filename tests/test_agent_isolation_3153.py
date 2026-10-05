@@ -160,9 +160,16 @@ def test_the_inside_run_calls_the_new_checks():
     # Task 3169: the root is / unless the tests name their own (--root-fs);
     # tests/test_agent_isolation_3169.py runs the default.
     assert 'local root_fs=/ scan_seconds=""' in calls
-    assert 'local root_prefix="${root_fs%/}"' in calls
-    assert ('check_world_writable_dirs "$root_fs" '
-            '"${WELL_KNOWN_WORLD_WRITABLE[@]/#/$root_prefix}"') in calls
+    # Task 3172 (R3169-03): each well-known name is joined to the root in a
+    # loop; a pattern substitution read "&" in the root as the matched text.
+    assert 'local root_prefix="${root_fs%/}" well_known_name' in calls
+    assert 'local -a well_known_dirs=()' in calls
+    assert ('for well_known_name in "${WELL_KNOWN_WORLD_WRITABLE[@]}"; do'
+            in calls)
+    assert 'well_known_dirs+=("$root_prefix$well_known_name")' in calls
+    assert ('check_world_writable_dirs "$root_fs" "${well_known_dirs[@]}"'
+            in calls)
+    assert not any("WELL_KNOWN_WORLD_WRITABLE[@]/" in call for call in calls)
     assert ('note_search_only_dirs "$root_prefix/tmp" '
             '"$root_prefix/var/tmp"') in calls
     assert 'check_shm_cap /dev/shm "$AGENT_SHM_CAP_MB"' in calls
