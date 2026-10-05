@@ -37,7 +37,12 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
-from tests.review_gate_timing import median_cpu_seconds, timing_test
+from tests.review_gate_production import (
+    gate_blocks,
+    production_decision,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -84,12 +89,15 @@ def build_review(body, context):
 
 
 def analyze(text):
+    """The parser alone: for assertions on a verdict's reason. Merge
+    decisions go through ``gate_blocks`` (the production entry point)."""
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
 
 
-def gate_blocks(text):
-    """The merge decision of dispatch._security_review_blocks_merge: an
-    untrusted review blocks; a trusted one blocks on CRITICAL or HIGH."""
+def parser_blocks(text):
+    """The merge rule applied to the parser alone (an untrusted review
+    blocks; a trusted one blocks on CRITICAL or HIGH), for a text the
+    production gate rejects before parsing it."""
     analysis = analyze(text)
     if not analysis.trusted:
         return True
@@ -98,7 +106,12 @@ def gate_blocks(text):
 
 
 def assert_backstop_blocks(text):
-    analysis = analyze(text)
+    """The production gate blocks ``text``, and the parser, given the text
+    provenance hands the gate, blocks it for an unaccounted severity word."""
+    decision = production_decision(text)
+    analysis = loops._analyze_review_file(
+        Path("SECURITY-REVIEW-1.md"), text=decision.provenance.text)
+    assert decision.blocks, (decision.counts, analysis)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
@@ -280,7 +293,8 @@ def test_hex_digits_after_a_reference_are_part_of_it():
 @timing_test
 def test_a_200kb_reference_is_decided_without_int():
     text = build_review(["&#" + "9" * RB + "HIGH severity RCE"], "zero")
-    assert median_cpu_seconds(assert_backstop_blocks, text) < 0.5
+    assert_backstop_blocks(text)
+    assert production_seconds(text) < 0.5
 
 
 # --- R3149-05: the link reader is linear and reads what it read before ------------
@@ -351,7 +365,7 @@ def test_link_reader_reads_what_the_old_reader_read():
 @timing_test
 def test_r3149_05_link_bodies_parse_in_half_a_second(body):
     text = build_review(body, "zero")
-    elapsed = median_cpu_seconds(analyze, text)
+    elapsed = production_seconds(text)
     assert elapsed < 0.5, elapsed
 
 
@@ -453,7 +467,7 @@ def test_strict_footer_grammar_is_linear_on_a_padded_line():
               "INFO: 0 x")
     text = one_high_review([], [footer])
     assert gate_blocks(text)
-    assert median_cpu_seconds(gate_blocks, text) < 0.5
+    assert production_seconds(text) < 0.5
 
 
 @pytest.mark.parametrize("last_line", [
@@ -472,7 +486,12 @@ def test_a_marker_line_naming_a_severity_is_read(last_line):
 def test_a_provenance_line_naming_a_severity_is_read():
     text = review("No findings.", ["## Findings", "", "None."], ZERO,
                   first_line="<!-- EQUIPA-REVIEWER-RUN-HIGH: 0123 -->")
-    assert gate_blocks(text)
+    decision = production_decision(text)
+    # Production rejects it before parsing (no nonce line); the parser, given
+    # the same text, reads the line too.
+    assert decision.blocks
+    assert decision.provenance.reason == "reviewer-nonce-missing"
+    assert parser_blocks(decision.provenance.text)
 
 
 def test_the_exact_marker_lines_are_still_blanked():
