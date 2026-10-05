@@ -245,8 +245,9 @@ def test_an_interpreter_older_than_the_table_parses_no_non_ascii_review(
         unidata_version = version
 
     monkeypatch.setattr(loops, "unicodedata", Older())
-    suffix = (f": the interpreter's Unicode data {version} predates 13.0.0 "
-              f"(name the character, never paste it)")
+    suffix = (f": the interpreter's Unicode data {version} is not one the "
+              f"gate's table is proven on (13.0.0, 15.0.0) (name the "
+              f"character, never paste it)")
     decision, analysis = decision_and_analysis(
         review("- **Status:** fixed \N{EM DASH} nothing else"))
     assert decision.blocks
