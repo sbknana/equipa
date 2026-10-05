@@ -87,10 +87,15 @@ AFTER_A_HANG_DEADLINE_SECONDS = 30.0
 # shorter deadline gets HARD_STOP_SLOWDOWN times itself as grace, never
 # under HARD_STOP_MIN_GRACE_SECONDS. A test that still uses CPU then
 # reaches its soft deadline (a named failure, the worker goes on) before
-# the hard stop ends the worker: a 0.5 s deadline was hard-stopped 1 s in
-# with 16 CPU burners beside 16 workers on 16 cores, and at a load of 90
-# on those cores a worker got a tenth of one. The 600 s deadline is still
-# stopped 15 minutes in, inside the 30-minute CI job.
+# the hard stop ends the worker, if it gets seconds / (seconds + grace) of
+# a core: a fifth up to 75 s, half at 300 s, two thirds at 600 s. A 0.5 s
+# deadline was hard-stopped 1 s in with 16 CPU burners beside 16 workers
+# on 16 cores, and at a load of 90 on those cores a worker got a tenth of
+# one. With less, the hard stop still names the test (its frame in the
+# dump, xdist's "crashed while running"): a quadratic regex put back under
+# a 300 s deadline, beside 14 other workers at a load near 60 on 16 cores,
+# ended that way. The 600 s deadline is still stopped 15 minutes in,
+# inside the 30-minute CI job.
 HARD_DEADLINE_GRACE_SECONDS = 300.0
 HARD_STOP_SLOWDOWN = 4.0
 HARD_STOP_MIN_GRACE_SECONDS = 60.0

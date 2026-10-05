@@ -91,8 +91,15 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   `DeadlineExceeded`; a test that swallows that, or waits without using
   CPU, is stopped once the wall clock passes the deadline plus a grace, and
   its traceback is dumped. The grace is four times the deadline, at least
-  60 s and at most 300 s, so a worker that a busy host gives a slice of a
-  core still fails by name instead of crashing. That stop is a POSIX timer
+  60 s and at most 300 s, so a test still using CPU fails with
+  `DeadlineExceeded` and the worker goes on if the host gives it a fifth
+  of a core for a deadline up to 75 s (the 30 s cut below included), half
+  of one at 300 s, or two thirds at 600 s. With less, the hard stop ends
+  the worker: the traceback names the test's frame, xdist reports "worker
+  'gwN' crashed while running '<test id>'", and `tests/conftest.py` fails
+  the run with exit status 3. That is still a named failure, not a hang (a
+  reintroduced quadratic regex beside 14 other workers at a host load near
+  60 on 16 cores ended that way). That stop is a POSIX timer
   signal, not a thread, so it costs a worker no task under a task cap
   (systemd `TasksMax`); it falls back to faulthandler's watchdog thread off
   64-bit Linux. After one
