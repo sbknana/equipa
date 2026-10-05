@@ -26,7 +26,6 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -81,7 +80,7 @@ def audit(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
 @pytest.fixture
 def refusals_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Records of this test only: the store follows THEFORGE_DB."""
-    database = tmp_path / "db" / "theforge.db"
+    database = tmp_path / "db" / "operator.db"
     database.parent.mkdir()
     monkeypatch.setattr(dispatch_mod._equipa_constants, "THEFORGE_DB", database)
     return database.parent / dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME
@@ -375,7 +374,7 @@ def test_the_refusal_is_an_unreadable_repository_to_every_dispatch_mode(
 def test_the_refusals_follow_the_operator_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "state" / "theforge.db"
+    database = tmp_path / "state" / "operator.db"
     monkeypatch.setattr(dispatch_mod._equipa_constants, "THEFORGE_DB", database)
 
     assert dispatch_mod._agent_repository_refusals_dir() == (
