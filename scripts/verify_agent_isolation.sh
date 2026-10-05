@@ -116,7 +116,11 @@ check_shared_tmp() {
 # toolchains, took longer than any caller waits). A search cut short, or one
 # that could not run, fails: the directories it did not reach were not
 # probed. The candidates it did report are probed all the same.
-WORLD_WRITABLE_SCAN_SECONDS=600
+# Task 3172 (R3169-02): the operator check (python3 -m equipa.isolation
+# --verify-probe) stops reading this probe after 120 s, so the bound, with
+# the 5 s kill grace, ends well before that: a cut-short search is then
+# reported as such instead of being lost with the rest of the output.
+WORLD_WRITABLE_SCAN_SECONDS=90
 check_world_writable_dirs() {
     local root="$1" root_device directory probe count=0 status
     local -a candidates=() writable=()
@@ -592,6 +596,12 @@ inside() {
             *) WORLD_WRITABLE_SCAN_SECONDS="$scan_seconds" ;;
         esac
     fi
+    # Task 3172 (R3169-03): a root that is not an absolute path of an
+    # existing directory fails, and the disk checks read / instead.
+    if [ "${root_fs#/}" = "$root_fs" ] || [ ! -d "$root_fs" ]; then
+        fail "--root-fs '$root_fs' is not an absolute path of an existing directory (the default / applies)"
+        root_fs=/
+    fi
 
     # --- identity: not root, no sudo, no privileged group -------------------
     local uid user
@@ -762,10 +772,17 @@ inside() {
     # --- disk: a TMPDIR of its own, no shared /tmp on / (F8, SR3147-01) ------
     # $root_fs is / unless --root-fs names another root; every directory
     # below is then read below that root ($root_prefix is empty for /).
-    local root_prefix="${root_fs%/}"
+    # Task 3172 (R3169-03): the well-known names are joined to the root one
+    # by one. A pattern substitution read "&" in the root as the matched
+    # text (bash 5.2 patsub_replacement), so "/tmp/a&b" probed /tmp/ab/...
+    local root_prefix="${root_fs%/}" well_known_name
+    local -a well_known_dirs=()
+    for well_known_name in "${WELL_KNOWN_WORLD_WRITABLE[@]}"; do
+        well_known_dirs+=("$root_prefix$well_known_name")
+    done
     check_unit_tmpdir "$root_fs"
     check_shared_tmp "$root_fs" "$root_prefix/tmp" "$root_prefix/var/tmp"
-    check_world_writable_dirs "$root_fs" "${WELL_KNOWN_WORLD_WRITABLE[@]/#/$root_prefix}"
+    check_world_writable_dirs "$root_fs" "${well_known_dirs[@]}"
     note_search_only_dirs "$root_prefix/tmp" "$root_prefix/var/tmp"
     check_shm_cap /dev/shm "$AGENT_SHM_CAP_MB"
 
