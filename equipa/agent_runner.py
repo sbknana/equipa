@@ -214,6 +214,7 @@ from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
     save_soft_checkpoint,
 )
+from equipa.git_ops import _nearest_git_entry
 from equipa.monitoring import (
     LOOP_TERMINATE_THRESHOLD,
     LOOP_WARNING_THRESHOLD,
@@ -227,6 +228,7 @@ from equipa.monitoring import (
     _get_budget_message,
     _parse_early_complete,
     detect_compaction_signals,
+    git_checks_allowed,
 )
 from equipa.output import log
 from equipa.parsing import validate_output
@@ -3062,8 +3064,21 @@ async def _run_agent_streaming_impl(
     #   (c) deferred commits caused stale-HEAD overrides of fresh edits
     # pre_head..post_head solves all three. None means "no commits yet" — the
     # later cross-check skips the override and trusts files_changed_set.
+    #
+    # R3166-01 (task #3168): in a project that was not git at dispatch any
+    # repository is one an agent made, and git run there by discovery
+    # executes the agent's clean filter in the orchestrator, outside agent
+    # containment. A caller that recorded nothing
+    # (equipa.monitoring.dispatched_without_git) gets the same treatment
+    # when there is no .git at or above project_dir as this run starts. Such
+    # a run starts no git at all (file changes come from the tool stream),
+    # and a repository that appears ends it.
+    non_git_run = bool(project_dir) and (
+        not git_checks_allowed(project_dir)
+        or _nearest_git_entry(Path(project_dir)) is None
+    )
     pre_head: str | None = None
-    if project_dir:
+    if project_dir and not non_git_run:
         pre_head = await _git_rev_parse_head(project_dir)
 
     # Create child abort controller if parent provided
@@ -3175,6 +3190,17 @@ async def _run_agent_streaming_impl(
             "errors": [f"Aborted before execution: {child_controller.signal.reason}"],
             "files_changed_set": [],
         }
+
+    # N1 (task #3168): an earlier agent of this dispatch already made a
+    # repository here; no further agent runs in it.
+    appeared = _repository_appeared_reason(project_dir) if non_git_run else None
+    if appeared is not None:
+        log(f"  [EarlyTerm] Not starting the agent: {appeared}", output)
+        refused = _build_streaming_result(
+            0, time.time() - start_time, False, appeared, False, None, None, [],
+        )
+        refused["files_changed_set"] = []
+        return refused
 
     try:
         process, contained = await _spawn_agent_process(
@@ -3771,13 +3797,23 @@ async def _run_agent_streaming_impl(
                                 entry["error_summary"] = error_text[:200]
 
                             # After any tool completes, check git for file changes
-                            if project_dir:
+                            if project_dir and not non_git_run:
                                 if _check_git_changes(project_dir):
                                     has_any_file_change = True
                                     turns_without_file_change = 0
                                     tool_label = entry.get("tool", "unknown")
                                     log(f"  [FileDetect] Git detected file changes "
                                         f"via {tool_label}", output)
+
+                        # R3166-01 / N1 (task #3168): the tool may have made a
+                        # repository in a project that was not git at
+                        # dispatch. The run ends before the orchestrator, or
+                        # the agent's next step, can use it.
+                        if non_git_run and not early_term_reason:
+                            appeared = _repository_appeared_reason(project_dir)
+                            if appeared is not None:
+                                early_term_reason = appeared
+                                log(f"  [EarlyTerm] {early_term_reason}", output)
 
                 if early_term_reason:
                     break
@@ -3820,6 +3856,15 @@ async def _run_agent_streaming_impl(
     if was_running:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, OSError):
             await asyncio.wait_for(process.communicate(), timeout=5)
+
+    # R3166-01 / N1 (task #3168): checked again once the agent's process
+    # tree is gone, for a repository its last step (or a process it left
+    # running) made after the last tool result. The attempt then reads as
+    # terminated, so the dev-test loop runs no git diff on it.
+    if non_git_run and not early_term_reason:
+        early_term_reason = _repository_appeared_reason(project_dir)
+        if early_term_reason is not None:
+            log(f"  [EarlyTerm] {early_term_reason}", output)
 
     duration = time.time() - start_time
 
@@ -3881,6 +3926,24 @@ async def _run_agent_streaming_impl(
                 result["files_changed_count"] = git_diff_count
 
     return result
+
+
+def _repository_appeared_reason(project_dir: str) -> str | None:
+    """Why a run in a project that was not git when it started must stop:
+    a ``.git`` is now at or above ``project_dir``. None while there is none.
+
+    R3166-01 / N1 (task #3168): found by a filesystem walk, never by asking
+    git. The wording matches none of the analysis-paralysis phrases
+    (``equipa.loops._is_analysis_paralysis``), so the dev-test loop ends
+    the attempt as terminated instead of retrying it in the same place.
+    """
+    git_entry = _nearest_git_entry(Path(project_dir))
+    if git_entry is None:
+        return None
+    return (
+        f"a git repository appeared at {git_entry} in a project that was not "
+        f"git at dispatch; the orchestrator runs no git there"
+    )
 
 
 async def _git_rev_parse_head(project_dir: str) -> str | None:
