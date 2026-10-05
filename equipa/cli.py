@@ -107,7 +107,11 @@ from equipa.loops import (
 )
 from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.mcp_server import run_server
-from equipa.monitoring import calculate_dynamic_budget, dispatched_without_git
+from equipa.monitoring import (
+    calculate_dynamic_budget,
+    dispatched_without_git,
+    git_checks_allowed,
+)
 from equipa.output import (
     log,
     print_dev_test_summary,
@@ -2043,6 +2047,20 @@ async def _execute_single_agent(task, project_dir, project_context, args) -> _Si
     # Tag result with dynamic budget info for telemetry
     result["turns_allocated"] = role_turns_allocated
     result["turns_max"] = role_turns_max
+
+    # R3166-01 / N1 (task #3168): run_mode_task runs a project that was not
+    # git at dispatch under dispatched_without_git, so a repository there now
+    # is the agent's. The no-output guard below asks git for the changed
+    # files (single_agent_guard._git_diff_files falls back to `git status`,
+    # which runs the agent's clean filter in the orchestrator). The task
+    # stops here instead, blocked and audited, before any git runs there.
+    if not git_checks_allowed(project_dir) and _repository_appeared_in_non_git_project(
+        task["id"], project_dir, f"after the {args.role} agent", None,
+    ):
+        return _SingleAgentRun(
+            result=result, outcome=REPOSITORY_APPEARED_OUTCOME, attempts=attempts,
+            model=role_model, max_turns=role_turns_max,
+        )
 
     # Determine outcome. Sustained 529 is checked first so it is recorded as
     # the loud overloaded failure, never folded into a generic outcome.
