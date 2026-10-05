@@ -22,7 +22,7 @@ import subprocess
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -2462,6 +2462,27 @@ def _shape_candidates(
 # line: a blockquote ">" or a list bullet / number with its spaces.
 _CONTAINER_MARKER_RE = re.compile(r">[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]{1,4}")
 _THEMATIC_BREAK_RE = re.compile(r"[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
+# Task 3172 (timing): the run of container markers at a position, each
+# where the one before it ended (empty when none is there). Nothing follows
+# the loop, so committing to each pass loses no match (_committed_loop).
+_CONTAINER_MARKER_RUN_RE = re.compile(
+    _committed_loop(_CONTAINER_MARKER_RE.pattern),
+)
+_MATCH_END = operator.methodcaller("end")
+
+
+def _container_markers(text: str, start: int) -> Iterator[re.Match[str]]:
+    """The container markers of the run at ``start``: what matching
+    _CONTAINER_MARKER_RE again where the last match ended finds, in order.
+
+    Task 3172 (timing): one match finds the run's end and finditer reads its
+    markers in C, so 100,000 nested "- " markers take no Python step each
+    (the 200 KB list_markers family sat at 0.45 s of its 0.5 s budget on
+    Python 3.10). Inside the run each marker starts where the one before it
+    ended, so finditer finds exactly the markers the repeated match does.
+    """
+    run_end = _CONTAINER_MARKER_RUN_RE.match(text, start).end()
+    return _CONTAINER_MARKER_RE.finditer(text, start, run_end)
 
 
 def _innermost_container_line(line: str) -> str:
@@ -2484,8 +2505,12 @@ def _innermost_container_line(line: str) -> str:
     innermost = _CONTAINER_MARKER_RE.match(line, first.end())
     if innermost is None or _THEMATIC_BREAK_RE.fullmatch(line):
         return line
-    while (inner := _CONTAINER_MARKER_RE.match(line, innermost.end())) is not None:
-        innermost = inner
+    inner = _CONTAINER_MARKER_RE.match(line, innermost.end())
+    if inner is not None:
+        # A deeper run: its markers are read in C (_container_markers) and
+        # a one-slot deque keeps the last.
+        innermost = deque(_container_markers(line, inner.start()),
+                          maxlen=1)[0]
     content = line[innermost.end():]
     if not content.strip():
         return line
@@ -2949,8 +2974,9 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
         ):
             continue  # a continuation line of the paragraph above
         blocks.breaks.add(index)
-        while item_columns and indent < item_columns[-1]:
-            item_columns.pop()
+        # Each column pushed is past the one before it, so the items this
+        # line ends (content column past its indent) are a tail of the list.
+        del item_columns[bisect.bisect_right(item_columns, indent):]
         base = item_columns[-1] if item_columns else 0
         relative = indent - base
         # An HTML block of type 7 cannot interrupt a paragraph.
@@ -3000,15 +3026,24 @@ def _rendered_blocks(text: str) -> _RenderedBlocks:
                 # GFM: a footnote's later paragraphs are indented 4 columns,
                 # like a list item's ("[^1]: x" / "" / "    HIGH: SQLi").
                 item_columns.append(base + 4)
-        position = markers = 0
+        marker_ends: list[int] = []
         quoted = False
-        while (marker := _CONTAINER_MARKER_RE.match(content, position)) is not None:
-            position = marker.end()
-            markers += 1
-            if marker.group(0).startswith(">"):
-                quoted = True
-            elif not quoted and footnote is None:
-                item_columns.append(base + relative + position)
+        if _CONTAINER_MARKER_RE.match(content) is not None:
+            marker_ends = list(map(_MATCH_END,
+                                   _container_markers(content, 0)))
+            # Only a quote marker holds ">". Each list marker before the
+            # first one opens a list item at the column where the marker
+            # ends; one inside a quote opens none here.
+            first_quote = content.find(">", 0, marker_ends[-1])
+            quoted = first_quote != -1
+            if footnote is None:
+                opened = (bisect.bisect_right(marker_ends, first_quote)
+                          if quoted else len(marker_ends))
+                item_columns.extend(map(operator.add,
+                                        itertools.repeat(base + relative),
+                                        itertools.islice(marker_ends, opened)))
+        markers = len(marker_ends)
+        position = marker_ends[-1] if marker_ends else 0
         rest = content[position:]
         if footnote is None and rest.startswith("[^"):
             # A footnote inside a quote or list item ("> [^1]: HIGH: SQLi")
