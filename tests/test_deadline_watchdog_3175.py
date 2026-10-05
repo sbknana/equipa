@@ -28,6 +28,7 @@ import pytest
 from tests import deadline_watchdog
 from tests.deadline_watchdog import (
     AFTER_A_HANG_DEADLINE_SECONDS,
+    HARD_STOP_MIN_GRACE_SECONDS,
     HARD_STOP_SIGNAL,
     TEST_DEADLINE_SECONDS,
     TIMING_TEST_DEADLINE_SECONDS,
@@ -186,6 +187,10 @@ SCRATCH_TESTS = '''
 import re
 import pytest
 
+from tests import deadline_watchdog
+
+# A run that waits for the hard stop lowers the minimum grace to 1 s.
+deadline_watchdog.HARD_STOP_MIN_GRACE_SECONDS = {min_grace}
 CATASTROPHIC = re.compile(r"(a+)+$")
 
 
@@ -269,9 +274,13 @@ def _scratch_command(*options: str) -> list[str]:
 
 def _run_scratch(tmp_path: Path, *options: str, swallow: bool = False,
                  source: str = SCRATCH_TESTS) -> subprocess.CompletedProcess:
-    (tmp_path / "test_scratch.py").write_text(
-        source.format(swallow=swallow) if source is SCRATCH_TESTS else source,
-        encoding="utf-8")
+    """A pytest child on ``source``. With ``swallow``, SCRATCH_TESTS swallows
+    its deadline and waits for the hard stop at 1 s of minimum grace."""
+    if source is SCRATCH_TESTS:
+        source = source.format(
+            swallow=swallow,
+            min_grace=1.0 if swallow else HARD_STOP_MIN_GRACE_SECONDS)
+    (tmp_path / "test_scratch.py").write_text(source, encoding="utf-8")
     return subprocess.run(
         _scratch_command(*options), cwd=tmp_path, env=_scratch_environment(),
         capture_output=True, text=True, timeout=120, check=False)
@@ -306,9 +315,10 @@ def test_after_a_hang_the_next_hang_is_cut_short_and_named(tmp_path):
 
 
 def test_a_swallowed_deadline_stops_the_process_and_names_the_test(tmp_path):
-    """The deadline is 1 s, so the hard stop comes 6 s in on the wall clock
-    (the 5 s minimum grace): the timer's signal ends the pytest process
-    after faulthandler has written the test's frame."""
+    """The deadline is 1 s, so the hard stop comes 5 s in on the wall clock
+    (four times the deadline, over the scratch run's 1 s minimum grace): the
+    timer's signal ends the pytest process after faulthandler has written
+    the test's frame."""
     started = time.monotonic()
     completed = _run_scratch(tmp_path, "-k", "swallows", swallow=True)
     assert completed.returncode == -HARD_STOP_SIGNAL, (
@@ -339,8 +349,8 @@ def test_with_the_signal_taken_the_thread_stops_a_swallowed_deadline(
     completed = _run_scratch(tmp_path, "-p", "ignore_hard_stop_signal", "-k",
                              "swallows", swallow=True)
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    # Armed for what is left of the 1 s deadline plus its 5 s grace.
-    assert re.search(r"^Timeout \(0:00:0[0-6][.\d]*\)!$", completed.stderr,
+    # Armed for what is left of the 1 s deadline plus its 4 s grace.
+    assert re.search(r"^Timeout \(0:00:0[0-5][.\d]*\)!$", completed.stderr,
                      re.MULTILINE), completed.stderr
     assert re.search(r'File ".*test_scratch.py", line \d+ in '
                      r"test_swallows_the_deadline", completed.stderr), (
@@ -388,12 +398,12 @@ def test_under_xdist_a_swallowed_deadline_is_a_named_crash(tmp_path):
 
 
 @pytest.mark.parametrize("seconds, grace", [
-    (0.3, 5.0), (1, 5.0), (2, 8.0), (30, 120.0),
+    (0.3, 60.0), (1, 60.0), (2, 60.0), (30, 120.0),
     (TIMING_TEST_DEADLINE_SECONDS, 300.0), (TEST_DEADLINE_SECONDS, 300.0),
 ])
 def test_the_hard_stop_leaves_a_contended_worker_room(seconds, grace):
-    """Four times a short deadline (a worker on a fifth of a core still
-    reaches its soft deadline first), at least 5 s, at most 300 s: the
+    """Four times a deadline, at least 60 s (a worker given a tenth of a
+    core still reaches a short soft deadline first), at most 300 s: the
     longest deadline is still stopped inside the 30-minute CI job."""
     assert deadline_watchdog.hard_stop_grace(seconds) == grace
     assert TEST_DEADLINE_SECONDS + deadline_watchdog.hard_stop_grace(
@@ -416,7 +426,7 @@ def test_a_worker_on_a_third_of_a_core_fails_by_name_not_by_crash(tmp_path):
     worker sharing its core with two busy processes. Its 0.3 s of CPU time
     then take about 0.9 s on the wall clock: past a hard stop at twice the
     deadline (0.6 s), which crashed workers under contention (task 3175),
-    and well inside the 5.3 s it now has."""
+    and well inside the 60.3 s it now has."""
     (tmp_path / "test_scratch.py").write_text(SHORT_DEADLINE_SCRATCH_TESTS,
                                               encoding="utf-8")
     output_path = tmp_path / "output.txt"

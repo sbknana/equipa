@@ -85,14 +85,15 @@ AFTER_A_HANG_DEADLINE_SECONDS = 30.0
 # phase that waits uses no CPU time. A busy host gives a worker a fraction
 # of a core, so a CPU-time deadline lasts longer on the wall clock: a
 # shorter deadline gets HARD_STOP_SLOWDOWN times itself as grace, never
-# under HARD_STOP_MIN_GRACE_SECONDS. With a fifth of a core a test still
+# under HARD_STOP_MIN_GRACE_SECONDS. A test that still uses CPU then
 # reaches its soft deadline (a named failure, the worker goes on) before
 # the hard stop ends the worker: a 0.5 s deadline was hard-stopped 1 s in
-# with 16 CPU burners beside 16 workers on 16 cores. The 600 s deadline is
-# still stopped 15 minutes in, inside the 30-minute CI job.
+# with 16 CPU burners beside 16 workers on 16 cores, and at a load of 90
+# on those cores a worker got a tenth of one. The 600 s deadline is still
+# stopped 15 minutes in, inside the 30-minute CI job.
 HARD_DEADLINE_GRACE_SECONDS = 300.0
 HARD_STOP_SLOWDOWN = 4.0
-HARD_STOP_MIN_GRACE_SECONDS = 5.0
+HARD_STOP_MIN_GRACE_SECONDS = 60.0
 # The handler ran while a deadline was being armed or disarmed: it looks
 # again this many CPU seconds later.
 RETRY_SECONDS = 0.01
