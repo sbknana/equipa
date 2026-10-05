@@ -485,6 +485,27 @@ def pytest_configure(config):
         print("  [conftest] Schema setup skipped — tests requiring DB may fail.")
 
 
+def _timing_calibration():
+    """The timing tests' host calibration (task 3171, tests/host_timing.py);
+    a malformed EQUIPA_TIMING_HOST_FACTOR stops the run before any test."""
+    from tests import host_timing
+
+    try:
+        return host_timing.host_calibration()
+    except host_timing.HostFactorError as error:
+        raise pytest.UsageError(str(error)) from error
+
+
+def pytest_report_header(config):
+    return _timing_calibration().describe()
+
+
+def pytest_sessionstart(session):
+    """Measure the timing reference workload once per process (every xdist
+    worker too) before the first test, not inside a timed test."""
+    _timing_calibration()
+
+
 def pytest_collection_modifyitems(session, config, items):
     """After collection, call setup_test_data() for modules that define it.
 
