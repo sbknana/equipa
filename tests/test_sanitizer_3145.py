@@ -46,6 +46,7 @@ from equipa.parsing import (  # noqa: E402
     build_test_failure_context,
     compact_agent_output,
 )
+from tests.host_timing import assert_linear_time, budget  # noqa: E402
 
 
 def _load(name: str, path: Path):
@@ -512,7 +513,7 @@ def _best_seconds(*args: str) -> float:
         except subprocess.TimeoutExpired:
             pytest.fail(f"probe {args} ran over {SUBPROCESS_TIMEOUT_SECONDS}s")
         best = min(best, float(completed.stdout.strip()))
-        if best < BUILDER_LIMIT_SECONDS:
+        if best < budget(BUILDER_LIMIT_SECONDS):
             break
     return best
 
@@ -537,6 +538,9 @@ def test_fixture_has_line_separator_families():
 )
 @pytest.mark.parametrize("target", ["tester-context", "recovery", "agent-messages"])
 def test_prompt_builders_are_fast_with_every_field_at_the_cap(target, case):
-    size = str(ls.MAX_SANITIZE_INPUT_LENGTH)
-    elapsed = _best_seconds(target, case, size)
-    assert elapsed < BUILDER_LIMIT_SECONDS, f"{target} took {elapsed:.2f}s on {case}"
+    # Budget host-calibrated, growth from a quarter of the cap linear
+    # (task 3171).
+    assert_linear_time(
+        lambda size: _best_seconds(target, case, str(size)),
+        ls.MAX_SANITIZE_INPUT_LENGTH, BUILDER_LIMIT_SECONDS, f"{target} on {case}",
+    )

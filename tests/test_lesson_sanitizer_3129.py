@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import lesson_sanitizer as ls  # noqa: E402
+from tests.host_timing import assert_linear_time, budget  # noqa: E402
 
 _PROBE_PATH = Path(__file__).resolve().parent / "fixtures" / "sanitizer_timing_probe.py"
 _probe_spec = importlib.util.spec_from_file_location("sanitizer_timing_probe", _PROBE_PATH)
@@ -81,9 +82,16 @@ def _best_of(target: str, case: str, size: int, attempts: int = 3) -> float:
     best = float("inf")
     for _ in range(attempts):
         best = min(best, _time_in_child(target, case, size))
-        if best < TIME_LIMIT_SECONDS:
+        if best < budget(TIME_LIMIT_SECONDS):
             break
     return best
+
+
+def _assert_linear(target: str, case: str, size: int) -> None:
+    """*target* on *case* within the host-calibrated limit at *size*, and
+    linear from a quarter of *size* to *size* (task 3171)."""
+    assert_linear_time(lambda at_size: _best_of(target, case, at_size), size,
+                       TIME_LIMIT_SECONDS, f"{target} on {case}")
 
 
 def test_every_injection_pattern_has_an_adversarial_timing_case():
@@ -95,8 +103,7 @@ def test_every_injection_pattern_has_an_adversarial_timing_case():
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.parametrize("case", sorted(ADVERSARIAL_CASES))
 def test_sanitize_is_fast_on_adversarial_input(case, size):
-    elapsed = _best_of("sanitize", case, size)
-    assert elapsed < TIME_LIMIT_SECONDS, f"sanitize took {elapsed:.2f}s on {case}"
+    _assert_linear("sanitize", case, size)
 
 
 @pytest.mark.parametrize("size", SIZES)
@@ -104,15 +111,13 @@ def test_sanitize_is_fast_on_adversarial_input(case, size):
     "case", sorted(name for name, (reasons, _) in ADVERSARIAL_CASES.items() if reasons)
 )
 def test_each_pattern_is_linear_without_the_input_cap(case, size):
-    elapsed = _best_of("pattern", case, size)
-    assert elapsed < TIME_LIMIT_SECONDS, f"pattern search took {elapsed:.2f}s on {case}"
+    _assert_linear("pattern", case, size)
 
 
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.parametrize("case", sorted(ADVERSARIAL_CASES))
 def test_neutralize_boundaries_is_fast_on_uncapped_task_text(case, size):
-    elapsed = _best_of("boundaries", case, size)
-    assert elapsed < TIME_LIMIT_SECONDS, f"neutralize_boundaries took {elapsed:.2f}s on {case}"
+    _assert_linear("boundaries", case, size)
 
 
 def test_input_cap_sits_above_every_stored_content_cap():
