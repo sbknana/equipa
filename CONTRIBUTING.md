@@ -87,8 +87,10 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   `@pytest.mark.deadline(seconds)`. Past it the test fails with
   `DeadlineExceeded`; a test that swallows that, or waits without using
   CPU, is stopped once the wall clock passes the deadline plus a grace, and
-  its traceback is dumped. A hung regression fails by name instead of
-  timing out the CI job.
+  its traceback is dumped. After one test of a worker has run past its
+  deadline, every later test of that worker gets 30 s, so a regression
+  that hangs a whole module costs one deadline and then 30 s per test. A
+  hung regression fails by name instead of timing out the CI job.
 - Set `EQUIPA_TIMING_HOST_FACTOR` (a number > 0, at most 4.0) to force the
   host factor, e.g. `EQUIPA_TIMING_HOST_FACTOR=2.0` to run the timing tests
   as on a runner twice as slow. The session-start factor is printed in the
