@@ -34,6 +34,10 @@ from equipa.loops import (
     backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate_at,
+)
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -51,8 +55,9 @@ def _rules_analysis(path: Path):
 def _assert_backstop_blocks(path: Path) -> None:
     """Task 3152: an UPPER-case HIGH outside a counted heading's label and
     the final strict footer blocks whatever the counts (each review here
-    blocked the merge before as well, by HIGH=1)."""
-    analysis = _analyze_review_file(path)
+    blocked the merge before as well, by HIGH=1). Task 3170 (IR67-02):
+    decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
     assert _count_findings_in_review_file(path) is None
@@ -97,11 +102,25 @@ def _lowercase_severity_words(text: str) -> str:
 def _assert_only_the_backstop_blocks(path: Path) -> None:
     """Task 3143: the rules trusted the review (the backstop runs only then)
     and the severity-token backstop blocked it: the reviewer prompt allows
-    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
-    analysis = _analyze_review_file(path)
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label. Task
+    3170 (IR67-02): decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helpers, so a gate that parsed the
+    normalised text (R3161-01) fails this suite too."""
+    path = _write(tmp_path,
+                  BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + _footer())
+    _assert_only_the_backstop_blocks(path)
+    _assert_backstop_blocks(path)
 
 
 # ---------- S3033-01: resolved headings never lower the merge counts ----------
@@ -161,7 +180,7 @@ def test_level_two_first_heading_is_not_title_exempt(tmp_path: Path) -> None:
         + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
@@ -178,7 +197,7 @@ def test_severity_beyond_eighty_characters_in_heading_is_seen(
         BODY + f"### {long_prefix}— HIGH\nDetail.\n" + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
@@ -197,7 +216,7 @@ def test_numbered_bold_lead_in_is_a_candidate(
 ) -> None:
     path = _write(tmp_path, BODY + line + "\n" + _footer())
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
 
 
@@ -223,7 +242,7 @@ def test_fixed_outside_bold_span_does_not_resolve_live_finding(
         BODY + "- **[S1] HIGH — nonce reuse** — FIXED\n" + _footer(),
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
 
 
@@ -293,7 +312,7 @@ def test_strict_finding_header_inside_code_fence_still_counts(
         + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.header_counts["HIGH"] == 1
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
@@ -330,7 +349,7 @@ def test_trailing_level_one_heading_after_footer_is_incomplete(
         BODY + "No findings.\n" + _footer() + "\n# Appendix\nNotes.\n",
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "not the final section" in analysis.detail

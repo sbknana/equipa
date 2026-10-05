@@ -37,6 +37,10 @@ from equipa.loops import (
     backstop_reason,
 )
 from equipa.security_gate import normalize_review_text
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate_at,
+)
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -54,8 +58,9 @@ def _rules_analysis(path: Path):
 def _assert_backstop_blocks(path: Path) -> None:
     """Task 3152: an UPPER-case HIGH outside a counted heading's label and
     the final strict footer blocks whatever the counts (each review here
-    blocked the merge before as well, by HIGH=1)."""
-    analysis = _analyze_review_file(path)
+    blocked the merge before as well, by HIGH=1). Task 3170 (IR67-02):
+    decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
     assert _count_findings_in_review_file(path) is None
@@ -106,11 +111,25 @@ def _lowercase_severity_words(text: str) -> str:
 def _assert_only_the_backstop_blocks(path: Path) -> None:
     """Task 3143: the rules trusted the review (the backstop runs only then)
     and the severity-token backstop blocked it: the reviewer prompt allows
-    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
-    analysis = _analyze_review_file(path)
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label. Task
+    3170 (IR67-02): decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helpers, so a gate that parsed the
+    normalised text (R3161-01) fails this suite too."""
+    path = _write(tmp_path,
+                  BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + _footer())
+    _assert_only_the_backstop_blocks(path)
+    _assert_backstop_blocks(path)
 
 
 @pytest.fixture(autouse=True)
@@ -206,7 +225,7 @@ def test_footer_above_live_plus_resolved_is_a_mismatch(tmp_path: Path) -> None:
         + _footer(medium=2),
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
 
 
@@ -229,7 +248,7 @@ def test_uncounted_candidate_form_is_a_count_mismatch(
 ) -> None:
     path = _write(tmp_path, BODY + line + "\n" + _footer())
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "finding-shaped lines not counted" in analysis.detail
@@ -305,7 +324,7 @@ def test_unterminated_fence_hides_no_candidate(tmp_path: Path) -> None:
         "## [S1] HIGH — written after a stray fence\n" + _footer(),
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
 
 
@@ -343,7 +362,7 @@ def test_heading_after_footer_is_incomplete(tmp_path: Path) -> None:
         tmp_path, BODY + "No findings.\n" + _footer() + "\n## Appendix\nx\n",
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "final section" in analysis.detail
@@ -359,7 +378,7 @@ def test_counted_bullet_finding_after_footer_is_incomplete(
         + "\n- **[S2] LOW** — appended after the footer\n",
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_INCOMPLETE
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_INCOMPLETE
 
 
 def test_non_zero_earlier_footer_is_overridden_by_last(tmp_path: Path) -> None:
@@ -404,7 +423,7 @@ def test_each_template_placeholder_marks_review_incomplete(
         tmp_path, BODY + "No findings.\n\n" + placeholder_line + "\n" + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "placeholder" in analysis.detail
@@ -441,7 +460,7 @@ def test_prose_that_is_not_a_no_findings_statement_stays_incomplete(
 ) -> None:
     path = _write(tmp_path, NO_SUMMARY_BODY + prose + "\n" + _footer())
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_INCOMPLETE
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_INCOMPLETE
 
 
 def test_empty_summary_section_is_not_a_summary(tmp_path: Path) -> None:
@@ -451,7 +470,7 @@ def test_empty_summary_section_is_not_a_summary(tmp_path: Path) -> None:
         "- b.py\n" + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "no Summary" in analysis.detail
@@ -480,7 +499,7 @@ def test_status_position_marker_marks_review_incomplete(
         "## Files Reviewed\n- a.py\n" + _footer(),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "summary marker" in analysis.detail
