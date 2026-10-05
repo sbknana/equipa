@@ -18,6 +18,10 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+)
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -45,6 +49,12 @@ def verdict(text: str) -> str:
     return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text).verdict
 
 
+def blocked_verdict(text: str) -> str:
+    """The parser's verdict on a review the merge gate blocks (task 3170,
+    IR67-02: every must-block case decides through the gate)."""
+    return blocked_by_the_gate(text).verdict
+
+
 # Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
 SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
 # Task 3152: "E1 was rated LOW rather than HIGH because ...", "No HIGH or
@@ -58,12 +68,23 @@ def lowercase_severity_words(text: str) -> str:
 
 
 def assert_only_the_backstop_blocks(text: str) -> None:
-    """The rules trusted ``text`` (the backstop runs only then) and the
-    severity-token backstop blocked it."""
-    analysis = loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
+    """The merge gate blocks ``text`` (task 3170, IR67-02): the rules
+    trusted it (the backstop runs only then) and the severity-token backstop
+    blocked it."""
+    analysis = blocked_by_the_gate(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks(review(
+        "No findings.", ["## Notes", AS_WRITTEN_ONLY_FINDINGS[finding]], ZERO,
+        low_heading=False))
 
 
 # --- 1. finding shapes that used to merge behind a zero footer ---------------
@@ -77,13 +98,13 @@ def assert_only_the_backstop_blocks(text: str) -> None:
 ])
 def test_finding_shapes_behind_zero_footer_fail_closed(body):
     text = review("No findings.", body, ZERO, low_heading=False)
-    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
 
 
 def test_leading_high_next_to_a_counted_low_fails_closed():
     text = review("1 finding.", ["## Notes", "- HIGH: auth bypass on /admin"],
                   ONE_LOW, low_heading=True)
-    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH
 
 
 # --- 2. prose mentions and near-misses still merge ----------------------------
@@ -135,7 +156,7 @@ def test_honest_summaries_are_not_unfinished(summary):
 ])
 def test_status_markers_still_block(summary):
     text = review(summary, [], ONE_LOW, low_heading=True)
-    assert verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary
+    assert blocked_verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary
 
 
 
@@ -155,7 +176,7 @@ def test_status_markers_still_block(summary):
 ])
 def test_rereview_shapes_fail_closed(body):
     text = review("No findings.", body, ZERO, low_heading=False)
-    assert verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert blocked_verdict(text) == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
 
 
 @pytest.mark.parametrize("line", [
@@ -180,4 +201,4 @@ def test_note_bullets_do_not_block(line):
 ])
 def test_punctuated_status_markers_block(summary):
     text = review(summary, [], ONE_LOW, low_heading=True)
-    assert verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary
+    assert blocked_verdict(text) == loops.REVIEW_VERDICT_INCOMPLETE, summary

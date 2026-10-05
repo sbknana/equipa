@@ -47,7 +47,9 @@ from equipa.security_gate import (
     verify_reviewer_provenance,
 )
 from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
+    blocked_by_the_gate,
     production_seconds,
 )
 from tests.review_gate_timing import timing_test
@@ -132,13 +134,22 @@ def lowercase_severity_words(text: str) -> str:
 
 
 def assert_only_the_backstop_blocks(text: str) -> None:
-    """The rules trusted ``text`` (the backstop runs only then) and the
-    severity-token backstop blocked it."""
-    analysis = loops._analyze_review_file(
-        Path("SECURITY-REVIEW-94300.md"), text=text)
+    """The merge gate blocks ``text`` (task 3170, IR67-02): the rules
+    trusted it (the backstop runs only then) and the severity-token backstop
+    blocked it."""
+    analysis = blocked_by_the_gate(text)
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks(
+        finished_review().replace("Details.", AS_WRITTEN_ONLY_FINDINGS[finding]))
 
 
 # --------------------------------------------------------------- gate-04
@@ -437,7 +448,9 @@ def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
     assert production_seconds(as_reviewer_artifact(text)) < 2.0
     if SEVERITY_TOKEN.search(line):
         # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
-        # only; the rules still read the padded line as prose.
+        # only; the rules still read the padded line as prose. Task 3170:
+        # decided through the merge gate.
+        analysis = blocked_by_the_gate(as_reviewer_artifact(text))
         assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
         assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
         text = lowercase_severity_words(text)
