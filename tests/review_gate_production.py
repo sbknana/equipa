@@ -196,6 +196,12 @@ def review_as_written(path: Path) -> str:
     return Path(path).read_bytes().decode("utf-8")
 
 
+def blocked_by_the_gate_at(path: Path) -> loops.ReviewCountAnalysis:
+    """``blocked_by_the_gate`` on the review a test wrote at ``path``, read
+    as written and made this cycle's reviewer artifact."""
+    return blocked_by_the_gate(as_reviewer_artifact(review_as_written(path)))
+
+
 # Task 3170 (IR67-02): finding lines only the review as written shows a
 # severity in. Normalisation deletes the filler and glues "Rated" to the
 # word, so with provenance handing the parser the normalised text (the

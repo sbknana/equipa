@@ -32,9 +32,12 @@ from equipa.loops import (
 )
 from equipa.security_gate import normalize_review_text
 from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
+    blocked_by_the_gate_at,
     gate_blocks,
     production_seconds,
+    review_as_written,
 )
 from tests.review_gate_timing import timing_test
 
@@ -80,8 +83,8 @@ def _write(tmp_path: Path, markdown: str) -> Path:
 def _blocks_merge(path: Path) -> bool:
     """dispatch._security_review_blocks_merge itself (task 3167) on the
     review at ``path``, written as this cycle's reviewer artifact: untrusted
-    or C+H > 0."""
-    return gate_blocks(as_reviewer_artifact(path.read_text(encoding="utf-8")))
+    or C+H > 0. Read as written, with no newline translation (R3167-02)."""
+    return gate_blocks(as_reviewer_artifact(review_as_written(path)))
 
 
 def _rules_counts(path: Path) -> dict[str, int] | None:
@@ -96,8 +99,9 @@ def _assert_backstop_blocks(path: Path) -> None:
     """Task 3152: an UPPER-case CRITICAL or HIGH outside a counted heading's
     label and the final strict footer (a prose finding, a second footer, a
     recap bullet) blocks, whatever the counts. Each review below blocked the
-    merge before as well, by its CRITICAL or HIGH count."""
-    analysis = _analyze_review_file(path)
+    merge before as well, by its CRITICAL or HIGH count. Task 3170
+    (IR67-02): the analysis is of the text the merge gate blocked."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
     assert _count_findings_in_review_file(path) is None
@@ -107,12 +111,36 @@ def _assert_backstop_blocks(path: Path) -> None:
 def _assert_medium_backstop_blocks(path: Path) -> None:
     """Task 3161: an UPPER-case MEDIUM outside a counted heading's label and
     the final strict footer blocks the same way (no MEDIUM exemption)."""
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(
         backstop_reason("MEDIUM") + " at line "), analysis
     assert _count_findings_in_review_file(path) is None
     assert _blocks_merge(path)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    _assert_backstop_blocks(_write(
+        tmp_path, BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + _footer()))
+
+
+def test_the_merge_helper_decides_on_the_bytes_as_written(
+    tmp_path: Path,
+) -> None:
+    """R3167-02: a fixture is decided on the text it wrote. Read with
+    newline translation, its CR line breaks became line feeds first."""
+    path = tmp_path / "SECURITY-REVIEW-3038.md"
+    path.write_bytes(b"# Security Review\r\n\r\n## Summary\rNo findings.\r\n")
+
+    assert review_as_written(path) == (
+        "# Security Review\r\n\r\n## Summary\rNo findings.\r\n")
+    assert path.read_text(encoding="utf-8") != review_as_written(path)
 
 
 # ---------- IR38-02: per-severity maximum across all footers ----------
@@ -168,7 +196,7 @@ def test_larger_quoted_footer_disagreeing_with_headers_is_untrusted(
         + "Draft:\n" + _footer(high=2) + "\nFinal:\n" + _footer(high=1),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
@@ -328,8 +356,7 @@ def test_long_candidate_title_parses_quickly_and_still_blocks(
     path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
 
     blocked = _blocks_merge(path)
-    elapsed = production_seconds(
-        as_reviewer_artifact(path.read_text(encoding="utf-8")))
+    elapsed = production_seconds(as_reviewer_artifact(review_as_written(path)))
 
     assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
     assert blocked

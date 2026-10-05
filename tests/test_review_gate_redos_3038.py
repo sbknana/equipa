@@ -26,8 +26,11 @@ from equipa.loops import (
     _count_findings_in_review_file,
 )
 from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
     as_reviewer_artifact,
+    blocked_by_the_gate_at,
     production_seconds,
+    review_as_written,
 )
 from tests.review_gate_timing import timing_test
 
@@ -61,8 +64,7 @@ def test_long_bold_tag_line_parses_in_linear_time(
     path = _write(tmp_path, BODY + adversarial_line + "\n" + ZERO_FOOTER)
 
     analysis = _analyze_review_file(path)
-    elapsed = production_seconds(
-        as_reviewer_artifact(path.read_text(encoding="utf-8")))
+    elapsed = production_seconds(as_reviewer_artifact(review_as_written(path)))
 
     assert elapsed < PARSE_BOUND_SECONDS, f"parse took {elapsed:.2f}s"
     assert analysis.verdict == REVIEW_VERDICT_OK
@@ -84,5 +86,20 @@ def test_unbracketed_tag_candidates_are_still_detected(
 ) -> None:
     path = _write(tmp_path, BODY + candidate_line + "\n" + ZERO_FOOTER)
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    # Task 3170 (IR67-02): decided through the merge gate.
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert _count_findings_in_review_file(path) is None
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through the merge gate here as well, so a gate that parsed the
+    normalised text (R3161-01) fails this suite too."""
+    path = _write(tmp_path,
+                  BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + ZERO_FOOTER)
+
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None

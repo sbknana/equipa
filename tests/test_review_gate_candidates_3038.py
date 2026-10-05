@@ -29,6 +29,10 @@ from equipa.loops import (
     _analyze_review_file,
     backstop_reason,
 )
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate_at,
+)
 
 # Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
 BLOCKING_TOKEN_REASONS = tuple(
@@ -61,11 +65,25 @@ def _lowercase_severity_words(text: str) -> str:
 def _assert_only_the_backstop_blocks(path: Path) -> None:
     """Task 3143: the rules trusted the review (the backstop runs only then)
     and the severity-token backstop blocked it: the reviewer prompt allows
-    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label."""
-    analysis = _analyze_review_file(path)
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label. Task
+    3170 (IR67-02): decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
     assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
         analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    _assert_only_the_backstop_blocks(_write_review(
+        tmp_path,
+        TITLE + BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + ZERO_FOOTER,
+    ))
 
 
 @pytest.mark.parametrize(
@@ -97,7 +115,7 @@ def test_uncounted_finding_form_blocks_under_zero_footer(
         TITLE + BODY + finding_line + "\nImpact paragraph.\n" + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
@@ -128,7 +146,7 @@ def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
           and "CRITICAL" not in prose_line):
         # Task 3152: a MEDIUM-only unaccounted token blocks, as on main
         # (task 3149, R3143-06, had counted it as a logged advisory).
-        blocked = _analyze_review_file(_write_review(
+        blocked = blocked_by_the_gate_at(_write_review(
             tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
         ))
         assert blocked.verdict == REVIEW_VERDICT_COUNT_MISMATCH, blocked
@@ -165,7 +183,7 @@ def test_severity_field_under_zero_footer_now_fails_closed(
         + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
@@ -200,7 +218,7 @@ def test_title_exemption_covers_only_the_first_heading(tmp_path: Path) -> None:
         + BODY + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
