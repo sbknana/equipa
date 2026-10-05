@@ -41,6 +41,12 @@ from pathlib import Path
 import pytest
 
 from equipa import loops
+from equipa.security_gate import REVIEW_BIDI_CONTROL_REASON
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+    decision_and_analysis,
+)
 from tests.test_review_gate_no_exemptions_3152 import (
     CONTEXTS, E, analyze, build_review, gate_blocks, review,
 )
@@ -67,16 +73,37 @@ def _line_of(text: str, body_line: str) -> int:
 
 
 def _unaccounted(text: str, severity: str, body_line: str) -> str | None:
-    """None when the review is untrusted for an unaccounted ``severity``
-    word on ``body_line``'s line, else what the gate said instead."""
-    analysis = analyze(text)
+    """None when the merge gate blocks the review, untrusted for an
+    unaccounted ``severity`` word on ``body_line``'s line, else what the gate
+    said instead. Task 3170 (IR67-02): the reason is the parser's reading of
+    the text provenance handed the gate, which provenance must trust (or
+    refuse for a bidi control, its first check)."""
+    decision, analysis = decision_and_analysis(text)
+    provenance = decision.provenance
     expected = (f"{loops.backstop_reason(severity)} at line "
                 f"{_line_of(text, body_line)}")
     if (analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
             and expected in analysis.detail.split(": ")[0]
-            and gate_blocks(text)):
+            and decision.blocks
+            and (provenance.trusted
+                 or provenance.reason.startswith(REVIEW_BIDI_CONTROL_REASON))):
         return None
     return f"{analysis.verdict}: {analysis.detail[:120]}"
+
+
+@pytest.mark.parametrize("finding, severity", [
+    ("hangul-filler-high", "HIGH"),
+    ("halfwidth-filler-critical", "CRITICAL"),
+])
+def test_the_must_block_helper_reads_the_review_as_written(finding, severity):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    line = AS_WRITTEN_ONLY_FINDINGS[finding]
+    for context in CONTEXTS:
+        text = build_review([line], context)
+        assert _unaccounted(text, severity, line) is None, (context,
+                                                            analyze(text))
 
 
 # --- R3157-01, R3157-02: the families of the independent 3157 review -------------
@@ -258,7 +285,7 @@ def test_the_reason_names_each_severity_and_its_lines():
     lines = ["No MEDIUM findings.", "", "Not HIGH either.", "",
              "No MEDIUM issues remain."]
     text = build_review(lines, "zero")
-    analysis = analyze(text)
+    analysis = blocked_by_the_gate(text)
     medium_lines = (_line_of(text, lines[0]), _line_of(text, lines[4]))
     high_line = _line_of(text, lines[2])
     assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH

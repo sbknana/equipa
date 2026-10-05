@@ -30,6 +30,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.review_gate_production import AS_WRITTEN_ONLY_FINDINGS
 from tests.review_gate_production import gate_blocks as production_gate_blocks
 from tests.review_gate_production import production_seconds
 from tests.review_gate_timing import median_cpu_seconds, timing_test
@@ -77,6 +78,14 @@ def one_low_review(body):
 def assert_gate_blocks(body):
     for text in (zero_review(body), one_low_review(body)):
         assert gate_blocks(text), (body, analyze(text))
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helper_reads_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_gate_blocks([AS_WRITTEN_ONLY_FINDINGS[finding]])
 
 
 # --- R3143-03: every Markdown link shape that joins a word -----------------------
