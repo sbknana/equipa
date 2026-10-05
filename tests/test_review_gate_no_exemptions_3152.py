@@ -37,6 +37,7 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     decision_and_analysis,
     gate_blocks,
@@ -281,9 +282,15 @@ def test_hex_digits_after_a_reference_are_part_of_it():
 
 @timing_test
 def test_a_200kb_reference_is_decided_without_int():
-    text = build_review(["&#" + "9" * RB + "HIGH severity RCE"], "zero")
-    assert_backstop_blocks(text)
-    assert production_seconds(text) < 0.5
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    def reference_review(digits):
+        return build_review(["&#" + "9" * digits + "HIGH severity RCE"],
+                            "zero")
+
+    assert_backstop_blocks(reference_review(RB))
+    assert_linear_time(lambda digits: production_seconds(
+        reference_review(digits)), RB, 0.5, "200 KB numeric reference")
 
 
 # --- R3149-05: the link reader is linear and reads what it read before ------------
@@ -345,17 +352,20 @@ def test_link_reader_reads_what_the_old_reader_read():
                 assert new == old, (view, labels, drop_alt)
 
 
-@pytest.mark.parametrize("body", [
-    ["[a]: x", "", "a[" + "b]" * (RB // 2)],
-    ["a[" + "b](" * (RB // 3)],
-    ["[a]: x", "", "a]" * (RB // 2)],
-    ["[a]: x", "", "[" + " " * (RB // 2) + "a]" * (RB // 4)],
-])
+@pytest.mark.parametrize("make_body", [
+    lambda rb: ["[a]: x", "", "a[" + "b]" * (rb // 2)],
+    lambda rb: ["a[" + "b](" * (rb // 3)],
+    lambda rb: ["[a]: x", "", "a]" * (rb // 2)],
+    lambda rb: ["[a]: x", "", "[" + " " * (rb // 2) + "a]" * (rb // 4)],
+], ids=["defined-label-pairs", "open-links", "defined-label-closers",
+        "blank-then-label-closers"])
 @timing_test
-def test_r3149_05_link_bodies_parse_in_half_a_second(body):
-    text = build_review(body, "zero")
-    elapsed = production_seconds(text)
-    assert elapsed < 0.5, elapsed
+def test_r3149_05_link_bodies_parse_in_half_a_second(make_body):
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(
+        lambda rb: production_seconds(build_review(make_body(rb), "zero")),
+        RB, 0.5, repr(make_body(8)))
 
 
 def test_link_text_longer_than_any_label_is_no_shortcut_link():
@@ -452,11 +462,16 @@ def test_only_the_final_footer_is_credited():
 
 @timing_test
 def test_strict_footer_grammar_is_linear_on_a_padded_line():
-    footer = ("CRITICAL: 0" + " " * RB + "| HIGH: 1 | MEDIUM: 0 | LOW: 0 | "
-              "INFO: 0 x")
-    text = one_high_review([], [footer])
-    assert gate_blocks(text)
-    assert production_seconds(text) < 0.5
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    def padded_footer_review(blanks):
+        footer = ("CRITICAL: 0" + " " * blanks
+                  + "| HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0 x")
+        return one_high_review([], [footer])
+
+    assert gate_blocks(padded_footer_review(RB))
+    assert_linear_time(lambda blanks: production_seconds(
+        padded_footer_review(blanks)), RB, 0.5, "padded footer line")
 
 
 @pytest.mark.parametrize("last_line", [
