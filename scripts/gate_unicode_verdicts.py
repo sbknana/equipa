@@ -4,22 +4,29 @@ the verdicts two interpreters gave (task 3177, IR3174-01).
 
 Usage:
     python3 scripts/gate_unicode_verdicts.py decide OUT.json
-        [--bodies N] [--seed S] [--workers W]
+        [--bodies N] [--seed S] [--workers W] [--from-file BODIES.json]
     python3 scripts/gate_unicode_verdicts.py compare A.json B.json
 
 ``decide`` builds at least N bodies (default 100,000) with
 tests/gate_unicode_lookalikes.py: the Unicode 14/15 marks indep-3174
 reported, U+A7F2, the code points whose data changed in Unicode 15 and 16,
 the table's lookalikes of the severity letters and a seeded sample of code
-points outside the table, each in every spelling and placement. Every body
-is written as a recorded reviewer artifact and decided by
-``dispatch._security_review_blocks_merge`` (tests/review_gate_production.py),
-and OUT.json maps each body's name to [blocks, verdict, detail]. The bodies
+points outside the table, each in every spelling and placement. The bodies
 are built from the gate's checked-in table only, so every interpreter
-decides the same bodies.
+decides the same bodies. With ``--from-file`` the bodies are read from a
+JSON object instead (the format of the indep-3174 probe): a string is a
+line of a review with one LOW finding, ``{"raw": text}`` a whole review, a
+list of lines the body of a review with no finding and of one with a LOW
+finding (two decisions, ``#zero`` and ``#one-low``).
 
-``compare`` prints how many decisions differ between two such files (and
-the first few), and exits 1 when any does.
+Every review is written as a recorded reviewer artifact (lone surrogates
+kept) and decided by ``dispatch._security_review_blocks_merge``, the
+function the orchestrator calls before a merge; OUT.json maps each name to
+[blocks, verdict, detail], with "untrusted" and the provenance reason when
+provenance refuses the review, or "exception" and its type.
+
+``compare`` prints how many decisions differ between two such files, in
+which direction, and the first few, and exits 1 when any does.
 
 Run ``decide`` once per interpreter, then ``compare`` the two files. GATE-
 AUDIT rows go to a scratch database, never to THEFORGE_DB.
@@ -43,6 +50,12 @@ import unicodedata
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parent.parent
+TASK_ID = 3177
+
+# The two reviews a list of lines is decided in (the indep-3174 harness).
+_ZERO_FOOTER = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+_ONE_LOW_FOOTER = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
+_LOW_HEADING = "### [E1] LOW \N{EM DASH} verbose error message"
 
 
 def _code_points(bodies: int, seed: int) -> list[int]:
@@ -64,36 +77,99 @@ def _code_points(bodies: int, seed: int) -> list[int]:
     return sorted(fixed + extra[:max(0, wanted - len(fixed))])
 
 
-def _decide_slice(arguments: tuple[list[tuple[str, str]], str]) -> dict:
+def _list_review(summary: str, lines: list[str], footer: str,
+                 heading: str | None = None) -> str:
+    text = ["# Security Review", "", "## Summary", summary, ""]
+    if heading:
+        text += [heading, "Details.", ""]
+    text += [*lines, "", "## Files Reviewed", "- app.py", "",
+             "## Methodology", "Read the diff, ran semgrep.", "",
+             "## Counts", footer]
+    return "\n".join(text) + "\n"
+
+
+def _reviews(name: str, body: object) -> list[tuple[str, str]]:
+    """(name, review text) for one body of either source."""
+    from tests import gate_unicode_lookalikes as lookalikes
+
+    if isinstance(body, str):
+        return [(name, lookalikes.review(body))]
+    if isinstance(body, dict) and isinstance(body.get("raw"), str):
+        return [(name, body["raw"])]
+    if isinstance(body, list) and all(isinstance(line, str) for line in body):
+        return [
+            (f"{name}#zero", _list_review(
+                "No findings.", ["## Findings", "", *body], _ZERO_FOOTER)),
+            (f"{name}#one-low", _list_review(
+                "1 finding.", ["## Notes", "", *body], _ONE_LOW_FOOTER,
+                heading=_LOW_HEADING)),
+        ]
+    raise ValueError(f"{name}: not a string, a {{'raw': text}} or a list of "
+                     f"lines")
+
+
+def _decide_text(project: Path, text: str) -> list:
+    """[blocks, verdict, detail] of the merge gate on ``text`` as this
+    task's recorded review in ``project``."""
+    from equipa import loops
+    from equipa.dispatch import _security_review_blocks_merge
+    from equipa.security_gate import (
+        REVIEWER_STATUS_SUCCEEDED, ReviewerRunRecord, fingerprint_artifact,
+        record_reviewer_run, verify_reviewer_provenance)
+    from tests.review_gate_production import (
+        NONCE, as_reviewer_artifact, audit_rows_not_persisted)
+
+    path = project / ".equipa-artifacts" / f"SECURITY-REVIEW-{TASK_ID}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(as_reviewer_artifact(text).encode("utf-8",
+                                                       "surrogatepass"))
+    record_reviewer_run(ReviewerRunRecord(
+        task_id=TASK_ID, nonce=NONCE, status=REVIEWER_STATUS_SUCCEEDED,
+        started_at=1.0, post_artifact=fingerprint_artifact(path), attempts=1,
+    ))
+    with audit_rows_not_persisted():
+        blocks, _counts = _security_review_blocks_merge(
+            str(project), TASK_ID, block_on_missing=True)
+    provenance = verify_reviewer_provenance(TASK_ID, path)
+    if provenance.text is None:
+        # The reason may name the artifact, whose directory differs per run.
+        return [blocks, "untrusted",
+                provenance.reason.replace(str(project), "<project>")]
+    analysis = loops._analyze_review_file(path, text=provenance.text)
+    return [blocks, analysis.verdict, analysis.detail]
+
+
+def _decide_slice(arguments: tuple[list[tuple[str, object]], str]) -> dict:
     """Decide each (name, body) in a scratch project of this worker."""
     items, scratch = arguments
-    from tests import gate_unicode_lookalikes as lookalikes
-    from tests.review_gate_production import (
-        as_reviewer_artifact, production_decision)
-    from equipa import loops
-
     project = Path(tempfile.mkdtemp(prefix="gate-verdicts-", dir=scratch))
     decided = {}
     for name, body in items:
-        text = as_reviewer_artifact(lookalikes.review(body))
-        # The gate prints a GATE-AUDIT line per decision; it is not wanted.
-        with contextlib.redirect_stderr(io.StringIO()):
-            decision = production_decision(text, project_dir=project)
-            if decision.provenance.text is None:
-                decided[name] = [decision.blocks, "untrusted",
-                                 decision.provenance.reason]
-                continue
-            analysis = loops._analyze_review_file(
-                Path("SECURITY-REVIEW.md"), text=decision.provenance.text)
-        decided[name] = [decision.blocks, analysis.verdict, analysis.detail]
+        for review_name, text in _reviews(name, body):
+            # The gate prints a GATE-AUDIT line per decision; not wanted.
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    decided[review_name] = _decide_text(project, text)
+                except Exception as error:  # noqa: BLE001 - recorded
+                    decided[review_name] = ["exception", type(error).__name__,
+                                            str(error)[:200]]
     return decided
 
 
-def decide(out: Path, bodies: int, seed: int, workers: int) -> int:
+def decide(out: Path, bodies: int, seed: int, workers: int,
+           from_file: Path | None) -> int:
     from tests import gate_unicode_lookalikes as lookalikes
 
-    code_points = _code_points(bodies, seed)
-    generated = sorted(lookalikes.lookalike_bodies(code_points).items())
+    if from_file is None:
+        code_points = _code_points(bodies, seed)
+        source = f"{len(code_points)} code points"
+        generated = sorted(lookalikes.lookalike_bodies(code_points).items())
+    else:
+        loaded = json.loads(from_file.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"{from_file}: not a JSON object of bodies")
+        source = from_file.name
+        generated = sorted(loaded.items())
     scratch = tempfile.mkdtemp(prefix="gate-verdicts-")
     slices = [(generated[index::workers], scratch) for index in range(workers)]
     started = time.monotonic()
@@ -105,15 +181,17 @@ def decide(out: Path, bodies: int, seed: int, workers: int) -> int:
     out.write_text(json.dumps({
         "python": sys.version.split()[0],
         "unidata_version": unicodedata.unidata_version,
-        "code_points": len(code_points),
+        "source": source,
         "decisions": decided,
     }, sort_keys=True))
-    blocked = sum(1 for blocks, _verdict, _detail in decided.values() if blocks)
+    blocked = sum(1 for decision in decided.values() if decision[0] is True)
+    failed = sum(1 for decision in decided.values()
+                 if decision[0] == "exception")
     print(f"python {sys.version.split()[0]} unicode "
-          f"{unicodedata.unidata_version}: {len(decided)} bodies from "
-          f"{len(code_points)} code points, {blocked} block, "
-          f"{len(decided) - blocked} merge, "
-          f"{time.monotonic() - started:.0f} s -> {out}")
+          f"{unicodedata.unidata_version}: {len(decided)} decisions from "
+          f"{source}, {blocked} block, {len(decided) - blocked - failed} "
+          f"merge, {failed} exceptions, {time.monotonic() - started:.0f} s "
+          f"-> {out}")
     return 0
 
 
@@ -130,14 +208,14 @@ def compare(first: Path, second: Path) -> int:
     print(f"{first.name}: python {one['python']} unicode "
           f"{one['unidata_version']}; {second.name}: python "
           f"{other['python']} unicode {other['unidata_version']}")
-    print(f"{len(names)} bodies, {len(missing)} in one file only, "
-          f"{len(differing)} decisions differ")
+    print(f"{len(names)} decisions, {len(missing)} in one file only, "
+          f"{len(differing)} differ")
     first_only = sum(1 for name in differing
-                     if one["decisions"][name][0]
-                     and not other["decisions"][name][0])
+                     if one["decisions"][name][0] is True
+                     and other["decisions"][name][0] is False)
     second_only = sum(1 for name in differing
-                      if other["decisions"][name][0]
-                      and not one["decisions"][name][0])
+                      if other["decisions"][name][0] is True
+                      and one["decisions"][name][0] is False)
     print(f"block in {first.name} and merge in {second.name}: {first_only}; "
           f"merge in {first.name} and block in {second.name}: {second_only}")
     for name in (missing + differing)[:20]:
@@ -155,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     decide_parser.add_argument("--seed", type=int, default=3177)
     decide_parser.add_argument("--workers", type=int,
                                default=max(1, (os.cpu_count() or 2) // 2))
+    decide_parser.add_argument("--from-file", type=Path, default=None)
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("first", type=Path)
     compare_parser.add_argument("second", type=Path)
@@ -169,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(REPOSITORY))
     logging.disable(logging.CRITICAL)
     return decide(arguments.out, arguments.bodies, arguments.seed,
-                  arguments.workers)
+                  arguments.workers, arguments.from_file)
 
 
 if __name__ == "__main__":
