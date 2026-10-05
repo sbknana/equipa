@@ -43,6 +43,11 @@ from equipa.parsing import (  # noqa: E402
     compact_agent_output,
 )
 from equipa.sessions import build_resume_prompt  # noqa: E402
+from tests.host_timing import (  # noqa: E402
+    assert_linear_time,
+    assert_linear_times,
+    budget,
+)
 
 _PROBE_PATH = REPO_ROOT / "tests" / "fixtures" / "sanitizer_timing_probe.py"
 _probe_spec = importlib.util.spec_from_file_location("sanitizer_timing_probe", _PROBE_PATH)
@@ -90,6 +95,15 @@ def _best_seconds(limit: float, *args: str) -> float:
     return best
 
 
+def _probe_seconds_at(limit: float, target: str, *args: str):
+    """``seconds_at(size)`` for ``assert_linear_time``: the best probe run of
+    *target* at *size*, held to the host-calibrated *limit* (task 3171)."""
+    def seconds_at(size: int) -> float:
+        return _best_seconds(budget(limit), target, *args, str(size))
+
+    return seconds_at
+
+
 # --- N1 / N2: linear time on whitespace runs ---------------------------------
 
 PATTERN_LIMIT_SECONDS = 0.2
@@ -109,16 +123,21 @@ def test_whitespace_families_cover_every_run_shape_with_and_without_a_prefix():
 
 @pytest.mark.parametrize("case", _probe.WHITESPACE_CASES)
 def test_every_pattern_is_fast_on_one_megabyte_of_whitespace(case):
-    best: dict[str, float] = {}
-    for _ in range(ATTEMPTS):
-        for line in _run_probe("each-pattern", case, str(ONE_MB)).splitlines():
-            seconds, reason = line.split("\t")
-            best[reason] = min(best.get(reason, float("inf")), float(seconds))
-        if max(best.values()) < PATTERN_LIMIT_SECONDS:
-            break
-    assert set(best) == {reason for reason, _ in ls._INJECTION_PATTERNS}
-    slow = {reason: round(s, 3) for reason, s in best.items() if s >= PATTERN_LIMIT_SECONDS}
-    assert not slow, f"patterns over {PATTERN_LIMIT_SECONDS}s on 1 MB of {case}: {slow}"
+    # Budget host-calibrated, growth from 250 KB to 1 MB linear (task 3171).
+    limit = budget(PATTERN_LIMIT_SECONDS)
+
+    def seconds_at(size: int) -> dict[str, float]:
+        best: dict[str, float] = {}
+        for _ in range(ATTEMPTS):
+            for line in _run_probe("each-pattern", case, str(size)).splitlines():
+                seconds, reason = line.split("\t")
+                best[reason] = min(best.get(reason, float("inf")), float(seconds))
+            if max(best.values()) < limit:
+                break
+        assert set(best) == {reason for reason, _ in ls._INJECTION_PATTERNS}
+        return best
+
+    assert_linear_times(seconds_at, ONE_MB, PATTERN_LIMIT_SECONDS, f"1 MB of {case}")
 
 
 CALL_SITE_LIMIT_SECONDS = 0.5
@@ -129,15 +148,15 @@ CALL_SITE_LIMIT_SECONDS = 0.5
     "target", ["sanitize", "db-context", "checkpoint", "compaction-summary", "episode"]
 )
 def test_prompt_call_sites_are_fast_on_whitespace_runs(target, case):
-    elapsed = _best_seconds(CALL_SITE_LIMIT_SECONDS, target, case, "60000")
-    assert elapsed < CALL_SITE_LIMIT_SECONDS, f"{target} took {elapsed:.2f}s on {case}"
+    seconds_at = _probe_seconds_at(CALL_SITE_LIMIT_SECONDS, target, case)
+    assert_linear_time(seconds_at, 60_000, CALL_SITE_LIMIT_SECONDS, f"{target} on {case}")
 
 
 def test_lesson_allowlist_is_fast_on_repeated_if_clauses():
     # The "if ... then" allowlist rule ran ".*" to the end of the line from
     # every "if": 7.8 s on 60k chars (found by the N1 audit of every pattern).
-    elapsed = _best_seconds(CALL_SITE_LIMIT_SECONDS, "validate", "if-clauses-repeated", "60000")
-    assert elapsed < CALL_SITE_LIMIT_SECONDS, f"validate took {elapsed:.2f}s"
+    seconds_at = _probe_seconds_at(CALL_SITE_LIMIT_SECONDS, "validate", "if-clauses-repeated")
+    assert_linear_time(seconds_at, 60_000, CALL_SITE_LIMIT_SECONDS, "validate")
 
 
 @pytest.mark.parametrize(
@@ -346,8 +365,8 @@ DEDUP_LIMIT_SECONDS = 0.2
 
 
 def test_dedup_of_ten_thousand_distinct_lines_is_fast():
-    elapsed = _best_seconds(DEDUP_LIMIT_SECONDS, "dedup", "10000")
-    assert elapsed < DEDUP_LIMIT_SECONDS, f"dedup took {elapsed:.2f}s on 10k lines"
+    seconds_at = _probe_seconds_at(DEDUP_LIMIT_SECONDS, "dedup")
+    assert_linear_time(seconds_at, 10_000, DEDUP_LIMIT_SECONDS, "dedup of distinct lines")
 
 
 def test_distinct_line_fixture_has_no_repeated_keys():
