@@ -1458,6 +1458,231 @@ def test_the_change_check_runs_the_agents_filter_when_nothing_records_the_projec
     assert f"{CHANGE_CHECK_VECTOR}-filter" in agent.ran()
 
 
+# --- R3166-01 / N1 (task #3168): the parallel loop's review of a non-git task --
+
+PLANTING_TASK_ID = TASK_ID + 1
+
+
+def _reviewer_agent(tmp_path: Path) -> list[str]:
+    """argv of a fake reviewer whose one Bash call changes nothing: any git
+    its run starts in the project comes from the orchestrator."""
+    directory = tmp_path / "fake-reviewer"
+    directory.mkdir()
+    events = [
+        *_tool_call("toolu_read", "ls"),
+        {"type": "result", "subtype": "success", "result": "RESULT: success",
+         "num_turns": 1, "total_cost_usd": 0.0},
+    ]
+    (directory / "stream.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+    )
+    cli = directory / "fake_claude.py"
+    cli.write_text(FAKE_AGENT_CLI)
+    return [sys.executable, str(cli)]
+
+
+@dataclass
+class ParallelNonGitRun:
+    """What the parallel loop did for its non-git tasks."""
+
+    statuses: dict[int, str] = field(default_factory=dict)
+    reviews: list[dict[str, Any]] = field(default_factory=list)
+    # Index into GitRecorder.calls when the agent's repository was planted.
+    planted_at: int | None = None
+
+
+def _patch_parallel_non_git_review(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    task_ids: list[int],
+    attempt: Callable[..., Any],
+    reviewer: Callable[..., Any],
+) -> ParallelNonGitRun:
+    """``run_parallel_tasks`` for a project that is not git, with the
+    attempts and the reviewer's agent replaced and everything between them
+    (the run's non-git record, the N1 check, ``review_task_branch``) as in
+    production."""
+    run = ParallelNonGitRun()
+
+    def update_status(task_id, outcome, **kwargs):
+        run.statuses[task_id] = outcome
+
+    monkeypatch.setattr(
+        dispatch_mod, "fetch_tasks_by_ids",
+        lambda ids: [_task(task_id) for task_id in task_ids if task_id in ids],
+    )
+    monkeypatch.setattr(dispatch_mod, "resolve_project_dir", lambda _task: str(project))
+    monkeypatch.setattr(dispatch_mod, "fetch_project_context", lambda _pid: {})
+    monkeypatch.setattr(dispatch_mod, "run_dev_test_loop_with_autoresearch", attempt)
+    monkeypatch.setattr(dispatch_mod, "run_security_review", reviewer)
+    monkeypatch.setattr(dispatch_mod, "update_task_status", update_status)
+    monkeypatch.setattr(dispatch_mod, "record_agent_run", lambda *a, **k: None)
+    monkeypatch.setattr(dispatch_mod, "get_role_model", lambda *a, **k: "claude-test")
+    monkeypatch.setattr(dispatch_mod, "get_role_turns", lambda *a, **k: 20)
+    monkeypatch.setattr("equipa.scaffold.ensure_scaffold", lambda *a, **k: False)
+    return run
+
+
+def _parallel_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        yes=True, max_concurrent=2, use_flow=False, security_review=True,
+        dispatch_config={},
+    )
+
+
+def _plant_change_check_repository(
+    agent: Agent, project: Path, tmp_path: Path, recorder: GitRecorder,
+    run: ParallelNonGitRun,
+) -> None:
+    """What another task's agent does in the shared project: make it a
+    repository whose clean filter is its program (see :func:`_plant_script`)."""
+    _fake_agent(tmp_path, agent, project)
+    with recorder.paused():
+        subprocess.run(["/bin/sh", str(tmp_path / "fake-agent" / "plant.sh")], check=True)
+    agent.ran_while_planting = agent.ran()
+    run.planted_at = len(recorder.calls)
+
+
+def _discovery_after_planting(
+    recorder: GitRecorder, run: ParallelNonGitRun, project: Path,
+) -> list[tuple[str, ...]]:
+    """git calls that found the agent's repository by discovery. The loop
+    asks whether the project is git once at dispatch, before any plant."""
+    assert run.planted_at is not None, "the agent's repository was never planted"
+    root = os.path.realpath(project)
+    return [
+        call.argv for call in recorder.calls[run.planted_at:]
+        if not call.explicit_repository
+        and (call.where == root or call.where.startswith(root + os.sep))
+    ]
+
+
+def test_parallel_review_of_a_non_git_task_runs_no_git_in_a_repository_another_task_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """R3166-01 / N1 in the parallel loop: its non-git tasks share the
+    project. Task ``TASK_ID`` finished its attempts cleanly; then the agent
+    of task ``PLANTING_TASK_ID`` made the project a repository with a clean
+    filter of its own. The security review of ``TASK_ID`` ran after its
+    attempts, outside the attempts' non-git record: the reviewer's
+    streaming runner found ``.git``, so its change check ran ``git diff``
+    there, and the agent's filter in the orchestrator. Now the task is
+    blocked before its review starts, with a durable GATE-AUDIT record."""
+    import equipa.agent_runner as agent_runner
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    reviewer_cmd = _reviewer_agent(tmp_path)
+    audit = _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    planted: dict[str, asyncio.Event] = {}
+    run: ParallelNonGitRun
+
+    def planted_event() -> asyncio.Event:
+        return planted.setdefault("event", asyncio.Event())
+
+    async def attempt(task, task_dir, project_context, args, config, output=None,
+                      task_branch=None):
+        assert task_branch is None
+        if task["id"] == PLANTING_TASK_ID:
+            _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+            planted_event().set()
+            # What the autoresearch wrapper returns after its own N1 check.
+            return {"cost": 0.0, "duration": 0.0}, 1, REPOSITORY_APPEARED, 0.0, 0.0, task
+        # This task's attempts ended before the repository appeared.
+        await planted_event().wait()
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed", 0.0, 0.0, task
+
+    async def reviewer(review_task, task_dir, project_context, args, output=None,
+                       stable_project_dir=None):
+        result = await agent_runner.run_agent_streaming(
+            reviewer_cmd, role="security-reviewer", output=output, max_turns=40,
+            project_dir=task_dir,
+        )
+        run.reviews.append({"task": review_task["id"], **result})
+        return result
+
+    run = _patch_parallel_non_git_review(
+        monkeypatch, project, [TASK_ID, PLANTING_TASK_ID], attempt, reviewer,
+    )
+
+    # The markers are read before an exception from the loop is raised.
+    error: Exception | None = None
+    try:
+        with recorder.recording():
+            _run(dispatch_mod.run_parallel_tasks([TASK_ID, PLANTING_TASK_ID], _parallel_args()))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "parallel-review", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    assert run.reviews == [], run.reviews
+    assert run.statuses == {TASK_ID: REPOSITORY_APPEARED, PLANTING_TASK_ID: REPOSITORY_APPEARED}
+    assert [event for _, event in audit] == ["repository-appeared"], audit
+    assert (
+        f"before the security review (tests_passed): a git repository appeared at "
+        f"{project / '.git'}" in audit[0][0]
+    ), audit
+    logged = capsys.readouterr().out
+    assert f"[GATE-AUDIT] task={TASK_ID} event=repository-appeared" in logged, logged
+
+
+def test_parallel_reviewer_of_a_non_git_task_starts_no_git_in_a_repository_made_during_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3166-01: the N1 check before the review reads the filesystem once.
+    A repository another task's agent makes after it, as the reviewer
+    starts, is caught by the non-git record the whole parallel task now
+    runs under: the reviewer's streaming runner does not start the agent
+    and runs no git. Without the record it found ``.git`` and its change
+    check ran the agent's filter."""
+    import equipa.agent_runner as agent_runner
+
+    project = _non_git_project(tmp_path)
+    agent = Agent(project, None, tmp_path, monkeypatch)
+    reviewer_cmd = _reviewer_agent(tmp_path)
+    _record_gate_audit(monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+    run: ParallelNonGitRun
+
+    async def attempt(task, task_dir, project_context, args, config, output=None,
+                      task_branch=None):
+        assert task_branch is None
+        return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed", 0.0, 0.0, task
+
+    async def reviewer(review_task, task_dir, project_context, args, output=None,
+                       stable_project_dir=None):
+        _plant_change_check_repository(agent, project, tmp_path, recorder, run)
+        result = await agent_runner.run_agent_streaming(
+            reviewer_cmd, role="security-reviewer", output=output, max_turns=40,
+            project_dir=task_dir,
+        )
+        run.reviews.append({"task": review_task["id"], **result})
+        return result
+
+    run = _patch_parallel_non_git_review(monkeypatch, project, [TASK_ID], attempt, reviewer)
+
+    error: Exception | None = None
+    try:
+        with recorder.recording():
+            _run(dispatch_mod.run_parallel_tasks([TASK_ID], _parallel_args()))
+    except Exception as exc:  # re-raised below, after the markers
+        error = exc
+
+    _assert_nothing_ran(agent, CHANGE_CHECK_VECTOR, "parallel-reviewer", agent.ran())
+    if error is not None:
+        raise error
+    _assert_planted(agent, project)
+    assert _discovery_after_planting(recorder, run, project) == []
+    [review] = run.reviews
+    assert review["early_terminated"], review
+    assert f"a git repository appeared at {project / '.git'}" in review["early_term_reason"]
+    assert run.statuses[TASK_ID] != "tests_passed", run.statuses
+
+
 # --- The three remaining discovery calls, one by one ----------------------------
 
 
