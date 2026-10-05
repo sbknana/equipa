@@ -1040,6 +1040,10 @@ def test_cli_dev_test_loop_refuses_a_root_swapped_during_the_attempt(
 # --- A project that was not git at dispatch (R3165-01) --------------------------
 
 NON_GIT_VECTOR = "non-git-project"
+# N1 (task #3168). Read when the module has it, so the matrix also runs on
+# trees before it and fails there for what the code does, not an
+# AttributeError (as _with_project_dir does for task #3158).
+REPOSITORY_APPEARED = getattr(dispatch_mod, "REPOSITORY_APPEARED_OUTCOME", "repository_appeared")
 
 
 def _non_git_project(tmp_path: Path) -> Path:
@@ -1150,7 +1154,7 @@ def test_failed_attempt_in_a_non_git_project_runs_no_git_in_the_agents_repositor
         raise error
     assert recorder.calls == [], [call.argv for call in recorder.calls]
     # N1: blocked after the attempt, with no cleanup and no retry.
-    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert outcome == REPOSITORY_APPEARED
     assert attempts == [str(project)]
     assert cleanups == []
     # The agent's repository is as the agent left it.
@@ -1193,7 +1197,7 @@ def test_a_repository_already_in_a_non_git_project_stops_the_task_before_any_age
     _assert_nothing_ran(agent, NON_GIT_VECTOR, f"{loop}-before-attempt", agent.ran())
     assert recorder.calls == [], [call.argv for call in recorder.calls]
     assert attempts == []
-    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert outcome == REPOSITORY_APPEARED
     assert [event for _, event in audit] == ["repository-appeared"], audit
     assert f"before attempt 1: a git repository appeared at {project / '.git'}" in audit[0][0]
 
@@ -1431,7 +1435,7 @@ def test_change_checks_run_no_git_in_a_repository_the_agent_made(
     assert (
         f"a git repository appeared at {project / '.git'}" in runs[0]["early_term_reason"]
     ), runs[0]
-    assert outcome == dispatch_mod.REPOSITORY_APPEARED_OUTCOME
+    assert outcome == REPOSITORY_APPEARED
     assert attempts == [str(project)]
     assert [event for _, event in audit] == ["repository-appeared"], audit
 
