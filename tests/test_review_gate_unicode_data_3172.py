@@ -43,6 +43,7 @@ import pytest
 
 import equipa.security_gate as security_gate
 from equipa import loops
+from tests import gate_unicode_lookalikes as lookalikes
 from tests.host_timing import assert_linear_time
 from tests.review_gate_production import (
     as_reviewer_artifact,
@@ -88,6 +89,58 @@ REFUSED_BODIES = {
     "unassigned": (f"### [S2] HI{UNASSIGNED}GH - upload", "U+0378 at line 8"),
     "cjk-extension-h": (f"Note: {CJK_EXTENSION_H}", "U+31350 at line 8"),
 }
+# Task 3177 (IR3174-01, S3172-01): spellings that are a reference only once
+# the review is normalised (NFKC, invisible characters deleted). Each merged
+# on Python 3.10 and blocked on 3.12, except the U+1734 one, which merged on
+# 3.12 and blocked on 3.10. They are the bodies of SECURITY-REVIEW-3172's
+# probe and of indep-3174.
+_FW_A7F2 = lookalikes.fullwidth("&#xA7F2;")
+_ONCE_NORMALIZED = "reference at line 8 once normalized"
+REFUSED_BODIES.update({
+    "fullwidth-whole-ref": (f"### [S2] {_FW_A7F2}RITI{_FW_A7F2}AL - remote "
+                            f"code execution", f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "fullwidth-amp-only": (f"### [S2] {lookalikes.FULLWIDTH_AMPERSAND}#xA7F2;"
+                           f"RITI{lookalikes.FULLWIDTH_AMPERSAND}#xA7F2;AL - "
+                           f"remote code execution",
+                           f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "small-amp-num": ("### [S2] " + "{0}RITI{0}AL - remote code execution"
+                      .format(lookalikes.SMALL_AMPERSAND
+                              + lookalikes.SMALL_NUMBER_SIGN + "xA7F2;"),
+                      f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "fullwidth-hex-digits": ("### [S2] {0}RITI{0}AL - remote code execution"
+                             .format("&#x" + lookalikes.fullwidth("A7F2")
+                                     + ";"), f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "math-decimal-digits": ("### [S2] {0}RITI{0}AL - remote code execution"
+                            .format("&#" + lookalikes.mathematical_digits(
+                                "42994") + ";"),
+                            f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "zwsp-inside": ("### [S2] {0}RITI{0}AL - remote code execution".format(
+        f"&{lookalikes.ZERO_WIDTH_SPACE}#xA7F2;"), f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "soft-hyphen-inside": ("### [S2] {0}RITI{0}AL - remote code execution"
+                           .format(f"&#x{lookalikes.SOFT_HYPHEN}A7F2;"),
+                           f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "severity-field-fw": (f"- **Severity:** {_FW_A7F2}RITI{_FW_A7F2}AL",
+                          f"U+A7F2 {_ONCE_NORMALIZED}"),
+    "high-1734-fw": (f"### [S2] HI{lookalikes.fullwidth('&#x1734;')}GH - "
+                     f"upload", f"U+1734 {_ONCE_NORMALIZED}"),
+    # Found by this task: a reference the renderer forms by removing a
+    # comment or a tag diverged the same way; it is refused where decoded.
+    "comment-formed": ("### [S2] &<!-- -->#xA7F2;RITI&<!-- -->#xA7F2;AL - "
+                       "remote code execution",
+                       "U+A7F2 reference once decoded"),
+    "tag-formed": ("### [S2] &<b></b>#xA7F2;RITI&<b></b>#xA7F2;AL - remote "
+                   "code execution", "U+A7F2 reference once decoded"),
+})
+# indep-3174: one combining mark of each block new in Unicode 14 and 15, in
+# each spelling normalisation makes a reference of, in a Severity field.
+REFUSED_BODIES.update({
+    f"new-mark-{code_point:04X}-{spelling}": (
+        lookalikes.PLACEMENTS["severity-field"].format(
+            x=lookalikes.SPELLINGS[spelling](code_point)),
+        f"U+{code_point:04X} {_ONCE_NORMALIZED}")
+    for code_point in lookalikes.one_mark_per_block()
+    for spelling in lookalikes.NORMALIZED_SPELLINGS
+})
 # Bodies made of table characters only: the gate parses them as before.
 PARSED_BODIES = {
     "latin": ("### [S2] CRITICAL - remote code execution", True),

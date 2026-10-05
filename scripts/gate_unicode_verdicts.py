@@ -132,6 +132,14 @@ def compare(first: Path, second: Path) -> int:
           f"{other['python']} unicode {other['unidata_version']}")
     print(f"{len(names)} bodies, {len(missing)} in one file only, "
           f"{len(differing)} decisions differ")
+    first_only = sum(1 for name in differing
+                     if one["decisions"][name][0]
+                     and not other["decisions"][name][0])
+    second_only = sum(1 for name in differing
+                      if other["decisions"][name][0]
+                      and not one["decisions"][name][0])
+    print(f"block in {first.name} and merge in {second.name}: {first_only}; "
+          f"merge in {first.name} and block in {second.name}: {second_only}")
     for name in (missing + differing)[:20]:
         print(f"  {name}: {one['decisions'].get(name)} vs "
               f"{other['decisions'].get(name)}")
