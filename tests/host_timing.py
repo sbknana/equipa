@@ -38,9 +38,10 @@ timing test checks two things through this module:
    a slow runner even when the host factor has loosened its budget. A
    ratio of two sub-millisecond times is noise (task 3175: 0.0006 s against
    0.0052 s), so while the quarter size takes under
-   ``GROWTH_FLOOR_SECONDS`` the INPUT grows: both sizes double (still 4x
-   apart) until the quarter size's reading reaches the floor, as
-   ``scan_growth`` in tests/test_review_gate_linear_3167.py does. A reading
+   ``GROWTH_FLOOR_SECONDS`` the INPUT grows, as ``scan_growth`` in
+   tests/test_review_gate_linear_3167.py does: the larger size becomes the
+   quarter size and the next larger size is 4 times it, until the quarter
+   size's reading reaches the floor (each step measures one size). A reading
    is never raised to hide work (IR75-01: raising 2 ms readings to a 20 ms
    floor at unchanged sizes let quadratic work of 16-159 ms pass). The
    input grows, whatever building the shape costs, while the larger
@@ -122,8 +123,9 @@ GROWTH_FLOOR_SECONDS = 0.02
 DETECTION_FLOOR_SECONDS = 0.002
 GROWTH_DETECTION_SECONDS = GROWTH_LIMIT * DETECTION_FLOOR_SECONDS
 # The input grows to at most this many times the test's sizes (16x a 1 MB
-# shape is 16 MB): quadratic work reading 16 ms at the test's size reaches
-# the limit by 4x, linear work reading 16 ms reaches the floor by 8x.
+# shape is 16 MB). Quadratic work reading 16 ms at the test's larger size
+# reads 256 ms at 4 times it, over the limit even against the floor;
+# linear work reading 16 ms there takes the floor at 16 times.
 MAX_INPUT_GROWTH = 16
 # A ratio over the limit is measured again (keeping the fastest total of
 # each size) before it counts: one descheduled run must not fail a test,
@@ -365,7 +367,8 @@ def growth_ratio(small_seconds: float, seconds: float) -> float:
 
 def grows_further(small_seconds: float, seconds: float,
                   input_growth: int) -> bool:
-    """Whether both sizes are measured again at twice their input.
+    """Whether the input grows another ``GROWTH`` times: the larger size
+    becomes the quarter size, and the size 4 times it is measured.
 
     ``small_seconds`` and ``seconds`` are the readings at ``input_growth``
     times the test's sizes. A quarter reading at the floor is decided as
@@ -381,14 +384,14 @@ def grows_further(small_seconds: float, seconds: float,
         return False
     if growth_ratio(small_seconds, seconds) >= GROWTH_LIMIT:
         return False
-    if input_growth * 2 > MAX_INPUT_GROWTH:
+    if input_growth * GROWTH > MAX_INPUT_GROWTH:
         return False
     return seconds >= GROWTH_DETECTION_SECONDS
 
 
 class _GrownReadings:
-    """The readings of one growth check by size, so the doubling ladder
-    (N/4, N; N/2, 2N; N, 4N; ...) measures each size once."""
+    """The readings of one growth check by size: the ladder (N/4, N; N,
+    4N; 4N, 16N) reuses each larger reading as the next quarter's."""
 
     def __init__(self, measure: Callable[[int], T]) -> None:
         self._measure = measure
@@ -463,7 +466,7 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     The smaller size runs first, so a quadratic regression fails on its
     budget before the larger size takes seconds; any time series that grows
     with the input then fails at the larger size too. While the smaller
-    reading is under ``GROWTH_FLOOR_SECONDS``, both sizes double
+    reading is under ``GROWTH_FLOOR_SECONDS``, the input grows 4x
     (``grows_further``); the grown sizes are held to the growth limit only."""
     if size < GROWTH:
         raise ValueError(f"size {size} has no quarter to compare against")
@@ -487,8 +490,8 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     input_growth = 1
     while grows_further(grown.at(small_size), grown.at(large_size),
                         input_growth):
-        input_growth *= 2
-        small_size, large_size = small_size * 2, large_size * 2
+        input_growth *= GROWTH
+        small_size, large_size = large_size, large_size * GROWTH
     timing = LinearTiming(label, small_size, grown.at(small_size),
                           large_size, grown.at(large_size),
                           base_budget_seconds * factor, factor, input_growth)
@@ -512,7 +515,7 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
     ``seconds_at(n)`` returns the seconds of each part at size ``n``, and
     every part is held to the budget and to the growth limit. While any
     part's smaller reading is under the floor and ``grows_further`` says
-    so, both sizes double for every part (one call times them all); the
+    so, the input grows 4x for every part (one call times them all); the
     parts are decided at the sizes the growth stopped at. A part over the
     growth limit is measured again (all parts, keeping each part's fastest
     time) before it counts."""
@@ -557,8 +560,8 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
                                  input_growth) for part in large)
 
     while any_part_grows():
-        input_growth *= 2
-        small_size, large_size = small_size * 2, large_size * 2
+        input_growth *= GROWTH
+        small_size, large_size = large_size, large_size * GROWTH
     small, large = dict(grown.at(small_size)), dict(grown.at(large_size))
     for _ in range(GROWTH_RETRIES):
         if all(growth_ratio(small[part], large[part]) < GROWTH_LIMIT

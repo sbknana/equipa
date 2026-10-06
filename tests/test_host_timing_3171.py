@@ -488,12 +488,11 @@ def test_work_below_the_floor_passes_the_growth_check():
 def test_linear_work_under_the_floor_is_not_repeated():
     """Linear work whose quarter size takes under the floor is not measured
     again at the same sizes: its input grows until the quarter size takes
-    the floor (5 ms, 10 ms, then 20 ms; the 40,000 reading is reused as the
-    quarter of 160,000), and 20 ms against 80 ms is decided as read."""
+    the floor (the 20 ms reading of 40,000 becomes the quarter of 160,000),
+    and 20 ms against 80 ms is decided as read."""
     calls: list[int] = []
     timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000, 20_000, 80_000, 160_000]
-    assert sorted(calls) == sorted(set(calls))
+    assert calls == [10_000, 40_000, 160_000]
     assert (timing.small_size, timing.size) == (40_000, 160_000)
     assert timing.input_growth == 4
     assert timing.ratio == pytest.approx(4.0)
@@ -503,10 +502,9 @@ def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
     sub-millisecond ratio of 8.7x. 5.2 ms is under the 16 ms that quadratic
     work main caught reads at, so it is decided against the floor; the
-    same spike over a 4 ms quarter reading (19.2 ms) grows the input until
-    a quarter reading takes the floor (the spike, reused as the quarter at
-    4x, is just under it): at 8x, 32 ms against 128 ms is linear."""
-    for quarter, spike, grown in ((0.0006, 0.0052, 1), (0.004, 0.0192, 8)):
+    same spike over a 5 ms quarter reading (24 ms) grows the input, and at
+    4 times it the spike (now the quarter) against 80 ms is linear."""
+    for quarter, spike, grown in ((0.0006, 0.0052, 1), (0.005, 0.024, 4)):
         calls: list[int] = []
         spikes = iter([spike])
 
@@ -534,7 +532,7 @@ def test_input_growth_is_decided_by_the_readings_not_by_what_a_call_costs():
     assert host_timing.GROWTH_DETECTION_SECONDS == pytest.approx(
         GROWTH_LIMIT * 0.002)
     assert grows(0.001, 0.016, 1)
-    assert grows(0.005, 0.08, MAX_INPUT_GROWTH // 2)
+    assert grows(0.005, 0.08, MAX_INPUT_GROWTH // GROWTH)
     assert not grows(0.005, 0.08, MAX_INPUT_GROWTH)
     # Under the detection reading: decided against the floor at once.
     assert not grows(0.001, 0.0159, 1)
@@ -545,9 +543,9 @@ def test_input_growth_is_decided_by_the_readings_not_by_what_a_call_costs():
 
 def test_quadratic_work_under_the_floor_fails_once_repeated():
     """5 ms then 80 ms: the 5 ms reading raised to the 20 ms floor would
-    read 4x. The input grows instead: 20 ms against 320 ms reads 16x."""
+    read 4x. The input grows instead: 80 ms against 1.28 s reads 16x."""
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*at 2x the test's input"):
+                       match=r"superlinear growth.*at 4x the test's input"):
         assert_linear_time(_model(5e-11, 2), 40_000, 0.5, "quad")
 
 
@@ -703,8 +701,8 @@ def test_a_heap_sized_collection_pause_does_not_fail_linear_work():
 
     timing = assert_linear_time(seconds_at, 16_384, 1.0, "scan")
     assert calls_with_the_collector_enabled == []
-    # 0.0129 s is under the floor: the input doubles once (0.0258 s).
-    assert timing.input_growth == 2
+    # 0.0129 s is under the floor: the input grows 4x (0.0516 s quarter).
+    assert timing.input_growth == 4
     assert timing.ratio == pytest.approx(4.0)
 
 
