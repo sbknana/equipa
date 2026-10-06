@@ -900,6 +900,11 @@ VERSION_INDEPENDENT_REFUSALS = {
     "git_run-GIT_CONFIG_COUNT-include.path": _requested({
         "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "include.path",
         "GIT_CONFIG_VALUE_0": "{project}/.git/config"}),
+    # Task #3189: the same environment pair with a key IR87-02 does not
+    # refuse everywhere, so its control below still starts a git.
+    "git_run-GIT_CONFIG_COUNT-core.worktree": _requested({
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": "{project}"}),
     "git_run-GIT_DIR": _requested({"GIT_DIR": "{project}/.git"}),
     "git_run-GIT_WORK_TREE": _requested({"GIT_WORK_TREE": "{project}"}),
     "git_run-GIT_CEILING_DIRECTORIES": _requested(
@@ -963,11 +968,27 @@ def test_the_fake_git_starts_for_every_shape_while_nothing_is_recorded(
 ) -> None:
     """Control: each refused shape does start a git (the fake, or the
     agent's) when no project is recorded, so its refusal above is the
-    guard's and not a call that could never start."""
+    guard's and not a call that could never start.
+
+    Task #3189 (IR87-02): a caller's include pair is refused whether or not
+    a project is recorded. For that shape the control shows the other
+    refusal, by its own message, so the guard's message asserted above
+    still proves the guard refused it."""
     result = VERSION_INDEPENDENT_REFUSALS[shape](fake_git, monkeypatch, tmp_path)
 
+    if shape in REFUSED_WHATEVER_IS_RECORDED:
+        assert fake_git.started() == []
+        assert result.returncode == git_ops._REFUSED_RETURNCODE
+        assert "includes a config file or names a command" in result.stderr
+        assert "not a git repository at dispatch" not in result.stderr
+        return
     assert result.returncode == 0, result.stderr
     assert len(fake_git.started()) == 1
+
+
+# Shapes the hardening override refusal (IR87-02, task #3189) refuses with
+# or without a recorded project.
+REFUSED_WHATEVER_IS_RECORDED = frozenset({"git_run-GIT_CONFIG_COUNT-include.path"})
 
 
 IR78_04_ALLOWED = {
