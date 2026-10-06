@@ -29,7 +29,6 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
-    GROWTH_INPUT_SECONDS,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
     MAX_HOST_FACTOR,
     MAX_INPUT_GROWTH,
@@ -471,9 +470,9 @@ def test_one_descheduled_run_is_measured_again():
 
 
 def test_work_below_the_floor_passes_the_growth_check():
-    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. The calls
-    # cost nothing, so the input grows as far as it may; the quarter
-    # reading never reaches the floor and is raised to it there.
+    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. A larger
+    # reading under GROWTH_DETECTION_SECONDS cannot be quadratic work main's
+    # 2 ms floor caught, so it is decided against the floor as read.
     calls: list[int] = []
 
     def seconds_at(size: int) -> float:
@@ -481,9 +480,8 @@ def test_work_below_the_floor_passes_the_growth_check():
         return 0.0001 if size < 40_000 else 0.0006
 
     timing = assert_linear_time(seconds_at, 40_000, 0.5, "tiny")
-    assert calls == [10_000, 40_000, 20_000, 80_000, 160_000, 320_000,
-                     640_000]
-    assert timing.input_growth == MAX_INPUT_GROWTH
+    assert calls == [10_000, 40_000]
+    assert timing.input_growth == 1
     assert timing.ratio == pytest.approx(0.0006 / GROWTH_FLOOR_SECONDS)
 
 
@@ -503,42 +501,43 @@ def test_linear_work_under_the_floor_is_not_repeated():
 
 def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
-    sub-millisecond ratio of 8.7x. The input grows instead (the spike stays
-    the reading of 40,000, reused as a quarter size on the way), and at 16
-    times the input 9.6 ms (raised to the floor) against 38.4 ms passes."""
-    calls: list[int] = []
-    spikes = iter([0.0052])
+    sub-millisecond ratio of 8.7x. 5.2 ms is under the 16 ms that quadratic
+    work main caught reads at, so it is decided against the floor; the
+    same spike over a 4 ms quarter reading (19.2 ms) grows the input until
+    a quarter reading takes the floor (the spike, reused as the quarter at
+    4x, is just under it): at 8x, 32 ms against 128 ms is linear."""
+    for quarter, spike, grown in ((0.0006, 0.0052, 1), (0.004, 0.0192, 8)):
+        calls: list[int] = []
+        spikes = iter([spike])
 
-    def seconds_at(size: int) -> float:
-        calls.append(size)
-        linear = 0.0006 * size / 10_000
-        if size == 40_000:
-            return next(spikes, linear)
-        return linear
+        def seconds_at(size: int, quarter=quarter, spikes=spikes,
+                       calls=calls) -> float:
+            calls.append(size)
+            linear = quarter * size / 10_000
+            if size == 40_000:
+                return next(spikes, linear)
+            return linear
 
-    timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
-    assert calls.count(40_000) == 1
-    assert timing.input_growth == MAX_INPUT_GROWTH
-    assert timing.seconds == pytest.approx(0.0006 * 64)
-    assert timing.ratio < 4.1
+        timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
+        assert calls.count(40_000) == 1
+        assert timing.input_growth == grown
+        assert timing.ratio < 4.1
 
 
-def test_repetitions_are_bounded_by_what_a_call_costs():
-    """Growing the input is bounded by what the calls cost, except while
-    the larger reading could be quadratic work main's 2 ms floor caught:
-    GROWTH_DETECTION_SECONDS (16 ms) grows the input whatever it costs."""
+def test_input_growth_is_decided_by_the_readings_not_by_what_a_call_costs():
+    """IR75-01: the 3175 repetitions stopped where a call was expensive, so
+    a 200 KB gate test's quadratic reading was raised to the floor. The
+    input grows on the readings alone: while the larger one could be
+    quadratic work main's 2 ms floor caught (GROWTH_DETECTION_SECONDS, 16
+    ms), up to MAX_INPUT_GROWTH."""
     grows = host_timing.grows_further
-    assert host_timing.GROWTH_DETECTION_SECONDS == pytest.approx(0.016)
-    # Under the detection reading: only within GROWTH_INPUT_SECONDS.
-    assert grows(0.001, 0.004, 1)
-    assert grows(0.001, 0.004, 1, 0.0, GROWTH_INPUT_SECONDS / 2)
-    assert not grows(0.001, 0.004, 1, 0.0, GROWTH_INPUT_SECONDS * 2)
-    assert not grows(0.001, 0.004, 1, GROWTH_INPUT_SECONDS / 2,
-                     GROWTH_INPUT_SECONDS)
-    # At or over it: whatever the calls cost, up to MAX_INPUT_GROWTH.
-    assert grows(0.001, 0.016, 1, 100.0, 100.0)
-    assert grows(0.005, 0.08, MAX_INPUT_GROWTH // 2, 100.0, 100.0)
+    assert host_timing.GROWTH_DETECTION_SECONDS == pytest.approx(
+        GROWTH_LIMIT * 0.002)
+    assert grows(0.001, 0.016, 1)
+    assert grows(0.005, 0.08, MAX_INPUT_GROWTH // 2)
     assert not grows(0.005, 0.08, MAX_INPUT_GROWTH)
+    # Under the detection reading: decided against the floor at once.
+    assert not grows(0.001, 0.0159, 1)
     # Decided as read: the quarter at the floor, or over the limit already.
     assert not grows(GROWTH_FLOOR_SECONDS, 0.5, 1)
     assert not grows(0.001, GROWTH_LIMIT * GROWTH_FLOOR_SECONDS, 1)
@@ -631,8 +630,8 @@ def test_a_quadratic_part_of_16_to_159_ms_fails_whatever_a_run_costs(
 def test_linear_work_passes_whatever_a_call_costs(monkeypatch, reading,
                                                   build_seconds):
     """The other side of IR75-01: linear work of any reading passes both
-    helpers, and an expensive build only grows the input while the reading
-    requires it (a sub-detection reading stays at the test's sizes)."""
+    helpers, and the input only grows while the reading requires it (a
+    sub-detection reading stays at the test's sizes)."""
     clock = _build_clock(monkeypatch)
     calls: list[int] = []
     timing = assert_linear_time(
@@ -640,8 +639,10 @@ def test_linear_work_passes_whatever_a_call_costs(monkeypatch, reading,
         10.0, "linear")
     assert timing.ratio < GROWTH_LIMIT
     assert timing.size <= IR75_01_SIZE * MAX_INPUT_GROWTH
-    if reading < host_timing.GROWTH_DETECTION_SECONDS and build_seconds >= 0.3:
+    if reading < host_timing.GROWTH_DETECTION_SECONDS:
         assert calls == [IR75_01_SIZE // GROWTH, IR75_01_SIZE]
+    else:
+        assert timing.small_seconds >= GROWTH_FLOOR_SECONDS
     linear = _planted(clock, reading, build_seconds, 1)
     timings = assert_linear_times(
         lambda size: {"a": linear(size), "b": reading * size / IR75_01_SIZE},

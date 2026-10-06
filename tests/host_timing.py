@@ -43,13 +43,12 @@ timing test checks two things through this module:
    ``scan_growth`` in tests/test_review_gate_linear_3167.py does. A reading
    is never raised to hide work (IR75-01: raising 2 ms readings to a 20 ms
    floor at unchanged sizes let quadratic work of 16-159 ms pass). The
-   input grows whatever it costs while the larger reading is at least
-   ``GROWTH_DETECTION_SECONDS`` (the quadratic work main's 2 ms floor
-   caught), and otherwise only within ``GROWTH_INPUT_SECONDS`` of wall
-   time, building the shape included. Past ``MAX_INPUT_GROWTH`` times the
-   test's sizes it stops; a quarter reading still under the floor there is
-   raised to it, which hides only quadratic work reading under
-   ``GROWTH_DETECTION_SECONDS / MAX_INPUT_GROWTH ** 2`` at the test's size.
+   input grows, whatever building the shape costs, while the larger
+   reading is at least ``GROWTH_DETECTION_SECONDS`` (16 ms: the quadratic
+   work main's 2 ms floor caught), up to ``MAX_INPUT_GROWTH`` times the
+   test's sizes. A smaller larger reading is decided against the floor at
+   the test's sizes (quadratic work that small passed main's floor too),
+   so a test timing thousands of fast shapes does not grow each one.
    Grown sizes are held to the growth limit, not to the budget (it holds
    at the test's sizes). Each timed call (and each reference run) runs
    with the garbage collector paused, as ``timeit`` does: a full collection
@@ -126,9 +125,6 @@ GROWTH_DETECTION_SECONDS = GROWTH_LIMIT * DETECTION_FLOOR_SECONDS
 # shape is 16 MB): quadratic work reading 16 ms at the test's size reaches
 # the limit by 4x, linear work reading 16 ms reaches the floor by 8x.
 MAX_INPUT_GROWTH = 16
-# The wall time growing the input may take (the whole calls, building the
-# shape included) when the larger reading does not require it.
-GROWTH_INPUT_SECONDS = 0.5
 # A ratio over the limit is measured again (keeping the fastest total of
 # each size) before it counts: one descheduled run must not fail a test,
 # a quadratic one fails every time.
@@ -367,62 +363,40 @@ def growth_ratio(small_seconds: float, seconds: float) -> float:
     return seconds / max(small_seconds, GROWTH_FLOOR_SECONDS)
 
 
-def grows_further(small_seconds: float, seconds: float, input_growth: int,
-                  spent_seconds: float = 0.0,
-                  step_cost_seconds: float = 0.0) -> bool:
+def grows_further(small_seconds: float, seconds: float,
+                  input_growth: int) -> bool:
     """Whether both sizes are measured again at twice their input.
 
     ``small_seconds`` and ``seconds`` are the readings at ``input_growth``
     times the test's sizes. A quarter reading at the floor is decided as
     read, and so is a ratio over the limit even against the floor (the
-    retries decide it). Under the floor the input grows to at most
-    ``MAX_INPUT_GROWTH`` times the test's sizes: always while the larger
-    reading is at least ``GROWTH_DETECTION_SECONDS`` (it could be the
-    quadratic work main's 2 ms floor caught, IR75-01), and otherwise only
-    while ``spent_seconds`` (the wall time of the calls the growth made so
-    far) plus ``step_cost_seconds`` (the next step's estimate) stays within
-    ``GROWTH_INPUT_SECONDS``."""
+    retries decide it). Under the floor the input grows, to at most
+    ``MAX_INPUT_GROWTH`` times the test's sizes and whatever the calls
+    cost, while the larger reading is at least ``GROWTH_DETECTION_SECONDS``:
+    it could be the quadratic work main's 2 ms floor caught (IR75-01). A
+    smaller larger reading is decided against the floor at once: quadratic
+    work that small passed main's floor too, and a test timing thousands
+    of fast shapes must not pay for growing each one."""
     if small_seconds >= GROWTH_FLOOR_SECONDS:
         return False
     if growth_ratio(small_seconds, seconds) >= GROWTH_LIMIT:
         return False
     if input_growth * 2 > MAX_INPUT_GROWTH:
         return False
-    if seconds >= GROWTH_DETECTION_SECONDS:
-        return True
-    return spent_seconds + step_cost_seconds <= GROWTH_INPUT_SECONDS
+    return seconds >= GROWTH_DETECTION_SECONDS
 
 
 class _GrownReadings:
     """The readings of one growth check by size, so the doubling ladder
-    (N/4, N; N/2, 2N; N, 4N; ...) measures each size once, with the wall
-    time of each call (building the shape included) and of the calls the
-    growth made."""
+    (N/4, N; N/2, 2N; N, 4N; ...) measures each size once."""
 
     def __init__(self, measure: Callable[[int], T]) -> None:
         self._measure = measure
         self.readings: dict[int, T] = {}
-        self.costs: dict[int, float] = {}
-        self.spent_seconds = 0.0
-
-    def keep(self, size: int, reading: T, cost_seconds: float) -> None:
-        self.readings[size] = reading
-        self.costs[size] = cost_seconds
-
-    def step_cost(self, small_size: int, size: int) -> float:
-        """The wall time doubling both sizes is expected to take: twice
-        each current call for a size not yet measured."""
-        return sum(2 * self.costs.get(at_size, 0.0)
-                   for at_size in (small_size, size)
-                   if at_size * 2 not in self.readings)
 
     def at(self, size: int) -> T:
         if size not in self.readings:
-            started = time.monotonic()
-            reading = self._measure(size)
-            cost_seconds = time.monotonic() - started
-            self.keep(size, reading, cost_seconds)
-            self.spent_seconds += cost_seconds
+            self.readings[size] = self._measure(size)
         return self.readings[size]
 
 
@@ -499,30 +473,20 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     else:
         small_size, large_size = size // GROWTH, size
     grown = _GrownReadings(seconds_at)
-
-    def costed(at_size: int) -> float:
-        """``seconds_at(at_size)``, kept with the wall time of the whole
-        call (building the shape included): what growing it costs."""
-        started = time.monotonic()
-        seconds_taken = seconds_at(at_size)
-        grown.keep(at_size, seconds_taken, time.monotonic() - started)
-        return seconds_taken
-
     small_seconds, small_factor = measure_under_load(
-        lambda: costed(small_size), base_budget_seconds)
+        lambda: grown.at(small_size), base_budget_seconds)
     _check_budget(label, small_seconds, small_size, base_budget_seconds,
                   small_factor)
     if compare_with_larger:
         # Past ``size`` only the growth counts: no budget, no reference.
-        seconds, factor = costed(large_size), small_factor
+        seconds, factor = grown.at(large_size), small_factor
     else:
-        seconds, factor = measure_under_load(lambda: costed(large_size),
+        seconds, factor = measure_under_load(lambda: grown.at(large_size),
                                              base_budget_seconds)
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
     input_growth = 1
     while grows_further(grown.at(small_size), grown.at(large_size),
-                        input_growth, grown.spent_seconds,
-                        grown.step_cost(small_size, large_size)):
+                        input_growth):
         input_growth *= 2
         small_size, large_size = small_size * 2, large_size * 2
     timing = LinearTiming(label, small_size, grown.at(small_size),
@@ -575,18 +539,11 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
                  f"{at_size}): {sorted(set(times) ^ set(expected))}")
 
     grown = _GrownReadings(lambda at_size: dict(seconds_at(at_size)))
-
-    def costed(at_size: int) -> dict[str, float]:
-        started = time.monotonic()
-        times = dict(seconds_at(at_size))
-        grown.keep(at_size, times, time.monotonic() - started)
-        return times
-
     small, small_factor = measure_under_load(
-        lambda: costed(small_size), base_budget_seconds, slowest_part)
+        lambda: grown.at(small_size), base_budget_seconds, slowest_part)
     check_budget(small, small_size, small_factor)
     large, factor = measure_under_load(
-        lambda: costed(size), base_budget_seconds, slowest_part)
+        lambda: grown.at(size), base_budget_seconds, slowest_part)
     check_budget(large, size, factor)
     check_parts(small, large, small_size)
     input_growth, large_size = 1, size
@@ -596,10 +553,8 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
         large_times = grown.at(large_size)
         check_parts(small_times, large, small_size)
         check_parts(large_times, large, large_size)
-        step_cost = grown.step_cost(small_size, large_size)
         return any(grows_further(small_times[part], large_times[part],
-                                 input_growth, grown.spent_seconds, step_cost)
-                   for part in large)
+                                 input_growth) for part in large)
 
     while any_part_grows():
         input_growth *= 2
