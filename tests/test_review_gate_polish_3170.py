@@ -38,6 +38,7 @@ from tests.host_timing import (
     GROWTH_LIMIT,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
     PER_UNIT_GROWTH_LIMIT,
+    PER_UNIT_OVER_RETRIES,
     TimingCheckFailed,
     assert_linear_per_unit,
     assert_linear_time,
@@ -474,19 +475,68 @@ def unloaded(monkeypatch):
     host_calibration.cache_clear()
 
 
-def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
-    """CI's readings (task 3185): 50 KB read 0.067 s per MB, 200 KB read
-    0.137 s three times. Measured again interleaved, a quieter 200 KB run
-    settles the pair as linear; the old check never measured 50 KB again
-    and failed at 2.04x."""
-    work = ScriptedPerUnit({50: [0.067], 200: [0.137, 0.137, 0.066],
-                            2048: [0.068]})
+def _pre_3185_ci_shape_check(per_unit_at):
+    """The CI-shape check as it was before task 3185: the larger size
+    measured again GROWTH_RETRIES times, the smallest never, then the
+    per-unit ratio compared by hand (growth_ratio: the smaller reading
+    raised to the floor). Returns the readings it failed on, None if it
+    passed."""
+    def ratio(smallest, seconds):
+        return seconds / max(smallest, GROWTH_FLOOR_SECONDS)
 
-    settled = assert_linear_per_unit(work, (50, 200, 2048), 0.5, "ci")
+    per_megabyte = {}
+    for kilobytes in CI_SHAPE_KILOBYTES:
+        seconds = per_unit_at(kilobytes)
+        smallest = per_megabyte.setdefault(CI_SHAPE_KILOBYTES[0], seconds)
+        for _ in range(2):
+            if ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT:
+                break
+            seconds = min(seconds, per_unit_at(kilobytes))
+        per_megabyte[kilobytes] = seconds
+        if not ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT:
+            return per_megabyte
+    return None
+
+
+# CI run 37447348074 (Python 3.10): 50 KB read 0.067 s per MB once, 200 KB
+# read 0.137 s on all three of its readings; linear work, so a quieter
+# 200 KB reading follows.
+CI_READINGS = {50: [0.067], 200: [0.137, 0.137, 0.137, 0.066], 2048: [0.068]}
+
+
+def test_the_pre_3185_check_fails_on_the_ci_readings():
+    """The scripted readings reproduce CI's failure on the old check, so the
+    test below proves the conversion, not the script."""
+    failed_at = _pre_3185_ci_shape_check(ScriptedPerUnit(CI_READINGS))
+
+    assert failed_at == {50: 0.067, 200: 0.137}
+
+
+def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
+    """The same readings through the shared per-unit check: the pair over
+    the limit is measured again PER_UNIT_OVER_RETRIES times, both sizes
+    interleaved, and the quieter fourth 200 KB reading settles it as
+    linear."""
+    work = ScriptedPerUnit(CI_READINGS)
+
+    settled = assert_linear_per_unit(work, CI_SHAPE_KILOBYTES, 0.5, "ci")
 
     assert settled == {50: 0.067, 200: 0.066, 2048: 0.068}
     assert work.calls[:2] == [50, 200]
-    assert work.calls[2:6] == [50, 200, 50, 200]
+    assert work.calls[2:8] == [50, 200] * 3
+    assert work.calls[8:] == [2048]
+
+
+def test_a_burst_over_every_reading_of_the_larger_size_still_fails(unloaded):
+    """Settling is not a pass: linear-looking work whose larger size reads
+    2.04x per unit on every one of its readings fails, after
+    PER_UNIT_OVER_RETRIES interleaved rounds."""
+    work = ScriptedPerUnit({50: [0.067], 200: [0.137], 2048: [0.068]})
+
+    with pytest.raises(TimingCheckFailed, match="fastest of 5 interleaved"):
+        assert_linear_per_unit(work, CI_SHAPE_KILOBYTES, 0.5, "burst")
+
+    assert work.calls == [50, 200] * (1 + PER_UNIT_OVER_RETRIES)
 
 
 @pytest.mark.parametrize("quarter_burst", [1.0, 2.0, 2.5, 3.0])

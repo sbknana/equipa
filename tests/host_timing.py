@@ -185,6 +185,13 @@ BORDERLINE_RETRIES = 4
 # ``assert_linear_per_unit`` holds it to the limit of one GROWTH step, per
 # unit: GROWTH_LIMIT for GROWTH times the input is this much per unit.
 PER_UNIT_GROWTH_LIMIT = GROWTH_LIMIT / GROWTH
+# A per-unit pair over that limit is measured again this many times (both
+# sizes, interleaved), not GROWTH_RETRIES: each reading is a run of fixed
+# length (about a megabyte scanned), so settling costs seconds at most, and
+# work over its budget per unit has failed before its pair is read. More
+# readings cannot hide quadratic work: the smaller size's fastest reading
+# only falls, which only raises the ratio.
+PER_UNIT_OVER_RETRIES = BORDERLINE_RETRIES
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -612,13 +619,15 @@ def _interleaved_means(measure: Callable[[int], Mapping[str, float]],
 @dataclass(frozen=True)
 class _Pair:
     """A pair of sizes a growth check holds to the limit, and how: the
-    floor of the smaller reading and the runs each reading is a mean of."""
+    floor of the smaller reading, the runs each reading is a mean of and
+    how many times a pair over the limit is measured again."""
 
     small_size: int
     size: int
     input_growth: float
     floor_seconds: float
     repetitions: int = 1
+    over_retries: int = GROWTH_RETRIES
 
 
 def _settled_readings(measure: Callable[[int], Mapping[str, float]],
@@ -635,7 +644,8 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     One reading of each size is at the mercy of the load it ran under, so
     both sizes are measured again (all parts, ``pair.repetitions`` runs
     each, the quarter size and the larger one interleaved) while a part is
-    over the limit, up to ``GROWTH_RETRIES`` times as main did, and, once
+    over the limit, up to ``pair.over_retries`` times (``GROWTH_RETRIES``
+    as main did, unless the check settles more), and, once
     any part has read a borderline ratio (``BORDERLINE_GROWTH`` up to the
     limit) on a quarter reading over the pair's floor,
     ``BORDERLINE_RETRIES`` times in all, however it reads after. (A ratio
@@ -659,7 +669,7 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
             and small[part] > pair.floor_seconds for part in parts)
         retries = BORDERLINE_RETRIES if borderline_seen else 0
         if over:
-            retries = max(retries, GROWTH_RETRIES)
+            retries = max(retries, pair.over_retries)
         if retries_done >= retries:
             return small, large, over, 1 + retries_done
         small_again, large_again = _interleaved_means(
@@ -900,8 +910,10 @@ def assert_linear_per_unit(per_unit_at: Callable[[int], float],
     both sizes are measured again, interleaved, each keeping its fastest
     reading, so a burst on either size does not decide alone (task 3185:
     CI read 0.067 s per MB at 50 KB and 0.137 s at 200 KB on linear work,
-    the larger size measured again three times, the smaller never). The
-    smallest size keeps its settled reading for the next pair."""
+    the larger size measured again twice, the smaller never). A pair over
+    the limit is measured again ``PER_UNIT_OVER_RETRIES`` times, not
+    ``GROWTH_RETRIES``: CI's three readings of 200 KB all fell in one burst.
+    The smallest size keeps its settled reading for the next pair."""
     if len(sizes) < 2 or list(sizes) != sorted(set(sizes)):
         raise ValueError(
             f"sizes {list(sizes)!r}: at least two, smallest first, each once")
@@ -929,7 +941,8 @@ def assert_linear_per_unit(per_unit_at: Callable[[int], float],
         seconds = read(size)
         small, large, over, samples = _settled_readings(
             as_one_step(size),
-            _Pair(smallest, size, size / smallest, GROWTH_FLOOR_SECONDS),
+            _Pair(smallest, size, size / smallest, GROWTH_FLOOR_SECONDS,
+                  over_retries=PER_UNIT_OVER_RETRIES),
             {label: settled[smallest]}, {label: seconds * GROWTH}, [label])
         settled[smallest], settled[size] = small[label], large[label] / GROWTH
         if over:
