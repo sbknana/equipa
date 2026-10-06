@@ -23,12 +23,14 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import statistics
+import sys
 import time
 from typing import Callable
 
 import pytest
 
 from tests import host_timing
+from tests import test_host_timing_3171 as host_timing_3171
 from tests import test_lesson_sanitizer_3129 as sanitizer_tests
 from tests.host_timing import (
     GROWTH,
@@ -296,6 +298,43 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
         f"{lower:.4f}-{upper:.4f} s band on this host")
     assert failure is not None and "superlinear growth" in str(failure), (
         f"windowed work reading {planted:.4f} s passed: {readings}")
+
+
+# --- The proofs plant what they claim on any host (CI run 37404143426) -----------
+
+
+# A runner whose calibration is off, simulated: (target, share of it the
+# plant reads). An eighth of the 120 ms target (the CI case) reads 15 ms,
+# under the 16 ms main caught, so the check rightly passes it; twice the
+# 20 ms target reads 40 ms, over the band, so it proves nothing about the
+# 16-26.7 ms it claims.
+MISCALIBRATIONS = ((0.12, 1 / 8), (0.02, 2.0))
+
+
+@pytest.mark.parametrize("target_seconds, miscalibration", MISCALIBRATIONS)
+@pytest.mark.parametrize("proof", ("quadratic", "windowed"))
+def test_a_proof_planted_outside_its_band_fails_loudly(
+        monkeypatch, proof, target_seconds, miscalibration):
+    """CI run 37404143426 failed 3178's proof with DID NOT RAISE: its plant
+    did not read what the proof claimed, and nothing said so. A runner that
+    plants outside the band now fails the proof on the band, naming the
+    reading, instead of passing (a plant under 16 ms) or proving nothing
+    about the band it claims (a plant over it)."""
+    real_units_reading = host_timing_3171._units_reading
+
+    def miscalibrated(target_seconds: float) -> int:
+        return real_units_reading(target_seconds * miscalibration)
+
+    if proof == "quadratic":
+        monkeypatch.setattr(host_timing_3171, "_units_reading", miscalibrated)
+        run = host_timing_3171.test_real_quadratic_work_of_16_to_159_ms_fails
+    else:
+        monkeypatch.setattr(sys.modules[__name__], "_units_reading",
+                            miscalibrated)
+        run = test_real_windowed_work_of_16_to_159_ms_fails
+    with pytest.raises(AssertionError, match=r"missed the [\d.]+-[\d.]+ s "
+                                             r"band on this host"):
+        run(target_seconds, 0.0)
 
 
 # The reviewer's plant (IR78-01): quadratic work in ``sanitize`` right after
