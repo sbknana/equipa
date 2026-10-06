@@ -6,6 +6,7 @@
     "skip_projects": [],
     "priority_boost": {},
     "only_projects": [],
+    "path_translations": [],
     "security_review": true,
     "security_review_timeout": 900,
     "security_review_timeout_max": 5400,

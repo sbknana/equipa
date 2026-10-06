@@ -14,6 +14,7 @@
     - [4. Verify the install](#4-verify-the-install)
     - [5. Start talking to Claude](#5-start-talking-to-claude)
   - [Environment Variables](#environment-variables)
+  - [Project Paths Recorded on Another Host](#project-paths-recorded-on-another-host)
   - [How It Actually Works](#how-it-actually-works)
     - [The Conversational Model (Primary)](#the-conversational-model-primary)
     - [The CLI (For Automation / Scripting)](#the-cli-for-automation-scripting)
@@ -164,6 +165,46 @@ Claude reads the database, dispatches agents, monitors progress, and reports res
 | `OLLAMA_MODEL` | Default Ollama model name | `codellama:13b` | No |
 | `EQUIPA_MAX_COST` | Global cost limit (USD) | `5.00` | No (default: per-config) |
 | `EQUIPA_PROJECT_DIR` | Override project working directory | `/home/user/myproject` | No |
+
+---
+
+## Project Paths Recorded on Another Host
+
+A project's `local_path` in TheForge may have been recorded on another
+machine, for example a Windows client that sees the project share as
+`X:\share` while the orchestrator host mounts the same share at
+`/srv/share`. List each such prefix under `path_translations` in
+`dispatch_config.json`:
+
+```json
+{
+  "path_translations": [
+    {"from": "X:\\share", "to": "/srv/share"}
+  ]
+}
+```
+
+- **Default:** empty. Every `local_path` is used exactly as recorded. EQUIPA
+  has no built-in mapping.
+- **Matching:**
+  - `from` matches whole path segments only, so `X:\share` does not match `X:\shared`.
+  - Matching is case-sensitive, and `\` and `/` count as the same separator.
+  - When two entries match, the longest `from` wins.
+  - In the translated path, every `\` becomes `/`, so `X:\share\Proj` becomes `/srv/share/Proj`.
+- **Validation:**
+  - `to` must be an absolute path on this host.
+  - Neither `from` nor `to` may contain a `..` segment, and `from` may not be a bare root.
+  - An entry that breaks a rule is logged as an error and ignored.
+- **Where it applies:** both places that turn a `local_path` into a directory use it: project
+  directory resolution (`equipa.tasks.resolve_project_dir`) and the
+  scaffold bootstrap (`equipa.dispatch._bootstrap_scaffold_if_needed`).
+  The scaffold bootstrap still runs its containment check on the translated
+  path.
+- **Scaffold allowlist:** scaffold auto-clone may only create project directories inside the
+  colon-separated roots in `EQUIPA_SCAFFOLD_ALLOWED_ROOTS`. When that is unset, it uses the `to`
+  prefixes of `path_translations`. With neither, auto-clone is refused.
+- **Scaffold source:** it comes from `EQUIPA_FORGESCAFFOLD_DIR` or the
+  `forgescaffold_dir` config key. There is no built-in location.
 
 ---
 
