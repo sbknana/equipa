@@ -22,6 +22,15 @@ All notable changes to EQUIPA are documented here.
   instead of the operator's host names. **Operator note:** `scripts/autoresearch_loop.py` and
   `scripts/autoresearch_prompts.py` read the remote host from `ORCHESTRATOR_HOST`; set it in place of the old
   host-named variable.
+- **A caller cannot switch git hardening off** (task #3187, IR83-03).
+  - **Change:** `git_run` / `git_run_async` refuse a call whose own `-c` / `--config-env` pairs, or whose
+    `GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS` variables, give a key EQUIPA pins (`core.hooksPath`,
+    `protocol.ext.allow`, `core.pager`, `gpg.program`, `submodule.recurse`, ...) another value. git lets the last
+    pair win and the caller's come after the pins, so `-c protocol.ext.allow=always` re-enabled `ext::` commands.
+    A pair that repeats the pinned value still runs.
+  - **Non-git dispatch:** an `include.path` / `includeIf.<condition>.path` pair is refused like an alias (the
+    included file can define one), and so are `trailer.<token>.cmd`, `submodule.<name>.update`,
+    `remote.<name>.vcs`, `gpg.ssh.defaultKeyCommand`, `interactive.diffFilter` and the send-email command keys.
 
 - **Project path translation is configuration** (task #3183, IR80-05).
   - **Change:** EQUIPA no longer carries a built-in mapping from one Windows share to one Linux mount.
