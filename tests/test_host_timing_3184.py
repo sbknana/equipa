@@ -217,10 +217,12 @@ def test_a_grown_pair_hidden_by_a_loaded_quarter_fails():
     """Linear at the test's sizes, superlinear past them: the reading at
     SIZE that the grown pair reuses was taken under load (0.04 s on both
     of the own pair's readings, quietly 0.025 s), so the grown pair reads
-    6.5x once (main passed it) and 10.4x on each size's fastest reading."""
+    6.5x once (main passed it) and 10.4x on each size's fastest reading.
+    Its growth exponent over SIZE, GROWN and 4 times GROWN (task 3191)
+    stays superlinear (10.4x then 10.4x)."""
     calls: list[int] = []
     seconds_at = _scripted({QUARTER: (0.010,), SIZE: (0.040, 0.040, 0.025),
-                            GROWN: (0.260,)}, calls)
+                            GROWN: (0.260,), GROWN * GROWTH: (2.704,)}, calls)
     with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
         assert_linear_time(seconds_at, SIZE, 10.0, "grown")
     message = str(failure.value)
@@ -228,8 +230,14 @@ def test_a_grown_pair_hidden_by_a_loaded_quarter_fails():
     assert "at 4x the test's input" in message
     assert (f"each the fastest of {1 + BORDERLINE_RETRIES} interleaved "
             f"readings" in message)
-    # Confirmed at the grown pair's own sizes, not past them.
-    assert calls == GROWN_PAIR_CALLS + _confirming(SIZE, GROWN)
+    assert "growth exponent 1.69" in message and ": superlinear" in message
+    # Confirmed at the grown pair's own sizes, then its exponent read one
+    # size past them (the outer pair settled and confirmed as any pair).
+    exponent_size = GROWN * GROWTH
+    assert calls == (GROWN_PAIR_CALLS + _confirming(SIZE, GROWN)
+                     + [exponent_size]
+                     + [SIZE, exponent_size] * host_timing.GROWTH_RETRIES
+                     + _confirming(SIZE, exponent_size))
 
 
 def test_a_settled_grown_pair_is_not_measured_again_where_growth_stops():

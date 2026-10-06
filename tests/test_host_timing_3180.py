@@ -231,16 +231,18 @@ def test_a_fast_part_never_carries_a_quadratic_part_past_its_sizes(reading):
     """292395d measured a quadratic part again at 4 and 16 times the test's
     input while a fast linear part grew (24-134 s per check at 30-159 ms).
     A pure quadratic part fails at the test's own pair; one quadratic only
-    past the test's size fails at the first grown pair it is over at."""
+    past the test's size fails at the first grown pair it is over at, once
+    the one size past that pair shows its growth exponent (task 3191)."""
     # The late shape's first grown pair: the scaled step a 16-20 ms reading
-    # takes (``next_quarter_size``), 4 times over.
+    # takes (``next_quarter_size``), 4 times over; its exponent is read at 4
+    # times that pair's larger size, and the input grows no further.
     first_grown_size = GROWTH * host_timing.next_quarter_size(
         SIZE, reading, SIZE * host_timing.MAX_INPUT_GROWTH)
     cases = [(_shape("quadratic", reading), SIZE)]
     if reading / GROWTH < host_timing.GROWTH_FLOOR_SECONDS:
         # From 80 ms on, the late shape's quarter reads the floor: it is
         # decided at the test's sizes, where it is linear (as in main).
-        cases.append((_late(reading), first_grown_size))
+        cases.append((_late(reading), GROWTH * first_grown_size))
     for superlinear, largest in cases:
         calls: list[int] = []
 
@@ -303,14 +305,18 @@ def test_a_constant_factor_step_past_the_tests_size_is_not_growth():
 
 
 def test_a_grown_pair_over_the_limit_against_the_growth_floor_still_fails():
-    """The control: the same cliff 8 times steep is over the limit at the
-    first grown pair even against the 20 ms floor, and fails there."""
+    """The control: the same cliff 40 times steep is over the limit at the
+    first grown pair even against the 20 ms floor, and fails there. Its
+    growth exponent over that pair and the size 4 times past it (task 3191)
+    is superlinear too: a step of 4 times or more per unit is a cliff, not
+    a cache."""
     calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*floor 0\.02 s"):
+                       match=r"superlinear growth.*floor 0\.02 s.*"
+                             r"growth exponent .*: superlinear"):
         assert_linear_time(_cliff_seconds_at([0.0174], 40.0, calls),
                            CLIFF_TEST_SIZE, 10.0, "steep cliff")
-    assert max(calls) <= GROWTH * host_timing.next_quarter_size(
+    assert max(calls) <= GROWTH * GROWTH * host_timing.next_quarter_size(
         CLIFF_TEST_SIZE, 0.0174, CLIFF_TEST_SIZE // GROWTH
         * host_timing.MAX_INPUT_GROWTH)
 
