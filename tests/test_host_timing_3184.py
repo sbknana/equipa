@@ -179,6 +179,49 @@ def test_the_own_pairs_repetitions_alternate_between_the_sizes():
     assert "each the fastest of 3 interleaved readings" in str(failure.value)
 
 
+# A quarter reading under the 20 ms floor and a larger one over it grow the
+# input 4x (task 3178): the grown pair is (SIZE, GROWN), its quarter reading
+# the one the test's own pair took at SIZE.
+GROWN = SIZE * GROWTH
+GROWN_PAIR_CALLS = [QUARTER, SIZE, GROWN] + [SIZE, GROWN] * BORDERLINE_RETRIES
+
+
+def test_a_grown_pair_hidden_by_a_loaded_quarter_fails():
+    """Linear at the test's sizes, superlinear past them: the reading at
+    SIZE that the grown pair reuses was taken under load (0.04 s, quietly
+    0.025 s), so the grown pair reads 6.5x once (main passed it) and
+    10.4x on each size's fastest reading."""
+    calls: list[int] = []
+    seconds_at = _scripted({QUARTER: (0.010,), SIZE: (0.040, 0.025),
+                            GROWN: (0.260,)}, calls)
+    with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
+        assert_linear_time(seconds_at, SIZE, 10.0, "grown")
+    message = str(failure.value)
+    assert f"0.0250 s at size {SIZE}" in message
+    assert "at 4x the test's input" in message
+    assert (f"each the fastest of {1 + BORDERLINE_RETRIES} interleaved "
+            f"readings" in message)
+    assert calls == GROWN_PAIR_CALLS
+
+
+def test_a_settled_grown_pair_is_not_measured_again_where_growth_stops():
+    """Linear work whose first grown reading a burst pushed into the band
+    passes on its fastest readings, and the pair the growth stopped at (the
+    same sizes) starts from them (``_GrownReadings.settle``) instead of
+    reading the burst again and measuring both sizes another
+    ``BORDERLINE_RETRIES`` times."""
+    calls: list[int] = []
+    timing = assert_linear_time(
+        _scripted({QUARTER: (0.010,), SIZE: (0.040,), GROWN: (0.250, 0.160)},
+                  calls), SIZE, 10.0, "grown linear")
+    assert (timing.small_size, timing.size) == (SIZE, GROWN)
+    assert timing.input_growth == GROWTH
+    assert timing.seconds == pytest.approx(0.160)
+    assert timing.ratio == pytest.approx(4.0)
+    assert timing.samples == 1 + BORDERLINE_RETRIES
+    assert calls == GROWN_PAIR_CALLS
+
+
 # --- Real work on the real clock -------------------------------------------------
 
 
