@@ -151,6 +151,15 @@ GROWTH_STEP_MARGIN = 1.2
 # each size) before it counts: one descheduled run must not fail a test,
 # a quadratic one fails every time.
 GROWTH_RETRIES = 2
+# A ratio from here up to the limit is borderline: linear work reads about
+# 4x, and contention that inflated the quarter reading compresses quadratic
+# work's 16x toward it (task 3184: a regression planted in ``sanitize`` read
+# 0.0228 s then 0.1486 s, 6.5x, at host load 20, and passed on one reading
+# of each size). Once a pair reads borderline, both sizes are measured again
+# this many times, interleaved, before it is decided on each size's fastest
+# reading (``_settled_readings``).
+BORDERLINE_GROWTH = 5.0
+BORDERLINE_RETRIES = 4
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -541,16 +550,26 @@ class _GrownReadings:
         return self.readings[size]
 
 
-def _mean_readings(measure: Callable[[int], Mapping[str, float]], size: int,
-                   repetitions: int, first: Mapping[str, float] | None = None
-                   ) -> dict[str, float]:
-    """Each part's mean over ``repetitions`` measurements at ``size``,
-    ``first`` (when given) counting as one of them."""
-    totals = dict(first) if first is not None else {}
+def _interleaved_means(measure: Callable[[int], Mapping[str, float]],
+                       small_size: int, size: int, repetitions: int,
+                       first: tuple[Mapping[str, float],
+                                    Mapping[str, float]] | None = None
+                       ) -> tuple[dict[str, float], dict[str, float]]:
+    """Each part's mean over ``repetitions`` measurements at ``small_size``
+    and at ``size``, taken alternately (quarter, larger, quarter, larger,
+    ...) so both sizes run under the same load: a burst of contention then
+    inflates both sizes' readings, not one size's whole run. ``first`` (a
+    reading already taken at each size) counts as one measurement of
+    each."""
+    small_totals = dict(first[0]) if first is not None else {}
+    large_totals = dict(first[1]) if first is not None else {}
     for _ in range(repetitions - (0 if first is None else 1)):
-        for part, seconds in measure(size).items():
-            totals[part] = totals.get(part, 0.0) + seconds
-    return {part: total / repetitions for part, total in totals.items()}
+        for totals, at_size in ((small_totals, small_size),
+                                (large_totals, size)):
+            for part, seconds in measure(at_size).items():
+                totals[part] = totals.get(part, 0.0) + seconds
+    return ({part: total / repetitions for part, total in small_totals.items()},
+            {part: total / repetitions for part, total in large_totals.items()})
 
 
 @dataclass(frozen=True)
@@ -565,36 +584,51 @@ class _Pair:
     repetitions: int = 1
 
 
-def _still_over_the_limit(measure: Callable[[int], Mapping[str, float]],
-                          pair: _Pair, small: Mapping[str, float],
-                          large: Mapping[str, float], parts: list[str]
-                          ) -> tuple[dict[str, float], dict[str, float],
-                                     list[str]]:
-    """The parts over the growth limit at ``pair`` once measured again.
+def _settled_readings(measure: Callable[[int], Mapping[str, float]],
+                      pair: _Pair, small: Mapping[str, float],
+                      large: Mapping[str, float], parts: list[str]
+                      ) -> tuple[dict[str, float], dict[str, float],
+                                 list[str], int]:
+    """The parts over the growth limit at ``pair`` once its readings have
+    settled.
 
     ``small`` and ``large`` are each part's reading at the pair's sizes.
-    While a part is over the limit, both sizes are measured again (all
-    parts, ``pair.repetitions`` runs each) up to ``GROWTH_RETRIES`` times,
-    keeping each part's fastest, as main did. Returns the readings kept
-    and the parts still over."""
+    One reading of each size is at the mercy of the load it ran under, so
+    both sizes are measured again (all parts, ``pair.repetitions`` runs
+    each, the quarter size and the larger one interleaved) while a part is
+    over the limit, up to ``GROWTH_RETRIES`` times as main did, and, once
+    any part has read a borderline ratio (``BORDERLINE_GROWTH`` up to the
+    limit) on a quarter reading over the pair's floor,
+    ``BORDERLINE_RETRIES`` times in all, however it reads after. (A ratio
+    taken against the floor cannot rise when measured again: only a
+    quarter reading over the floor can hide growth.) Each part keeps its
+    fastest reading of each size: the minimum is the
+    estimate of the work's cost the load inflated least, so a burst that
+    inflated the quarter reading (and hid quadratic growth, task 3184) or
+    the larger one (and faked it) is outrun by a quieter run of that size.
+    Returns the readings kept, the parts still over and how many readings
+    of each size the minimum was taken over."""
     small, large = dict(small), dict(large)
-
-    def over() -> list[str]:
-        return [part for part in parts
-                if not growth_ratio(small[part], large[part],
-                                    pair.floor_seconds) < GROWTH_LIMIT]
-
-    still_over = over()
-    for _ in range(GROWTH_RETRIES):
-        if not still_over:
-            break
-        for readings, at_size in ((small, pair.small_size),
-                                  (large, pair.size)):
-            again = _mean_readings(measure, at_size, pair.repetitions)
-            for part in readings:
-                readings[part] = min(readings[part], again[part])
-        still_over = over()
-    return small, large, still_over
+    borderline_seen = False
+    retries_done = 0
+    while True:
+        ratios = {part: growth_ratio(small[part], large[part],
+                                     pair.floor_seconds) for part in parts}
+        over = [part for part in parts if not ratios[part] < GROWTH_LIMIT]
+        borderline_seen = borderline_seen or any(
+            BORDERLINE_GROWTH <= ratios[part] < GROWTH_LIMIT
+            and small[part] > pair.floor_seconds for part in parts)
+        retries = BORDERLINE_RETRIES if borderline_seen else 0
+        if over:
+            retries = max(retries, GROWTH_RETRIES)
+        if retries_done >= retries:
+            return small, large, over, 1 + retries_done
+        small_again, large_again = _interleaved_means(
+            measure, pair.small_size, pair.size, pair.repetitions)
+        for part in small:
+            small[part] = min(small[part], small_again[part])
+            large[part] = min(large[part], large_again[part])
+        retries_done += 1
 
 
 def fail(message: str) -> None:
@@ -625,6 +659,9 @@ class LinearTiming:
     # Each reading is the mean of this many runs (the test's own pair,
     # ``growth_repetitions``).
     repetitions: int = 1
+    # Each reading is the fastest of this many readings of its size, taken
+    # interleaved with the other size's (``_settled_readings``).
+    samples: int = 1
 
     @property
     def ratio(self) -> float:
@@ -633,12 +670,14 @@ class LinearTiming:
     def describe(self) -> str:
         runs = (f" over {self.repetitions} runs of each"
                 if self.repetitions > 1 else "")
+        fastest = (f"; each the fastest of {self.samples} interleaved "
+                   f"readings" if self.samples > 1 else "")
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth:.3g}x the "
                 f"test's input{runs}, floor {self.floor_seconds:g} s, limit "
                 f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
-                f"factor {self.factor:.2f})")
+                f"factor {self.factor:.2f}{fastest})")
 
 
 def _check_budget(label: str, seconds: float, size: int,
@@ -785,35 +824,36 @@ def _check_growth(grown: _GrownReadings,
        (``grows_further``): against ``GROWTH_FLOOR_SECONDS``, or main's
        floor where the shape does not exist at the next size.
 
-    Each pair is measured again before it fails (``_still_over_the_limit``).
+    Each pair over the limit is measured again before it fails, and a
+    borderline one before it passes (``_settled_readings``).
     """
     parts = list(labels)
 
     def timings_at(pair: _Pair, small: Mapping[str, float],
-                   large: Mapping[str, float], at_parts: list[str]
-                   ) -> dict[str, LinearTiming]:
+                   large: Mapping[str, float], at_parts: list[str],
+                   samples: int) -> dict[str, LinearTiming]:
         return {part: LinearTiming(labels[part], pair.small_size, small[part],
                                    pair.size, large[part], budget_seconds,
                                    factor, pair.input_growth,
-                                   pair.floor_seconds, pair.repetitions)
+                                   pair.floor_seconds, pair.repetitions,
+                                   samples)
                 for part in at_parts}
 
     def held(pair: _Pair, small: Mapping[str, float],
              large: Mapping[str, float]) -> dict[str, LinearTiming]:
-        small, large, over = _still_over_the_limit(measure, pair, small,
-                                                   large, parts)
+        small, large, over, samples = _settled_readings(measure, pair, small,
+                                                        large, parts)
         if over:
             fail("superlinear growth: " + "; ".join(
-                timing.describe()
-                for timing in timings_at(pair, small, large, over).values()))
-        return timings_at(pair, small, large, parts)
+                timing.describe() for timing in timings_at(
+                    pair, small, large, over, samples).values()))
+        return timings_at(pair, small, large, parts, samples)
 
-    # 1. The test's own pair.
+    # 1. The test's own pair, its repetitions interleaved.
     held(_Pair(test_small_size, test_size, 1.0, own_pair_floor(repetitions),
                repetitions),
-         _mean_readings(measure, test_small_size, repetitions,
-                        grown.at(test_small_size)),
-         _mean_readings(measure, test_size, repetitions, grown.at(test_size)))
+         *_interleaved_means(measure, test_small_size, test_size, repetitions,
+                             (grown.at(test_small_size), grown.at(test_size))))
 
     # 2. Growth (task 3178), every grown pair held to the growth limit.
     small_size, size, input_growth = test_small_size, test_size, 1.0
