@@ -26,6 +26,7 @@ import ast
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -726,6 +727,247 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     assert result.returncode == NOT_A_REPOSITORY
     assert result.stdout == ""
     assert "not a git repository at dispatch" in result.stderr
+
+
+# --- IR85-01 (task #3185): the verdict does not depend on git or on the pin ------
+#
+# CI (git 2.55, Python 3.10) ran git for git_run-GIT_CONFIG_GLOBAL-in-the-project
+# while the same commit passed on Python 3.12 with the same git. The xdist worker
+# had run a merge-integrity test first, which leaves the global-config pin set;
+# git_run's hardening then replaces the caller's GIT_CONFIG_GLOBAL with the pin,
+# and the guard, reading only the child's environment, no longer saw the project.
+
+
+def _pin_the_global_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The state an earlier test of the same worker can leave: the operator's
+    global config pinned to a copy outside every project."""
+    pin = tmp_path / "pin" / "gitconfig"
+    pin.parent.mkdir()
+    pin.write_text("")
+    monkeypatch.setattr(git_ops, "_global_config_pin", git_ops.GlobalConfigPin(
+        path=pin, sha256="0" * 64, entries=0))
+    return pin
+
+
+@pytest.mark.parametrize("helper", sorted(FORGETFUL_HELPERS))
+def test_a_helper_runs_no_git_in_a_non_git_project_while_the_global_config_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, helper: str,
+) -> None:
+    project, agent = _planted_project(tmp_path, monkeypatch)
+    prepare = FORGETFUL_HELPER_PREPARATIONS.get(helper)
+    if prepare is not None:
+        prepare(tmp_path)
+    _pin_the_global_config(tmp_path, monkeypatch)
+    recorder = GitRecorder(monkeypatch)
+
+    with dispatched_without_git(project), recorder.recording():
+        result = FORGETFUL_HELPERS[helper](project, tmp_path)
+
+    assert agent.ran() == [], f"EXECUTED {CHANGE_CHECK_VECTOR}/{helper}: {agent.ran()}"
+    assert recorder.calls == [], [entry.argv for entry in recorder.calls]
+    assert result.returncode == NOT_A_REPOSITORY
+    assert "not a git repository at dispatch" in result.stderr
+
+
+# A git of any version, first on the PATH: it reads whatever its environment
+# names (a newer git honours GIT_CONFIG_GLOBAL, HOME and XDG_CONFIG_HOME in
+# its own order) and logs that it started. The environment is allowlisted,
+# so the log path is written into the script.
+FAKE_GIT = """#!/bin/sh
+config="${{GIT_CONFIG_GLOBAL:-${{XDG_CONFIG_HOME:-$HOME/.config}}/git/config}}"
+printf '%s\\n' "{name} $* in $PWD reading $config" >> {log}
+exit 0
+"""
+
+
+@dataclass
+class FakeGit:
+    project: Path
+    elsewhere: Path
+    log: Path
+    bin: Path
+
+    def started(self) -> list[str]:
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+
+def _install_fake_git(directory: Path, log: Path, name: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "git"
+    script.write_text(FAKE_GIT.format(name=name, log=shlex.quote(str(log))))
+    script.chmod(0o755)
+
+
+@pytest.fixture
+def fake_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeGit:
+    """A project holding an agent's repository and git, the fake git first
+    on the orchestrator's PATH, and a directory elsewhere."""
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "config").write_text('[filter "planted"]\n\tclean = false\n')
+    log = tmp_path / "fake-git.log"
+    _install_fake_git(project / "bin", log, "agent-git")
+    _install_fake_git(tmp_path / "fake-bin", log, "git")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'fake-bin'}{os.pathsep}{os.environ['PATH']}")
+    return FakeGit(project, _elsewhere(tmp_path), log, tmp_path / "fake-bin")
+
+
+def _config_in(project: Path) -> str:
+    return str(project / ".git" / "config")
+
+
+def _requested_global_config(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                             tmp_path: Path) -> subprocess.CompletedProcess:
+    _pin_the_global_config(tmp_path, monkeypatch)
+    return git_run(["status", "--short"], fake.elsewhere,
+                   env={"GIT_CONFIG_GLOBAL": _config_in(fake.project)})
+
+
+def _requested_global_config_async(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                                   tmp_path: Path) -> subprocess.CompletedProcess:
+    _pin_the_global_config(tmp_path, monkeypatch)
+    return asyncio.run(git_run_async(["status", "--short"], fake.elsewhere,
+                                     env={"GIT_CONFIG_GLOBAL": _config_in(fake.project)}))
+
+
+def _inherited_global_config(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                             tmp_path: Path) -> subprocess.CompletedProcess:
+    """GIT_CONFIG_GLOBAL is allowlisted: the orchestrator's own value is the
+    one git gets unless the pin replaces it."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", _config_in(fake.project))
+    _pin_the_global_config(tmp_path, monkeypatch)
+    return git_run(["status", "--short"], fake.elsewhere)
+
+
+def _inherited_global_config_replaced_by_the_runner(
+    fake: FakeGit, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    """A helper that hands the runner its own environment, replacing the
+    orchestrator's GIT_CONFIG_GLOBAL as the agent-worktree helpers do."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", _config_in(fake.project))
+    env = {**git_ops._get_repo_env(), "GIT_CONFIG_GLOBAL": os.devnull}
+    return git_ops._run_with_env(["git", "status"], fake.elsewhere, 30, env)
+
+
+def _inherited_global_config_replaced_by_the_async_runner(
+    fake: FakeGit, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", _config_in(fake.project))
+    env = {**git_ops._get_repo_env(), "GIT_CONFIG_GLOBAL": os.devnull}
+    return asyncio.run(git_ops._run_git_process_async(
+        ["git", "status"], str(fake.elsewhere), env, 30))
+
+
+def _requested(variables: dict[str, str]):
+    def helper(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+               tmp_path: Path) -> subprocess.CompletedProcess:
+        env = {key: value.format(project=fake.project, bin=fake.bin, sep=os.pathsep)
+               for key, value in variables.items()}
+        return git_run(["status", "--short"], fake.elsewhere, env=env)
+
+    return helper
+
+
+def _inherited_home(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                    tmp_path: Path) -> subprocess.CompletedProcess:
+    monkeypatch.setenv("HOME", str(fake.project))
+    return git_ops._run_with_env(["git", "status"], fake.elsewhere, 30)
+
+
+def _program_by_path(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                     tmp_path: Path) -> subprocess.CompletedProcess:
+    return git_ops._run_with_env(
+        [str(fake.project / "bin" / "git"), "status"], fake.elsewhere, 30)
+
+
+def _program_by_relative_path(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                              tmp_path: Path) -> subprocess.CompletedProcess:
+    return git_ops._run_with_env(["project/bin/git", "status"], tmp_path, 30)
+
+
+VERSION_INDEPENDENT_REFUSALS = {
+    "git_run-requested-GIT_CONFIG_GLOBAL-pinned": _requested_global_config,
+    "git_run_async-requested-GIT_CONFIG_GLOBAL-pinned": _requested_global_config_async,
+    "git_run-inherited-GIT_CONFIG_GLOBAL-pinned": _inherited_global_config,
+    "runner-inherited-GIT_CONFIG_GLOBAL-replaced":
+        _inherited_global_config_replaced_by_the_runner,
+    "async-runner-inherited-GIT_CONFIG_GLOBAL-replaced":
+        _inherited_global_config_replaced_by_the_async_runner,
+    "git_run-GIT_CONFIG_GLOBAL": _requested(
+        {"GIT_CONFIG_GLOBAL": "{project}/.git/config"}),
+    "git_run-GIT_CONFIG_SYSTEM": _requested(
+        {"GIT_CONFIG_SYSTEM": "{project}/.git/config"}),
+    "git_run-GIT_CONFIG_COUNT-include.path": _requested({
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "include.path",
+        "GIT_CONFIG_VALUE_0": "{project}/.git/config"}),
+    "git_run-GIT_DIR": _requested({"GIT_DIR": "{project}/.git"}),
+    "git_run-GIT_WORK_TREE": _requested({"GIT_WORK_TREE": "{project}"}),
+    "git_run-GIT_CEILING_DIRECTORIES": _requested(
+        {"GIT_CEILING_DIRECTORIES": "{project}"}),
+    "git_run-HOME": _requested({"HOME": "{project}"}),
+    "git_run-XDG_CONFIG_HOME": _requested({"XDG_CONFIG_HOME": "{project}/.config"}),
+    "git_run-PATH-into-the-project": _requested({"PATH": "{project}/bin{sep}{bin}"}),
+    "runner-inherited-HOME": _inherited_home,
+    "runner-program-by-path": _program_by_path,
+    "runner-program-by-relative-path": _program_by_relative_path,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(VERSION_INDEPENDENT_REFUSALS))
+def test_no_git_of_any_version_starts_when_the_call_points_into_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_git: FakeGit, shape: str,
+) -> None:
+    """IR85-01: decided from argv, cwd and the environment before any git
+    starts, so no git, whatever its version resolves, ever runs."""
+    with dispatched_without_git(fake_git.project):
+        result = VERSION_INDEPENDENT_REFUSALS[shape](fake_git, monkeypatch, tmp_path)
+
+    assert fake_git.started() == []
+    assert result.returncode == NOT_A_REPOSITORY
+    assert "not a git repository at dispatch" in result.stderr
+
+
+def _pinned_and_elsewhere(fake: FakeGit, monkeypatch: pytest.MonkeyPatch,
+                          tmp_path: Path) -> subprocess.CompletedProcess:
+    _pin_the_global_config(tmp_path, monkeypatch)
+    return git_run(["status", "--short"], fake.elsewhere)
+
+
+VERSION_INDEPENDENT_ALLOWED = {
+    "git_run-elsewhere": _requested({}),
+    "git_run-pinned-elsewhere": _pinned_and_elsewhere,
+    "git_run-HOME-above-the-project": _requested({"HOME": "{project}/.."}),
+    "git_run-GIT_CEILING_DIRECTORIES-above-the-project": _requested(
+        {"GIT_CEILING_DIRECTORIES": "{project}/.."}),
+    "git_run-PATH-elsewhere": _requested({"PATH": "{bin}"}),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(VERSION_INDEPENDENT_ALLOWED))
+def test_the_fake_git_starts_for_a_call_that_stays_out_of_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_git: FakeGit, shape: str,
+) -> None:
+    """Control: the fake git is the git the runners start, and only a
+    location in the recorded project is refused (an ancestor is not)."""
+    with dispatched_without_git(fake_git.project):
+        result = VERSION_INDEPENDENT_ALLOWED[shape](fake_git, monkeypatch, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert len(fake_git.started()) == 1
+    assert fake_git.started()[0].startswith("git ")
+
+
+@pytest.mark.parametrize("shape", sorted(VERSION_INDEPENDENT_REFUSALS))
+def test_the_fake_git_starts_for_every_shape_while_nothing_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_git: FakeGit, shape: str,
+) -> None:
+    """Control: each refused shape does start a git (the fake, or the
+    agent's) when no project is recorded, so its refusal above is the
+    guard's and not a call that could never start."""
+    result = VERSION_INDEPENDENT_REFUSALS[shape](fake_git, monkeypatch, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert len(fake_git.started()) == 1
 
 
 IR78_04_ALLOWED = {
