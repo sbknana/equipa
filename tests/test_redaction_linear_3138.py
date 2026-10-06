@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import random
 import re
 import string
@@ -154,7 +155,12 @@ def _assert_linear(func, build, size: int, limit: float, label: str) -> None:
     quarter of it, and linear between them (task 3171). The arguments are
     built before the clock starts."""
     def seconds_at(at_size: int) -> float:
-        return _best_time(func, *build(at_size), limit=budget(limit))
+        # The budget holds at *size* and its quarter; past *size* (the input
+        # the growth check grows, task 3178) only the growth counts, and
+        # assert_linear_time measures a ratio over its limit again itself,
+        # so a run over the budget there is not taken again.
+        at_limit = budget(limit) if at_size <= size else math.inf
+        return _best_time(func, *build(at_size), limit=at_limit)
 
     assert_linear_time(seconds_at, size, limit, label)
 
