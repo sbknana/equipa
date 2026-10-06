@@ -140,6 +140,68 @@ def test_an_alias_in_an_included_file_never_runs_during_a_non_git_dispatch(
     assert INCLUDE_REFUSED in result.stderr
 
 
+# Further keys the reviewer saw real git run a command line from (IR83-03):
+# the non-git guard reads each as a command line it cannot read.
+COMMAND_KEY_CALLS: dict[str, list[str]] = {
+    "trailer.cmd": ["-c", "trailer.s.cmd=touch /tmp/x", "interpret-trailers"],
+    "trailer.command": ["-c", "trailer.s.command=touch /tmp/x",
+                        "interpret-trailers"],
+    "submodule.update": ["-c", "submodule.x.update=!touch /tmp/x",
+                         "submodule", "update"],
+    "gpg.ssh.defaultKeyCommand": ["-c", "gpg.ssh.defaultKeyCommand=touch /tmp/x",
+                                  "log"],
+    "sendemail.toCmd": ["-c", "sendemail.toCmd=touch /tmp/x", "send-email"],
+    "sendemail.identity.ccCmd": ["-c", "sendemail.work.ccCmd=touch /tmp/x",
+                                 "send-email"],
+    "interactive.diffFilter": ["-c", "interactive.diffFilter=touch /tmp/x",
+                               "add", "-p"],
+    "remote.vcs": ["-c", "remote.origin.vcs=evil", "fetch", "origin"],
+}
+COMMAND_LINE_REFUSED = "carries a command line"
+
+
+@pytest.mark.parametrize("shape", sorted(COMMAND_KEY_CALLS))
+def test_a_command_key_is_refused_during_a_non_git_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str,
+) -> None:
+    project, elsewhere = _project_and_elsewhere(tmp_path)
+    recorder = _StartRecorder(monkeypatch)
+
+    with dispatched_without_git(project):
+        result = git_run(COMMAND_KEY_CALLS[shape], elsewhere)
+
+    assert recorder.starts == []
+    assert result.returncode == git_ops._REFUSED_RETURNCODE
+    assert COMMAND_LINE_REFUSED in result.stderr
+
+
+def test_a_trailer_command_never_runs_during_a_non_git_dispatch(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's real-git shape: ``-c trailer.s.cmd=...`` with
+    ``interpret-trailers --trailer s=x`` ran the command (base)."""
+    project, elsewhere = _project_and_elsewhere(tmp_path)
+    marker = tmp_path / "trailer-ran"
+    message = tmp_path / "message.txt"
+    message.write_text("subject\n", encoding="utf-8")
+
+    with dispatched_without_git(project):
+        result = git_run(["-c", f"trailer.s.cmd=touch '{marker}' #",
+                          "interpret-trailers", "--trailer", "s=x",
+                          str(message)], elsewhere)
+
+    assert not marker.exists()
+    assert COMMAND_LINE_REFUSED in result.stderr
+
+
+def test_a_non_command_submodule_setting_is_not_a_command_key() -> None:
+    """``submodule.recurse`` is a pinned boolean, not a per-submodule
+    ``update`` command; only ``submodule.<name>.update`` is read as one."""
+    assert git_ops._is_command_config_key("submodule.x.update")
+    assert not git_ops._is_command_config_key("submodule.recurse")
+    assert not git_ops._is_command_config_key("trailer.s.key")
+
+
 def test_an_included_file_still_reads_while_no_project_is_recorded(
     repository: Path, tmp_path: Path,
 ) -> None:

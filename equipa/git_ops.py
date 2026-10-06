@@ -1374,6 +1374,9 @@ _COMMAND_CONFIG_KEYS: frozenset[str] = frozenset({
     "core.askpass", "core.gitproxy", "core.fsmonitor",
     "core.alternaterefscommand", "diff.external", "credential.helper",
     "uploadpack.packobjectshook",
+    # IR83-03 (task #3187): further keys real git ran a command line from.
+    "gpg.ssh.defaultkeycommand", "interactive.difffilter",
+    "sendemail.tocmd", "sendemail.cccmd", "sendemail.headercmd",
 })
 # ``<section>.<subsection>.<name>`` keys of the same kind, as (section, name);
 # ``pager.<command>`` is the one two-part family.
@@ -1383,6 +1386,13 @@ _COMMAND_CONFIG_SUBSECTION_KEYS: frozenset[tuple[str, str]] = frozenset({
     ("merge", "driver"), ("difftool", "cmd"), ("mergetool", "cmd"),
     ("credential", "helper"),
     ("remote", "uploadpack"), ("remote", "receivepack"),
+    # IR83-03 (task #3187): ``trailer.<token>.cmd`` runs on commit --trailer
+    # and interpret-trailers, ``submodule.<name>.update=!cmd`` on submodule
+    # update, ``remote.<name>.vcs`` names a remote-helper program, and
+    # ``sendemail.<identity>.toCmd`` runs on send-email.
+    ("trailer", "cmd"), ("trailer", "command"), ("submodule", "update"),
+    ("remote", "vcs"),
+    ("sendemail", "tocmd"), ("sendemail", "cccmd"), ("sendemail", "headercmd"),
 })
 _COMMAND_ENV_KEYS: tuple[str, ...] = (
     "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EDITOR",
