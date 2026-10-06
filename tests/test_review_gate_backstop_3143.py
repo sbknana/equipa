@@ -46,7 +46,13 @@ from equipa.security_gate import (
     review_complete_line,
     reviewer_nonce_line,
 )
-from tests.host_timing import InputTooLarge, assert_linear_time
+from tests.host_timing import (
+    DETECTION_FLOOR_SECONDS,
+    GROWTH,
+    InputTooLarge,
+    assert_linear_time,
+    next_quarter_size,
+)
 from tests.review_gate_production import (
     decision_and_analysis,
     production_seconds,
@@ -790,17 +796,33 @@ def family_review_seconds(name, rb):
 def test_a_family_grown_past_the_gate_cap_is_decided_at_the_last_size():
     """Task 3178: under load the growth check grew a 200 KB family to 3.2 MB,
     where the code-point families raised ValueError (chr() out of range)
-    and the gate refused the artifact. Readings fixed to force that growth:
-    the check stops at 800 KB and decides there."""
-    readings = {RB // 4: 0.004, RB: 0.016, RB * 4: 0.064}
+    and the gate refused the artifact. A size over the cap is now
+    InputTooLarge before the family is built, and the check decides at
+    the last size the shape exists at, against main's floor. Readings
+    fixed to force that growth at a 400 KB test size: the scaled step
+    (600 KB, 2.4 MB) passes the cap, so the check takes the 4x step
+    (400 KB, 1.6 MB), whose next step (1.6 MB, 6.4 MB) passes it too."""
+    size = 2 * RB
+    larger_reading = 0.016
+    scaled_quarter = next_quarter_size(size, larger_reading, size * GROWTH)
+    readings = {size // GROWTH: 0.004, size: larger_reading,
+                scaled_quarter: 0.024, size * GROWTH: 0.064}
+    refused = []
 
     def seconds_at(rb):
         if rb in readings:
             return readings[rb]
-        return family_review_seconds("high_nl", rb)
+        try:
+            return family_review_seconds("high_nl", rb)
+        except InputTooLarge:
+            refused.append(rb)
+            raise
 
-    timing = assert_linear_time(seconds_at, RB, 0.5, "high_nl")
-    assert (timing.small_size, timing.size) == (RB, RB * 4)
+    timing = assert_linear_time(seconds_at, size, 0.5, "high_nl")
+    assert refused == [scaled_quarter * GROWTH, size * GROWTH ** 2]
+    assert all(rb > MAX_REVIEW_ARTIFACT_BYTES for rb in refused)
+    assert (timing.small_size, timing.size) == (size, size * GROWTH)
+    assert timing.floor_seconds == DETECTION_FLOOR_SECONDS
     with pytest.raises(InputTooLarge):
         family_review_seconds("distinct_code_points", RB * 16)
 
