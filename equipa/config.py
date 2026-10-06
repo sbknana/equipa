@@ -299,11 +299,15 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
 
     * a fail-closed gate (``FAIL_CLOSED_FEATURE_FLAGS``) the host config
       (:func:`host_dispatch_config_path`) has on stays on, with the host's
-      ``agent_isolation`` section unless the per-run file has its own. A
-      per-run config may turn such a gate on, never off, and a missing
-      per-run file does not turn it off either (review F1);
+      ``agent_isolation`` section unless the per-run file has its own (an
+      empty section is not, IR87-07). A per-run config may turn such a gate
+      on, never off, and a missing per-run file does not turn it off either
+      (review F1);
+    * the security review the host config has on stays on (IR87-05);
     * the host's ``path_translations`` stay, and a per-run file may only add
-      prefixes the host does not map (IR83-01);
+      prefixes the host does not map (IR83-01). The prefixes it adds are
+      recorded (``PER_RUN_TRANSLATIONS_KEY``) and never widen the scaffold's
+      mkdir allowlist (IR87-04, :func:`scaffold_root_targets`);
     * the host's MCP trust lists (``HOST_TRUST_LIST_KEYS``) stay, and a
       per-run file may only add entries (IR87-01);
     * host layout keys (``HOST_LAYOUT_KEYS``) the per-run file does not set
@@ -313,6 +317,8 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
         return _read_dispatch_config(default_dispatch_config_path())
     filepath = Path(filepath)
     config = _read_dispatch_config(filepath)
+    # Only the carry below records which entries a per-run file added.
+    config.pop(PER_RUN_TRANSLATIONS_KEY, None)
     _carry_host_settings(config, filepath)
     return config
 
@@ -364,16 +370,57 @@ def _carry_host_settings(config: dict, per_run_path: Path) -> None:
     host = _read_dispatch_config(host_path)
     for gate in sorted(FAIL_CLOSED_FEATURE_FLAGS):
         _carry_host_gate(config, host, gate, per_run_path, host_path)
-    if (is_feature_enabled(host, AGENT_ISOLATION_KEY)
-            and AGENT_ISOLATION_KEY not in config
-            and AGENT_ISOLATION_KEY in host):
-        config[AGENT_ISOLATION_KEY] = _json_copy(host[AGENT_ISOLATION_KEY])
+    _carry_host_security_review(config, host, per_run_path, host_path)
+    _carry_host_isolation_section(config, host, per_run_path, host_path)
     _carry_host_path_translations(config, host, per_run_path, host_path)
     for key in HOST_TRUST_LIST_KEYS:
         _carry_host_list(config, host, key, per_run_path)
     for key in HOST_LAYOUT_KEYS:
         if key not in config and key in host:
             config[key] = _json_copy(host[key])
+
+
+def _carry_host_security_review(config: dict, host: dict,
+                                per_run_path: Path, host_path: Path) -> None:
+    """Keep the security review on when the host config has it on (IR87-05,
+    task #3189): a per-run file may turn it on, never off, by the top-level
+    ``security_review`` or by ``features.security_review``. The CLI's
+    ``--no-security-review`` still decides for its own run."""
+    if (not is_security_review_enabled(None, host)
+            or is_security_review_enabled(None, config)):
+        return
+    logger.warning(
+        "dispatch config '%s' turns the security review off, but the host "
+        "config '%s' has it on; a per-run config cannot turn the security "
+        "review off", per_run_path, host_path,
+    )
+    config["security_review"] = True
+    features = config.get("features")
+    # Features that are not an object leave the flag at its default (on).
+    if isinstance(features, dict):
+        config["features"] = {**features, "security_review": True}
+
+
+def _carry_host_isolation_section(config: dict, host: dict,
+                                  per_run_path: Path, host_path: Path) -> None:
+    """The host's ``agent_isolation`` settings when the host has isolation
+    on and the per-run file has no settings of its own. An empty or
+    non-object per-run section is not settings of its own (IR87-07, task
+    #3189): it used to replace the host's section."""
+    host_section = host.get(AGENT_ISOLATION_KEY)
+    if (not is_feature_enabled(host, AGENT_ISOLATION_KEY)
+            or not isinstance(host_section, dict) or not host_section):
+        return
+    own = config.get(AGENT_ISOLATION_KEY, None)
+    if isinstance(own, dict) and own:
+        return
+    if AGENT_ISOLATION_KEY in config:
+        logger.warning(
+            "dispatch config '%s': %r is %r, which holds no settings; using "
+            "the host config '%s' section", per_run_path, AGENT_ISOLATION_KEY,
+            own, host_path,
+        )
+    config[AGENT_ISOLATION_KEY] = _json_copy(host_section)
 
 
 def _carry_host_list(config: dict, host: dict, key: str,
@@ -443,9 +490,12 @@ def _carry_host_path_translations(config: dict, host: dict,
     are also the scaffold's mkdir allowlist (equipa.scaffold).
     """
     host_entries = host.get(PATH_TRANSLATIONS_KEY)
-    if not isinstance(host_entries, list) or not host_entries:
-        return
+    if not isinstance(host_entries, list):
+        host_entries = []
     own = config.get(PATH_TRANSLATIONS_KEY)
+    if not host_entries and not isinstance(own, list):
+        # Nothing to carry, and nothing the per-run file adds is usable.
+        return
     if own is None:
         own = []
     elif not isinstance(own, list):
@@ -474,6 +524,8 @@ def _carry_host_path_translations(config: dict, host: dict,
             continue
         kept.append(entry)
     config[PATH_TRANSLATIONS_KEY] = _json_copy(host_entries) + _json_copy(kept)
+    if kept:
+        config[PER_RUN_TRANSLATIONS_KEY] = _json_copy(kept)
 
 
 def _read_dispatch_config(filepath: Path) -> dict:
@@ -742,6 +794,9 @@ def get_persistent_retry_max_attempts(dispatch_config: dict | None = None) -> in
 # DB ``local_path`` into a directory goes through translate_local_path().
 
 PATH_TRANSLATIONS_KEY = "path_translations"
+# Set by load_dispatch_config on a per-run config: the path_translations
+# entries the per-run file added over the host config's (IR87-04).
+PER_RUN_TRANSLATIONS_KEY = "_per_run_path_translations"
 _PATH_SEPARATORS = "/\\"
 
 
@@ -806,6 +861,35 @@ def configured_path_translations(
         pair for pair in map(_valid_path_translation, raw) if pair is not None
     ]
     return sorted(translations, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def scaffold_root_targets(dispatch_config: dict | None = None) -> list[str]:
+    """The ``to`` prefixes under which a scaffold clone may be created.
+
+    Every usable ``path_translations`` target except those of the entries a
+    per-run config added over the host config's (IR87-04, task #3189): a
+    per-run file may map a new prefix, but it cannot widen where
+    :mod:`equipa.scaffold` creates directories (``{"from": "Q:", "to":
+    "/"}`` would have allowed any absolute path). A record of added entries
+    that is not a list trusts no target.
+    """
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    if not isinstance(config, dict):
+        return []
+    added = config.get(PER_RUN_TRANSLATIONS_KEY, [])
+    if not isinstance(added, list):
+        logger.error("dispatch config %r is %r, not a list; no scaffold root "
+                     "is taken from %r", PER_RUN_TRANSLATIONS_KEY, added,
+                     PATH_TRANSLATIONS_KEY)
+        return []
+    raw = config.get(PATH_TRANSLATIONS_KEY)
+    if added and isinstance(raw, list):
+        raw = [entry for entry in raw if entry not in added]
+    host_only = {PATH_TRANSLATIONS_KEY: raw}
+    return [target for _source, target in configured_path_translations(host_only)]
 
 
 def translate_local_path(

@@ -38,7 +38,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
-from equipa.config import configured_path_translations, is_drive_letter_path
+from equipa.config import is_drive_letter_path, scaffold_root_targets
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,9 @@ def _is_placeholder_name(name: str) -> bool:
 # ``mkdir(parents=True)`` into materialising ``/etc/evil``. The roots are the
 # ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` env var (colon-separated) when set,
 # otherwise the ``to`` prefixes of ``path_translations`` (the share mounts
-# DB paths are translated into). With neither, every clone is refused.
+# DB paths are translated into), without the entries a per-run dispatch
+# config added over the host's (IR87-04, equipa.config.scaffold_root_targets).
+# With neither, every clone is refused.
 
 
 class ScaffoldCloneError(RuntimeError):
@@ -104,7 +106,7 @@ def _allowed_roots() -> tuple[Path, ...]:
             return parsed
     return tuple(
         Path(target).resolve(strict=False)
-        for _source, target in configured_path_translations()
+        for target in scaffold_root_targets()
     )
 
 
