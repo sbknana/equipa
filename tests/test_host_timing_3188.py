@@ -23,6 +23,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import random
 import time
 from types import SimpleNamespace
 from typing import Callable, Mapping, Sequence
@@ -298,6 +299,49 @@ def test_a_per_unit_pair_is_confirmed_too():
                                                 .PER_UNIT_OVER_RETRIES)
                  + [0.068]}), (50, 200), 10.0, "settling burst")
     assert settled[200] == pytest.approx(0.068)
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_every_verdict_agrees_with_the_readings_it_keeps(seed):
+    """Two parts over the limit, confirmed on noisy readings (seeded): each
+    larger reading anywhere from linear to quadratic, each quarter reading
+    sometimes loaded, so the quarter's fastest reading falls between rounds
+    and recounts a round decided earlier. Whatever the readings, every part
+    has a strict majority one way, fails exactly when confirmed, and keeps
+    readings that agree with its verdict: a confirmed part its settled
+    ones (over the limit), a cleared part a round under the limit."""
+    rng = random.Random(seed)
+    quiet = {"a": 0.030, "b": 0.025}
+    settled_small = {part: seconds * 1.3 for part, seconds in quiet.items()}
+    settled_large = {"a": 0.48, "b": 0.30}
+    pair = host_timing._Pair(QUARTER, SIZE, 1.0, GROWTH_FLOOR_SECONDS)
+
+    def measure(size: int) -> dict[str, float]:
+        if size == QUARTER:
+            return {part: seconds * rng.choice((1.0, 1.1, 1.3, 2.0))
+                    for part, seconds in quiet.items()}
+        return {part: seconds * rng.uniform(3.5, 18.0)
+                for part, seconds in quiet.items()}
+
+    assert all(host_timing.growth_ratio(settled_small[part],
+                                        settled_large[part]) >= GROWTH_LIMIT
+               for part in quiet)
+    small, large, still_over, confirmations = host_timing._confirmed(
+        measure, pair, settled_small, settled_large, list(quiet))
+
+    assert set(confirmations) == set(quiet)
+    assert len({verdict.rounds for verdict in confirmations.values()}) == 1
+    for part, verdict in confirmations.items():
+        assert CONFIRM_MAJORITY <= verdict.rounds <= CONFIRM_ROUNDS
+        assert 2 * verdict.rounds_over != verdict.rounds, verdict
+        assert (part in still_over) is verdict.confirmed
+        assert small[part] <= settled_small[part]
+        ratio = host_timing.growth_ratio(small[part], large[part])
+        if verdict.confirmed:
+            assert large[part] == settled_large[part]
+            assert ratio >= GROWTH_LIMIT
+        else:
+            assert ratio < GROWTH_LIMIT, (part, verdict, small, large)
 
 
 # --- Cost ---------------------------------------------------------------------------
