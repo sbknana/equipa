@@ -76,7 +76,7 @@ Overlays are agent instructions in a repo that agents can write, so they are con
   sources only, never from `refs/remotes/origin/HEAD` or the checked-out `HEAD`, because any agent
   worktree can repoint those:
   1. `project_default_branches` in `dispatch_config.json`, e.g.
-     `{"project_default_branches": {"/srv/forge-share/AI_Stuff/HomeNetwork": "main"}}`. The value
+     `{"project_default_branches": {"/srv/share/HomeNetwork": "main"}}`. The value
      must be a plain branch name that exists as `refs/heads/<name>`. `forge-task-*` is rejected.
   2. Otherwise, exactly one of `main` / `master` must exist. If both exist, or neither does, the
      choice is ambiguous and it **fails closed**. Configure the project explicitly.

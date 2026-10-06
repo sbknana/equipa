@@ -5,7 +5,7 @@
 > copy into Equipa-prod itself; this template lives in source so the list
 > stays version-tracked.
 
-These files exist **only in the production checkout** (`/srv/forge-share/AI_Stuff/Equipa-prod`)
+These files exist **only in the production checkout** (`/srv/share/Equipa-prod`)
 and must never be synced from source. The deploy script snapshots them to
 `/tmp/equipa-prod-snapshot-<timestamp>/` before pulling and restores them
 after, so a `git pull` cannot silently overwrite production-tuned values.
@@ -34,7 +34,7 @@ agree.
 ### `forge_config.json`
 - **What:** map of `project_id` → on-disk `local_path` for each managed
   project, plus other environment-specific orchestrator settings.
-- **Why prod-only:** paths are environment-specific (`/srv/forge-share/...`
+- **Why prod-only:** paths are environment-specific (`/srv/share/...`
   on the prod host vs. developer laptops vs. CI).
 - **Source template:** `forge_config.example.json`
 
@@ -46,7 +46,7 @@ agree.
 
 ### `theforge.db`
 - **What:** symlink to the canonical TheForge SQLite database at
-  `/srv/forge-share/AI_Stuff/TheForge/theforge.db`.
+  `/srv/share/TheForge/theforge.db`.
 - **Why prod-only:** symlink target is environment-specific. A 233 KB
   stale `theforge.db` was previously discovered in the prod dir while
   the live 17 MB DB was elsewhere — that incident is the reason this

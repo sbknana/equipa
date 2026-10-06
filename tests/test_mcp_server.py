@@ -199,7 +199,7 @@ def isolated_db(tmp_path: Path) -> Path:
     The MCP server reads THEFORGE_DB at import time (equipa.constants),
     so the fixture that spawns the server must export this env var BEFORE
     starting the subprocess. Otherwise tests leak rows into the production
-    DB at /srv/forge-share/AI_Stuff/Equipa-repo/theforge.db.
+    DB at /srv/share/Equipa-repo/theforge.db.
     """
     db_path = tmp_path / "theforge.db"
     _build_isolated_db(db_path)

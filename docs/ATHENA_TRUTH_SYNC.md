@@ -117,7 +117,7 @@ gpg --quick-gen-key 'EQUIPA truth-sync bot <athena-bot@forgeborn.dev>' \
 # Capture the long-format fingerprint (40 hex chars, no spaces):
 FPR="$(gpg --list-secret-keys --with-colons athena-bot@forgeborn.dev \
        | awk -F: '/^fpr:/ {print $10; exit}')"
-echo "$FPR" | tee /srv/forge-share/AI_Stuff/Athena/keys/athena-bot.fingerprint
+echo "$FPR" | tee /srv/share/Athena/keys/athena-bot.fingerprint
 
 # Verify git can sign:
 echo "test" | gpg --clearsign -u "$FPR" >/dev/null
@@ -169,7 +169,7 @@ When the bot key reaches expiry or is suspected of compromise:
 ## When it runs
 
 ```cron
-0 5 * * 0 /srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh \
+0 5 * * 0 /srv/share/Equipa-repo/scripts/athena_truth_sync.sh \
     >> /var/log/athena-truth-sync.log 2>&1
 ```
 
@@ -180,7 +180,7 @@ value.
 ## Manual force-run
 
 ```bash
-/srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh
+/srv/share/Equipa-repo/scripts/athena_truth_sync.sh
 ```
 
 The script reads its configuration from environment variables, so a
@@ -188,18 +188,18 @@ dry-run against a scratch checkout looks like:
 
 ```bash
 EQUIPA_REPO=/tmp/equipa-test \
-ATHENA_DIR=/srv/forge-share/AI_Stuff/Athena \
+ATHENA_DIR=/srv/share/Athena \
 THEFORGE_DB=/tmp/forge.db \
 ATHENA_LOCKFILE=/tmp/athena-test.lock \
-/srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh
+/srv/share/Equipa-repo/scripts/athena_truth_sync.sh
 ```
 
 Override env vars:
 
 | Variable                 | Default                                                   |
 |--------------------------|-----------------------------------------------------------|
-| `EQUIPA_REPO`            | `/srv/forge-share/AI_Stuff/Equipa-repo`                   |
-| `ATHENA_DIR`             | `/srv/forge-share/AI_Stuff/Athena`                        |
+| `EQUIPA_REPO`            | `/srv/share/Equipa-repo`                   |
+| `ATHENA_DIR`             | `/srv/share/Athena`                        |
 | `ATHENA_CLI`             | `${ATHENA_DIR}/dist/cli.js`                               |
 | `ATHENA_MODEL`           | `quality`                                                 |
 | `PYTHON_BIN`             | `python3`                                                 |
@@ -207,7 +207,7 @@ Override env vars:
 | `ATHENA_BOT_NAME`        | `EQUIPA truth-sync bot`                                   |
 | `ATHENA_BOT_EMAIL`       | `athena-bot@forgeborn.dev`                                |
 | `ATHENA_LOCKFILE`        | `/tmp/athena-truth-sync.lock`                             |
-| `THEFORGE_DB`            | `/srv/forge-share/AI_Stuff/TheForge/theforge.db`          |
+| `THEFORGE_DB`            | `/srv/share/TheForge/theforge.db`          |
 | `EQUIPA_PROJECT_ID`      | `23`                                                      |
 | `BADGE_DELTA_THRESHOLD`  | `50` (lines changed in README to count as "non-trivial")  |
 
@@ -218,7 +218,7 @@ Comment out the crontab line on Claudinator:
 ```bash
 crontab -e
 # Prefix the line with `#`:
-# 0 5 * * 0 /srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh ...
+# 0 5 * * 0 /srv/share/Equipa-repo/scripts/athena_truth_sync.sh ...
 ```
 
 To remove it entirely:
@@ -257,7 +257,7 @@ gpg --list-secret-keys "$ATHENA_SIGNING_KEY" || exit 1
 # 4. Add the cron entry.
 crontab -l > /tmp/cron.bak
 ( crontab -l; \
-  echo '0 5 * * 0 /srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh >> /var/log/athena-truth-sync.log 2>&1' \
+  echo '0 5 * * 0 /srv/share/Equipa-repo/scripts/athena_truth_sync.sh >> /var/log/athena-truth-sync.log 2>&1' \
 ) | crontab -
 
 # 5. Verify.

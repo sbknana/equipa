@@ -231,87 +231,87 @@ Directory tree of important project files and folders.
 
 ```mermaid
 graph TD
-  srv_forge_share_AI_Stuff_Equipa_repo["Equipa-repo (41)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_benchmarks["benchmarks"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_benchmarks
-  srv_forge_share_AI_Stuff_Equipa_repo_docs["docs (16)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_docs
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_diagrams["diagrams (3)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_docs --> srv_forge_share_AI_Stuff_Equipa_repo_docs_diagrams
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_diagrams_more["3 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_diagrams --> srv_forge_share_AI_Stuff_Equipa_repo_docs_diagrams_more
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_html["html (17)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_docs --> srv_forge_share_AI_Stuff_Equipa_repo_docs_html
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_html_diagrams["diagrams"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_html --> srv_forge_share_AI_Stuff_Equipa_repo_docs_html_diagrams
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_html_more["17 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_html --> srv_forge_share_AI_Stuff_Equipa_repo_docs_html_more
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_README_md["README.md"]:::file
-  srv_forge_share_AI_Stuff_Equipa_repo_docs --> srv_forge_share_AI_Stuff_Equipa_repo_docs_README_md
-  srv_forge_share_AI_Stuff_Equipa_repo_docs_more["15 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_docs --> srv_forge_share_AI_Stuff_Equipa_repo_docs_more
-  srv_forge_share_AI_Stuff_Equipa_repo_equipa["equipa (37)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_equipa
-  srv_forge_share_AI_Stuff_Equipa_repo_equipa_more["37 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_equipa --> srv_forge_share_AI_Stuff_Equipa_repo_equipa_more
-  srv_forge_share_AI_Stuff_Equipa_repo_hooks["hooks (2)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_hooks
-  srv_forge_share_AI_Stuff_Equipa_repo_hooks_more["2 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_hooks --> srv_forge_share_AI_Stuff_Equipa_repo_hooks_more
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts["prompts (19)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_prompts
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts_languages["languages (7)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts --> srv_forge_share_AI_Stuff_Equipa_repo_prompts_languages
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts_languages_more["7 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts_languages --> srv_forge_share_AI_Stuff_Equipa_repo_prompts_languages_more
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts_more["19 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_prompts --> srv_forge_share_AI_Stuff_Equipa_repo_prompts_more
-  srv_forge_share_AI_Stuff_Equipa_repo_scratch["scratch (1)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_scratch
-  srv_forge_share_AI_Stuff_Equipa_repo_scratch_more["1 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_scratch --> srv_forge_share_AI_Stuff_Equipa_repo_scratch_more
-  srv_forge_share_AI_Stuff_Equipa_repo_scripts["scripts (11)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_scripts
-  srv_forge_share_AI_Stuff_Equipa_repo_scripts_more["11 more files"]:::meta
-  srv_forge_share_AI_Stuff_Equipa_repo_scripts --> srv_forge_share_AI_Stuff_Equipa_repo_scripts_more
-  srv_forge_share_AI_Stuff_Equipa_repo_skills["skills"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo --> srv_forge_share_AI_Stuff_Equipa_repo_skills
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer["code-reviewer (1)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills --> srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer_skills["skills"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer --> srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer_skills
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer_README_md["README.md"]:::file
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer --> srv_forge_share_AI_Stuff_Equipa_repo_skills_code_reviewer_README_md
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger["debugger (1)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills --> srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger_skills["skills"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger --> srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger_skills
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger_README_md["README.md"]:::file
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger --> srv_forge_share_AI_Stuff_Equipa_repo_skills_debugger_README_md
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_developer["developer (1)"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills --> srv_forge_share_AI_Stuff_Equipa_repo_skills_developer
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_developer_skills["skills"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_developer --> srv_forge_share_AI_Stuff_Equipa_repo_skills_developer_skills
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_developer_README_md["README.md"]:::file
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_developer --> srv_forge_share_AI_Stuff_Equipa_repo_skills_developer_README_md
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security["security"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_audit_context_building["audit-context-building"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_audit_context_building
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_differential_review["differential-review"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_differential_review
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_fix_review["fix-review"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_fix_review
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_semgrep_rule_creator["semgrep-rule-creator"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_semgrep_rule_creator
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_sharp_edges["sharp-edges"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_sharp_edges
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_static_analysis["static-analysis"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_static_analysis
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_variant_analysis["variant-analysis"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_variant_analysis
-  srv_forge_share_AI_Stuff_Equipa_repo_skills_security_reviewer["security-reviewer"]:::dir
-  srv_forge_share_AI_Stuff_Equipa_repo_skills --> srv_forge_share_AI_Stuff_Equipa_repo_skills_security_reviewer
+  equipa_repo["Equipa-repo (41)"]:::dir
+  equipa_repo_benchmarks["benchmarks"]:::dir
+  equipa_repo --> equipa_repo_benchmarks
+  equipa_repo_docs["docs (16)"]:::dir
+  equipa_repo --> equipa_repo_docs
+  equipa_repo_docs_diagrams["diagrams (3)"]:::dir
+  equipa_repo_docs --> equipa_repo_docs_diagrams
+  equipa_repo_docs_diagrams_more["3 more files"]:::meta
+  equipa_repo_docs_diagrams --> equipa_repo_docs_diagrams_more
+  equipa_repo_docs_html["html (17)"]:::dir
+  equipa_repo_docs --> equipa_repo_docs_html
+  equipa_repo_docs_html_diagrams["diagrams"]:::dir
+  equipa_repo_docs_html --> equipa_repo_docs_html_diagrams
+  equipa_repo_docs_html_more["17 more files"]:::meta
+  equipa_repo_docs_html --> equipa_repo_docs_html_more
+  equipa_repo_docs_README_md["README.md"]:::file
+  equipa_repo_docs --> equipa_repo_docs_README_md
+  equipa_repo_docs_more["15 more files"]:::meta
+  equipa_repo_docs --> equipa_repo_docs_more
+  equipa_repo_equipa["equipa (37)"]:::dir
+  equipa_repo --> equipa_repo_equipa
+  equipa_repo_equipa_more["37 more files"]:::meta
+  equipa_repo_equipa --> equipa_repo_equipa_more
+  equipa_repo_hooks["hooks (2)"]:::dir
+  equipa_repo --> equipa_repo_hooks
+  equipa_repo_hooks_more["2 more files"]:::meta
+  equipa_repo_hooks --> equipa_repo_hooks_more
+  equipa_repo_prompts["prompts (19)"]:::dir
+  equipa_repo --> equipa_repo_prompts
+  equipa_repo_prompts_languages["languages (7)"]:::dir
+  equipa_repo_prompts --> equipa_repo_prompts_languages
+  equipa_repo_prompts_languages_more["7 more files"]:::meta
+  equipa_repo_prompts_languages --> equipa_repo_prompts_languages_more
+  equipa_repo_prompts_more["19 more files"]:::meta
+  equipa_repo_prompts --> equipa_repo_prompts_more
+  equipa_repo_scratch["scratch (1)"]:::dir
+  equipa_repo --> equipa_repo_scratch
+  equipa_repo_scratch_more["1 more files"]:::meta
+  equipa_repo_scratch --> equipa_repo_scratch_more
+  equipa_repo_scripts["scripts (11)"]:::dir
+  equipa_repo --> equipa_repo_scripts
+  equipa_repo_scripts_more["11 more files"]:::meta
+  equipa_repo_scripts --> equipa_repo_scripts_more
+  equipa_repo_skills["skills"]:::dir
+  equipa_repo --> equipa_repo_skills
+  equipa_repo_skills_code_reviewer["code-reviewer (1)"]:::dir
+  equipa_repo_skills --> equipa_repo_skills_code_reviewer
+  equipa_repo_skills_code_reviewer_skills["skills"]:::dir
+  equipa_repo_skills_code_reviewer --> equipa_repo_skills_code_reviewer_skills
+  equipa_repo_skills_code_reviewer_README_md["README.md"]:::file
+  equipa_repo_skills_code_reviewer --> equipa_repo_skills_code_reviewer_README_md
+  equipa_repo_skills_debugger["debugger (1)"]:::dir
+  equipa_repo_skills --> equipa_repo_skills_debugger
+  equipa_repo_skills_debugger_skills["skills"]:::dir
+  equipa_repo_skills_debugger --> equipa_repo_skills_debugger_skills
+  equipa_repo_skills_debugger_README_md["README.md"]:::file
+  equipa_repo_skills_debugger --> equipa_repo_skills_debugger_README_md
+  equipa_repo_skills_developer["developer (1)"]:::dir
+  equipa_repo_skills --> equipa_repo_skills_developer
+  equipa_repo_skills_developer_skills["skills"]:::dir
+  equipa_repo_skills_developer --> equipa_repo_skills_developer_skills
+  equipa_repo_skills_developer_README_md["README.md"]:::file
+  equipa_repo_skills_developer --> equipa_repo_skills_developer_README_md
+  equipa_repo_skills_security["security"]:::dir
+  equipa_repo_skills --> equipa_repo_skills_security
+  equipa_repo_skills_security_audit_context_building["audit-context-building"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_audit_context_building
+  equipa_repo_skills_security_differential_review["differential-review"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_differential_review
+  equipa_repo_skills_security_fix_review["fix-review"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_fix_review
+  equipa_repo_skills_security_semgrep_rule_creator["semgrep-rule-creator"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_semgrep_rule_creator
+  equipa_repo_skills_security_sharp_edges["sharp-edges"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_sharp_edges
+  equipa_repo_skills_security_static_analysis["static-analysis"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_static_analysis
+  equipa_repo_skills_security_variant_analysis["variant-analysis"]:::dir
+  equipa_repo_skills_security --> equipa_repo_skills_security_variant_analysis
+  equipa_repo_skills_security_reviewer["security-reviewer"]:::dir
+  equipa_repo_skills --> equipa_repo_skills_security_reviewer
   classDef dir fill:#e8f4f8,stroke:#2196F3,stroke-width:2px
   classDef file fill:#fff,stroke:#666
   classDef meta fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
