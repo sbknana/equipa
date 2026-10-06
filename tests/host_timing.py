@@ -673,8 +673,9 @@ class Confirmation:
 
     @property
     def confirmed(self) -> bool:
-        """A majority of the rounds read over the limit."""
-        return 2 * self.rounds_over > self.rounds
+        """A majority of the rounds read over the limit, or no round was
+        read (fail closed: no evidence clears a pair)."""
+        return self.rounds == 0 or 2 * self.rounds_over > self.rounds
 
     def describe(self) -> str:
         verdict = "confirmed" if self.confirmed else "not confirmed"

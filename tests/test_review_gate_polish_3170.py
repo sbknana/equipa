@@ -33,6 +33,8 @@ import pytest
 from equipa import loops
 from tests import test_review_gate_linear_3167 as linear_3167
 from tests.host_timing import (
+    CONFIRM_MAJORITY,
+    CONFIRM_READINGS,
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
@@ -532,13 +534,15 @@ def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
 def test_a_burst_over_every_reading_of_the_larger_size_still_fails(unloaded):
     """Settling is not a pass: linear-looking work whose larger size reads
     2.04x per unit on every one of its readings fails, after
-    PER_UNIT_OVER_RETRIES interleaved rounds."""
+    PER_UNIT_OVER_RETRIES interleaved rounds and the CONFIRM_MAJORITY
+    confirming rounds (task 3188) it reads over the limit in."""
     work = ScriptedPerUnit({50: [0.067], 200: [0.137], 2048: [0.068]})
 
     with pytest.raises(TimingCheckFailed, match="fastest of 5 interleaved"):
         assert_linear_per_unit(work, CI_SHAPE_KILOBYTES, 0.5, "burst")
 
-    assert work.calls == [50, 200] * (1 + PER_UNIT_OVER_RETRIES)
+    assert work.calls == ([50, 200] * (1 + PER_UNIT_OVER_RETRIES)
+                          + [50, 200] * (CONFIRM_MAJORITY * CONFIRM_READINGS))
 
 
 @pytest.mark.parametrize("quarter_burst", [1.0, 2.0, 2.5, 3.0])

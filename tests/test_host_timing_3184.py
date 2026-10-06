@@ -28,6 +28,8 @@ from tests import host_timing
 from tests.host_timing import (
     BORDERLINE_GROWTH,
     BORDERLINE_RETRIES,
+    CONFIRM_MAJORITY,
+    CONFIRM_READINGS,
     GROWTH,
     GROWTH_LIMIT,
     GROWTH_RETRIES,
@@ -65,6 +67,16 @@ def _scripted(readings: Mapping[int, Sequence[float]],
     return seconds_at
 
 
+def _confirming(small_size: int, size: int, repetitions: int = 1) -> list[int]:
+    """The calls of the confirming rounds of a pair over the limit in every
+    round (task 3188): ``CONFIRM_MAJORITY`` rounds of ``CONFIRM_READINGS``
+    interleaved readings, each ``repetitions`` runs of each size (scripted
+    readings cost no wall time, and a quarter reading of 5 ms or more over
+    ``repetitions`` runs totals the floor in three readings)."""
+    return ([small_size, size]
+            * (repetitions * CONFIRM_READINGS * CONFIRM_MAJORITY))
+
+
 def test_the_band_lies_between_linear_and_quadratic_growth():
     assert GROWTH < BORDERLINE_GROWTH < GROWTH_LIMIT < GROWTH ** 2
     assert BORDERLINE_RETRIES > GROWTH_RETRIES
@@ -86,8 +98,12 @@ def test_the_regression_ci_read_under_load_fails_on_its_fastest_readings():
     assert (f"each the fastest of {1 + BORDERLINE_RETRIES} interleaved "
             f"readings" in message)
     assert f"{QUIET_QUARTER:.4f} s at size {QUARTER}" in message
-    # Each size measured again, the quarter first, the two alternating.
-    assert calls == [QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
+    assert (f"confirmed: over the limit in {CONFIRM_MAJORITY} of "
+            f"{CONFIRM_MAJORITY} confirming rounds" in message)
+    # Each size measured again, the quarter first, the two alternating;
+    # then the confirming rounds, alternating the same way.
+    assert calls == ([QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
+                     + _confirming(QUARTER, SIZE))
 
 
 def test_a_part_hidden_by_a_loaded_quarter_fails_beside_a_linear_part():
@@ -104,7 +120,8 @@ def test_a_part_hidden_by_a_loaded_quarter_fails_beside_a_linear_part():
     with pytest.raises(TimingCheckFailed, match="parts: hidden") as failure:
         assert_linear_times(seconds_at, SIZE, 10.0, "parts")
     assert "parts: linear" not in str(failure.value)
-    assert calls == [QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
+    assert calls == ([QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
+                     + _confirming(QUARTER, SIZE))
 
 
 @pytest.mark.parametrize("larger_readings", (
@@ -142,12 +159,15 @@ def test_linear_work_out_of_the_band_is_measured_once():
 
 def test_quadratic_work_over_the_limit_is_measured_again_as_often_as_before():
     """A regression over the limit from its first readings costs what it
-    did on main: GROWTH_RETRIES more readings of each size."""
+    did on main: GROWTH_RETRIES more readings of each size; then the
+    ``CONFIRM_MAJORITY`` confirming rounds it reads over the limit in
+    (task 3188), and no more."""
     calls: list[int] = []
     with pytest.raises(TimingCheckFailed, match="superlinear growth"):
         assert_linear_time(_scripted({QUARTER: (0.03,), SIZE: (0.48,)}, calls),
                            SIZE, 10.0, "quadratic")
-    assert calls == [QUARTER, SIZE] * (1 + GROWTH_RETRIES)
+    assert calls == ([QUARTER, SIZE] * (1 + GROWTH_RETRIES)
+                     + _confirming(QUARTER, SIZE))
 
 
 def test_a_ratio_against_the_floor_is_not_measured_again():
@@ -179,7 +199,8 @@ def test_the_own_pairs_repetitions_alternate_between_the_sizes():
         assert_linear_time(
             _scripted({QUARTER: (0.005,), SIZE: (0.08,)}, calls), SIZE,
             10.0, "cheap quadratic")
-    assert calls == [QUARTER, SIZE] * (repetitions * (1 + GROWTH_RETRIES))
+    assert calls == ([QUARTER, SIZE] * (repetitions * (1 + GROWTH_RETRIES))
+                     + _confirming(QUARTER, SIZE, repetitions))
     assert "each the fastest of 3 interleaved readings" in str(failure.value)
 
 
@@ -207,7 +228,8 @@ def test_a_grown_pair_hidden_by_a_loaded_quarter_fails():
     assert "at 4x the test's input" in message
     assert (f"each the fastest of {1 + BORDERLINE_RETRIES} interleaved "
             f"readings" in message)
-    assert calls == GROWN_PAIR_CALLS
+    # Confirmed at the grown pair's own sizes, not past them.
+    assert calls == GROWN_PAIR_CALLS + _confirming(SIZE, GROWN)
 
 
 def test_a_settled_grown_pair_is_not_measured_again_where_growth_stops():
