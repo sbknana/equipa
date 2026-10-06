@@ -25,8 +25,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import os
+import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -569,75 +571,302 @@ def _called_name(function: ast.expr, imported: dict[str, str]) -> str | None:
     return ".".join(reversed(parts))
 
 
-class _GitNaming:
-    """Decides whether an expression names git or gh as the program to
-    start, following the names a module binds to one."""
+# Programs that start another program their own arguments name: ``env git
+# -C P``, ``sh -c "cd P && git diff"``, ``python3 -c "..."``. Such a start
+# is proven not to start git only when every later argument is a known
+# string holding no git word (IR76-02, task #3178).
+WRAPPER_PROGRAMS = frozenset({
+    "env", "sh", "bash", "dash", "zsh", "ksh", "fish", "busybox", "cmd", "cmd.exe",
+    "powershell", "powershell.exe", "pwsh", "timeout", "nice", "nohup", "ionice",
+    "chrt", "taskset", "setsid", "stdbuf", "sudo", "doas", "su", "runuser", "xargs",
+    "flock", "script", "systemd-run", "unshare", "nsenter", "bwrap", "firejail",
+    "strace", "ltrace", "time", "watch", "parallel", "python", "python3", "uv", "uvx",
+})
+# The stand-in for a value the fence cannot resolve to a string.
+UNKNOWN = None
+# Where each starter takes its program and arguments: the positional index
+# of the argv (a list), of the program (a string), of the first of the
+# separate argument strings, or of a shell command line.
+_ARGV, _PROGRAM, _REST, _COMMAND_LINE = "argv", "program", "rest", "command line"
+STARTER_ARGUMENTS: dict[str, tuple[tuple[str, int], ...]] = {
+    **{f"subprocess.{name}": ((_ARGV, 0),)
+       for name in ("run", "Popen", "call", "check_call", "check_output")},
+    **{f"subprocess.{name}": ((_COMMAND_LINE, 0),)
+       for name in ("getoutput", "getstatusoutput")},
+    **{f"{module}.create_subprocess_exec": ((_PROGRAM, 0), (_REST, 1))
+       for module in ("asyncio", "asyncio.subprocess")},
+    **{f"{module}.create_subprocess_shell": ((_COMMAND_LINE, 0),)
+       for module in ("asyncio", "asyncio.subprocess")},
+    "os.system": ((_COMMAND_LINE, 0),),
+    "os.popen": ((_COMMAND_LINE, 0),),
+    "os.posix_spawn": ((_PROGRAM, 0), (_ARGV, 1)),
+    "os.posix_spawnp": ((_PROGRAM, 0), (_ARGV, 1)),
+    **{f"os.{name}": ((_PROGRAM, 0), (_ARGV, 1))
+       for name in ("execv", "execve", "execvp", "execvpe")},
+    **{f"os.{name}": ((_PROGRAM, 0), (_REST, 1))
+       for name in ("execl", "execle", "execlp", "execlpe")},
+    **{f"os.{name}": ((_PROGRAM, 1), (_ARGV, 2))
+       for name in ("spawnv", "spawnve", "spawnvp", "spawnvpe")},
+    **{f"os.{name}": ((_PROGRAM, 1), (_REST, 2))
+       for name in ("spawnl", "spawnle", "spawnlp", "spawnlpe")},
+    "subprocess_exec": ((_PROGRAM, 1), (_REST, 2)),
+    "subprocess_shell": ((_COMMAND_LINE, 1),),
+}
+# Keyword arguments that hand a starter its argv or its program.
+_ARGV_KEYWORDS = frozenset({"args"})
+_PROGRAM_KEYWORDS = frozenset({"executable", "path", "file", "program"})
+_SHELL_WORD_SEPARATORS = re.compile(r"[\s;&|()<>`$'\"=]+")
+
+
+MAX_ARGVS = 64
+
+
+def _combined(heads: list[list[str | None]],
+              tails: list[list[str | None]]) -> list[list[str | None]]:
+    """Every head followed by every tail; past ``MAX_ARGVS`` combinations
+    the rest is one argv of unknown content (fail closed)."""
+    combined = [head + tail for head in heads for tail in tails]
+    if len(combined) > MAX_ARGVS:
+        return combined[:MAX_ARGVS] + [[UNKNOWN]]
+    return combined
+
+
+def _names_git_word(text: str) -> bool:
+    """Whether any shell word of ``text`` is git or gh (``cd P && git``)."""
+    return any(os.path.basename(word) in GIT_PROGRAMS
+               for word in _SHELL_WORD_SEPARATORS.split(text) if word)
+
+
+@dataclass(frozen=True)
+class ProcessStart:
+    """One call that starts a process, and what the fence proved of it."""
+
+    line: int
+    function: str
+    called: str
+    verdict: str            # "git", "unproven" or "not git"
+
+    def describe(self, filename: str) -> str:
+        what = ("starts git" if self.verdict == "git"
+                else "starts a program the fence cannot prove is not git or gh")
+        return f"{filename}:{self.line}: {self.called} in {self.function} {what}"
+
+
+class _ProcessStartFence:
+    """Classifies each process start of a module: its program is git or gh,
+    cannot be proven not to be ("unproven", fail closed), or is proven not
+    to be. Values are followed through the names the module binds."""
 
     def __init__(self, tree: ast.Module, imported: dict[str, str]) -> None:
         self._imported = imported
-        self._names: set[str] = set()
-        # A name bound to git, to a git argv, or to another such name: bind
-        # until nothing changes, so the order of the assignments is free.
-        assignments = [
-            (target.id, node.value)
-            for node in ast.walk(tree) if isinstance(node, ast.Assign)
-            for target in node.targets if isinstance(target, ast.Name)
-        ]
-        changed = True
-        while changed:
-            changed = False
-            for name, value in assignments:
-                if name not in self._names and (
-                    self.names_git(value, command_line=False) or self._finds_git(value)
-                ):
-                    self._names.add(name)
-                    changed = True
+        self._bindings: dict[str, list[ast.expr]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self._bindings.setdefault(target.id, []).append(value)
+        self._resolving: set[str] = set()
 
-    def _finds_git(self, node: ast.expr) -> bool:
-        """``shutil.which("git")`` and the like."""
-        return (
-            isinstance(node, ast.Call)
-            and _called_name(node.func, self._imported) == "shutil.which"
-            and any(self.names_git(argument, command_line=False) for argument in node.args)
-        )
+    # --- what a call starts -------------------------------------------------------
 
-    def names_git(self, node: ast.expr, *, command_line: bool) -> bool:
-        """True when ``node`` names git or gh: a string that is the program
-        (``git``, ``/usr/bin/git``) or, with ``command_line``, starts with
-        it (``git status``); a list or tuple whose first item names it (an
-        argv); or a name bound to one of those."""
-        if isinstance(node, ast.Starred):
-            return self.names_git(node.value, command_line=command_line)
+    def starter(self, call: ast.Call) -> tuple[str, list[ast.expr], dict[str, ast.expr]] | None:
+        """The starter ``call`` runs and the arguments it hands it; through
+        ``functools.partial`` and names bound to a starter too."""
+        called = self._starter_name(call.func)
+        if called is not None:
+            return called, list(call.args), {k.arg: k.value for k in call.keywords if k.arg}
+        if (_called_name(call.func, self._imported) in ("functools.partial", "partial")
+                and call.args):
+            called = self._starter_name(call.args[0])
+            if called is not None:
+                return (called, list(call.args[1:]),
+                        {k.arg: k.value for k in call.keywords if k.arg})
+        return None
+
+    def _starter_name(self, function: ast.expr, depth: int = 0) -> str | None:
+        called = _called_name(function, self._imported)
+        if called in PROCESS_STARTERS:
+            return called
+        if called is not None and called.rsplit(".", 1)[-1] in LOOP_PROCESS_STARTERS:
+            return called.rsplit(".", 1)[-1]
+        if isinstance(function, ast.Name) and depth < 8:
+            for value in self._bindings.get(function.id, []):
+                found = self._starter_name(value, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    # --- values -------------------------------------------------------------------
+
+    def strings(self, node: ast.expr) -> list[str | None]:
+        """The possible string values of ``node`` (UNKNOWN for one the
+        fence cannot resolve)."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.JoinedStr):
+            known = "".join(part.value for part in node.values
+                            if isinstance(part, ast.Constant))
+            if any(not isinstance(part, ast.Constant) for part in node.values):
+                return [known, UNKNOWN]
+            return [known]
+        if (isinstance(node, ast.Call) and node.args
+                and _called_name(node.func, self._imported) in ("shutil.which", "os.fspath",
+                                                               "str")):
+            return self.strings(node.args[0])
+        if (isinstance(node, ast.Attribute)
+                and _called_name(node, self._imported) == "sys.executable"):
+            return ["python"]
         if isinstance(node, ast.Name):
-            return node.id in self._names
+            return self._through_name(node.id, self.strings, [UNKNOWN])
+        return [UNKNOWN]
+
+    def argvs(self, node: ast.expr) -> list[list[str | None]]:
+        """The possible argvs ``node`` holds (one per combination of the
+        possible values of its items, at most ``MAX_ARGVS``); an argv of
+        unknown length or content holds UNKNOWN."""
         if isinstance(node, (ast.List, ast.Tuple)):
-            return bool(node.elts) and self.names_git(node.elts[0], command_line=False)
-        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
-            return False
-        words = node.value.split() if command_line else [node.value]
-        return bool(words) and os.path.basename(words[0]) in GIT_PROGRAMS
+            argvs: list[list[str | None]] = [[]]
+            for element in node.elts:
+                if isinstance(element, ast.Starred):
+                    options = self.argvs(element.value)
+                else:
+                    options = [[value] for value in self.strings(element)]
+                argvs = _combined(argvs, options)
+            return argvs
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return _combined(self.argvs(node.left), self.argvs(node.right))
+        if (isinstance(node, ast.Call) and len(node.args) == 1
+                and _called_name(node.func, self._imported) in ("list", "tuple")):
+            return self.argvs(node.args[0])
+        if isinstance(node, ast.Name):
+            return self._through_name(node.id, self.argvs, [[UNKNOWN]])
+        return [[UNKNOWN]]
+
+    def _through_name(self, name: str, resolve, unknown):
+        values = self._bindings.get(name)
+        if not values or name in self._resolving:
+            return unknown
+        self._resolving.add(name)
+        try:
+            return [found for value in values for found in resolve(value)]
+        finally:
+            self._resolving.discard(name)
+
+    # --- verdicts -------------------------------------------------------------------
+
+    @staticmethod
+    def _argv_verdict(argv: list[str | None]) -> str:
+        if not argv or argv[0] is UNKNOWN:
+            return "unproven"
+        program = os.path.basename(argv[0])
+        if program in GIT_PROGRAMS:
+            return "git"
+        if program in WRAPPER_PROGRAMS or program.startswith("python"):
+            if any(value is not UNKNOWN and _names_git_word(value) for value in argv[1:]):
+                return "git"
+            if UNKNOWN in argv[1:]:
+                return "unproven"
+        return "not git"
+
+    @staticmethod
+    def _command_line_verdict(texts: list[str | None]) -> str:
+        if any(text is not UNKNOWN and _names_git_word(text) for text in texts):
+            return "git"
+        return "unproven" if UNKNOWN in texts else "not git"
+
+    def verdict(self, called: str, args: list[ast.expr],
+                keywords: dict[str, ast.expr]) -> str:
+        """The worst verdict over every value the start could be given."""
+        layout = dict(STARTER_ARGUMENTS.get(called, ((_ARGV, 0),)))
+        candidates: list[list[str | None]] = []
+        command_lines: list[str | None] = []
+        shell = keywords.get("shell")
+        uses_shell = shell is not None and not (
+            isinstance(shell, ast.Constant) and shell.value in (False, None))
+        if any(isinstance(argument, ast.Starred) for argument in args) and _REST not in layout:
+            # ``run(*argv)``: where each item lands is unknown.
+            return "unproven"
+        if layout.get(_COMMAND_LINE, len(args)) < len(args):
+            command_lines.extend(self.strings(args[layout[_COMMAND_LINE]]))
+        if _REST in layout and layout[_PROGRAM] < len(args):
+            # create_subprocess_exec("git", "status"): program, then arguments.
+            candidates.extend(self.argvs(ast.List(elts=args[layout[_PROGRAM]:],
+                                                  ctx=ast.Load())))
+        elif layout.get(_ARGV, len(args)) < len(args):
+            argvs = self.argvs(args[layout[_ARGV]])
+            if layout.get(_PROGRAM, len(args)) < len(args):
+                # os.execv(path, argv): the program is the path.
+                argvs = _combined([[program] for program in
+                                   self.strings(args[layout[_PROGRAM]])],
+                                  [argv[1:] for argv in argvs])
+            candidates.extend(argvs)
+        for name, node in keywords.items():
+            if name in _ARGV_KEYWORDS:
+                candidates.extend(self.argvs(node))
+            elif name in _PROGRAM_KEYWORDS:
+                candidates.extend([value] for value in self.strings(node))
+        if uses_shell:
+            command_lines.extend(argv[0] for argv in candidates if argv)
+            command_lines.extend(value for argv in candidates for value in argv[1:])
+            candidates = []
+        verdicts = [self._argv_verdict(argv) for argv in candidates]
+        if command_lines:
+            verdicts.append(self._command_line_verdict(command_lines))
+        if not verdicts:
+            return "unproven"
+        for worst in ("git", "unproven"):
+            if worst in verdicts:
+                return worst
+        return "not git"
 
 
-def _git_started_outside_the_runners(source: str, filename: str) -> list[str]:
-    """``filename:line`` of each call in ``source`` that starts a process
-    and is given git or gh as the program: in an argv, as the program
-    argument, or at the start of a command line."""
+def _process_starts(source: str, filename: str) -> list[ProcessStart]:
+    """Every call in ``source`` that starts a process, with the function it
+    is in (``<module>`` at module level) and the fence's verdict on it."""
     tree = ast.parse(source, filename=filename)
     imported = _imported_names(tree)
-    naming = _GitNaming(tree, imported)
-    found: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        called = _called_name(node.func, imported)
-        starts_a_process = called in PROCESS_STARTERS or (
-            called is not None and called.rsplit(".", 1)[-1] in LOOP_PROCESS_STARTERS
-        )
-        if starts_a_process and any(
-            naming.names_git(argument, command_line=True) for argument in node.args
-        ):
-            found.append(f"{filename}:{node.lineno}: {called} starts git")
-    return found
+    fence = _ProcessStartFence(tree, imported)
+    starts: list[ProcessStart] = []
+
+    def visit(node: ast.AST, function: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = function
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = child.name
+            if isinstance(child, ast.Call):
+                started = fence.starter(child)
+                if started is not None:
+                    called, args, keywords = started
+                    starts.append(ProcessStart(child.lineno, inner, called,
+                                               fence.verdict(called, args, keywords)))
+            visit(child, inner)
+
+    visit(tree, "<module>")
+    return starts
+
+
+def _git_started_outside_the_runners(
+    source: str, filename: str, *, allowed_functions: frozenset[str] = frozenset(),
+    unproven_allowed: frozenset[str] = frozenset(),
+) -> list[str]:
+    """``filename:line`` of each call in ``source`` that starts git or gh,
+    or a program the fence cannot prove is not git or gh (fail closed),
+    outside ``allowed_functions`` (the runners). A start in one of
+    ``unproven_allowed`` (functions reviewed in ``UNPROVEN_STARTS``) is
+    accepted when the fence cannot prove its program, never when it proves
+    it is git."""
+    return [
+        start.describe(filename)
+        for start in _process_starts(source, filename)
+        if start.function not in allowed_functions
+        and start.verdict != "not git"
+        and not (start.verdict == "unproven" and start.function in unproven_allowed)
+    ]
 
 
 def _orchestrator_sources() -> list[Path]:
@@ -649,6 +878,54 @@ def _orchestrator_sources() -> list[Path]:
         sources.append(entry_point)
     return sources
 
+
+# Inside git_ops.py only these two functions may start a process: they are
+# the runners the non-git guard lives in (IR76-02: the module itself is no
+# longer exempt, so a new git_ops helper that starts git is found too).
+RUNNER_FUNCTIONS = frozenset({"_run_with_env", "_run_git_process_async"})
+
+# Process starts whose program the fence cannot resolve, each read and
+# found not to start the orchestrator's git or gh in a project. Keyed by
+# (module, function): a new start in one of these functions whose program
+# the fence PROVES is git is still found; one in any other function needs
+# an entry (and a reason) here.
+UNPROVEN_STARTS: dict[tuple[str, str], str] = {
+    ("equipa/agent_launcher.py", "_git"):
+        "the launcher is a separate program (python -I, imports nothing from "
+        "equipa) that git-inits its own session repository under the unit's "
+        "state directory, with GIT_CONFIG_GLOBAL=/dev/null; the orchestrator's "
+        "non-git record cannot reach that process",
+    ("equipa/agent_launcher.py", "_verify_no_scheduler"):
+        "crontab -l / at -l from the fixed _SCHEDULERS paths",
+    ("equipa/agent_launcher.py", "_run_isolated"):
+        "starts the contained agent CLI, the program the launcher exists for",
+    ("equipa/agent_launcher.py", "main"):
+        "execs or spawns the contained agent CLI given by --executable",
+    ("equipa/agent_runner.py", "_gate_canary_ok"):
+        "runs the configured PreToolUse hook command with a canary payload",
+    ("equipa/agent_runner.py", "_spawn_unisolated"):
+        "starts the agent CLI command, or the launcher (sys.executable -I)",
+    ("equipa/generated_files.py", "run_generator"):
+        "sys.executable -I -B <generator script> in the export root (GeneratedFile.argv)",
+    ("equipa/hooks/__init__.py", "run_external_hook"):
+        "an operator-configured external hook command line",
+    ("equipa/hooks/__init__.py", "run_external_hook_async"):
+        "an operator-configured external hook command line",
+    ("equipa/isolation.py", "_spawn_in_slot"):
+        "build_launch_command: the isolation unit launcher for the agent",
+    ("equipa/isolation.py", "_exit_status"):
+        "sudo -n checks of the agent user (sudo -l, nft list table)",
+    ("equipa/isolation.py", "_run_capture"):
+        "sudo -n -l -U <agent user>",
+    ("equipa/mcp_server.py", "_handle_equipa_dispatch"):
+        "starts a detached orchestrator run (sys.executable -m ...)",
+    ("equipa/preflight.py", "_run_install_cmd"):
+        "a detected dependency install command, refused in a task worktree",
+    ("equipa/preflight.py", "preflight_build_check"):
+        "a detected build command, refused in a task worktree",
+    ("equipa/reactive_check.py", "_start_worker"):
+        "the reactive-check worker (sys.executable, the orchestrator's own code)",
+}
 
 HELPERS_THAT_START_GIT_THEMSELVES = {
     "subprocess.run-list": 'import subprocess\nsubprocess.run(["git", "diff"], cwd=p)\n',
@@ -671,6 +948,47 @@ HELPERS_THAT_START_GIT_THEMSELVES = {
         'import subprocess\nsubprocess.run("gh pr list", shell=True, cwd=p)\n',
     "os.execvp": 'import os\nos.execvp("git", ["git", "gc"])\n',
     "windows-program": 'import subprocess\nsubprocess.run(["git.exe", "diff"])\n',
+    # IR76-02 (task #3178): the shapes the first fence did not see.
+    "argv-concatenated": 'import subprocess\nsubprocess.run(["git"] + args, cwd=p)\n',
+    "argv-concatenated-first":
+        'import subprocess\nargv = ["git"] + list(args)\nsubprocess.run(argv)\n',
+    "args-keyword": 'import subprocess\nsubprocess.run(args=["git", "status"])\n',
+    "list-call": 'import subprocess\nsubprocess.run(list(("git", "status")))\n',
+    "tuple-call-of-a-name":
+        'import subprocess\nBASE = ("gh", "pr")\nsubprocess.run(tuple(BASE))\n',
+    "functools.partial":
+        'import functools, subprocess\n'
+        'start = functools.partial(subprocess.run, ["git", "diff"])\nstart()\n',
+    "partial-imported":
+        'from functools import partial\nimport subprocess\n'
+        'partial(subprocess.Popen, ["gh", "api"])()\n',
+    "starter-bound-to-a-name":
+        'import subprocess\nrunner = subprocess.run\nrunner(["git", "log"])\n',
+    "attribute-program":
+        'import subprocess\nsubprocess.run([settings.git_executable, "status"])\n',
+    "call-program": 'import subprocess\nsubprocess.run([_git_binary(), "status"])\n',
+    "parameter-argv": 'import subprocess\ndef helper(argv):\n    subprocess.run(argv)\n',
+    "executable-keyword":
+        'import subprocess\nsubprocess.run(["x", "status"], executable="/usr/bin/git")\n',
+    "env-wrapper": 'import subprocess\nsubprocess.run(["env", "git", "-C", p, "diff"])\n',
+    "env-assignment-wrapper":
+        'import subprocess\nsubprocess.run(["/usr/bin/env", "GIT_DIR=x", "gh", "pr"])\n',
+    "sh-c-wrapper":
+        'import subprocess\nsubprocess.run(["sh", "-c", "cd project && git diff"])\n',
+    "sh-c-f-string-wrapper":
+        'import subprocess\nsubprocess.run(["bash", "-c", f"cd {p}; git status"])\n',
+    "shell-wrapper-of-unknown-command":
+        'import subprocess\nsubprocess.run(["sh", "-c", command])\n',
+    "timeout-wrapper": 'import subprocess\nsubprocess.run(["timeout", "30", "git", "gc"])\n',
+    "python-wrapper":
+        'import subprocess, sys\n'
+        'subprocess.run([sys.executable, "-c", "import os; os.system(\'git gc\')"])\n',
+    "command-line-git-later": 'import os\nos.system("cd project && git diff")\n',
+    "shell-true-list": 'import subprocess\nsubprocess.run(["cd p; git diff"], shell=True)\n',
+    "create_subprocess_exec-wrapper":
+        'import asyncio\nawait asyncio.create_subprocess_exec("env", "git", "status")\n',
+    "posix_spawn": 'import os\nos.posix_spawn("/usr/bin/git", ["git", "gc"], env)\n',
+    "spawnv": 'import os\nos.spawnv(os.P_WAIT, "/usr/bin/git", ["git", "gc"])\n',
 }
 
 
@@ -694,6 +1012,14 @@ CODE_THAT_DOES_NOT_START_GIT = {
     "git-as-an-argument": 'import subprocess\nsubprocess.run(["grep", "git", path])\n',
     "a-word-starting-with-git":
         'import subprocess\nsubprocess.run(["gitleaks", "detect"])\n',
+    "a-wrapper-of-another-program":
+        'import subprocess\nsubprocess.run(["env", "LANG=C", "nft", "list", "ruleset"])\n',
+    "a-known-argv-built-by-concatenation":
+        'import subprocess\nBASE = ["crontab"]\nsubprocess.run(BASE + ["-l"])\n',
+    "a-python-wrapper-of-known-code":
+        'import subprocess, sys\nsubprocess.run([sys.executable, "-c", "pass"])\n',
+    "os.spawnv-of-another-program":
+        'import os\nos.spawnv(os.P_WAIT, "/usr/bin/nft", ["nft", "list"])\n',
 }
 
 
@@ -725,15 +1051,55 @@ def test_no_orchestrator_module_starts_git_outside_the_runners() -> None:
     a helper that forgets to ask cannot run git there by starting it
     itself either."""
     sources = _orchestrator_sources()
-    found = [
-        place
-        for source in sources
-        if source != RUNNERS_MODULE
-        for place in _git_started_outside_the_runners(
-            source.read_text(encoding="utf-8"), str(source.relative_to(REPO_ROOT)),
-        )
-    ]
+    found = []
+    for source in sources:
+        name = source.relative_to(REPO_ROOT).as_posix()
+        found.extend(_git_started_outside_the_runners(
+            source.read_text(encoding="utf-8"), name,
+            allowed_functions=RUNNER_FUNCTIONS if source == RUNNERS_MODULE else frozenset(),
+            unproven_allowed=frozenset(
+                function for module, function in UNPROVEN_STARTS if module == name),
+        ))
 
     assert RUNNERS_MODULE in sources
     assert len(sources) > 50, [str(source) for source in sources]
     assert found == []
+
+
+def test_every_reviewed_unproven_start_is_still_one() -> None:
+    """IR76-02: an UNPROVEN_STARTS entry names a function that still starts
+    a program the fence cannot prove (no stale entry that would let a new
+    one through), and none of them is proven to start git; the runners'
+    own starts are the only ones git_ops.py keeps."""
+    unproven: set[tuple[str, str]] = set()
+    proven_git: list[str] = []
+    for source in _orchestrator_sources():
+        name = source.relative_to(REPO_ROOT).as_posix()
+        for start in _process_starts(source.read_text(encoding="utf-8"), name):
+            if start.verdict == "unproven":
+                unproven.add((name, start.function))
+            elif start.verdict == "git":
+                proven_git.append(start.describe(name))
+    runner_starts = {("equipa/git_ops.py", function) for function in RUNNER_FUNCTIONS}
+
+    assert set(UNPROVEN_STARTS) == unproven - runner_starts
+    assert runner_starts <= unproven
+    assert proven_git == []
+    assert all(reason.strip() for reason in UNPROVEN_STARTS.values())
+
+
+def test_a_new_git_ops_helper_that_starts_git_is_found() -> None:
+    """IR76-02: git_ops.py was exempt as a whole module; now only the two
+    runner functions may start a process there."""
+    source = RUNNERS_MODULE.read_text(encoding="utf-8") + (
+        "\n\ndef _forgetful_helper(cwd):\n"
+        "    return subprocess.run([\"git\", \"diff\"], cwd=cwd)\n"
+    )
+    found = _git_started_outside_the_runners(
+        source, "equipa/git_ops.py", allowed_functions=RUNNER_FUNCTIONS)
+
+    assert len(found) == 1 and "_forgetful_helper" in found[0], found
+
+
+def test_every_starter_has_an_argument_layout() -> None:
+    assert set(STARTER_ARGUMENTS) >= PROCESS_STARTERS | LOOP_PROCESS_STARTERS
