@@ -72,7 +72,8 @@ def _pre_3182_call(rule: redact._CommandScoped, match: re.Match[str]) -> str:
 COMMAND_WORDS = (
     "curl", "CURL", "Curl", "xcurl", "curl-config", "mysql", "MySQL",
     "mysqldump", "mariadb", "mariadb-dump", "sshpass", "ssh", "docker",
-    "podman", "nerdctl", "docker login", "az", "az vm", "sqlcmd", "SQLCMD",
+    "podman", "nerdctl", "docker login", "podman login", "nerdctl login",
+    "az", "az vm", "az login", "sqlcmd", "SQLCMD",
     "redis-cli", "mongosh", "mongo", "mongodump", "htpasswd", "openssl",
     "echo",
 )
