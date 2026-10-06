@@ -343,6 +343,61 @@ def test_the_timing_helpers_raise_instead_of_asserting():
     assert _asserts_in(timed[0]) == []
 
 
+# Fixture data, never imported: the source files of a fake repository the
+# docs-drift tests read as text.
+NOT_IMPORTED_FIXTURES = TESTS_DIR / "fixtures" / "drift_test_docs"
+
+
+def _helper_modules() -> list[Path]:
+    """Every Python module under tests/ that pytest does not rewrite: not a
+    test module or conftest, and not a probe a child pytest collects as a
+    test module (it defines tests, and a path given to pytest is
+    rewritten)."""
+    helpers = []
+    for path in sorted(TESTS_DIR.rglob("*.py")):
+        if (path.name.startswith("test_") or path.name == "conftest.py"
+                or NOT_IMPORTED_FIXTURES in path.parents
+                or "__pycache__" in path.parts):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(isinstance(node, ast.FunctionDef)
+               and node.name.startswith("test_") for node in tree.body):
+            continue
+        helpers.append(path)
+    return helpers
+
+
+def test_no_helper_module_the_suites_import_asserts():
+    """IR75-04: an ``assert`` in a helper module is stripped by ``python
+    -O``, so tests/review_gate_production.py's must-block helper stopped
+    checking that the gate blocked, and ``gate_blocks`` returned a block
+    provenance refused for any reason. Every helper raises instead."""
+    helpers = _helper_modules()
+    names = {path.name for path in helpers}
+    assert {"review_gate_production.py", "host_timing.py",
+            "deadline_watchdog.py", "sanitizer_timing_probe.py"} <= names
+    asserting = {str(path.relative_to(TESTS_DIR)): len(_asserts_in(
+        ast.parse(path.read_text(encoding="utf-8")))) for path in helpers}
+    assert {name: count for name, count in asserting.items() if count} == {}
+
+
+def test_the_must_block_helper_raises_when_the_gate_does_not_block(
+        monkeypatch):
+    """IR75-04, behaviour: the helper fails on a clean review by raising,
+    so it fails under ``python -O`` too."""
+    from tests import review_gate_production as production
+
+    refused = SimpleNamespace(trusted=False, text=None,
+                              reason="no completion line")
+    monkeypatch.setattr(production, "production_decision",
+                        lambda text, nonce: SimpleNamespace(
+                            blocks=True, provenance=refused))
+    with pytest.raises(AssertionError, match="another reason"):
+        production.gate_blocks("text")
+    with pytest.raises(AssertionError, match="provenance read no text"):
+        production.blocked_by_the_gate("text")
+
+
 def test_the_reference_workload_is_fixed_work():
     assert host_timing.reference_workload() == host_timing.reference_workload()
     assert host_timing.reference_workload(10) != host_timing.reference_workload()

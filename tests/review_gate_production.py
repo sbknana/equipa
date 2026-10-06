@@ -128,6 +128,16 @@ def production_decision(text: str, *, project_dir: Path | None = None,
                               verify_reviewer_provenance(task_id, path))
 
 
+def _require_refused_for_a_bidi_control(reason: str) -> None:
+    """Fail unless provenance refused the review for a bidi control (its
+    first check). Raised, not asserted: pytest does not rewrite this
+    module, so ``python -O`` would strip an assert and let a block come
+    from a malformed test artifact (task 3178, IR75-04)."""
+    if not reason.startswith(REVIEW_BIDI_CONTROL_REASON):
+        raise AssertionError(
+            f"provenance refused the review for another reason: {reason}")
+
+
 def gate_blocks(text: str, *, nonce: str = NONCE) -> bool:
     """The production merge decision on a review the reviewer could have
     written. Provenance must trust it, or reject it for a bidi control the
@@ -136,8 +146,7 @@ def gate_blocks(text: str, *, nonce: str = NONCE) -> bool:
     decision = production_decision(text, nonce=nonce)
     if decision.provenance.trusted:
         return decision.blocks
-    reason = decision.provenance.reason
-    assert reason.startswith(REVIEW_BIDI_CONTROL_REASON), reason
+    _require_refused_for_a_bidi_control(decision.provenance.reason)
     # Production refuses the bidi control before parsing; the suites also
     # held the parser to blocking these texts, and still do.
     return decision.blocks and parser_blocks(decision.provenance.text)
@@ -162,7 +171,9 @@ def decision_and_analysis(
     of the text provenance handed the gate (for assertions on the reason
     behind a verdict)."""
     decision = production_decision(text, nonce=nonce)
-    assert decision.provenance.text is not None, decision.provenance.reason
+    if decision.provenance.text is None:
+        raise AssertionError(
+            f"provenance read no text: {decision.provenance.reason}")
     analysis = loops._analyze_review_file(
         Path(f"SECURITY-REVIEW-{GATE_TASK_ID}.md"),
         text=decision.provenance.text,
@@ -182,9 +193,10 @@ def blocked_by_the_gate(text: str, *,
     completion line. Callers assert the analysis blocks too."""
     decision, analysis = decision_and_analysis(text, nonce=nonce)
     if not decision.provenance.trusted:
-        reason = decision.provenance.reason
-        assert reason.startswith(REVIEW_BIDI_CONTROL_REASON), reason
-    assert decision.blocks, (analysis.verdict, analysis.detail)
+        _require_refused_for_a_bidi_control(decision.provenance.reason)
+    if not decision.blocks:
+        raise AssertionError(
+            f"the gate did not block: {(analysis.verdict, analysis.detail)}")
     return analysis
 
 
