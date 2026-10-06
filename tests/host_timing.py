@@ -96,6 +96,20 @@ timing test checks two things through this module:
    (task 3185: CI read a linear scan at 0.067 s per MB at 50 KB and
    0.137 s at 200 KB), and the timing meta-test flags it.
 
+5. **Confirmation.** A pair still over the limit once settled is confirmed
+   before it fails (``_confirmed``, task 3188): CI read a linear pattern of
+   task 3138 at 0.0030 s then 0.0250 s, 8.3x against the test's own pair's
+   2 ms floor, each the fastest of three readings, on work that grows 4.0x
+   (its larger readings were all inflated). Both sizes are read again in
+   up to ``CONFIRM_ROUNDS`` rounds of several interleaved readings each, at
+   the pair's own sizes (a capped regression grows linearly past them,
+   IR78-01), and the pair fails only when a majority of the rounds read
+   over the limit too. Each round reads the larger size afresh (its bursts
+   fake growth) and holds it against the quarter size's fastest reading so
+   far (a quieter quarter only raises the ratio). Superlinear work reads
+   over the limit in every round and fails after ``CONFIRM_MAJORITY`` of
+   them; no floor, limit or budget moves.
+
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
 ``EQUIPA_TIMING_HOST_FACTOR=2.0`` to simulate a runner twice as slow as the
@@ -206,6 +220,22 @@ PER_UNIT_GROWTH_LIMIT = GROWTH_LIMIT / GROWTH
 # readings cannot hide quadratic work: the smaller size's fastest reading
 # only falls, which only raises the ratio.
 PER_UNIT_OVER_RETRIES = BORDERLINE_RETRIES
+# A pair still over the limit once settled is CONFIRMED before it fails: it
+# is read again in up to this many rounds, each of several interleaved
+# readings of both sizes, and fails only when a majority of them read over
+# the limit too (task 3188: CI read pattern 24 of task 3138 at 0.0030 s
+# then 0.0250 s, 8.3x, each the fastest of three readings, on work that
+# grows 4.0x; its larger readings were all inflated). Quadratic work reads
+# over the limit in every round, so it fails after CONFIRM_MAJORITY rounds.
+CONFIRM_ROUNDS = 5
+CONFIRM_MAJORITY = CONFIRM_ROUNDS // 2 + 1
+# Interleaved readings of each size in one round: at least this many, and
+# more while the quarter size's total over the round is under
+# GROWTH_FLOOR_SECONDS (a round of 3 ms readings is 7 of them)...
+CONFIRM_READINGS = 3
+# ...within what this much wall time per round pays for, measured on the
+# round's first reading (an expensive pair reads once per round).
+CONFIRM_ROUND_SECONDS = 1.0
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -631,6 +661,29 @@ def _interleaved_means(measure: Callable[[int], Mapping[str, float]],
 
 
 @dataclass(frozen=True)
+class Confirmation:
+    """The confirming rounds of a part still over the limit once its pair
+    settled (``_confirmed``): how many rounds were read, how many of them
+    read over the limit, and how many interleaved readings of each size
+    each round took."""
+
+    rounds: int
+    rounds_over: int
+    readings: int
+
+    @property
+    def confirmed(self) -> bool:
+        """A majority of the rounds read over the limit."""
+        return 2 * self.rounds_over > self.rounds
+
+    def describe(self) -> str:
+        verdict = "confirmed" if self.confirmed else "not confirmed"
+        return (f"{verdict}: over the limit in {self.rounds_over} of "
+                f"{self.rounds} confirming rounds of {self.readings} "
+                f"interleaved readings of each size")
+
+
+@dataclass(frozen=True)
 class _Pair:
     """A pair of sizes a growth check holds to the limit, and how: the
     floor of the smaller reading, the runs each reading is a mean of and
@@ -674,8 +727,12 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     estimate of the work's cost the load inflated least, so a burst that
     inflated the quarter reading (and hid quadratic growth, task 3184) or
     the larger one (and faked it) is outrun by a quieter run of that size.
-    Returns the readings kept, the parts still over and how many readings
-    of each size the minimum was taken over."""
+    A part still over the limit then is confirmed (``_confirmed``) and
+    counts as over only when a majority of the confirming rounds read over
+    the limit too.
+    Returns the readings kept, the parts still over, how many readings of
+    each size the minimum was taken over and the confirmation of each part
+    that was confirmed."""
     small, large = dict(small), dict(large)
     borderline_seen = False
     over_floor_seen = False
@@ -703,13 +760,94 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
         if over:
             retries = max(retries, pair.over_retries)
         if retries_done >= retries:
-            return small, large, over, 1 + retries_done
+            confirmations: dict[str, Confirmation] = {}
+            if over:
+                small, large, over, confirmations = _confirmed(
+                    measure, pair, small, large, over)
+            return small, large, over, 1 + retries_done, confirmations
         small_again, large_again = _interleaved_means(
             measure, pair.small_size, pair.size, pair.repetitions)
         for part in small:
             small[part] = min(small[part], small_again[part])
             large[part] = min(large[part], large_again[part])
         retries_done += 1
+
+
+def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
+               small: Mapping[str, float], large: Mapping[str, float],
+               over: list[str]
+               ) -> tuple[dict[str, float], dict[str, float], list[str],
+                          dict[str, Confirmation]]:
+    """Confirm the parts ``over`` the limit at ``pair`` on their settled
+    readings (``small``, ``large``) before they fail (task 3188).
+
+    Both sizes are read again in up to ``CONFIRM_ROUNDS`` rounds, each of
+    ``CONFIRM_READINGS`` or more interleaved readings (enough for the
+    quarter size's total over the round to reach ``GROWTH_FLOOR_SECONDS``,
+    within ``CONFIRM_ROUND_SECONDS``), measured as the pair measures them
+    (``pair.repetitions`` runs each) and at the pair's own sizes: a capped
+    or windowed regression grows linearly past the test's size, so a larger
+    pair could clear it (IR78-01). A round reads over the limit when its
+    fastest larger reading is ``GROWTH_LIMIT`` times the part's fastest
+    quarter reading so far (against the pair's floor). The larger reading
+    is the one a burst inflates to fake growth, so each round reads it
+    afresh; the quarter keeps its fastest reading through the rounds, since
+    a quieter quarter can only raise the ratio, and a round deciding on a
+    quarter it read loaded would clear a regression (R3184-03). The rounds
+    stop once every part has a majority either way.
+
+    A part over the limit in a majority of the rounds stays over, on its
+    settled readings; any other is kept on the reading of its median round,
+    which is under the limit. Returns the readings, the parts still over and
+    each confirmed part's ``Confirmation``."""
+    small, large = dict(small), dict(large)
+    quarter_total = pair.repetitions * max(min(small[part] for part in over),
+                                           1e-6)
+    wanted = min(MAX_GROWTH_REPETITIONS, max(
+        CONFIRM_READINGS, math.ceil(GROWTH_FLOOR_SECONDS / quarter_total)))
+    readings = wanted
+    larger_by_round: dict[str, list[float]] = {part: [] for part in over}
+
+    def rounds_over(part: str) -> int:
+        return sum(1 for seconds in larger_by_round[part]
+                   if not growth_ratio(small[part], seconds,
+                                       pair.floor_seconds) < GROWTH_LIMIT)
+
+    def decided(part: str) -> bool:
+        read_over = rounds_over(part)
+        read_under = len(larger_by_round[part]) - read_over
+        return max(read_over, read_under) >= CONFIRM_MAJORITY
+
+    rounds = 0
+    while rounds < CONFIRM_ROUNDS and not all(map(decided, over)):
+        round_large = {part: math.inf for part in over}
+        reading = 0
+        while reading < readings:
+            started = time.monotonic()
+            small_again, large_again = _interleaved_means(
+                measure, pair.small_size, pair.size, pair.repetitions)
+            if rounds == 0 and reading == 0:
+                cost = max(time.monotonic() - started, 1e-9)
+                readings = max(1, min(
+                    wanted, 1 + int(CONFIRM_ROUND_SECONDS / cost)))
+            for part in over:
+                small[part] = min(small[part], small_again[part])
+                round_large[part] = min(round_large[part], large_again[part])
+            reading += 1
+        for part in over:
+            larger_by_round[part].append(round_large[part])
+        rounds += 1
+
+    confirmations = {part: Confirmation(len(larger_by_round[part]),
+                                        rounds_over(part), readings)
+                     for part in over}
+    still_over = [part for part in over if confirmations[part].confirmed]
+    for part in over:
+        if part not in still_over:
+            # The median round: under the limit, as most rounds read.
+            ordered = sorted(larger_by_round[part])
+            large[part] = ordered[len(ordered) // 2]
+    return small, large, still_over, confirmations
 
 
 def fail(message: str) -> None:
@@ -743,6 +881,9 @@ class LinearTiming:
     # Each reading is the fastest of this many readings of its size, taken
     # interleaved with the other size's (``_settled_readings``).
     samples: int = 1
+    # The confirming rounds when the settled readings were over the limit
+    # (``_confirmed``); a part they did not confirm keeps its median round.
+    confirmation: Confirmation | None = None
 
     @property
     def ratio(self) -> float:
@@ -753,12 +894,14 @@ class LinearTiming:
                 if self.repetitions > 1 else "")
         fastest = (f"; each the fastest of {self.samples} interleaved "
                    f"readings" if self.samples > 1 else "")
+        confirmed = (f"; {self.confirmation.describe()}"
+                     if self.confirmation is not None else "")
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth:.3g}x the "
                 f"test's input{runs}, floor {self.floor_seconds:g} s, limit "
                 f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
-                f"factor {self.factor:.2f}{fastest})")
+                f"factor {self.factor:.2f}{fastest}{confirmed})")
 
 
 def _check_budget(label: str, seconds: float, size: int,
@@ -888,6 +1031,8 @@ class SettledGrowth:
     seconds: float
     samples: int = 1
     floor_seconds: float = GROWTH_FLOOR_SECONDS
+    # The confirming rounds when the settled readings were over the limit.
+    confirmation: Confirmation | None = None
 
     @property
     def ratio(self) -> float:
@@ -904,7 +1049,9 @@ def settled_growth(seconds_at: Callable[[int], float], small_size: int,
     ``assert_linear_time`` is (``_settled_readings``, task 3184): over
     ``GROWTH_LIMIT`` it is measured again ``GROWTH_RETRIES`` times, and
     borderline ``BORDERLINE_RETRIES`` times, both sizes interleaved, each
-    keeping its fastest reading.
+    keeping its fastest reading; still over, it is confirmed
+    (``_confirmed``), and the readings of a pair a majority of the
+    confirming rounds did not read over the limit are its median round's.
 
     ``seconds_at(n)`` times the work at size ``n`` as the test does;
     ``small_seconds`` and ``seconds`` are the readings the test already
@@ -912,12 +1059,12 @@ def settled_growth(seconds_at: Callable[[int], float], small_size: int,
     (task 3185: a ratio compared by hand on one reading of each size is the
     load's verdict, not the work's)."""
     part = "growth"
-    small, large, _, samples = _settled_readings(
+    small, large, _, samples, confirmations = _settled_readings(
         _collector_paused_calls(lambda at_size: {part: seconds_at(at_size)}),
         _Pair(small_size, size, 1.0, floor_seconds),
         {part: small_seconds}, {part: seconds}, [part])
     return SettledGrowth(small_size, small[part], size, large[part], samples,
-                         floor_seconds)
+                         floor_seconds, confirmations.get(part))
 
 
 def assert_linear_per_unit(per_unit_at: Callable[[int], float],
@@ -971,7 +1118,7 @@ def assert_linear_per_unit(per_unit_at: Callable[[int], float],
     settled = {smallest: read(smallest)}
     for size in sizes[1:]:
         seconds = read(size)
-        small, large, over, samples = _settled_readings(
+        small, large, over, samples, confirmations = _settled_readings(
             as_one_step(size),
             _Pair(smallest, size, size / smallest, GROWTH_FLOOR_SECONDS,
                   over_retries=PER_UNIT_OVER_RETRIES),
@@ -982,7 +1129,8 @@ def assert_linear_per_unit(per_unit_at: Callable[[int], float],
                  f"unit at size {size}, {settled[smallest]:.4f} s at size "
                  f"{smallest} ({settled[size] / settled[smallest]:.2f}x, "
                  f"limit {PER_UNIT_GROWTH_LIMIT}x; each the fastest of "
-                 f"{samples} interleaved readings): {settled}")
+                 f"{samples} interleaved readings; "
+                 f"{confirmations[label].describe()}): {settled}")
     return settled
 
 
@@ -1016,18 +1164,21 @@ def _check_growth(grown: _GrownReadings,
        floor where the shape does not exist at the next size.
 
     Each pair over the limit is measured again before it fails, and a
-    borderline one before it passes (``_settled_readings``).
+    borderline one before it passes (``_settled_readings``); one still over
+    then fails only when a majority of its confirming rounds read over the
+    limit (``_confirmed``).
     """
     parts = list(labels)
 
     def timings_at(pair: _Pair, small: Mapping[str, float],
                    large: Mapping[str, float], at_parts: list[str],
-                   samples: int) -> dict[str, LinearTiming]:
+                   samples: int, confirmations: Mapping[str, Confirmation]
+                   ) -> dict[str, LinearTiming]:
         return {part: LinearTiming(labels[part], pair.small_size, small[part],
                                    pair.size, large[part], budget_seconds,
                                    factor, pair.input_growth,
                                    pair.floor_seconds, pair.repetitions,
-                                   samples)
+                                   samples, confirmations.get(part))
                 for part in at_parts}
 
     def held(pair: _Pair, means: tuple[Mapping[str, float],
@@ -1044,7 +1195,7 @@ def _check_growth(grown: _GrownReadings,
             small, large = grown.at(pair.small_size), grown.at(pair.size)
             first_samples = min(grown.samples[pair.small_size],
                                 grown.samples[pair.size])
-        small, large, over, samples = _settled_readings(
+        small, large, over, samples, confirmations = _settled_readings(
             measure, pair, small, large, parts, first_samples)
         if means is None:
             for at_size, readings in ((pair.small_size, small),
@@ -1054,8 +1205,9 @@ def _check_growth(grown: _GrownReadings,
         if over:
             fail("superlinear growth: " + "; ".join(
                 timing.describe() for timing in timings_at(
-                    pair, small, large, over, samples).values()))
-        return timings_at(pair, small, large, parts, samples)
+                    pair, small, large, over, samples,
+                    confirmations).values()))
+        return timings_at(pair, small, large, parts, samples, confirmations)
 
     # 1. The test's own pair, its repetitions interleaved.
     own_pair = _Pair(test_small_size, test_size, 1.0,
