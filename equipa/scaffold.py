@@ -38,7 +38,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
-from equipa.config import configured_path_translations
+from equipa.config import configured_path_translations, is_drive_letter_path
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,18 @@ def assert_contained_path(candidate: str | Path) -> Path:
     if any(part == ".." for part in posix_parts):
         raise ScaffoldCloneError(
             f"Refusing scaffold clone: path contains traversal segment ({raw!r})"
+        )
+    # A relative path resolves against the process cwd, and on this host a
+    # Windows path no ``path_translations`` entry maps (``C:\x``) is one: an
+    # allowlisted root holding the cwd would then get a junk directory such
+    # as ``<cwd>/C:\x`` (IR83-02). Only an absolute path of this host may be
+    # created; a translated path never keeps a backslash.
+    if not Path(raw).is_absolute() or (
+            os.name != "nt" and ("\\" in raw or is_drive_letter_path(raw))):
+        raise ScaffoldCloneError(
+            f"Refusing scaffold clone: {raw!r} is not an absolute path on "
+            "this host (a relative path, or a Windows path that no "
+            "path_translations entry maps)"
         )
     resolved = Path(raw).resolve(strict=False)
     roots = _allowed_roots()
