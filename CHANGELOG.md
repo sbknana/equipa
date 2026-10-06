@@ -20,6 +20,19 @@ All notable changes to EQUIPA are documented here.
   - **Upgrading:** an install that relied on the built-in mapping must add its own `path_translations` entry and
     `forgescaffold_dir` before it deploys.
 
+- **Non-git project guard reads command lines and the inherited environment** (task #3183, IR80-02, IR80-03).
+  - **Change:** while a project that was not a git repository at dispatch is recorded, the git runners refuse a
+    call whose config pairs or variables carry a command line (`core.sshCommand`, `core.pager`, `diff.external`,
+    `credential.helper=!...`, `core.fsmonitor=<cmd>`, `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, `GIT_PAGER` and
+    similar), as they already refused aliases. EQUIPA's own hardening pins and values that run nothing are allowed.
+  - **Inherited environment:** a runner given no `env` is now guarded on the environment its child really gets
+    (`_get_repo_env()`), not on an empty mapping.
+  - **Operator note:** `GIT_SSH_COMMAND` in the orchestrator's environment reaches git, so it refuses every git call
+    for the whole run of a non-git project. Set `GIT_SSH` (a program path, carried into the `core.sshCommand` pin)
+    instead.
+- **Windows refusal store** (task #3183, IR80-01): OWNER RIGHTS (`S-1-3-4`) is a trusted writer, so the store
+  `os.mkdir(mode=0o700)` creates on CPython 3.13 and 3.12.4+ is no longer refused. Ownership is still checked first.
+
 - **Review-agent output path** (task #2476) — security-reviewer,
   code-reviewer, and other review-style agents now write their output
   artifacts to `.equipa-artifacts/<TYPE>-<TASK_ID>.md` (e.g.
