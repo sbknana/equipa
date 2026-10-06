@@ -703,7 +703,7 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
                       large: Mapping[str, float], parts: list[str],
                       samples: int = 1
                       ) -> tuple[dict[str, float], dict[str, float],
-                                 list[str], int]:
+                                 list[str], int, dict[str, Confirmation]]:
     """The parts over the growth limit at ``pair`` once its readings have
     settled.
 
