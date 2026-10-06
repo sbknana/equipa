@@ -36,7 +36,17 @@ import pytest
 
 from equipa import redact
 from equipa.redact import REDACTED, redact_secrets
-from tests import test_redaction_linear_3138 as linear_3138
+# Imported by name, so the 3171 timing fence follows _assert_linear.
+from tests.test_redaction_linear_3138 import (
+    COMMAND_UNITS,
+    PAIR_UNITS,
+    PATTERN_LIMIT_SECONDS,
+    REVIEW_UNITS,
+    SIXTY_FOUR_KB,
+    _assert_linear,
+    _derived_units,
+    _repeat,
+)
 
 TESTS_DIR = Path(__file__).resolve().parent
 CORPUS_SEED = 3182
@@ -130,12 +140,11 @@ def _existing_test_strings() -> list[str]:
 def _timing_units() -> list[str]:
     """The 3138 timing units, command units and each command rule's derived
     units, repeated to a short text."""
-    units = set(linear_3138.REVIEW_UNITS + linear_3138.COMMAND_UNITS
-                + linear_3138.PAIR_UNITS)
+    units = set(REVIEW_UNITS + COMMAND_UNITS + PAIR_UNITS)
     for index, (_pattern, replacement, _hints) in enumerate(redact._PATTERNS):
         if isinstance(replacement, redact._CommandScoped):
-            units.update(linear_3138._derived_units(index))
-    return [linear_3138._repeat(unit, UNIT_REPEAT_SIZE)
+            units.update(_derived_units(index))
+    return [_repeat(unit, UNIT_REPEAT_SIZE)
             for unit in sorted(units)]
 
 
@@ -192,7 +201,7 @@ def test_the_corpus_holds_every_source():
                  + list(RULE_EXAMPLES.values())):
         assert text in corpus
     # The CI shapes and the redaction tests' own inputs are in it.
-    assert linear_3138._repeat("curl;", UNIT_REPEAT_SIZE) in corpus
+    assert _repeat("curl;", UNIT_REPEAT_SIZE) in corpus
     assert "htpasswd -b " in corpus
 
 
@@ -302,8 +311,8 @@ def test_command_word_repeats_take_half_the_pattern_budget(word, shape):
     budget (task 3182 target), and linear."""
     rule = _rule_for(word)
     unit = shape.format(word)
-    linear_3138._assert_linear(
+    _assert_linear(
         rule.pattern.sub,
-        lambda size: (rule, linear_3138._repeat(unit, size)),
-        linear_3138.SIXTY_FOUR_KB, linear_3138.PATTERN_LIMIT_SECONDS / 2,
+        lambda size: (rule, _repeat(unit, size)),
+        SIXTY_FOUR_KB, PATTERN_LIMIT_SECONDS / 2,
         f"{unit!r} half budget")
