@@ -45,6 +45,7 @@ from equipa.config import (
     is_feature_enabled,
     is_security_review_enabled,
     load_dispatch_config,
+    translate_local_path,
 )
 import equipa.constants as _equipa_constants
 from equipa.constants import (
@@ -209,18 +210,13 @@ def _bootstrap_scaffold_if_needed(task: dict, project_id: int | None) -> str | N
         local_path = None
     if not local_path:
         return None
-    # Translate Windows-style paths to the Samba mount, mirroring
-    # ``tasks.resolve_project_dir``.
-    candidate = local_path.rstrip("/").rstrip("\\")
-    if candidate.startswith(("Z:\\AI_Stuff", "Z:/AI_Stuff")):
-        candidate = (
-            "/srv/forge-share/AI_Stuff"
-            + candidate[len("Z:\\AI_Stuff"):].replace("\\", "/")
-        )
+    # Map the dispatch config's ``path_translations`` prefixes (for example
+    # a Windows share to its mount here), as ``tasks.resolve_project_dir``.
+    candidate = translate_local_path(local_path.rstrip("/").rstrip("\\"))
     # Containment check: a DB-supplied ``local_path`` is untrusted input.
-    # Without this, a value like ``Z:\AI_Stuff\..\..\etc\evil`` translates to
-    # ``/srv/forge-share/AI_Stuff/../../etc/evil`` and ``mkdir(parents=True)``
-    # would silently create ``/etc/evil``. Reject ``..`` segments and require
+    # Without this, a value like ``X:\share\..\..\etc\evil`` translates to
+    # ``/srv/share/../../etc/evil`` and ``mkdir(parents=True)`` would
+    # silently create ``/etc/evil``. Reject ``..`` segments and require
     # the resolved path to live inside an allowlisted root.
     try:
         from equipa.scaffold import assert_contained_path, ScaffoldCloneError

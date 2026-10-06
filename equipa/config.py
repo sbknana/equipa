@@ -23,6 +23,8 @@ Exports:
     is_downgrade_model
     resolve_claude_model
     get_persistent_retry_max_attempts
+    configured_path_translations
+    translate_local_path
 
 Copyright 2026 Forgeborn
 """
@@ -589,3 +591,111 @@ def get_persistent_retry_max_attempts(dispatch_config: dict | None = None) -> in
               f"{DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS}")
         return DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS
     return raw
+
+
+# --- Local path translation (task #3183, IR80-05) ---------------------------
+#
+# A TheForge ``projects.local_path`` can be recorded from another host: a
+# Windows client that sees the project share as ``X:\share`` while the
+# orchestrator sees the same share mounted at ``/srv/share``. The operator
+# lists such prefixes in the dispatch config, e.g.
+#
+#     "path_translations": [{"from": "X:\\share", "to": "/srv/share"}]
+#
+# Empty by default: a path is then used as recorded. Every place that turns a
+# DB ``local_path`` into a directory goes through translate_local_path().
+
+PATH_TRANSLATIONS_KEY = "path_translations"
+_PATH_SEPARATORS = "/\\"
+
+
+def _has_parent_segment(path: str) -> bool:
+    """True if ``path`` has a ``..`` segment under either separator."""
+    return ".." in path.replace("\\", "/").split("/")
+
+
+def _valid_path_translation(entry: object) -> tuple[str, str] | None:
+    """``(from, to)`` of one configured entry, or None (logged) if unusable.
+
+    ``from`` loses its trailing separators and must not become empty (that
+    would match every path); ``to`` must be absolute on this host. Neither
+    may hold a ``..`` segment.
+    """
+    if not isinstance(entry, dict):
+        logger.error("dispatch config %r: ignoring entry %r (expected an "
+                     'object with "from" and "to")', PATH_TRANSLATIONS_KEY, entry)
+        return None
+    source, target = entry.get("from"), entry.get("to")
+    if not isinstance(source, str) or not isinstance(target, str):
+        logger.error('dispatch config %r: ignoring entry %r ("from" and "to" '
+                     "must be strings)", PATH_TRANSLATIONS_KEY, entry)
+        return None
+    source = source.strip().rstrip(_PATH_SEPARATORS)
+    target = target.strip()
+    if not source or not Path(target).is_absolute():
+        logger.error('dispatch config %r: ignoring entry %r ("from" must be a '
+                     'non-root prefix and "to" an absolute path)',
+                     PATH_TRANSLATIONS_KEY, entry)
+        return None
+    if _has_parent_segment(source) or _has_parent_segment(target):
+        logger.error("dispatch config %r: ignoring entry %r (a '..' segment)",
+                     PATH_TRANSLATIONS_KEY, entry)
+        return None
+    return source, target
+
+
+def configured_path_translations(
+    dispatch_config: dict | None = None,
+) -> list[tuple[str, str]]:
+    """The usable ``(from, to)`` prefixes from ``path_translations``.
+
+    Reads the orchestrator's registered config when none is passed (see
+    get_active_dispatch_config). Invalid entries are logged and skipped, so a
+    path they would have matched is used as recorded. Longest ``from`` first,
+    so ``X:\\share\\sub`` wins over ``X:\\share``.
+    """
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    raw = config.get(PATH_TRANSLATIONS_KEY, []) if isinstance(config, dict) else []
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.error("dispatch config %r must be a list of {\"from\", \"to\"} "
+                     "objects, got %r; no path is translated",
+                     PATH_TRANSLATIONS_KEY, raw)
+        return []
+    translations = [
+        pair for pair in map(_valid_path_translation, raw) if pair is not None
+    ]
+    return sorted(translations, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def translate_local_path(
+    local_path: str, dispatch_config: dict | None = None,
+) -> str:
+    """``local_path`` with its configured ``path_translations`` prefix mapped.
+
+    A prefix matches whole path segments only (``X:\\share`` does not match
+    ``X:\\shared``), case-sensitively, with ``\\`` and ``/`` read as the same
+    separator. The rest of a translated path has its ``\\`` turned into
+    ``/``. A path no prefix matches is returned unchanged.
+
+    This does not check where the result points: a caller that creates
+    directories must still run its own containment check on the result.
+    """
+    if not isinstance(local_path, str):
+        raise TypeError(
+            f"local_path must be a str, got {type(local_path).__name__}"
+        )
+    normalized = local_path.replace("\\", "/")
+    for source, target in configured_path_translations(dispatch_config):
+        prefix = source.replace("\\", "/")
+        if not normalized.startswith(prefix):
+            continue
+        rest = normalized[len(prefix):]
+        if rest and not rest.startswith("/"):
+            continue  # same leading letters, a different directory
+        return (target.rstrip(_PATH_SEPARATORS) + rest) or "/"
+    return local_path
