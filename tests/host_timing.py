@@ -110,6 +110,25 @@ timing test checks two things through this module:
    over the limit in every round and fails after ``CONFIRM_MAJORITY`` of
    them; no floor, limit or budget moves.
 
+6. **Growth exponent.** A GROWN pair still over the limit once confirmed
+   is judged on its growth exponent over three sizes before it fails
+   (``_exponent_judged``, task 3191): CI read a linear pattern of task
+   3139 at 0.0320 s at 1 MB and 0.2605 s at 4 MB, 8.1x, confirmed: its
+   cost per byte steps up about 2x where the input outgrows a CPU cache of
+   the small runner, a constant factor, not growth. Two sizes cannot tell
+   that step from superlinear work; three can. The size ``GROWTH`` times
+   the pair's larger one is read, and the exponent (the least-squares
+   slope of log(seconds) against log(size), for sizes ``GROWTH`` apart the
+   outer pair's) must stay under ``GROWTH_EXPONENT_LIMIT`` (1.5, the
+   limit's own exponent): the outer pair is held to ``GROWTH_LIMIT ** 2``,
+   settled and confirmed as every pair is. Quadratic work grows
+   ``GROWTH ** 2`` on every step and fails; a cache step of under
+   ``GROWTH`` times per byte reads about ``GROWTH`` on the step past it
+   and passes. The test's own pair (IR78-01) and the pair the growth
+   stopped at, at the test's sizes, never go by an exponent; nor does a
+   pair whose third size does not exist (``InputTooLarge``): it decides
+   alone, as before.
+
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
 ``EQUIPA_TIMING_HOST_FACTOR=2.0`` to simulate a runner twice as slow as the
@@ -729,8 +748,9 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
                       samples: int = 1
                       ) -> tuple[dict[str, float], dict[str, float],
                                  list[str], int, dict[str, Confirmation]]:
-    """The parts over the growth limit at ``pair`` once its readings have
-    settled.
+    """The parts over the growth limit at ``pair`` (``pair.limit``:
+    ``GROWTH_LIMIT``, or its power for a pair several steps apart) once its
+    readings have settled.
 
     ``small`` and ``large`` are each part's reading at the pair's sizes,
     each already the fastest of ``samples`` readings of its size.
@@ -1290,12 +1310,16 @@ def _check_growth(grown: _GrownReadings,
        just over its 60,000-character test size).
     2. A pair of grown sizes reaches ``GROWTH_LIMIT`` against
        ``GROWTH_FLOOR_SECONDS`` (the floor task 3178 held grown sizes to),
-       for any part. A part over the limit fails at the first pair it is
-       over at, so another part still growing cannot carry it to 16 times
-       the test's input (IR78-02: 2 minutes for a 159 ms quadratic part).
+       for any part, and its growth exponent over that pair and the size
+       ``GROWTH`` times past it is superlinear too (``_exponent_judged``,
+       task 3191). A part over the limit fails at the first pair it is
+       over at, the one size past it read for its exponent, so another
+       part still growing cannot carry it to 16 times the test's input
+       (IR78-02: 2 minutes for a 159 ms quadratic part).
     3. The pair the growth stopped at breaks the growth check of task 3178
        (``grows_further``): against ``GROWTH_FLOOR_SECONDS``, or main's
-       floor where the shape does not exist at the next size.
+       floor where the shape does not exist at the next size; at grown
+       sizes its exponent decides as in 2.
 
     Each pair over the limit is measured again before it fails, and a
     borderline one before it passes (``_settled_readings``); one still over
