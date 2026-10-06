@@ -89,7 +89,7 @@ import math
 import os
 import statistics
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Callable, Iterator, Mapping, TypeVar
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
@@ -141,6 +141,17 @@ GROWTH_STEP_MARGIN = 1.2
 # each size) before it counts: one descheduled run must not fail a test,
 # a quadratic one fails every time.
 GROWTH_RETRIES = 2
+# The test's own pair of sizes is held to main's floor and, for one
+# ``seconds_at``, to the rule of b81777b (the default branch before task
+# 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
+# could reach the limit once repeated is measured again, both sizes alike,
+# until the quarter size's total reaches the floor. At most this many runs
+# of each size...
+MAX_GROWTH_REPETITIONS = 32
+# ...and no more extra runs than this much wall time pays for: a
+# ``seconds_at`` building a 200 KB review around a 10 ms measurement
+# repeats less, or not at all (main's 2 ms floor then decides).
+GROWTH_REPETITION_SECONDS = 0.5
 
 T = TypeVar("T")
 
@@ -384,6 +395,41 @@ def growth_ratio(small_seconds: float, seconds: float,
     return seconds / max(small_seconds, floor_seconds)
 
 
+def growth_repetitions(small_seconds: float, pair_cost_seconds: float = 0.0,
+                       seconds: float | None = None) -> int:
+    """How many times ``assert_linear_time`` measures each size of the
+    test's own pair (the rule of b81777b) so that the quarter size's total
+    reaches ``GROWTH_FLOOR_SECONDS``: at most ``MAX_GROWTH_REPETITIONS``,
+    and no more extra pairs than ``GROWTH_REPETITION_SECONDS`` of wall time
+    pays for when one call of each size took ``pair_cost_seconds``.
+
+    ``seconds`` is the larger size's first reading. When that many
+    repetitions of it would total under ``GROWTH_LIMIT`` floors, the ratio
+    cannot reach the limit against the floor the repetitions earn
+    (``own_pair_floor``), so the sizes are measured once and main's floor
+    decides: linear work under the floor (about 4 floors in all) is never
+    repeated, a suspicious reading is."""
+    if small_seconds >= GROWTH_FLOOR_SECONDS:
+        return 1
+    needed = math.ceil(GROWTH_FLOOR_SECONDS / max(small_seconds, 1e-6))
+    affordable = MAX_GROWTH_REPETITIONS
+    if pair_cost_seconds > 0:
+        affordable = 1 + int(GROWTH_REPETITION_SECONDS / pair_cost_seconds)
+    repetitions = max(1, min(MAX_GROWTH_REPETITIONS, needed, affordable))
+    if (seconds is not None
+            and repetitions * seconds < GROWTH_LIMIT * GROWTH_FLOOR_SECONDS):
+        return 1
+    return repetitions
+
+
+def own_pair_floor(repetitions: int) -> float:
+    """The floor of the test's own pair when each size's reading is the
+    mean of ``repetitions`` runs: main's ``DETECTION_FLOOR_SECONDS``, or
+    ``GROWTH_FLOOR_SECONDS`` spread over the runs when that is lower
+    (b81777b raised the quarter size's TOTAL to the floor)."""
+    return min(DETECTION_FLOOR_SECONDS, GROWTH_FLOOR_SECONDS / repetitions)
+
+
 def _grown_further(grown: _GrownReadings, *sizes: int) -> bool:
     """Measure ``sizes``, the next sizes of a growth check (the quarter
     first); False when the shape does not exist at one (``InputTooLarge``)."""
@@ -451,18 +497,80 @@ def grows_further(small_seconds: float, seconds: float,
 
 
 class _GrownReadings:
-    """The readings of one growth check by size: the ladder (N/4, N; N,
-    4N; 4N, 16N) reuses each larger reading of at least the floor as the
-    next quarter's (``next_quarter_size``)."""
+    """The readings of one growth check by size (the seconds of each part):
+    the ladder (N/4, N; N, 4N; 4N, 16N) reuses each larger reading of at
+    least the floor as the next quarter's (``next_quarter_size``)."""
 
-    def __init__(self, measure: Callable[[int], T]) -> None:
+    def __init__(self, measure: Callable[[int], dict[str, float]]) -> None:
         self._measure = measure
-        self.readings: dict[int, T] = {}
+        self.readings: dict[int, dict[str, float]] = {}
 
-    def at(self, size: int) -> T:
-        if size not in self.readings:
-            self.readings[size] = self._measure(size)
+    def measure(self, size: int) -> dict[str, float]:
+        """A new reading at ``size``, kept as its reading: the test's sizes
+        are measured again under the load (``measure_under_load``)."""
+        self.readings[size] = self._measure(size)
         return self.readings[size]
+
+    def at(self, size: int) -> dict[str, float]:
+        if size not in self.readings:
+            self.measure(size)
+        return self.readings[size]
+
+
+def _mean_readings(measure: Callable[[int], Mapping[str, float]], size: int,
+                   repetitions: int, first: Mapping[str, float] | None = None
+                   ) -> dict[str, float]:
+    """Each part's mean over ``repetitions`` measurements at ``size``,
+    ``first`` (when given) counting as one of them."""
+    totals = dict(first) if first is not None else {}
+    for _ in range(repetitions - (0 if first is None else 1)):
+        for part, seconds in measure(size).items():
+            totals[part] = totals.get(part, 0.0) + seconds
+    return {part: total / repetitions for part, total in totals.items()}
+
+
+@dataclass(frozen=True)
+class _Pair:
+    """A pair of sizes a growth check holds to the limit, and how: the
+    floor of the smaller reading and the runs each reading is a mean of."""
+
+    small_size: int
+    size: int
+    input_growth: float
+    floor_seconds: float
+    repetitions: int = 1
+
+
+def _still_over_the_limit(measure: Callable[[int], Mapping[str, float]],
+                          pair: _Pair, small: Mapping[str, float],
+                          large: Mapping[str, float], parts: list[str]
+                          ) -> tuple[dict[str, float], dict[str, float],
+                                     list[str]]:
+    """The parts over the growth limit at ``pair`` once measured again.
+
+    ``small`` and ``large`` are each part's reading at the pair's sizes.
+    While a part is over the limit, both sizes are measured again (all
+    parts, ``pair.repetitions`` runs each) up to ``GROWTH_RETRIES`` times,
+    keeping each part's fastest, as main did. Returns the readings kept
+    and the parts still over."""
+    small, large = dict(small), dict(large)
+
+    def over() -> list[str]:
+        return [part for part in parts
+                if not growth_ratio(small[part], large[part],
+                                    pair.floor_seconds) < GROWTH_LIMIT]
+
+    still_over = over()
+    for _ in range(GROWTH_RETRIES):
+        if not still_over:
+            break
+        for readings, at_size in ((small, pair.small_size),
+                                  (large, pair.size)):
+            again = _mean_readings(measure, at_size, pair.repetitions)
+            for part in readings:
+                readings[part] = min(readings[part], again[part])
+        still_over = over()
+    return small, large, still_over
 
 
 def fail(message: str) -> None:
@@ -487,18 +595,24 @@ class LinearTiming:
     factor: float = 1.0
     input_growth: float = 1.0
     # ``DETECTION_FLOOR_SECONDS`` when the shape did not exist at the next
-    # larger size (``InputTooLarge``).
+    # larger size (``InputTooLarge``), and at every pair held to main's
+    # rule; ``own_pair_floor`` for the test's own pair when repeated.
     floor_seconds: float = GROWTH_FLOOR_SECONDS
+    # Each reading is the mean of this many runs (the test's own pair,
+    # ``growth_repetitions``).
+    repetitions: int = 1
 
     @property
     def ratio(self) -> float:
         return growth_ratio(self.small_seconds, self.seconds, self.floor_seconds)
 
     def describe(self) -> str:
+        runs = (f" over {self.repetitions} runs of each"
+                if self.repetitions > 1 else "")
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth:.3g}x the "
-                f"test's input, floor {self.floor_seconds:g} s, limit "
+                f"test's input{runs}, floor {self.floor_seconds:g} s, limit "
                 f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
                 f"factor {self.factor:.2f})")
 
@@ -541,48 +655,35 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         small_size, large_size = size, size * GROWTH
     else:
         small_size, large_size = size // GROWTH, size
-    grown = _GrownReadings(seconds_at)
+    call_costs: dict[int, float] = {}
+
+    def costed(at_size: int) -> dict[str, float]:
+        """``seconds_at(at_size)``, keeping the wall time of the whole call
+        (building the shape included): what one more repetition costs."""
+        started = time.monotonic()
+        seconds_taken = seconds_at(at_size)
+        call_costs[at_size] = time.monotonic() - started
+        return {label: seconds_taken}
+
+    grown = _GrownReadings(costed)
     small_seconds, small_factor = measure_under_load(
-        lambda: grown.at(small_size), base_budget_seconds)
+        lambda: grown.measure(small_size)[label], base_budget_seconds)
     _check_budget(label, small_seconds, small_size, base_budget_seconds,
                   small_factor)
     if compare_with_larger:
         # Past ``size`` only the growth counts: no budget, no reference.
-        seconds, factor = grown.at(large_size), small_factor
+        seconds, factor = grown.at(large_size)[label], small_factor
     else:
-        seconds, factor = measure_under_load(lambda: grown.at(large_size),
-                                             base_budget_seconds)
+        seconds, factor = measure_under_load(
+            lambda: grown.measure(large_size)[label], base_budget_seconds)
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
-    test_small_size = small_size
-    input_growth, floor_seconds = 1.0, GROWTH_FLOOR_SECONDS
-    while grows_further(grown.at(small_size), grown.at(large_size),
-                        input_growth):
-        quarter_size = _grow_step(grown, large_size, next_quarter_size(
-            large_size, grown.at(large_size),
-            test_small_size * MAX_INPUT_GROWTH))
-        if quarter_size is None:
-            # The shape does not exist at the next size (a 200 KB review
-            # grown 16x passes the gate's 2 MB artifact cap): decided here
-            # with main's floor, under which a larger reading of 16 ms
-            # that grew 16x fails (IR75-01 without growing).
-            floor_seconds = DETECTION_FLOOR_SECONDS
-            break
-        small_size, large_size = quarter_size, quarter_size * GROWTH
-        input_growth = small_size / test_small_size
-    timing = LinearTiming(label, small_size, grown.at(small_size),
-                          large_size, grown.at(large_size),
-                          base_budget_seconds * factor, factor, input_growth,
-                          floor_seconds)
-    for _ in range(GROWTH_RETRIES):
-        if timing.ratio < GROWTH_LIMIT:
-            break
-        timing = replace(
-            timing,
-            small_seconds=min(timing.small_seconds, seconds_at(small_size)),
-            seconds=min(timing.seconds, seconds_at(large_size)))
-    if not timing.ratio < GROWTH_LIMIT:
-        fail(f"superlinear growth: {timing.describe()}")
-    return timing
+    repetitions = growth_repetitions(small_seconds, sum(call_costs.values()),
+                                     seconds)
+    timings = _check_growth(
+        grown, lambda at_size: {label: seconds_at(at_size)}, small_size,
+        large_size, {label: label}, base_budget_seconds * factor, factor,
+        repetitions)
+    return timings[label]
 
 
 def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
@@ -614,61 +715,117 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
     def slowest_part(times: Mapping[str, float]) -> float:
         return max(times.values(), default=0.0)
 
-    def check_parts(times: Mapping[str, float], expected: Mapping[str, float],
-                    at_size: int) -> None:
-        if set(times) != set(expected):
-            fail(f"{label}: the parts differ between the sizes (at size "
-                 f"{at_size}): {sorted(set(times) ^ set(expected))}")
+    first_parts: list[set[str]] = []
 
-    grown = _GrownReadings(lambda at_size: dict(seconds_at(at_size)))
+    def measured(at_size: int) -> dict[str, float]:
+        """``seconds_at(at_size)``, refused when its parts are not those
+        of the first measurement."""
+        times = dict(seconds_at(at_size))
+        if not first_parts:
+            first_parts.append(set(times))
+        elif set(times) != first_parts[0]:
+            fail(f"{label}: the parts differ between the sizes (at size "
+                 f"{at_size}): {sorted(set(times) ^ first_parts[0])}")
+        return times
+
+    grown = _GrownReadings(measured)
     small, small_factor = measure_under_load(
-        lambda: grown.at(small_size), base_budget_seconds, slowest_part)
+        lambda: grown.measure(small_size), base_budget_seconds, slowest_part)
     check_budget(small, small_size, small_factor)
     large, factor = measure_under_load(
-        lambda: grown.at(size), base_budget_seconds, slowest_part)
+        lambda: grown.measure(size), base_budget_seconds, slowest_part)
     check_budget(large, size, factor)
-    check_parts(small, large, small_size)
-    test_small_size = small_size
-    input_growth, large_size = 1.0, size
+    return _check_growth(grown, measured, small_size, size,
+                         {part: f"{label}: {part}" for part in large},
+                         base_budget_seconds * factor, factor)
+
+
+def _check_growth(grown: _GrownReadings,
+                  measure: Callable[[int], Mapping[str, float]],
+                  test_small_size: int, test_size: int,
+                  labels: Mapping[str, str], budget_seconds: float,
+                  factor: float, repetitions: int = 1
+                  ) -> dict[str, LinearTiming]:
+    """The growth verdict of every part of ``labels`` (part -> label), once
+    the test's sizes are in ``grown``; returns each part's timing at the
+    sizes the growth stopped at. A check fails when ANY of these holds:
+
+    1. The test's own pair (``test_small_size``, ``test_size``) breaks
+       main's rule: growth of ``GROWTH_LIMIT`` against
+       ``DETECTION_FLOOR_SECONDS`` (pre-3175 main, 883c9f2). With
+       ``repetitions`` (one ``seconds_at``, ``growth_repetitions``), both
+       sizes are means of that many runs against ``own_pair_floor``: also
+       the rule of b81777b. Grown sizes are no substitute for these:
+       superlinear work that gets cheaper past the test's size (a window,
+       an input cap or truncation the larger size reaches) grows linearly
+       there (IR78-01: 3129's ``sanitize`` truncates at 64,000 characters,
+       just over its 60,000-character test size).
+    2. A pair of grown sizes breaks main's rule, for any part. A part
+       over the limit fails at the first pair it is over at, so another
+       part still growing cannot carry it to 16 times the test's input
+       (IR78-02: 2 minutes for a 159 ms quadratic part).
+    3. The pair the growth stopped at breaks the growth check of task 3178
+       (``grows_further``): against ``GROWTH_FLOOR_SECONDS``, or main's
+       floor where the shape does not exist at the next size.
+
+    Each pair is measured again before it fails (``_still_over_the_limit``).
+    """
+    parts = list(labels)
+
+    def timings_at(pair: _Pair, small: Mapping[str, float],
+                   large: Mapping[str, float], at_parts: list[str]
+                   ) -> dict[str, LinearTiming]:
+        return {part: LinearTiming(labels[part], pair.small_size, small[part],
+                                   pair.size, large[part], budget_seconds,
+                                   factor, pair.input_growth,
+                                   pair.floor_seconds, pair.repetitions)
+                for part in at_parts}
+
+    def held(pair: _Pair, small: Mapping[str, float],
+             large: Mapping[str, float]) -> dict[str, LinearTiming]:
+        small, large, over = _still_over_the_limit(measure, pair, small,
+                                                   large, parts)
+        if over:
+            fail("superlinear growth: " + "; ".join(
+                timing.describe()
+                for timing in timings_at(pair, small, large, over).values()))
+        return timings_at(pair, small, large, parts)
+
+    # 1. The test's own pair.
+    held(_Pair(test_small_size, test_size, 1.0, own_pair_floor(repetitions),
+               repetitions),
+         _mean_readings(measure, test_small_size, repetitions,
+                        grown.at(test_small_size)),
+         _mean_readings(measure, test_size, repetitions, grown.at(test_size)))
+
+    # 2. Growth (task 3178), every grown pair held to main's rule.
+    small_size, size, input_growth = test_small_size, test_size, 1.0
+    floor_seconds = GROWTH_FLOOR_SECONDS
 
     def growing_parts() -> list[str]:
-        small_times = grown.at(small_size)
-        large_times = grown.at(large_size)
-        check_parts(small_times, large, small_size)
-        check_parts(large_times, large, large_size)
-        return [part for part in large
+        small_times, large_times = grown.at(small_size), grown.at(size)
+        return [part for part in parts
                 if grows_further(small_times[part], large_times[part],
                                  input_growth)]
 
-    floor_seconds = GROWTH_FLOOR_SECONDS
-    while parts := growing_parts():
+    while growing := growing_parts():
         # The step every growing part needs: the one whose larger reading
         # is smallest sets it.
-        quarter_size = _grow_step(grown, large_size, next_quarter_size(
-            large_size, min(grown.at(large_size)[part] for part in parts),
+        quarter_size = _grow_step(grown, size, next_quarter_size(
+            size, min(grown.at(size)[part] for part in growing),
             test_small_size * MAX_INPUT_GROWTH))
         if quarter_size is None:
-            # As in assert_linear_time: no larger shape, main's floor.
+            # The shape does not exist at the next size (a 200 KB review
+            # grown 16x passes the gate's 2 MB artifact cap): decided here
+            # with main's floor, under which a larger reading of 16 ms
+            # that grew 16x fails (IR75-01 without growing).
             floor_seconds = DETECTION_FLOOR_SECONDS
             break
-        small_size, large_size = quarter_size, quarter_size * GROWTH
+        small_size, size = quarter_size, quarter_size * GROWTH
         input_growth = small_size / test_small_size
-    small, large = dict(grown.at(small_size)), dict(grown.at(large_size))
-    for _ in range(GROWTH_RETRIES):
-        if all(growth_ratio(small[part], large[part], floor_seconds) < GROWTH_LIMIT
-               for part in large):
-            break
-        for part, seconds in seconds_at(small_size).items():
-            small[part] = min(small[part], seconds)
-        for part, seconds in seconds_at(large_size).items():
-            large[part] = min(large[part], seconds)
-    timings = {part: LinearTiming(f"{label}: {part}", small_size, small[part],
-                                  large_size, large[part],
-                                  base_budget_seconds * factor, factor,
-                                  input_growth, floor_seconds)
-               for part in large}
-    superlinear = [timing.describe() for timing in timings.values()
-                   if not timing.ratio < GROWTH_LIMIT]
-    if superlinear:
-        fail(f"superlinear growth: {superlinear}")
-    return timings
+        held(_Pair(small_size, size, input_growth, DETECTION_FLOOR_SECONDS),
+             grown.at(small_size), grown.at(size))
+
+    # 3. The pair the growth stopped at, as task 3178 decided it.
+    return held(_Pair(small_size, size, input_growth, floor_seconds),
+                grown.at(small_size), grown.at(size))

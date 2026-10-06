@@ -32,6 +32,7 @@ from tests.host_timing import (
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
+    MAX_GROWTH_REPETITIONS,
     MAX_HOST_FACTOR,
     MAX_INPUT_GROWTH,
     REFERENCE_SECONDS,
@@ -571,11 +572,17 @@ def test_the_scaled_step_never_passes_the_input_growth_cap():
 
 def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
-    sub-millisecond ratio of 8.7x. 5.2 ms is under the 16 ms that quadratic
-    work main caught reads at, so it is decided against the floor; the
-    same spike over a 5 ms quarter reading (24 ms) grows the input, and at
-    4 times it the spike (now the quarter) against 80 ms is linear."""
-    for quarter, spike, grown in ((0.0006, 0.0052, 1), (0.005, 0.024, 4)):
+    sub-millisecond ratio of 8.7x. That larger reading could reach the
+    limit once repeated (the test's own pair, b81777b's rule), so both
+    sizes run 32 times and their means (0.6 ms against 2.5 ms) are linear;
+    5.2 ms is under the 16 ms that quadratic work main caught reads at, so
+    the input does not grow. The same spike over a 5 ms quarter reading
+    (24 ms) cannot reach the limit when repeated, so it runs once, and it
+    grows the input: at 4 times it the spike (now the quarter) against 80
+    ms is linear."""
+    for quarter, spike, runs, grown in (
+            (0.0006, 0.0052, MAX_GROWTH_REPETITIONS, 1),
+            (0.005, 0.024, 1, 4)):
         calls: list[int] = []
         spikes = iter([spike])
 
@@ -588,7 +595,7 @@ def test_the_ci_reading_is_measured_again_and_passes():
             return linear
 
         timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
-        assert calls.count(40_000) == 1
+        assert calls.count(10_000) == calls.count(40_000) == runs
         assert timing.input_growth == grown
         assert timing.ratio < 4.1
 
@@ -614,10 +621,27 @@ def test_input_growth_is_decided_by_the_readings_not_by_what_a_call_costs():
 
 def test_quadratic_work_under_the_floor_fails_once_repeated():
     """5 ms then 80 ms: the 5 ms reading raised to the 20 ms floor would
-    read 4x. The input grows instead: 80 ms against 1.28 s reads 16x."""
+    read 4x. The test's own pair is held to main's 2 ms floor (16x), after
+    four runs of each size (b81777b: 20 ms against 320 ms); it fails there,
+    before the input grows to 1.28 s."""
+    calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*at 4x the test's input"):
-        assert_linear_time(_model(5e-11, 2), 40_000, 0.5, "quad")
+                       match=r"superlinear growth.*16\.0x at 1x the test's "
+                             r"input over 4 runs of each, floor 0\.002 s"):
+        assert_linear_time(_model(5e-11, 2, calls), 40_000, 0.5, "quad")
+    assert max(calls) == 40_000
+
+
+def test_quadratic_work_past_the_tests_size_fails_on_the_grown_input():
+    """Linear up to the test's size and quadratic past it: the test's own
+    pair reads 4x, so only the grown input (task 3178) sees the growth."""
+    def seconds_at(size: int) -> float:
+        return 0.02 * size / 40_000 * max(1.0, size / 40_000)
+
+    with pytest.raises(TimingCheckFailed,
+                       match=r"superlinear growth.*at [\d.]+x the test's input"
+                             r", floor 0\.002 s"):
+        assert_linear_time(seconds_at, 40_000, 10.0, "late")
 
 
 class _BuildClock:
