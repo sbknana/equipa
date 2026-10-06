@@ -132,7 +132,10 @@ def test_every_pattern_is_fast_on_one_megabyte_of_whitespace(case):
             for line in _run_probe("each-pattern", case, str(size)).splitlines():
                 seconds, reason = line.split("\t")
                 best[reason] = min(best.get(reason, float("inf")), float(seconds))
-            if max(best.values()) < limit:
+            # The budget holds up to 1 MB; past it (the input the growth
+            # check grows, task 3178) only the growth counts, so a run over
+            # the budget there is not taken again.
+            if size > ONE_MB or max(best.values()) < limit:
                 break
         assert set(best) == {reason for reason, _ in ls._INJECTION_PATTERNS}
         return best
