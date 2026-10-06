@@ -27,10 +27,12 @@ import asyncio
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -190,10 +192,12 @@ def test_a_store_that_cannot_be_trusted_refuses_every_dispatch(
 
 def _windows_reported_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: Any,
+    writers: Any = lambda path: [],
 ) -> Path:
     """A store as Windows reports it: no ``os.geteuid``, and a writable
     directory reads mode 0o777 (CPython derives it from the read-only
-    attribute alone)."""
+    attribute alone). ``owner`` and ``writers`` stand in for the security
+    descriptor's owner and access-list readings."""
     database = _real_database(tmp_path)
     _use_database(monkeypatch, database)
     store = database.parent / dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME
@@ -202,7 +206,85 @@ def _windows_reported_store(
     monkeypatch.delattr(dispatch_mod.os, "geteuid")
     monkeypatch.setattr(dispatch_mod, "_owned_by_this_windows_user", owner,
                         raising=False)
+    monkeypatch.setattr(dispatch_mod, "_windows_store_writers", writers,
+                        raising=False)
     return store
+
+
+def _access_list_unreadable(path: Path) -> list[str]:
+    raise OSError(5, "access denied")
+
+
+@pytest.mark.parametrize("writers, reason", [
+    (lambda path: ["S-1-5-32-545"], "can be written by other accounts: S-1-5-32-545"),
+    (_access_list_unreadable, "its access list cannot be read"),
+])
+def test_on_windows_a_store_others_may_write_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writers: Any, reason: str,
+) -> None:
+    """R3178-02 (task #3180): owned by this user is not enough; an allow
+    entry giving another account write or delete rights lets it delete the
+    records (the threat IR73-01 names)."""
+    store = _windows_reported_store(tmp_path, monkeypatch, lambda path: True, writers)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match=re.escape(reason)):
+        dispatch_mod._check_refusal_store(store)
+
+
+def test_on_windows_a_reparse_point_store_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3178-02: a junction is not S_ISLNK, and the security calls read its
+    target's owner and access list."""
+    asked: list[Path] = []
+    store = _windows_reported_store(
+        tmp_path, monkeypatch, lambda path: asked.append(path) or True)
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        info = real_lstat(path, *args, **kwargs)
+        if Path(path) == store:
+            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=(
+                stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT))
+        return info
+
+    monkeypatch.setattr(dispatch_mod.os, "lstat", lstat)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match="is a reparse point"):
+        dispatch_mod._check_refusal_store(store)
+    assert asked == []
+
+
+USERS, EVERYONE, OWN = "S-1-5-32-545", "S-1-1-0", "S-1-5-21-1-2-3-1001"
+FULL, READ_AND_EXECUTE = 0x001F01FF, 0x001200A9
+
+
+@pytest.mark.parametrize("entries, writers", [
+    ([], []),
+    ([(0, FULL, OWN), (0, FULL, "S-1-5-18"), (0, FULL, "S-1-5-32-544"),
+      (0, FULL, "S-1-3-0"), (0, READ_AND_EXECUTE, USERS)], []),
+    ([(0, READ_AND_EXECUTE | 0x0002, USERS)], [USERS]),          # add a record
+    ([(0, 0x0040, EVERYONE)], [EVERYONE]),                         # delete one
+    ([(0, 0x0001_0000, USERS)], [USERS]),                          # DELETE
+    ([(0, 0x0004_0000, USERS)], [USERS]),                          # WRITE_DAC
+    ([(0, 0x4000_0000, USERS)], [USERS]),                          # GENERIC_WRITE
+    ([(1, FULL, USERS)], []),                                      # a deny entry
+    ([(5, 0, "?")], ["? (an access entry of type 5)"]),            # unknown type
+    (None, ["Everyone (the directory has no access list)"]),
+])
+def test_the_windows_access_list_names_every_other_writer(entries: Any, writers: list[str]) -> None:
+    access = None if entries is None else [
+        dispatch_mod.WindowsAccessEntry(*entry) for entry in entries]
+    assert dispatch_mod._untrusted_windows_writers(access, [OWN]) == writers
+
+
+def test_the_windows_access_list_check_fails_closed_without_the_windows_api(
+    tmp_path: Path,
+) -> None:
+    if hasattr(__import__("ctypes"), "WinDLL"):
+        pytest.fail("this host has the Windows API; run the other Windows tests")
+    with pytest.raises(OSError, match="no Windows security API"):
+        dispatch_mod._windows_store_writers(tmp_path)
 
 
 def test_on_windows_a_store_of_this_user_is_trusted_whatever_its_mode(
@@ -298,6 +380,37 @@ def test_a_relative_database_keeps_its_store_after_a_chdir(tmp_path: Path) -> No
     expected = Path(os.path.realpath(started_in / "forge")) / (
         dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME)
     assert probe.stdout.split("\n")[:2] == [str(expected), str(expected)]
+
+
+def test_a_relative_database_in_the_dispatch_config_keeps_its_store_after_a_chdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3178-01 (task #3180): the forge_config.json ``theforge_db`` replaces
+    THEFORGE_DB after import; it is made absolute there too."""
+    import equipa.cli as cli_mod
+    import equipa.constants as constants
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "forge_config.json").write_text(
+        '{"theforge_db": "forge/theforge.db"}', encoding="utf-8")
+    started_in = tmp_path / "started"
+    (started_in / "forge").mkdir(parents=True)
+    moved_to = tmp_path / "moved"
+    moved_to.mkdir()
+    monkeypatch.setattr(constants, "THEFORGE_DB", constants.THEFORGE_DB)
+    monkeypatch.setattr(cli_mod, "__file__", str(checkout / "equipa" / "cli.py"))
+    monkeypatch.chdir(started_in)
+
+    cli_mod.load_config()
+    before = dispatch_mod._agent_repository_refusals_dir()
+    monkeypatch.chdir(moved_to)
+    after = dispatch_mod._agent_repository_refusals_dir()
+
+    expected = Path(os.path.realpath(started_in / "forge")) / (
+        dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME)
+    assert constants.THEFORGE_DB.is_absolute()
+    assert (before, after) == (expected, expected)
 
 
 def test_a_store_of_this_user_is_used_and_kept_private(
@@ -477,7 +590,60 @@ def _forgetful_async_wrapper(project: Path, tmp_path: Path) -> subprocess.Comple
     ))
 
 
+# IR78-04 (task #3180): a location carried by config, a repository named to
+# a transport subcommand, and an alias (a wrapper inside git).
+def _forgetful_config(*config: str, env: dict[str, str] | None = None,
+                      subcommand: tuple[str, ...] = ("status", "--short")):
+    def helper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+        values = [part.format(project=project) for part in config]
+        variables = {key: value.format(project=project)
+                     for key, value in (env or {}).items()}
+        return git_run(
+            [*values, *(part.format(project=project) for part in subcommand)],
+            _elsewhere(tmp_path), env=variables or None,
+        )
+
+    return helper
+
+
+IR78_04_HELPERS = {
+    "git_run-c-core.worktree": _forgetful_config("-c", "core.worktree={project}"),
+    "git_run-config-env-core.worktree": _forgetful_config(
+        "--config-env=core.worktree=PLANTED_WORK_TREE",
+        env={"PLANTED_WORK_TREE": "{project}"}),
+    "git_run-GIT_CONFIG_COUNT-core.worktree": _forgetful_config(env={
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": "{project}"}),
+    "git_run-GIT_CONFIG_PARAMETERS-core.worktree": _forgetful_config(
+        env={"GIT_CONFIG_PARAMETERS": "'core.worktree'='{project}'"}),
+    "git_run-GIT_CONFIG_GLOBAL-in-the-project": _forgetful_config(
+        env={"GIT_CONFIG_GLOBAL": "{project}/.git/config"}),
+    "git_run-fetch-the-project": _forgetful_config(subcommand=("fetch", "{project}")),
+    "git_run-fetch-a-file-url": _forgetful_config(
+        subcommand=("fetch", "file://{project}/.git")),
+    "git_run-ls-remote-localhost": _forgetful_config(
+        subcommand=("ls-remote", "localhost:{project}")),
+    "git_run-clone-the-project": _forgetful_config(
+        subcommand=("clone", "--no-checkout", "{project}", "{project}-copy")),
+    "git_run-remote-url-config": _forgetful_config(
+        "-c", "remote.planted.url={project}", subcommand=("fetch", "planted")),
+    "git_run-url-insteadOf": _forgetful_config(
+        "-c", "url.{project}.insteadOf=planted:", subcommand=("fetch", "planted:x")),
+    "git_run-shell-alias": _forgetful_config(
+        "-c", "alias.z=!cd {project} && git diff --stat", subcommand=("z",)),
+    "git_run-GIT_CONFIG_COUNT-alias": _forgetful_config(
+        env={"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "alias.z",
+             "GIT_CONFIG_VALUE_0": "!git -C {project} diff"},
+        subcommand=("z",)),
+    "git_run-upload-pack-wrapper": _forgetful_config(subcommand=(
+        "ls-remote", "--upload-pack=sh -c 'cd {project} && git diff' #", "/tmp")),
+    "git_run-unreadable-GIT_CONFIG_COUNT": _forgetful_config(
+        env={"GIT_CONFIG_COUNT": "many"}),
+}
+
+
 FORGETFUL_HELPERS = {
+    **IR78_04_HELPERS,
     "git_run": _forgetful_sync,
     "git_run-relative-git-dir-before-dash-C":
         _forgetful_relative_git_dir_before_change_directory,
@@ -521,6 +687,29 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     assert result.returncode == NOT_A_REPOSITORY
     assert result.stdout == ""
     assert "not a git repository at dispatch" in result.stderr
+
+
+IR78_04_ALLOWED = {
+    "config-elsewhere": ["git", "-c", "core.worktree={elsewhere}", "status"],
+    "config-of-no-location": ["git", "-c", "user.name=t", "-c", "core.hooksPath=", "log"],
+    "fetch-a-remote-name": ["git", "fetch", "origin"],
+    "fetch-another-repository": ["git", "fetch", "{elsewhere}"],
+    "push-set-upstream": ["git", "push", "-u", "origin", "main"],
+    "diff-of-a-path-named-like-the-project": ["git", "diff", "--", "project"],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(IR78_04_ALLOWED))
+def test_config_and_transport_shapes_elsewhere_are_allowed(tmp_path: Path, shape: str) -> None:
+    """Control for IR78-04: only a location in the recorded project (or an
+    alias, or a remote-side program) is refused, never config or transport
+    as such."""
+    project = tmp_path / "project"
+    project.mkdir()
+    elsewhere = _elsewhere(tmp_path)
+    argv = [part.format(elsewhere=elsewhere) for part in IR78_04_ALLOWED[shape]]
+    with dispatched_without_git(project):
+        assert git_ops._non_git_project_refusal(argv, elsewhere, {}) is None
 
 
 def test_a_wrapper_runs_while_no_project_is_recorded(tmp_path: Path) -> None:
@@ -646,10 +835,21 @@ PROCESS_STARTERS = frozenset({
         "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp",
         "spawnlpe",
     )),
+    # IR78-03 (task #3180).
+    "pty.spawn",
 })
 # Event-loop methods, called on a loop object whose name the source does
 # not fix.
 LOOP_PROCESS_STARTERS = frozenset({"subprocess_exec", "subprocess_shell"})
+# The modules a starter is an attribute of: ``getattr(subprocess, name)``
+# with a name the fence cannot resolve may be any of their starters.
+PROCESS_MODULES = frozenset(starter.rsplit(".", 1)[0] for starter in PROCESS_STARTERS)
+# A starter the fence cannot name (an unresolved ``getattr`` of a process
+# module, a container of different starters): its start is unproven.
+UNRESOLVED_STARTER = "<a starter the fence cannot name>"
+# List methods that add items to an argv a name holds (IR78-03:
+# ``cmd = ["nice"]; cmd.extend(["git", "diff"])``).
+ARGV_MUTATORS = frozenset({"extend", "append", "insert"})
 
 
 def _imported_names(tree: ast.Module) -> dict[str, str]:
@@ -724,6 +924,7 @@ STARTER_ARGUMENTS: dict[str, tuple[tuple[str, int], ...]] = {
        for name in ("spawnl", "spawnle", "spawnlp", "spawnlpe")},
     "subprocess_exec": ((_PROGRAM, 1), (_REST, 2)),
     "subprocess_shell": ((_COMMAND_LINE, 1),),
+    "pty.spawn": ((_ARGV, 0),),
 }
 # Keyword arguments that hand a starter its argv or its program.
 _ARGV_KEYWORDS = frozenset({"args"})
@@ -773,17 +974,48 @@ class _ProcessStartFence:
     def __init__(self, tree: ast.Module, imported: dict[str, str]) -> None:
         self._imported = imported
         self._bindings: dict[str, list[ast.expr]] = {}
+        # Items added to the argv a name holds, in source order: (True when
+        # they may land first, the items as an argv node).
+        self._additions: dict[str, list[tuple[bool, ast.expr]]] = {}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                self._note_argv_mutation(node)
+                continue
             if isinstance(node, ast.Assign):
                 targets, value = node.targets, node.value
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value:
                 targets, value = [node.target], node.value
+                if (isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add)
+                        and isinstance(node.target, ast.Name)):
+                    self._additions.setdefault(node.target.id, []).append((False, value))
             else:
                 continue
             for target in targets:
                 if isinstance(target, ast.Name):
                     self._bindings.setdefault(target.id, []).append(value)
         self._resolving: set[str] = set()
+
+    def _note_argv_mutation(self, call: ast.Call) -> None:
+        """Record ``name.extend(items)``, ``name.append(item)`` and
+        ``name.insert(index, item)`` as items added to ``name``'s argv; an
+        insert at index 0, or at an index the source does not fix, may put
+        its item first."""
+        function = call.func
+        if not (isinstance(function, ast.Attribute) and function.attr in ARGV_MUTATORS
+                and isinstance(function.value, ast.Name) and call.args):
+            return
+        name = function.value.id
+        if function.attr == "extend":
+            self._additions.setdefault(name, []).append((False, call.args[0]))
+        elif function.attr == "append":
+            self._additions.setdefault(name, []).append(
+                (False, ast.List(elts=[call.args[0]], ctx=ast.Load())))
+        elif len(call.args) >= 2:
+            index = call.args[0]
+            later = (isinstance(index, ast.Constant) and isinstance(index.value, int)
+                     and not isinstance(index.value, bool) and index.value > 0)
+            self._additions.setdefault(name, []).append(
+                (not later, ast.List(elts=[call.args[1]], ctx=ast.Load())))
 
     # --- what a call starts -------------------------------------------------------
 
@@ -807,12 +1039,62 @@ class _ProcessStartFence:
             return called
         if called is not None and called.rsplit(".", 1)[-1] in LOOP_PROCESS_STARTERS:
             return called.rsplit(".", 1)[-1]
-        if isinstance(function, ast.Name) and depth < 8:
+        if depth >= 8:
+            return None
+        if isinstance(function, ast.Name):
             for value in self._bindings.get(function.id, []):
                 found = self._starter_name(value, depth + 1)
                 if found is not None:
                     return found
+        if isinstance(function, ast.Call):
+            return self._starter_got(function)
+        if isinstance(function, ast.Subscript):
+            # ``STARTERS["run"](...)``: any starter the container holds.
+            found = {name for element in self._elements(function.value, depth)
+                     if (name := self._starter_name(element, depth + 1)) is not None}
+            if len(found) == 1:
+                return found.pop()
+            if found:
+                return UNRESOLVED_STARTER
         return None
+
+    def _starter_got(self, call: ast.Call) -> str | None:
+        """The starter ``getattr(<process module>, name)`` gets, an
+        unresolved one when the name is not known, or the one a
+        container's ``.get`` returns (IR78-03)."""
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "get":
+            container = call.func.value
+            found = {name for element in self._elements(container, 0)
+                     if (name := self._starter_name(element, 1)) is not None}
+            if len(found) == 1:
+                return found.pop()
+            return UNRESOLVED_STARTER if found else None
+        if (_called_name(call.func, self._imported) not in ("getattr", "builtins.getattr")
+                or len(call.args) < 2):
+            return None
+        owner = _called_name(call.args[0], self._imported)
+        for attribute in self.strings(call.args[1]):
+            if attribute is UNKNOWN:
+                if owner in PROCESS_MODULES:
+                    return UNRESOLVED_STARTER
+                continue
+            if f"{owner}.{attribute}" in PROCESS_STARTERS:
+                return f"{owner}.{attribute}"
+            if attribute in LOOP_PROCESS_STARTERS:
+                return attribute
+        return None
+
+    def _elements(self, container: ast.expr, depth: int) -> list[ast.expr]:
+        """The values a dict, list, tuple or set (or a name bound to one)
+        holds."""
+        if isinstance(container, ast.Dict):
+            return list(container.values)
+        if isinstance(container, (ast.List, ast.Tuple, ast.Set)):
+            return list(container.elts)
+        if isinstance(container, ast.Name) and depth < 8:
+            return [element for value in self._bindings.get(container.id, [])
+                    for element in self._elements(value, depth + 1)]
+        return []
 
     # --- values -------------------------------------------------------------------
 
@@ -857,8 +1139,32 @@ class _ProcessStartFence:
                 and _called_name(node.func, self._imported) in ("list", "tuple")):
             return self.argvs(node.args[0])
         if isinstance(node, ast.Name):
-            return self._through_name(node.id, self.argvs, [[UNKNOWN]])
+            return self._with_additions(
+                node.id, self._through_name(node.id, self.argvs, [[UNKNOWN]]))
         return [[UNKNOWN]]
+
+    def _with_additions(self, name: str,
+                        argvs: list[list[str | None]]) -> list[list[str | None]]:
+        """``argvs`` (what ``name`` is bound to), and each of them with every
+        item the source adds to ``name`` (``extend``, ``append``, ``insert``,
+        ``+=``): appended in source order, or put first where an insert may
+        put it there. A program the additions change is judged as started
+        (IR78-03: ``cmd = ["nice"]; cmd.extend(["git", "diff"])``)."""
+        additions = self._additions.get(name)
+        if not additions or name in self._resolving:
+            return argvs
+        self._resolving.add(name)
+        try:
+            added = argvs
+            for first, items in additions:
+                options = self.argvs(items)
+                added = _combined(options, added) if first else _combined(added, options)
+        finally:
+            self._resolving.discard(name)
+        combined = argvs + added
+        if len(combined) > MAX_ARGVS:
+            return combined[:MAX_ARGVS] + [[UNKNOWN]]
+        return combined
 
     def _through_name(self, name: str, resolve, unknown):
         values = self._bindings.get(name)
@@ -895,6 +1201,8 @@ class _ProcessStartFence:
     def verdict(self, called: str, args: list[ast.expr],
                 keywords: dict[str, ast.expr]) -> str:
         """The worst verdict over every value the start could be given."""
+        if called == UNRESOLVED_STARTER:
+            return "unproven"
         layout = dict(STARTER_ARGUMENTS.get(called, ((_ARGV, 0),)))
         candidates: list[list[str | None]] = []
         command_lines: list[str | None] = []
@@ -1102,6 +1410,27 @@ HELPERS_THAT_START_GIT_THEMSELVES = {
         'import asyncio\nawait asyncio.create_subprocess_exec("env", "git", "status")\n',
     "posix_spawn": 'import os\nos.posix_spawn("/usr/bin/git", ["git", "gc"], env)\n',
     "spawnv": 'import os\nos.spawnv(os.P_WAIT, "/usr/bin/git", ["git", "gc"])\n',
+    # IR78-03 (task #3180): the shapes the IR76-02 fence did not see.
+    "argv-extended":
+        'import subprocess\ncmd = ["nice"]\ncmd.extend(["git", "diff"])\nsubprocess.run(cmd)\n',
+    "argv-appended": 'import subprocess\ncmd = ["env"]\ncmd.append("gh")\nsubprocess.run(cmd)\n',
+    "argv-inserted-first":
+        'import subprocess\ncmd = ["status"]\ncmd.insert(0, "git")\nsubprocess.run(cmd)\n',
+    "argv-inserted-anywhere":
+        'import subprocess\ncmd = ["status"]\ncmd.insert(i, "git")\nsubprocess.run(cmd)\n',
+    "argv-added-after-an-assignment-word":
+        'import subprocess\ncmd = ["env"]\ncmd += ["LANG=C", "git", "diff"]\nsubprocess.run(cmd)\n',
+    "getattr-starter": 'import subprocess\ngetattr(subprocess, "run")(["git", "diff"])\n',
+    "getattr-starter-bound-to-a-name":
+        'import subprocess\nstart = getattr(subprocess, "Popen")\nstart(["git", "log"])\n',
+    "getattr-of-an-unknown-name": 'import subprocess\ngetattr(subprocess, name)(["x"])\n',
+    "pty.spawn": 'import pty\npty.spawn(["git", "log"])\n',
+    "dict-of-starters":
+        'import subprocess\nSTARTERS = {"run": subprocess.run}\nSTARTERS["run"](["git", "diff"])\n',
+    "dict-of-starters-get":
+        'import subprocess\nSTARTERS = {"run": subprocess.run}\n'
+        'STARTERS.get("run")(["git", "status"])\n',
+    "list-of-starters": 'import os, subprocess\n[subprocess.run, os.system][i](argv)\n',
 }
 
 
@@ -1133,6 +1462,13 @@ CODE_THAT_DOES_NOT_START_GIT = {
         'import subprocess, sys\nsubprocess.run([sys.executable, "-c", "pass"])\n',
     "os.spawnv-of-another-program":
         'import os\nos.spawnv(os.P_WAIT, "/usr/bin/nft", ["nft", "list"])\n',
+    "an-argv-of-another-program-extended":
+        'import subprocess\ncmd = ["nft"]\ncmd.extend(["list", "ruleset"])\n'
+        'cmd.append("-j")\nsubprocess.run(cmd)\n',
+    "a-dict-of-other-callables": 'HANDLERS = {"a": print}\nHANDLERS["a"]("git")\n',
+    "getattr-of-another-object": 'getattr(logger, "info")(["git", "diff"])\n',
+    "getattr-of-another-starter-name":
+        'import subprocess\ngetattr(subprocess, "DEVNULL")\n',
 }
 
 
@@ -1156,6 +1492,39 @@ def test_the_fence_finds_git_started_in_a_real_module() -> None:
     assert calls > 0
     assert _git_started_outside_the_runners(source, module.name) == []
     assert len(_git_started_outside_the_runners(started_itself, module.name)) == calls
+
+
+PLANTED_FORGETFUL_HELPERS = {
+    "extended-argv": (
+        "def _planted_forgetful_status(project):\n"
+        "    cmd = [\"nice\"]\n"
+        "    cmd.extend([\"git\", \"status\"])\n"
+        "    return subprocess.run(cmd, cwd=project)\n"),
+    "getattr-starter": (
+        "def _planted_forgetful_status(project):\n"
+        "    return getattr(subprocess, \"run\")([\"git\", \"status\"], cwd=project)\n"),
+    "pty-spawn": (
+        "import pty\n\n\n"
+        "def _planted_forgetful_status(project):\n"
+        "    return pty.spawn([\"git\", \"-C\", project, \"status\"])\n"),
+    "dict-of-starters": (
+        "_PLANTED_STARTERS = {\"run\": subprocess.run}\n\n\n"
+        "def _planted_forgetful_status(project):\n"
+        "    return _PLANTED_STARTERS[\"run\"]([\"git\", \"status\"], cwd=project)\n"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(PLANTED_FORGETFUL_HELPERS))
+def test_the_fence_finds_an_ir78_03_helper_planted_in_a_real_module(shape: str) -> None:
+    """IR78-03: the reviewer planted the ``extend`` shape in a scratch copy
+    of monitoring.py and the scan passed; each shape is found there now."""
+    module = REPO_ROOT / "equipa" / "monitoring.py"
+    source = module.read_text(encoding="utf-8")
+    planted = source + "\n\n" + PLANTED_FORGETFUL_HELPERS[shape]
+
+    assert _git_started_outside_the_runners(source, module.name) == []
+    found = _git_started_outside_the_runners(planted, module.name)
+    assert len(found) == 1 and "_planted_forgetful_status" in found[0], found
 
 
 def test_no_orchestrator_module_starts_git_outside_the_runners() -> None:

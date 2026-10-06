@@ -15,10 +15,11 @@ from __future__ import annotations
 import ast
 import gc
 import math
+import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from tests.host_timing import (
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
+    MAX_GROWTH_REPETITIONS,
     MAX_HOST_FACTOR,
     MAX_INPUT_GROWTH,
     REFERENCE_SECONDS,
@@ -571,11 +573,17 @@ def test_the_scaled_step_never_passes_the_input_growth_cap():
 
 def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
-    sub-millisecond ratio of 8.7x. 5.2 ms is under the 16 ms that quadratic
-    work main caught reads at, so it is decided against the floor; the
-    same spike over a 5 ms quarter reading (24 ms) grows the input, and at
-    4 times it the spike (now the quarter) against 80 ms is linear."""
-    for quarter, spike, grown in ((0.0006, 0.0052, 1), (0.005, 0.024, 4)):
+    sub-millisecond ratio of 8.7x. That larger reading could reach the
+    limit once repeated (the test's own pair, b81777b's rule), so both
+    sizes run 32 times and their means (0.6 ms against 2.5 ms) are linear;
+    5.2 ms is under the 16 ms that quadratic work main caught reads at, so
+    the input does not grow. The same spike over a 5 ms quarter reading
+    (24 ms) cannot reach the limit when repeated, so it runs once, and it
+    grows the input: at 4 times it the spike (now the quarter) against 80
+    ms is linear."""
+    for quarter, spike, runs, grown in (
+            (0.0006, 0.0052, MAX_GROWTH_REPETITIONS, 1),
+            (0.005, 0.024, 1, 4)):
         calls: list[int] = []
         spikes = iter([spike])
 
@@ -588,7 +596,7 @@ def test_the_ci_reading_is_measured_again_and_passes():
             return linear
 
         timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
-        assert calls.count(40_000) == 1
+        assert calls.count(10_000) == calls.count(40_000) == runs
         assert timing.input_growth == grown
         assert timing.ratio < 4.1
 
@@ -614,10 +622,29 @@ def test_input_growth_is_decided_by_the_readings_not_by_what_a_call_costs():
 
 def test_quadratic_work_under_the_floor_fails_once_repeated():
     """5 ms then 80 ms: the 5 ms reading raised to the 20 ms floor would
-    read 4x. The input grows instead: 80 ms against 1.28 s reads 16x."""
+    read 4x. The test's own pair is held to main's 2 ms floor (16x), after
+    four runs of each size (b81777b: 20 ms against 320 ms); it fails there,
+    before the input grows to 1.28 s."""
+    calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*at 4x the test's input"):
-        assert_linear_time(_model(5e-11, 2), 40_000, 0.5, "quad")
+                       match=r"superlinear growth.*16\.0x at 1x the test's "
+                             r"input over 4 runs of each, floor 0\.002 s"):
+        assert_linear_time(_model(5e-11, 2, calls), 40_000, 0.5, "quad")
+    assert max(calls) == 40_000
+
+
+def test_quadratic_work_past_the_tests_size_fails_on_the_grown_input():
+    """Linear up to the test's size and quadratic past it: the test's own
+    pair reads 4x, so only the grown input (task 3178) sees the growth: it
+    fails at the first grown pair (40,000 then 160,000 units: 20 ms then
+    320 ms), against the 20 ms floor 3178 held grown sizes to."""
+    def seconds_at(size: int) -> float:
+        return 0.02 * size / 40_000 * max(1.0, size / 40_000)
+
+    with pytest.raises(TimingCheckFailed,
+                       match=r"superlinear growth.*at 4x the test's input"
+                             r", floor 0\.02 s"):
+        assert_linear_time(seconds_at, 40_000, 10.0, "late")
 
 
 class _BuildClock:
@@ -728,13 +755,54 @@ def _pair_work(units: int) -> int:
     return total
 
 
+def _pair_work_seconds(units: int) -> float:
+    """The CPU time of one ``_pair_work(units)`` call, collector paused."""
+    with host_timing.collector_paused():
+        started = time.process_time()
+        _pair_work(units)
+        return time.process_time() - started
+
+
+# Readings within this share of the target end the calibration.
+PLANT_CALIBRATION_TOLERANCE = 0.1
+PLANT_CALIBRATION_ROUNDS = 5
+
+
 def _units_reading(target_seconds: float) -> int:
     """How many units ``_pair_work`` takes ``target_seconds`` of CPU time on
-    here (measured, so the planted reading is what this host reads)."""
-    started = time.process_time()
-    _pair_work(400)
-    per_pair = (time.process_time() - started) / 400 ** 2
-    return max(GROWTH, round(math.sqrt(target_seconds / per_pair)))
+    here, measured on the work itself: the median of three readings at a
+    size, rescaled (quadratic work: by the square root of the ratio) until
+    one lands within PLANT_CALIBRATION_TOLERANCE of the target. Task 3180:
+    one 400-unit reading, scaled 30 times over, planted a reading outside
+    16-159 ms on a CI runner, and the proof passed (DID NOT RAISE)."""
+    units = 400
+    for _ in range(PLANT_CALIBRATION_ROUNDS):
+        reading = statistics.median(_pair_work_seconds(units)
+                                    for _ in range(3))
+        if abs(reading / target_seconds - 1) <= PLANT_CALIBRATION_TOLERANCE:
+            break
+        units = max(GROWTH, round(
+            units * math.sqrt(target_seconds / max(reading, 1e-6))))
+    return units
+
+
+def planted_band(target_seconds: float) -> tuple[float, float]:
+    """The readings a planted proof aiming at ``target_seconds`` must land
+    in at the test's size: inside 16.5-159 ms (quadratic work main's 2 ms
+    floor caught, up to the 159 ms of IR75-01), within a quarter (-) or a
+    third (+) of the target."""
+    return (max(1.03 * host_timing.GROWTH_DETECTION_SECONDS,
+                0.75 * target_seconds),
+            min(0.159, target_seconds * 4 / 3))
+
+
+def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
+    """The ``TimingCheckFailed`` ``check()`` raised, or None if it passed."""
+    try:
+        check()
+    except TimingCheckFailed as failure:
+        return failure
+    return None
 
 
 @pytest.mark.parametrize("build_seconds", (0.0, 0.3))
@@ -744,17 +812,35 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
     """IR75-01 on real work and the real clock: quadratic work reading
     about 20 ms or 120 ms at the test's size fails, also when building the
     shape takes 0.3 s of wall time per call (3175 then measured each size
-    once and raised the quarter reading to the 20 ms floor)."""
-    units = _units_reading(target_seconds)
+    once and raised the quarter reading to the 20 ms floor).
 
-    def seconds_at(size: int) -> float:
-        time.sleep(build_seconds * size / units)
-        started = time.process_time()
-        _pair_work(size)
-        return time.process_time() - started
+    Task 3180: the proof must plant what it claims on any host. The size
+    is calibrated on the work itself, the reading at the test's size is
+    recorded, and the test asserts it landed in the band (re-planted up to
+    three times) before asserting the check failed on it."""
+    lower, upper = planted_band(target_seconds)
+    for _ in range(3):
+        units = _units_reading(target_seconds)
+        readings: dict[int, list[float]] = {}
 
-    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
-        assert_linear_time(seconds_at, units, 30.0, "planted quadratic")
+        def seconds_at(size: int, units=units, readings=readings) -> float:
+            time.sleep(build_seconds * size / units)
+            started = time.process_time()
+            _pair_work(size)
+            elapsed = time.process_time() - started
+            readings.setdefault(size, []).append(elapsed)
+            return elapsed
+
+        failure = timing_failure(lambda: assert_linear_time(
+            seconds_at, units, 30.0, "planted quadratic"))
+        planted = readings[units][0]
+        if lower <= planted <= upper:
+            break
+    assert lower <= planted <= upper, (
+        f"the planted reading {planted:.4f} s at {units} units missed the "
+        f"{lower:.4f}-{upper:.4f} s band on this host")
+    assert failure is not None and "superlinear growth" in str(failure), (
+        f"quadratic work reading {planted:.4f} s passed: {readings}")
 
 
 @pytest.mark.parametrize("target_seconds", (0.005, 0.05))

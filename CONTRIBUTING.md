@@ -73,7 +73,17 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   16-159 ms pass (IR75-01), so a larger reading of 16 ms or more always
   grows the input, whatever building the shape costs.
   `assert_linear_times` (several parts per child run) grows its size the
-  same way. Never raise a base budget. Build the input
+  same way. Growing the input never replaces the test's own sizes: work
+  that is superlinear up to the test's size and cheaper past it (a window,
+  an input cap or truncation the larger size reaches) grows linearly at the
+  grown sizes (IR78-01: a quadratic regression behind `sanitize`'s 64,000
+  character cap passed its 60,000-character test). So the test's own pair
+  is also held to main's rule (8x against a 2 ms floor), and a pair of
+  cheap calls that could reach the limit is measured again until the
+  quarter size totals 20 ms (b81777b's rule); every grown pair is held to
+  the growth limit against the 20 ms floor (as task 3178 held the pair the
+  growth stopped at), and a part fails at the first pair it is over at.
+  Never raise a base budget. Build the input
   before the clock starts: allocating a multi-megabyte string is page
   faults, which grew 32x from 1 MB to 4 MB under load. `assert_linear_time`
   pauses the garbage collector inside each timed call: a full collection
