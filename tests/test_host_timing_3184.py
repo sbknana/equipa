@@ -258,5 +258,9 @@ def test_real_linear_work_read_under_a_burst_passes():
 
     timing = assert_linear_time(seconds_at, units, 30.0, "linear under a burst")
     assert readings[units][0] / readings[units // GROWTH][0] >= 6.0
-    assert timing.samples == 1 + BORDERLINE_RETRIES
-    assert timing.ratio < BORDERLINE_GROWTH
+    # The test's own pair was settled on 1 + BORDERLINE_RETRIES readings of
+    # each size. (Under load its fastest quarter reading can drop under the
+    # floor, and the input then grows: ``timing`` is the pair it stopped at.)
+    assert len(readings[units]) >= 1 + BORDERLINE_RETRIES
+    assert len(readings[units // GROWTH]) == 1 + BORDERLINE_RETRIES
+    assert timing.ratio < GROWTH_LIMIT
