@@ -28,7 +28,9 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import (
+    AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence,
+)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1179,7 +1181,12 @@ def _check_refusal_store(refusals_dir: Path) -> None:
         # Windows: st_mode carries only the read-only attribute, so every
         # writable directory reads 0o777 and the mode test refused every
         # store; ownership is read from the directory's security descriptor
-        # instead (IR76-04, task #3178).
+        # instead (IR76-04, task #3178), and who else may write from its
+        # access list (R3178-02, task #3180). A junction is not S_ISLNK, and
+        # the security calls read its target.
+        if getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RefusalStoreError(
+                f"{refusals_dir} is a reparse point (a junction or a link)")
         try:
             owned = _owned_by_this_windows_user(refusals_dir)
         except OSError as exc:
@@ -1188,6 +1195,16 @@ def _check_refusal_store(refusals_dir: Path) -> None:
             ) from exc
         if not owned:
             raise RefusalStoreError(f"{refusals_dir} is not owned by this user")
+        try:
+            writers = _windows_store_writers(refusals_dir)
+        except OSError as exc:
+            raise RefusalStoreError(
+                f"{refusals_dir}: its access list cannot be read ({exc})"
+            ) from exc
+        if writers:
+            raise RefusalStoreError(
+                f"{refusals_dir} can be written by other accounts: "
+                f"{', '.join(writers)}")
         return
     if info.st_uid != os.geteuid():
         raise RefusalStoreError(
@@ -1261,6 +1278,159 @@ def _owned_by_this_windows_user(path: Path) -> bool:
             kernel32.CloseHandle(token)
     finally:
         kernel32.LocalFree(descriptor)
+
+
+# Rights over the refusal store that let an account add, change or delete a
+# record, or take the store over (R3178-02, task #3180).
+_WINDOWS_STORE_WRITE_RIGHTS = (
+    0x0000_0002      # FILE_ADD_FILE (FILE_WRITE_DATA)
+    | 0x0000_0004    # FILE_ADD_SUBDIRECTORY (FILE_APPEND_DATA)
+    | 0x0000_0010    # FILE_WRITE_EA
+    | 0x0000_0040    # FILE_DELETE_CHILD
+    | 0x0000_0100    # FILE_WRITE_ATTRIBUTES
+    | 0x0001_0000    # DELETE
+    | 0x0004_0000    # WRITE_DAC
+    | 0x0008_0000    # WRITE_OWNER
+    | 0x0200_0000    # MAXIMUM_ALLOWED
+    | 0x1000_0000    # GENERIC_ALL
+    | 0x4000_0000    # GENERIC_WRITE
+)
+_WINDOWS_ACCESS_ALLOWED_ACE = 0
+_WINDOWS_ACCESS_DENIED_ACE = 1
+# Accounts whose write access leaves the store trusted: SYSTEM, the
+# Administrators group (either can take any file over anyway), and CREATOR
+# OWNER (a placeholder for whoever creates a record: this user).
+_WINDOWS_TRUSTED_WRITER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-0"})
+
+
+@dataclass(frozen=True)
+class WindowsAccessEntry:
+    """One entry of a Windows access list: its type, access mask and SID."""
+
+    ace_type: int
+    mask: int
+    sid: str
+
+
+def _untrusted_windows_writers(
+    entries: Sequence[WindowsAccessEntry] | None, own_sids: Iterable[str],
+) -> list[str]:
+    """The accounts other than ``own_sids`` (this process's user and token
+    owner) and the trusted ones that ``entries`` grant the right to add,
+    change or delete a refusal record, or to take the store over. Inherit-
+    only entries count: they reach every record created in the store. An
+    entry of a type other than allow or deny counts as a grant (fail
+    closed), and ``entries`` None is a NULL access list: everyone has full
+    access."""
+    if entries is None:
+        return ["Everyone (the directory has no access list)"]
+    trusted = _WINDOWS_TRUSTED_WRITER_SIDS | set(own_sids)
+    writers: list[str] = []
+    for entry in entries:
+        if entry.ace_type == _WINDOWS_ACCESS_DENIED_ACE:
+            continue
+        if entry.ace_type != _WINDOWS_ACCESS_ALLOWED_ACE:
+            writers.append(f"{entry.sid} (an access entry of type {entry.ace_type})")
+        elif entry.mask & _WINDOWS_STORE_WRITE_RIGHTS and entry.sid not in trusted:
+            writers.append(entry.sid)
+    return writers
+
+
+def _windows_store_writers(path: Path) -> list[str]:
+    """:func:`_untrusted_windows_writers` of the access list (DACL) of
+    ``path``. Windows only; raises OSError when a security call fails or
+    there is no Windows API."""
+    import ctypes
+    from ctypes import wintypes
+
+    if not hasattr(ctypes, "WinDLL"):
+        raise OSError("no Windows security API on this platform")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    se_file_object, dacl_security_information = 1, 0x4
+    token_query, token_user, token_owner = 0x0008, 1, 4
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    class AclHeader(ctypes.Structure):
+        _fields_ = [("revision", ctypes.c_ubyte), ("padding", ctypes.c_ubyte),
+                    ("size", wintypes.WORD), ("count", wintypes.WORD),
+                    ("padding2", wintypes.WORD)]
+
+    class AccessEntry(ctypes.Structure):
+        # ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header, mask, then the SID.
+        _fields_ = [("ace_type", ctypes.c_ubyte), ("flags", ctypes.c_ubyte),
+                    ("size", wintypes.WORD), ("mask", wintypes.DWORD),
+                    ("sid_start", wintypes.DWORD)]
+
+    def sid_text(sid: int | None) -> str:
+        text = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.wstring_at(text.value)
+        finally:
+            kernel32.LocalFree(text)
+
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        os.fspath(path), se_file_object, dacl_security_information,
+        None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    if status != 0:
+        raise OSError(status, f"GetNamedSecurityInfoW failed with {status}")
+    try:
+        entries: list[WindowsAccessEntry] | None = None
+        if dacl.value:
+            entries = []
+            for number in range(AclHeader.from_address(dacl.value).count):
+                address = ctypes.c_void_p()
+                if not advapi32.GetAce(dacl, number, ctypes.byref(address)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                entry = AccessEntry.from_address(address.value)
+                known = entry.ace_type in (_WINDOWS_ACCESS_ALLOWED_ACE,
+                                           _WINDOWS_ACCESS_DENIED_ACE)
+                entries.append(WindowsAccessEntry(
+                    entry.ace_type, entry.mask if known else 0,
+                    sid_text(address.value + AccessEntry.sid_start.offset)
+                    if known else "?"))
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            own_sids = []
+            for information_class in (token_user, token_owner):
+                needed = wintypes.DWORD()
+                advapi32.GetTokenInformation(
+                    token, information_class, None, 0, ctypes.byref(needed))
+                buffer = ctypes.create_string_buffer(needed.value)
+                if not advapi32.GetTokenInformation(
+                        token, information_class, buffer, needed,
+                        ctypes.byref(needed)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                # TOKEN_USER and TOKEN_OWNER both start with the SID pointer.
+                own_sids.append(sid_text(ctypes.c_void_p.from_buffer(buffer).value))
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.LocalFree(descriptor)
+    return _untrusted_windows_writers(entries, own_sids)
 
 
 def _refusal_record(refusals_dir: Path, location: str) -> Path:

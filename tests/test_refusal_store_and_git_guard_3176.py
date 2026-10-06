@@ -27,10 +27,12 @@ import asyncio
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -190,10 +192,12 @@ def test_a_store_that_cannot_be_trusted_refuses_every_dispatch(
 
 def _windows_reported_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: Any,
+    writers: Any = lambda path: [],
 ) -> Path:
     """A store as Windows reports it: no ``os.geteuid``, and a writable
     directory reads mode 0o777 (CPython derives it from the read-only
-    attribute alone)."""
+    attribute alone). ``owner`` and ``writers`` stand in for the security
+    descriptor's owner and access-list readings."""
     database = _real_database(tmp_path)
     _use_database(monkeypatch, database)
     store = database.parent / dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME
@@ -202,7 +206,85 @@ def _windows_reported_store(
     monkeypatch.delattr(dispatch_mod.os, "geteuid")
     monkeypatch.setattr(dispatch_mod, "_owned_by_this_windows_user", owner,
                         raising=False)
+    monkeypatch.setattr(dispatch_mod, "_windows_store_writers", writers,
+                        raising=False)
     return store
+
+
+def _access_list_unreadable(path: Path) -> list[str]:
+    raise OSError(5, "access denied")
+
+
+@pytest.mark.parametrize("writers, reason", [
+    (lambda path: ["S-1-5-32-545"], "can be written by other accounts: S-1-5-32-545"),
+    (_access_list_unreadable, "its access list cannot be read"),
+])
+def test_on_windows_a_store_others_may_write_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writers: Any, reason: str,
+) -> None:
+    """R3178-02 (task #3180): owned by this user is not enough; an allow
+    entry giving another account write or delete rights lets it delete the
+    records (the threat IR73-01 names)."""
+    store = _windows_reported_store(tmp_path, monkeypatch, lambda path: True, writers)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match=re.escape(reason)):
+        dispatch_mod._check_refusal_store(store)
+
+
+def test_on_windows_a_reparse_point_store_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3178-02: a junction is not S_ISLNK, and the security calls read its
+    target's owner and access list."""
+    asked: list[Path] = []
+    store = _windows_reported_store(
+        tmp_path, monkeypatch, lambda path: asked.append(path) or True)
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        info = real_lstat(path, *args, **kwargs)
+        if Path(path) == store:
+            return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=(
+                stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT))
+        return info
+
+    monkeypatch.setattr(dispatch_mod.os, "lstat", lstat)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match="is a reparse point"):
+        dispatch_mod._check_refusal_store(store)
+    assert asked == []
+
+
+USERS, EVERYONE, OWN = "S-1-5-32-545", "S-1-1-0", "S-1-5-21-1-2-3-1001"
+FULL, READ_AND_EXECUTE = 0x001F01FF, 0x001200A9
+
+
+@pytest.mark.parametrize("entries, writers", [
+    ([], []),
+    ([(0, FULL, OWN), (0, FULL, "S-1-5-18"), (0, FULL, "S-1-5-32-544"),
+      (0, FULL, "S-1-3-0"), (0, READ_AND_EXECUTE, USERS)], []),
+    ([(0, READ_AND_EXECUTE | 0x0002, USERS)], [USERS]),          # add a record
+    ([(0, 0x0040, EVERYONE)], [EVERYONE]),                         # delete one
+    ([(0, 0x0001_0000, USERS)], [USERS]),                          # DELETE
+    ([(0, 0x0004_0000, USERS)], [USERS]),                          # WRITE_DAC
+    ([(0, 0x4000_0000, USERS)], [USERS]),                          # GENERIC_WRITE
+    ([(1, FULL, USERS)], []),                                      # a deny entry
+    ([(5, 0, "?")], ["? (an access entry of type 5)"]),            # unknown type
+    (None, ["Everyone (the directory has no access list)"]),
+])
+def test_the_windows_access_list_names_every_other_writer(entries: Any, writers: list[str]) -> None:
+    access = None if entries is None else [
+        dispatch_mod.WindowsAccessEntry(*entry) for entry in entries]
+    assert dispatch_mod._untrusted_windows_writers(access, [OWN]) == writers
+
+
+def test_the_windows_access_list_check_fails_closed_without_the_windows_api(
+    tmp_path: Path,
+) -> None:
+    if hasattr(__import__("ctypes"), "WinDLL"):
+        pytest.fail("this host has the Windows API; run the other Windows tests")
+    with pytest.raises(OSError, match="no Windows security API"):
+        dispatch_mod._windows_store_writers(tmp_path)
 
 
 def test_on_windows_a_store_of_this_user_is_trusted_whatever_its_mode(
