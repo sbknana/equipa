@@ -327,13 +327,51 @@ def _planted_cap_input(text, *, label):
 _real._cap_input = _planted_cap_input
 """
 # The reviewer read the unplanted sanitize at about 31 ms and the plant at
-# 105-157 ms; a slower host scales the band by its own unplanted reading
-# (over 26 ms, so the plant stays at least 4 times the linear work: 10x
-# growth at the test's own pair).
+# 105-157 ms. The planted reading is at least PLANTED_SANITIZE_OVER_LINEAR
+# times the unplanted one, so the test's own pair grows at least 9.6x
+# (``own_pair_growth``) whatever the host. Up to PLANTED_SANITIZE_BAND_TOP
+# that stays inside the reviewer's band (unplanted readings up to about
+# 33 ms); a slower host scales the band by the target it needs.
 PLANTED_SANITIZE_BAND = (0.105, 0.157)
 PLANTED_SANITIZE_TARGET = 0.13
-PLANTED_SANITIZE_LINEAR_SHARE = 0.2
+PLANTED_SANITIZE_OVER_LINEAR = 4.5
+# The highest target kept inside the reviewer's band: the readings of the
+# unplanted work vary by a few milliseconds over the median it is planted on.
+PLANTED_SANITIZE_BAND_TOP = 0.15
 SANITIZE_SIZE = 60_000
+
+
+def own_pair_growth(reading: float, linear: float) -> float:
+    """The growth at the test's own pair (a quarter, then the test's size)
+    of a plant reading ``reading`` at the test's size over linear work
+    reading ``linear`` there, its quadratic part growing 16x."""
+    return reading / (linear / GROWTH + (reading - linear) / GROWTH ** 2)
+
+
+def planted_sanitize_target(linear: float) -> tuple[float, float, float]:
+    """The reading to plant over an unplanted ``sanitize`` reading
+    ``linear`` at the test's size, and the band it must land in."""
+    target = max(PLANTED_SANITIZE_TARGET, PLANTED_SANITIZE_OVER_LINEAR * linear)
+    if target <= PLANTED_SANITIZE_BAND_TOP:
+        return (target, *PLANTED_SANITIZE_BAND)
+    scale = target / PLANTED_SANITIZE_TARGET
+    lower, upper = PLANTED_SANITIZE_BAND
+    return target, lower * scale, upper * scale
+
+
+@pytest.mark.parametrize("linear", (0.005, 0.026, 0.031, 0.0333, 0.034,
+                                    0.05, 0.2))
+def test_the_sanitize_plant_keeps_to_the_reviewers_band_where_it_can(linear):
+    """On a host reading the unplanted ``sanitize`` like the reviewer's
+    (about 31 ms), the plant lands in their 105-157 ms band; everywhere it
+    grows at least 9.6x at the test's own pair, over main's 8x."""
+    target, lower, upper = planted_sanitize_target(linear)
+    assert lower <= target <= upper
+    # 9.6x exactly at the lowest plant (4.5 times the linear work).
+    assert own_pair_growth(target, linear) >= 9.6 - 1e-9
+    if linear <= 0.0333:
+        assert (lower, upper) == PLANTED_SANITIZE_BAND
+        assert target <= PLANTED_SANITIZE_BAND_TOP
 
 
 @pytest.mark.parametrize("case", ("bracket-then-spaces",
@@ -362,10 +400,8 @@ def test_a_quadratic_regression_planted_in_sanitize_fails_its_real_test(
         linear = statistics.median(
             real_time_in_child("sanitize", case, SANITIZE_SIZE)
             for _ in range(3))
-        scale = max(1.0, linear / (PLANTED_SANITIZE_TARGET
-                                   * PLANTED_SANITIZE_LINEAR_SHARE))
-        lower, upper = (bound * scale for bound in PLANTED_SANITIZE_BAND)
-        planted_seconds = PLANTED_SANITIZE_TARGET * scale - linear
+        target, lower, upper = planted_sanitize_target(linear)
+        planted_seconds = target - linear
         scratch = tmp_path / f"attempt-{attempt}"
         scratch.mkdir()
         (scratch / "lesson_sanitizer.py").write_text(
