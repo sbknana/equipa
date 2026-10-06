@@ -876,7 +876,19 @@ PROCESS_STARTERS = frozenset({
     )),
     # IR78-03 (task #3180).
     "pty.spawn",
+    # IR80-04 (task #3183): the C helper under subprocess.Popen.
+    "_posixsubprocess.fork_exec",
 })
+# The attribute names of the starters: ``import_module(name).run(...)`` with
+# a module name the fence cannot resolve may be any of them (IR80-04).
+STARTER_ATTRIBUTES = frozenset(starter.rsplit(".", 1)[1] for starter in PROCESS_STARTERS)
+# Calls that look a module up by a name given at run time (IR80-04).
+DYNAMIC_IMPORTERS = frozenset({
+    "__import__", "builtins.__import__", "importlib.import_module",
+    "importlib.__import__",
+})
+# Wrappers a class attribute holding a starter may be given in (IR80-04).
+METHOD_WRAPPERS = frozenset({"staticmethod", "classmethod"})
 # Event-loop methods, called on a loop object whose name the source does
 # not fix.
 LOOP_PROCESS_STARTERS = frozenset({"subprocess_exec", "subprocess_shell"})
@@ -964,6 +976,7 @@ STARTER_ARGUMENTS: dict[str, tuple[tuple[str, int], ...]] = {
     "subprocess_exec": ((_PROGRAM, 1), (_REST, 2)),
     "subprocess_shell": ((_COMMAND_LINE, 1),),
     "pty.spawn": ((_ARGV, 0),),
+    "_posixsubprocess.fork_exec": ((_ARGV, 0),),
 }
 # Keyword arguments that hand a starter its argv or its program.
 _ARGV_KEYWORDS = frozenset({"args"})
@@ -1016,6 +1029,13 @@ class _ProcessStartFence:
         # Items added to the argv a name holds, in source order: (True when
         # they may land first, the items as an argv node).
         self._additions: dict[str, list[tuple[bool, ast.expr]]] = {}
+        # Values bound to an attribute name in a class body or on ``self``
+        # (IR80-04: ``start = staticmethod(subprocess.run)``).
+        self._attributes: dict[str, list[ast.expr]] = {}
+        class_body_assignments = {
+            id(statement) for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+            for statement in node.body
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 self._note_argv_mutation(node)
@@ -1032,7 +1052,28 @@ class _ProcessStartFence:
             for target in targets:
                 if isinstance(target, ast.Name):
                     self._bindings.setdefault(target.id, []).append(value)
+                    if id(node) in class_body_assignments:
+                        self._attributes.setdefault(target.id, []).append(value)
+                elif (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                      and target.value.id == "self"):
+                    self._attributes.setdefault(target.attr, []).append(value)
+                elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                    self._note_item_assignment(target, value)
         self._resolving: set[str] = set()
+
+    def _note_item_assignment(self, target: ast.Subscript, value: ast.expr) -> None:
+        """Record ``name[0:0] = items`` and ``name[0] = item`` as items added
+        to ``name``'s argv (IR80-04); one at a positive index the source
+        fixes lands later, any other may land first (it may replace the
+        program, which is judged like putting the item first)."""
+        index = target.slice
+        if isinstance(index, ast.Slice):
+            items, index = value, index.lower
+        else:
+            items = ast.List(elts=[value], ctx=ast.Load())
+        later = (isinstance(index, ast.Constant) and isinstance(index.value, int)
+                 and not isinstance(index.value, bool) and index.value > 0)
+        self._additions.setdefault(target.value.id, []).append((not later, items))
 
     def _note_argv_mutation(self, call: ast.Call) -> None:
         """Record ``name.extend(items)``, ``name.append(item)`` and
@@ -1085,7 +1126,18 @@ class _ProcessStartFence:
                 found = self._starter_name(value, depth + 1)
                 if found is not None:
                     return found
+        if isinstance(function, ast.Attribute):
+            modules = self._dynamic_modules(function.value, depth)
+            if modules is not None:
+                return self._starter_of_modules(modules, [function.attr])
+            for value in self._attributes.get(function.attr, []):
+                found = self._starter_name(value, depth + 1)
+                if found is not None:
+                    return found
         if isinstance(function, ast.Call):
+            if (_called_name(function.func, self._imported) in METHOD_WRAPPERS
+                    and function.args):
+                return self._starter_name(function.args[0], depth + 1)
             return self._starter_got(function)
         if isinstance(function, ast.Subscript):
             # ``STARTERS["run"](...)``: any starter the container holds.
@@ -1111,6 +1163,9 @@ class _ProcessStartFence:
         if (_called_name(call.func, self._imported) not in ("getattr", "builtins.getattr")
                 or len(call.args) < 2):
             return None
+        modules = self._dynamic_modules(call.args[0], 0)
+        if modules is not None:
+            return self._starter_of_modules(modules, self.strings(call.args[1]))
         owner = _called_name(call.args[0], self._imported)
         for attribute in self.strings(call.args[1]):
             if attribute is UNKNOWN:
@@ -1121,6 +1176,45 @@ class _ProcessStartFence:
                 return f"{owner}.{attribute}"
             if attribute in LOOP_PROCESS_STARTERS:
                 return attribute
+        return None
+
+    def _dynamic_modules(self, node: ast.expr, depth: int) -> list[str | None] | None:
+        """The names of the modules ``node`` looks up at run time
+        (``__import__("subprocess")``, ``importlib.import_module(name)``,
+        ``sys.modules["os"]``, or a name bound to one), UNKNOWN for one the
+        fence cannot resolve; None when ``node`` is no such lookup (IR80-04)."""
+        if isinstance(node, ast.Call) and node.args:
+            called = _called_name(node.func, self._imported)
+            if called in DYNAMIC_IMPORTERS:
+                return self.strings(node.args[0])
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                    and _called_name(node.func.value, self._imported) == "sys.modules"):
+                return self.strings(node.args[0])
+        if (isinstance(node, ast.Subscript)
+                and _called_name(node.value, self._imported) == "sys.modules"):
+            return self.strings(node.slice)
+        if isinstance(node, ast.Name) and depth < 8:
+            found = [module for value in self._bindings.get(node.id, [])
+                     for module in (self._dynamic_modules(value, depth + 1) or [])]
+            return found or None
+        return None
+
+    @staticmethod
+    def _starter_of_modules(modules: list[str | None],
+                            attributes: list[str | None]) -> str | None:
+        """The starter an attribute of a run-time module lookup names; an
+        unresolved one when the module or the attribute is not known and
+        could make one (IR80-04)."""
+        for module in modules:
+            for attribute in attributes:
+                if module is UNKNOWN or attribute is UNKNOWN:
+                    if ((module is UNKNOWN or module in PROCESS_MODULES)
+                            and (attribute is UNKNOWN or attribute in STARTER_ATTRIBUTES
+                                 or attribute in LOOP_PROCESS_STARTERS)):
+                        return UNRESOLVED_STARTER
+                    continue
+                if f"{module}.{attribute}" in PROCESS_STARTERS:
+                    return f"{module}.{attribute}"
         return None
 
     def _elements(self, container: ast.expr, depth: int) -> list[ast.expr]:
@@ -1470,6 +1564,35 @@ HELPERS_THAT_START_GIT_THEMSELVES = {
         'import subprocess\nSTARTERS = {"run": subprocess.run}\n'
         'STARTERS.get("run")(["git", "status"])\n',
     "list-of-starters": 'import os, subprocess\n[subprocess.run, os.system][i](argv)\n',
+    # IR80-04 (task #3183): the shapes the IR78-03 fence did not see.
+    "argv-slice-assigned-first":
+        'import subprocess\ncmd = ["status"]\ncmd[0:0] = ["git"]\nsubprocess.run(cmd)\n',
+    "argv-item-replaced":
+        'import subprocess\ncmd = ["true", "status"]\ncmd[0] = "git"\nsubprocess.run(cmd)\n',
+    "argv-item-at-an-unknown-index":
+        'import subprocess\ncmd = ["true"]\ncmd[i] = "gh"\nsubprocess.run(cmd)\n',
+    "__import__-starter": '__import__("subprocess").run(["git", "diff"])\n',
+    "__import__-bound-to-a-name":
+        'sp = __import__("subprocess")\nsp.Popen(["git", "log"])\n',
+    "importlib-import_module":
+        'import importlib\nimportlib.import_module("subprocess").run(["git", "gc"])\n',
+    "import_module-imported":
+        'from importlib import import_module\nimport_module("os").system("git gc")\n',
+    "import_module-of-an-unknown-name":
+        'import importlib\nimportlib.import_module(name).run(["x"])\n',
+    "sys.modules-starter": 'import sys\nsys.modules["subprocess"].run(["git", "diff"])\n',
+    "sys.modules-get": 'import sys\nsys.modules.get("os").system("git status")\n',
+    "getattr-of-__import__":
+        'getattr(__import__("subprocess"), "check_call")(["git", "fetch"])\n',
+    "class-attribute-staticmethod":
+        'import subprocess\nclass Runner:\n    start = staticmethod(subprocess.run)\n'
+        'Runner.start(["git", "diff"])\n',
+    "self-attribute-starter":
+        'import subprocess\nclass Runner:\n    def __init__(self):\n'
+        '        self.start = subprocess.Popen\n'
+        '    def go(self):\n        self.start(["gh", "pr", "list"])\n',
+    "_posixsubprocess.fork_exec":
+        'import _posixsubprocess\n_posixsubprocess.fork_exec(["git", "gc"], [b"/usr/bin/git"])\n',
 }
 
 
@@ -1508,6 +1631,16 @@ CODE_THAT_DOES_NOT_START_GIT = {
     "getattr-of-another-object": 'getattr(logger, "info")(["git", "diff"])\n',
     "getattr-of-another-starter-name":
         'import subprocess\ngetattr(subprocess, "DEVNULL")\n',
+    # IR80-04 controls: the new shapes, starting something else.
+    "an-argv-item-replaced-by-another-program":
+        'import subprocess\ncmd = ["true", "-l"]\ncmd[0] = "crontab"\nsubprocess.run(cmd)\n',
+    "an-item-assigned-past-the-program":
+        'import subprocess\ncmd = ["nft", "list"]\ncmd[1:1] = ["-j"]\nsubprocess.run(cmd)\n',
+    "__import__-of-another-module": '__import__("json").dumps(["git", "diff"])\n',
+    "import_module-of-an-unknown-name-then-no-starter":
+        'import importlib\nimportlib.import_module(name).dumps(["git"])\n',
+    "a-class-attribute-of-another-callable":
+        'class Runner:\n    start = staticmethod(print)\nRunner.start(["git", "diff"])\n',
 }
 
 
