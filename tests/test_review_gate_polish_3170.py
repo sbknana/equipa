@@ -39,6 +39,7 @@ from tests.host_timing import (
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
     PER_UNIT_GROWTH_LIMIT,
     PER_UNIT_OVER_RETRIES,
+    SETTLE_RETRIES,
     TimingCheckFailed,
     assert_linear_per_unit,
     assert_linear_time,
@@ -516,7 +517,8 @@ def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
     """The same readings through the shared per-unit check: the pair over
     the limit is measured again PER_UNIT_OVER_RETRIES times, both sizes
     interleaved, and the quieter fourth 200 KB reading settles it as
-    linear."""
+    linear. The 2 MB pair, linear on its first readings, is read once
+    more before it passes (SETTLE_RETRIES, task 3187)."""
     work = ScriptedPerUnit(CI_READINGS)
 
     settled = assert_linear_per_unit(work, CI_SHAPE_KILOBYTES, 0.5, "ci")
@@ -524,7 +526,7 @@ def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
     assert settled == {50: 0.067, 200: 0.066, 2048: 0.068}
     assert work.calls[:2] == [50, 200]
     assert work.calls[2:8] == [50, 200] * 3
-    assert work.calls[8:] == [2048]
+    assert work.calls[8:] == [2048] + [50, 2048] * SETTLE_RETRIES
 
 
 def test_a_burst_over_every_reading_of_the_larger_size_still_fails(unloaded):

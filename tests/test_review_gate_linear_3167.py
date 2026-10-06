@@ -49,6 +49,7 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
+    SETTLE_RETRIES,
     SettledGrowth,
     assert_linear_time,
     budget,
@@ -319,22 +320,29 @@ def scan_growth(pattern, anchored, prefix, unit, count):
     The pair is settled under contention by the shared helper
     (``settled_growth``, task 3185): over the limit or borderline, both
     sizes are measured again interleaved, each keeping its fastest median,
-    so a burst on the quarter size cannot hide quadratic growth."""
-    quarter_count = count
-    while True:
-        quarter_text = prefix + unit * quarter_count
-        if (_median_scan_seconds(pattern, anchored, quarter_text)
-                >= GROWTH_FLOOR_SECONDS
-                or len(quarter_text) * GROWTH * 2
-                > MAX_GROWTH_SCAN_CHARACTERS):
-            break
-        quarter_count *= 2
+    so a burst on the quarter size cannot hide quadratic growth.
+
+    A burst can also lift the quarter size's median to the floor while its
+    settled reading stays under it. That pair can straddle the memory step
+    and is decided against the floor: contention read 0.0123 s against
+    0.162 s, 8.1x on linear work (task 3187, IR84-02). So a pair whose
+    settled quarter reading is under the floor is not decided while the
+    input can still double: it doubles, as ``host_timing`` grows the input
+    until the quarter size's reading takes the floor."""
     def median_at(units):
         return _median_scan_seconds(pattern, anchored, prefix + unit * units)
 
-    return ScanGrowth(quarter_count, settled_growth(
-        median_at, quarter_count, quarter_count * GROWTH,
-        median_at(quarter_count), median_at(quarter_count * GROWTH)))
+    quarter_count = count
+    while True:
+        at_cap = (len(prefix + unit * quarter_count) * GROWTH * 2
+                  > MAX_GROWTH_SCAN_CHARACTERS)
+        if at_cap or median_at(quarter_count) >= GROWTH_FLOOR_SECONDS:
+            settled = settled_growth(
+                median_at, quarter_count, quarter_count * GROWTH,
+                median_at(quarter_count), median_at(quarter_count * GROWTH))
+            if at_cap or settled.small_seconds >= GROWTH_FLOOR_SECONDS:
+                return ScanGrowth(quarter_count, settled)
+        quarter_count *= 2
 
 
 def superlinear_scan(pattern, anchored, prefix, unit, count, seconds):
@@ -345,9 +353,20 @@ def superlinear_scan(pattern, anchored, prefix, unit, count, seconds):
     reads ``BORDERLINE_GROWTH`` or more there is decided by ``scan_growth``,
     on settled scans of at least ``GROWTH_FLOOR_SECONDS``, never by the
     first look: a burst that inflated ``seconds`` compresses quadratic
-    work's 16x toward linear's 4x, as it did a growth pair's (task 3184)."""
-    larger = prefix + unit * (count * GROWTH)
-    if _scan_seconds(pattern, anchored, larger) < seconds * BORDERLINE_GROWTH:
+    work's 16x toward linear's 4x, as it did a growth pair's (task 3184).
+    So neither does a first look under the band pass on one reading of
+    each size: both sizes are scanned once more, interleaved, and each
+    keeps its fastest reading (``SETTLE_RETRIES``, task 3187)."""
+    smaller_text = prefix + unit * count
+    larger_text = prefix + unit * (count * GROWTH)
+    larger_seconds = _scan_seconds(pattern, anchored, larger_text)
+    for _ in range(SETTLE_RETRIES):
+        if larger_seconds >= seconds * BORDERLINE_GROWTH:
+            break
+        seconds = min(seconds, _scan_seconds(pattern, anchored, smaller_text))
+        larger_seconds = min(larger_seconds,
+                             _scan_seconds(pattern, anchored, larger_text))
+    if larger_seconds < seconds * BORDERLINE_GROWTH:
         return None
     growth = scan_growth(pattern, anchored, prefix, unit, count)
     return growth if growth.ratio >= GROWTH_LIMIT else None
