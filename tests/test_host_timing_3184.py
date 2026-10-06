@@ -98,7 +98,8 @@ def test_a_part_hidden_by_a_loaded_quarter_fails_beside_a_linear_part():
                         SIZE: (LOADED_LARGE, QUIET_LARGE)}, calls)
 
     def seconds_at(size: int) -> dict[str, float]:
-        return {"linear": 0.04 * size / SIZE, "hidden": hidden(size)}
+        # The linear part's quarter reads the floor: no part grows the input.
+        return {"linear": 0.08 * size / SIZE, "hidden": hidden(size)}
 
     with pytest.raises(TimingCheckFailed, match="parts: hidden") as failure:
         assert_linear_times(seconds_at, SIZE, 10.0, "parts")
@@ -170,11 +171,12 @@ def test_the_own_pairs_repetitions_alternate_between_the_sizes():
     repetitions = host_timing.growth_repetitions(0.005, 0.0, 0.08)
     assert repetitions == 4
     with pytest.raises(TimingCheckFailed,
-                       match=r"over 4 runs of each.*fastest of 3 interleaved"):
+                       match=r"over 4 runs of each") as failure:
         assert_linear_time(
             _scripted({QUARTER: (0.005,), SIZE: (0.08,)}, calls), SIZE,
             10.0, "cheap quadratic")
     assert calls == [QUARTER, SIZE] * (repetitions * (1 + GROWTH_RETRIES))
+    assert "each the fastest of 3 interleaved readings" in str(failure.value)
 
 
 # --- Real work on the real clock -------------------------------------------------
