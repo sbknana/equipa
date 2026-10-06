@@ -1311,6 +1311,25 @@ def git_checks_allowed(directory: str | os.PathLike[str] | None) -> bool:
     return True
 
 
+# The programs the process runners exist for. While a project is recorded
+# as not git, any other program is refused: a wrapper (``env git -C P``,
+# ``sh -c "cd P && git diff"``, ``nice``, ``timeout``) decides by its own
+# arguments where the git it starts runs, and the guard reads only git's
+# options (IR76-09, task #3178).
+_GUARDED_PROGRAMS: frozenset[str] = frozenset({"git", "gh"})
+
+
+def _program_name(argv: Sequence[str]) -> str:
+    """The program ``argv`` starts, without its directory or a Windows
+    ``.exe`` suffix ("" for an empty argv)."""
+    if not argv:
+        return ""
+    name = os.path.basename(os.fspath(argv[0]))
+    if name.lower().endswith(".exe"):
+        name = name[: -len(".exe")]
+    return name
+
+
 def _git_call_directories(
     argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
 ) -> list[str]:
@@ -1318,17 +1337,25 @@ def _git_call_directories(
     from: ``cwd``; for git each ``-C`` applied in turn and every
     ``--git-dir`` / ``--work-tree`` option; and every ``GIT_DIR`` /
     ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` variable (gh passes them to the
-    git it runs), resolved as git resolves them."""
+    git it runs), resolved as git resolves them.
+
+    git applies each ``-C`` as it reads it, but only records
+    ``--git-dir`` / ``--work-tree`` and resolves them once every option is
+    read, against the directory the last ``-C`` left, exactly like the
+    variables. So a relative ``--git-dir=P/.git`` given before ``-C <parent
+    of P>`` names P's repository (IR76-01, task #3178)."""
     directory = os.path.abspath(os.fspath(cwd))
     directories = [directory]
-    is_git = bool(argv) and os.path.basename(os.fspath(argv[0])) == "git"
-    options = [os.fspath(token) for token in argv[1:]] if is_git else []
+    options = (
+        [os.fspath(token) for token in argv[1:]] if _program_name(argv) == "git" else []
+    )
+    locations: list[str] = []
     index = 0
     while index < len(options):
         token = options[index]
         name, separator, value = token.partition("=")
         if separator and name in ("--git-dir", "--work-tree"):
-            directories.append(os.path.join(directory, value))
+            locations.append(value)
             index += 1
         elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
             if index + 1 < len(options):
@@ -1337,15 +1364,14 @@ def _git_call_directories(
                     directory = os.path.join(directory, value)
                     directories.append(directory)
                 elif token in ("--git-dir", "--work-tree"):
-                    directories.append(os.path.join(directory, value))
+                    locations.append(value)
             index += 2
         elif token.startswith("-"):
             index += 1
         else:
             break
-    directories.extend(
-        os.path.join(directory, env[key]) for key in _GIT_LOCATION_ENV_KEYS if env.get(key)
-    )
+    locations.extend(env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key))
+    directories.extend(os.path.join(directory, location) for location in locations)
     return directories
 
 
@@ -1364,17 +1390,40 @@ def _directory_in_non_git_project(
     return None
 
 
-def _non_git_refused_result(
-    argv: Sequence[str], directory: str, text: bool,
-) -> subprocess.CompletedProcess:
-    """The result of a process refused by IR73-02: git's own "not a git
-    repository" status, which is what EQUIPA knows the project to be, so a
-    caller reads it the way it reads a project that has no repository."""
-    message = (
-        f"equipa: refused to run {os.path.basename(os.fspath(argv[0]))} at {directory}: "
+def _non_git_project_refusal(
+    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
+) -> str | None:
+    """Why the process runners must not start ``argv``, None when they may:
+    git or gh would run in a project :func:`dispatched_without_git`
+    recorded (IR73-02), or, while any project is recorded, the program is
+    not git or gh, so its own arguments could carry git there (IR76-09)."""
+    if not _NON_GIT_PROJECT_ROOTS.get():
+        return None
+    program = _program_name(argv)
+    if program not in _GUARDED_PROGRAMS:
+        return (
+            f"equipa: refused to run {program or 'an empty command'} from "
+            f"{os.path.abspath(os.fspath(cwd))}: while a project that was not a git "
+            f"repository at dispatch is recorded, the git runners start only git "
+            f"or gh, whose options they can read"
+        )
+    directory = _directory_in_non_git_project(argv, cwd, env)
+    if directory is None:
+        return None
+    return (
+        f"equipa: refused to run {program} at {directory}: "
         f"it is in a project that was not a git repository at dispatch, so a "
         f"repository there is an agent's"
     )
+
+
+def _non_git_refused_result(
+    argv: Sequence[str], message: str, text: bool,
+) -> subprocess.CompletedProcess:
+    """The result of a process refused by IR73-02: git's own "not a git
+    repository" status, which is what EQUIPA knows the project to be, so a
+    caller reads it the way it reads a project that has no repository.
+    ``message`` is :func:`_non_git_project_refusal`'s reason."""
     logger.warning("[git] %r", message)
     return subprocess.CompletedProcess(
         args=list(argv), returncode=_REFUSED_RETURNCODE,
@@ -1399,9 +1448,9 @@ def _run_with_env(
     Starts nothing, and returns a failed result, when the process would run
     in a project :func:`dispatched_without_git` recorded (IR73-02).
     """
-    refused_in = _directory_in_non_git_project(args_list, cwd, env)
-    if refused_in is not None:
-        return _non_git_refused_result(args_list, refused_in, text)
+    refusal = _non_git_project_refusal(args_list, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(args_list, refusal, text)
     return subprocess.run(
         args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
@@ -1517,9 +1566,9 @@ async def _run_git_process_async(
     returns a failed result, when git would run in a project
     :func:`dispatched_without_git` recorded (IR73-02).
     """
-    refused_in = _directory_in_non_git_project(argv, cwd, env)
-    if refused_in is not None:
-        return _non_git_refused_result(argv, refused_in, text)
+    refusal = _non_git_project_refusal(argv, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(argv, refusal, text)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,

@@ -306,8 +306,72 @@ def _forgetful_process_runner(project: Path, tmp_path: Path) -> subprocess.Compl
     ))
 
 
+def _elsewhere(tmp_path: Path) -> Path:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    return elsewhere
+
+
+def _forgetful_relative_git_dir_before_change_directory(
+    project: Path, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    """IR76-01: git resolves a relative --git-dir / --work-tree against the
+    directory the LAST -C leaves, not the one current where it is given."""
+    return git_run(
+        ["--git-dir=project/.git", "--work-tree=project", "-C", str(tmp_path),
+         "diff", "--stat"],
+        _elsewhere(tmp_path),
+    )
+
+
+def _forgetful_relative_git_dir_variable_after_change_directory(
+    project: Path, tmp_path: Path,
+) -> subprocess.CompletedProcess:
+    return git_run(
+        ["-C", str(tmp_path), "diff", "--stat"], _elsewhere(tmp_path),
+        env={"GIT_DIR": "project/.git", "GIT_WORK_TREE": "project"},
+    )
+
+
+def _forgetful_env_wrapper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    """IR76-09: the guard reads -C only when the program is git itself."""
+    return git_ops._run_with_env(
+        ["env", "git", "-C", str(project), "diff", "--stat"], _elsewhere(tmp_path), 30,
+    )
+
+
+def _forgetful_shell_wrapper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    return git_ops._run_with_env(
+        ["sh", "-c", "cd project && git diff --stat"], tmp_path, 30,
+    )
+
+
+def _forgetful_timeout_wrapper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    return git_ops._run_with_env(
+        ["/usr/bin/timeout", "30", "git", "diff", "--stat"], _elsewhere(tmp_path), 30,
+        env={"GIT_DIR": str(project / ".git"), "GIT_WORK_TREE": str(project)},
+    )
+
+
+def _forgetful_async_wrapper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    env = git_ops._get_repo_env()
+    return asyncio.run(git_ops._run_git_process_async(
+        ["env", f"GIT_DIR={project / '.git'}", f"GIT_WORK_TREE={project}",
+         "git", "diff", "--stat"],
+        str(_elsewhere(tmp_path)), env, 30,
+    ))
+
+
 FORGETFUL_HELPERS = {
     "git_run": _forgetful_sync,
+    "git_run-relative-git-dir-before-dash-C":
+        _forgetful_relative_git_dir_before_change_directory,
+    "git_run-relative-GIT_DIR-after-dash-C":
+        _forgetful_relative_git_dir_variable_after_change_directory,
+    "process-runner-env-wrapper": _forgetful_env_wrapper,
+    "process-runner-sh-wrapper": _forgetful_shell_wrapper,
+    "process-runner-timeout-wrapper": _forgetful_timeout_wrapper,
+    "async-process-runner-env-wrapper": _forgetful_async_wrapper,
     "git_run-below-the-project": _forgetful_status_below,
     "git_run-through-a-symlink": _forgetful_through_a_symlink,
     "git_run-dash-C": _forgetful_change_directory,
@@ -342,6 +406,25 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     assert result.returncode == NOT_A_REPOSITORY
     assert result.stdout == ""
     assert "not a git repository at dispatch" in result.stderr
+
+
+def test_a_wrapper_runs_while_no_project_is_recorded(tmp_path: Path) -> None:
+    """IR76-09 refuses programs other than git and gh only during a
+    dispatch that recorded a project as not git."""
+    result = git_ops._run_with_env(["sh", "-c", "echo ran"], tmp_path, 30)
+    assert (result.returncode, result.stdout) == (0, "ran\n")
+
+
+def test_the_guard_reads_the_options_of_a_windows_git_executable(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    windows_git = ["C:/Program Files/Git/cmd/git.EXE", "-C", str(project), "status"]
+    with dispatched_without_git(project):
+        refusal = git_ops._non_git_project_refusal(windows_git, tmp_path, {})
+        allowed = git_ops._non_git_project_refusal(
+            [windows_git[0], "status"], tmp_path, {})
+    assert refusal is not None and f"at {project}" in refusal
+    assert allowed is None
 
 
 def _gh_in_the_project(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
