@@ -501,6 +501,74 @@ def test_linear_work_under_the_floor_is_not_repeated():
     assert timing.ratio == pytest.approx(4.0)
 
 
+def test_a_larger_reading_under_the_floor_grows_the_input_in_one_step():
+    """Task 3178: 518 units of 3138's pattern 24 read 16.5 ms at 64 KB on
+    Python 3.10. Reused as the next quarter, 16.5 ms is under the floor
+    again, so each unit grew twice (to 1 MB). The next quarter size is
+    scaled instead to read 1.2 times the floor: one step, the quarter over
+    the floor, and under 40% of the two 4x steps' input."""
+    size = 64 * 1024
+    per_byte = 0.0165 / size
+    calls: list[int] = []
+    timing = assert_linear_time(_model(per_byte, 1, calls), size, 0.5, "pat")
+    quarter = math.ceil(size * host_timing.GROWTH_STEP_MARGIN
+                        * GROWTH_FLOOR_SECONDS / 0.0165)
+    assert calls == [size // GROWTH, size, quarter, quarter * GROWTH]
+    assert timing.small_seconds >= GROWTH_FLOOR_SECONDS
+    assert timing.input_growth == pytest.approx(quarter / (size // GROWTH))
+    assert timing.ratio == pytest.approx(4.0)
+    assert sum(calls[2:]) < 0.4 * (4 + 16) * size
+
+
+@pytest.mark.parametrize("larger_reading", (0.0161, 0.017, 0.0199, 0.04))
+def test_growth_of_four_to_the_1_6_main_caught_still_fails(larger_reading):
+    """4 ** 1.6 is 9.2x. Main's 2 ms floor caught it from a 16 ms larger
+    reading on; a scaled step lands the quarter over the floor, where it
+    still reads 9.2x."""
+    size = 40_000
+    per_unit = larger_reading / size ** 1.6
+
+    def seconds_at(at_size: int) -> float:
+        return per_unit * at_size ** 1.6
+
+    assert growth_ratio(seconds_at(size // GROWTH), seconds_at(size),
+                        DETECTION_FLOOR_SECONDS) >= GROWTH_LIMIT
+    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+        assert_linear_time(seconds_at, size, 10.0, "n^1.6")
+    with pytest.raises(TimingCheckFailed, match="parts: steep"):
+        assert_linear_times(
+            lambda at_size: {"flat": 1e-9 * at_size,
+                             "steep": seconds_at(at_size)},
+            size, 10.0, "parts")
+
+
+def test_the_growing_part_with_the_smallest_reading_sets_the_step():
+    """Every growing part's quarter must reach the floor: the step is
+    scaled from the smallest larger reading among the growing parts."""
+    size = 40_000
+    calls: list[int] = []
+
+    def seconds_at(at_size: int) -> dict[str, float]:
+        calls.append(at_size)
+        return {"a": 0.0165 * at_size / size, "b": 0.019 * at_size / size,
+                "fast": 0.001 * at_size / size}
+
+    timings = assert_linear_times(seconds_at, size, 0.5, "parts")
+    assert len(calls) == 4
+    assert timings["a"].small_seconds >= GROWTH_FLOOR_SECONDS
+    assert all(timing.ratio == pytest.approx(4.0)
+               for name, timing in timings.items() if name != "fast")
+
+
+def test_the_scaled_step_never_passes_the_input_growth_cap():
+    next_quarter_size = host_timing.next_quarter_size
+    assert next_quarter_size(40_000, 0.02, 10**9) == 40_000
+    assert next_quarter_size(40_000, 0.016, 10**9) == 60_000
+    assert next_quarter_size(40_000, 0.016, 50_000) == 50_000
+    # Never scaled past what a 16 ms reading needs.
+    assert next_quarter_size(40_000, 0.001, 10**9) == 60_000
+
+
 def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
     sub-millisecond ratio of 8.7x. 5.2 ms is under the 16 ms that quadratic

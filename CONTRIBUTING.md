@@ -66,7 +66,9 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   passes at any factor and runs no reference. A faster host never tightens
   a budget. A ratio of sub-millisecond times is noise, so while the
   quarter size reads under 20 ms the INPUT grows (4x per step, up to 16x
-  the test's sizes), as the 3167 regex scan does; a reading is never
+  the test's sizes; a larger reading still under 20 ms is not reused as
+  the next quarter, which is scaled to read 1.2x the floor instead), as
+  the 3167 regex scan does; a reading is never
   raised to hide work. Raising readings to 20 ms let quadratic work of
   16-159 ms pass (IR75-01), so a larger reading of 16 ms or more always
   grows the input, whatever building the shape costs.
