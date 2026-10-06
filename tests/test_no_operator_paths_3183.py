@@ -27,7 +27,7 @@ OPERATOR_PATH_MARKERS: tuple[str, ...] = (
 # directories, and the files at the repository root.
 SCANNED_DIRECTORIES: tuple[str, ...] = (
     "equipa", "scripts", "docs", "tests", "prompts", "skills", "hooks", "tools",
-    "examples", "standing_orders", ".github", ".githooks",
+    "examples", "standing_orders", ".github", ".githooks", ".claude",
 )
 _SKIPPED_DIRECTORY_NAMES = frozenset({"__pycache__", ".pytest_cache", "node_modules"})
 
