@@ -18,6 +18,7 @@ import math
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -914,6 +915,13 @@ CLOCKS_BY_ID = {"clock_gettime", "clock_gettime_ns"}
 USAGE_CLOCKS = {"times", "getrusage"}
 USAGE_SECONDS = {"ru_utime", "ru_stime", "user", "system", "children_user",
                  "children_system", "elapsed"}
+# Wall-clock datetimes, read with any arguments (a time zone):
+# ``datetime.now() - started`` (IR75-03, task 3178).
+DATETIME_CLOCKS = {"now", "utcnow"}
+DATETIME_READINGS = {f"datetime.{clock}" for clock in DATETIME_CLOCKS}
+CLOCK_FUNCTIONS = CLOCKS | CLOCKS_BY_ID | USAGE_CLOCKS | DATETIME_READINGS
+# Modules whose names an ``import ... as`` can give a clock another name.
+CLOCK_MODULES = {"time", "datetime", "os", "resource"}
 # Calls that time work themselves: ``timeit.timeit``/``timeit.repeat`` and
 # a Timer's ``timeit``/``autorange``.
 TIMEIT_METHODS = {"timeit", "autorange"}
@@ -925,39 +933,135 @@ BUDGETS = {"budget", "host_factor", "measure_under_load"}
 HELPER_MODULES = {"review_gate_timing", "review_gate_production"}
 
 
-def _is_clock_call(node: ast.AST) -> bool:
+def _clock_name(function: ast.AST, aliases: Mapping[str, str]) -> str | None:
+    """The clock *function* names, through ``aliases`` (``tick`` for
+    ``from time import perf_counter as tick``, ``clock`` for ``clock =
+    time.perf_counter``, a ``now()`` helper): ``perf_counter`` for
+    ``time.perf_counter`` or ``tick``, ``datetime.now`` for
+    ``datetime.now`` or ``dt.now``."""
+    if isinstance(function, ast.Attribute):
+        if function.attr not in DATETIME_CLOCKS:
+            return function.attr
+        owner = function.value
+        owner_name = (owner.id if isinstance(owner, ast.Name)
+                      else owner.attr if isinstance(owner, ast.Attribute)
+                      else None)
+        if owner_name is not None and aliases.get(owner_name, owner_name) == "datetime":
+            return f"datetime.{function.attr}"
+        return None
+    if isinstance(function, ast.Name):
+        return aliases.get(function.id, function.id)
+    return None
+
+
+def _is_clock_call(node: ast.AST, aliases: Mapping[str, str] | None = None) -> bool:
     if not isinstance(node, ast.Call):
         return False
-    function = node.func
-    if isinstance(function, ast.Attribute):
-        name = function.attr
-    elif isinstance(function, ast.Name):
-        name = function.id
-    else:
+    name = _clock_name(node.func, aliases or {})
+    if name is None:
         return False
-    if name == "getrusage" or name in CLOCKS_BY_ID:
+    if name == "getrusage" or name in CLOCKS_BY_ID or name in DATETIME_READINGS:
         return True
     return not node.args and not node.keywords and (
         name in CLOCKS or name in USAGE_CLOCKS)
 
 
-def _reading_key(node: ast.AST) -> str | None:
-    """``started`` or ``self.started``: what a clock reading is kept in."""
-    if isinstance(node, (ast.Name, ast.Attribute)):
-        return ast.unparse(node)
+def _clock_reference(value: ast.AST, aliases: Mapping[str, str]) -> str | None:
+    """The clock ``name = <value>`` makes ``name`` another name for:
+    ``time.perf_counter`` (not called) or ``lambda: time.perf_counter()``."""
+    if isinstance(value, ast.Lambda):
+        if (not value.args.args and not value.args.posonlyargs
+                and _is_clock_call(value.body, aliases)):
+            return _clock_name(value.body.func, aliases)
+        return None
+    if isinstance(value, (ast.Name, ast.Attribute)):
+        name = _clock_name(value, aliases)
+        return name if name in CLOCK_FUNCTIONS else None
     return None
 
 
-def _clock_names(function: ast.AST) -> set[str]:
+def _clock_returned(function: ast.AST, aliases: Mapping[str, str]) -> str | None:
+    """The clock a helper ``def now(): return time.perf_counter()`` reads."""
+    arguments = function.args
+    if len(arguments.posonlyargs) + len(arguments.args) > len(arguments.defaults):
+        return None
+    body = function.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)):
+        body = body[1:]
+    if (len(body) == 1 and isinstance(body[0], ast.Return)
+            and _is_clock_call(body[0].value, aliases)):
+        return _clock_name(body[0].value.func, aliases)
+    return None
+
+
+def _clock_aliases(statements: Iterable[ast.AST],
+                   inherited: Mapping[str, str]) -> dict[str, str]:
+    """``inherited`` plus the clock aliases *statements* define (IR75-03):
+    ``from time import perf_counter as tick``, ``clock =
+    time.perf_counter``, ``now = lambda: time.monotonic()`` and ``def now():
+    return time.perf_counter()``."""
+    aliases = dict(inherited)
+    for node in statements:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.rpartition(".")[2] not in CLOCK_MODULES:
+                continue
+            for alias in node.names:
+                if alias.asname and alias.asname != alias.name:
+                    aliases[alias.asname] = aliases.get(alias.name, alias.name)
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+              and isinstance(node.targets[0], ast.Name)):
+            clock = _clock_reference(node.value, aliases)
+            if clock is not None:
+                aliases[node.targets[0].id] = clock
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            clock = _clock_returned(node, aliases)
+            if clock is not None:
+                aliases[node.name] = clock
+    return aliases
+
+
+def _reading_key(node: ast.AST) -> str | None:
+    """``started`` or ``self.started``: what a clock reading is kept in;
+    ``stamps[]`` for any item of a list ``stamps`` of readings."""
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return ast.unparse(node)
+    if isinstance(node, ast.Subscript):
+        container = _reading_key(node.value)
+        return None if container is None else f"{container}[]"
+    return None
+
+
+def _holds_a_reading(value: ast.AST, aliases: Mapping[str, str]) -> bool:
+    """``[clock(), ...]`` or ``[clock() for ...]``: a list of readings."""
+    if isinstance(value, (ast.List, ast.Tuple)):
+        return any(_is_clock_call(item, aliases) for item in value.elts)
+    if isinstance(value, ast.ListComp):
+        return _is_clock_call(value.elt, aliases)
+    return False
+
+
+def _clock_names(function: ast.AST,
+                 aliases: Mapping[str, str] | None = None) -> set[str]:
     """What *function* (nested functions and methods included) sets to a
     clock reading: ``started = time.process_time()``, ``self.start =
     perf_counter()``, ``start, n = monotonic(), 0``, ``start: float =
-    monotonic()``."""
+    monotonic()``; ``stamps[]`` for a list readings are kept in
+    (``stamps.append(clock())``), ``-elapsed`` for ``elapsed =
+    -clock()``."""
+    aliases = aliases or {}
     names: set[str] = set()
     for node in ast.walk(function):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("append", "insert")
+                and any(_is_clock_call(argument, aliases) for argument in node.args)):
+            container = _reading_key(node.func.value)
+            if container is not None:
+                names.add(f"{container}[]")
+            continue
         if isinstance(node, ast.Assign):
             pairs = [(target, node.value) for target in node.targets]
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
             pairs = [(node.target, node.value)]
         else:
             continue
@@ -970,25 +1074,84 @@ def _clock_names(function: ast.AST) -> set[str]:
                 pairs_of_items = [(target, value)]
             for item_target, item_value in pairs_of_items:
                 key = _reading_key(item_target)
-                if key is not None and _is_clock_call(item_value):
+                if key is None:
+                    continue
+                if isinstance(node, ast.AugAssign):
+                    if _holds_a_reading(item_value, aliases):
+                        names.add(f"{key}[]")
+                elif _is_clock_call(item_value, aliases):
                     names.add(key)
+                elif _holds_a_reading(item_value, aliases):
+                    names.add(f"{key}[]")
+                elif (isinstance(item_value, ast.UnaryOp)
+                      and isinstance(item_value.op, ast.USub)
+                      and _is_clock_call(item_value.operand, aliases)):
+                    names.add(f"-{key}")
     return names
 
 
-def _measures_elapsed(node: ast.AST, clock_names: set[str]) -> bool:
+def _measures_elapsed(node: ast.AST, clock_names: set[str],
+                      aliases: Mapping[str, str] | None = None) -> bool:
     """``clock() - started`` or ``now - started`` with both sides clock
     readings: a deadline ``clock() + timeout`` or a timestamp ``clock() -
-    AGE`` is not a measurement."""
-    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
+    AGE`` is not a measurement. Also the negated start, ``elapsed =
+    -clock()`` then ``elapsed += clock()``, and ``started -= clock()``."""
+    def is_reading(side: ast.AST) -> bool:
+        return (_is_clock_call(side, aliases)
+                or _reading_key(side) in clock_names)
+
+    if isinstance(node, ast.AugAssign):
+        key = _reading_key(node.target)
+        if key is None or not is_reading(node.value):
+            return False
+        if isinstance(node.op, ast.Add):
+            return f"-{key}" in clock_names
+        return isinstance(node.op, ast.Sub) and key in clock_names
+    if not isinstance(node, ast.BinOp):
         return False
     left, right = node.left, node.right
+    if isinstance(node.op, ast.Add):
+        # ``elapsed + clock()`` after ``elapsed = -clock()``.
+        return any(f"-{_reading_key(negated)}" in clock_names and is_reading(other)
+                   for negated, other in ((left, right), (right, left)))
+    if not isinstance(node.op, ast.Sub):
+        return False
     if (isinstance(left, ast.Attribute) and isinstance(right, ast.Attribute)
             and left.attr in USAGE_SECONDS and right.attr in USAGE_SECONDS):
         # ``after.ru_utime - before.ru_utime``: fields of two readings.
         left, right = left.value, right.value
-    left_is_reading = (_is_clock_call(left)
-                       or _reading_key(left) in clock_names)
-    return left_is_reading and _reading_key(right) in clock_names
+    return is_reading(left) and _reading_key(right) in clock_names
+
+
+def _parents(function: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {child: parent for parent in ast.walk(function)
+            for child in ast.iter_child_nodes(parent)}
+
+
+def _result_is_compared(call: ast.Call, parents: Mapping[ast.AST, ast.AST],
+                        function: ast.AST) -> bool:
+    """Whether a ``growth_ratio(...)`` result is compared, returned (to a
+    caller that compares it), or kept in a name that is compared: a
+    discarded ratio calibrates nothing (IR75-03, task 3178)."""
+    node = call
+    while not isinstance(parents.get(node), (ast.stmt, type(None))):
+        node = parents[node]
+        if isinstance(node, ast.Compare):
+            return True
+    statement = parents.get(node)
+    if isinstance(statement, ast.Return):
+        return True
+    if isinstance(statement, ast.Assign):
+        targets = statement.targets
+    elif isinstance(statement, ast.AnnAssign):
+        targets = [statement.target]
+    else:
+        return False
+    kept_in = {target.id for target in targets if isinstance(target, ast.Name)}
+    return any(isinstance(compared, ast.Name) and compared.id in kept_in
+               for comparison in ast.walk(function)
+               if isinstance(comparison, ast.Compare)
+               for compared in ast.walk(comparison))
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -1020,6 +1183,9 @@ class _Module:
         self.imports: dict[str, tuple[str, str]] = {}
         self.functions: dict[str, ast.AST] = {}
         self.tests: dict[str, ast.AST] = {}
+        self.classes: dict[str, ast.ClassDef] = {}
+        # Fixtures by the name a test requests them under (IR75-03).
+        self.fixtures: dict[str, ast.AST] = {}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module:
                 source_module = node.module.rpartition(".")[2]
@@ -1028,19 +1194,74 @@ class _Module:
                         source_module, alias.name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions[node.name] = node
+                fixture_name = _fixture_name(node)
+                if fixture_name is not None:
+                    self.fixtures[fixture_name] = node
                 if node.name.startswith("test_"):
                     self.tests[node.name] = node
             elif isinstance(node, ast.ClassDef):
                 self.functions[node.name] = node
+                self.classes[node.name] = node
                 for member in node.body:
                     if (isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                             and member.name.startswith("test_")):
                         self.tests[f"{node.name}.{member.name}"] = member
+        self.aliases = _clock_aliases(tree.body, {})
+
+    def method(self, class_name: str, name: str) -> ast.AST | None:
+        """``class_name``'s method ``name``, from it or a base class of
+        this module."""
+        pending, seen = [class_name], set()
+        while pending:
+            current = pending.pop(0)
+            if current in seen or current not in self.classes:
+                continue
+            seen.add(current)
+            for member in self.classes[current].body:
+                if (isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and member.name == name):
+                    return member
+            pending += [base.id for base in self.classes[current].bases
+                        if isinstance(base, ast.Name)]
+        return None
+
+
+def _fixture_name(function: ast.AST) -> str | None:
+    """The name a test requests *function* under, when it is a fixture
+    (``@pytest.fixture``, ``@pytest.fixture(name=...)``)."""
+    for decorator in function.decorator_list:
+        call = decorator if isinstance(decorator, ast.Call) else None
+        target = call.func if call is not None else decorator
+        if not ast.unparse(target).endswith("fixture"):
+            continue
+        for keyword in call.keywords if call is not None else []:
+            if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                return str(keyword.value.value)
+        return function.name
+    return None
+
+
+def _gives_a_reading(fixture: ast.AST, aliases: Mapping[str, str]) -> bool:
+    """Whether *fixture* returns or yields a clock reading."""
+    aliases = _clock_aliases(ast.walk(fixture), aliases)
+    return any(isinstance(node, (ast.Return, ast.Yield))
+               and _is_clock_call(node.value, aliases)
+               for node in ast.walk(fixture))
+
+
+def _requested_fixtures(function: ast.AST) -> list[str]:
+    if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+    arguments = function.args
+    return [argument.arg for argument in
+            arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+            if argument.arg not in ("self", "cls")]
 
 
 def _load_modules() -> dict[str, _Module]:
     paths = sorted(TESTS_DIR.glob("test_*.py"))
     paths += [TESTS_DIR / f"{name}.py" for name in sorted(HELPER_MODULES)]
+    paths.append(TESTS_DIR / "conftest.py")
     return {path.stem: _Module(path.stem, path.read_text(encoding="utf-8"))
             for path in paths}
 
@@ -1063,28 +1284,65 @@ class _Reach:
 
 
 def _reach(modules: dict[str, _Module], module: _Module,
-           node: ast.AST) -> _Reach:
+           node: ast.AST, class_name: str | None = None) -> _Reach:
     """What *node* and every function it calls (or passes on by name, as
     ``assert_linear_time(seconds_at, ...)``) in this module or a followed
-    one do: measure elapsed time, reach a growth check, reach a budget."""
+    one do: measure elapsed time, reach a growth check, reach a budget.
+    Also followed (IR75-03, task 3178): the fixtures a function requests
+    (from its module, its class or conftest.py) and, in a method of
+    ``class_name``, the ``self.<method>`` it calls or passes on."""
     measures = growth_checked = budgeted = False
-    seen: set[tuple[str, str]] = set()
-    pending = [(module, node)]
+    seen: set[int] = {id(node)}
+    pending = [(module, node, class_name)]
+    conftest = modules.get("conftest")
+
+    def follow(callee_module: _Module, callee: ast.AST | None,
+               owner: str | None) -> None:
+        if callee is not None and id(callee) not in seen:
+            seen.add(id(callee))
+            pending.append((callee_module, callee, owner))
+
     while pending:
-        current, function = pending.pop()
-        clock_names = _clock_names(function)
+        current, function, owner = pending.pop()
+        aliases = _clock_aliases(ast.walk(function), current.aliases)
+        clock_names = _clock_names(function, aliases)
+        parents = _parents(function)
+        for request in _requested_fixtures(function):
+            in_class = None if owner is None else current.method(owner, request)
+            if in_class is not None and _fixture_name(in_class) == request:
+                fixture_module, fixture, fixture_owner = current, in_class, owner
+            elif request in current.fixtures:
+                fixture_module, fixture, fixture_owner = (
+                    current, current.fixtures[request], None)
+            elif conftest is not None and request in conftest.fixtures:
+                fixture_module, fixture, fixture_owner = (
+                    conftest, conftest.fixtures[request], None)
+            else:
+                continue
+            if _gives_a_reading(fixture, fixture_module.aliases):
+                # ``def started(): return time.perf_counter()``: the
+                # requested value is itself a clock reading.
+                clock_names.add(request)
+            follow(fixture_module, fixture, fixture_owner)
         for child in ast.walk(function):
-            measures = measures or _measures_elapsed(child, clock_names)
+            measures = measures or _measures_elapsed(child, clock_names, aliases)
             referenced = None
             if isinstance(child, ast.Call):
                 measures = measures or _times_with_timeit(child, current.imports)
                 name = _called_name(child)
-                growth_checked = growth_checked or name in GROWTH_CHECKS
+                growth_checked = growth_checked or (
+                    name in GROWTH_CHECKS and (
+                        name != "growth_ratio"
+                        or _result_is_compared(child, parents, function)))
                 budgeted = budgeted or name in BUDGETS
                 if name in current.imports:
                     referenced = name
             elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 referenced = child.id
+            elif (owner is not None and isinstance(child, ast.Attribute)
+                  and isinstance(child.value, ast.Name)
+                  and child.value.id in ("self", "cls")):
+                follow(current, current.method(owner, child.attr), owner)
             target = None
             if referenced in current.imports:
                 source, original = current.imports[referenced]
@@ -1092,21 +1350,25 @@ def _reach(modules: dict[str, _Module], module: _Module,
                     target = (source, original)
             elif referenced in current.functions:
                 target = (current.name, referenced)
-            if target and target not in seen:
-                seen.add(target)
+            if target:
                 callee = modules[target[0]]
-                if target[1] in callee.functions:
-                    pending.append((callee, callee.functions[target[1]]))
+                follow(callee, callee.functions.get(target[1]), None)
     return _Reach(measures, growth_checked, budgeted)
+
+
+def _reach_test(modules: dict[str, _Module], module: _Module, test: str) -> _Reach:
+    """``_reach`` of the test ``name`` or ``Class.name`` of *module*."""
+    class_name = test.rpartition(".")[0] or None
+    return _reach(modules, module, module.tests[test], class_name)
 
 
 @pytest.fixture(scope="module")
 def timing_reach() -> dict[str, _Reach]:
     modules = _load_modules()
     return {
-        f"{module.name}.py::{test}": _reach(modules, module, node)
+        f"{module.name}.py::{test}": _reach_test(modules, module, test)
         for module in modules.values() if module.name.startswith("test_")
-        for test, node in module.tests.items()
+        for test in module.tests
     }
 
 
@@ -1190,11 +1452,36 @@ def test_the_fence_sees_the_shapes_it_must(timing_reach):
     ("start = clock_gettime_ns(CLOCK_MONOTONIC)\n"
      "x = clock_gettime_ns(CLOCK_MONOTONIC) - start", True),
     ("deadline = time.clock_gettime(CLOCK_MONOTONIC) + 5", False),
+    # IR75-03 (task 3178): aliases, lists, negated starts, datetimes.
+    ("from time import perf_counter as tick\nstart = tick()\nx = tick() - start",
+     True),
+    ("clock = time.perf_counter\nstart = clock()\nx = clock() - start", True),
+    ("now = lambda: time.monotonic()\nstart = now()\nx = now() - start", True),
+    ("def now():\n    return time.perf_counter()\n"
+     "start = now()\nx = now() - start", True),
+    ("stamps = []\nstamps.append(time.perf_counter())\n"
+     "stamps.append(time.perf_counter())\nx = stamps[1] - stamps[0]", True),
+    ("stamps = [time.perf_counter() for _ in range(2)]\nx = stamps[-1] - stamps[0]",
+     True),
+    ("elapsed = -time.perf_counter()\nelapsed += time.perf_counter()", True),
+    ("elapsed = -time.perf_counter()\nx = elapsed + time.perf_counter()", True),
+    ("start = time.perf_counter()\nstart -= time.perf_counter()", True),
+    ("from datetime import datetime\nstart = datetime.now()\n"
+     "x = (datetime.now() - start).total_seconds()", True),
+    ("import datetime as dt\nstart = dt.datetime.utcnow()\n"
+     "x = dt.datetime.utcnow() - start", True),
+    ("from datetime import datetime as moment\nstart = moment.now(timezone.utc)\n"
+     "x = moment.now(timezone.utc) - start", True),
+    ("cutoff = datetime.now() - timedelta(days=1)", False),
+    ("total = 0\ntotal += time.perf_counter()", False),
+    ("start = clock.now()\nx = clock.now() - start", False),
+    ("names = [name() for name in hooks]\nx = names[1] - names[0]", False),
 ])
 def test_a_clock_subtraction_is_found_and_a_deadline_is_not(source, measures):
     tree = ast.parse(source)
-    names = _clock_names(tree)
-    assert any(_measures_elapsed(node, names)
+    aliases = _clock_aliases(ast.walk(tree), {})
+    names = _clock_names(tree, aliases)
+    assert any(_measures_elapsed(node, names, aliases)
                for node in ast.walk(tree)) is measures
 
 
@@ -1358,6 +1645,159 @@ def test_shape():
         if poll():
             break
 """),
+    # The blind shapes of the independent review of task 3175 (IR75-03).
+    "import-alias-clock": ("unscaled", """
+from time import perf_counter as tick
+def test_shape():
+    start = tick()
+    work()
+    assert tick() - start < 0.5
+"""),
+    "local-import-alias-clock": ("unscaled", """
+def test_shape():
+    from time import process_time as cpu
+    start = cpu()
+    work()
+    assert cpu() - start < 0.5
+"""),
+    "module-clock-alias": ("unscaled", """
+import time
+clock = time.perf_counter
+def test_shape():
+    start = clock()
+    work()
+    assert clock() - start < 0.5
+"""),
+    "local-clock-alias": ("unscaled", """
+import time
+def test_shape():
+    clock = time.monotonic
+    start = clock()
+    work()
+    assert clock() - start < 0.5
+"""),
+    "readings-in-a-list": ("unscaled", """
+import time
+def test_shape():
+    stamps = []
+    stamps.append(time.perf_counter())
+    work()
+    stamps.append(time.perf_counter())
+    assert stamps[1] - stamps[0] < 0.5
+"""),
+    "negated-start": ("unscaled", """
+import time
+def test_shape():
+    elapsed = -time.perf_counter()
+    work()
+    elapsed += time.perf_counter()
+    assert elapsed < 0.5
+"""),
+    "datetime-now": ("unscaled", """
+from datetime import datetime
+def test_shape():
+    start = datetime.now()
+    work()
+    assert (datetime.now() - start).total_seconds() < 0.5
+"""),
+    "datetime-utcnow-module": ("unscaled", """
+import datetime
+def test_shape():
+    start = datetime.datetime.utcnow()
+    work()
+    assert (datetime.datetime.utcnow() - start).total_seconds() < 0.5
+"""),
+    "now-helper": ("unscaled", """
+import time
+def now():
+    \"\"\"The current reading.\"\"\"
+    return time.perf_counter()
+def test_shape():
+    start = now()
+    work()
+    assert now() - start < 0.5
+"""),
+    "timing-fixture": ("unscaled", """
+import time
+import pytest
+@pytest.fixture
+def within_half_a_second():
+    start = time.perf_counter()
+    yield
+    assert time.perf_counter() - start < 0.5
+def test_shape(within_half_a_second):
+    work()
+"""),
+    "named-fixture-requesting-a-fixture": ("unscaled", """
+import time
+import pytest
+@pytest.fixture
+def started():
+    return time.perf_counter()
+@pytest.fixture(name="bounded")
+def _bounded(started):
+    yield
+    assert time.perf_counter() - started < 0.5
+def test_shape(bounded):
+    work()
+"""),
+    "self-method": ("unscaled", """
+import time
+class TestShape:
+    def _seconds(self):
+        start = time.process_time()
+        work()
+        return time.process_time() - start
+    def test_shape(self):
+        assert self._seconds() < 0.5
+"""),
+    "base-class-method-passed-on": ("calibrated", """
+import time
+from tests.host_timing import assert_linear_time
+class Timed:
+    def seconds_at(self, size):
+        start = time.process_time()
+        work(size)
+        return time.process_time() - start
+class TestShape(Timed):
+    def test_shape(self):
+        assert_linear_time(self.seconds_at, 4096, 0.5)
+"""),
+    "discarded-growth-ratio": ("unscaled", """
+import time
+from tests.host_timing import growth_ratio
+def test_shape():
+    growth_ratio(1.0, 1.0)
+    start = time.process_time()
+    work()
+    assert time.process_time() - start < 0.5
+"""),
+    "kept-but-never-compared-growth-ratio": ("unscaled", """
+import time
+from tests.host_timing import growth_ratio
+def test_shape():
+    ratio = growth_ratio(1.0, 1.0)
+    start = time.process_time()
+    work()
+    assert time.process_time() - start < 0.5
+"""),
+    "compared-growth-ratio": ("calibrated", """
+import time
+from tests.host_timing import GROWTH_LIMIT, growth_ratio
+def seconds_at(size):
+    start = time.process_time()
+    work(size)
+    return time.process_time() - start
+def test_shape():
+    ratio = growth_ratio(seconds_at(1024), seconds_at(4096))
+    assert ratio < GROWTH_LIMIT
+"""),
+    "a-datetime-cutoff-is-not-timing": ("not timing", """
+from datetime import datetime, timedelta
+def test_shape():
+    cutoff = datetime.now() - timedelta(days=1)
+    assert prune(cutoff) == 0
+"""),
 }
 
 
@@ -1365,9 +1805,26 @@ def test_shape():
 def test_the_fence_gives_each_planted_shape_its_verdict(shape):
     verdict, source = PLANTED_SHAPES[shape]
     scratch = _Module("test_scratch_shape", source)
-    reach = _reach({"test_scratch_shape": scratch}, scratch,
-                   scratch.tests["test_shape"])
+    (test,) = [name for name in scratch.tests
+               if name.rpartition(".")[2] == "test_shape"]
+    reach = _reach_test({"test_scratch_shape": scratch}, scratch, test)
     assert reach.verdict == verdict
+
+
+def test_conftest_fixtures_a_test_requests_are_followed():
+    """IR75-03: a timing fixture in conftest.py is followed too."""
+    conftest = _Module("conftest", """
+import time
+import pytest
+@pytest.fixture
+def stopwatch():
+    start = time.perf_counter()
+    yield
+    assert time.perf_counter() - start < 0.5
+""")
+    scratch = _Module("test_scratch_shape", "def test_shape(stopwatch):\n    work()\n")
+    modules = {"conftest": conftest, "test_scratch_shape": scratch}
+    assert _reach_test(modules, scratch, "test_shape").verdict == "unscaled"
 
 
 @pytest.mark.parametrize("path", sorted(TESTS_DIR.glob("test_*.py")),
