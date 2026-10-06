@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -499,7 +500,11 @@ def test_a_forked_child_neither_rewrites_nor_removes_the_parents_phase(tmp_path)
     record = tmp_path / f"phase-{os.getpid()}"
     try:
         phases.running("tests/test_x.py::test_forks (call)")
-        child = os.fork()
+        # The child only makes system calls and exits, so the xdist
+        # worker's threads (the reason fork warns) hold nothing it needs.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            child = os.fork()
         if child == 0:
             try:
                 phases.finished()
