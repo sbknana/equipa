@@ -64,10 +64,14 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   right after it, so contention between xdist workers loosens the budget
   of exactly the work it slowed. A measurement within its base budget
   passes at any factor and runs no reference. A faster host never tightens
-  a budget. A ratio of sub-millisecond times is noise: the smaller time is
-  raised to 20 ms, and a reading that could still reach the limit is
-  measured repeatedly (or, for a regex scan, made larger) until the
-  smaller size takes 20 ms. Never raise a base budget. Build the input
+  a budget. A ratio of sub-millisecond times is noise, so while the
+  quarter size reads under 20 ms the INPUT grows (4x per step, up to 16x
+  the test's sizes), as the 3167 regex scan does; a reading is never
+  raised to hide work. Raising readings to 20 ms let quadratic work of
+  16-159 ms pass (IR75-01), so a larger reading of 16 ms or more always
+  grows the input, whatever building the shape costs.
+  `assert_linear_times` (several parts per child run) grows its size the
+  same way. Never raise a base budget. Build the input
   before the clock starts: allocating a multi-megabyte string is page
   faults, which grew 32x from 1 MB to 4 MB under load. `assert_linear_time`
   pauses the garbage collector inside each timed call: a full collection
@@ -82,7 +86,10 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   A whole-corpus cap held to `budget()` without a growth check goes in
   `CORPUS_CAPS`. That fence fails on any other timing test (clock
   differences, `*_ns` clocks, `timeit`, timer objects, event-loop
-  heartbeats) that reaches no growth check.
+  heartbeats, clock aliases and `import ... as` names, `now()` helpers,
+  readings kept in a list, `datetime.now()`, a negated start, timing
+  fixtures and `self.` methods) that reaches no growth check. A
+  `growth_ratio` whose result is not compared calibrates nothing.
 - The helper raises its failures explicitly, so `python -O` cannot strip
   them.
 - Every test phase has a deadline (`tests/deadline_watchdog.py`): 600 s of
@@ -105,14 +112,22 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   64-bit Linux. After one
   test of a worker has run past its deadline, every later test of that
   worker gets 30 s, so a regression that hangs a whole module costs one
-  deadline and then 30 s per test. A hung regression fails by name instead
-  of timing out the CI job.
+  deadline and then 30 s per test. A hard stop does not reset that: each
+  process keeps the phase it is in in a directory the session shares, so a
+  phase left there by a worker that ended cuts every later phase of the
+  run (the replacement worker's too) to 30 s, and the run's summary lists
+  it under "deadline watchdog: stopped mid-phase". A hung regression fails
+  by name instead of timing out the CI job.
 - To check the timing tests under contention, run them at `-n 16` while a
   CPU-burning process runs. Under a task cap, leave git room: at `-n 16`
   the xdist workers alone hold about 50 tasks, and the files holding the
-  timing tests peak near 70 because `git fetch` starts index-pack threads,
-  so a `TasksMax=64` scope fails those git tests with "unable to create
-  thread" (main does too). The timing tests on their own fit in 64. Under
+  timing tests peak near 70 because `git fetch` starts index-pack threads
+  that count against the cap too. A `TasksMax=64` scope therefore fails
+  the git fetch tests of `tests/test_agent_isolation_3142.py` with "unable
+  to create thread" (main does too; the file passes alone under the same
+  load), which is the cap, not a timing verdict: give the scope room above
+  70 tasks, or run that file apart. The timing tests on their own fit in
+  64. Under
   that load a bound must read the clock its claim is about: an event-loop
   heartbeat leaves out the time its thread waited for a CPU
   (`/proc/thread-self/schedstat`), and a child run bounded for its work is
