@@ -48,12 +48,13 @@ from equipa.git_ops import (
     GlobalConfigPinError,
     get_trusted_default_branch,
     git_run_async,
+    git_toplevel_async,
     parse_config_list_z,
     pin_global_git_config,
     read_regular_file_bounded,
     verify_global_git_config_pin,
 )
-from equipa.security_gate import _gate_audit_log
+from equipa.security_gate import _gate_audit_log, escape_audit_text
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,19 @@ _REDIRECT_CONFIG_KEYS: tuple[tuple[re.Pattern[str], str], ...] = (
     # not be where the merge runs, so any includeIf fails closed.
     (re.compile(r"^includeif\..+\.path$"), "conditional include"),
 )
+
+# R3119-01 (task #3126): keys that make git report paths relative to the
+# directory it runs in. From a nested project's sub-directory,
+# ``diff.relative=true`` drops every change outside it from the gate diff.
+# The hardened helper pins both off; a scope switching them on is refused
+# (an explicit false value is harmless). ``git config --list`` lowercases keys.
+_PATH_SCOPE_CONFIG_KEYS = frozenset({"diff.relative", "status.relativepaths"})
+_GIT_FALSE_VALUES = frozenset({"false", "no", "off", "0", ""})
+
+# IND-01 (task #3132): keys that hide a submodule pointer bump from
+# porcelain ``git diff``, so a gitlink change plus a README read as doc-only.
+# The gate diff overrides them, but any value other than "none" is refused.
+_SUBMODULE_IGNORE_KEY_RE = re.compile(r"^(diff\.ignoresubmodules|submodule\..+\.ignore)$")
 
 # Task #3116 (MI-04): driver programs allowed in any config scope, by exact
 # key AND value. An agent redefining filter.lfs.smudge to its own program is
@@ -126,12 +140,22 @@ class MergeAttempt:
 
     ``merged_sha`` is the task commit now on the default branch: the approved
     commit itself, or its rebased copy when the rebase fallback was used.
+
+    ``regenerated_paths`` (task #3131) is set when the merge conflicted only
+    in declared generated files and was completed by regenerating them.
+    ``merged_sha`` is then still the approved commit (the merge's second
+    parent) and ``post_head`` the resolution commit, which is what the gate
+    records as merged: the regenerated content is part of what landed.
+    ``regenerated_blobs`` (task #3141) maps each of those paths to the blob
+    SHA of the verified generator output the resolution committed.
     """
 
     merged_sha: str | None = None
     pre_head: str | None = None
     post_head: str | None = None
     reason: str = ""
+    regenerated_paths: tuple[str, ...] = ()
+    regenerated_blobs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -264,6 +288,120 @@ async def rebased_range_problem(
     return None
 
 
+@dataclass(frozen=True)
+class MergedTree:
+    """``git merge-tree --write-tree`` result: the tree and its conflicted paths.
+
+    With conflicts, ``tree`` holds the conflicted files with markers and every
+    other path exactly as ``git merge`` resolves it.
+    """
+
+    tree: str
+    conflicted: frozenset[str]
+
+
+async def merged_tree(
+    repo: str | os.PathLike, ours: str, theirs: str,
+) -> MergedTree | None:
+    """Merge ``ours`` and ``theirs`` from the object store alone, or None.
+
+    Independent of the ref store and of any checkout an agent can touch
+    (git >= 2.38). None when git fails or its output is inconsistent.
+    """
+    result = await git_run_async(
+        ["merge-tree", "--write-tree", "--no-messages", "--name-only", "-z",
+         ours, theirs],
+        repo, timeout=60,
+    )
+    if result.returncode not in (0, 1):
+        logger.error(
+            "[Merge-Integrity] merge-tree of %s and %s failed rc=%s: %s",
+            _short(ours), _short(theirs), result.returncode,
+            (result.stderr or result.stdout).strip()[:200],
+        )
+        return None
+    fields = result.stdout.split("\0")
+    tree = fields[0].strip()
+    conflicted = frozenset(name for name in fields[1:] if name)
+    if not tree or (result.returncode == 1) != bool(conflicted):
+        return None
+    return MergedTree(tree, conflicted)
+
+
+async def changed_paths(
+    repo: str | os.PathLike, tree_a: str, tree_b: str,
+) -> set[str] | None:
+    """Paths whose entry differs between two trees, or None if git fails.
+
+    Plumbing ``diff-tree`` with renames off and submodules never ignored,
+    so no agent-written diff config can fold or hide a path.
+    """
+    result = await git_run_async(
+        ["diff-tree", "-r", "-z", "--name-only", "--no-renames",
+         "--ignore-submodules=none", tree_a, tree_b],
+        repo, timeout=60,
+    )
+    if result.returncode != 0:
+        return None
+    return {name for name in result.stdout.split("\0") if name}
+
+
+async def regenerated_resolution_problem(
+    repo: str | os.PathLike,
+    merged: MergedTree,
+    resolved_tree: str,
+    regenerated: frozenset[str],
+    expected_blobs: Mapping[str, str],
+) -> str | None:
+    """Why ``resolved_tree`` is not ``merged`` with only ``regenerated`` redone.
+
+    Task #3131: a merge that conflicted only in declared generated files is
+    completed by regenerating them. The resolution may differ from the
+    ``git merge-tree`` result in exactly those paths — every one of them a
+    conflicted path and a regular file afterwards — and nowhere else.
+
+    Task #3141 (I-03): the content is bound too. ``expected_blobs`` maps each
+    regenerated path to the blob SHA of the verified generator output, and
+    the resolution must carry exactly that blob, not merely some regular file.
+    """
+    if not regenerated or merged.conflicted != regenerated:
+        return (
+            f"conflicted paths {sorted(merged.conflicted)} are not the "
+            f"regenerated paths {sorted(regenerated)}"
+        )
+    if set(expected_blobs) != regenerated:
+        return (
+            f"verified content is known for {sorted(expected_blobs)}, not for "
+            f"the regenerated paths {sorted(regenerated)}"
+        )
+    differing = await changed_paths(repo, merged.tree, resolved_tree)
+    if differing is None:
+        return f"diff-tree {_short(merged.tree)} {_short(resolved_tree)} failed"
+    extra = differing - regenerated
+    if extra:
+        return f"the resolution also changes {sorted(extra)[:10]}"
+    for path in sorted(regenerated):
+        entry = await git_run_async(
+            ["ls-tree", "-z", "--full-tree", resolved_tree, "--", path],
+            repo, timeout=_GIT_TIMEOUT,
+        )
+        meta, _, listed = entry.stdout.rstrip("\0").partition("\t")
+        fields = meta.split()
+        if (
+            entry.returncode != 0
+            or listed != path
+            or len(fields) != 3
+            or fields[:2] != ["100644", "blob"]
+        ):
+            return f"regenerated {path} is not a regular file in the resolution"
+        if fields[2] != expected_blobs[path]:
+            return (
+                f"regenerated {path} is blob {_short(fields[2])}, not the "
+                f"verified generator output {_short(expected_blobs[path])}"
+            )
+    return None
+
+
 def _driver_hazard(key: str, value: str | None) -> str | None:
     """Label of the driver program ``key`` defines, None if harmless/allowed."""
     lowered = key.lower()
@@ -282,6 +420,41 @@ def _redirect_hazard(key: str) -> str | None:
         if pattern.match(lowered):
             return label
     return None
+
+
+def _path_scope_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``key`` switches on cwd-relative path output, else None.
+
+    A key with no ``=`` (value None) is boolean true to git.
+    """
+    if key.lower() not in _PATH_SCOPE_CONFIG_KEYS:
+        return None
+    if value is not None and value.strip().lower() in _GIT_FALSE_VALUES:
+        return None
+    return "cwd-relative path output"
+
+
+def _submodule_ignore_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``key`` hides submodule changes from ``git diff``."""
+    if not _SUBMODULE_IGNORE_KEY_RE.match(key.lower()):
+        return None
+    if value is not None and value.strip().lower() == "none":
+        return None
+    return "submodule change hiding"
+
+
+def _bare_repository_hazard(key: str, value: str | None) -> str | None:
+    """Label when ``core.bare`` is switched on (IND-02, task #3132).
+
+    ``git init`` writes ``core.bare = false`` into every repository, so only
+    a true value counts. A bare repository has no work tree: git would
+    answer for a different directory than the operator's project.
+    """
+    if key.lower() != "core.bare":
+        return None
+    if value is not None and value.strip().lower() in _GIT_FALSE_VALUES:
+        return None
+    return "work-tree redirect"
 
 
 def _parse_scoped_config_z(raw: str) -> list[tuple[str, str, str | None]] | None:
@@ -349,6 +522,39 @@ async def _git_path(repo: str | os.PathLike, *args: str) -> Path | None:
         return None
     path = Path(printed)
     return path if path.is_absolute() else Path(repo) / path
+
+
+# IND3132-06 (task #3146): files that change which objects or parents git
+# sees. ``info/grafts`` rewrites commit parents even with
+# GIT_NO_REPLACE_OBJECTS set, and ``objects/info/alternates`` adds another
+# object store (one the agent can write) to every lookup.
+_OBJECT_GRAPH_FILES = (
+    ("info/grafts", "commit parents"),
+    ("objects/info/alternates", "the object store"),
+)
+
+
+async def _object_graph_hazards(repo: str | os.PathLike) -> list[str]:
+    """A grafts or alternates file present in the repository (fail closed)."""
+    hazards: list[str] = []
+    for relative, effect in _OBJECT_GRAPH_FILES:
+        path = await _git_path(repo, "--git-path", relative)
+        if path is None:
+            hazards.append(f"could not locate {relative}")
+            continue
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            hazards.append(f"{relative} is unreadable ({exc.strerror})")
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
+            hazards.append(
+                f"{relative} is present and rewrites {effect} for every git "
+                f"call; remove it before the merge"
+            )
+    return hazards
 
 
 async def _submodule_config_hazards(repo: str | os.PathLike) -> list[str]:
@@ -424,9 +630,14 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
       system config is switched off), including files pulled in via
       ``include``, that defines a filter, merge or diff driver program
       outside :data:`DRIVER_CONFIG_ALLOWLIST`, or sets ``core.worktree``,
-      ``attr.tree`` or an ``includeIf``.
+      ``attr.tree`` or an ``includeIf``, or switches on ``diff.relative`` /
+      ``status.relativePaths`` (R3119-01, task #3126), ``core.bare``, or
+      sets ``diff.ignoreSubmodules`` / ``submodule.<name>.ignore`` to
+      anything but ``none`` (IND-02, IND-01, task #3132).
     * ``info/attributes`` or the global attributes file selecting a driver
       outside the built-in / git-lfs set.
+    * a non-empty ``info/grafts`` or ``objects/info/alternates`` (IND3132-06,
+      task #3146).
     * submodule git dirs defining or selecting such a driver (MI-05).
     """
     hazards: list[str] = []
@@ -467,7 +678,13 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
     for scope, key, value in entries:
         if scope in _TRUSTED_SCOPES:
             continue
-        label = _driver_hazard(key, value) or _redirect_hazard(key)
+        label = (
+            _driver_hazard(key, value)
+            or _redirect_hazard(key)
+            or _bare_repository_hazard(key, value)
+            or _path_scope_hazard(key, value)
+            or _submodule_ignore_hazard(key, value)
+        )
         if label:
             hazards.append(f"{scope} config defines {label} '{key}'")
 
@@ -476,6 +693,7 @@ async def find_repo_execution_hazards(repo: str | os.PathLike) -> list[str]:
         hazards.append("could not locate info/attributes")
     else:
         hazards.extend(attribute_file_hazards(info_attributes, "info/attributes"))
+    hazards.extend(await _object_graph_hazards(repo))
     attributes_file = await git_run_async(
         ["config", "--type=path", "--get", "core.attributesFile"],
         repo, timeout=_GIT_TIMEOUT,
@@ -526,8 +744,17 @@ async def index_flag_problem(worktree_dir: str | os.PathLike) -> str | None:
     copy on disk then reads as clean. ``git ls-files -v`` tags a normal
     entry ``H``; skip-worktree is ``S``, assume-unchanged lowercase, and
     any other tag (unmerged, ...) is not a clean tree either.
+
+    ``git ls-files`` lists only the directory it runs in, so it runs at the
+    work-tree root: for a nested project the reviewer's ``worktree_dir`` is
+    a sub-directory (R3119-07, task #3126). The root must contain
+    ``worktree_dir``: a ``core.worktree`` naming another checkout would
+    otherwise check that checkout's index (IND-02, task #3132).
     """
-    result = await git_run_async(["ls-files", "-v", "-z"], worktree_dir, timeout=30)
+    root = await git_toplevel_async(worktree_dir)
+    if root is None:
+        return f"could not locate the work-tree root of {os.fspath(worktree_dir)}"
+    result = await git_run_async(["ls-files", "-v", "-z"], root, timeout=30)
     if result.returncode != 0:
         return (
             f"git ls-files failed rc={result.returncode}: "
@@ -756,6 +983,133 @@ def reviewed_commit_refusal(record, branch_sha: str | None) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    """Which repository a project directory is, pinned before any agent runs.
+
+    IND3132-01 (task #3146): git finds the repository through whatever
+    ``.git`` entry it meets, and agents can replace that entry (a ``.git``
+    directory swapped for a ``gitdir:`` file pointing at a clone). Each
+    field is re-read at the gate and on every guard check; any difference
+    means the directory now names another repository.
+
+    * ``common_dir``: realpath of the git common dir, with its device and
+      inode (``common_dir_id``) so a directory swapped in at the same path is
+      seen too;
+    * ``git_entry``: the kind of ``<project_dir>/.git`` (``dir``, ``file``,
+      ``symlink``, ``other`` or ``absent`` for a nested project) and its
+      device and inode;
+    * ``default_head``: the default branch's commit read through the pinned
+      common dir itself, never through discovery from the project directory;
+    * ``git_dir`` / ``git_dir_id`` and ``work_tree`` (task #3151, R3146-01):
+      realpath and device/inode of the checkout's own git dir (the common
+      dir, unless the checkout is a linked worktree) and of its work-tree
+      root. The merge runs git on exactly these, opened by descriptor and
+      inode-checked, never on whatever ``.git`` says at merge time.
+    """
+
+    common_dir: str
+    common_dir_id: tuple[int, int]
+    git_entry: str
+    git_entry_id: tuple[int, int] | None
+    default_head: str
+    git_dir: str
+    git_dir_id: tuple[int, int]
+    work_tree: str
+
+    def describe(self) -> str:
+        return (
+            f"common_dir={self.common_dir} git_entry={self.git_entry} "
+            f"default_head={_short(self.default_head)}"
+        )
+
+
+def _git_entry(directory: str | os.PathLike) -> tuple[str, tuple[int, int] | None]:
+    """Kind and (device, inode) of ``directory/.git``, never following a link."""
+    try:
+        info = os.lstat(os.path.join(os.fspath(directory), ".git"))
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as exc:
+        return f"unreadable ({exc.strerror})", None
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "dir"
+    elif stat.S_ISREG(info.st_mode):
+        kind = "file"
+    else:
+        kind = "other"
+    return kind, (info.st_dev, info.st_ino)
+
+
+async def git_common_dir(directory: str | os.PathLike) -> str | None:
+    """Realpath of the git common dir git finds from ``directory``, or None."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--git-common-dir"], directory, timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[Merge-Integrity] no git common dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    return os.path.realpath(os.path.join(os.fspath(directory), printed))
+
+
+async def repository_identity(
+    directory: str | os.PathLike, default_branch: str,
+) -> RepositoryIdentity | str:
+    """The :class:`RepositoryIdentity` of ``directory``, or why it has none."""
+    common = await git_common_dir(directory)
+    if common is None:
+        return f"git cannot locate the repository of {os.fspath(directory)}"
+    try:
+        common_info = os.stat(common)
+    except OSError as exc:
+        return f"the git common dir {common} is unreadable: {exc.strerror}"
+    # Read through the common dir itself: git run inside a git directory
+    # uses that directory, whatever ``.git`` entry the project now has.
+    head = await resolve_commit(common, f"refs/heads/{default_branch}")
+    if head is None:
+        return (
+            f"default branch '{default_branch}' does not resolve in the git "
+            f"common dir {common}"
+        )
+    git_dir = await _absolute_git_dir(directory)
+    if git_dir is None:
+        return f"git cannot locate the git dir of {os.fspath(directory)}"
+    try:
+        git_dir_info = os.stat(git_dir)
+    except OSError as exc:
+        return f"the git dir {git_dir} is unreadable: {exc.strerror}"
+    # Empty when git names no work tree containing ``directory``: snapshot()
+    # refuses that, and a later check reports the first changed field.
+    work_tree = await git_toplevel_async(directory)
+    kind, entry_id = _git_entry(directory)
+    return RepositoryIdentity(
+        common, (common_info.st_dev, common_info.st_ino), kind, entry_id, head,
+        git_dir, (git_dir_info.st_dev, git_dir_info.st_ino),
+        os.path.realpath(work_tree) if work_tree is not None else "",
+    )
+
+
+async def _absolute_git_dir(directory: str | os.PathLike) -> str | None:
+    """Realpath of the git dir git finds from ``directory``, or None."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--absolute-git-dir"], directory, timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[Merge-Integrity] no git dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    return os.path.realpath(printed)
+
+
 @dataclass
 class DefaultBranchGuard:
     """Expected-SHA chain for the default branch over one dispatch run.
@@ -775,6 +1129,9 @@ class DefaultBranchGuard:
     merges: list[tuple[int, str, str]] = field(default_factory=list)
     # Per-task gate result for this run, written by dispatch._gated_merge_task.
     outcomes: dict[int, MergeOutcome] = field(default_factory=dict)
+    # IND3132-01 (task #3146): which repository project_dir was at the
+    # snapshot. Always set by snapshot(); only a hand-built guard has None.
+    identity: RepositoryIdentity | None = None
 
     @classmethod
     async def snapshot(cls, project_dir: str | os.PathLike) -> DefaultBranchGuard:
@@ -803,7 +1160,18 @@ class DefaultBranchGuard:
             raise MergeIntegrityError(
                 f"default branch '{default_branch}' does not resolve in {repo}"
             )
-        return cls(repo, default_branch, sha, sha)
+        identity = await repository_identity(repo, default_branch)
+        if isinstance(identity, str):
+            raise MergeIntegrityError(identity)
+        if not identity.work_tree:
+            raise MergeIntegrityError(f"no readable git work tree contains {repo}")
+        if identity.default_head != sha:
+            raise MergeIntegrityError(
+                f"default branch '{default_branch}' is {_short(sha)} in {repo} "
+                f"but {_short(identity.default_head)} in its git common dir "
+                f"{identity.common_dir}"
+            )
+        return cls(repo, default_branch, sha, sha, identity=identity)
 
     @property
     def tripped(self) -> bool:
@@ -814,9 +1182,89 @@ class DefaultBranchGuard:
             self.project_dir, f"refs/heads/{self.default_branch}",
         )
 
-    async def verify(self, stage: str, *, task_id: int | None = None) -> bool:
-        """True while the default branch is still at the expected SHA."""
+    async def repository_problem(
+        self, *directories: str | os.PathLike | None,
+    ) -> str | None:
+        """Why ``project_dir`` (or one of ``directories``) is no longer the
+        pinned repository, or None.
+
+        ``project_dir`` must keep every :class:`RepositoryIdentity` field
+        apart from ``default_head``, and the default branch read through the
+        pinned common dir must be the commit git finds from ``project_dir``
+        (where it points is the SHA chain's check). Each extra directory (the
+        gate's repository root, the task worktree) must use the same common
+        dir. A guard built without an identity checks nothing here.
+        """
+        pinned = self.identity
+        if pinned is None:
+            return None
+        problem = await self._identity_change()
+        if problem is not None:
+            return problem
+        # A plain move of the branch is the SHA chain's business (verify);
+        # here the two reads must name the same commit, or git is reading
+        # the branch from somewhere other than the pinned common dir.
+        pinned_head = await resolve_commit(
+            pinned.common_dir, f"refs/heads/{self.default_branch}",
+        )
+        discovered_head = await self.current_sha()
+        if pinned_head != discovered_head:
+            return (
+                f"default branch '{self.default_branch}' is "
+                f"{_short(pinned_head)} in the pinned git common dir "
+                f"{pinned.common_dir} but {_short(discovered_head)} from "
+                f"{self.project_dir}"
+            )
+        for directory in directories:
+            if directory is None:
+                continue
+            common = await git_common_dir(directory)
+            if common != pinned.common_dir:
+                return (
+                    f"{os.fspath(directory)} uses the repository at "
+                    f"{common or 'none'}, not the pinned {pinned.common_dir}"
+                )
+        return None
+
+    async def _identity_change(self) -> str | None:
+        """Which pinned identity field of ``project_dir`` changed, or None.
+
+        ``default_head`` moves with legitimate merges and is checked against
+        the expected SHA by the callers instead.
+        """
+        pinned = self.identity
+        if pinned is None:
+            return None
+        current = await repository_identity(self.project_dir, self.default_branch)
+        if isinstance(current, str):
+            return current
+        for name in (
+            "common_dir", "common_dir_id", "git_entry", "git_entry_id",
+            "git_dir", "git_dir_id", "work_tree",
+        ):
+            if getattr(current, name) != getattr(pinned, name):
+                return (
+                    f"repository identity of {self.project_dir} changed: {name} "
+                    f"was {getattr(pinned, name)} at the snapshot, now "
+                    f"{getattr(current, name)}"
+                )
+        return None
+
+    async def verify(
+        self,
+        stage: str,
+        *,
+        task_id: int | None = None,
+        directories: tuple[str | os.PathLike | None, ...] = (),
+    ) -> bool:
+        """True while the default branch is still at the expected SHA and
+        ``project_dir`` (plus ``directories``) is still the pinned repository.
+        """
         if self.tripped:
+            return False
+        problem = await self.repository_problem(*directories)
+        if problem is not None:
+            self.trip(stage, await self.current_sha(), task_id=task_id, detail=problem)
             return False
         current = await self.current_sha()
         if current == self.expected_sha:
@@ -825,7 +1273,13 @@ class DefaultBranchGuard:
         return False
 
     async def record_merge(
-        self, task_id: int, merged_sha: str, *, post_head: str | None,
+        self,
+        task_id: int,
+        merged_sha: str,
+        *,
+        post_head: str | None,
+        regenerated_paths: tuple[str, ...] = (),
+        regenerated_blobs: Mapping[str, str] | None = None,
     ) -> bool:
         """Advance the chain after the orchestrator merged ``merged_sha``.
 
@@ -839,77 +1293,150 @@ class DefaultBranchGuard:
           ``git merge-tree --write-tree expected merged_sha`` computes — a
           forged commit with the right parents and a backdoored tree fails.
 
+        ``regenerated_paths`` (task #3131) names the generated files the
+        orchestrator regenerated to complete a conflicted merge. The only
+        permitted difference from the ``merge-tree`` result is then those
+        paths — which must be exactly its conflicted paths and regular files
+        — see :func:`regenerated_resolution_problem`. A fast-forward never
+        carries regenerated files. ``regenerated_blobs`` (task #3141, I-03)
+        maps each regenerated path to the blob SHA of the verified generator
+        output; the landed commit must carry exactly those blobs, and
+        regenerated paths without it are refused.
+
         Anything else means another writer moved the branch around the
         merge, and trips the guard.
         """
         if self.tripped:
             return False
+        # IND3132-01 (task #3146): the merge must have landed in the pinned
+        # repository, read through its common dir, not by discovery.
+        problem = await self.repository_problem()
+        if problem is not None:
+            self.trip(
+                f"post-merge task={task_id}", await self.current_sha(),
+                task_id=task_id, detail=problem,
+            )
+            return False
         current = await self.current_sha()
         previous = self.expected_sha
+        regenerated = frozenset(regenerated_paths)
         legitimate = False
         if current is not None and current != previous and current == post_head:
             if current == merged_sha:
-                legitimate = await is_ancestor(self.project_dir, previous, current)
+                legitimate = not regenerated and await is_ancestor(
+                    self.project_dir, previous, current,
+                )
             else:
                 parents = await commit_parents(self.project_dir, current)
                 legitimate = (
                     parents == [previous, merged_sha]
-                    and await self._tree_is_merge_of(current, previous, merged_sha)
+                    and await self._tree_is_merge_of(
+                        current, previous, merged_sha, regenerated,
+                        regenerated_blobs,
+                    )
                 )
         if not legitimate:
             self.trip(f"post-merge task={task_id}", current, task_id=task_id)
             return False
         self.expected_sha = current
         self.merges.append((task_id, previous, current))
+        regenerated_note = (
+            f" regenerated={','.join(sorted(regenerated))}" if regenerated else ""
+        )
         _gate_audit_log(
             f"task={task_id} event=default-branch-advanced "
             f"branch={self.default_branch} before={_short(previous)} "
-            f"after={_short(current)} merged_sha={_short(merged_sha)}",
+            f"after={_short(current)} merged_sha={_short(merged_sha)}"
+            f"{regenerated_note}",
             task_id=task_id,
             event="default-branch-advanced",
         )
         return True
 
-    async def _tree_is_merge_of(self, commit: str, ours: str, theirs: str) -> bool:
-        """True when ``commit``'s tree is the clean merge of ``ours`` and ``theirs``.
+    async def _tree_is_merge_of(
+        self,
+        commit: str,
+        ours: str,
+        theirs: str,
+        regenerated: frozenset[str] = frozenset(),
+        regenerated_blobs: Mapping[str, str] | None = None,
+    ) -> bool:
+        """True when ``commit``'s tree is the merge of ``ours`` and ``theirs``.
 
         ``git merge-tree --write-tree`` (git >= 2.38) recomputes the merge
         from the object store alone, independent of the ref store and of any
-        checkout an agent can touch. A conflicted or failed recomputation is
-        not a match: the orchestrator's merge would not have succeeded.
+        checkout an agent can touch. Without ``regenerated`` the merge must be
+        clean and the trees identical: a conflicted or failed recomputation is
+        not a match, the orchestrator's merge would not have succeeded. With
+        ``regenerated`` (task #3131) the merge must conflict in exactly those
+        paths and ``commit`` may differ from the recomputed tree only there,
+        each holding the verified blob in ``regenerated_blobs`` (task #3141).
         """
-        expected = await git_run_async(
-            ["merge-tree", "--write-tree", "--no-messages", ours, theirs],
-            self.project_dir, timeout=60,
-        )
+        merged = await merged_tree(self.project_dir, ours, theirs)
         actual = await resolve_tree(self.project_dir, commit)
-        expected_tree = expected.stdout.split("\n", 1)[0].strip()
-        if expected.returncode != 0 or not expected_tree or actual is None:
+        if merged is None or actual is None:
+            return False
+        if regenerated:
+            problem = await regenerated_resolution_problem(
+                self.project_dir, merged, actual, regenerated,
+                regenerated_blobs or {},
+            )
+            if problem:
+                logger.error(
+                    "[Merge-Integrity] merge commit %s is not the merge of %s "
+                    "and %s with only %s regenerated: %s",
+                    _short(commit), _short(ours), _short(theirs),
+                    sorted(regenerated), problem,
+                )
+                return False
+            return True
+        if merged.conflicted:
             logger.error(
-                "[Merge-Integrity] merge-tree of %s and %s failed rc=%s: %s",
-                _short(ours), _short(theirs), expected.returncode,
-                (expected.stderr or expected.stdout).strip()[:200],
+                "[Merge-Integrity] merge-tree of %s and %s conflicts in %s",
+                _short(ours), _short(theirs), sorted(merged.conflicted)[:10],
             )
             return False
-        if actual != expected_tree:
+        if actual != merged.tree:
             logger.error(
                 "[Merge-Integrity] merge commit %s has tree %s, but merging %s "
                 "and %s gives %s",
                 _short(commit), _short(actual), _short(ours), _short(theirs),
-                _short(expected_tree),
+                _short(merged.tree),
             )
             return False
         return True
 
-    def trip(self, stage: str, actual: str | None, *, task_id: int | None = None) -> None:
-        """Record an unexpected default-branch movement and raise the alarm."""
+    def trip(
+        self,
+        stage: str,
+        actual: str | None,
+        *,
+        task_id: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Record an unexpected default-branch movement and raise the alarm.
+
+        ``detail`` (task #3146) explains a repository-identity change: the
+        project directory no longer names the pinned repository.
+        """
         if self.tripped:
             return
-        self.alert = (
-            f"default branch '{self.default_branch}' moved outside the "
-            f"orchestrator's merges (stage={stage}): expected "
-            f"{self.expected_sha} but found {actual or 'MISSING'}"
-        )
+        # R3146-02 (task #3151): ``detail`` embeds agent-chosen paths (a
+        # common dir reached through a planted symlink). The alert is printed,
+        # logged and handed on as a task's block reason, so it is escaped
+        # once here, like the audit line: a newline in a path must not start
+        # a forged ``[GATE-AUDIT]`` line in the operator's log.
+        if detail is not None:
+            self.alert = escape_audit_text(
+                f"repository of default branch '{self.default_branch}' changed "
+                f"(stage={stage}): {detail}"
+            )
+        else:
+            self.alert = escape_audit_text(
+                f"default branch '{self.default_branch}' moved outside the "
+                f"orchestrator's merges (stage={stage}): expected "
+                f"{self.expected_sha} but found {actual or 'MISSING'}"
+            )
         banner = "!" * 72
         print(f"\n{banner}")
         print(f"  [Merge-Integrity] ALERT: {self.alert}")
@@ -920,11 +1447,16 @@ class DefaultBranchGuard:
         )
         print(banner)
         logger.error("[Merge-Integrity] ALERT: %s", self.alert)
+        event = (
+            "repository-identity-changed" if detail is not None
+            else "default-branch-moved"
+        )
         _gate_audit_log(
             f"task={task_id if task_id is not None else '-'} "
-            f"event=default-branch-moved branch={self.default_branch} "
+            f"event={event} branch={self.default_branch} "
             f"stage={stage} expected={self.expected_sha} "
-            f"actual={actual or 'MISSING'} baseline={self.baseline_sha}",
+            f"actual={actual or 'MISSING'} baseline={self.baseline_sha}"
+            + (f" reason={detail}" if detail is not None else ""),
             task_id=task_id,
-            event="default-branch-moved",
+            event=event,
         )

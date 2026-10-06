@@ -285,7 +285,7 @@ def test_cleanup_with_unreachable_base_fails_loud_before_status_reset(
 
     with pytest.raises(AttemptCleanupError, match="reset forge-task-31"):
         asyncio.run(dispatch_mod.cleanup_failed_attempt(
-            31, str(worktree), [], output=[], base_sha="0" * 40,
+            31, str(worktree), [], output=[], base_sha="0" * 40, expect_repository=True,
         ))
 
     db_opened.assert_not_called()
@@ -302,7 +302,7 @@ def test_main_checkout_cleanup_without_task_branch_still_resets_todo(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", lambda write=False: db)
     output: list[str] = []
 
-    asyncio.run(dispatch_mod.cleanup_failed_attempt(32, str(repo), [], output=output))
+    asyncio.run(dispatch_mod.cleanup_failed_attempt(32, str(repo), [], output=output, expect_repository=True))
 
     assert any("does not exist" in line for line in output), output
     assert _checked_out_branch(repo) == "master"
@@ -319,9 +319,14 @@ def test_branch_is_rechecked_before_the_retry_attempt(repo: Path) -> None:
     _git(repo, "worktree", "add", "-q", "-b", "forge-task-33", str(worktree))
     agent = FakeAgent(["cycles_exhausted", "tests_passed"])
     gate_audit = MagicMock()
+    expected_repository: list[bool] = []
 
     async def cleanup_that_detaches(task_id, project_dir, reflections,
-                                    output=None, *, base_sha=None):
+                                    output=None, *, base_sha=None,
+                                    expect_repository=True):
+        # Task 3166 (R3165-01): a loop with a task branch says a repository
+        # is expected.
+        expected_repository.append(expect_repository)
         _git(Path(project_dir), "checkout", "-q", "--detach")
 
     with patch.object(dispatch_mod, "run_dev_test_loop", new=agent), \
@@ -342,6 +347,7 @@ def test_branch_is_rechecked_before_the_retry_attempt(repo: Path) -> None:
     assert len(agent.calls) == 1, "the retry ran on a detached HEAD"
     events = [call.kwargs.get("event") for call in gate_audit.call_args_list]
     assert events == ["worktree-branch-mismatch"]
+    assert expected_repository == [True]
 
 
 # --- abort outcomes and their audit trail -----------------------------------

@@ -20,6 +20,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Model-chosen commands get the same allowlisted environment as every other
+# agent subprocess, never the orchestrator's (IR-07, task 3134).
+from equipa.env_loader import active_agent_env
+from equipa.isolation import (
+    OLLAMA_REFUSAL_ACTION,
+    OLLAMA_REFUSAL_REMEDY,
+    unisolated_spawn_refusal,
+)
+
 # --- Config ---
 
 DEFAULT_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -316,7 +325,8 @@ def exec_grep(project_dir, args):
             "grep", "-rn", pattern, str(target)
         ]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, cwd=str(project)
+            cmd, capture_output=True, text=True, timeout=30, cwd=str(project),
+            env=active_agent_env(),
         )
         output = result.stdout
         if len(output) > MAX_OUTPUT_SIZE:
@@ -342,7 +352,8 @@ def exec_bash(project_dir, args, allow_write=False):
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            timeout=120, cwd=project_dir,
+            timeout=120, cwd=str(Path(project_dir).resolve()),
+            env=active_agent_env(),
         )
         output = result.stdout
         if result.stderr:
@@ -460,6 +471,23 @@ def run_ollama_agent(system_prompt, project_dir, role="developer",
             "cost": float,  # always 0 for local LLM
         }
     """
+    # R3136-01: every tool call below runs in this process as the
+    # orchestrator's user. With agent_isolation on that is refused here as
+    # well as in dispatch_agent, so no caller can reach it unsandboxed.
+    refusal = unisolated_spawn_refusal(
+        "Ollama agent", OLLAMA_REFUSAL_REMEDY, action=OLLAMA_REFUSAL_ACTION)
+    if refusal:
+        print(f"  [Ollama] {refusal}")
+        return {
+            "success": False,
+            "result": "blocked",
+            "result_text": f"RESULT: blocked\nBLOCKERS: {refusal}",
+            "errors": [refusal],
+            "num_turns": 0,
+            "duration": 0.0,
+            "cost": 0.0,
+        }
+
     base_url = base_url or os.environ.get("OLLAMA_BASE_URL", DEFAULT_BASE_URL)
     model = model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
     max_turns = max_turns or DEFAULT_MAX_TURNS

@@ -356,10 +356,24 @@ async def run_external_hook_async(
 
 
 def _build_hook_env(context: dict[str, Any]) -> dict[str, str]:
-    """Build environment variables for hook subprocess."""
-    import os
+    """Build environment variables for hook subprocess.
 
-    env = os.environ.copy()
+    Hooks get the same allowlisted environment as agent CLIs (sandbox-17,
+    see equipa.env_loader.build_agent_env) plus ``EQUIPA_HOOK_*`` context
+    variables, never a copy of the orchestrator's environment and its
+    credentials. Names a hook needs can be added with the dispatch config's
+    ``agent_env_passthrough``.
+    """
+    from equipa.env_loader import build_agent_env
+
+    try:
+        from equipa.config import get_active_dispatch_config
+        dispatch_config = get_active_dispatch_config()
+    except (ImportError, OSError, ValueError, TypeError, AttributeError):
+        logger.warning("dispatch config unavailable; hook env passthrough "
+                       "disabled", exc_info=True)
+        dispatch_config = None
+    env = build_agent_env(dispatch_config)
     for key, value in context.items():
         if value is not None:
             env_key = f"EQUIPA_HOOK_{key.upper()}"

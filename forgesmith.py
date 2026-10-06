@@ -28,6 +28,11 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    RunConfigDirError,
+    claude_cli_run_env,
+)
 from equipa.config import (
     APPROVED_MODEL_UPGRADES_KEY,
     get_configured_model,
@@ -36,7 +41,13 @@ from equipa.config import (
     load_dispatch_config,
     resolve_claude_model,
 )
+# ISO-06: GHOST and OPRO run `claude -p` as the orchestrator's user on text
+# derived from agent output; with agent_isolation on they refuse.
+from equipa.isolation import unisolated_spawn_refusal
 from forgesmith_gepa import run_gepa
+
+_ISOLATION_REMEDY = ("run this ForgeSmith phase with agent_isolation off, "
+                     "or skip it")
 
 # forgesmith_simba and forgesmith_impact were moved to scripts/ during
 # repo cleanup.  Add the scripts directory to sys.path so imports resolve.
@@ -362,10 +373,18 @@ def extract_lessons(runs, cfg):
         if info["count"] < 2:
             continue
 
-        # Check if lesson already exists
+        # Reject mode: a signature that matches an injection pattern yields
+        # no lesson at all (the sanitizer logs the reason).
+        safe_sig = sanitize_error_signature(sig)
+        if not safe_sig:
+            continue
+
+        # Check if lesson already exists. Signatures are stored sanitized
+        # (< and > escaped); older rows may hold the raw form, so match both.
         existing = conn.execute(
-            "SELECT id, times_seen FROM lessons_learned WHERE error_signature = ?",
-            (sig,)
+            "SELECT id, times_seen FROM lessons_learned "
+            "WHERE error_signature IN (?, ?)",
+            (safe_sig, sig)
         ).fetchone()
 
         if existing:
@@ -382,7 +401,6 @@ def extract_lessons(runs, cfg):
             if lesson and validate_lesson_structure(lesson):
                 # Sanitize the lesson content before storage
                 lesson = sanitize_lesson_content(lesson)
-                safe_sig = sanitize_error_signature(sig)
                 cursor = conn.execute(
                     """INSERT INTO lessons_learned
                        (role, error_type, error_signature, lesson, times_seen)
@@ -2197,13 +2215,26 @@ def dispatch_ghost_scout(prompt: str) -> str | None:
         "--model", get_configured_model(),
         "--max-turns", str(GHOST_SCOUT_MAX_TURNS),
         "--no-session-persistence",
+        # IR-01: no project-scope settings, CLAUDE.md or .mcp.json.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("ForgeSmith GHOST scout", _ISOLATION_REMEDY)
+    if refusal:
+        log(f"  [GHOST] {refusal}")
+        return None
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=GHOST_SCOUT_TIMEOUT,
-        )
+        # RR3144-A: a fresh, empty CLAUDE_CONFIG_DIR, never the
+        # agent-writable ~/.claude (equipa/cli_isolation.py).
+        with claude_cli_run_env() as cli_env:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=GHOST_SCOUT_TIMEOUT, env=cli_env,
+            )
+    except RunConfigDirError as exc:
+        log(f"  [GHOST] {exc}")
+        return None
     except subprocess.TimeoutExpired:
         log("  [GHOST] Scout timed out")
         return None
@@ -2691,12 +2722,25 @@ def call_claude_for_proposals(prompt, cfg):
         "--model", model,
         "--max-turns", "2",
         "--no-session-persistence",
+        # IR-01: no project-scope settings, CLAUDE.md or .mcp.json.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("ForgeSmith OPRO", _ISOLATION_REMEDY)
+    if refusal:
+        log(f"  [OPRO] {refusal}")
+        return None
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
+        # RR3144-A: same per-run config directory as the GHOST scout.
+        with claude_cli_run_env() as cli_env:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                env=cli_env,
+            )
+    except RunConfigDirError as exc:
+        log(f"  [OPRO] {exc}")
+        return None
     except subprocess.TimeoutExpired:
         log("  [OPRO] Claude call timed out")
         return None

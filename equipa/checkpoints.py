@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import unicodedata
 from pathlib import Path
 
 from equipa.constants import CHECKPOINT_DIR
@@ -189,6 +190,66 @@ def load_soft_checkpoint(
         return None
 
 
+# How much agent-authored free text one recovery prompt scans (review F6 of
+# task 3139). Each sanitize() call costs up to about 0.2 s at its 64k input
+# cap, and this prompt makes four of them, so the last output and each
+# .forge-state.json field are cut first, with a visible marker. The soft
+# checkpoint already stores at most SOFT_CHECKPOINT_TEXT_LIMIT characters.
+RECOVERY_TEXT_SCAN_LIMIT: int = 16_000
+STATE_FIELD_SCAN_LIMIT: int = 4_000
+
+# Unicode categories of characters that break a line or are invisible
+# controls: Cc (C0/C1, including newline and tab), Zl and Zp (U+2028,
+# U+2029). An agent-recorded path or tool name holding one could start a
+# line of its own in the prompt.
+_LINE_BREAKING_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+
+
+def _sanitize_agent_text(
+    text: object, label: str, scan_limit: int = STATE_FIELD_SCAN_LIMIT
+) -> str:
+    """Reject-mode sanitize agent-authored free text for a recovery prompt.
+
+    Text longer than *scan_limit* is cut, with a marker, before scanning;
+    the cut can only drop text, so the kept part is scanned whole.
+    """
+    from lesson_sanitizer import sanitize  # HARD dependency
+    # Late import keeps this module free of parsing's git_ops dependency.
+    from equipa.parsing import AGENT_OUTPUT_WITHHELD
+
+    text = str(text) if text else ""
+    if len(text) > scan_limit:
+        dropped = len(text) - scan_limit
+        text = f"{text[:scan_limit]}\n[... {dropped} chars not shown]"
+    return sanitize(text, label=label) or AGENT_OUTPUT_WITHHELD
+
+
+def _safe_entry(value: object) -> str:
+    """One agent-recorded path or tool name, or the withheld-line marker.
+
+    An entry with a line break or control character is withheld: it could
+    start a heading or an order on a line of its own (review F2 of task
+    3139). The others are boundary-escaped by the wrapper they render in.
+    """
+    from equipa.parsing import AGENT_OUTPUT_LINE_WITHHELD
+
+    text = str(value)
+    if any(
+        unicodedata.category(char) in _LINE_BREAKING_CATEGORIES for char in text
+    ):
+        return AGENT_OUTPUT_LINE_WITHHELD
+    return text
+
+
+def _join_paths(paths: list) -> str:
+    """Comma-join agent-supplied paths, withholding multi-line entries.
+
+    The caller renders the result inside wrap_agent_output(), which escapes
+    every wrapper token.
+    """
+    return ", ".join(_safe_entry(path) for path in paths)
+
+
 def _format_recovery_prompt(
     state: dict,
     forge_state: dict | None = None,
@@ -202,7 +263,18 @@ def _format_recovery_prompt(
     only exist on the session side (``open_files``, ``recent_tool_calls``,
     ``partial_reasoning``) are rendered when present and silently skipped
     otherwise.
+
+    The last output and the ``.forge-state.json`` fields are agent-authored
+    and this prompt joins compaction history, so they get the same treatment
+    as the compaction summary: reject-mode sanitize (a rejected field becomes
+    AGENT_OUTPUT_WITHHELD) inside an escaped ``<task-input>`` block (review
+    N3 of task 3129). File paths and tool names are agent-chosen too: they
+    render inside their own escaped block, and an entry with a line break or
+    control character is withheld (review F2 of task 3139).
     """
+    # Late import keeps this module free of parsing's git_ops dependency.
+    from equipa.parsing import wrap_agent_output
+
     parts: list[str] = []
 
     parts.append(
@@ -229,57 +301,77 @@ def _format_recovery_prompt(
     parts.append(f"**Turn count at checkpoint:** {turn}")
     parts.append(f"**Compactions detected so far:** {compaction_count}")
 
+    # Paths and tool names: agent-recorded, so one escaped block.
+    recorded_lines: list[str] = []
     if files_changed:
-        parts.append(
-            f"**Files you already changed:** {', '.join(files_changed)}"
+        recorded_lines.append(
+            f"Files you already changed: {_join_paths(files_changed)}"
         )
-
     if files_read:
-        parts.append(
-            f"**Files you already read (do NOT re-read):** "
-            f"{', '.join(files_read)}"
+        recorded_lines.append(
+            "Files you already read (do NOT re-read): "
+            f"{_join_paths(files_read)}"
         )
-
     if open_files:
-        parts.append(f"**Open files:** {', '.join(open_files)}")
+        recorded_lines.append(f"Open files: {_join_paths(open_files)}")
+
+    rendered_calls = []
+    for call in recent_tool_calls:
+        if not isinstance(call, dict):
+            continue
+        tool = _safe_entry(call.get("tool", "?"))
+        turn_num = _safe_entry(call.get("turn", "?"))
+        ok = _safe_entry(call.get("ok", "?"))
+        rendered_calls.append(f"- turn {turn_num}: {tool} (ok={ok})")
+    if rendered_calls:
+        recorded_lines.append("Recent tool calls:")
+        recorded_lines.extend(rendered_calls)
+
+    if recorded_lines:
+        parts.append(
+            "\n**Files and tool calls from your saved state:**\n"
+            + wrap_agent_output("recorded-paths", "\n".join(recorded_lines))
+        )
 
     if last_text:
+        safe_last_text = _sanitize_agent_text(
+            last_text, "checkpoint last output",
+            scan_limit=RECOVERY_TEXT_SCAN_LIMIT,
+        )
         parts.append(
-            f"\n**Your last output (truncated):**\n```\n{last_text}\n```"
+            "\n**Your last output (truncated):**\n"
+            + wrap_agent_output("last-output", safe_last_text)
         )
 
-    if recent_tool_calls:
-        rendered_calls = []
-        for call in recent_tool_calls:
-            if not isinstance(call, dict):
-                continue
-            tool = call.get("tool", "?")
-            turn_num = call.get("turn", "?")
-            ok = call.get("ok", "?")
-            rendered_calls.append(f"- turn {turn_num}: {tool} (ok={ok})")
-        if rendered_calls:
-            parts.append(
-                "\n**Recent tool calls:**\n" + "\n".join(rendered_calls)
-            )
-
     if forge_state:
-        parts.append("\n**Agent state file (.forge-state.json):**")
+        state_lines: list[str] = []
         current_step = forge_state.get("current_step", "")
         if current_step:
-            parts.append(f"- Current step: {current_step}")
+            state_lines.append(
+                f"- Current step: "
+                f"{_sanitize_agent_text(current_step, 'forge-state current_step')}"
+            )
         next_action = forge_state.get("next_action", "")
         if next_action:
-            parts.append(f"- Next action: {next_action}")
+            state_lines.append(
+                f"- Next action: "
+                f"{_sanitize_agent_text(next_action, 'forge-state next_action')}"
+            )
         state_decisions = forge_state.get("decisions", [])
         if state_decisions:
-            parts.append(
-                f"- Decisions made: {', '.join(str(d) for d in state_decisions[:5])}"
+            decisions_text = ", ".join(str(d) for d in state_decisions[:5])
+            state_lines.append(
+                f"- Decisions made: "
+                f"{_sanitize_agent_text(decisions_text, 'forge-state decisions')}"
             )
         state_files = forge_state.get("files_changed", [])
         if state_files:
-            parts.append(
-                f"- Files changed (from state): {', '.join(state_files)}"
+            state_lines.append(
+                f"- Files changed (from state): {_join_paths(state_files)}"
             )
+        if state_lines:
+            parts.append("\n**Agent state file (.forge-state.json):**")
+            parts.append(wrap_agent_output("forge-state", "\n".join(state_lines)))
 
     parts.append(
         "\n**RESUME NOW.** Pick up from your next action. "

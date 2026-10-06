@@ -23,7 +23,17 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    claude_cli_env,
+    fresh_claude_config_dir,
+)
 from equipa.config import get_configured_model
+# The claude -p calls below embed project files in their prompt, so they get
+# the allowlisted agent env like every other agent CLI (P2A-07).
+from equipa.env_loader import active_agent_env
+# They are not isolated agents, so with agent_isolation on they refuse (CT-04).
+from equipa.isolation import unisolated_spawn_refusal
 from equipa.output import log
 from equipa.parsing import estimate_tokens
 
@@ -264,16 +274,26 @@ def _run_sub_query(
         "--model", model,
         "--max-turns", str(MAX_SUB_QUERY_TURNS),
         "--no-session-persistence",
+        # IR-01: cwd is the agent-writable project; ignore its .claude/
+        # settings, CLAUDE.md and .mcp.json (see equipa/cli_isolation.py).
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("RLM sub-query")
+    if refusal:
+        return f"[sub_query error: {refusal}]"
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=SUB_QUERY_TIMEOUT,
-            cwd=project_dir,
-        )
+        # RR3144-A: a fresh, empty CLAUDE_CONFIG_DIR per call, never the
+        # agent-writable user scope (see equipa/cli_isolation.py).
+        with fresh_claude_config_dir() as config_dir:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=SUB_QUERY_TIMEOUT,
+                cwd=project_dir,
+                env=claude_cli_env(active_agent_env(), config_dir),
+            )
         if result.returncode == 0:
             try:
                 data = __import__("json").loads(result.stdout)
@@ -595,16 +615,24 @@ def _call_outer_agent(
         "--model", model,
         "--max-turns", "1",
         "--no-session-persistence",
+        # IR-01: same as sub_query; the cwd is the project directory.
+        *CLAUDE_CLI_ISOLATION_ARGS,
     ]
 
+    refusal = unisolated_spawn_refusal("RLM decomposition")
+    if refusal:
+        return f"[agent error: {refusal}]"
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=project_dir,
-        )
+        # RR3144-A: same per-call config directory as _run_sub_query.
+        with fresh_claude_config_dir() as config_dir:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=project_dir,
+                env=claude_cli_env(active_agent_env(), config_dir),
+            )
         if result.returncode == 0:
             return result.stdout
         if _is_overloaded_cli_failure(result.stderr, result.stdout):

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,20 @@ from equipa.security_gate import (
     reviewer_nonce_line,
     reviewer_run_failure,
     verify_reviewer_provenance,
+)
+from tests.host_timing import assert_linear_time
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    as_reviewer_artifact,
+    blocked_by_the_gate,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
 )
 
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -102,6 +117,40 @@ def gate_result(project_dir: Path, task_id: int):
     return _security_review_blocks_merge(
         str(project_dir), task_id, block_on_missing=True,
     )
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def lowercase_severity_words(text: str) -> str:
+    """``text`` with CRITICAL, HIGH and MEDIUM in lower case, except in the
+    final footer (written last, after every other line)."""
+    body, separator, footer = text.rpartition("## Counts")
+    if not separator:
+        return SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), text)
+    return SEVERITY_TOKEN.sub(
+        lambda match: match.group(1).lower(), body,
+    ) + separator + footer
+
+
+def assert_only_the_backstop_blocks(text: str) -> None:
+    """The merge gate blocks ``text`` (task 3170, IR67-02): the rules
+    trusted it (the backstop runs only then) and the severity-token backstop
+    blocked it."""
+    analysis = blocked_by_the_gate(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
+        analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks(
+        finished_review().replace("Details.", AS_WRITTEN_ONLY_FINDINGS[finding]))
 
 
 # --------------------------------------------------------------- gate-04
@@ -317,8 +366,11 @@ def test_hidden_high_form_with_zero_high_footer_fails_closed(tmp_path, form):
 @pytest.mark.parametrize(
     "form", list(HIDDEN_HIGH_FORMS), ids=list(HIDDEN_HIGH_FORMS),
 )
-def test_hidden_high_form_counted_in_footer_is_trusted(tmp_path, form):
-    """An honest review whose only finding uses the form, and counts it.
+def test_hidden_high_form_counted_in_footer_blocks_the_merge(tmp_path, form):
+    """An honest review whose only finding uses the form, and counts it,
+    blocks the merge: untrusted when the form holds an UPPER-case HIGH,
+    otherwise trusted with HIGH=1 (task 3154, I3152-04: named for what it
+    asserts).
 
     The strict ``### [E1] LOW`` header is removed: headers that disagree with
     the footer are a count mismatch on their own (task #3033), whatever else
@@ -331,7 +383,14 @@ def test_hidden_high_form_counted_in_footer_is_trusted(tmp_path, form):
     task_id = 94200 + list(HIDDEN_HIGH_FORMS).index(form)
     write_recorded_review(tmp_path, task_id, text)
     blocks, counts = gate_result(tmp_path, task_id)
-    assert blocks is True and counts and counts["HIGH"] == 1, (blocks, counts)
+    if SEVERITY_TOKEN.search(HIDDEN_HIGH_FORMS[form]):
+        # Task 3152: an UPPER-case HIGH that is not a counted heading's label
+        # blocks even when the footer counts it (no section or footer-count
+        # exemption); the merge was blocked before too, by HIGH=1.
+        assert (blocks, counts) == (True, None)
+    else:
+        assert blocks is True and counts and counts["HIGH"] == 1, (
+            blocks, counts)
 
 
 # Lines that mention a severity word but report no finding. A clean review
@@ -349,15 +408,25 @@ BENIGN_SEVERITY_MENTIONS = {
     "clean-summary-prose": "No CRITICAL or HIGH findings in this area.",
     "html-comment": "<!-- reviewer note: HIGH bar for evidence -->",
 }
-
-
 @pytest.mark.parametrize(
     "mention", list(BENIGN_SEVERITY_MENTIONS),
     ids=list(BENIGN_SEVERITY_MENTIONS),
 )
 def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention):
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label, so a compliant mention is in lower case
+    and merges. In UPPER case every rule still reads it as no finding (the
+    review is trusted) and only the severity-token backstop blocks it.
+
+    Task 3152: "tally-table" and "clean-summary-prose" (a zero tally and a
+    negation) merged as written under the 3143 exemptions; CRITICAL and HIGH
+    have none now, so they block like every other UPPER-case mention."""
+    mention_text = BENIGN_SEVERITY_MENTIONS[mention]
+    if SEVERITY_TOKEN.search(mention_text):
+        assert_only_the_backstop_blocks(
+            finished_review().replace("Details.", mention_text))
     text = finished_review().replace(
-        "Details.", BENIGN_SEVERITY_MENTIONS[mention],
+        "Details.", lowercase_severity_words(mention_text),
     )
     task_id = 94300 + list(BENIGN_SEVERITY_MENTIONS).index(mention)
     write_recorded_review(tmp_path, task_id, text)
@@ -365,21 +434,45 @@ def test_benign_severity_mentions_do_not_block_a_clean_review(tmp_path, mention)
     assert blocks is False and counts and counts["LOW"] == 1, (blocks, counts)
 
 
-@pytest.mark.parametrize("line", [
-    "Severity" + " " * 50000 + "x",
-    "- Severity" + " " * 50000 + "level",
-    "- x (" + " " * 50000 + "HIGH" + " " * 50000 + "x",
-], ids=["severity-spaces", "severity-level-spaces", "list-paren-spaces"])
-def test_new_severity_forms_parse_in_linear_time(tmp_path, line):
-    """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds."""
-    import time
+PADDING_SPACES = 50000
 
-    text = review_body(footer=ONE_LOW_FOOTER).replace("Details.", line)
+
+@pytest.mark.parametrize("make_line", [
+    lambda spaces: "Severity" + " " * spaces + "x",
+    lambda spaces: "- Severity" + " " * spaces + "level",
+    lambda spaces: "- x (" + " " * spaces + "HIGH" + " " * spaces + "x",
+], ids=["severity-spaces", "severity-level-spaces", "list-paren-spaces"])
+@timing_test
+def test_new_severity_forms_parse_in_linear_time(tmp_path, make_line):
+    """Adjacent unbounded ``[ \\t]*`` made one padded line take seconds.
+    Budget host-calibrated, growth from a quarter of the padding to all of
+    it linear (task 3171)."""
+    def padded_review(spaces, rewrite=lambda text: text):
+        return rewrite(review_body(footer=ONE_LOW_FOOTER).replace(
+            "Details.", make_line(spaces)))
+
+    def assert_parses_in_linear_time(rewrite=lambda text: text):
+        assert_linear_time(
+            lambda spaces: production_seconds(
+                as_reviewer_artifact(padded_review(spaces, rewrite))),
+            PADDING_SPACES, 2.0, make_line(0))
+
+    line = make_line(PADDING_SPACES)
+    text = padded_review(PADDING_SPACES)
     path = tmp_path / "SECURITY-REVIEW-94400.md"
     path.write_text(text, encoding="utf-8")
-    start = time.perf_counter()
     analysis = loops._analyze_review_file(path, text=text)
-    assert time.perf_counter() - start < 2.0
+    assert_parses_in_linear_time()
+    if SEVERITY_TOKEN.search(line):
+        # Task 3143: an UPPER-case HIGH in prose is blocked by the backstop
+        # only; the rules still read the padded line as prose. Task 3170:
+        # decided through the merge gate.
+        analysis = blocked_by_the_gate(as_reviewer_artifact(text))
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, analysis
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
+        text = lowercase_severity_words(text)
+        analysis = loops._analyze_review_file(path, text=text)
+        assert_parses_in_linear_time(lowercase_severity_words)
     assert analysis.verdict == loops.REVIEW_VERDICT_OK, analysis
 
 
@@ -439,9 +532,13 @@ def review_writer(root, newline="\n", extra=None):
     return behave
 
 
+# The agent env is allowlisted (loop-03), so the fake finds result.json next
+# to itself rather than through an inherited variable.
 FAKE_CLI_PRINTING_RESULT = (
     "import os, sys\n"
-    "sys.stdout.write(open(os.environ['FAKE_RESULT'], encoding='utf-8').read())\n"
+    "here = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.stdout.write(open(os.path.join(here, 'result.json'),"
+    " encoding='utf-8').read())\n"
 )
 
 
@@ -454,8 +551,9 @@ def test_run_agent_flags_a_run_that_hit_max_turns(
 ):
     """The CLI's ``error_max_turns`` result is reported as ``hit_max_turns``.
 
-    ``success`` stays True for callers that keep partial work; the security
-    reviewer reads the flag and treats the run as failed (gate-07).
+    The security reviewer reads the flag and treats the run as failed
+    (gate-07). Since task 3134 (F8) the run is also not a success, as on the
+    streaming path: it was cut off, not finished.
     """
     result_file = tmp_path / "result.json"
     result_file.write_text(json.dumps({
@@ -464,13 +562,12 @@ def test_run_agent_flags_a_run_that_hit_max_turns(
     }), encoding="utf-8")
     fake_cli = tmp_path / "fake_claude.py"
     fake_cli.write_text(FAKE_CLI_PRINTING_RESULT, encoding="utf-8")
-    monkeypatch.setenv("FAKE_RESULT", str(result_file))
 
     result = asyncio.run(agent_runner.run_agent(
         [sys.executable, str(fake_cli)], timeout=30, max_retries=0,
     ))
 
-    assert result["success"] is True
+    assert result["success"] is (not expect_max_turns)
     assert bool(result.get("hit_max_turns")) is expect_max_turns
     assert ("Agent hit max turns limit" in result["errors"]) is expect_max_turns
 

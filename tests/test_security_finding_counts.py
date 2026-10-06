@@ -20,6 +20,7 @@ These tests guard:
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -38,10 +39,26 @@ def _write(tmp_path: Path, task_id: int, body: str) -> Path:
     return path
 
 
+# Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and MEDIUM
+# only as a finding's label, and the severity-token backstop refuses a review
+# holding any other. The prose tests below check both: the UPPER-case
+# original is refused, the compliant lower-case prose is not counted.
+_SEVERITY_TOKEN_RE = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def _lowercase_prose_severities(review: str) -> str:
+    """``review`` with CRITICAL, HIGH and MEDIUM in lower case outside its
+    ``### [ID]`` finding headers."""
+    return "".join(
+        line if line.startswith("### [") else _SEVERITY_TOKEN_RE.sub(
+            lambda match: match.group(1).lower(), line,
+        )
+        for line in review.splitlines(keepends=True)
+    )
+
+
 def test_parser_counts_findings_by_severity_header(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path,
-        2315,
+    review = (
         "# Security Review\n"
         "## Findings\n"
         "### [S1] CRITICAL — SQL injection in login handler\n"
@@ -50,7 +67,16 @@ def test_parser_counts_findings_by_severity_header(tmp_path: Path) -> None:
         "### [S3] HIGH — Open redirect on /go\n"
         "### [S4] MEDIUM — Missing CSRF\n"
         "### [S5] LOW — Verbose error responses\n"
-        "### [S6] INFO — Logging note\n",
+        "### [S6] INFO — Logging note\n"
+    )
+    # Task 3143: UPPER-case severity words in prose label no finding, so the
+    # severity-token backstop refuses the review; the reviewer prompt has
+    # them written in lower case, and the headers are then counted.
+    assert _count_findings_in_review_file(_write(tmp_path, 2315, review)) is None
+    path = _write(
+        tmp_path,
+        2315,
+        review.replace("word HIGH and MEDIUM", "word high and medium"),
     )
     assert _count_findings_in_review_file(path) == {
         "CRITICAL": 1,
@@ -65,9 +91,7 @@ def test_parser_ignores_prose_mentions_of_severities(tmp_path: Path) -> None:
     # Stdout-style content: CRITICAL appears 5 times but only in non-finding
     # contexts (rejected findings, narrative prose). The artifact's structured
     # finding headers list 0 CRITICAL, 0 HIGH.
-    path = _write(
-        tmp_path,
-        2315,
+    review = (
         "# Security Review\n"
         "Summary: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 0 LOW, 0 INFO.\n"
         "## Discussion\n"
@@ -76,8 +100,10 @@ def test_parser_ignores_prose_mentions_of_severities(tmp_path: Path) -> None:
         "Reviewer note: nothing here rises to CRITICAL or HIGH severity.\n"
         "## Findings\n"
         "### [S1] MEDIUM — Race condition in token issuance\n"
-        "This is HIGH risk on multi-tenant deployments, downgraded to MEDIUM.\n",
+        "This is HIGH risk on multi-tenant deployments, downgraded to MEDIUM.\n"
     )
+    assert _count_findings_in_review_file(_write(tmp_path, 2315, review)) is None
+    path = _write(tmp_path, 2315, _lowercase_prose_severities(review))
     counts = _count_findings_in_review_file(path)
     assert counts == {
         "CRITICAL": 0,
@@ -93,17 +119,20 @@ def test_parser_returns_none_when_artifact_missing(tmp_path: Path) -> None:
 
 
 def test_parser_handles_zero_findings_approve_review(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path,
-        2310,
+    review = (
         "# Security Review\n"
         "**APPROVE.**\n"
         "No CRITICAL, HIGH, MEDIUM, or LOW findings.\n"
         "## Findings\n"
         "### [S1] INFO — Defense-in-depth suggestion\n"
         "### [S2] INFO — Documentation nit\n"
-        "### [S3] INFO — Test coverage observation\n",
+        "### [S3] INFO — Test coverage observation\n"
     )
+    # Task 3152: the backstop has no negation exemption for CRITICAL and
+    # HIGH any more, so the UPPER-case negation blocks; the prompt has it
+    # written in lower case, and that review is counted as before.
+    assert _count_findings_in_review_file(_write(tmp_path, 2310, review)) is None
+    path = _write(tmp_path, 2310, _lowercase_prose_severities(review))
     assert _count_findings_in_review_file(path) == {
         "CRITICAL": 0,
         "HIGH": 0,
@@ -398,11 +427,14 @@ def test_security_review_prompt_uses_task_scoped_filename() -> None:
 
 
 def test_zero_findings_reports_zero(tmp_path: Path) -> None:
+    # Task 3152: an UPPER-case "0 CRITICAL, 0 HIGH" tally in prose blocks
+    # (no tally exemption for the merge-blocking severities); the compliant
+    # lower-case tally reports zero.
     _write(
         tmp_path,
         4245,
         "# Security Review\n"
-        "**APPROVE.** 0 CRITICAL, 0 HIGH, 0 MEDIUM, 0 LOW, 0 INFO.\n"
+        "**APPROVE.** 0 critical, 0 high, 0 medium, 0 LOW, 0 INFO.\n"
         "## Findings\n"
         "_No findings._\n",
     )
@@ -414,3 +446,12 @@ def test_zero_findings_reports_zero(tmp_path: Path) -> None:
     assert any("No critical or high severity findings" in ln for ln in lines)
     assert not any("WARNING: Found" in ln for ln in lines)
     assert not any("artifact missing" in ln for ln in lines)
+    upper_case_tally = _write(
+        tmp_path,
+        4246,
+        "# Security Review\n"
+        "**APPROVE.** 0 CRITICAL, 0 HIGH, 0 MEDIUM, 0 LOW, 0 INFO.\n"
+        "## Findings\n"
+        "_No findings._\n",
+    )
+    assert _count_findings_in_review_file(upper_case_tally) is None

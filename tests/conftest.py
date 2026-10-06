@@ -10,9 +10,12 @@ Copyright 2026 Forgeborn
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Add parent directory (repo root) to path for imports
@@ -43,7 +46,130 @@ import pytest  # noqa: E402  (sys.path must be set before any equipa import)
 # real TheForge DB, and an inherited production path is exactly how the
 # damage happened. _assert_db_isolated() then checks every loaded module's
 # binding and stops the run before any test executes if one escaped.
-_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="equipa-test-db-"))
+#
+# --- Per-session temp directory (R3150-08) ---
+#
+# Every Claude CLI run gets a per-run CLAUDE_CONFIG_DIR (equipa-claude-config-*)
+# in the temp directory, and the orchestrator scripts some tests SIGKILL never
+# remove theirs. So everything this session puts in the temp directory, in
+# this process and in every subprocess (they inherit TMPDIR), goes into one
+# private directory that pytest_unconfigure removes. Per-run config
+# directories are never swept from the shared temp directory instead: agents
+# run this suite while the orchestrator dispatches, and a live run's directory
+# looks the same as a leaked one. Set before the test DB below, so it lives
+# inside it too and _is_safe_test_db() judges against the same temp root.
+#
+# pytest_unconfigure never runs when the session is killed. The tester runs
+# the suite under `timeout`, whose SIGTERM is therefore handled below and
+# removes the session directory first. A SIGKILLed session's directory is
+# removed by the next session once it is a day old (only "eqt-" directories
+# of this user: no session lasts that long, so a live one is never taken).
+_ORIGINAL_TMP = tempfile.gettempdir()
+_SESSION_TMP_PREFIX = "eqt-"
+STALE_SESSION_TMP_SECONDS = 24 * 3600
+
+
+def _sweep_stale_session_dirs(root: str,
+                              max_age_seconds: float = STALE_SESSION_TMP_SECONDS,
+                              now: float | None = None) -> list[str]:
+    """Remove the session temp directories killed sessions left in *root*.
+
+    Only real directories (never symlinks) named ``eqt-*``, owned by this
+    user, whose own mtime and every direct entry's mtime are older than
+    *max_age_seconds*. Returns the paths that were removed.
+    """
+    cutoff = (time.time() if now is None else now) - max_age_seconds
+    removed: list[str] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(_SESSION_TMP_PREFIX):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            continue
+        newest = info.st_mtime
+        try:
+            with os.scandir(entry.path) as children:
+                for child in children:
+                    newest = max(newest,
+                                 child.stat(follow_symlinks=False).st_mtime)
+        except OSError:
+            continue
+        if newest > cutoff:
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+        if not os.path.lexists(entry.path):
+            removed.append(entry.path)
+    return removed
+
+
+#
+# --- pytest-xdist workers (task 3160) ---
+#
+# Under `pytest -n N` every worker is its own process and runs this file
+# itself, so each worker gets its own session directory (inside the
+# controller's: the worker inherits TMPDIR) and its own THEFORGE_DB. Workers
+# never share a database. tmp_path is different: the controller hands every
+# worker a base directory under ITS basetemp (<controller session>/
+# pytest-of-<user>/pytest-N/popen-gwN), outside the worker's own session
+# directory. So a worker judges test-DB paths against the controller's
+# session directory, the one directory that holds both. The controller
+# exports it in SESSION_ROOT_ENV; a worker accepts it only when it is the
+# TMPDIR the worker inherited and a real "eqt-" directory of this user.
+SESSION_ROOT_ENV = "EQUIPA_TEST_SESSION_ROOT"
+_XDIST_WORKER_ID = re.compile(r"gw\d+")
+
+
+def _xdist_session_root(worker_id: str | None, exported_root: str | None,
+                        inherited_tmp: str) -> Path | None:
+    """The controller's session directory if this process is one of its
+    xdist workers, else None (a top-level session, serial or controller).
+
+    A test that starts a Python subprocess inherits PYTEST_XDIST_WORKER but
+    not the controller's TMPDIR (the worker moved it), so it stays top-level.
+    """
+    if not worker_id or not _XDIST_WORKER_ID.fullmatch(worker_id):
+        return None
+    if not exported_root or Path(exported_root) != Path(inherited_tmp):
+        return None
+    root = Path(exported_root)
+    try:
+        info = root.lstat()
+    except OSError:
+        return None
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or not root.name.startswith(_SESSION_TMP_PREFIX)):
+        return None
+    return root
+
+
+XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER") or None
+_CONTROLLER_SESSION_ROOT = _xdist_session_root(
+    XDIST_WORKER, os.environ.get(SESSION_ROOT_ENV), _ORIGINAL_TMP)
+if _CONTROLLER_SESSION_ROOT is None:
+    XDIST_WORKER = None
+
+# A worker's parent temp directory is the controller's live session
+# directory: never sweep it (nothing in it is a day old anyway).
+if XDIST_WORKER is None:
+    _sweep_stale_session_dirs(_ORIGINAL_TMP)
+SESSION_TMP = Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX,
+                                    dir=_ORIGINAL_TMP))
+os.environ["TMPDIR"] = str(SESSION_TMP)
+tempfile.tempdir = str(SESSION_TMP)
+# The directory every DB path and tmp_path of this run must sit inside.
+SESSION_ROOT = _CONTROLLER_SESSION_ROOT or SESSION_TMP
+os.environ[SESSION_ROOT_ENV] = str(SESSION_ROOT)
+
+_TEST_DB_DIR = Path(tempfile.mkdtemp(
+    prefix=f"equipa-test-db-{XDIST_WORKER}-" if XDIST_WORKER
+    else "equipa-test-db-"))
 TEST_DB_PATH = _TEST_DB_DIR / "theforge-test.db"
 os.environ["THEFORGE_DB"] = str(TEST_DB_PATH)
 
@@ -52,16 +178,18 @@ def _is_safe_test_db(path) -> bool:
     """True only for a DB path that cannot be a real TheForge database.
 
     The path must not itself be a symlink, and after resolving any symlinks
-    in its parents it must sit inside the system temp directory (where this
-    conftest's DB and every tmp_path live). A repo-root theforge.db that is a
-    symlink to production fails both tests. Nothing inside the repo counts
-    as safe either, even when the checkout itself lives under /tmp: the
-    repo-root default is never a test DB.
+    in its parents it must sit inside this run's session directory
+    (SESSION_ROOT, in the system temp directory, where this conftest's DB
+    and every tmp_path live; under xdist the controller's, holding every
+    worker's). A repo-root theforge.db that is a symlink to production fails
+    both tests. Nothing inside the repo counts as safe either, even when the
+    checkout itself lives under /tmp: the repo-root default is never a test
+    DB.
     """
     p = Path(path)
     if p.is_symlink():
         return False
-    tmp_root = Path(tempfile.gettempdir()).resolve()
+    tmp_root = SESSION_ROOT.resolve()
     try:
         resolved = p.resolve()
     except OSError:
@@ -107,6 +235,24 @@ def _is_project_module(name, mod) -> bool:
     return result
 
 
+#
+# --- A refusing or crashed xdist worker fails the whole run (task 3163) ---
+#
+# xdist treats only a worker's exit status 2 as fatal. A worker that stopped
+# itself with pytest.exit(returncode=3) (an isolation refusal below) was just
+# dropped from the schedule: the other workers ran its tests, the run could
+# end green, and the REFUSING reason was printed nowhere (a worker's terminal
+# output is not forwarded). So a refusing worker hands its reason to the
+# controller in workeroutput, and the controller fails the run with exit
+# status 3, printing why, when any worker refused or went down.
+WORKER_REFUSAL_KEY = "equipa_refusal"
+# Every refusal that stopped this process's run (sent to the controller if
+# it is a worker). Filled by pytest_keyboard_interrupt, never at the call.
+_REFUSAL_REASONS: list[str] = []
+# Controller only: why each refusing or crashed worker fails the run.
+_WORKER_FAILURES: list[str] = []
+
+
 def _assert_db_isolated(stage: str) -> None:
     """Abort the whole run if any loaded module points outside the temp dir."""
     escaped = [f"{name}.THEFORGE_DB = {value}"
@@ -119,6 +265,81 @@ def _assert_db_isolated(stage: str) -> None:
             + "\n  ".join(escaped),
             returncode=3,
         )
+
+
+def pytest_keyboard_interrupt(excinfo):
+    """Record a refusal (a pytest.exit with status 3) once it has stopped
+    this process's run.
+
+    pytest calls this hook only for an exit that reached the session. A test
+    that calls _assert_db_isolated on purpose and catches the exit
+    (tests/test_conftest_db_isolation.py) records nothing. When the reason
+    was recorded at the call instead, that test made its worker report a
+    refusal and failed the whole parallel run.
+    """
+    refusal = excinfo.value
+    if (isinstance(refusal, pytest.exit.Exception)
+            and refusal.returncode == pytest.ExitCode.INTERNAL_ERROR):
+        _REFUSAL_REASONS.append(refusal.msg)
+
+
+def _worker_failure(worker_id: str, workeroutput: dict | None,
+                    error: object | None) -> str | None:
+    """Why the xdist worker *worker_id* fails the whole run, or None.
+
+    It fails the run when it refused (the reasons it sent, or exit status 3
+    without them) or went down (xdist passes the crash as *error*). A worker
+    that finished with failed tests (1) or none to run (5) does not: the
+    controller counts those itself.
+    """
+    output = workeroutput or {}
+    reasons = output.get(WORKER_REFUSAL_KEY)
+    if reasons:
+        return f"xdist worker {worker_id} refused:\n" + "\n".join(reasons)
+    if output.get("exitstatus") == pytest.ExitCode.INTERNAL_ERROR:
+        return (f"xdist worker {worker_id} stopped with exit status 3 "
+                "(an internal error or a refusal without a reason)")
+    if error is not None:
+        return f"xdist worker {worker_id} went down: {error}"
+    return None
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """Controller side (xdist): record a refusing or crashed worker and say
+    so at once, so the reason shows even if the run is killed later."""
+    failure = _worker_failure(node.gateway.id,
+                              getattr(node, "workeroutput", None), error)
+    if failure is None:
+        return
+    _WORKER_FAILURES.append(failure)
+    reporter = node.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line("")
+        reporter.write_line(f"[conftest] {failure}", red=True, bold=True)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """A worker sends its refusal reasons to the controller (workeroutput is
+    sent after every sessionfinish implementation has run). The controller
+    fails the run with exit status 3 if any worker refused or went down,
+    whatever the workers that kept going reported."""
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        if _REFUSAL_REASONS:
+            workeroutput[WORKER_REFUSAL_KEY] = list(_REFUSAL_REASONS)
+        return
+    if not _WORKER_FAILURES:
+        return
+    session.exitstatus = pytest.ExitCode.INTERNAL_ERROR
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.section("[conftest] RUN FAILED: an xdist worker refused or "
+                         "went down (exit status 3)", sep="!", red=True,
+                         bold=True)
+        for failure in _WORKER_FAILURES:
+            reporter.write_line(failure, red=True)
 
 
 
@@ -140,6 +361,28 @@ def _restore_db_bindings():
         os.environ.pop("THEFORGE_DB", None)
     else:
         os.environ["THEFORGE_DB"] = saved_env
+
+
+@pytest.fixture(scope="session")
+def _absent_host_path(tmp_path_factory) -> Path:
+    """A directory that does not exist, for host-state paths in tests."""
+    return tmp_path_factory.mktemp("no-host-isolation") / "absent"
+
+
+@pytest.fixture(autouse=True)
+def _no_host_agent_isolation_state(_absent_host_path, monkeypatch):
+    """Task 3142 (review F1): the host's isolation marker and dispatch
+    config make agent isolation sticky. On a host where the operator has
+    enabled it, every test would otherwise see isolation required; tests
+    of that state set both paths themselves."""
+    from equipa import config as equipa_config
+    from equipa import isolation as equipa_isolation
+
+    absent = _absent_host_path
+    monkeypatch.setattr(equipa_isolation, "REQUIRED_MARKER", absent / "marker")
+    monkeypatch.setattr(equipa_config, "host_dispatch_config_path",
+                        lambda: absent / "dispatch_config.json")
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -218,7 +461,13 @@ def _ensure_full_schema():
 
 
 def pytest_configure(config):
-    """Ensure database schema exists before any tests collect."""
+    """Ensure database schema exists before any tests collect, and bound
+    every test with a deadline (task 3175, tests/deadline_watchdog.py)."""
+    from tests import deadline_watchdog
+
+    if not config.pluginmanager.is_registered(deadline_watchdog):
+        config.pluginmanager.register(deadline_watchdog,
+                                      "tests.deadline_watchdog")
     from equipa import constants as equipa_constants
 
     if Path(equipa_constants.THEFORGE_DB) != TEST_DB_PATH:
@@ -242,6 +491,27 @@ def pytest_configure(config):
         print("  [conftest] Schema setup skipped — tests requiring DB may fail.")
 
 
+def _timing_calibration():
+    """The timing tests' host calibration (task 3171, tests/host_timing.py);
+    a malformed EQUIPA_TIMING_HOST_FACTOR stops the run before any test."""
+    from tests import host_timing
+
+    try:
+        return host_timing.host_calibration()
+    except host_timing.HostFactorError as error:
+        raise pytest.UsageError(str(error)) from error
+
+
+def pytest_report_header(config):
+    return _timing_calibration().describe()
+
+
+def pytest_sessionstart(session):
+    """Measure the timing reference workload once per process (every xdist
+    worker too) before the first test, not inside a timed test."""
+    _timing_calibration()
+
+
 def pytest_collection_modifyitems(session, config, items):
     """After collection, call setup_test_data() for modules that define it.
 
@@ -261,6 +531,57 @@ def pytest_collection_modifyitems(session, config, items):
             setup_modules.add(module)
 
 
+def _remove_session_tmp() -> None:
+    """Remove SESSION_TMP, every per-run config directory in it included.
+
+    Tests leave read-only directories behind (permission probes), so an
+    entry that cannot be removed gets its parent made writable once and is
+    retried. Whatever still remains is reported, never silently kept.
+    """
+    def _retry_writable(func, path, _exc):
+        parent = os.path.dirname(path)
+        try:
+            os.chmod(parent, 0o700)
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.chmod(path, 0o700)
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                func(path)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(SESSION_TMP, onexc=_retry_writable)
+    else:
+        shutil.rmtree(SESSION_TMP, onerror=_retry_writable)
+    if SESSION_TMP.exists():
+        print(f"  [conftest] WARNING: could not fully remove the session temp "
+              f"directory {SESSION_TMP}", file=sys.stderr)
+
+
+# The process that owns SESSION_TMP. A child forked by a test inherits the
+# handler below but must never remove the session's directory.
+_SESSION_PID = os.getpid()
+
+
+def _remove_session_tmp_on_sigterm(signum, _frame) -> None:
+    """Remove SESSION_TMP, then die of the signal as if it were unhandled.
+
+    `timeout` stops a slow suite with SIGTERM, which skips
+    pytest_unconfigure, so the session directory (with the per-run Claude
+    config directories of the tests that ran) would stay behind.
+    """
+    if os.getpid() == _SESSION_PID:
+        _remove_session_tmp()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+signal.signal(signal.SIGTERM, _remove_session_tmp_on_sigterm)
+
+
 def pytest_unconfigure(config):
-    """Remove this run's throwaway DB directory."""
+    """Remove this run's throwaway DB directory and the session temp
+    directory (with every per-run Claude config directory in it)."""
     shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+    _remove_session_tmp()

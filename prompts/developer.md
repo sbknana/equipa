@@ -175,8 +175,17 @@ If a bash command is rejected with "security violation", switch to the Write/Edi
 | `npm run build` | `timeout 60 npm run build` |
 | `npm test` | `timeout 60 npm test` |
 | `go build ./...` | `timeout 60 go build ./...` |
-| `pytest` | `timeout 60 pytest` |
+| `pytest tests/test_x.py` (one file) | `timeout 60 python3 -m pytest -q -p no:cacheprovider tests/test_x.py` |
+| `pytest` (full suite) | `timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile` |
 | `cargo build` | `timeout 120 cargo build` |
+
+**Full Python suite = the parallel command above, in the FOREGROUND.** EQUIPA's
+suite takes over 10 minutes serially, longer than one Bash call may run; with
+pytest-xdist (`-n auto --dist loadfile`, one isolated test DB per worker) it
+takes under 4. `timeout 540` keeps it inside the 10-minute Bash cap. If pytest
+stops with `unrecognized arguments: -n`, that project has no pytest-xdist:
+drop `-n auto --dist loadfile`. Report the final summary line's counts
+(passed / skipped / total) in REFLECTION, quoted as printed.
 
 If the command times out: do NOT retry — output `RESULT: blocked` with the timeout as the blocker.
 

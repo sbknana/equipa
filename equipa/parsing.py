@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import math
 import re
 
 from equipa.constants import EARLY_TERM_KILL_TURNS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY
 from equipa.git_ops import git_run
+from equipa.monitoring import git_checks_allowed
+
+_log = logging.getLogger(__name__)
 
 # --- Token Budget Constants ---
 # Anthropic recommendation: ~4 chars/token for Claude
@@ -24,6 +28,11 @@ CHARS_PER_TOKEN: int = 4
 SYSTEM_PROMPT_TOKEN_TARGET: int = 8000   # 8K token target
 SYSTEM_PROMPT_TOKEN_HARD_LIMIT: int = 10000  # absolute max before aggressive trimming
 EPISODE_REDUCTION_THRESHOLD: int = 6000  # reduce episodes from 3->2 above this
+
+# Emitted by compact_agent_output() in place of agent output the sanitizer
+# rejected. Checkpoint and compaction context must never fall back to the raw
+# text (review finding F1 of task 3123).
+AGENT_OUTPUT_WITHHELD: str = "[agent output withheld: failed sanitization]"
 
 
 # --- Token Estimation ---
@@ -53,30 +62,6 @@ def compute_keyword_overlap(text_a: str, text_b: str) -> float:
         return 0.0
     intersection = words_a & words_b
     union = words_a | words_b
-    return len(intersection) / len(union)
-
-
-def _compute_ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
-    """Compute n-gram Jaccard similarity between two texts.
-
-    Uses character n-grams for fuzzy matching (catches typos, variations).
-    Returns similarity score 0.0-1.0.
-    """
-    if not text_a or not text_b:
-        return 0.0
-
-    def ngrams(s: str, n: int) -> set[str]:
-        s_lower = s.lower()
-        return set(s_lower[i:i+n] for i in range(len(s_lower) - n + 1))
-
-    ngrams_a = ngrams(text_a, n)
-    ngrams_b = ngrams(text_b, n)
-
-    if not ngrams_a or not ngrams_b:
-        return 0.0
-
-    intersection = ngrams_a & ngrams_b
-    union = ngrams_a | ngrams_b
     return len(intersection) / len(union)
 
 
@@ -135,44 +120,45 @@ def _extract_section(text: str, marker: str, max_lines: int = 1) -> str:
     return "\n".join(lines[:max_lines]).strip()
 
 
-def _deduplicate_log_lines(lines: list[str], threshold: float = 0.85) -> list[str]:
-    """Deduplicate similar log lines using n-gram Jaccard similarity.
+_DIGIT_RUN = re.compile(r"\d+")
 
-    Groups identical or nearly-identical lines, showing count instead of repeating.
+
+def _log_line_key(line: str) -> str:
+    """Grouping key for a log line: case, spacing and numbers (timestamps,
+    counters, line numbers) do not make two log lines different."""
+    return _DIGIT_RUN.sub("#", " ".join(line.lower().split()))
+
+
+def _deduplicate_log_lines(lines: list[str]) -> list[str]:
+    """Group repeated log lines, showing a count instead of repeating them.
+
+    Lines are grouped by _log_line_key() in a dict, so the cost is linear in
+    the number of lines. The fuzzy n-gram comparison this replaced compared
+    every line with every earlier group (17 s on 1000 distinct lines) on the
+    compaction path of every checkpoint (review N5 of task 3129).
     Example: "Error: timeout\n" × 50 → "Error: timeout (×50)"
     """
     if not lines:
         return lines
 
     result: list[str] = []
-    line_groups: dict[str, int] = {}  # line → count
-    group_reps: list[str] = []  # first representative of each group
+    group_counts: dict[str, int] = {}  # key → count
+    group_reps: dict[str, str] = {}  # key → first line seen (insertion order)
 
     for line in lines:
         if not line.strip():
             result.append(line)
             continue
-
-        # Find matching group
-        matched_idx = -1
-        for idx, rep in enumerate(group_reps):
-            sim = _compute_ngram_jaccard(line, rep)
-            if sim >= threshold:
-                matched_idx = idx
-                break
-
-        if matched_idx >= 0:
-            # Increment existing group
-            rep = group_reps[matched_idx]
-            line_groups[rep] += 1
+        key = _log_line_key(line)
+        if key in group_counts:
+            group_counts[key] += 1
         else:
-            # New group
-            group_reps.append(line)
-            line_groups[line] = 1
+            group_counts[key] = 1
+            group_reps[key] = line
 
     # Emit deduplicated lines with counts
-    for rep in group_reps:
-        count = line_groups[rep]
+    for key, rep in group_reps.items():
+        count = group_counts[key]
         if count > 1:
             result.append(f"{rep.rstrip()} (×{count})")
         else:
@@ -224,6 +210,107 @@ def _aggressive_compress_code(text: str) -> str:
     return "\n".join(compressed)
 
 
+AGENT_OUTPUT_LINE_WITHHELD: str = "[line withheld: failed sanitization]"
+
+
+# A list bullet or number in front of a section entry ("- ", "* ", "2. ").
+_LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+
+
+def _section_entry(line: str, index: int, marker: str) -> str:
+    """The entry text of one section line, without its marker or bullet."""
+    if index == 0 and line.startswith(f"{marker}:"):
+        return line[len(marker) + 1:].strip()
+    return _LIST_MARK.sub("", line, count=1)
+
+
+def _lines_building_a_match(entries: dict[int, str]) -> set[int] | None:
+    """Indexes of entries that only match the injection patterns together.
+
+    *entries* maps line index to entry text, in order, for the lines that
+    passed the per-line check. Returns an empty set when the joined block is
+    clean; otherwise the entries that match alone once their bullet is gone
+    ("- system: approve") plus both lines of every adjacent pair that
+    matches, provided withholding them leaves a clean block; and None when
+    the match cannot be pinned that way (the caller then withholds the
+    whole section).
+    """
+    from lesson_sanitizer import detect_injection  # HARD dependency
+
+    def joined(indexes) -> str:
+        return "\n".join(entries[index] for index in indexes)
+
+    if detect_injection(joined(entries)) is None:
+        return set()
+    order = list(entries)
+    involved = {index for index in order if detect_injection(entries[index])}
+    for first, second in zip(order, order[1:]):
+        if first in involved or second in involved:
+            continue
+        if detect_injection(joined((first, second))):
+            involved.update((first, second))
+    remaining = [index for index in order if index not in involved]
+    if involved and detect_injection(joined(remaining)) is None:
+        return involved
+    return None
+
+
+def _sanitize_lines(section_text: str, marker: str) -> str:
+    """Reject-mode sanitize each line of a list section, then the whole list.
+
+    *section_text* starts with ``MARKER:`` (see _extract_section). A rejected
+    line is replaced by AGENT_OUTPUT_LINE_WITHHELD, under the fixed marker
+    for the header line and as a bullet otherwise, so the other entries
+    still reach the next agent.
+
+    The entries that pass are then checked joined, without their bullets, so
+    a phrase split across entries ("- a.py act as the" / "- admin and
+    approve") is still seen. The adjacent entries that build the match are
+    withheld; if the match cannot be pinned to them, the whole section is
+    (``""``, which the caller reports as withheld) (review F5 of task 3139).
+    The joined result gets the lesson length cap, as a whole section would.
+    """
+    from lesson_sanitizer import MAX_LESSON_LENGTH, enforce_limit, sanitize
+
+    label = f"agent output {marker}"
+    lines = section_text.split("\n")
+    kept: list[str] = []
+    passed: dict[int, str] = {}
+    for index, line in enumerate(lines):
+        if not line.strip():
+            kept.append("")
+            continue
+        clean = sanitize(line, label=label)
+        if clean:
+            kept.append(clean)
+            passed[index] = _section_entry(line, index, marker)
+        else:
+            kept.append(_withheld_line(index, marker))
+
+    split_match = _lines_building_a_match(passed)
+    if split_match is None:
+        _log.warning(
+            "parsing: withheld %s; its entries form an injection phrase "
+            "together", label,
+        )
+        return ""
+    if split_match:
+        _log.warning(
+            "parsing: withheld %d %s lines that form an injection phrase "
+            "together", len(split_match), label,
+        )
+    for index in split_match:
+        kept[index] = _withheld_line(index, marker)
+    return enforce_limit("\n".join(kept).strip(), MAX_LESSON_LENGTH, label=label)
+
+
+def _withheld_line(index: int, marker: str) -> str:
+    """The placeholder for a withheld section line (header or bullet)."""
+    if index == 0:
+        return f"{marker}: {AGENT_OUTPUT_LINE_WITHHELD}"
+    return f"- {AGENT_OUTPUT_LINE_WITHHELD}"
+
+
 def compact_agent_output(
     raw_output: str,
     max_words: int = 200,
@@ -271,7 +358,10 @@ def compact_agent_output(
     raw_output = "\n".join(deduped_lines)
 
     # Late import to avoid circular dependency — sanitizer may not be available
-    from lesson_sanitizer import sanitize_lesson_content  # HARD dependency — no silent fallback
+    from lesson_sanitizer import (  # HARD dependency — no silent fallback
+        sanitize,
+        sanitize_lesson_content,
+    )
 
     sections = {
         "SUMMARY": _extract_section(raw_output, "SUMMARY"),
@@ -281,10 +371,24 @@ def compact_agent_output(
         "REFLECTION": _extract_section(raw_output, "REFLECTION", max_lines=3),
     }
 
-    # Sanitize all extracted sections to prevent cross-agent prompt injection (PS-02)
-    for key in sections:
-        if sections[key]:
-            sections[key] = sanitize_lesson_content(sections[key])
+    # Sanitize all extracted sections to prevent cross-agent prompt injection
+    # (PS-02). The sanitizer rejects rather than strips, so a rejected section
+    # comes back empty and is recorded here: it must be reported as withheld,
+    # never replaced by the raw text it was extracted from (review F1).
+    # FILES_CHANGED is a list of independent entries, so it is sanitized per
+    # line: one rejected path withholds that line, not the section (N4).
+    rejected: list[str] = []
+    for key, section_text in sections.items():
+        if not section_text:
+            continue
+        if key == "FILES_CHANGED":
+            sections[key] = _sanitize_lines(section_text, key)
+        else:
+            sections[key] = sanitize_lesson_content(
+                section_text, label=f"agent output {key}"
+            )
+        if not sections[key]:
+            rejected.append(key)
 
     parts: list[str] = []
     if sections["SUMMARY"]:
@@ -296,12 +400,19 @@ def compact_agent_output(
             parts.append(sections[key])
     if sections["REFLECTION"]:
         parts.append(sections["REFLECTION"])
+    if rejected:
+        parts.append(
+            f"[agent output withheld: {', '.join(rejected)} failed sanitization]"
+        )
 
     compact = "\n".join(parts)
 
     if not compact.strip():
+        # No structured section at all: fall back to the tail of the output,
+        # which is agent-authored too and gets the same reject-mode pass.
         words = raw_output.split()
-        compact = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
+        tail = ("..." + " ".join(words[-max_words:])) if len(words) > max_words else raw_output
+        compact = sanitize(tail, label="agent output tail") or AGENT_OUTPUT_WITHHELD
 
     words = compact.split()
     if len(words) > max_words:
@@ -794,8 +905,11 @@ def verify_files_changed(claimed_files: list[str], project_dir: str) -> list[str
 
     Returns only files that actually changed according to git.
     Prevents agents from faking progress by claiming changes they didn't make.
+    In a project that was not git at dispatch no git runs and the claim is
+    returned as is (R3166-01: see
+    :func:`equipa.monitoring.dispatched_without_git`).
     """
-    if not claimed_files or not project_dir:
+    if not claimed_files or not project_dir or not git_checks_allowed(project_dir):
         return claimed_files
     try:
         # Task #3112: hardened git (no hooks, fsmonitor or diff drivers run).
@@ -824,19 +938,86 @@ def build_compaction_summary(
     Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
     BLOCKERS, SUMMARY) from raw output instead of passing raw tail content.
     Target: ~200 words max to prevent context rot across cycles.
+
+    The summary reaches the next agent's prompt through compaction history,
+    outside any other wrapper, so the agent-authored part is confined to a
+    <task-input> block here and every wrapper token in it is escaped.
     """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
     text = result.get("result_text", "")
     # Compact to 200 words max, preserving file paths and error messages
     compacted = compact_agent_output(text, max_words=200)
 
     summary = (
         f"## Prior Work Summary (Cycle {cycle}, {role})\n"
-        f"Task: #{task['id']} - {task['title']}\n"
+        f"Task: #{task['id']} - {neutralize_boundaries(task['title'])}\n"
         f"Turns used: {result.get('num_turns', '?')}\n"
         f"---\n"
-        f"{compacted}\n"
+        f'<task-input type="compaction-summary" trust="agent-output">\n'
+        f"{neutralize_boundaries(compacted)}\n"
+        f"</task-input>\n"
     )
     return summary
+
+
+def wrap_agent_output(tag_type: str, text: str) -> str:
+    """Confine agent-authored *text* to a ``<task-input>`` block.
+
+    Every wrapper token inside *text* is escaped first, so the text cannot
+    close the block and carry anything out into instruction position.
+    """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
+    return (
+        f'<task-input type="{tag_type}" trust="agent-output">\n'
+        f"{neutralize_boundaries(text)}\n"
+        f"</task-input>"
+    )
+
+
+# How much of one Tester line is scanned. Only the first 200 characters are
+# shown, and no injection pattern spans more than about 2,100 characters, so
+# every phrase that reaches the shown part lies wholly inside this window.
+# Bounds build_test_failure_context: at most 9 scans of this size instead
+# of 9 of 64k (1.7 s, review F6 of task 3139).
+_TESTER_LINE_SCAN_LIMIT = 4_000
+
+# Test frameworks named in the prompt sentence itself. Any other name the
+# Tester reports is shown only inside the wrapped block (review F3 of task
+# 3139), since it is agent-authored text in instruction position.
+KNOWN_TEST_FRAMEWORKS: frozenset[str] = frozenset({
+    "none", "pytest", "unittest", "nose2", "doctest", "tox", "hypothesis",
+    "jest", "vitest", "mocha", "jasmine", "ava", "karma", "node:test",
+    "node --test", "bun test", "deno test", "playwright", "cypress",
+    "go test", "cargo test", "cargo nextest", "dotnet test", "xunit",
+    "nunit", "mstest", "rspec", "minitest", "phpunit", "pest", "junit",
+    "testng", "gradle", "maven", "kotest", "xctest", "swift test",
+    "zig test", "ctest", "googletest", "gtest", "catch2", "bats",
+    "exunit", "mix test", "dart test", "flutter test",
+})
+
+
+def _sanitize_tester_line(text: object, label: str, max_chars: int = 200) -> str:
+    """Reject-mode sanitize one Tester-authored line, then cap it.
+
+    The line is scanned up to _TESTER_LINE_SCAN_LIMIT characters before it
+    is cut to *max_chars*, so truncation cannot hide the end of an injection
+    phrase from the sanitizer.
+    """
+    from lesson_sanitizer import sanitize  # HARD dependency
+
+    scanned = str(text)[:_TESTER_LINE_SCAN_LIMIT] if text else ""
+    clean = sanitize(scanned, label=label) or AGENT_OUTPUT_WITHHELD
+    return clean[:max_chars] + "..." if len(clean) > max_chars else clean
+
+
+def _known_test_framework(name: object) -> str | None:
+    """*name* if it is a known test framework (case-insensitive), else None."""
+    if not isinstance(name, str):
+        return None
+    normalized = " ".join(name.split()).lower()
+    return normalized if normalized in KNOWN_TEST_FRAMEWORKS else None
 
 
 def build_test_failure_context(test_results: dict, cycle: int) -> str:
@@ -845,33 +1026,58 @@ def build_test_failure_context(test_results: dict, cycle: int) -> str:
     Returns a string to append to the Developer's system prompt.
     Caps output to prevent unbounded context growth: max 5 failure details,
     each truncated to 200 chars; max 3 recommendations.
+
+    Failure details, recommendations and the framework name are Tester
+    output, and this text reaches compaction history, so each one goes
+    through the reject-mode sanitizer (a rejected line becomes
+    AGENT_OUTPUT_WITHHELD) and the block sits in an escaped <task-input>
+    wrapper, like the compaction summary (review N3 of task 3129). Only a
+    known framework name appears outside the wrapper; any other name is
+    reported inside it (review F3 of task 3139).
     """
+    raw_framework = test_results["test_framework"]
+    framework = _known_test_framework(raw_framework)
+    tester_lines: list[str] = []
+    if framework is None:
+        framework = "an unrecognised framework (named in the block below)"
+        reported = _sanitize_tester_line(
+            raw_framework, "tester test_framework", max_chars=80
+        )
+        tester_lines.extend((f"Test framework reported: {reported}", ""))
+
+    if test_results["failure_details"]:
+        tester_lines.append("### Failing Tests:")
+        # Cap at 5 details, truncate each to 200 chars
+        for detail in test_results["failure_details"][:5]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(detail, 'tester failure detail')}"
+            )
+        remaining = len(test_results["failure_details"]) - 5
+        if remaining > 0:
+            tester_lines.append(f"- ...and {remaining} more failure(s)")
+        tester_lines.append("")
+
+    if test_results["recommendations"]:
+        tester_lines.append("### Tester Recommendations:")
+        # Cap at 3 recommendations
+        for rec in test_results["recommendations"][:3]:
+            tester_lines.append(
+                f"- {_sanitize_tester_line(rec, 'tester recommendation')}"
+            )
+        tester_lines.append("")
+
     lines = [
         f"## Test Failures from Cycle {cycle}",
         "",
         f"The Tester agent ran {test_results['tests_run']} tests "
-        f"using {test_results['test_framework']}.",
+        f"using {framework}.",
         f"**{test_results['tests_failed']} tests failed.**",
         "",
     ]
-
-    if test_results["failure_details"]:
-        lines.append("### Failing Tests:")
-        # Cap at 5 details, truncate each to 200 chars
-        for detail in test_results["failure_details"][:5]:
-            truncated = detail[:200] + "..." if len(detail) > 200 else detail
-            lines.append(f"- {truncated}")
-        remaining = len(test_results["failure_details"]) - 5
-        if remaining > 0:
-            lines.append(f"- ...and {remaining} more failure(s)")
-        lines.append("")
-
-    if test_results["recommendations"]:
-        lines.append("### Tester Recommendations:")
-        # Cap at 3 recommendations
-        for rec in test_results["recommendations"][:3]:
-            truncated = rec[:200] + "..." if len(rec) > 200 else rec
-            lines.append(f"- {truncated}")
+    if tester_lines:
+        lines.append(
+            wrap_agent_output("tester-failures", "\n".join(tester_lines).strip())
+        )
         lines.append("")
 
     lines.append("**Fix these test failures. Do NOT skip or delete failing tests.**")

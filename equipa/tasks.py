@@ -13,6 +13,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from equipa.config import translate_local_path
 from equipa.constants import (
     COMPLEXITY_MULTIPLIERS,
     PRIORITY_ORDER,
@@ -323,10 +324,10 @@ def resolve_project_dir(task: dict) -> str | None:
                     (project_id,)
                 ).fetchone()
             if row and row["local_path"]:
-                db_path = row["local_path"].rstrip("/").rstrip("\\")
-                # Translate Windows paths to Samba mount
-                if db_path.startswith(("Z:\\AI_Stuff", "Z:/AI_Stuff")):
-                    db_path = "/srv/forge-share/AI_Stuff" + db_path[len("Z:\\AI_Stuff"):].replace("\\", "/")
+                # Map the dispatch config's ``path_translations`` prefixes
+                # (for example a Windows share to its mount here).
+                db_path = translate_local_path(
+                    row["local_path"].rstrip("/").rstrip("\\"))
                 if Path(db_path).exists():
                     return db_path
         except Exception as e:

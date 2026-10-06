@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/license-Apache%202.0-orange" alt="Apache 2.0">
-  <img src="https://img.shields.io/badge/tests-3371-success" alt="3371 Tests">
+  <img src="https://img.shields.io/badge/tests-14163-success" alt="14163 Tests">
 </p>
 
 ---
@@ -149,14 +149,14 @@ Per-task budgets scale by complexity (simple/medium/complex/epic). Agents that w
 Detects your project language (Python, TypeScript, Go, C#, Java, Rust, JavaScript) and injects language-specific best practices. Agents write idiomatic code for your stack.
 
 ### Zero Dependencies
-Pure Python standard library. No pip install, no virtualenv, no supply chain risk. Copy the folder, run the script. Works on any machine with Python 3.10+.
+Pure Python standard library. No pip install, no virtualenv, no supply chain risk. Copy the folder, run the script. Works on any machine with Python 3.10+. The security review gate fully parses reviews that contain non-ASCII text only on Python 3.10 and 3.12 (Unicode 13.0 and 15.0); on other versions it fails closed and blocks those reviews, so use 3.10 or 3.12 for real work.
 
 ---
 
 ## Architecture
 
 ```
-equipa/                    # 52 modules (key files shown below)
+equipa/                    # 61 modules (key files shown below)
 |-- cli.py                 # Entry point and argument parsing
 |-- dispatch.py            # Task scanning, scoring, parallel dispatch
 |-- loops.py               # Dev-test iteration loop
@@ -218,7 +218,7 @@ python forgesmith.py --auto
 
 ### Requirements
 
-- Python 3.10+ (no pip install needed)
+- Python 3.10+ (no pip install needed); 3.10 or 3.12 recommended, see the review-gate note above
 - Claude Code CLI (`claude`) or Ollama for local LLM
 - Git (for worktree isolation)
 

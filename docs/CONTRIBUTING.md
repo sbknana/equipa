@@ -75,7 +75,8 @@ The migrator auto-detects your schema version and applies whatever's needed. It 
 **Verify everything works:**
 
 ```bash
-python -m pytest tests/ -x
+pip install -r requirements-dev.txt
+timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
 ```
 
 There are 680+ tests. They should all pass. If they don't, open an issue — that's on us, not you.
@@ -139,8 +140,8 @@ A few things worth knowing before you dive in:
 ### Running Tests
 
 ```bash
-# Run everything
-python -m pytest tests/ -x
+# Run everything (in parallel, one test DB per worker; see CONTRIBUTING.md)
+timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
 
 # Run a specific test file
 python -m pytest tests/test_bash_security.py -v
@@ -175,7 +176,7 @@ python -m pytest tests/ -x -s
 
 ### Before You Submit
 
-1. Run the full test suite: `python -m pytest tests/ -x`
+1. Run the full test suite: `timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile`
 2. Make sure you haven't introduced any bare `except:` blocks
 3. If you added new functions to `equipa/`, check that `test_public_surface.py` still passes — we track the public API surface
 4. If you changed prompts, verify the skill integrity: the tests in `test_skill_integrity.py` check file hashes

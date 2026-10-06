@@ -8,8 +8,10 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 from equipa.agent_runner import (
@@ -25,10 +27,11 @@ from equipa.constants import (
     MAX_TASKS_PER_PLAN,
 )
 from equipa.db import get_db_connection, update_task_status
-from equipa.git_ops import _is_git_repo
+from equipa.git_ops import GitRepositoryUnreadableError, _is_git_repo
 from equipa.loops import run_dev_test_loop
 from equipa.merge_integrity import DefaultBranchGuard, MergeIntegrityError
 from equipa.merge_safety import report_leftover_dispatch_state, shutdown_requested
+from equipa.monitoring import dispatched_without_git
 from equipa.output import log
 from equipa.prompts import build_evaluator_prompt, build_planner_prompt
 from equipa.roles import get_role_turns
@@ -36,6 +39,218 @@ from equipa.single_agent_guard import TasksCreatedDb, validate_tasks_created_cla
 from equipa.tasks import _get_task_status, fetch_tasks_by_ids
 
 logger = logging.getLogger(__name__)
+
+# dispatch-07 (task #3119): the planner and evaluator run in the project's
+# MAIN checkout, where a commit lands straight on the default branch. They
+# only read the project and return the tasks they want in a TASKS_JSON
+# block (the manager inserts them, R3126-03, task #3132), so their built-in
+# tools are limited to this read-only allowlist (``--tools``): no Write,
+# Edit, NotebookEdit or Bash, hence nothing to commit with.
+GOAL_AGENT_READ_ONLY_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
+# Goal outcomes that mean the dispatch was refused rather than run to an
+# end: the default branch moved outside the gated merge or could not be
+# pinned, or a task was refused its isolation worktree. The CLI exits with
+# EXIT_DISPATCH_REFUSED for these (3112 review, task #3119). S3168-02 (task
+# #3173): so does a goal stopped because a repository appeared in a project
+# that was not git at dispatch (equipa.dispatch.REPOSITORY_APPEARED_OUTCOME,
+# spelled out here: equipa.dispatch imports this module).
+GOAL_REFUSED_OUTCOMES: frozenset[str] = frozenset({
+    "merge_integrity_failed",
+    "worktree_refused",
+    "repository_appeared",
+})
+
+
+# R3126-03 / IND-04 (task #3132): the MCP server set the goal agents get.
+# TheForge's ``write_query`` runs arbitrary SQL on the orchestrator's DB
+# (resolving security_finding decisions, flipping task status), so the
+# planner and evaluator get no MCP server at all. They return the tasks they
+# want in a ``TASKS_JSON`` block and the manager inserts them itself.
+GOAL_AGENT_MCP_CONFIG = '{"mcpServers": {}}'
+
+
+def _without_mcp_servers(cmd: list[str]) -> list[str]:
+    """``cmd`` with every ``--mcp-config`` value replaced by the empty set.
+
+    ``--mcp-config`` takes several values (files or JSON strings) up to the
+    next option, and ``--mcp-config=<value>`` is accepted too.
+    """
+    result: list[str] = []
+    index = 0
+    while index < len(cmd):
+        token = cmd[index]
+        if token.startswith("--mcp-config="):
+            result.append(f"--mcp-config={GOAL_AGENT_MCP_CONFIG}")
+            index += 1
+            continue
+        result.append(token)
+        index += 1
+        if token == "--mcp-config":
+            result.append(GOAL_AGENT_MCP_CONFIG)
+            while index < len(cmd) and not cmd[index].startswith("-"):
+                index += 1
+    return result
+
+
+def restrict_to_read_only_tools(cmd: list[str]) -> list[str]:
+    """``cmd`` with the agent's built-in tools limited to the read-only set.
+
+    ``--tools`` is an allowlist of built-in tools, so a tool added to the
+    CLI later is excluded too.
+
+    ``--tools`` does not cover MCP servers. ``--strict-mcp-config`` keeps
+    only the servers EQUIPA passes with ``--mcp-config``, so no user- or
+    project-scope server (one that writes files, for example) reaches the
+    read-only agents (R3119-03, task #3126), and EQUIPA passes none, so
+    TheForge's DB write tools do not reach them either (R3126-03, task
+    #3132).
+    """
+    if "--tools" in cmd:
+        raise ValueError("agent command already selects its tools (--tools)")
+    restricted = _without_mcp_servers(cmd)
+    strict_mcp = [] if "--strict-mcp-config" in cmd else ["--strict-mcp-config"]
+    return [*restricted, *strict_mcp, "--tools", ",".join(GOAL_AGENT_READ_ONLY_TOOLS)]
+
+
+def _read_only_notice(project_dir: str) -> str:
+    """Tell a goal agent up front that it cannot change the checkout."""
+    return (
+        f"Project dir: {project_dir}. You are read-only: your only tools are "
+        f"{', '.join(GOAL_AGENT_READ_ONLY_TOOLS)}, and you have no database "
+        f"access. Do not try to edit files, run commands or commit; return "
+        f"any task you want created in a {TASKS_JSON_MARKER} block."
+    )
+
+
+# --- Tasks proposed by the goal agents (R3126-03, task #3132) ----------------
+
+TASKS_JSON_MARKER = "TASKS_JSON:"
+PLANNED_TASK_PRIORITIES: tuple[str, ...] = ("critical", "high", "medium", "low")
+MAX_PLANNED_TASK_TITLE_CHARS = 200
+MAX_PLANNED_TASK_DESCRIPTION_CHARS = 8000
+
+
+class PlannedTasksError(ValueError):
+    """A ``TASKS_JSON`` block that cannot be turned into tasks."""
+
+
+@dataclass(frozen=True)
+class PlannedTask:
+    """One task a goal agent asked the manager to create."""
+
+    title: str
+    description: str
+    priority: str
+
+
+def _planned_task(index: int, entry: object) -> PlannedTask:
+    """Validate one ``TASKS_JSON`` entry."""
+    if not isinstance(entry, dict):
+        raise PlannedTasksError(f"entry {index} is not an object")
+    title = entry.get("title")
+    description = entry.get("description", "")
+    priority = entry.get("priority", "medium")
+    if not isinstance(title, str) or not title.strip():
+        raise PlannedTasksError(f"entry {index} has no title")
+    if len(title) > MAX_PLANNED_TASK_TITLE_CHARS:
+        raise PlannedTasksError(
+            f"entry {index} title is longer than {MAX_PLANNED_TASK_TITLE_CHARS} chars"
+        )
+    if not isinstance(description, str):
+        raise PlannedTasksError(f"entry {index} description is not text")
+    if len(description) > MAX_PLANNED_TASK_DESCRIPTION_CHARS:
+        raise PlannedTasksError(
+            f"entry {index} description is longer than "
+            f"{MAX_PLANNED_TASK_DESCRIPTION_CHARS} chars"
+        )
+    if priority not in PLANNED_TASK_PRIORITIES:
+        raise PlannedTasksError(
+            f"entry {index} priority {priority!r} is not one of "
+            f"{', '.join(PLANNED_TASK_PRIORITIES)}"
+        )
+    return PlannedTask(title.strip(), description.strip(), priority)
+
+
+def parse_tasks_json(result_text: str) -> list[PlannedTask]:
+    """Tasks from the last ``TASKS_JSON:`` block of an agent's output.
+
+    The marker is followed by a JSON array of objects with ``title``,
+    ``description`` and ``priority`` (optionally inside a ```` ``` ```` fence).
+    Returns an empty list when there is no block; raises
+    :class:`PlannedTasksError` when the block is malformed, so a garbled
+    plan creates nothing rather than part of itself.
+    """
+    if not result_text:
+        return []
+    position = result_text.rfind(TASKS_JSON_MARKER)
+    if position < 0:
+        return []
+    remainder = result_text[position + len(TASKS_JSON_MARKER):].lstrip()
+    if remainder.startswith("```"):
+        remainder = remainder.split("\n", 1)[1] if "\n" in remainder else ""
+    try:
+        entries, _end = json.JSONDecoder().raw_decode(remainder.lstrip())
+    except ValueError as exc:
+        raise PlannedTasksError(f"{TASKS_JSON_MARKER} is not valid JSON: {exc}") from exc
+    if not isinstance(entries, list):
+        raise PlannedTasksError(f"{TASKS_JSON_MARKER} is not a JSON array")
+    return [_planned_task(index, entry) for index, entry in enumerate(entries)]
+
+
+def insert_planned_tasks(project_id: int, tasks: list[PlannedTask]) -> list[int]:
+    """Create ``tasks`` in ``project_id`` in one transaction; their new ids.
+
+    The orchestrator, not the agent, writes the rows: the project, status and
+    creation time are fixed here, whatever the agent asked for.
+    """
+    if not tasks:
+        return []
+    conn = get_db_connection(write=True)
+    try:
+        with conn:
+            return [
+                conn.execute(
+                    "INSERT INTO tasks (project_id, title, description, status, "
+                    "priority, created_at) "
+                    "VALUES (?, ?, ?, 'todo', ?, datetime('now'))",
+                    (project_id, task.title, task.description, task.priority),
+                ).lastrowid
+                for task in tasks
+            ]
+    finally:
+        conn.close()
+
+
+def _create_proposed_tasks(
+    role: str,
+    result_text: str,
+    project_id: int,
+    limit: int,
+    output: Any,
+) -> list[int] | None:
+    """Insert the tasks of a ``TASKS_JSON`` block; None when there is none.
+
+    A malformed block or a failed insert creates nothing and returns ``[]``.
+    """
+    try:
+        planned = parse_tasks_json(result_text)
+    except PlannedTasksError as exc:
+        log(f"  [{role}] REJECTED {TASKS_JSON_MARKER} block: {exc}. "
+            f"No task created.", output)
+        return []
+    if not planned:
+        return None
+    if len(planned) > limit:
+        log(f"  [{role}] Proposed {len(planned)} tasks (max {limit}). "
+            f"Creating the first {limit}.", output)
+        planned = planned[:limit]
+    try:
+        return insert_planned_tasks(project_id, planned)
+    except (sqlite3.Error, OSError) as exc:
+        logger.exception("[%s] could not create the proposed tasks", role)
+        log(f"  [{role}] Could not create the proposed tasks: {exc}", output)
+        return []
 
 
 def parse_planner_output(result_text: str) -> list[int]:
@@ -157,11 +372,12 @@ async def run_planner_agent(
         get_role_turns("planner", args),
         args.model,
         role="planner",
-        prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
+        prompt_message=f"Break this goal into tasks. {_read_only_notice(project_dir)}",
     ) as cmd:
-        log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars, "
+            f"read-only tools)...", output)
         run_started_at = _run_started_at_utc()
-        result = await run_agent(cmd)
+        result = await run_agent(restrict_to_read_only_tools(cmd))
 
     if is_overloaded_result(result):
         log("  [Planner] Agent FAILED: model overloaded (529) through every "
@@ -171,6 +387,18 @@ async def run_planner_agent(
         log(f"  [Planner] Agent failed: {result.get('errors', [])}", output)
         return result, []
 
+    created = _create_proposed_tasks(
+        "Planner", result.get("result_text", ""), project_id,
+        MAX_TASKS_PER_PLAN, output,
+    )
+    if created is not None:
+        if created:
+            log(f"  [Planner] Created {len(created)} tasks: {created}", output)
+        return result, created
+
+    # Legacy TASKS_CREATED claim: the planner has no DB write tool any more,
+    # so only ids something else created in this project during the run can
+    # pass the validation below.
     task_ids = parse_planner_output(result.get("result_text", ""))
 
     if len(task_ids) > MAX_TASKS_PER_PLAN:
@@ -220,11 +448,12 @@ async def run_evaluator_agent(
         args.model,
         role="evaluator",
         prompt_message=(
-            f"Evaluate whether this goal is complete. Project dir: {project_dir}"
+            f"Evaluate whether this goal is complete. {_read_only_notice(project_dir)}"
         ),
     ) as cmd:
-        log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
-        result = await run_agent(cmd)
+        log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars, "
+            f"read-only tools)...", output)
+        result = await run_agent(restrict_to_read_only_tools(cmd))
 
     if is_overloaded_result(result):
         # Never parse an overloaded run: it did no evaluation (#2994 S1).
@@ -239,6 +468,12 @@ async def run_evaluator_agent(
                         "evaluation": "Evaluator agent failed", "blockers": "Agent error"}
 
     parsed = parse_evaluator_output(result.get("result_text", ""))
+    created = _create_proposed_tasks(
+        "Evaluator", result.get("result_text", ""), project_id,
+        MAX_FOLLOWUP_TASKS, output,
+    )
+    if created is not None:
+        parsed["tasks_created"] = created
 
     if len(parsed["tasks_created"]) > MAX_FOLLOWUP_TASKS:
         log(f"  [Evaluator] Created {len(parsed['tasks_created'])} follow-up tasks "
@@ -263,8 +498,51 @@ async def run_manager_loop(
 ) -> tuple[str, int, list[dict], list[dict], float, float]:
     """Run the full Manager loop: Plan -> Execute -> Evaluate -> Repeat.
 
+    S3168-02 (task #3173): a project that is not git at dispatch runs the
+    whole goal (planner, tasks and evaluator) under
+    :func:`equipa.monitoring.dispatched_without_git`, as the retry loops
+    do, so no change check runs git in a repository an agent makes there.
+    Before and after each task the N1 check looks for such a repository;
+    one found blocks the task and stops the goal with outcome
+    ``repository_appeared`` (in ``GOAL_REFUSED_OUTCOMES``).
+
     Returns (outcome, total_rounds, all_completed, all_blocked, total_cost, total_duration).
     """
+    # Imported here: equipa.dispatch imports this module.
+    from equipa.dispatch import refuse_agent_made_repository
+
+    try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
+        is_git_project = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        log(f"\n  [Manager] {exc} Not running the goal.", output)
+        return "merge_integrity_failed", 0, [], [], 0.0, 0.0
+    if is_git_project:
+        return await _run_goal_rounds(
+            goal, project_id, project_dir, project_context, args, output,
+            is_git_project=True,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_goal_rounds(
+            goal, project_id, project_dir, project_context, args, output,
+            is_git_project=False,
+        )
+
+
+async def _run_goal_rounds(
+    goal: str,
+    project_id: int,
+    project_dir: str,
+    project_context: dict[str, Any],
+    args: Any,
+    output: Any,
+    *,
+    is_git_project: bool,
+) -> tuple[str, int, list[dict], list[dict], float, float]:
+    """The rounds of :func:`run_manager_loop`, once the project is known to
+    be git (``is_git_project``) or not."""
     max_rounds = args.max_rounds
     cost_limit = getattr(args, "manager_cost_limit", None)
     if cost_limit is None:
@@ -277,11 +555,12 @@ async def run_manager_loop(
     # dispatch-07 (task #3112): in a git project each task runs in its own
     # worktree and reaches the default branch only through the gated merge
     # (equipa.dispatch.run_task_in_isolation). The planner and evaluator
-    # still run in the project checkout, so the goal's guard is verified
-    # after each of them: if either moved the default branch, the goal stops
-    # and nothing further is merged.
+    # run in the project checkout with read-only tools (task #3119), and the
+    # goal's guard is still verified after each of them: if the default
+    # branch moved anyway, the goal stops, nothing further is merged and the
+    # CLI exits non-zero (GOAL_REFUSED_OUTCOMES).
     goal_guard: DefaultBranchGuard | None = None
-    if _is_git_repo(project_dir):
+    if is_git_project:
         # Imported here: equipa.dispatch imports this module.
         from equipa.dispatch import run_task_in_isolation
 
@@ -376,16 +655,61 @@ async def run_manager_loop(
                 update_task_status(
                     task["id"], outcome, output=output, merged_sha=isolated.merged_sha,
                 )
+                if isolated.agent_outcome is None or goal_guard.tripped:
+                    # Refused before any agent ran (stale branch, leftover
+                    # worktree), or the default branch moved outside the
+                    # gated merge: the operator has to look, so the goal
+                    # stops here instead of paying for more agents.
+                    goal_outcome = (
+                        "merge_integrity_failed" if goal_guard.tripped else outcome
+                    )
+                    log(f"\n  [Manager] Task #{task['id']} {outcome}: "
+                        f"{isolated.reason or goal_guard.alert}. Stopping the goal.",
+                        output)
+                    all_completed.extend(round_completed)
+                    all_blocked.extend([*round_blocked, task])
+                    return (
+                        goal_outcome, round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
             else:
-                # Not a git repo: there are no branches to protect.
-                result, cycles, outcome = await run_dev_test_loop(
-                    task, project_dir, project_context, args, output=output,
+                # Not a git repo: there are no branches to protect. S3168-02
+                # (task #3173): the goal runs under the non-git record (see
+                # run_manager_loop), and N1 stops it on a repository found
+                # before or after the task: the planner's or an earlier
+                # task's, or this task's own.
+                from equipa.dispatch import (
+                    REPOSITORY_APPEARED_OUTCOME,
+                    _repository_appeared_in_non_git_project,
                 )
-                total_duration += result.get("duration", 0)
-                if result.get("cost"):
-                    total_cost += result["cost"]
+
+                if _repository_appeared_in_non_git_project(
+                    task["id"], project_dir, "before the task", output,
+                ):
+                    outcome = REPOSITORY_APPEARED_OUTCOME
+                else:
+                    result, cycles, outcome = await run_dev_test_loop(
+                        task, project_dir, project_context, args, output=output,
+                    )
+                    total_duration += result.get("duration", 0)
+                    if result.get("cost"):
+                        total_cost += result["cost"]
+                    if _repository_appeared_in_non_git_project(
+                        task["id"], project_dir, f"after the task ({outcome})", output,
+                    ):
+                        outcome = REPOSITORY_APPEARED_OUTCOME
 
                 update_task_status(task["id"], outcome, output=output)
+                if outcome == REPOSITORY_APPEARED_OUTCOME:
+                    log(f"\n  [Manager] Task #{task['id']} {outcome}: a git repository "
+                        f"appeared in a project that was not git at dispatch. "
+                        f"Stopping the goal.", output)
+                    all_completed.extend(round_completed)
+                    all_blocked.extend([*round_blocked, task])
+                    return (
+                        outcome, round_num, all_completed, all_blocked,
+                        total_cost, total_duration,
+                    )
 
             if outcome in ("tests_passed", "no_tests"):
                 round_completed.append(task)

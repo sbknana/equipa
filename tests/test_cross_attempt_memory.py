@@ -302,7 +302,7 @@ class TestCleanupFailedAttempt:
         asyncio.run(cleanup_failed_attempt(
             task_id=42,
             project_dir=str(tmp_path),
-            reflections=reflections,
+            reflections=reflections, expect_repository=True,
         ))
 
         assert len(calls) == 1, (
@@ -363,7 +363,7 @@ class TestCleanupFailedAttempt:
         )
 
         asyncio.run(cleanup_failed_attempt(
-            task_id=7, project_dir=str(tmp_path), reflections=[]
+            task_id=7, project_dir=str(tmp_path), reflections=[], expect_repository=True
         ))
 
         assert calls == [], (

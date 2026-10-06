@@ -41,6 +41,7 @@ from equipa.agent_runner import (
 from equipa.checkpoints import load_checkpoint
 from equipa.db import log_gate_audit, record_agent_run, update_task_status
 from equipa.git_ops import (
+    GitRepositoryUnreadableError,
     GlobalConfigPinError,
     _is_git_repo,
     pin_global_git_config,
@@ -57,20 +58,25 @@ from equipa.merge_safety import (
 from equipa.config import is_security_review_enabled, set_active_dispatch_config
 from equipa.dispatch import (
     EXIT_DISPATCH_REFUSED,
+    REPOSITORY_APPEARED_OUTCOME,
     AttemptCleanupError,
     IsolatedTaskRun,
     _audit_task_abort,
     _build_dispatch_attempt_reflection,
     _gated_merge_task,
+    _repository_appeared_in_non_git_project,
     _require_task_branch,
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
+    collect_refusals,
+    escape_audit_detail,
     is_feature_enabled,
     load_dispatch_config,
     load_goals_file,
     outcome_after_merge,
     parse_task_ids,
+    refuse_agent_made_repository,
     refuse_dispatch,
     run_auto_dispatch,
     run_parallel_goals,
@@ -85,6 +91,11 @@ from equipa.security_gate import (
     record_reviewer_skipped_doc_only,
     reviewer_run_failure,
 )
+from equipa.isolation import (
+    describe_isolation_state,
+    isolation_requirement_refusal,
+    uid_pool_refusal,
+)
 from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
@@ -95,9 +106,13 @@ from equipa.loops import (
     run_quality_scoring,
     run_security_review,
 )
-from equipa.manager import run_manager_loop
+from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.mcp_server import run_server
-from equipa.monitoring import calculate_dynamic_budget
+from equipa.monitoring import (
+    calculate_dynamic_budget,
+    dispatched_without_git,
+    git_checks_allowed,
+)
 from equipa.output import (
     log,
     print_dev_test_summary,
@@ -205,7 +220,10 @@ def load_config() -> None:
         return
 
     if "theforge_db" in cfg:
-        _equipa_constants.THEFORGE_DB = Path(cfg["theforge_db"])
+        # Absolute once, here, as constants does for the environment value:
+        # a relative path keeps naming the database (and the refusal store
+        # beside it) after a later chdir (R3178-01, task #3180).
+        _equipa_constants.THEFORGE_DB = Path(os.path.abspath(cfg["theforge_db"]))
     if "project_dirs" in cfg:
         # Support PROJECT_BASE_DIR env var: if a project path starts with
         # $PROJECT_BASE_DIR/, resolve it against the env var value.
@@ -216,7 +234,13 @@ def load_config() -> None:
             if base_dir and v.startswith("$PROJECT_BASE_DIR/"):
                 v = v.replace("$PROJECT_BASE_DIR", base_dir, 1)
             resolved[k.lower()] = v
-        _equipa_constants.PROJECT_DIRS = resolved
+        # Updated in place, never rebound: equipa.dispatch, equipa.tasks,
+        # equipa.git_ops and equipa.output import this dict by name at
+        # startup, so a new object here left them all with the empty
+        # default and --auto-run / --parallel-goals resolved no project
+        # directory (3112 review, task #3119).
+        _equipa_constants.PROJECT_DIRS.clear()
+        _equipa_constants.PROJECT_DIRS.update(resolved)
     if "github_owner" in cfg:
         _equipa_constants.GITHUB_OWNER = cfg["github_owner"]
     if "mcp_config" in cfg:
@@ -362,13 +386,35 @@ async def _gated_post_merge(
     )
 
 
+def _is_git_project(project_dir: str) -> bool:
+    """:func:`_is_git_repo`, refusing the dispatch when git cannot read it.
+
+    R3119-02 (task #3126): a repository git cannot read is never run as a
+    non-git project (no worktree, no guard, no gate); the CLI exits with
+    ``EXIT_DISPATCH_REFUSED`` instead.
+
+    S3168-03 (task #3173): so is a project under a repository an N1 check
+    recorded, before any git runs there. A project this dispatch already
+    recorded as not git (:func:`dispatched_without_git`) stays not git: the
+    merge step after an N1 block then runs no git in the agent's repository
+    and is not refused, so the block is still recorded for the task.
+    """
+    if not git_checks_allowed(project_dir):
+        return False
+    try:
+        refuse_agent_made_repository(project_dir)
+        return _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        refuse_dispatch(str(exc))
+
+
 async def _snapshot_merge_guard(project_dir: str) -> DefaultBranchGuard | None:
     """Pin the default branch before the dev-test loop (dispatch-03).
 
     ``None`` when the project is not a git repo or its default branch cannot
     be pinned; the gated merge then refuses to mark the task done.
     """
-    if not _is_git_repo(project_dir):
+    if not _is_git_project(project_dir):
         return None
     try:
         guard = await DefaultBranchGuard.snapshot(project_dir)
@@ -1172,7 +1218,16 @@ async def run_mode_auto_run(args: argparse.Namespace) -> None:
             return
 
     # Dispatch
-    await run_auto_dispatch(work, dispatch_config, args)
+    _refuse_if_any_refused(await run_auto_dispatch(work, dispatch_config, args))
+
+
+def _refuse_if_any_refused(results: list) -> None:
+    """Exit with EXIT_DISPATCH_REFUSED when a project or goal was refused."""
+    refusals = collect_refusals(results)
+    if refusals:
+        refuse_dispatch(
+            f"{len(refusals)} refusal(s) in this run: " + "; ".join(refusals)
+        )
 
 
 async def run_mode_parallel_goals(args: argparse.Namespace) -> None:
@@ -1219,7 +1274,7 @@ async def run_mode_parallel_goals(args: argparse.Namespace) -> None:
             print("Aborted.")
             return
 
-    await run_parallel_goals(resolved_goals, defaults, args)
+    _refuse_if_any_refused(await run_parallel_goals(resolved_goals, defaults, args))
 
 
 async def run_mode_goal(args: argparse.Namespace) -> None:
@@ -1283,6 +1338,9 @@ async def run_mode_goal(args: argparse.Namespace) -> None:
     )
 
     print_manager_summary(args.goal, outcome, rounds, completed, blocked, cost, duration)
+    if outcome in GOAL_REFUSED_OUTCOMES:
+        # 3112 review (task #3119): a refused goal used to exit 0.
+        refuse_dispatch(f"goal stopped: {outcome}")
 
 
 async def run_mode_tasks(args: argparse.Namespace) -> None:
@@ -1497,7 +1555,27 @@ async def _run_dev_test_mode(
     attempt, and a failed attempt is reset to the commit it started from.
     A reset that fails (:class:`AttemptCleanupError`) stops the retries and
     leaves the task blocked with outcome ``attempt_cleanup_failed`` instead
-    of crashing with the task stuck in_progress."""
+    of crashing with the task stuck in_progress.
+
+    Without ``task_branch`` the project was not git at dispatch. R3166-01 /
+    N1 (task #3168): the attempts run under ``dispatched_without_git``, and
+    a repository found there before or after an attempt stops the task with
+    outcome ``REPOSITORY_APPEARED_OUTCOME``, as in
+    :func:`equipa.dispatch.run_dev_test_loop_with_autoresearch`."""
+    if task_branch is not None:
+        return await _run_dev_test_attempts(
+            task, project_dir, project_context, args, task_branch,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_dev_test_attempts(
+            task, project_dir, project_context, args, None,
+        )
+
+
+async def _run_dev_test_attempts(
+    task, project_dir, project_context, args, task_branch: str | None,
+):
+    """The retry loop of :func:`_run_dev_test_mode`."""
     # Dev+Tester iteration loop (Phase 2) with autoresearch retry
     print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
 
@@ -1521,6 +1599,11 @@ async def _run_dev_test_mode(
                 break
             if base_sha is None:
                 base_sha = head_sha
+        elif _repository_appeared_in_non_git_project(
+            task["id"], project_dir, f"before attempt {retry_count + 1}", None,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args,
@@ -1554,6 +1637,27 @@ async def _run_dev_test_mode(
             outcome = "circuit_breaker_blocked"
             break
 
+        # R3162-01 (task #3165): assert the branch AFTER every attempt too, as
+        # the dispatch loop has since task #3111. Without it a worktree the
+        # agent swapped during its attempt went straight to
+        # cleanup_failed_attempt, and a successful attempt's commits on
+        # another branch were treated as the task's result.
+        if task_branch is not None:
+            try:
+                await _require_task_branch(project_dir, task_branch)
+            except AttemptCleanupError as exc:
+                _audit_task_abort(
+                    task["id"], "worktree-branch-mismatch",
+                    f"after attempt {retry_count + 1} ({outcome}): {exc}", None,
+                )
+                outcome = "worktree_branch_mismatch"
+                break
+        elif _repository_appeared_in_non_git_project(
+            task["id"], project_dir, f"after attempt {retry_count + 1} ({outcome})", None,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
+
         # Success - break out
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
             break
@@ -1580,15 +1684,20 @@ async def _run_dev_test_mode(
         # 3107 review N1: a failed reset must not crash the run and leave the
         # task in_progress — stop retrying and record why (same as
         # equipa.dispatch.run_dev_test_loop_with_autoresearch).
+        # R3165-01 (task #3166): without a task branch the project was not
+        # git at dispatch, so no git step may run in it.
         try:
             await cleanup_failed_attempt(
                 task["id"], project_dir, attempt_reflections, base_sha=base_sha,
+                expect_repository=task_branch is not None,
             )
         except AttemptCleanupError as exc:
             _audit_task_abort(task["id"], "attempt-cleanup-failed", exc, None)
+            # R3166-04 (task #3168): escaped like the audit line just above,
+            # which raw control characters here could otherwise redraw.
             print(
                 f"  [Autoresearch] Task #{task['id']}: resetting the failed "
-                f"attempt failed ({' '.join(str(exc).split())}); no further "
+                f"attempt failed ({escape_audit_detail(exc)}); no further "
                 f"retries, task left blocked."
             )
             outcome = "attempt_cleanup_failed"
@@ -1757,7 +1866,7 @@ async def _run_security_review_and_gate(
         # artifact itself. ``review_blocks_merge`` / ``review_skipped_doc_
         # only`` above still drive the DB-status outcome demotion and the
         # operator log lines, but they NO LONGER steer the merge decision.
-        if guard is None and _is_git_repo(project_dir):
+        if guard is None and _is_git_project(project_dir):
             # MI-06 (task #3116): the default branch was not pinned before
             # the agents ran, so a fresh snapshot now would adopt whatever
             # they did as the baseline. Parallel mode merges nothing in this
@@ -1802,7 +1911,7 @@ async def _run_security_review_and_gate(
                 f"  [Task #{task['id']}] MERGE: skipped — security gate "
                 f"blocked merge of {merge_branch}."
             )
-        if merge_eligible and _is_git_repo(project_dir):
+        if merge_eligible and _is_git_project(project_dir):
             if guard is not None:
                 await guard.verify("end-of-run", task_id=task["id"])
             merge_outcome = (
@@ -1951,6 +2060,20 @@ async def _execute_single_agent(task, project_dir, project_context, args) -> _Si
     # Tag result with dynamic budget info for telemetry
     result["turns_allocated"] = role_turns_allocated
     result["turns_max"] = role_turns_max
+
+    # R3166-01 / N1 (task #3168): run_mode_task runs a project that was not
+    # git at dispatch under dispatched_without_git, so a repository there now
+    # is the agent's. The no-output guard below asks git for the changed
+    # files (single_agent_guard._git_diff_files falls back to `git status`,
+    # which runs the agent's clean filter in the orchestrator). The task
+    # stops here instead, blocked and audited, before any git runs there.
+    if not git_checks_allowed(project_dir) and _repository_appeared_in_non_git_project(
+        task["id"], project_dir, f"after the {args.role} agent", None,
+    ):
+        return _SingleAgentRun(
+            result=result, outcome=REPOSITORY_APPEARED_OUTCOME, attempts=attempts,
+            model=role_model, max_turns=role_turns_max,
+        )
 
     # Determine outcome. Sustained 529 is checked first so it is recorded as
     # the loud overloaded failure, never folded into a generic outcome.
@@ -2141,7 +2264,7 @@ async def run_mode_task(args: argparse.Namespace) -> None:
 
     # --- Execute ---
 
-    if _is_git_repo(project_dir):
+    if _is_git_project(project_dir):
         # dispatch-04/07 (task #3112): in a git project the agent works in a
         # forge-task-<id> worktree and its commits reach the default branch
         # only through the gated merge — never by committing in the project
@@ -2150,26 +2273,29 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         await _run_task_isolated(task, project_dir, project_context, args)
         return
 
-    # Not a git repo: there are no branches to protect or merge.
-    if args.dev_test:
-        # dispatch-03 (task #3111): pin the default branch before any agent
-        # runs; only the gated merge below may move it.
-        merge_guard = await _snapshot_merge_guard(project_dir)
-        result, cycles, outcome = await _run_dev_test_mode(
-            task, project_dir, project_context, args,
-        )
-        outcome = await _run_security_review_and_gate(
-            task, project_dir, project_context, args, outcome,
-            guard=merge_guard,
-        )
-        await _record_task_telemetry(
-            task, result, outcome, cycles, args,
-            merged_sha=_merged_sha_for(merge_guard, task["id"], outcome),
-        )
-    else:
-        await _run_single_agent_mode(
-            task, project_dir, project_context, args,
-        )
+    # Not a git repo: there are no branches to protect or merge. R3166-01
+    # (task #3168): no change check runs git in it for the rest of this
+    # dispatch, the security review and the single-agent mode included.
+    with dispatched_without_git(project_dir):
+        if args.dev_test:
+            # dispatch-03 (task #3111): pin the default branch before any agent
+            # runs; only the gated merge below may move it.
+            merge_guard = await _snapshot_merge_guard(project_dir)
+            result, cycles, outcome = await _run_dev_test_mode(
+                task, project_dir, project_context, args,
+            )
+            outcome = await _run_security_review_and_gate(
+                task, project_dir, project_context, args, outcome,
+                guard=merge_guard,
+            )
+            await _record_task_telemetry(
+                task, result, outcome, cycles, args,
+                merged_sha=_merged_sha_for(merge_guard, task["id"], outcome),
+            )
+        else:
+            await _run_single_agent_mode(
+                task, project_dir, project_context, args,
+            )
 
 
 # --- Mode Dispatcher ---
@@ -2228,6 +2354,17 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     return run_mode_task
 
 
+def warn_missing_dispatch_config(dispatch_config_arg: str | None) -> str | None:
+    """The warning for a ``--dispatch-config`` path that does not exist
+    (printed by async_main), or None. Such a run uses the defaults; agent
+    isolation stays as the host config and marker have it (review F1)."""
+    if dispatch_config_arg is None or Path(dispatch_config_arg).exists():
+        return None
+    return (f"WARNING: --dispatch-config '{dispatch_config_arg}' does not "
+            f"exist; using the defaults (agent isolation stays as the host "
+            f"config and marker have it).")
+
+
 async def async_main() -> None:
     """Main entry point — parses args, validates, then dispatches to a mode handler."""
     parser = _build_arg_parser()
@@ -2248,11 +2385,23 @@ async def async_main() -> None:
               f"Loop uses Developer + Tester automatically.")
 
     # Load dispatch config globally so model tiering and adaptive turns work in all modes
+    missing_config = warn_missing_dispatch_config(args.dispatch_config)
+    if missing_config:
+        print(missing_config)
     args.dispatch_config = load_dispatch_config(args.dispatch_config)
     # Auxiliary model resolution (reflexion, RLM, ForgeSmith helpers) must use
     # THIS config — the one role resolution uses — never a CWD-relative file
     # (task #2994 S2).
     set_active_dispatch_config(args.dispatch_config)
+    # Review F1 (task 3142): when the host requires agent isolation, a config
+    # that turns it off refuses the run instead of dispatching unisolated.
+    # Review F4: a UID pool would let isolated agents run side by side; it
+    # is not implemented, so a config that names one is refused.
+    isolation_refusal = (isolation_requirement_refusal(args.dispatch_config)
+                         or uid_pool_refusal(args.dispatch_config))
+    if isolation_refusal:
+        refuse_dispatch(isolation_refusal)
+    print(describe_isolation_state(args.dispatch_config))
 
     # --- Auth availability check (Max subscription OR API key) ---
     # Warn only when neither auth source is present. The Claude CLI accepts

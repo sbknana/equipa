@@ -17,16 +17,35 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
 
 from equipa.loops import (
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    _analyze_review_views,
     _count_findings_in_review_file,
+    backstop_reason,
+)
+from equipa.security_gate import normalize_review_text
+from tests.host_timing import assert_linear_time
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    as_reviewer_artifact,
+    blocked_by_the_gate_at,
+    gate_blocks,
+    production_seconds,
+    review_as_written,
+)
+from tests.review_gate_timing import timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
 )
 
 BODY = (
@@ -63,11 +82,66 @@ def _write(tmp_path: Path, markdown: str) -> Path:
 
 
 def _blocks_merge(path: Path) -> bool:
-    """Mirror dispatch._security_review_blocks_merge: untrusted or C+H > 0."""
-    counts = _count_findings_in_review_file(path)
-    if counts is None:
-        return True
-    return counts["CRITICAL"] + counts["HIGH"] > 0
+    """dispatch._security_review_blocks_merge itself (task 3167) on the
+    review at ``path``, written as this cycle's reviewer artifact: untrusted
+    or C+H > 0. Read as written, with no newline translation (R3167-02)."""
+    return gate_blocks(as_reviewer_artifact(review_as_written(path)))
+
+
+def _rules_counts(path: Path) -> dict[str, int] | None:
+    """The merge counts of the shape rules alone (no severity-token
+    backstop), or None when the rules do not trust the review."""
+    analysis = _analyze_review_views(
+        normalize_review_text(path.read_text(encoding="utf-8")))
+    return analysis.counts if analysis.trusted else None
+
+
+def _assert_backstop_blocks(path: Path) -> None:
+    """Task 3152: an UPPER-case CRITICAL or HIGH outside a counted heading's
+    label and the final strict footer (a prose finding, a second footer, a
+    recap bullet) blocks, whatever the counts. Each review below blocked the
+    merge before as well, by its CRITICAL or HIGH count. Task 3170
+    (IR67-02): the analysis is of the text the merge gate blocked."""
+    analysis = blocked_by_the_gate_at(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
+    assert _count_findings_in_review_file(path) is None
+    assert _blocks_merge(path)
+
+
+def _assert_medium_backstop_blocks(path: Path) -> None:
+    """Task 3161: an UPPER-case MEDIUM outside a counted heading's label and
+    the final strict footer blocks the same way (no MEDIUM exemption)."""
+    analysis = blocked_by_the_gate_at(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(
+        backstop_reason("MEDIUM") + " at line "), analysis
+    assert _count_findings_in_review_file(path) is None
+    assert _blocks_merge(path)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    _assert_backstop_blocks(_write(
+        tmp_path, BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + _footer()))
+
+
+def test_the_merge_helper_decides_on_the_bytes_as_written(
+    tmp_path: Path,
+) -> None:
+    """R3167-02: a fixture is decided on the text it wrote. Read with
+    newline translation, its CR line breaks became line feeds first."""
+    path = tmp_path / "SECURITY-REVIEW-3038.md"
+    path.write_bytes(b"# Security Review\r\n\r\n## Summary\rNo findings.\r\n")
+
+    assert review_as_written(path) == (
+        "# Security Review\r\n\r\n## Summary\rNo findings.\r\n")
+    assert path.read_text(encoding="utf-8") != review_as_written(path)
 
 
 # ---------- IR38-02: per-severity maximum across all footers ----------
@@ -85,7 +159,8 @@ def test_later_quoted_zero_footer_cannot_mask_earlier_real_footer(
     )
 
     assert _blocks_merge(path)
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_footer_maximum_is_per_severity(tmp_path: Path) -> None:
@@ -95,9 +170,8 @@ def test_footer_maximum_is_per_severity(tmp_path: Path) -> None:
         + "\nOlder tally:\n" + _footer(high=1, low=1),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(
-        critical=1, high=1, low=2,
-    )
+    assert _rules_counts(path) == _counts(critical=1, high=1, low=2)
+    _assert_backstop_blocks(path)
 
 
 def test_zero_then_real_footer_still_uses_the_real_one(tmp_path: Path) -> None:
@@ -108,7 +182,8 @@ def test_zero_then_real_footer_still_uses_the_real_one(tmp_path: Path) -> None:
         + "\nS1: HIGH SQL injection.\n" + _footer(high=1),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_larger_quoted_footer_disagreeing_with_headers_is_untrusted(
@@ -122,7 +197,7 @@ def test_larger_quoted_footer_disagreeing_with_headers_is_untrusted(
         + "Draft:\n" + _footer(high=2) + "\nFinal:\n" + _footer(high=1),
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
@@ -176,11 +251,11 @@ def test_resolved_candidate_adds_to_merge_counts(
     # omitted from the footer, but it is counted, never subtracted.
     path = _write(tmp_path, BODY + finding_line + "\n" + DETAIL + footer)
 
-    counts = _count_findings_in_review_file(path)
+    counts = _rules_counts(path)
 
     assert counts is not None
     assert counts["CRITICAL"] + counts["HIGH"] == 1
-    assert _blocks_merge(path)
+    _assert_backstop_blocks(path)
 
 
 def test_resolved_medium_candidate_is_counted_not_dropped(
@@ -192,7 +267,11 @@ def test_resolved_medium_candidate_is_counted_not_dropped(
         + DETAIL + _footer(),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(medium=1)
+    # The shape rules count it; its UPPER-case MEDIUM is no label of a
+    # counted "###" heading, so the backstop blocks (task 3161, as task 3152
+    # did for the CRITICAL and HIGH forms above).
+    assert _rules_counts(path) == _counts(medium=1)
+    _assert_medium_backstop_blocks(path)
 
 
 # ---------- IR38-05: tally / overall-risk headings are not findings ----------
@@ -216,6 +295,14 @@ def test_zero_tally_or_low_risk_heading_is_not_a_finding(
         + "\nFine.\n\n## Files\n- a.py\n- b.py\n" + _footer(),
     )
 
+    assert _rules_counts(path) == _counts()
+    if "CRITICAL" in heading or "HIGH" in heading:
+        # Task 3152: the UPPER-case zero tally merged under the 3143 tally
+        # exemption; CRITICAL and HIGH have none now, nor MEDIUM since task
+        # 3161. In lower case it merges.
+        _assert_backstop_blocks(path)
+        path = _write(tmp_path, path.read_text(encoding="utf-8").replace(
+            "0 CRITICAL / 0 HIGH / 0 MEDIUM", "0 critical / 0 high / 0 medium"))
     assert _analyze_review_file(path).verdict == REVIEW_VERDICT_OK
     assert _count_findings_in_review_file(path) == _counts()
 
@@ -255,24 +342,30 @@ def test_non_zero_tally_or_blocking_risk_heading_still_blocks(
 
 
 @pytest.mark.parametrize(
-    "adversarial_line",
+    "prefix, unit, count, suffix",
     [
-        "- **[S1] HIGH — " + "(" * 20_000 + "**",
-        "## [S1] HIGH — " + "[" * 20_000,
-        "#### [S1] CRITICAL — " + "(x" * 10_000,
+        ("- **[S1] HIGH — ", "(", 20_000, "**"),
+        ("## [S1] HIGH — ", "[", 20_000, ""),
+        ("#### [S1] CRITICAL — ", "(x", 10_000, ""),
     ],
     ids=["bold-parens", "l2-brackets", "l4-paren-x"],
 )
+@timing_test
 def test_long_candidate_title_parses_quickly_and_still_blocks(
-    tmp_path: Path, adversarial_line: str,
+    tmp_path: Path, prefix: str, unit: str, count: int, suffix: str,
 ) -> None:
-    path = _write(tmp_path, BODY + adversarial_line + "\n" + _footer())
+    """Budget host-calibrated, growth from a quarter of the run to the
+    whole run linear (task 3171)."""
+    def write(units: int) -> Path:
+        return _write(tmp_path, BODY + prefix + unit * units + suffix + "\n"
+                      + _footer())
 
-    started = time.perf_counter()
-    blocked = _blocks_merge(path)
-    elapsed = time.perf_counter() - started
+    blocked = _blocks_merge(write(count))
 
-    assert elapsed < 1.0, f"parse took {elapsed:.2f}s"
+    assert_linear_time(
+        lambda units: production_seconds(
+            as_reviewer_artifact(review_as_written(write(units)))),
+        count, 1.0, prefix + unit)
     assert blocked
 
 
@@ -285,4 +378,7 @@ def test_resolved_status_after_long_title_is_still_recognised(
         + _footer(),
     )
 
-    assert _count_findings_in_review_file(path) == _counts(medium=1)
+    # Counted as resolved by the shape rules; the recap's UPPER-case MEDIUM
+    # is no counted heading label, so it blocks (task 3161).
+    assert _rules_counts(path) == _counts(medium=1)
+    _assert_medium_backstop_blocks(path)

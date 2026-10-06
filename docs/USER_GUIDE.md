@@ -106,6 +106,7 @@ Controls agent behavior across all modes — model selection, turn limits, concu
     "skip_projects": [],
     "priority_boost": {},
     "only_projects": [],
+    "path_translations": [],
     "security_review": true,
     "model_tester": "haiku",
     "model_epic": "opus"
@@ -124,6 +125,7 @@ Controls agent behavior across all modes — model selection, turn limits, concu
 | `skip_projects` | [] | Project IDs/codenames to exclude from auto-run |
 | `priority_boost` | {} | Manual priority overrides: `{"myproject": 100}` |
 | `only_projects` | [] | Whitelist (empty = all projects) |
+| `path_translations` | [] | Prefixes mapping a project `local_path` recorded on another host to this one: `[{"from": "X:\\share", "to": "/srv/share"}]`. See [Project Paths Recorded on Another Host](DEPLOYMENT.md#project-paths-recorded-on-another-host) |
 | `security_review` | false | Auto-run security review after successful dev-test |
 | `security_review_tools` | "all" | Which ClaudeStick tools security reviewer can use |
 | `model_{role}` | — | Per-role model override (e.g. `model_tester: "haiku"`) |
@@ -140,7 +142,7 @@ MCP server configuration passed to each agent.
     "mcpServers": {
         "theforge": {
             "type": "stdio",
-            "command": "uvx",
+            "command": "/path/to/uvx",
             "args": [
                 "mcp-server-sqlite",
                 "--db-path",
@@ -150,6 +152,10 @@ MCP server configuration passed to each agent.
     }
 }
 ```
+
+The command and `--db-path` must be absolute paths; agents run in the project
+directory, and a relative entry refuses every dispatch (see "MCP server
+config" in `docs/ORCHESTRATOR.md` for the accepted launch forms).
 
 ---
 

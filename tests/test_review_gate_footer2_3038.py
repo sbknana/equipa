@@ -22,12 +22,46 @@ import pytest
 from equipa import db as equipa_db
 from equipa.dispatch import _security_review_blocks_merge
 from equipa.loops import (
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_INCOMPLETE,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    _analyze_review_views,
     _count_findings_in_review_file,
+    backstop_reason,
 )
+from equipa.security_gate import normalize_review_text
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate_at,
+)
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
+)
+
+
+def _rules_counts(path: Path) -> dict[str, int] | None:
+    """The merge counts of the shape rules alone (no severity-token
+    backstop), or None when the rules do not trust the review."""
+    analysis = _analyze_review_views(
+        normalize_review_text(path.read_text(encoding="utf-8")))
+    return analysis.counts if analysis.trusted else None
+
+
+def _assert_backstop_blocks(path: Path) -> None:
+    """Task 3152: an UPPER-case CRITICAL or HIGH outside a counted heading's
+    label and the final strict footer (a second footer, a recap bullet)
+    blocks whatever the counts; each review here blocked the merge before
+    as well, by its HIGH count. Task 3170 (IR67-02): decided through the
+    merge gate."""
+    analysis = blocked_by_the_gate_at(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), analysis
+    assert _count_findings_in_review_file(path) is None
 
 TASK_ID = 3038
 
@@ -138,11 +172,25 @@ def persisted_audit_events(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 
 @pytest.mark.parametrize("body", MUST_BLOCK.values(), ids=MUST_BLOCK.keys())
 def test_poc_case_blocks_merge(tmp_path: Path, body: str) -> None:
-    _write(tmp_path, body)
+    path = _write(tmp_path, body)
 
     blocked, _ = _security_review_blocks_merge(str(tmp_path), TASK_ID)
 
     assert blocked is True
+    # Task 3170 (IR67-02): also as a reviewer artifact provenance trusts, so
+    # the block is the parser's.
+    blocked_by_the_gate_at(path)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    _assert_backstop_blocks(_write(
+        tmp_path, BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + ZERO_FOOTER))
 
 
 @pytest.mark.parametrize(
@@ -165,7 +213,7 @@ def test_stale_footer_over_resolved_looking_live_heading_is_untrusted(
 ) -> None:
     path = _write(tmp_path, MUST_BLOCK[case])
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert _count_findings_in_review_file(path) is None
 
 
@@ -178,7 +226,7 @@ def test_finding_the_strict_regex_cannot_see_is_a_count_mismatch(
 ) -> None:
     path = _write(tmp_path, MUST_BLOCK[case])
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
@@ -187,7 +235,7 @@ def test_finding_the_strict_regex_cannot_see_is_a_count_mismatch(
 def test_unfilled_template_is_incomplete(tmp_path: Path) -> None:
     path = _write(tmp_path, TEMPLATE_SKELETON)
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "placeholder" in analysis.detail
@@ -196,7 +244,8 @@ def test_unfilled_template_is_incomplete(tmp_path: Path) -> None:
 def test_last_footer_wins_over_quoted_zero_footer(tmp_path: Path) -> None:
     path = _write(tmp_path, MUST_BLOCK["F-quoted-zero-footer-then-real-footer"])
 
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_last_unfenced_footer_wins(tmp_path: Path) -> None:
@@ -209,7 +258,10 @@ def test_last_unfenced_footer_wins(tmp_path: Path) -> None:
         + HIGH_FOOTER,
     )
 
-    assert _count_findings_in_review_file(path) == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    # Task 3152: the early footer's CRITICAL and HIGH labels are not the
+    # final footer's, so they are unaccounted.
+    _assert_backstop_blocks(path)
 
 
 def test_footer_followed_by_a_finding_is_incomplete(tmp_path: Path) -> None:
@@ -222,7 +274,7 @@ def test_footer_followed_by_a_finding_is_incomplete(tmp_path: Path) -> None:
         + "\n### [S1] MEDIUM — found later\nDetail.\n",
     )
 
-    analysis = _analyze_review_file(path)
+    analysis = blocked_by_the_gate_at(path)
 
     assert analysis.verdict == REVIEW_VERDICT_INCOMPLETE
     assert "final section" in analysis.detail
@@ -281,7 +333,8 @@ def test_uppercase_resolved_recap_bullet_is_not_a_live_candidate(
     # Task #3038 fix-forward (IR38-01): the recap is resolved, so the footer
     # may omit it, but like a resolved level-3 heading it is ADDED to the
     # merge counts, never dropped. HIGH=1 blocks the merge.
-    assert _count_findings_in_review_file(path) == _counts(high=1, low=1)
+    assert _rules_counts(path) == _counts(high=1, low=1)
+    _assert_backstop_blocks(path)
 
 
 def test_lowercase_fixed_wording_in_bullet_stays_live(tmp_path: Path) -> None:
@@ -297,7 +350,8 @@ def test_lowercase_fixed_wording_in_bullet_stays_live(tmp_path: Path) -> None:
     # and a resolved candidate is COUNTED, never dropped: HIGH=1 blocks.
     counts = _count_findings_in_review_file(path)
     assert counts is None or counts["HIGH"] >= 1
-    assert counts == _counts(high=1)
+    assert _rules_counts(path) == _counts(high=1)
+    _assert_backstop_blocks(path)
 
 
 def test_hyphenated_severity_word_is_not_a_candidate(tmp_path: Path) -> None:
@@ -320,4 +374,4 @@ def test_zero_finding_review_without_summary_or_statement_is_incomplete(
         "## Files Reviewed\n- a.py\n" + ZERO_FOOTER,
     )
 
-    assert _analyze_review_file(path).verdict == REVIEW_VERDICT_INCOMPLETE
+    assert blocked_by_the_gate_at(path).verdict == REVIEW_VERDICT_INCOMPLETE

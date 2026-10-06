@@ -189,12 +189,20 @@ def test_artifact_count_ignores_severity_words_in_prose(tmp_path):
     like '[S1] LOW — this is NOT a CRITICAL because…'.
     """
     review = tmp_path / "SECURITY-REVIEW-42.md"
-    review.write_text(
+    text = (
         "# Review\n\n"
         "### [S1] LOW — this is NOT a CRITICAL vulnerability\n"
         "The reviewer considered HIGH severity but downgraded after analysis.\n"
         "\n"
-        "### [S2] INFO — discussion of HIGH-impact edge cases\n",
+        "### [S2] INFO — discussion of HIGH-impact edge cases\n"
+    )
+    # Task 3143: UPPER-case severity words in prose label no finding, so the
+    # severity-token backstop holds the merge; the reviewer prompt has them
+    # written in lower case, and then only the finding headers count.
+    review.write_text(text, encoding="utf-8")
+    assert _security_review_blocks_merge(str(tmp_path), 42) == (True, None)
+    review.write_text(
+        text.replace("CRITICAL", "critical").replace("HIGH", "high"),
         encoding="utf-8",
     )
     blocks, counts = _security_review_blocks_merge(str(tmp_path), 42)
@@ -226,10 +234,15 @@ class _FakeMergeGuard:
     def __init__(self) -> None:
         self.outcomes: dict = {}
 
-    async def verify(self, stage, *, task_id=None) -> bool:
+    async def verify(self, stage, *, task_id=None, directories=()) -> bool:
+        # Same signature as DefaultBranchGuard.verify (task #3146 added the
+        # repository-identity ``directories``).
         return True
 
-    async def record_merge(self, task_id, merged_sha, *, post_head=None) -> bool:
+    async def record_merge(
+        self, task_id, merged_sha, *, post_head=None, regenerated_paths=(),
+        regenerated_blobs=None,
+    ) -> bool:
         return True
 
 
@@ -346,6 +359,22 @@ def _pretend_git_repo():
     stubbed alongside ``_is_git_repo``.
     """
     with patch("equipa.dispatch._is_git_repo", return_value=True), \
+            patch(
+                # Task #3119: the project is the root of its (pretend) repo,
+                # so agents run at the root of each fake worktree.
+                "equipa.dispatch.git_toplevel",
+                side_effect=lambda project_dir: Path(project_dir),
+            ), \
+            patch(
+                # Task #3126: the gated merge runs git at the work-tree root.
+                "equipa.dispatch.git_toplevel_async",
+                new=AsyncMock(side_effect=lambda project_dir: Path(project_dir)),
+            ), \
+            patch(
+                # Task #3132: the fake worktrees share the pretend repository.
+                "equipa.dispatch._common_dir_mismatch",
+                new=AsyncMock(return_value=None),
+            ), \
             patch(
                 "equipa.dispatch.DefaultBranchGuard.snapshot",
                 new=AsyncMock(side_effect=lambda *_a, **_k: _FakeMergeGuard()),

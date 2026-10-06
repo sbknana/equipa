@@ -19,8 +19,8 @@ Design notes
   seeded by hand and we must NOT touch it.
 * The scaffold source is resolved from (in order): an explicit
   ``EQUIPA_FORGESCAFFOLD_DIR`` environment variable, the
-  ``forgescaffold_dir`` key in ``forge_config.json``/``dispatch_config.json``,
-  and finally a hard-coded fallback under ``/srv/forge-share/AI_Stuff``.
+  ``forgescaffold_dir`` key in ``forge_config.json``/``dispatch_config.json``.
+  There is no built-in fallback: with neither set, auto-clone is refused.
 * Copy excludes ``node_modules``, ``.next``, build/dist artefacts, and any
   ``.git`` directory — the destination is meant to be a fresh repository
   rooted at the project directory.
@@ -37,6 +37,8 @@ import os
 import shutil
 from pathlib import Path
 from typing import Iterable
+
+from equipa.config import configured_path_translations
 
 logger = logging.getLogger(__name__)
 
@@ -74,18 +76,15 @@ def _is_placeholder_name(name: str) -> bool:
     """Return True if ``name`` matches a known placeholder filename."""
     return name.lower() in _PLACEHOLDER_FILENAMES_LOWER
 
-_FALLBACK_SCAFFOLD_DIR = Path("/srv/forge-share/AI_Stuff/ForgeScaffold")
-
 # Allowlisted roots inside which scaffold project directories may be created.
-# A ``projects.local_path`` value (after Windows -> POSIX translation) must
-# resolve to a path contained by one of these roots, otherwise the clone is
-# refused. This prevents a malicious or corrupted DB row of the form
-# ``Z:\AI_Stuff\..\..\etc\evil`` from coaxing ``mkdir(parents=True)`` into
-# materialising ``/etc/evil``. The list is intentionally short; override
-# only via the ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` env var (colon-separated).
-_DEFAULT_ALLOWED_ROOTS: tuple[Path, ...] = (
-    Path("/srv/forge-share/AI_Stuff"),
-)
+# A ``projects.local_path`` value (after the dispatch config's
+# ``path_translations``) must resolve to a path contained by one of these
+# roots, otherwise the clone is refused. This prevents a malicious or
+# corrupted DB row of the form ``X:\share\..\..\etc\evil`` from coaxing
+# ``mkdir(parents=True)`` into materialising ``/etc/evil``. The roots are the
+# ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` env var (colon-separated) when set,
+# otherwise the ``to`` prefixes of ``path_translations`` (the share mounts
+# DB paths are translated into). With neither, every clone is refused.
 
 
 class ScaffoldCloneError(RuntimeError):
@@ -103,7 +102,10 @@ def _allowed_roots() -> tuple[Path, ...]:
         )
         if parsed:
             return parsed
-    return tuple(root.resolve(strict=False) for root in _DEFAULT_ALLOWED_ROOTS)
+    return tuple(
+        Path(target).resolve(strict=False)
+        for _source, target in configured_path_translations()
+    )
 
 
 def assert_contained_path(candidate: str | Path) -> Path:
@@ -129,6 +131,12 @@ def assert_contained_path(candidate: str | Path) -> Path:
         )
     resolved = Path(raw).resolve(strict=False)
     roots = _allowed_roots()
+    if not roots:
+        raise ScaffoldCloneError(
+            f"Refusing scaffold clone of {resolved}: no allowlisted root is "
+            "configured (set EQUIPA_SCAFFOLD_ALLOWED_ROOTS or add "
+            "path_translations to the dispatch config)"
+        )
     for root in roots:
         try:
             resolved.relative_to(root)
@@ -141,13 +149,14 @@ def assert_contained_path(candidate: str | Path) -> Path:
     )
 
 
-def resolve_scaffold_source(config: dict | None = None) -> Path:
+def resolve_scaffold_source(config: dict | None = None) -> Path | None:
     """Resolve the path to the ForgeScaffold source tree.
 
     Resolution order:
       1. ``EQUIPA_FORGESCAFFOLD_DIR`` environment variable.
       2. ``forgescaffold_dir`` key in the active dispatch/forge config dict.
-      3. Hard-coded fallback under ``/srv/forge-share/AI_Stuff/ForgeScaffold``.
+
+    Returns None when neither names one (there is no built-in location).
     """
     env_path = os.environ.get("EQUIPA_FORGESCAFFOLD_DIR")
     if env_path:
@@ -156,7 +165,7 @@ def resolve_scaffold_source(config: dict | None = None) -> Path:
         cfg_path = config.get("forgescaffold_dir") if isinstance(config, dict) else None
         if cfg_path:
             return Path(cfg_path).expanduser()
-    return _FALLBACK_SCAFFOLD_DIR
+    return None
 
 
 def is_uninitialized(project_dir: str | Path) -> bool:
@@ -568,7 +577,7 @@ def ensure_scaffold(
             return False
 
     # Containment check BEFORE we touch the filesystem. A crafted
-    # ``local_path`` like ``/srv/forge-share/AI_Stuff/../../etc/evil`` would
+    # ``local_path`` like ``/srv/share/../../etc/evil`` would
     # otherwise reach ``dest.mkdir(parents=True, exist_ok=True)`` below and
     # silently create directories outside the share. ``assert_contained_path``
     # rejects ``..`` segments and verifies the resolved path lies inside an
@@ -576,6 +585,12 @@ def ensure_scaffold(
     dest = assert_contained_path(dest)
 
     source = resolve_scaffold_source(config)
+    if source is None:
+        raise ScaffoldCloneError(
+            "ForgeScaffold source is not configured. Set "
+            "EQUIPA_FORGESCAFFOLD_DIR or add forgescaffold_dir to the "
+            "dispatch config."
+        )
     if not source.exists() or not source.is_dir():
         raise ScaffoldCloneError(
             f"ForgeScaffold source not found at {source}. Set "

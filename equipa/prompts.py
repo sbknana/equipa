@@ -33,6 +33,7 @@ from equipa.constants import (
 )
 from equipa.lessons import (
     _injected_episodes_by_task,
+    filter_injectable_episodes,
     format_episodes_for_injection,
     format_lessons_for_injection,
     get_relevant_episodes,
@@ -199,6 +200,71 @@ def load_standing_orders(role: str) -> str:
         return ""
 
 
+def _wrap_untrusted_block(
+    tag_type: str,
+    content: str,
+    delimiter: str | None,
+    trust: str,
+) -> str:
+    """Wrap DB- or user-sourced content in <task-input> tags + delimiter.
+
+    Any <task-input> tag or <<<UNTRUSTED delimiter inside *content* is
+    escaped first, so the content cannot close the wrapper it sits in and
+    carry text out into instruction position.
+    """
+    from lesson_sanitizer import neutralize_boundaries  # HARD dependency
+
+    safe = neutralize_boundaries(content)
+    inner = wrap_untrusted(safe, delimiter) if delimiter else safe
+    return f'<task-input type="{tag_type}" trust="{trust}">\n{inner}\n</task-input>'
+
+
+def _sanitize_db_context(text: Any, label: str, *, narrative: bool = False) -> str:
+    """Reject-mode sanitize one DB-sourced context field before injection.
+
+    Session notes, decisions and open questions can be written by agents
+    through TheForge MCP, so every field goes through the lesson sanitizer
+    (review finding sandbox-10). A rejected field is replaced by a fixed
+    placeholder: the agent sees that something was withheld, never the
+    payload.
+
+    Args:
+        text: Raw field value from the database.
+        label: Field kind, used in the log line and the placeholder.
+        narrative: True for session-note fields, which get the generous
+            session-note length cap instead of the decision cap.
+    """
+    if text is None or text == "":
+        return ""
+    from lesson_sanitizer import (  # HARD dependency — no silent fallback
+        MAX_DECISION_LENGTH,
+        sanitize_lesson_content,
+        sanitize_session_note,
+    )
+
+    if narrative:
+        safe = sanitize_session_note(text)
+    else:
+        safe = sanitize_lesson_content(text, max_len=MAX_DECISION_LENGTH, label=label)
+    return safe or f"[{label} withheld: matched a prompt-injection pattern]"
+
+
+def _session_context_lines(session: dict[str, Any]) -> list[str]:
+    """Sanitized lines describing the last session note."""
+    session_date = _sanitize_db_context(session.get("session_date") or "unknown",
+                                        "session date")
+    lines = [
+        f"Last session ({session_date}):",
+        _sanitize_db_context(session.get("summary") or "No summary",
+                             "session note", narrative=True),
+    ]
+    if session.get("next_steps"):
+        next_steps = _sanitize_db_context(session["next_steps"],
+                                          "session next steps", narrative=True)
+        lines.append(f"Next steps: {next_steps}")
+    return lines
+
+
 def build_task_prompt(
     task: dict[str, Any],
     project_context: dict[str, Any],
@@ -213,6 +279,11 @@ def build_task_prompt(
             in <<<DELIMITER>>> ... <<<END_DELIMITER>>> markers so agents can
             distinguish data from instructions even if <task-input> tags are
             spoofed by injected content.
+
+    Every block's content has its <task-input> tags and delimiters escaped.
+    Session notes, open questions and decisions are additionally sanitized in
+    reject mode; the operator-authored task title and description are shown
+    verbatim apart from that boundary escaping.
     """
     # Task metadata (safe — controlled by orchestrator, not user input)
     lines = [
@@ -226,8 +297,7 @@ def build_task_prompt(
 
     # Helper: wrap content in both task-input tags AND unpredictable delimiter
     def _wrap(tag_type: str, content: str) -> str:
-        inner = wrap_untrusted(content, delimiter) if delimiter else content
-        return f'<task-input type="{tag_type}" trust="database">\n{inner}\n</task-input>'
+        return _wrap_untrusted_block(tag_type, content, delimiter, "database")
 
     # Task title and description — from database, could contain injection
     lines.append(_wrap("task-title", task["title"]))
@@ -235,24 +305,22 @@ def build_task_prompt(
     lines.append(_wrap("task-description", task.get("description", "No description provided")))
     lines.append("")
 
-    # Project context also wrapped — comes from database
+    # Project context also wrapped — comes from database and is
+    # agent-writable, so each field is sanitized in reject mode as well.
     session = project_context.get("last_session")
     if session:
-        ctx_lines = [f"Last session ({session.get('session_date', 'unknown')}):"]
-        ctx_lines.append(session.get("summary", "No summary"))
-        if session.get("next_steps"):
-            ctx_lines.append(f"Next steps: {session['next_steps']}")
         lines.append("## Recent Project Context")
-        lines.append(_wrap("session-context", "\n".join(ctx_lines)))
+        lines.append(_wrap("session-context", "\n".join(_session_context_lines(session))))
         lines.append("")
 
     questions = project_context.get("open_questions", [])
     if questions:
         q_lines = []
         for q in questions:
-            q_lines.append(f"- {q['question']}")
+            q_lines.append(f"- {_sanitize_db_context(q['question'], 'open question')}")
             if q.get("context"):
-                q_lines.append(f"  Context: {q['context']}")
+                context = _sanitize_db_context(q["context"], "open question context")
+                q_lines.append(f"  Context: {context}")
         lines.append("## Open Questions (unresolved)")
         lines.append(_wrap("open-questions", "\n".join(q_lines)))
         lines.append("")
@@ -261,9 +329,13 @@ def build_task_prompt(
     if decisions:
         d_lines = []
         for d in decisions:
-            d_lines.append(f"- {d['decision']} ({d.get('decided_at', 'unknown')})")
+            decision = _sanitize_db_context(d["decision"], "decision")
+            decided_at = _sanitize_db_context(d.get("decided_at") or "unknown",
+                                              "decision date")
+            d_lines.append(f"- {decision} ({decided_at})")
             if d.get("rationale"):
-                d_lines.append(f"  Rationale: {d['rationale']}")
+                rationale = _sanitize_db_context(d["rationale"], "decision rationale")
+                d_lines.append(f"  Rationale: {rationale}")
         lines.append("## Recent Decisions")
         lines.append(_wrap("decisions", "\n".join(d_lines)))
         lines.append("")
@@ -475,6 +547,9 @@ def build_system_prompt(
                 task_description=task_description,
                 dispatch_config=dispatch_config,
             )
+            # Drop episodes whose agent-authored text is rejected, so only
+            # episodes actually shown are tracked for q-value updates.
+            episodes = filter_injectable_episodes(episodes)
             if episodes:
                 episodes_text = format_episodes_for_injection(episodes, delimiter=_untrusted_delimiter)
                 dynamic_parts.append(episodes_text)
@@ -638,8 +713,12 @@ def build_checkpoint_context(checkpoint_text: str, attempt: int) -> str:
     Uses compact_agent_output() to extract structured data (RESULT, FILES_CHANGED,
     BLOCKERS, SUMMARY) instead of passing raw text, preventing context rot.
     """
-    # Compact checkpoint to structured summary (max 200 words)
+    # Compact checkpoint to structured summary (max 200 words). The result is
+    # agent-authored, so it goes in the same escaped wrapper as DB context.
     compacted = compact_agent_output(checkpoint_text, max_words=200)
+    checkpoint_block = _wrap_untrusted_block(
+        "checkpoint", compacted, None, "agent-output"
+    )
 
     return (
         f"## Previous Attempt (#{attempt}) — Continue From Here\n\n"
@@ -651,7 +730,7 @@ def build_checkpoint_context(checkpoint_text: str, attempt: int) -> str:
         f"not Read, not Glob, not Grep. You have the previous agent's summary below. "
         f"Use it to skip exploration entirely and go straight to implementation.\n\n"
         f"### Previous Agent Summary:\n"
-        f"<task-input type=\"checkpoint\" trust=\"agent-output\">\n{compacted}\n</task-input>\n\n"
+        f"{checkpoint_block}\n\n"
         f"**CRITICAL:** Do NOT repeat the previous agent's exploration. Do NOT re-read "
         f"files they already read. Do NOT analyze the codebase from scratch. Look at "
         f"what remains to be done and START CODING in your FIRST turn.\n\n"
@@ -691,8 +770,7 @@ def build_planner_prompt(
 
     # Helper: wrap content in both task-input tags AND unpredictable delimiter
     def _wrap(tag_type: str, content: str) -> str:
-        inner = wrap_untrusted(content, _delim)
-        return f'<task-input type="{tag_type}" trust="user">\n{inner}\n</task-input>'
+        return _wrap_untrusted_block(tag_type, content, _delim, "user")
 
     # Dynamic suffix: goal and project context (includes project_id for agent)
     lines = [
@@ -706,20 +784,19 @@ def build_planner_prompt(
         "",
     ]
 
-    # Add project context
+    # Add project context (agent-writable DB fields: reject-mode sanitized)
     session = project_context.get("last_session")
     if session:
-        ctx_parts = [f"Last session ({session.get('session_date', 'unknown')}):"]
-        ctx_parts.append(session.get("summary", "No summary"))
-        if session.get("next_steps"):
-            ctx_parts.append(f"Next steps: {session['next_steps']}")
         lines.append("## Recent Project Context")
-        lines.append(_wrap("session-context", "\n".join(ctx_parts)))
+        lines.append(_wrap("session-context", "\n".join(_session_context_lines(session))))
         lines.append("")
 
     questions = project_context.get("open_questions", [])
     if questions:
-        q_lines = [f"- {q['question']}" for q in questions]
+        q_lines = [
+            f"- {_sanitize_db_context(q['question'], 'open question')}"
+            for q in questions
+        ]
         lines.append("## Open Questions (unresolved)")
         lines.append(_wrap("open-questions", "\n".join(q_lines)))
         lines.append("")
@@ -757,8 +834,7 @@ def build_evaluator_prompt(
     _delim = _make_untrusted_delimiter()
 
     def _wrap(tag_type: str, content: str, trust: str = "user") -> str:
-        inner = wrap_untrusted(content, _delim)
-        return f'<task-input type="{tag_type}" trust="{trust}">\n{inner}\n</task-input>'
+        return _wrap_untrusted_block(tag_type, content, _delim, trust)
 
     # Dynamic suffix: goal, project info, task results
     lines = [

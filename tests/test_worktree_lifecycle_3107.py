@@ -328,7 +328,7 @@ def test_cleanup_on_worktree_resets_to_fork_point_without_base_sha(
     monkeypatch.setattr(dispatch_mod, "get_db_connection",
                         lambda write=False: _memory_tasks_db([11]))
 
-    asyncio.run(dispatch_mod.cleanup_failed_attempt(11, str(worktree), [], output=[]))
+    asyncio.run(dispatch_mod.cleanup_failed_attempt(11, str(worktree), [], output=[], expect_repository=True))
 
     assert _checked_out_branch(worktree) == "forge-task-11"
     assert _sha(repo, "forge-task-11") == master_before
@@ -354,7 +354,7 @@ def test_main_checkout_cleanup_fails_loud_and_keeps_status(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", db_opened)
 
     with pytest.raises(AttemptCleanupError):
-        asyncio.run(dispatch_mod.cleanup_failed_attempt(12, str(repo), [], output=[]))
+        asyncio.run(dispatch_mod.cleanup_failed_attempt(12, str(repo), [], output=[], expect_repository=True))
 
     db_opened.assert_not_called()
     assert _checked_out_branch(repo) == "forge-task-12"
@@ -374,7 +374,7 @@ def test_main_checkout_cleanup_refuses_branch_held_by_a_worktree(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", MagicMock())
 
     with pytest.raises(AttemptCleanupError, match="checked out"):
-        asyncio.run(dispatch_mod.cleanup_failed_attempt(13, str(repo), [], output=[]))
+        asyncio.run(dispatch_mod.cleanup_failed_attempt(13, str(repo), [], output=[], expect_repository=True))
 
     assert _sha(repo, "forge-task-13") == branch_sha
     assert _checked_out_branch(worktree) == "forge-task-13"
@@ -393,7 +393,7 @@ def test_main_checkout_cleanup_refuses_ambiguous_default_branch(
     monkeypatch.setattr(dispatch_mod, "get_db_connection", MagicMock())
 
     with pytest.raises(AttemptCleanupError, match="trusted default branch"):
-        asyncio.run(dispatch_mod.cleanup_failed_attempt(14, str(repo), [], output=[]))
+        asyncio.run(dispatch_mod.cleanup_failed_attempt(14, str(repo), [], output=[], expect_repository=True))
 
     assert _checked_out_branch(repo) == "forge-task-14"
     assert _branch_exists(repo, "forge-task-14")
@@ -407,7 +407,7 @@ def test_main_checkout_cleanup_deletes_task_branch(repo: Path, monkeypatch) -> N
     db = _memory_tasks_db([15])
     monkeypatch.setattr(dispatch_mod, "get_db_connection", lambda write=False: db)
 
-    asyncio.run(dispatch_mod.cleanup_failed_attempt(15, str(repo), [], output=[]))
+    asyncio.run(dispatch_mod.cleanup_failed_attempt(15, str(repo), [], output=[], expect_repository=True))
 
     assert _checked_out_branch(repo) == "master"
     assert not _branch_exists(repo, "forge-task-15")

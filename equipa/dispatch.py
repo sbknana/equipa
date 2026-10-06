@@ -17,15 +17,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+import unicodedata
+from collections.abc import (
+    AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence,
+)
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
@@ -38,7 +45,9 @@ from equipa.config import (
     is_feature_enabled,
     is_security_review_enabled,
     load_dispatch_config,
+    translate_local_path,
 )
+import equipa.constants as _equipa_constants
 from equipa.constants import (
     ATTEMPT_REFLECTIONS_MAX_CHARS,
     ATTEMPT_SECTION_TRIM_CHARS,
@@ -47,7 +56,6 @@ from equipa.constants import (
     MAX_MANAGER_ROUNDS,
     MAX_TASK_RANGE,
     PRIORITY_ORDER,
-    PROJECT_DIRS,
 )
 from equipa.db import (
     db_conn,
@@ -58,13 +66,36 @@ from equipa.db import (
 )
 from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import (
+    AgentWorktreeGit,
+    AgentWorktreeGitError,
+    GitRepositoryUnreadableError,
+    PinnedGitRepository,
+    PinnedRepositoryError,
     UntrustedDefaultBranchError,
     _is_git_repo,
+    _nearest_git_entry,
+    agent_worktree_git,
+    check_pinned_directory,
+    descriptor_path,
+    fd_pinning_available,
+    find_worktree_git_dir,
     get_default_branch,
     get_trusted_default_branch,
+    git_repositories_pinned,
     git_run,
     git_run_async,
+    git_toplevel,
+    git_toplevel_async,
+    open_pinned_directory,
+    open_work_tree,
+    pinned_repository,
+    pinned_repository_by_path,
+    read_regular_file_bounded,
+    read_worktree_head,
+    remove_registered_worktree,
 )
+from equipa.generated_files import ConflictResolution, resolve_generated_conflicts
+from equipa.isolation import concurrency_refusal
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.merge_safety import (
     MergeSignalShield,
@@ -77,12 +108,14 @@ from equipa.merge_integrity import (
     MergeAttempt,
     MergeIntegrityError,
     MergeOutcome,
+    RepositoryIdentity,
     find_repo_execution_hazards,
     is_ancestor,
     rebased_range_problem,
     resolve_commit,
     reviewed_commit_refusal,
 )
+from equipa.monitoring import dispatched_without_git
 from equipa.loops import (
     _count_findings_in_review_file,
     ensure_artifacts_dir,
@@ -92,7 +125,7 @@ from equipa.loops import (
     run_quality_scoring,
     run_security_review,
 )
-from equipa.manager import run_manager_loop
+from equipa.manager import GOAL_REFUSED_OUTCOMES, run_manager_loop
 from equipa.parsing import _extract_section
 from equipa.output import (
     log,
@@ -110,6 +143,8 @@ from equipa.security_gate import (
     SecurityGateBypassError,
     _gate_audit_log,
     decide_merge_gate,
+    escape_audit_text,
+    describe_submodule_pointer_changes,
     format_counts,
     get_changed_files_for_branch,
     get_reviewer_run,
@@ -175,18 +210,13 @@ def _bootstrap_scaffold_if_needed(task: dict, project_id: int | None) -> str | N
         local_path = None
     if not local_path:
         return None
-    # Translate Windows-style paths to the Samba mount, mirroring
-    # ``tasks.resolve_project_dir``.
-    candidate = local_path.rstrip("/").rstrip("\\")
-    if candidate.startswith(("Z:\\AI_Stuff", "Z:/AI_Stuff")):
-        candidate = (
-            "/srv/forge-share/AI_Stuff"
-            + candidate[len("Z:\\AI_Stuff"):].replace("\\", "/")
-        )
+    # Map the dispatch config's ``path_translations`` prefixes (for example
+    # a Windows share to its mount here), as ``tasks.resolve_project_dir``.
+    candidate = translate_local_path(local_path.rstrip("/").rstrip("\\"))
     # Containment check: a DB-supplied ``local_path`` is untrusted input.
-    # Without this, a value like ``Z:\AI_Stuff\..\..\etc\evil`` translates to
-    # ``/srv/forge-share/AI_Stuff/../../etc/evil`` and ``mkdir(parents=True)``
-    # would silently create ``/etc/evil``. Reject ``..`` segments and require
+    # Without this, a value like ``X:\share\..\..\etc\evil`` translates to
+    # ``/srv/share/../../etc/evil`` and ``mkdir(parents=True)`` would
+    # silently create ``/etc/evil``. Reject ``..`` segments and require
     # the resolved path to live inside an allowlisted root.
     try:
         from equipa.scaffold import assert_contained_path, ScaffoldCloneError
@@ -421,6 +451,102 @@ async def _is_linked_worktree(cwd: str) -> bool:
     return Path(lines[0]).resolve() != Path(lines[1]).resolve()
 
 
+_WORKTREE_BASE_DIRNAME = ".forge-worktrees"
+_GITFILE_LIMIT = 4096
+
+
+def _in_task_worktree_location(path: str) -> bool:
+    """True when ``path`` lies in ``<project>/.forge-worktrees/<name>``,
+    judged on the path as given and on its realpath.
+
+    R3162-01 (task #3165): the path as given decides first. An agent that
+    replaces its worktree root with a symlink to a repository outside
+    ``.forge-worktrees`` must still be treated as a task worktree (and then
+    refused by :func:`_task_worktree_location`), never sent to discovery.
+    This is the rule :func:`equipa.git_ops._task_worktree_path` applies.
+    """
+    return any(
+        _WORKTREE_BASE_DIRNAME in Path(candidate).parts[:-1]
+        for candidate in (os.path.abspath(path), os.path.realpath(path))
+    )
+
+
+def _common_dir_named_by_gitfile(root: Path) -> Path | None:
+    """The common dir that ``root/.git`` (a ``gitdir:`` file) and the
+    ``commondir`` file of the git dir it names point at, read as data."""
+    try:
+        gitfile = read_regular_file_bounded(root / ".git", _GITFILE_LIMIT)
+        text = gitfile.decode("utf-8", "replace").strip()
+        if not text.startswith("gitdir:"):
+            return None
+        git_dir = Path(os.path.normpath(root / text[len("gitdir:"):].strip()))
+        named = read_regular_file_bounded(git_dir / "commondir", _GITFILE_LIMIT)
+    except OSError:
+        return None
+    return Path(os.path.realpath(git_dir / named.decode("utf-8", "replace").strip()))
+
+
+def _canonical_task_worktree_root(given: Path) -> Path | None:
+    """Realpath of the ``<project>/.forge-worktrees/<name>`` directory on the
+    absolute path ``given``; None when ``.forge-worktrees`` or ``<name>``
+    is a symlink (the directory is then not where the path says it is)."""
+    parts = given.parts
+    index = parts.index(_WORKTREE_BASE_DIRNAME)
+    lexical_root = Path(*parts[:index + 2])
+    canonical = Path(
+        os.path.realpath(Path(*parts[:index])), _WORKTREE_BASE_DIRNAME, parts[index + 1],
+    )
+    if Path(os.path.realpath(lexical_root)) != canonical:
+        return None
+    return canonical
+
+
+async def _task_worktree_location(agent_dir: str) -> tuple[str, str] | None:
+    """``(work-tree root, git common dir)`` of the task worktree holding
+    ``agent_dir``; None unless that repository registers the worktree.
+
+    R3155-01 (task #3158): found without running git through the worktree's
+    ``.git``. The root is the ``.forge-worktrees/<name>`` directory on the
+    path, else the nearest directory with a ``.git`` entry. The repository
+    is the project the orchestrator registered the worktree for (or the one
+    holding ``.forge-worktrees``); for any other layout the ``.git`` file is
+    read as data. Whichever it is, git on the worktree then reads neither its
+    config nor its attributes (:func:`equipa.git_ops.agent_worktree_git`).
+
+    R3162-01 (task #3165): the path as given is classified first. When it
+    names ``.forge-worktrees/<name>`` but that directory (or
+    ``.forge-worktrees``) is a symlink, the worktree is refused: following
+    it would act on whatever repository the agent pointed it at.
+    """
+    from equipa.role_resolver import stable_project_root
+
+    given = Path(os.path.abspath(agent_dir))
+    resolved = Path(os.path.realpath(agent_dir))
+    parts = resolved.parts
+    root: Path | None
+    if _WORKTREE_BASE_DIRNAME in given.parts[:-1]:
+        root = _canonical_task_worktree_root(given)
+        if root is None:
+            return None
+    elif _WORKTREE_BASE_DIRNAME in parts[:-1]:
+        root = Path(*parts[:parts.index(_WORKTREE_BASE_DIRNAME) + 2])
+    else:
+        root = next(
+            (p for p in (resolved, *resolved.parents) if os.path.lexists(p / ".git")),
+            None,
+        )
+    if root is None:
+        return None
+    project_root = stable_project_root(root)
+    if project_root != root:
+        common_dir = await _git_common_dir(project_root)
+    else:
+        common_dir = _common_dir_named_by_gitfile(root)
+    if common_dir is None or find_worktree_git_dir(str(common_dir), str(root)) is None:
+        return None
+    return str(root), str(common_dir)
+
+
 async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
     """Paths of every worktree (main checkout included) on ``branch_name``."""
     listing = await _git_checked(
@@ -437,53 +563,94 @@ async def _worktrees_holding_branch(cwd: str, branch_name: str) -> list[str]:
     return holders
 
 
+def _checked_output(
+    result: subprocess.CompletedProcess, action: str, cwd: str,
+) -> str:
+    """Stripped stdout of ``result``; :class:`AttemptCleanupError` unless it
+    succeeded (the message shape of :func:`_git_checked`)."""
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise AttemptCleanupError(
+            f"{action} in {cwd} failed (rc={result.returncode}): {detail}"
+        )
+    return (result.stdout or "").strip()
+
+
 async def _reset_task_worktree(
     worktree_dir: str,
     branch_name: str,
     base_sha: str | None,
     emit: Callable[[str], None],
+    *,
+    common_dir: str,
 ) -> None:
     """Discard a failed attempt inside its own worktree, staying on its branch.
 
     The worktree never leaves ``branch_name``: checking out the default
     branch here would let the next attempt commit straight onto it, and the
     branch cannot be deleted while this worktree holds it (dispatch-02).
+
+    R3155-01 (task #3158): ``reset --hard`` and ``clean`` write and read file
+    content, so they run on a private git dir
+    (:func:`equipa.git_ops.agent_worktree_git`) where no agent-planted driver
+    is defined; the branch of ``common_dir``'s repository is then moved and
+    the resulting index installed for the worktree.
     """
-    current = await _current_branch(worktree_dir)
-    if current != branch_name:
+    try:
+        async with agent_worktree_git(common_dir, worktree_dir) as worktree_git:
+            await _reset_in_private_git_dir(
+                worktree_git, worktree_dir, branch_name, base_sha, emit,
+            )
+    except AgentWorktreeGitError as exc:
         raise AttemptCleanupError(
-            f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
+            f"cannot reset {branch_name} in {worktree_dir}: {exc}"
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"reset {branch_name} in {worktree_dir}: {exc}") from exc
+
+
+async def _reset_in_private_git_dir(
+    worktree_git: AgentWorktreeGit,
+    worktree_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """The steps of :func:`_reset_task_worktree` on ``worktree_git``."""
+    if worktree_git.branch != branch_name:
+        raise AttemptCleanupError(
+            f"worktree {worktree_dir} is on "
+            f"{worktree_git.branch or 'a detached HEAD'!r}, "
             f"not {branch_name!r}; refusing to reset it"
         )
+    failed_head = worktree_git.head
     if not base_sha:
         # No recorded base: fall back to the fork point from the operator's
-        # default branch, never the checked-out HEAD or origin/HEAD.
+        # default branch, never the checked-out HEAD or origin/HEAD. FF-3158
+        # (task #3162): its branches are looked up in the repository that
+        # registers the worktree, never through the worktree's .git.
         try:
-            default_branch = get_trusted_default_branch(worktree_dir)
+            default_branch = get_trusted_default_branch(
+                worktree_dir, common_dir=worktree_git.common_dir,
+            )
         except UntrustedDefaultBranchError as exc:
             raise AttemptCleanupError(str(exc)) from exc
-        base_sha = await _git_checked(
-            ["merge-base", "HEAD", f"refs/heads/{default_branch}"],
-            worktree_dir, timeout=10,
-            action=f"find the fork point of {branch_name} from {default_branch}",
+        base_sha = _checked_output(
+            await worktree_git.run_in_repository(
+                ["merge-base", failed_head, f"refs/heads/{default_branch}"], timeout=10,
+            ),
+            f"find the fork point of {branch_name} from {default_branch}", worktree_dir,
         )
-    failed_head = await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action="read the failed attempt's HEAD",
+    _checked_output(
+        await worktree_git.run(["reset", "--hard", base_sha], timeout=60),
+        f"reset {branch_name} to {base_sha[:12]}", worktree_dir,
     )
-    await _git_checked(
-        ["reset", "--hard", base_sha], worktree_dir, timeout=60,
-        action=f"reset {branch_name} to {base_sha[:12]}",
+    _checked_output(
+        await worktree_git.run(["clean", "-fd"], timeout=60),
+        f"clean untracked files from {branch_name}", worktree_dir,
     )
-    await _git_checked(
-        ["clean", "-fd"], worktree_dir, timeout=60,
-        action=f"clean untracked files from {branch_name}",
-    )
-    after_branch = await _current_branch(worktree_dir)
-    after_head = await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action="read HEAD after the reset",
-    )
+    await worktree_git.publish_reset(branch_name, base_sha, failed_head)
+    after_head, after_branch = await worktree_git.current_head()
     if after_branch != branch_name or after_head != base_sha:
         raise AttemptCleanupError(
             f"worktree {worktree_dir} ended on {after_branch!r}@{after_head[:12]} "
@@ -550,6 +717,7 @@ async def cleanup_failed_attempt(
     output: list[str] | None = None,
     *,
     base_sha: str | None = None,
+    expect_repository: bool,
 ) -> None:
     """Reset a failed task for a fresh autoresearch attempt.
 
@@ -564,6 +732,11 @@ async def cleanup_failed_attempt(
     * ``project_dir`` is the main checkout: leave ``forge-task-<id>`` for the
       trusted default branch if it is checked out, then delete it unless a
       worktree still holds it.
+    * ``expect_repository`` is False: the project was not a git repository
+      when the task was dispatched (no worktree was made for it). No git
+      step runs at all (R3165-01, task #3166). A repository found there now
+      is one the agent created during its attempt; it is reported, never
+      discovered or checked out.
 
     Every git step is checked. On failure :class:`AttemptCleanupError` is
     raised BEFORE the task is reset to ``todo``; the task must not be
@@ -580,6 +753,10 @@ async def cleanup_failed_attempt(
             list is allowed (skips reflection injection).
         output: Optional buffer for ``log()`` calls; if ``None``, prints.
         base_sha: Commit the task worktree was created on.
+        expect_repository: False when the project was not a git repository
+            at dispatch; both loops pass ``task_branch is not None``.
+            Required, with no default (R3166-05, task #3168): a caller that
+            omitted it got discovery in a non-git project again.
 
     Raises:
         AttemptCleanupError: a git step failed or the worktree is not on
@@ -593,13 +770,10 @@ async def cleanup_failed_attempt(
         else:
             print(message)
 
-    if _is_git_repo(project_dir):
-        if await _is_linked_worktree(project_dir):
-            await _reset_task_worktree(project_dir, branch_name, base_sha, emit)
-        else:
-            await _delete_task_branch_in_main_checkout(
-                project_dir, branch_name, emit,
-            )
+    if expect_repository:
+        await _clean_up_attempt_branch(project_dir, branch_name, base_sha, emit)
+    else:
+        _report_repository_made_by_attempt(project_dir, emit)
 
     conn = get_db_connection(write=True)
     try:
@@ -614,6 +788,68 @@ async def cleanup_failed_attempt(
         f"  [Autoresearch] Reset task #{task_id} to todo with "
         f"{len(reflections)} attempt reflection(s)"
     )
+
+
+def _report_repository_made_by_attempt(
+    project_dir: str, emit: Callable[[str], None],
+) -> None:
+    """Report a ``.git`` that appeared in a project that was not git at
+    dispatch, found without running git.
+
+    R3165-01 (task #3166): asking git (by discovery) found the agent's own
+    repository, and checking out its default branch ran the smudge filter
+    the agent had defined, as a child of the orchestrator and outside the
+    agent's containment. Nothing is done with the repository.
+    """
+    git_entry = _nearest_git_entry(Path(project_dir))
+    if git_entry is not None:
+        emit(
+            f"  [Autoresearch] A git repository appeared at "
+            f"{escape_audit_text(str(git_entry))} during the failed attempt; "
+            f"the project was not git at dispatch, so no git step runs there"
+        )
+
+
+async def _clean_up_attempt_branch(
+    project_dir: str,
+    branch_name: str,
+    base_sha: str | None,
+    emit: Callable[[str], None],
+) -> None:
+    """The git step of :func:`cleanup_failed_attempt` for a project that was
+    a git repository at dispatch."""
+    in_task_worktree = _in_task_worktree_location(project_dir)
+    if in_task_worktree:
+        # FF-3158 (task #3162): a task worktree is git by construction; asking
+        # git (by discovery, through the agent's .git) is not needed, and
+        # the reset below finds the repository that registers it.
+        is_git = True
+    else:
+        try:
+            is_git = _is_git_repo(project_dir)
+        except GitRepositoryUnreadableError as exc:
+            raise AttemptCleanupError(str(exc)) from exc
+    if is_git:
+        # R3155-01 (task #3158): a path in a task worktree location is reset
+        # as one, whatever its (agent-writable) .git claims.
+        if in_task_worktree or await _is_linked_worktree(project_dir):
+            # R3119-07 (task #3126): a nested project's attempt ran in a
+            # sub-directory of its worktree; ``git clean`` there would leave
+            # the rest of the worktree dirty for the next attempt.
+            location = await _task_worktree_location(project_dir)
+            if location is None:
+                raise AttemptCleanupError(
+                    f"{project_dir} is not in a worktree its repository "
+                    f"registers; not resetting"
+                )
+            worktree_root, common_dir = location
+            await _reset_task_worktree(
+                worktree_root, branch_name, base_sha, emit, common_dir=common_dir,
+            )
+        else:
+            await _delete_task_branch_in_main_checkout(
+                project_dir, branch_name, emit,
+            )
 
 
 # --- DB Scanning & Scoring ---
@@ -715,20 +951,63 @@ def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) 
 async def _require_task_branch(worktree_dir: str, task_branch: str) -> str:
     """Return HEAD's SHA if ``worktree_dir`` is on ``task_branch``.
 
+    ``worktree_dir`` is the task worktree, or the sub-directory of it that a
+    nested project's agent runs in. FF-3155 (task #3158): this runs before
+    and after every agent, so it never runs git through the worktree. By
+    discovery, ``rev-parse HEAD`` read whatever repository the agent left at
+    its ``.git`` (or in the sub-directory), and lazy-fetching a missing HEAD
+    there ran that repository's promisor upload-pack program in the
+    orchestrator. HEAD is read from the repository's own ``worktrees/<name>``
+    entry instead (:func:`equipa.git_ops.read_worktree_head`).
+
     Raises:
-        AttemptCleanupError: the worktree is on another branch, detached, or
-            git could not be run there.
+        AttemptCleanupError: the worktree is on another branch, detached, not
+            a worktree its repository registers, or its HEAD is unreadable.
     """
-    current = await _current_branch(worktree_dir)
+    location = await _task_worktree_location(worktree_dir)
+    if location is None:
+        raise AttemptCleanupError(
+            f"{worktree_dir} is not in a worktree its repository registers; "
+            f"cannot read its branch"
+        )
+    worktree_root, common_dir = location
+    try:
+        head, current = await read_worktree_head(common_dir, worktree_root)
+    except (AgentWorktreeGitError, subprocess.SubprocessError, OSError) as exc:
+        raise AttemptCleanupError(f"read HEAD in {worktree_dir}: {exc}") from exc
     if current != task_branch:
         raise AttemptCleanupError(
             f"worktree {worktree_dir} is on {current or 'a detached HEAD'!r}, "
             f"expected {task_branch!r}"
         )
-    return await _git_checked(
-        ["rev-parse", "--verify", "HEAD^{commit}"], worktree_dir, timeout=10,
-        action=f"read the HEAD of {task_branch}",
+    return head
+
+
+def escape_audit_detail(detail: object) -> str:
+    """``detail`` as one audit-safe line.
+
+    git stderr can span lines, so whitespace runs are collapsed. R3165-02
+    (task #3166): the detail can carry agent-written text (a branch name
+    read from the worktree's HEAD); its control characters are escaped
+    (:func:`escape_audit_text`) so a terminal cannot redraw the line as
+    another event (N-01). R3166-03 (task #3168): so is every Unicode format
+    character (category Cf: bidi controls such as U+202E, zero-width
+    characters), which a viewer that renders bidi text, such as an editor
+    or a dashboard of GATE-AUDIT rows, would otherwise use to show the line
+    reordered.
+    """
+    escaped = escape_audit_text(" ".join(str(detail).split()))
+    if escaped.isascii():
+        return escaped
+    return "".join(
+        _escaped_code_point(char) if unicodedata.category(char) == "Cf" else char
+        for char in escaped
     )
+
+
+def _escaped_code_point(char: str) -> str:
+    code = ord(char)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 def _audit_task_abort(
@@ -738,11 +1017,574 @@ def _audit_task_abort(
     output: list[str] | None,
 ) -> None:
     """Log a task abort to the operator output and the durable gate audit."""
-    # git stderr can span lines; keep each audit record on one line.
-    single_line_detail = " ".join(str(detail).split())
-    line = f"task={task_id} event={event} detail={single_line_detail}"
+    line = f"task={task_id} event={event} detail={escape_audit_detail(detail)}"
     log(f"  [GATE-AUDIT] {line}", output)
     log_gate_audit(line, task_id, event=event)
+
+
+# N1 (task #3168): the outcome of a task whose project was not git at
+# dispatch and now holds a repository, made by one of its agents or by an
+# earlier task of the same run. Not a success outcome, so the task is
+# recorded blocked; it is never retried.
+REPOSITORY_APPEARED_OUTCOME = "repository_appeared"
+
+# S3168-01 (task #3173): the entries that make git's discovery take a
+# directory with no ``.git`` entry as a git directory (git's
+# ``is_git_directory``): ``HEAD`` with ``refs`` (``objects`` can come from
+# the environment), or ``HEAD`` with ``commondir`` (a linked worktree's git
+# directory, whose refs and objects are in the common directory).
+_GIT_DIRECTORY_SIGNATURES: tuple[tuple[str, ...], ...] = (
+    ("HEAD", "refs"),
+    ("HEAD", "commondir"),
+)
+
+
+def _is_implicit_git_directory(directory: str) -> bool:
+    """True when git's discovery would take ``directory`` itself for a git
+    directory (an implicit bare repository). Runs no git."""
+    return any(
+        all(os.path.lexists(os.path.join(directory, name)) for name in signature)
+        for signature in _GIT_DIRECTORY_SIGNATURES
+    )
+
+
+def _walk_up(project_dir: str) -> Iterator[str]:
+    """``project_dir`` and every directory above it, first in the form given
+    (made absolute), then in the symlink-resolved form (git discovers from
+    the resolved working directory). ``os.path.realpath`` does not raise on
+    a symlink loop."""
+    for start in dict.fromkeys((os.path.abspath(project_dir), os.path.realpath(project_dir))):
+        directory = start
+        while True:
+            yield directory
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+
+
+def _nearest_repository(project_dir: str) -> Path | None:
+    """The repository git's discovery would find from ``project_dir``,
+    located without running git: the first ``.git`` entry, or directory
+    that is itself a git directory, at or above it. None if there is none.
+
+    S3168-01 (task #3173): ``git_ops._nearest_git_entry`` looks for a
+    ``.git`` entry only. An agent that moved its repository's ``HEAD``,
+    ``objects``, ``refs`` and ``config`` into the project directory (with
+    ``core.worktree`` naming the work tree) left no ``.git`` anywhere, yet
+    git run in the project discovers that repository and its filters.
+    """
+    for directory in _walk_up(project_dir):
+        git_entry = os.path.join(directory, ".git")
+        if os.path.lexists(git_entry):
+            return Path(git_entry)
+        if _is_implicit_git_directory(directory):
+            return Path(directory)
+    return None
+
+
+# The entries the walks look for in each directory: ``.git`` and those of
+# _GIT_DIRECTORY_SIGNATURES.
+_REPOSITORY_ENTRY_NAMES: tuple[str, ...] = tuple(dict.fromkeys(
+    (".git", *(name for signature in _GIT_DIRECTORY_SIGNATURES for name in signature))
+))
+
+
+def _unexaminable_directory(project_dir: str) -> Path | None:
+    """The first directory at or above ``project_dir`` in which the walks
+    cannot tell whether a repository entry is there, None when they can in
+    every one. Runs no git.
+
+    IR3174-04 (task #3177): ``os.path.lexists`` reads every error as "no
+    such entry", so a project holding ``.git`` that the agent made mode
+    0600 (no search permission for anyone, the orchestrator included) read
+    as "no repository": N1 blocked nothing and recorded nothing, and once
+    the operator restored the mode the next dispatch adopted the agent's
+    repository. Only "no such file" (ENOENT) and "not a directory"
+    (ENOTDIR; git cannot start there either) show that an entry is absent;
+    any other error (EACCES, EIO, ELOOP) does not.
+    """
+    for directory in _walk_up(project_dir):
+        for name in _REPOSITORY_ENTRY_NAMES:
+            try:
+                os.lstat(os.path.join(directory, name))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return Path(directory)
+    return None
+
+
+# S3168-03 (task #3173): where the N1 check records a repository found in a
+# project that was not git at dispatch, so a later dispatch refuses every
+# project that would discover it instead of adopting the agent's repository
+# as the project's checkout (``git worktree add`` there ran the agent's
+# smudge filter in the orchestrator). Outside every project tree, next to
+# the operator's TheForge DB: one file per repository location. With
+# THEFORGE_DB unset and the default theforge.db a real file, that is the
+# EQUIPA checkout's root, where .gitignore lists it (IR73-01, task #3176).
+AGENT_REPOSITORY_REFUSALS_DIRNAME = "equipa-agent-repository-refusals"
+
+
+class RefusalStoreError(OSError):
+    """The refusal records' directory is not one EQUIPA can trust: a
+    symlink, not a directory, another user's, or writable by others
+    (IR73-01, task #3176). Records there could be redirected or removed."""
+
+
+class AgentMadeRepositoryError(GitRepositoryUnreadableError):
+    """A dispatch refused because the repository its project would discover
+    was found by the N1 check, in a project that was not git at dispatch.
+
+    A :class:`GitRepositoryUnreadableError`, so every dispatch that already
+    refuses a repository git cannot read refuses this one the same way.
+    """
+
+
+def _agent_repository_refusals_dir() -> Path:
+    """The refusal records' directory, read at call time (THEFORGE_DB is
+    set per run and per test).
+
+    IR73-01 (task #3176): next to the database itself. The database path is
+    symlink-resolved, so a THEFORGE_DB that is (or lies under) a symlink
+    puts the records next to the real database, not next to the link; with
+    THEFORGE_DB unset and the checkout's default theforge.db a link to the
+    operator's database, that is outside the EQUIPA checkout.
+    """
+    database = Path(os.path.realpath(os.fspath(_equipa_constants.THEFORGE_DB)))
+    return database.parent / AGENT_REPOSITORY_REFUSALS_DIRNAME
+
+
+def _check_refusal_store(refusals_dir: Path) -> None:
+    """Raise :class:`RefusalStoreError` unless ``refusals_dir`` is a real
+    directory (not a symlink to one) owned by this user and writable by no
+    one else; FileNotFoundError when there is nothing at ``refusals_dir``.
+
+    IR73-01 (task #3176): a symlinked store would put the records wherever
+    the link points, and a store others can write lets them delete records.
+    """
+    try:
+        info = os.lstat(refusals_dir)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise RefusalStoreError(f"{refusals_dir} cannot be examined ({exc})") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise RefusalStoreError(f"{refusals_dir} is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RefusalStoreError(f"{refusals_dir} is not a directory")
+    if not hasattr(os, "geteuid"):
+        # Windows: st_mode carries only the read-only attribute, so every
+        # writable directory reads 0o777 and the mode test refused every
+        # store; ownership is read from the directory's security descriptor
+        # instead (IR76-04, task #3178), and who else may write from its
+        # access list (R3178-02, task #3180). A junction is not S_ISLNK, and
+        # the security calls read its target.
+        if getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RefusalStoreError(
+                f"{refusals_dir} is a reparse point (a junction or a link)")
+        try:
+            owned = _owned_by_this_windows_user(refusals_dir)
+        except OSError as exc:
+            raise RefusalStoreError(
+                f"{refusals_dir}: its owner cannot be read ({exc})"
+            ) from exc
+        if not owned:
+            raise RefusalStoreError(f"{refusals_dir} is not owned by this user")
+        try:
+            writers = _windows_store_writers(refusals_dir)
+        except OSError as exc:
+            raise RefusalStoreError(
+                f"{refusals_dir}: its access list cannot be read ({exc})"
+            ) from exc
+        if writers:
+            raise RefusalStoreError(
+                f"{refusals_dir} can be written by other accounts: "
+                f"{', '.join(writers)}")
+        return
+    if info.st_uid != os.geteuid():
+        raise RefusalStoreError(
+            f"{refusals_dir} is owned by uid {info.st_uid}, not by this user"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RefusalStoreError(
+            f"{refusals_dir} is writable by other users "
+            f"(mode {stat.S_IMODE(info.st_mode):o})"
+        )
+
+
+def _owned_by_this_windows_user(path: Path) -> bool:
+    """Whether the owner SID of ``path`` is this process's user, or the
+    owner this process's token gives the objects it creates (the
+    Administrators group for an elevated administrator). Windows only;
+    raises OSError when a security call fails or there is no Windows API.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    if not hasattr(ctypes, "WinDLL"):
+        raise OSError("no Windows security API on this platform")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    se_file_object, owner_security_information = 1, 0x1
+    token_query, token_user, token_owner = 0x0008, 1, 4
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        os.fspath(path), se_file_object, owner_security_information,
+        ctypes.byref(owner), None, None, None, ctypes.byref(descriptor))
+    if status != 0:
+        raise OSError(status, f"GetNamedSecurityInfoW failed with {status}")
+    try:
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            for information_class in (token_user, token_owner):
+                needed = wintypes.DWORD()
+                advapi32.GetTokenInformation(
+                    token, information_class, None, 0, ctypes.byref(needed))
+                buffer = ctypes.create_string_buffer(needed.value)
+                if not advapi32.GetTokenInformation(
+                        token, information_class, buffer, needed,
+                        ctypes.byref(needed)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                # TOKEN_USER and TOKEN_OWNER both start with the SID pointer.
+                sid = ctypes.c_void_p.from_buffer(buffer)
+                if advapi32.EqualSid(owner, sid):
+                    return True
+            return False
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+# Rights over the refusal store that let an account add, change or delete a
+# record, or take the store over (R3178-02, task #3180).
+_WINDOWS_STORE_WRITE_RIGHTS = (
+    0x0000_0002      # FILE_ADD_FILE (FILE_WRITE_DATA)
+    | 0x0000_0004    # FILE_ADD_SUBDIRECTORY (FILE_APPEND_DATA)
+    | 0x0000_0010    # FILE_WRITE_EA
+    | 0x0000_0040    # FILE_DELETE_CHILD
+    | 0x0000_0100    # FILE_WRITE_ATTRIBUTES
+    | 0x0001_0000    # DELETE
+    | 0x0004_0000    # WRITE_DAC
+    | 0x0008_0000    # WRITE_OWNER
+    | 0x0200_0000    # MAXIMUM_ALLOWED
+    | 0x1000_0000    # GENERIC_ALL
+    | 0x4000_0000    # GENERIC_WRITE
+)
+_WINDOWS_ACCESS_ALLOWED_ACE = 0
+_WINDOWS_ACCESS_DENIED_ACE = 1
+# Accounts whose write access leaves the store trusted: SYSTEM, the
+# Administrators group (either can take any file over anyway), CREATOR
+# OWNER (a placeholder for whoever creates a record: this user) and OWNER
+# RIGHTS (the object's current owner, which the ownership check has already
+# proved is this user). ``os.mkdir(mode=0o700)`` on Windows grants OWNER
+# RIGHTS since the CVE-2024-4030 fix (3.13, 3.12.4+), so the store EQUIPA
+# makes itself carries it (IR80-01).
+_WINDOWS_TRUSTED_WRITER_SIDS = frozenset(
+    {"S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"}
+)
+
+
+@dataclass(frozen=True)
+class WindowsAccessEntry:
+    """One entry of a Windows access list: its type, access mask and SID."""
+
+    ace_type: int
+    mask: int
+    sid: str
+
+
+def _untrusted_windows_writers(
+    entries: Sequence[WindowsAccessEntry] | None, own_sids: Iterable[str],
+) -> list[str]:
+    """The accounts other than ``own_sids`` (this process's user and token
+    owner) and the trusted ones that ``entries`` grant the right to add,
+    change or delete a refusal record, or to take the store over. Inherit-
+    only entries count: they reach every record created in the store. An
+    entry of a type other than allow or deny counts as a grant (fail
+    closed), and ``entries`` None is a NULL access list: everyone has full
+    access."""
+    if entries is None:
+        return ["Everyone (the directory has no access list)"]
+    trusted = _WINDOWS_TRUSTED_WRITER_SIDS | set(own_sids)
+    writers: list[str] = []
+    for entry in entries:
+        if entry.ace_type == _WINDOWS_ACCESS_DENIED_ACE:
+            continue
+        if entry.ace_type != _WINDOWS_ACCESS_ALLOWED_ACE:
+            writers.append(f"{entry.sid} (an access entry of type {entry.ace_type})")
+        elif entry.mask & _WINDOWS_STORE_WRITE_RIGHTS and entry.sid not in trusted:
+            writers.append(entry.sid)
+    return writers
+
+
+def _windows_store_writers(path: Path) -> list[str]:
+    """:func:`_untrusted_windows_writers` of the access list (DACL) of
+    ``path``. Windows only; raises OSError when a security call fails or
+    there is no Windows API."""
+    import ctypes
+    from ctypes import wintypes
+
+    if not hasattr(ctypes, "WinDLL"):
+        raise OSError("no Windows security API on this platform")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    se_file_object, dacl_security_information = 1, 0x4
+    token_query, token_user, token_owner = 0x0008, 1, 4
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    class AclHeader(ctypes.Structure):
+        _fields_ = [("revision", ctypes.c_ubyte), ("padding", ctypes.c_ubyte),
+                    ("size", wintypes.WORD), ("count", wintypes.WORD),
+                    ("padding2", wintypes.WORD)]
+
+    class AccessEntry(ctypes.Structure):
+        # ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header, mask, then the SID.
+        _fields_ = [("ace_type", ctypes.c_ubyte), ("flags", ctypes.c_ubyte),
+                    ("size", wintypes.WORD), ("mask", wintypes.DWORD),
+                    ("sid_start", wintypes.DWORD)]
+
+    def sid_text(sid: int | None) -> str:
+        text = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.wstring_at(text.value)
+        finally:
+            kernel32.LocalFree(text)
+
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        os.fspath(path), se_file_object, dacl_security_information,
+        None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    if status != 0:
+        raise OSError(status, f"GetNamedSecurityInfoW failed with {status}")
+    try:
+        entries: list[WindowsAccessEntry] | None = None
+        if dacl.value:
+            entries = []
+            for number in range(AclHeader.from_address(dacl.value).count):
+                address = ctypes.c_void_p()
+                if not advapi32.GetAce(dacl, number, ctypes.byref(address)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                entry = AccessEntry.from_address(address.value)
+                known = entry.ace_type in (_WINDOWS_ACCESS_ALLOWED_ACE,
+                                           _WINDOWS_ACCESS_DENIED_ACE)
+                entries.append(WindowsAccessEntry(
+                    entry.ace_type, entry.mask if known else 0,
+                    sid_text(address.value + AccessEntry.sid_start.offset)
+                    if known else "?"))
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            own_sids = []
+            for information_class in (token_user, token_owner):
+                needed = wintypes.DWORD()
+                advapi32.GetTokenInformation(
+                    token, information_class, None, 0, ctypes.byref(needed))
+                buffer = ctypes.create_string_buffer(needed.value)
+                if not advapi32.GetTokenInformation(
+                        token, information_class, buffer, needed,
+                        ctypes.byref(needed)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                # TOKEN_USER and TOKEN_OWNER both start with the SID pointer.
+                own_sids.append(sid_text(ctypes.c_void_p.from_buffer(buffer).value))
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.LocalFree(descriptor)
+    return _untrusted_windows_writers(entries, own_sids)
+
+
+def _refusal_record(refusals_dir: Path, location: str) -> Path:
+    """The record of the repository at ``location`` (the directory holding
+    its ``.git``, or the git directory itself)."""
+    digest = hashlib.sha256(os.fsencode(location)).hexdigest()
+    return refusals_dir / f"{digest}.json"
+
+
+def _record_agent_made_repository(
+    task_id: int, project_dir: str, repository: Path,
+) -> list[Path]:
+    """Record ``repository`` (found by the N1 check) under its location, in
+    the form found and the resolved form. Returns the records written.
+
+    Raises OSError when none could be written, :class:`RefusalStoreError`
+    when the store is not a directory EQUIPA can trust (nothing is written
+    through a symlinked store).
+    """
+    found = os.fspath(repository)
+    location = os.path.dirname(found) if os.path.basename(found) == ".git" else found
+    refusals_dir = _agent_repository_refusals_dir()
+    refusals_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _check_refusal_store(refusals_dir)
+    content = json.dumps({
+        "repository": found,
+        "project_dir": project_dir,
+        "task_id": task_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, indent=2) + "\n"
+    records = []
+    for form in dict.fromkeys((os.path.abspath(location), os.path.realpath(location))):
+        record = _refusal_record(refusals_dir, form)
+        partial = record.with_name(f".{record.name}.{os.getpid()}.tmp")
+        partial.write_text(content, encoding="utf-8")
+        os.replace(partial, record)
+        records.append(record)
+    return records
+
+
+def _agent_made_repository_record(project_dir: str) -> Path | None:
+    """The refusal record of a repository location at or above
+    ``project_dir``, None if there is none. Runs no git.
+
+    Fails closed: a record that cannot be examined (anything but "no such
+    file") counts as present. Raises :class:`RefusalStoreError` when the
+    store exists but is not a directory EQUIPA can trust (IR73-01).
+    """
+    refusals_dir = _agent_repository_refusals_dir()
+    try:
+        _check_refusal_store(refusals_dir)
+    except FileNotFoundError:
+        return None  # no N1 check has recorded anything yet
+    for directory in _walk_up(project_dir):
+        record = _refusal_record(refusals_dir, directory)
+        try:
+            os.lstat(record)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return record
+        return record
+    return None
+
+
+def refuse_agent_made_repository(project_dir: str) -> None:
+    """Raise :class:`AgentMadeRepositoryError` when an N1 check recorded the
+    repository ``project_dir`` would discover; return otherwise.
+
+    S3168-03 (task #3173): call before anything runs git in the project at
+    dispatch (``_is_git_repo``, ``git worktree add``). The refusal stays
+    until the operator, having inspected or removed that repository,
+    deletes the record named in the message. A store that cannot be
+    trusted refuses every project (fail closed, IR73-01).
+    """
+    try:
+        record = _agent_made_repository_record(project_dir)
+    except RefusalStoreError as exc:
+        raise AgentMadeRepositoryError(
+            f"{project_dir}: the records of repositories EQUIPA refuses cannot be "
+            f"trusted: {exc}. Refusing to run git there: make it a directory owned "
+            f"by this user and writable by no one else, keeping the records in it."
+        ) from exc
+    if record is None:
+        return
+    raise AgentMadeRepositoryError(
+        f"{project_dir} is under a repository an EQUIPA check found in a project "
+        f"that was not git at dispatch (recorded in {record}). Refusing to run "
+        f"git there: inspect or remove that repository, then delete {record}."
+    )
+
+
+def _repository_appeared_in_non_git_project(
+    task_id: int,
+    project_dir: str,
+    when: str,
+    output: list[str] | None,
+) -> bool:
+    """True, with a durable GATE-AUDIT record, when a repository is at or
+    above ``project_dir``, a project that was not git at dispatch.
+
+    N1 (task #3168): found by a filesystem walk; no git runs. Such a
+    repository is the agent's: before this check it was only reported, the
+    task was retried in it, and the dev-test loop ran ``git diff`` there.
+    The repository is left as it is for the operator.
+
+    S3168-01 (task #3173): the walk also finds a directory that is itself a
+    git directory (:func:`_nearest_repository`), not only a ``.git`` entry.
+    S3168-03: the repository is recorded outside the project, and every
+    later dispatch of a project that would discover it is refused
+    (:func:`refuse_agent_made_repository`) until the operator deletes the
+    record; before, the next dispatch adopted it as the project's checkout.
+
+    S3168-04 (task #3172, kept with the S3168-01 walk by task #3174): a
+    symlink loop at or above ``project_dir`` cannot be walked, so nothing
+    shows that no repository is reachable through it. It is reported as the
+    repository (fail closed): the task is blocked, never retried, and the
+    check does not raise.
+
+    IR3174-04 (task #3177): the same for a directory the walk cannot
+    search, such as a project made mode 0600 (:func:`_unexaminable_directory`).
+    """
+    repository = _nearest_repository(project_dir)
+    if repository is None:
+        # ``_nearest_repository`` walks ``os.path.realpath``, which returns
+        # on a loop without seeing past it, so a loop read as "no
+        # repository". ``_nearest_git_entry`` returns the looping path
+        # itself; anything else it returns is a ``.git`` entry, which blocks
+        # the task as well.
+        repository = _nearest_git_entry(Path(project_dir))
+    if repository is None:
+        # Both walks read an entry they cannot examine as absent.
+        repository = _unexaminable_directory(project_dir)
+    if repository is None:
+        return False
+    try:
+        records = _record_agent_made_repository(task_id, project_dir, repository)
+    except OSError as exc:
+        refusal = f"the refusal of later dispatches could NOT be recorded ({exc})"
+    else:
+        refusal = (
+            "later dispatches there are refused until "
+            + " and ".join(str(record) for record in records) + " is deleted"
+        )
+    _audit_task_abort(
+        task_id, "repository-appeared",
+        f"{when}: a git repository appeared at {repository} in a project that "
+        f"was not git at dispatch; no git runs there, task blocked, not retried; "
+        f"{refusal}",
+        output,
+    )
+    return True
 
 
 async def run_dev_test_loop_with_autoresearch(
@@ -771,6 +1613,14 @@ async def run_dev_test_loop_with_autoresearch(
     with outcome ``attempt_cleanup_failed``. Both outcomes leave the task
     blocked.
 
+    Without ``task_branch`` the project was not git at dispatch (every loop
+    gives a git project's task a worktree and a branch). R3166-01 (task
+    #3168): the attempts then run under
+    :func:`equipa.monitoring.dispatched_without_git`, so no change check
+    runs git there. N1: a repository found there before or after an attempt
+    is the agent's; the task stops with outcome
+    ``REPOSITORY_APPEARED_OUTCOME`` (blocked, audited, never retried).
+
     Returns:
         (result, cycles, outcome, loop_total_cost, loop_total_duration, task)
 
@@ -779,6 +1629,26 @@ async def run_dev_test_loop_with_autoresearch(
     The task dict is returned because autoresearch may re-fetch it
     between attempts to pick up reflection-injected context.
     """
+    if task_branch is not None:
+        return await _run_attempts_with_autoresearch(
+            task, project_dir, project_context, args, config, output, task_branch,
+        )
+    with dispatched_without_git(project_dir):
+        return await _run_attempts_with_autoresearch(
+            task, project_dir, project_context, args, config, output, None,
+        )
+
+
+async def _run_attempts_with_autoresearch(
+    task: dict,
+    project_dir: str,
+    project_context: dict,
+    args,
+    config: dict,
+    output: list[str] | None,
+    task_branch: str | None,
+):
+    """The retry loop of :func:`run_dev_test_loop_with_autoresearch`."""
     task_id = task["id"]
     autoresearch_on = is_feature_enabled(config, "autoresearch")
     max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
@@ -800,6 +1670,11 @@ async def run_dev_test_loop_with_autoresearch(
                 break
             if base_sha is None:
                 base_sha = head_sha
+        elif _repository_appeared_in_non_git_project(
+            task_id, project_dir, f"before attempt {retry_count + 1}", output,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
         try:
             result, cycles, outcome = await run_dev_test_loop(
                 task, project_dir, project_context, args, output=output,
@@ -852,6 +1727,11 @@ async def run_dev_test_loop_with_autoresearch(
                 )
                 outcome = "worktree_branch_mismatch"
                 break
+        elif _repository_appeared_in_non_git_project(
+            task_id, project_dir, f"after attempt {retry_count + 1} ({outcome})", output,
+        ):
+            outcome = REPOSITORY_APPEARED_OUTCOME
+            break
 
         # Success - break out of retry loop
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
@@ -884,10 +1764,12 @@ async def run_dev_test_loop_with_autoresearch(
         )
 
         # Clean up failed git branch and reset task for next attempt.
+        # R3165-01 (task #3166): without a task branch the project was not
+        # git at dispatch, so no git step may run in it.
         try:
             await cleanup_failed_attempt(
                 task_id, project_dir, attempt_reflections, output,
-                base_sha=base_sha,
+                base_sha=base_sha, expect_repository=task_branch is not None,
             )
         except AttemptCleanupError as exc:
             _audit_task_abort(task_id, "attempt-cleanup-failed", exc, output)
@@ -1080,7 +1962,7 @@ async def run_project_tasks(
 
     # Resolve project directory
     codename_lower = codename.lower().strip()
-    project_dir = PROJECT_DIRS.get(codename_lower)
+    project_dir = _equipa_constants.PROJECT_DIRS.get(codename_lower)
     if not project_dir:
         log(f"  [{codename}] ERROR: No directory mapped. Skipping.", output)
         return {
@@ -1091,6 +1973,7 @@ async def run_project_tasks(
             "tasks_blocked": [],
             "tasks_skipped": len(tasks),
             "error": "No directory mapped",
+            "refusals": ["no directory mapped for the project"],
             "total_cost": 0.0,
             "total_duration": 0.0,
         }
@@ -1118,6 +2001,7 @@ async def run_project_tasks(
             "tasks_blocked": [],
             "tasks_skipped": len(tasks),
             "error": "Directory does not exist",
+            "refusals": [f"project directory does not exist: {project_dir}"],
             "total_cost": 0.0,
             "total_duration": 0.0,
         }
@@ -1126,6 +2010,7 @@ async def run_project_tasks(
 
     completed = []
     blocked = []
+    refusals: list[str] = []
     total_cost = 0.0
     total_duration = 0.0
 
@@ -1144,7 +2029,25 @@ async def run_project_tasks(
     # One guard per project: every orchestrator merge advances it, anything
     # else trips it and the remaining tasks are refused.
     project_guard: DefaultBranchGuard | None = None
-    use_isolation = _is_git_repo(project_dir)
+    try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
+        use_isolation = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        log(f"  [{codename}] REFUSED: {exc}", output)
+        return {
+            "project_id": project_id,
+            "codename": codename,
+            "tasks_attempted": 0,
+            "tasks_completed": [],
+            "tasks_blocked": [],
+            "tasks_skipped": len(tasks),
+            "error": str(exc),
+            "refusals": [str(exc)],
+            "total_cost": 0.0,
+            "total_duration": 0.0,
+        }
     if use_isolation:
         await report_leftover_dispatch_state(project_dir)
         try:
@@ -1163,6 +2066,7 @@ async def run_project_tasks(
                 "tasks_blocked": [],
                 "tasks_skipped": len(tasks),
                 "error": f"default branch could not be pinned: {exc}",
+                "refusals": [f"default branch could not be pinned: {exc}"],
                 "total_cost": 0.0,
                 "total_duration": 0.0,
             }
@@ -1218,6 +2122,14 @@ async def run_project_tasks(
                 # Never started: the task and the rest of the queue stay todo.
                 log(f"  [{codename}] {isolated.reason}; not starting further tasks.", output)
                 break
+            if isolated.agent_outcome is None:
+                # Refused before any agent ran: recorded blocked, no agent
+                # telemetry, and the CLI exits with EXIT_DISPATCH_REFUSED.
+                update_task_status(task_id, isolated.outcome, output=output)
+                refusals.append(f"task #{task_id} {isolated.outcome}: {isolated.reason}")
+                blocked.append(task)
+                log(f"  [{codename}] Task #{task_id}: REFUSED ({isolated.reason})", output)
+                continue
             result, cycles, outcome = isolated.result, isolated.cycles, isolated.outcome
             merged_sha = isolated.merged_sha
             task = loop_totals.get("task", task)
@@ -1288,6 +2200,7 @@ async def run_project_tasks(
         "tasks_blocked": blocked,
         "tasks_skipped": 0,
         "error": None,
+        "refusals": refusals,
         "total_cost": total_cost,
         "total_duration": total_duration,
     }
@@ -1333,6 +2246,8 @@ async def run_project_dispatch(
                 "tasks_blocked": [],
                 "tasks_skipped": project_summary["total_todo"],
                 "error": str(e),
+                # R3119-04 (task #3126): a crashed project exits non-zero.
+                "refusals": [f"exception: {e}"],
                 "total_cost": 0.0,
                 "total_duration": 0.0,
             }
@@ -1341,12 +2256,17 @@ async def run_project_dispatch(
     return result
 
 
-async def run_auto_dispatch(scored: list[dict], config: dict, args) -> None:
+async def run_auto_dispatch(scored: list[dict], config: dict, args) -> list:
     """Run all project dispatches concurrently with semaphore.
 
     Prints each project's buffered output as it completes, then summary.
+    Returns the per-project results; their ``refusals`` feed
+    :func:`collect_refusals`.
     """
     max_concurrent = config.get("max_concurrent", 4)
+    refusal = concurrency_refusal(max_concurrent)
+    if refusal:
+        refuse_dispatch(refusal)
     semaphore = asyncio.Semaphore(max_concurrent)
 
     print(f"\nDispatching {len(scored)} projects "
@@ -1375,6 +2295,7 @@ async def run_auto_dispatch(scored: list[dict], config: dict, args) -> None:
 
     # Print combined summary
     print_dispatch_summary(results)
+    return results
 
 
 # --- Goals ---
@@ -1449,7 +2370,10 @@ def validate_goals(goals: list[dict]) -> list[dict]:
 
         codename = project_info.get("codename", "").lower().strip()
         pname = project_info.get("name", "").lower().strip()
-        project_dir = PROJECT_DIRS.get(codename) or PROJECT_DIRS.get(pname)
+        project_dir = (
+            _equipa_constants.PROJECT_DIRS.get(codename)
+            or _equipa_constants.PROJECT_DIRS.get(pname)
+        )
 
         if not project_dir:
             print(f"ERROR: Goal #{i + 1}: No directory mapped for project "
@@ -1532,6 +2456,8 @@ async def run_single_goal(
                 "project_id": project_id,
                 "outcome": "exception",
                 "error": str(e),
+                # R3119-04 (task #3126): a crashed goal exits non-zero.
+                "refusals": [f"exception: {e}"],
                 "rounds": 0,
                 "completed": [],
                 "blocked": [],
@@ -1551,6 +2477,9 @@ async def run_single_goal(
         "project_name": project_name,
         "project_id": project_id,
         "outcome": outcome,
+        "refusals": (
+            [f"goal stopped: {outcome}"] if outcome in GOAL_REFUSED_OUTCOMES else []
+        ),
         "rounds": rounds,
         "completed": completed,
         "blocked": blocked,
@@ -1560,12 +2489,17 @@ async def run_single_goal(
     }
 
 
-async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -> None:
+async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -> list:
     """Run multiple Manager loops concurrently with a semaphore.
 
-    Prints each goal's buffered output as it completes, then a combined summary.
+    Prints each goal's buffered output as it completes, then a combined
+    summary. Returns the per-goal results (an exception for a goal that
+    raised); their ``refusals`` feed :func:`collect_refusals`.
     """
     max_concurrent = args.max_concurrent or defaults["max_concurrent"]
+    refusal = concurrency_refusal(max_concurrent)
+    if refusal:
+        refuse_dispatch(refusal)
     semaphore = asyncio.Semaphore(max_concurrent)
 
     print(f"\nStarting {len(resolved_goals)} parallel goals "
@@ -1595,6 +2529,7 @@ async def run_parallel_goals(resolved_goals: list[dict], defaults: dict, args) -
 
     # Print combined summary
     print_parallel_summary(results)
+    return results
 
 
 # --- Parallel Tasks ---
@@ -1864,6 +2799,48 @@ async def _create_isolation_worktrees(
     return worktree_dirs
 
 
+def project_dir_in_worktree(
+    project_dir: str, worktree_dir: str,
+) -> tuple[str | None, str]:
+    """The project's directory inside a task worktree of its repository.
+
+    Task #3119: a project nested inside another repository gets a worktree
+    of the ENCLOSING repository, so its agents must run in the project's
+    sub-directory of that worktree, not at the worktree root. For a project
+    at the root of its own repository this is ``worktree_dir`` itself.
+
+    Returns ``(directory, "")``, or ``(None, reason)`` when the project is
+    not part of the checked-out tree (for example untracked or ignored in
+    the enclosing repository); the task must then be refused, never run in
+    ``project_dir``.
+    """
+    toplevel = git_toplevel(project_dir)
+    if toplevel is None:
+        return None, f"{project_dir} is not inside a git work tree"
+    try:
+        relative = Path(project_dir).resolve().relative_to(toplevel.resolve())
+    except ValueError:
+        return None, (
+            f"{project_dir} does not resolve inside its repository {toplevel}"
+        )
+    if relative == Path("."):
+        return worktree_dir, ""
+    nested_dir = Path(worktree_dir) / relative
+    if not nested_dir.is_dir():
+        return None, (
+            f"'{relative}' is not tracked by the enclosing repository "
+            f"{toplevel}, so the task worktree has no such directory"
+        )
+    # R3119-06 (task #3126): no component of ``relative`` may be a symlink,
+    # or the agent would run wherever it points (e.g. the main checkout).
+    if nested_dir.resolve() != Path(worktree_dir).resolve() / relative:
+        return None, (
+            f"'{relative}' in the task worktree resolves to "
+            f"{nested_dir.resolve()}, outside the worktree's own '{relative}'"
+        )
+    return str(nested_dir), ""
+
+
 async def _log_stale_branch_commits(project_dir: str, branch_name: str) -> None:
     """Log the commits on a stale task branch that are not on the default.
 
@@ -1906,45 +2883,41 @@ async def _retire_leftover_worktree(
     """Remove a leftover task worktree without losing uncommitted work.
 
     Uncommitted changes (untracked files included) are stashed first. The
-    worktree is force-removed only once ``git status`` reads clean.
+    worktree is force-removed only once nothing uncommitted is left in it.
+
+    R3155-01 (task #3158): whether it is a worktree of this repository is
+    read from the repository's own ``worktrees/`` entries, not by running
+    git through the directory's (agent-writable) ``.git``.
 
     Returns:
         None once the worktree is gone, otherwise the reason it was kept.
     """
     wt = str(wt_path)
-    toplevel = await git_run_async(["rev-parse", "--show-toplevel"], wt, timeout=10)
-    toplevel_path = (toplevel.stdout or "").strip()
-    if toplevel.returncode != 0 or Path(toplevel_path).resolve() != wt_path.resolve():
-        # Not a worktree of its own: git run there would act on the
-        # enclosing checkout, so neither stash nor remove it.
-        if wt_path.is_dir() and not any(wt_path.iterdir()):
+    common_dir = await _git_common_dir(project_dir)
+    registered = (
+        common_dir is not None
+        and not wt_path.is_symlink()
+        and find_worktree_git_dir(str(common_dir), os.path.realpath(wt)) is not None
+    )
+    if common_dir is None or not registered:
+        # Not a worktree of its own: git run there would act on whatever
+        # its .git names, so neither stash nor remove it.
+        if wt_path.is_dir() and not wt_path.is_symlink() and not any(wt_path.iterdir()):
             wt_path.rmdir()
             return None
         return (
             f"leftover {wt} is not a registered worktree; preserved, "
             f"resolve by hand"
         )
-    status = await git_run_async(
-        ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
+    problem = await _stash_uncommitted_in_worktree(
+        wt, task_id, branch_name, project_dir=project_dir,
     )
-    if status.returncode != 0:
+    if problem is not None:
         return (
-            f"could not read the status of leftover worktree {wt}; "
-            f"preserved, resolve by hand"
+            f"leftover worktree {wt} has uncommitted work that could not "
+            f"be stashed ({problem}); preserved, resolve by hand"
         )
-    if status.stdout.strip():
-        await _stash_uncommitted_in_worktree(wt, task_id, branch_name)
-        recheck = await git_run_async(
-            ["status", "--porcelain", "--ignore-submodules=all"], wt, timeout=15,
-        )
-        if recheck.returncode != 0 or recheck.stdout.strip():
-            return (
-                f"leftover worktree {wt} has uncommitted work that could not "
-                f"be stashed; preserved, resolve by hand"
-            )
-    remove = await git_run_async(
-        ["worktree", "remove", "--force", wt], project_dir, timeout=30,
-    )
+    remove = await remove_registered_worktree(common_dir, wt, timeout=30)
     if remove.returncode != 0:
         return (
             f"could not remove leftover worktree {wt}: "
@@ -1962,8 +2935,15 @@ async def _merge_task_branch(
     merge_sha: str | None = None,
     worktree_dir: str | None = None,
     merge_record: MergeAttempt | None = None,
+    artifact_dir: str | None = None,
+    pinned_default_sha: str | None = None,
 ) -> bool:
     """Merge a single task branch into the main repo's current branch.
+
+    ``project_dir`` is where git runs (the work-tree root); ``artifact_dir``,
+    when given, is where the review artifact is read from — the project's
+    own directory, which for a project nested in its repository is a
+    sub-directory of that root (R3119-01, task #3126).
 
     Task #3111 (gate-01): the merge target is a commit SHA, never the branch
     name. ``merge_sha`` is the commit the gate approved (the reviewed SHA);
@@ -1978,6 +2958,17 @@ async def _merge_task_branch(
     fast-forwards the default branch from the main checkout with
     ``--ff-only``. Success requires the default branch to have actually moved
     to the rebased SHA. Without a worktree there is no fallback.
+
+    Task #3131: before that fallback, a merge that conflicts ONLY in files
+    declared in :data:`equipa.generated_files.GENERATED_FILES` is completed
+    by regenerating them from the merged tree (``merge_record`` then carries
+    ``regenerated_paths`` and the resolution commit as ``post_head``). If the
+    task branch changed the generator, or the generator fails or times out,
+    the merge is aborted and fails with that reason; any other conflict takes
+    the unchanged abort / rebase path. Task #3141 (I-01): the resolution is
+    attempted only with ``pinned_default_sha`` — the run guard's expected
+    default-branch SHA — which is the generator's trust anchor; it is
+    refused unless the merge started from that SHA.
 
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
     All failures are logged to stdout — the function NEVER swallows errors
@@ -2015,7 +3006,7 @@ async def _merge_task_branch(
     # legacy repo-root artifacts via find_review_artifact for in-flight
     # runs still on the old layout.
     review_path = find_review_artifact(
-        os.fspath(project_dir), "SECURITY-REVIEW", task_id,
+        os.fspath(artifact_dir or project_dir), "SECURITY-REVIEW", task_id,
     )
     if not expect_artifact:
         _gate_audit_log(
@@ -2246,6 +3237,45 @@ async def _merge_task_branch(
             f"  [Isolation] Merge of task #{task_id} failed "
             f"(rc={merge_result.returncode}): {merge_output}"
         )
+        # Task #3131: a conflict confined to declared generated files is
+        # completed by regenerating them from the merged tree. Any other
+        # conflict (or a project without the generator) is not "applicable"
+        # and keeps the abort / rebase-fallback path below unchanged.
+        # Task #3141 (I-01): only against the guard's pinned SHA, never the
+        # re-read pre_head — without one, no generator is trusted.
+        if shutdown_requested() is None and pinned_default_sha:
+            try:
+                resolution = await _resolve_generated_conflict(
+                    project_dir, task_id, branch_name, pre_head, target_sha,
+                    pinned_default_sha, default_branch,
+                )
+            except PinnedRepositoryError:
+                # R3155-03 (task #3158): a swap seen while resolving is the
+                # merge's alarm. The checkout is mid-merge, so abort it (while
+                # the swap is still in place the abort is refused as well),
+                # then let _gated_merge_task trip the guard.
+                with contextlib.suppress(
+                    subprocess.SubprocessError, OSError, PinnedRepositoryError,
+                ):
+                    await git_run_async(["merge", "--abort"], project_dir, timeout=15)
+                raise
+            if resolution.resolved:
+                record.merged_sha = target_sha
+                record.post_head = resolution.commit
+                record.regenerated_paths = resolution.paths
+                record.regenerated_blobs = dict(resolution.blobs)
+                return True
+            if resolution.applicable:
+                await git_run_async(
+                    ["merge", "--abort"], project_dir, timeout=15,
+                )
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                record.reason = (
+                    f"conflict in generated file(s) "
+                    f"{', '.join(resolution.paths)} not regenerated: "
+                    f"{resolution.reason}"
+                )
+                return False
         await git_run_async(
             ["merge", "--abort"], project_dir, timeout=15,
         )
@@ -2372,6 +3402,90 @@ async def _merge_task_branch(
         return False
 
 
+async def _resolve_generated_conflict(
+    project_dir: str,
+    task_id: int,
+    branch_name: str,
+    pre_head: str,
+    target_sha: str,
+    pinned_sha: str,
+    default_branch: str | None = None,
+) -> ConflictResolution:
+    """Try the task #3131 generated-file resolution of a conflicted merge.
+
+    Runs in the main checkout while ``git merge`` of ``target_sha`` into
+    ``pre_head`` is in progress; see :mod:`equipa.generated_files`. Logs a
+    GATE-AUDIT line naming the files whenever the resolution applies. A git
+    or OS error while resolving is a refusal, so the caller aborts the merge.
+
+    ``pinned_sha`` is the default-branch SHA the run's guard pinned: every
+    generator blob comparison uses it, and the resolution is refused unless
+    ``pre_head`` (and HEAD mid-merge) equal it (task #3141, I-01).
+
+    A :class:`PinnedRepositoryError` (a pinned work tree swapped while
+    resolving) is raised, not turned into a refusal (R3155-03, task #3158).
+    """
+    try:
+        resolution = await resolve_generated_conflicts(
+            project_dir,
+            ours=pinned_sha,
+            theirs=target_sha,
+            head_before_merge=pre_head,
+            message=(
+                f"Merge {branch_name} at {target_sha[:12]} (task #{task_id})\n\n"
+                f"Conflict in generated file(s) resolved by regenerating them "
+                f"from the merged tree (task #3131)."
+            ),
+            default_branch=default_branch,
+        )
+    except PinnedRepositoryError:
+        raise
+    except (subprocess.SubprocessError, OSError) as exc:
+        resolution = ConflictResolution(
+            True, (), None, f"generated-file resolution errored: {exc}",
+        )
+    except Exception as exc:
+        # The main checkout is mid-merge here. Any unexpected error must
+        # still reach the caller's ``merge --abort``, never unwind past it.
+        logger.exception(
+            "[Generated-Files] resolution of task #%s errored mid-merge", task_id,
+        )
+        resolution = ConflictResolution(
+            True, (), None,
+            f"generated-file resolution errored: {type(exc).__name__}: {exc}",
+        )
+    if not resolution.applicable:
+        return resolution
+    files = ",".join(resolution.paths) or "unknown"
+    if resolution.resolved:
+        print(
+            f"  [Isolation] Task #{task_id}: merge conflicted only in generated "
+            f"file(s) {files}; regenerated from the merged tree and committed "
+            f"{resolution.commit[:12]}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=generated-files-regenerated files={files} "
+            f"branch={branch_name} sha={target_sha} before={pre_head} "
+            f"merge_commit={resolution.commit}",
+            task_id=task_id,
+            event="generated-files-regenerated",
+        )
+    else:
+        print(
+            f"  [Isolation] Merge FAILED for task #{task_id}: conflict in "
+            f"generated file(s) {files} not regenerated: {resolution.reason}"
+        )
+        _gate_audit_log(
+            f"task={task_id} event=generated-files-not-regenerated "
+            f"files={files} branch={branch_name} sha={target_sha} "
+            f"pinned={pinned_sha} before={pre_head} "
+            f"reason={resolution.reason}",
+            task_id=task_id,
+            event="generated-files-not-regenerated",
+        )
+    return resolution
+
+
 def _git_output(result: subprocess.CompletedProcess, limit: int = 400) -> str:
     """stdout and stderr of a git call on one line, for failure logs.
 
@@ -2387,45 +3501,100 @@ def _git_output(result: subprocess.CompletedProcess, limit: int = 400) -> str:
     return combined[:limit]
 
 
+@contextlib.asynccontextmanager
+async def _task_worktree_git(
+    project_dir: str, worktree_dir: str,
+) -> AsyncIterator[AgentWorktreeGit]:
+    """:func:`agent_worktree_git` for a task worktree of the repository
+    ``project_dir`` is checked out from. Raises :class:`AgentWorktreeGitError`.
+    """
+    common_dir = await _git_common_dir(project_dir)
+    if common_dir is None:
+        raise AgentWorktreeGitError(
+            f"could not locate the git common dir of {project_dir}"
+        )
+    async with agent_worktree_git(common_dir, worktree_dir) as worktree_git:
+        yield worktree_git
+
+
 async def _stash_uncommitted_in_worktree(
     wt_path: str,
     task_id: int,
     branch_name: str,
-) -> None:
+    *,
+    project_dir: str,
+) -> str | None:
     """Stash any uncommitted changes inside ``wt_path`` onto its branch.
 
-    Runs inside the worktree itself so the stash lands on ``branch_name``'s
-    HEAD. Includes untracked files (``-u``) so newly-created agent files
-    are preserved. Stash message is tagged so it can be located later by
+    The stash lands on the worktree's HEAD (``branch_name``'s, normally).
+    Includes untracked files (``-u``) so newly-created agent files are
+    preserved. Stash message is tagged so it can be located later by
     rescue tooling: ``equipa-early-term task-<id>``.
 
-    Silent failure paths (missing git, no changes, locked index) are
-    logged but never raised — cleanup must continue even if the stash
-    cannot be saved.
+    R3155-01 (task #3158): git never runs on what the worktree's ``.git``
+    names, nor with any config, attributes file or driver the agent could
+    plant (:func:`equipa.git_ops.agent_worktree_git`). A worktree that cannot
+    be inspected that way is not stashed; that is logged and written to the
+    GATE-AUDIT log.
+
+    Returns None when nothing uncommitted is left to lose (clean, or
+    stashed), otherwise why the work could not be saved. Never raises:
+    cleanup must continue even if the stash cannot be saved.
     """
     if not Path(wt_path).exists():
-        return
+        return None
+    stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
     try:
-        status = await git_run_async(
-            ["status", "--porcelain", "--ignore-submodules=all"], wt_path, timeout=15,
-        )
-        if status.returncode != 0 or not status.stdout.strip():
-            return
-        stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
-        result = await git_run_async(
-            ["stash", "push", "-u", "-m", stash_msg],
-            wt_path, timeout=30,
-        )
-        if result.returncode == 0 and "No local changes" not in result.stdout:
-            print(
-                f"  [Isolation] Task #{task_id}: stashed uncommitted work "
-                f"on '{branch_name}' as '{stash_msg}'"
+        async with _task_worktree_git(project_dir, wt_path) as worktree_git:
+            status = await worktree_git.run(
+                ["status", "--porcelain", "--ignore-submodules=all"], timeout=15,
             )
-    except (subprocess.SubprocessError, OSError) as e:
-        print(
-            f"  [Isolation] Could not stash uncommitted work for task "
-            f"#{task_id} on '{branch_name}': {e}"
+            if status.returncode != 0:
+                problem = f"git status failed: {_git_output(status)}"
+            elif not status.stdout.strip():
+                return None
+            else:
+                # A stash compares submodule entries with their directories
+                # by running git inside them, on the agent's config.
+                await worktree_git.skip_submodule_work_trees()
+                result = await worktree_git.run(
+                    ["stash", "push", "-u", "-m", stash_msg], timeout=30,
+                )
+                if result.returncode != 0 or "No local changes" in result.stdout:
+                    problem = f"git stash saved nothing: {_git_output(result)}"
+                else:
+                    try:
+                        commit = await worktree_git.store_stash()
+                    except AgentWorktreeGitError:
+                        # The stash already cleared the work tree but is not
+                        # in the repository (refs/stash locked, ...): put the
+                        # work back, so a kept worktree still holds it.
+                        # --quiet: otherwise the pop ends by running git
+                        # status, which looks inside submodules again.
+                        await worktree_git.run(
+                            ["stash", "pop", "--index", "--quiet"], timeout=30,
+                        )
+                        raise
+                    print(
+                        f"  [Isolation] Task #{task_id}: stashed uncommitted work "
+                        f"on '{branch_name}' as '{stash_msg}' ({commit[:12]})"
+                    )
+                    return None
+    except AgentWorktreeGitError as exc:
+        problem = str(exc)
+        _gate_audit_log(
+            f"task={task_id} event=worktree-stash-skipped branch={branch_name} "
+            f"reason={escape_audit_text(problem)}",
+            task_id=task_id,
+            event="worktree-stash-skipped",
         )
+    except (subprocess.SubprocessError, OSError) as exc:
+        problem = str(exc)
+    print(
+        f"  [Isolation] Could not stash uncommitted work for task "
+        f"#{task_id} on '{branch_name}': {problem}"
+    )
+    return problem
 
 
 async def _cleanup_worktrees(
@@ -2440,8 +3609,12 @@ async def _cleanup_worktrees(
     investigations have evidence of which step failed.
 
     Uses ``git_run_async`` so the per-task ``git worktree remove`` and
-    ``git branch -D`` calls do not block the event loop.
+    ``git branch -D`` calls do not block the event loop. FF-3158 (task
+    #3162): ``worktree remove`` names the repository found from
+    ``project_dir`` explicitly (:func:`equipa.git_ops.remove_registered_worktree`);
+    when it cannot be found, the worktree is kept.
     """
+    common_dir = await _git_common_dir(project_dir)
     for task_id, wt_path in worktree_dirs.items():
         branch_name = f"forge-task-{task_id}"
         try:
@@ -2457,12 +3630,27 @@ async def _cleanup_worktrees(
             # running `git stash pop`.
             if task_id not in merged_tasks:
                 await _stash_uncommitted_in_worktree(
-                    wt_path, task_id, branch_name,
+                    wt_path, task_id, branch_name, project_dir=project_dir,
                 )
-            await git_run_async(
-                ["worktree", "remove", "--force", wt_path],
-                project_dir, timeout=30,
-            )
+            if common_dir is None:
+                print(
+                    f"  [Isolation] Cleanup error for task #{task_id} "
+                    f"(branch '{branch_name}'): could not locate the "
+                    f"repository of {project_dir}; worktree {wt_path} kept"
+                )
+                continue
+            removal = await remove_registered_worktree(common_dir, wt_path, timeout=30)
+            if removal.returncode != 0:
+                # R3162-02 (task #3165): git refuses a worktree whose .git the
+                # agent rewrote, or one it locked. The directory stays, so say
+                # so; the branch it still holds cannot be deleted either.
+                print(
+                    f"  [Isolation] Cleanup error for task #{task_id} "
+                    f"(branch '{branch_name}'): git refused to remove worktree "
+                    f"{wt_path} (rc={removal.returncode}): {_git_output(removal)}; "
+                    f"worktree and branch kept"
+                )
+                continue
             if task_id in merged_tasks:
                 await git_run_async(
                     ["branch", "-D", branch_name], project_dir, timeout=10,
@@ -2570,6 +3758,294 @@ def _security_review_blocks_merge(
         return False, None
     blocks = counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
     return blocks, counts
+
+
+@dataclass(frozen=True)
+class _HazardScan:
+    """Hazards found and the resolved directories that were scanned."""
+
+    hazards: list[str]
+    directories: frozenset[Path]
+
+
+async def _collect_repo_hazards(
+    directories: list[str | None],
+    *,
+    already_scanned: frozenset[Path] = frozenset(),
+) -> _HazardScan:
+    """:func:`find_repo_execution_hazards` for each directory, deduplicated.
+
+    ``None`` entries and directories in ``already_scanned`` (compared
+    resolved) are skipped.
+    """
+    hazards: list[str] = []
+    scanned = set(already_scanned)
+    for directory in directories:
+        if directory is None:
+            continue
+        resolved = Path(directory).resolve()
+        if resolved in scanned:
+            continue
+        scanned.add(resolved)
+        for hazard in await find_repo_execution_hazards(directory):
+            if hazard not in hazards:
+                hazards.append(hazard)
+    return _HazardScan(hazards, frozenset(scanned))
+
+
+async def _git_common_dir(directory: str | os.PathLike) -> Path | None:
+    """Resolved git common dir of ``directory``, None when git cannot say."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--git-common-dir"], directory, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[git] no common dir for %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    if result.returncode != 0 or not printed:
+        return None
+    common = Path(printed)
+    if not common.is_absolute():
+        common = Path(directory) / common
+    return common.resolve()
+
+
+async def _common_dir_mismatch(
+    repo_root: str | os.PathLike, worktree_root: str | os.PathLike,
+) -> str | None:
+    """Why ``worktree_root`` is not a worktree of ``repo_root``'s repository."""
+    repo_common = await _git_common_dir(repo_root)
+    worktree_common = await _git_common_dir(worktree_root)
+    if repo_common is None or worktree_common is None:
+        return (
+            f"could not locate the git common dir of {repo_root} or "
+            f"{worktree_root}"
+        )
+    if repo_common != worktree_common:
+        return (
+            f"{repo_root} uses the repository at {repo_common} but its task "
+            f"worktree {worktree_root} uses {worktree_common} (a .git file or "
+            f"similar GIT_DIR redirect)"
+        )
+    return None
+
+
+@dataclass
+class _MergePins:
+    """Pinned repositories for one merge and the descriptors they hold."""
+    repositories: list[PinnedGitRepository]
+    fds: list[int]
+
+    def close(self) -> None:
+        for fd in self.fds:
+            os.close(fd)
+        self.fds.clear()
+
+
+async def _pin_merge_repositories(
+    guard: DefaultBranchGuard, work_tree: str, worktree_dir: str | None,
+) -> _MergePins:
+    """Open the repositories the merge must use, as recorded at the snapshot.
+
+    R3146-01 (task #3151): ``guard.verify`` proved the identity a moment ago,
+    but git would discover the repository again on every call, so a ``.git``
+    swapped in between redirected the merge (and its filter drivers) into
+    another repository. The main checkout's git dir and common dir are
+    opened by their snapshot realpaths and must have their snapshot inodes.
+    The task worktree's git dir is opened INSIDE the pinned common dir (its
+    ``worktrees/<name>`` entry, no symlink), so it cannot be elsewhere; the
+    merge then checks its branch and HEAD through that pin.
+
+    git's files ref backend reads refs through the ``commondir`` file of the
+    git dir, whatever ``GIT_COMMON_DIR`` says (git 2.43); config, objects and
+    so every driver do follow the pin. A ``commondir`` that does not name the
+    pinned common dir is refused here. One planted during the merge can move
+    only refs, never run another repository's drivers, and the post-merge
+    identity check (``record_merge``) trips on it.
+
+    R3155-02 (task #3158): both work trees are opened once. The main
+    checkout's path is read from its descriptor, and the pins record each
+    descriptor's inode and start git in it, so the directory checked is the
+    directory pinned and the one git uses.
+
+    A guard without an identity (hand-built or a test double) pins nothing.
+    Raises :class:`PinnedRepositoryError` when anything does not match.
+    """
+    identity = getattr(guard, "identity", None)
+    if identity is None:
+        return _MergePins([], [])
+    if not fd_pinning_available():
+        if os.path.realpath(work_tree) != identity.work_tree:
+            raise _merge_work_tree_mismatch(work_tree, identity)
+        return await _pin_merge_repositories_by_path(identity, work_tree, worktree_dir)
+    pins = _MergePins([], [])
+    try:
+        work_tree_fd = open_work_tree(work_tree)
+        pins.fds.append(work_tree_fd)
+        if descriptor_path(work_tree_fd) != identity.work_tree:
+            raise _merge_work_tree_mismatch(work_tree, identity)
+        common_fd = open_pinned_directory(identity.common_dir, identity.common_dir_id)
+        pins.fds.append(common_fd)
+        git_dir_fd = common_fd
+        if identity.git_dir_id != identity.common_dir_id:
+            git_dir_fd = open_pinned_directory(identity.git_dir, identity.git_dir_id)
+            pins.fds.append(git_dir_fd)
+        _check_commondir_file(
+            git_dir_fd, identity.git_dir, identity.common_dir,
+            linked=git_dir_fd != common_fd,
+        )
+        # Keyed by the path the merge passes (F2, task #3155); the path of
+        # its descriptor was checked against the snapshot above.
+        pins.repositories.append(pinned_repository(
+            work_tree, git_dir_fd, common_fd,
+            git_dir=identity.git_dir, common_dir=identity.common_dir,
+            work_tree_fd=work_tree_fd,
+        ))
+        if worktree_dir is not None:
+            admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
+            worktrees_fd = open_pinned_directory("worktrees", None, dir_fd=common_fd)
+            try:
+                admin_fd = open_pinned_directory(admin, None, dir_fd=worktrees_fd)
+            finally:
+                os.close(worktrees_fd)
+            pins.fds.append(admin_fd)
+            admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
+            _check_commondir_file(admin_fd, admin_dir, identity.common_dir, linked=True)
+            task_tree_fd = open_work_tree(worktree_dir)
+            pins.fds.append(task_tree_fd)
+            pins.repositories.append(pinned_repository(
+                worktree_dir, admin_fd, common_fd,
+                git_dir=admin_dir, common_dir=identity.common_dir,
+                work_tree_fd=task_tree_fd,
+            ))
+    except BaseException:
+        pins.close()
+        raise
+    return pins
+
+
+def _merge_work_tree_mismatch(
+    work_tree: str, identity: RepositoryIdentity,
+) -> PinnedRepositoryError:
+    return PinnedRepositoryError(
+        f"the merge would run in {work_tree}, not in the work tree "
+        f"{identity.work_tree} pinned at the snapshot"
+    )
+
+
+async def _pin_merge_repositories_by_path(
+    identity: RepositoryIdentity, work_tree: str, worktree_dir: str | None,
+) -> _MergePins:
+    """:func:`_pin_merge_repositories` without ``/proc/self/fd``.
+
+    git is given the snapshot realpaths after an inode check. That is never
+    a fresh discovery, but a rename between the check and a git call still
+    redirects it; the descriptor pin is the rename-proof form.
+    """
+    check_pinned_directory(identity.common_dir, identity.common_dir_id)
+    check_pinned_directory(identity.git_dir, identity.git_dir_id)
+    _check_commondir_file(
+        None, identity.git_dir, identity.common_dir,
+        linked=identity.git_dir_id != identity.common_dir_id,
+    )
+    repositories = [pinned_repository_by_path(
+        work_tree, git_dir=identity.git_dir, common_dir=identity.common_dir,
+    )]
+    if worktree_dir is not None:
+        admin = await _worktree_admin_name(worktree_dir, identity.common_dir)
+        admin_dir = os.path.join(identity.common_dir, "worktrees", admin)
+        _check_commondir_file(None, admin_dir, identity.common_dir, linked=True)
+        repositories.append(pinned_repository_by_path(
+            worktree_dir, git_dir=admin_dir, common_dir=identity.common_dir,
+        ))
+    return _MergePins(repositories, [])
+
+
+# git writes a worktree's commondir as a short relative path ("../..").
+_COMMONDIR_READ_LIMIT = 4096
+
+
+def _check_commondir_file(
+    git_dir_fd: int | None, git_dir: str, common_dir: str, *, linked: bool,
+) -> None:
+    """Refuse a ``commondir`` file in the pinned git dir that does not name
+    ``common_dir``. A repository's own git dir (``linked=False``) has none;
+    a linked worktree's names the common dir, usually relatively. Read
+    through ``git_dir_fd`` when given, else by path.
+
+    F3 (task #3155): the agent can plant a FIFO or a directory under that
+    name. Only a regular file is read (``lstat`` first, then the opened
+    descriptor must be that same regular file); the open never blocks, and
+    every OS error is a :class:`PinnedRepositoryError`, so a plant blocks
+    the merge instead of hanging the event loop or crashing the run.
+    """
+    target = "commondir" if git_dir_fd is not None else os.path.join(git_dir, "commondir")
+    try:
+        planted = os.stat(target, dir_fd=git_dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if linked:
+            raise PinnedRepositoryError(
+                f"the worktree git dir {git_dir} has no commondir file"
+            ) from None
+        return
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read {git_dir}/commondir: {exc.strerror}"
+        ) from exc
+    if not stat.S_ISREG(planted.st_mode):
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir is not a regular file "
+            f"(mode {stat.filemode(planted.st_mode)})"
+        )
+    if planted.st_size > _COMMONDIR_READ_LIMIT:
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir is {planted.st_size} bytes, longer than any "
+            f"common dir path git writes"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(target, flags, dir_fd=git_dir_fd)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (planted.st_dev, planted.st_ino):
+                raise PinnedRepositoryError(
+                    f"{git_dir}/commondir was replaced while it was being read"
+                )
+            content = os.read(fd, _COMMONDIR_READ_LIMIT + 1)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read {git_dir}/commondir: {exc.strerror}"
+        ) from exc
+    named = content.decode("utf-8", "replace").rstrip("\r\n")
+    if not linked or os.path.normpath(os.path.join(git_dir, named)) != common_dir:
+        raise PinnedRepositoryError(
+            f"{git_dir}/commondir names {named[:200]!r}, not the pinned git "
+            f"common dir {common_dir}"
+        )
+
+
+async def _worktree_admin_name(worktree_dir: str, common_dir: str) -> str:
+    """Name of ``worktree_dir``'s git dir under ``<common_dir>/worktrees``."""
+    try:
+        result = await git_run_async(
+            ["rev-parse", "--absolute-git-dir"], worktree_dir, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the git dir of the task worktree {worktree_dir}: {exc}"
+        ) from exc
+    printed = (result.stdout or "").strip()
+    admin = os.path.realpath(printed) if result.returncode == 0 and printed else ""
+    if os.path.dirname(admin) != os.path.join(common_dir, "worktrees"):
+        raise PinnedRepositoryError(
+            f"the task worktree {worktree_dir} uses the git dir "
+            f"{admin or 'none'}, not one of the worktrees of the pinned "
+            f"repository {common_dir}"
+        )
+    return os.path.basename(admin)
 
 
 async def _gated_merge_task(
@@ -2686,19 +4162,7 @@ async def _gated_merge_task(
         )
         return finish("skipped", f"outcome {outcome} is not merge-eligible")
 
-    # Task #3111: repository state the hardened git helper cannot neutralise
-    # blocks before ANY gate evaluation — the reviewer agent's git honours
-    # replace refs, and driver config runs programs during the merge. The
-    # task worktree is scanned too: the rebase fallback runs git there, and
-    # its own config.worktree is invisible from the main checkout.
-    hazards: list[str] = []
-    for scan_dir in (project_dir, worktree_dir):
-        if scan_dir is None:
-            continue
-        for hazard in await find_repo_execution_hazards(scan_dir):
-            if hazard not in hazards:
-                hazards.append(hazard)
-    if hazards:
+    def refuse_hazards(hazards: list[str]) -> str:
         detail = "; ".join(hazards)
         print(
             f"  [Merge-Integrity] Task #{task_id}: refusing to gate or merge "
@@ -2711,9 +4175,62 @@ async def _gated_merge_task(
         )
         return finish("blocked", f"repository hazard: {detail}")
 
+    # Task #3111: repository state the hardened git helper cannot neutralise
+    # blocks before ANY gate evaluation — the reviewer agent's git honours
+    # replace refs, and driver config runs programs during the merge. The
+    # task worktree is scanned too: the rebase fallback runs git there, and
+    # its own config.worktree is invisible from the main checkout.
+    #
+    # IND-02 (task #3132): the scan runs on the OPERATOR's paths BEFORE any
+    # work-tree root is resolved. ``rev-parse --show-toplevel`` follows an
+    # agent-written ``core.worktree``; scanning the resolved root scanned
+    # whichever repository the agent named, and the gate and the merge then
+    # ran there while this project's task was recorded merged.
+    scanned = await _collect_repo_hazards([project_dir, worktree_dir])
+    if scanned.hazards:
+        return refuse_hazards(scanned.hazards)
+
+    # R3119-01 (task #3126): every git call of the gate and the merge runs
+    # at the work-tree ROOT. A project nested in a sub-directory of its
+    # repository keeps ``project_dir`` only for its review artifact; from
+    # the sub-directory, agent-written config could narrow the gate diff.
+    # git_toplevel_async names no root that does not contain the directory
+    # (IND-02, task #3132).
+    repo_root = await git_toplevel_async(project_dir)
+    worktree_root = (
+        await git_toplevel_async(worktree_dir) if worktree_dir is not None else None
+    )
+    if repo_root is None or (worktree_dir is not None and worktree_root is None):
+        unreadable = project_dir if repo_root is None else worktree_dir
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=no-work-tree-root "
+            f"dir={unreadable}",
+            task_id=task_id,
+            event="merge-skipped",
+        )
+        return finish("blocked", f"no readable git work tree at {unreadable}")
+    git_dir = str(repo_root)
+    git_worktree_dir = str(worktree_root) if worktree_root is not None else None
+
+    # IND-02 (task #3132): a ``.git`` file planted in a nested project's
+    # directory (a GIT_DIR-style redirect) makes that directory the root of
+    # ANOTHER repository. The orchestrator made the task worktree from the
+    # project's repository, so both must share one git common dir.
+    if worktree_root is not None:
+        mismatch = await _common_dir_mismatch(repo_root, worktree_root)
+        if mismatch:
+            return refuse_hazards([mismatch])
+
+    # Roots not scanned above (a nested project's) are scanned as well.
+    root_hazards = await _collect_repo_hazards(
+        [git_dir, git_worktree_dir], already_scanned=scanned.directories,
+    )
+    if root_hazards.hazards:
+        return refuse_hazards(root_hazards.hazards)
+
     if guard is None:
         try:
-            guard = await DefaultBranchGuard.snapshot(project_dir)
+            guard = await DefaultBranchGuard.snapshot(git_dir)
         except MergeIntegrityError as exc:
             _gate_audit_log(
                 f"task={task_id} event=merge-skipped "
@@ -2722,12 +4239,18 @@ async def _gated_merge_task(
                 event="merge-skipped",
             )
             return finish("blocked", f"default branch could not be pinned: {exc}")
-    if not await guard.verify(f"pre-gate task={task_id}", task_id=task_id):
+    # IND3132-01 (task #3146): the repository the gate is about to diff and
+    # merge in, and the task worktree, must be the one the guard pinned
+    # before any agent ran.
+    if not await guard.verify(
+        f"pre-gate task={task_id}", task_id=task_id,
+        directories=(git_dir, git_worktree_dir),
+    ):
         return finish("blocked", guard.alert or "default branch moved")
 
     # gate-01: pin the branch to ONE commit. The gate diffs that commit and
     # the merge names it, so the branch moving afterwards changes nothing.
-    branch_sha = await resolve_commit(project_dir, f"refs/heads/{branch}")
+    branch_sha = await resolve_commit(git_dir, f"refs/heads/{branch}")
 
     # === Single GateDecision, computed from ground truth (task #2706) ===
     # Diff the task BRANCH ref (not HEAD) so the file list is identical in
@@ -2735,7 +4258,7 @@ async def _gated_merge_task(
     # (main checkout on the default branch, work on a shared branch ref).
     # base_ref omitted -> auto-detect default branch (#2479).
     changed_files = await get_changed_files_for_branch(
-        project_dir, head_ref=branch_sha or branch,
+        git_dir, head_ref=branch_sha or branch,
     )
     decision: GateDecision = decide_merge_gate(
         changed_files,
@@ -2790,7 +4313,7 @@ async def _gated_merge_task(
             merge_sha = review_record.reviewed_sha
 
     if merge_sha is not None and await is_ancestor(
-        project_dir, merge_sha, guard.expected_sha,
+        git_dir, merge_sha, guard.expected_sha,
     ):
         _gate_audit_log(
             f"task={task_id} event=merge-noop branch={branch} "
@@ -2805,7 +4328,10 @@ async def _gated_merge_task(
         )
         return finish("noop", "approved commit already on the default branch", merge_sha)
 
-    if not await guard.verify(f"pre-merge task={task_id}", task_id=task_id):
+    if not await guard.verify(
+        f"pre-merge task={task_id}", task_id=task_id,
+        directories=(git_dir, git_worktree_dir),
+    ):
         return finish("blocked", guard.alert or "default branch moved")
     shutdown_signal = shutdown_requested()
     if shutdown_signal is not None:
@@ -2822,6 +4348,17 @@ async def _gated_merge_task(
             event="merge-skipped",
         )
         return finish("merge_failed", reason)
+    # R3146-01 (task #3151): from here on git never discovers the repository.
+    # The pinned git dirs are opened and inode-checked now; every merge-path
+    # git call in the main checkout or the task worktree runs on them.
+    try:
+        pins = await _pin_merge_repositories(guard, git_dir, git_worktree_dir)
+    except PinnedRepositoryError as exc:
+        guard.trip(
+            f"pre-merge task={task_id}", await guard.current_sha(),
+            task_id=task_id, detail=str(exc),
+        )
+        return finish("blocked", guard.alert or str(exc))
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
         f"sha={merge_sha or 'MISSING'} doc_only={decision.doc_only} "
@@ -2836,14 +4373,17 @@ async def _gated_merge_task(
         # the artifact requirement; everything else demands it fail-closed.
         # dispatch-06: SIGTERM/SIGINT are deferred for the merge, so it
         # finishes or is aborted before the orchestrator acts on them.
-        async with MergeSignalShield(project_dir, context=f"merge of {branch}"):
-            merged = await _merge_task_branch(
-                project_dir, task_id, branch,
-                expect_artifact=decision.expect_artifact,
-                merge_sha=merge_sha,
-                worktree_dir=worktree_dir,
-                merge_record=attempt,
-            )
+        with git_repositories_pinned(*pins.repositories):
+            async with MergeSignalShield(git_dir, context=f"merge of {branch}"):
+                merged = await _merge_task_branch(
+                    git_dir, task_id, branch,
+                    expect_artifact=decision.expect_artifact,
+                    merge_sha=merge_sha,
+                    worktree_dir=git_worktree_dir,
+                    merge_record=attempt,
+                    artifact_dir=project_dir,
+                    pinned_default_sha=guard.expected_sha,
+                )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-blocked detail={exc}",
@@ -2851,24 +4391,47 @@ async def _gated_merge_task(
             event="defensive-invariant-blocked",
         )
         return finish("blocked", f"defensive invariant: {exc}")
+    except PinnedRepositoryError as exc:
+        # F2 (task #3155): a work tree swapped during the merge, or a git
+        # call outside the pinned work trees, was refused before git ran.
+        guard.trip(
+            f"merge task={task_id}", await guard.current_sha(),
+            task_id=task_id, detail=str(exc),
+        )
+        return finish("blocked", guard.alert or str(exc))
+    finally:
+        pins.close()
     if merged:
         landed_sha = attempt.merged_sha or merge_sha
         if landed_sha is None or not await guard.record_merge(
             task_id, landed_sha, post_head=attempt.post_head,
+            regenerated_paths=attempt.regenerated_paths,
+            regenerated_blobs=attempt.regenerated_blobs,
         ):
             return finish(
                 "blocked",
                 guard.alert or "merged commit could not be verified on the "
                 "default branch",
             )
+        reason = "merged"
+        regenerated_note = ""
+        if attempt.regenerated_paths:
+            # Task #3131: the regenerated content is part of what was merged,
+            # so the recorded merged SHA is the resolution commit itself (the
+            # guard has just verified it differs from the approved merge in
+            # the regenerated generated files only).
+            landed_sha = attempt.post_head
+            files = ",".join(attempt.regenerated_paths)
+            reason = f"merged; regenerated generated file(s) {files}"
+            regenerated_note = f" regenerated={files}"
         _gate_audit_log(
             f"task={task_id} event=merge-succeeded branch={branch} "
             f"merged_sha={landed_sha} "
-            f"default_after={guard.expected_sha}",
+            f"default_after={guard.expected_sha}{regenerated_note}",
             task_id=task_id,
             event="merge-succeeded",
         )
-        return finish("merged", "merged", landed_sha)
+        return finish("merged", reason, landed_sha)
     if not await guard.verify(f"after-failed-merge task={task_id}", task_id=task_id):
         return finish("blocked", guard.alert or "default branch moved")
     reason = attempt.reason or "merge failed"
@@ -2881,6 +4444,38 @@ async def _gated_merge_task(
 
 
 MERGE_ELIGIBLE_OUTCOMES: tuple[str, ...] = ("tests_passed", "no_tests")
+
+# An agent that reports "already implemented / no changes needed" ends with
+# this outcome, which update_task_status records as done WITHOUT a merge.
+NO_CHANGES_OUTCOME = "early_completed_no_changes"
+# That claim contradicted by the task branch (commits or uncommitted work):
+# recorded as blocked, nothing reviewed or merged, the branch kept.
+NO_CHANGES_CONTRADICTED_OUTCOME = "no_changes_claim_contradicted"
+
+
+async def _no_changes_claim_problem(
+    project_dir: str,
+    worktree_dir: str,
+    task_branch: str,
+    trusted_sha: str | None,
+) -> str | None:
+    """Why a "no changes needed" claim is false for this branch, or None.
+
+    3112 review LOW (task #3119): the claim is true only when the task
+    branch's tip is already on the trusted default branch and the worktree
+    holds no uncommitted work. Anything else means the agent changed the
+    project, and marking the task done would strand those changes
+    unreviewed on the branch.
+    """
+    tip = await resolve_commit(project_dir, f"refs/heads/{task_branch}")
+    if tip is None:
+        return f"{task_branch} could not be resolved"
+    if trusted_sha is None or not await is_ancestor(project_dir, tip, trusted_sha):
+        return f"{task_branch} has commits that are not on the default branch"
+    dirty = await _worktree_dirty_reason(worktree_dir, project_dir=project_dir)
+    if dirty is not None:
+        return f"the worktree has uncommitted work ({dirty})"
+    return None
 
 
 async def review_task_branch(
@@ -2919,11 +4514,27 @@ async def review_task_branch(
         )
         return outcome, False
 
+    # IND3132-02 (task #3146): a submodule pointer bump can be hidden from
+    # the reviewer's own `git diff`, so it is named in the context the
+    # reviewer is given (its prompt quotes the task description).
+    review_task = task
+    pointer_note = describe_submodule_pointer_changes(changed_files)
+    if pointer_note is not None:
+        review_task = {
+            **task,
+            "description": f"{task.get('description') or ''}\n\n{pointer_note}",
+        }
+        log(
+            f"[Task #{task_id}] SECURITY GATE: reviewer told about submodule "
+            f"pointer change(s).",
+            output,
+        )
+
     review_crashed = False
     sec_result = None
     try:
         sec_result = await run_security_review(
-            task, task_dir, project_context, args,
+            review_task, task_dir, project_context, args,
             output=output,
             stable_project_dir=project_dir,
         )
@@ -3030,18 +4641,26 @@ def _empty_run_result() -> dict:
     return {"cost": 0.0, "duration": 0.0}
 
 
-async def _worktree_dirty_reason(worktree_dir: str) -> str | None:
-    """Uncommitted work (untracked files included) left in a task worktree.
+async def _worktree_dirty_reason(worktree_dir: str, *, project_dir: str) -> str | None:
+    """Uncommitted work (untracked files included) left in a task worktree
+    of ``project_dir``'s repository.
 
     ``.forge-state.json`` is agent scratch state, not work; it is removed
-    first, as :func:`_cleanup_worktrees` would remove it anyway.
+    first, as :func:`_cleanup_worktrees` would remove it anyway. R3155-01
+    (task #3158): ``git status`` runs without anything the agent could
+    plant (:func:`equipa.git_ops.agent_worktree_git`); a worktree that
+    cannot be inspected that way counts as dirty, so nothing is lost.
     """
     state_file = Path(worktree_dir) / ".forge-state.json"
     if state_file.is_file():
         state_file.unlink()
-    status = await git_run_async(
-        ["status", "--porcelain", "--ignore-submodules=all"], worktree_dir, timeout=30,
-    )
+    try:
+        async with _task_worktree_git(project_dir, worktree_dir) as worktree_git:
+            status = await worktree_git.run(
+                ["status", "--porcelain", "--ignore-submodules=all"], timeout=30,
+            )
+    except AgentWorktreeGitError as exc:
+        return f"the worktree could not be inspected safely: {exc}"
     if status.returncode != 0:
         return f"git status failed (rc={status.returncode})"
     dirty = [line for line in status.stdout.splitlines() if line.strip()]
@@ -3137,8 +4756,34 @@ async def run_task_in_isolation(
 
     delete_branch = False
     try:
+        # A nested project runs in its sub-directory of the worktree.
+        agent_dir, agent_dir_problem = project_dir_in_worktree(
+            project_dir, worktree_dir,
+        )
+        if agent_dir is None:
+            # Nothing ran: the branch is still at its fork point.
+            delete_branch = True
+            reason = f"no project directory in the task worktree: {agent_dir_problem}"
+            log(f"[Task #{task_id}] REFUSED: {reason}", output)
+            _audit_task_abort(task_id, "worktree-refused", reason, output)
+            return IsolatedTaskRun(
+                "worktree_refused", _empty_run_result(), 0, reason=reason,
+            )
+        if agent_dir != worktree_dir:
+            log(
+                f"  [Isolation] Nested project: task #{task_id} runs in "
+                f"{Path(agent_dir).relative_to(worktree_dir)} of its worktree",
+                output,
+            )
         base_sha = await resolve_commit(worktree_dir, "HEAD")
-        result, cycles, agent_outcome = await execute(worktree_dir, task_branch)
+        result, cycles, agent_outcome = await execute(agent_dir, task_branch)
+        if agent_dir != worktree_dir:
+            # R3119-05 (task #3126): the agent controls this path; only a
+            # regular file is removed, so a directory there cannot abort the
+            # review, gate and audit record below.
+            state_file = Path(agent_dir) / ".forge-state.json"
+            if state_file.is_file() and not state_file.is_symlink():
+                state_file.unlink()
         # Task #3111 (3107 review R1): an agent that left its worktree on
         # another branch must not have that branch's commits treated as the
         # task's result.
@@ -3161,8 +4806,26 @@ async def run_task_in_isolation(
             and await is_ancestor(project_dir, branch_sha, guard.expected_sha)
         )
         outcome = agent_outcome
-        if outcome in MERGE_ELIGIBLE_OUTCOMES and nothing_to_merge:
-            dirty = await _worktree_dirty_reason(worktree_dir)
+        reason = ""
+        claim_problem = (
+            await _no_changes_claim_problem(
+                project_dir, worktree_dir, task_branch, guard.expected_sha,
+            )
+            if outcome == NO_CHANGES_OUTCOME else None
+        )
+        if claim_problem is not None:
+            # 3112 review LOW: "no changes needed" is recorded as done without
+            # a merge, so commits behind it would stay unreviewed on the branch.
+            outcome = NO_CHANGES_CONTRADICTED_OUTCOME
+            reason = (
+                f"agent reported no changes needed, but {claim_problem}; "
+                f"not reviewed or merged, {task_branch} kept"
+            )
+            guard.outcomes[task_id] = MergeOutcome("skipped", reason)
+            log(f"[Task #{task_id}] {reason}", output)
+            _audit_task_abort(task_id, "no-changes-claim-contradicted", reason, output)
+        elif outcome in MERGE_ELIGIBLE_OUTCOMES and nothing_to_merge:
+            dirty = await _worktree_dirty_reason(worktree_dir, project_dir=project_dir)
             if dirty:
                 guard.outcomes[task_id] = MergeOutcome(
                     "merge_failed",
@@ -3183,7 +4846,7 @@ async def run_task_in_isolation(
             if not guard.tripped:
                 # A tripped guard blocks the merge anyway; no reviewer is paid for.
                 outcome, _ = await review_task_branch(
-                    task, worktree_dir, project_dir, project_context, args,
+                    task, agent_dir, project_dir, project_context, args,
                     outcome, output=output,
                 )
             try:
@@ -3212,7 +4875,6 @@ async def run_task_in_isolation(
                     "blocked", f"defensive invariant: {exc}",
                 )
         merged_sha: str | None = None
-        reason = ""
         if outcome in MERGE_ELIGIBLE_OUTCOMES:
             await guard.verify(f"end-of-task task={task_id}", task_id=task_id)
             final_outcome, merged_sha, reason = outcome_after_merge(
@@ -3247,7 +4909,9 @@ async def run_task_in_isolation(
                 delete_branch = (
                     tip is not None
                     and await is_ancestor(project_dir, tip, guard.expected_sha)
-                    and await _worktree_dirty_reason(worktree_dir) is None
+                    and await _worktree_dirty_reason(
+                        worktree_dir, project_dir=project_dir,
+                    ) is None
                 )
         return IsolatedTaskRun(
             outcome, result, cycles, merged_sha=merged_sha,
@@ -3388,6 +5052,30 @@ def refuse_dispatch(message: str) -> NoReturn:
     raise DispatchRefused(message)
 
 
+def collect_refusals(results: list) -> list[str]:
+    """Every refusal recorded in ``--auto-run`` or ``--parallel-goals`` results.
+
+    3112 review (task #3119): a project or goal refused inside a
+    multi-project run (unmapped directory, unpinnable default branch, a task
+    refused its worktree, a goal stopped because the default branch moved)
+    used to leave the process exiting 0. Each entry is prefixed with its
+    project so the CLI can name it when it exits non-zero.
+
+    R3119-04 (task #3126): an exception returned by
+    ``gather(..., return_exceptions=True)`` is a refusal too.
+    """
+    refusals: list[str] = []
+    for entry in results:
+        if isinstance(entry, BaseException):
+            refusals.append(f"exception: {type(entry).__name__}: {entry}")
+            continue
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("codename") or entry.get("project_name") or "?"
+        refusals.extend(f"{label}: {reason}" for reason in entry.get("refusals") or ())
+    return refusals
+
+
 def resolve_max_concurrent(args) -> int:
     """Concurrency cap for ``--tasks``: CLI flag, else dispatch config, else 4.
 
@@ -3405,6 +5093,9 @@ def resolve_max_concurrent(args) -> int:
         source = "dispatch config max_concurrent"
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         refuse_dispatch(f"{source} must be a positive integer, got {value!r}")
+    refusal = concurrency_refusal(value, source)
+    if refusal:
+        refuse_dispatch(refusal)
     return value
 
 
@@ -3517,7 +5208,13 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # historical `len(tasks) > 1` guard silently dropped isolation for N=1
     # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
-    use_worktrees = _is_git_repo(project_dir)
+    try:
+        # S3168-03 (task #3173): before any git runs in the project.
+        refuse_agent_made_repository(project_dir)
+        use_worktrees = _is_git_repo(project_dir)
+    except GitRepositoryUnreadableError as exc:
+        # R3119-02 (task #3126): never run an unreadable repo ungated.
+        refuse_dispatch(str(exc))
     if use_worktrees:
         # dispatch-06: surface what earlier runs left behind (report only).
         await report_leftover_dispatch_state(project_dir)
@@ -3549,10 +5246,39 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         )
         if use_worktrees else {}
     )
+    # Task #3119: a nested project runs in its sub-directory of each
+    # worktree; a task whose worktree lacks that directory is refused.
+    agent_dirs: dict[int, str] = {}
+    for task_id, worktree_dir in list(worktree_dirs.items()):
+        agent_dir, agent_dir_problem = project_dir_in_worktree(project_dir, worktree_dir)
+        if agent_dir is None:
+            worktree_refusals[task_id] = (
+                f"no project directory in the task worktree: {agent_dir_problem}"
+            )
+            del worktree_dirs[task_id]
+            await _cleanup_worktrees(
+                project_dir, {task_id: worktree_dir}, {task_id}, worktree_base,
+            )
+            continue
+        agent_dirs[task_id] = agent_dir
 
     async def run_one_task(task):
+        # R3166-01 (task #3168): in a project that was not git at dispatch
+        # the whole of a task's turn runs under the dispatch's non-git
+        # record, its security review included. The attempts already did
+        # (run_dev_test_loop_with_autoresearch); the reviewer run after them
+        # did not, so in a repository a concurrent task's agent made in the
+        # shared project its change checks ran git, and the agent's filter.
+        # Each task of the gather is its own asyncio task, so the record
+        # covers only this task's turn.
+        if use_worktrees:
+            return await _run_one_task(task)
+        with dispatched_without_git(project_dir):
+            return await _run_one_task(task)
+
+    async def _run_one_task(task):
         output = []
-        task_dir = worktree_dirs.get(task["id"])
+        task_dir = agent_dirs.get(task["id"])
         if task_dir is None and use_worktrees:
             # dispatch-01: never fall back to the shared main checkout. A
             # task run there commits straight onto whatever it has checked
@@ -3623,6 +5349,35 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     ),
                 )
             )
+
+            if outcome == NO_CHANGES_OUTCOME and task["id"] in worktree_dirs:
+                claim_problem = await _no_changes_claim_problem(
+                    project_dir, worktree_dirs[task["id"]],
+                    f"forge-task-{task['id']}",
+                    merge_guard.expected_sha if merge_guard is not None else None,
+                )
+                if claim_problem is not None:
+                    # 3112 review LOW: never "done" with unreviewed commits.
+                    outcome = NO_CHANGES_CONTRADICTED_OUTCOME
+                    _audit_task_abort(
+                        task["id"], "no-changes-claim-contradicted",
+                        f"agent reported no changes needed, but {claim_problem}; "
+                        f"branch kept", output,
+                    )
+
+            # N1 (task #3168): every non-git task of this run shares the
+            # project. A repository that another task's agent made there
+            # after this task's last attempt blocks this task too, before
+            # the review starts an agent in the project.
+            if (
+                not use_worktrees
+                and outcome in MERGE_ELIGIBLE_OUTCOMES
+                and _repository_appeared_in_non_git_project(
+                    task["id"], project_dir, f"before the security review ({outcome})",
+                    output,
+                )
+            ):
+                outcome = REPOSITORY_APPEARED_OUTCOME
 
             # Bug 2321: review BEFORE the task can be marked done; CRITICAL/
             # HIGH findings demote the outcome so the task stays blocked and

@@ -6,6 +6,33 @@ All notable changes to EQUIPA are documented here.
 
 ### Changed
 
+- **Project path translation is configuration** (task #3183, IR80-05).
+  - **Change:** EQUIPA no longer carries a built-in mapping from one Windows share to one Linux mount.
+  - **New config key:** list the mappings under `path_translations` in `dispatch_config.json`, for example
+    `[{"from": "X:\\share", "to": "/srv/share"}]`. It is empty by default.
+  - **Where it applies:** `equipa.tasks.resolve_project_dir` and the scaffold bootstrap both use
+    `equipa.config.translate_local_path`. The bootstrap keeps its containment check after translation.
+  - **Scaffold:** auto-clone has no built-in location either.
+    - The source comes from `EQUIPA_FORGESCAFFOLD_DIR` or `forgescaffold_dir`.
+    - The allowed roots come from `EQUIPA_SCAFFOLD_ALLOWED_ROOTS`, or else from the `to` prefixes of `path_translations`.
+  - **Scripts:** their defaults now sit beside the checkout that holds them.
+  - **Docs:** see "Project Paths Recorded on Another Host" in `docs/DEPLOYMENT.md`.
+  - **Upgrading:** an install that relied on the built-in mapping must add its own `path_translations` entry and
+    `forgescaffold_dir` before it deploys.
+
+- **Non-git project guard reads command lines and the inherited environment** (task #3183, IR80-02, IR80-03).
+  - **Change:** while a project that was not a git repository at dispatch is recorded, the git runners refuse a
+    call whose config pairs or variables carry a command line (`core.sshCommand`, `core.pager`, `diff.external`,
+    `credential.helper=!...`, `core.fsmonitor=<cmd>`, `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, `GIT_PAGER` and
+    similar), as they already refused aliases. EQUIPA's own hardening pins and values that run nothing are allowed.
+  - **Inherited environment:** a runner given no `env` is now guarded on the environment its child really gets
+    (`_get_repo_env()`), not on an empty mapping.
+  - **Operator note:** `GIT_SSH_COMMAND` in the orchestrator's environment reaches git, so it refuses every git call
+    for the whole run of a non-git project. Set `GIT_SSH` (a program path, carried into the `core.sshCommand` pin)
+    instead.
+- **Windows refusal store** (task #3183, IR80-01): OWNER RIGHTS (`S-1-3-4`) is a trusted writer, so the store
+  `os.mkdir(mode=0o700)` creates on CPython 3.13 and 3.12.4+ is no longer refused. Ownership is still checked first.
+
 - **Review-agent output path** (task #2476) — security-reviewer,
   code-reviewer, and other review-style agents now write their output
   artifacts to `.equipa-artifacts/<TYPE>-<TASK_ID>.md` (e.g.
@@ -53,6 +80,17 @@ All notable changes to EQUIPA are documented here.
   - A task is `done` only after its merge landed (`tasks.merged_sha`,
     schema v12); a single-task run whose pre-dispatch pin failed is not
     merged.
+
+- **Generated-file merge conflicts** (task #3131) — a gated merge that
+  conflicts only in declared generated files
+  (`equipa.generated_files.GENERATED_FILES`, initially
+  `equipa/MODULE_DEPENDENCY_REPORT.md` from `scripts/gen_module_report.py`)
+  is completed by regenerating them from the merged tree instead of ending
+  `merge_failed`. The generator runs only when the task branch left it
+  unchanged, isolated from the orchestrator and with a timeout; the recorded
+  merged SHA is the resolution commit, and the merge-integrity check accepts
+  it only if it differs from `git merge-tree`'s merge in the regenerated
+  files alone. Any other conflict behaves as before. See CONTRIBUTING.md §7.
 
 ## [3.1.0] - 2026-03-05
 

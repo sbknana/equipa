@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Generate the review gate's table of severity-letter confusables.
+
+Usage:
+    python3 scripts/generate_severity_confusables.py CONFUSABLES_TXT
+
+CONFUSABLES_TXT is ``confusables.txt`` of Unicode Technical Standard #39
+(https://www.unicode.org/Public/security/latest/confusables.txt). For each
+letter of CRITICAL, HIGH and MEDIUM the script takes the letter's prototype
+(confusables.txt maps the capital I to the small l, every other one of
+these letters to itself) and every single code point, other than ASCII,
+whose prototype is the same. It writes:
+
+* ``equipa/severity_confusables.py``: the derived table, letter -> code
+  points, with the version and sha256 of the source file;
+* ``tests/fixtures/confusables_severity_letters.txt``: the source file's
+  header and the lines the table was derived from, so the tests can check
+  the table against the data without the full file.
+
+Re-run it when a new Unicode version adds confusables. The output is
+deterministic: the same input file gives byte-identical files.
+
+Copyright 2026 Forgeborn
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+MODULE_PATH = REPO / "equipa" / "severity_confusables.py"
+EXTRACT_PATH = REPO / "tests" / "fixtures" / "confusables_severity_letters.txt"
+LETTERS = "CRITALHGMEDU"
+_VERSION_RE = re.compile(r"^#\s*Version:\s*(\S+)", re.MULTILINE)
+# Task 3157 (R3154-06): the prototypes of LETTERS as confusables.txt gives
+# them (the capital I maps to the small l), and a plain scan of the raw
+# mapping lines "SOURCE ; TARGET ;" with one code point on each side. It
+# shares no code with severity_confusables, so a bug there that drops a
+# source line changes the table but not this count.
+LETTER_PROTOTYPES = frozenset("CRlTALHGMEDU")
+_SINGLE_MAPPING_LINE_RE = re.compile(
+    r"^([0-9A-Fa-f]{4,6})[ \t]*;[ \t]*([0-9A-Fa-f]{4,6})[ \t]*;", re.MULTILINE)
+
+
+def count_letter_mappings(text: str) -> int:
+    """How many mapping lines of ``text`` map one code point other than
+    ASCII to the prototype of a letter of LETTERS."""
+    return sum(
+        1 for match in _SINGLE_MAPPING_LINE_RE.finditer(text)
+        if int(match.group(1), 16) >= 0x80
+        and chr(int(match.group(2), 16)) in LETTER_PROTOTYPES
+    )
+
+
+def parse_confusables(text: str) -> list[tuple[str, str, str]]:
+    """(source, prototype, raw line) for every mapping line of ``text``."""
+    entries: list[tuple[str, str, str]] = []
+    for raw_line in text.splitlines():
+        data = raw_line.split("#", 1)[0].strip()
+        if not data:
+            continue
+        fields = [field.strip() for field in data.split(";")]
+        if len(fields) < 2:
+            raise ValueError(f"malformed confusables line: {raw_line!r}")
+        source = "".join(chr(int(code, 16)) for code in fields[0].split())
+        prototype = "".join(chr(int(code, 16)) for code in fields[1].split())
+        entries.append((source, prototype, raw_line))
+    return entries
+
+
+def severity_confusables(
+    entries: list[tuple[str, str, str]],
+) -> tuple[dict[str, tuple[int, ...]], list[str]]:
+    """letter -> sorted non-ASCII code points sharing its prototype, and the
+    source lines those come from (plus each letter's own mapping line)."""
+    prototypes = {source: prototype for source, prototype, _ in entries}
+    table: dict[str, tuple[int, ...]] = {}
+    used_lines: set[str] = set()
+    for letter in LETTERS:
+        prototype = prototypes.get(letter, letter)
+        code_points = set()
+        for source, target, raw_line in entries:
+            if source == letter:
+                used_lines.add(raw_line)
+            if target != prototype or len(source) != 1:
+                continue
+            used_lines.add(raw_line)
+            if not source.isascii():
+                code_points.add(ord(source))
+        if len(prototype) == 1 and not prototype.isascii():
+            code_points.add(ord(prototype))
+        table[letter] = tuple(sorted(code_points))
+    ordered_lines = [line for _, _, line in entries if line in used_lines]
+    return table, ordered_lines
+
+
+def render_module(table: dict[str, tuple[int, ...]], version: str,
+                  digest: str, mappings: int, extract_digest: str) -> str:
+    rows = []
+    for letter in sorted(table):
+        values = [f"0x{code_point:04X}," for code_point in table[letter]]
+        lines = []
+        current = "       "
+        for value in values:
+            if len(current) + 1 + len(value) > 79:
+                lines.append(current)
+                current = "       "
+            current += " " + value
+        lines.append(current)
+        rows.append(f'    "{letter}": (\n' + "\n".join(lines) + "\n    ),")
+    return (
+        '"""Unicode confusables of the letters of CRITICAL, HIGH and MEDIUM.\n'
+        "\n"
+        "GENERATED by scripts/generate_severity_confusables.py from the\n"
+        "confusables.txt of Unicode Technical Standard #39; do not edit by\n"
+        "hand. Per letter: every code point other than ASCII whose\n"
+        "confusables prototype is the letter's own (for I that is the small\n"
+        "l, so the table holds what is drawn as I or l). The review gate's\n"
+        "backstop reads these as the letter (equipa/loops.py).\n"
+        "\n"
+        "Copyright 2026 Forgeborn\n"
+        '"""\n'
+        "\n"
+        f'CONFUSABLES_VERSION = "{version}"\n'
+        f'CONFUSABLES_SHA256 = (\n    "{digest}"\n)\n'
+        "# Mapping lines of the full file whose source is one code point\n"
+        "# other than ASCII and whose target is a letter's prototype, counted\n"
+        "# apart from the table (count_letter_mappings), and the sha256 of\n"
+        "# tests/fixtures/confusables_severity_letters.txt.\n"
+        f"CONFUSABLES_LETTER_MAPPINGS = {mappings}\n"
+        f'CONFUSABLES_EXTRACT_SHA256 = (\n    "{extract_digest}"\n)\n'
+        "SEVERITY_LETTER_CONFUSABLES: dict[str, tuple[int, ...]] = {\n"
+        + "\n".join(rows) + "\n}\n"
+    )
+
+
+def render_extract(source_text: str, lines: list[str]) -> str:
+    header = []
+    for raw_line in source_text.splitlines():
+        if not raw_line.startswith("#"):
+            break
+        header.append(raw_line)
+    return "\n".join(header + ["#", "# Extract: the lines of the letters of "
+                               "CRITICAL, HIGH and MEDIUM (see "
+                               "scripts/generate_severity_confusables.py).",
+                               ""] + lines) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("confusables", type=Path)
+    args = parser.parse_args()
+    data = args.confusables.read_bytes()
+    text = data.decode("utf-8-sig")
+    version_match = _VERSION_RE.search(text)
+    if version_match is None:
+        parser.error(f"{args.confusables}: no '# Version:' header")
+    entries = parse_confusables(text)
+    table, lines = severity_confusables(entries)
+    total = sum(map(len, table.values()))
+    mappings = count_letter_mappings(text)
+    if total != mappings:
+        parser.error(f"the table holds {total} code points, but the file "
+                     f"maps {mappings} to the letters' prototypes")
+    extract = render_extract(text, lines)
+    MODULE_PATH.write_text(
+        render_module(table, version_match.group(1),
+                      hashlib.sha256(data).hexdigest(), mappings,
+                      hashlib.sha256(extract.encode("utf-8")).hexdigest()),
+        encoding="utf-8")
+    EXTRACT_PATH.write_text(extract, encoding="utf-8")
+    print(f"wrote {MODULE_PATH.name} ({total} code points) and "
+          f"{EXTRACT_PATH.name} ({len(lines)} lines)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

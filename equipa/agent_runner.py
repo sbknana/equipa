@@ -11,12 +11,15 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import filecmp
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
 import random
+import re
 import select
 import shlex
 import shutil
@@ -24,8 +27,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Iterator
+import weakref
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -50,6 +55,8 @@ def _run_started_at_utc() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from equipa.prompts import PromptResult
 
 
@@ -167,10 +174,25 @@ class AgentResult(_AgentResultRequired, total=False):
     # _run_started_at_utc.
     started_at: str
 
-from equipa import agent_launcher
+from equipa import agent_launcher, isolation, merge_safety
 from equipa.abort_controller import AbortController, create_child_abort_controller
-from equipa.bash_security import check_bash_command
+from equipa.cli_isolation import (
+    CLAUDE_CLI_ISOLATION_ARGS,
+    CLAUDE_CODE_SHELL_VAR,
+    RunConfigDirError,
+    claude_cli_env,
+    claude_cli_shell_env,
+    create_run_config_dir,
+    has_env_auth,
+    is_claude_cli,
+    isolate_claude_argv,
+    mcp_config_values,
+    remove_run_config_dir,
+    trusted_bash,
+)
+from equipa.reactive_check import ReactiveBashChecker
 from equipa.config import (
+    get_active_dispatch_config,
     get_configured_model,
     get_persistent_retry_max_attempts,
     is_feature_enabled,
@@ -182,13 +204,17 @@ from equipa.constants import (
     EARLY_TERM_WARN_TURNS,
     MCP_CONFIG,
     PROCESS_TIMEOUT,
+    PROJECT_DIRS,
     ROLE_SKILLS,
 )
 from equipa.db import bulk_log_agent_actions, classify_error
+from equipa.env_loader import active_agent_env, protect_orchestrator_process
+from equipa.redact import redact_secrets, redact_tool_input, redacted_preview
 from equipa.checkpoints import (
     SOFT_CHECKPOINT_INTERVAL,
     save_soft_checkpoint,
 )
+from equipa.git_ops import _nearest_git_entry
 from equipa.monitoring import (
     LOOP_TERMINATE_THRESHOLD,
     LOOP_WARNING_THRESHOLD,
@@ -202,6 +228,7 @@ from equipa.monitoring import (
     _get_budget_message,
     _parse_early_complete,
     detect_compaction_signals,
+    git_checks_allowed,
 )
 from equipa.output import log
 from equipa.parsing import validate_output
@@ -259,13 +286,34 @@ def is_overloaded_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is an overloaded/529 error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in [
-        "529",
-        "overloaded",
-        "overloaded_error",
-        "temporarily overloaded",
-    ])
+    return bool(_OVERLOADED_RE.search(f"{stderr} {stdout}"))
+
+
+# Retry classifiers (F1, task 3134). A status code only counts as a whole
+# token: "529" inside "15290 tokens" or "500" inside "1500" is not an API
+# error. Callers pass structured error fields (stderr, the CLI's error
+# result), never the agent's own RESULT text.
+_OVERLOADED_RE = re.compile(r"\b529\b|overloaded", re.IGNORECASE)
+_CAPACITY_RE = re.compile(r"\b(?:429|529)\b|rate limit|overloaded", re.IGNORECASE)
+_RETRYABLE_RE = re.compile(
+    r"\b(?:429|500|502|503|504)\b|rate limit|connection|timeout|econnreset"
+    r"|epipe", re.IGNORECASE)
+# The error entry both result builders add for an error_max_turns run.
+_MAX_TURNS_ERROR = "Agent hit max turns limit"
+
+
+def _structured_error_text(result: Mapping[str, Any]) -> str:
+    """The error fields the retry classifiers may read (F1, task 3134).
+
+    ``errors`` holds what the orchestrator recorded: CLI stderr, the CLI's
+    error result (an API error message), early-termination reasons. The
+    agent's ``result_text`` is never included: a RESULT block that mentions
+    "timeout" or "HTTP 500" is not an API error, and matching it relaunched
+    a finished agent up to ten times.
+    """
+    errors = result.get("errors") or []
+    return " ".join(error for error in errors
+                    if isinstance(error, str) and error != _MAX_TURNS_ERROR)
 
 
 def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
@@ -280,8 +328,7 @@ def is_transient_capacity_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if this is a 429 or 529 capacity error
     """
-    combined = f"{stderr} {stdout}".lower()
-    return any(marker in combined for marker in ["429", "rate limit", "529", "overloaded"])
+    return bool(_CAPACITY_RE.search(f"{stderr} {stdout}"))
 
 
 def is_retryable_error(stderr: str, stdout: str) -> bool:
@@ -294,20 +341,7 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     Returns:
         True if error should be retried
     """
-    combined = f"{stderr} {stdout}".lower()
-    retryable_markers = [
-        "429",
-        "rate limit",
-        "connection",
-        "timeout",
-        "econnreset",
-        "epipe",
-        "500",
-        "502",
-        "503",
-        "504",
-    ]
-    return any(marker in combined for marker in retryable_markers)
+    return bool(_RETRYABLE_RE.search(f"{stderr} {stdout}"))
 
 
 def _cmd_model(cmd: list[str]) -> str | None:
@@ -416,7 +450,74 @@ PRETOOLUSE_HOOK_SCRIPT = (
 )
 
 
-def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
+# Environment variables the --settings file sets to empty (RR-03). The CLI
+# still loads the agent-writable ~/.claude/settings.json (user scope), whose
+# "env" block reaches the CLI's own environment and every tool, hook and MCP
+# server it starts. The CLI applies the env blocks in source order and the
+# --settings file (flag scope) comes after user scope, so each name below is
+# overwritten with "", which every consumer treats as unset:
+# * shell and loader startup code: BASH_ENV/ENV run a file before every
+#   non-interactive shell; SHELLOPTS=xtrace with PS4='$(...)' runs code per
+#   command; LD_* load libraries into every program;
+# * interpreter startup code: NODE_OPTIONS (--require), PYTHON*, PERL5*,
+#   RUBY*, JAVA_TOOL_OPTIONS;
+# * Python startup failures (RR3138-A): a bogus PYTHONHASHSEED, PYTHONMALLOC,
+#   PYTHONPLATLIBDIR, PYTHONIOENCODING, PYTHONUTF8, PYTHONINTMAXSTRDIGITS or
+#   PYTHONTRACEMALLOC makes a Python without -I exit 1 before any code runs.
+#   The gate hook runs with -I, which ignores them; emptying them as well
+#   covers it if -I is ever lost. The CLI has no per-hook env (its command
+#   hook schema is command/args/shell/timeout/...), so this block, which
+#   reaches every hook process, is where they are cleared;
+# * Claude CLI switches: CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE (bare
+#   mode) turn every non-managed hook off, which is the Bash gate;
+#   CLAUDE_CODE_SHELL_PREFIX wraps and CLAUDE_CODE_SHELL replaces the shell
+#   that runs each command, and CLAUDE_ENV_FILE is sourced before it, all
+#   after the gate has judged the command. CLAUDE_CODE_SHELL is the one name
+#   that is pinned instead of emptied: to an absolute, root-owned bash
+#   (cli_isolation.trusted_bash). Empty, the CLI fell back to SHELL, and
+#   a planted SHELL ran every command (RR3144-A (1)).
+# An operator passthrough of one of these names is overridden too while the
+# gate is on; they load code and have no place in an agent environment.
+# User scope itself is no longer the operator's ~/.claude: every CLI run gets
+# a fresh, empty CLAUDE_CONFIG_DIR (_spawn_agent_process, RR3144-A), so
+# user-scope env blocks (BASH_FUNC_<name>%%, SHELL), hooks and CLAUDE.md
+# written by an agent are never loaded. This block stays as the second layer.
+# Residual until agent isolation (per-unit HOME): ~/.bashrc functions reach
+# the CLI's shell snapshot (docs/ORCHESTRATOR.md, gate limitations).
+SETTINGS_ENV_NEUTRALISED: tuple[str, ...] = (
+    "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "PYTHONHASHSEED", "PYTHONMALLOC",
+    "PYTHONPLATLIBDIR", "PYTHONIOENCODING", "PYTHONUTF8",
+    "PYTHONINTMAXSTRDIGITS", "PYTHONTRACEMALLOC", "PERL5OPT", "PERL5LIB", "RUBYOPT",
+    "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+    "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SHELL_PREFIX",
+    "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
+)
+
+
+def _hook_interpreter() -> str | None:
+    """Absolute path of the interpreter that runs the Bash gate hook, or None.
+
+    Resolved when the settings file is written (RR3138-A): the orchestrator's
+    own ``sys.executable``, else ``python3`` on the orchestrator's PATH. A
+    bare ``python3`` in the hook command would be looked up on the agent's
+    PATH instead. None when neither is an executable file; the caller then
+    wires no gate, and the reactive check keeps killing on sight.
+    """
+    candidate = sys.executable or shutil.which("python3")
+    if not candidate:
+        return None
+    interpreter = os.path.abspath(candidate)
+    if not (os.path.isfile(interpreter) and os.access(interpreter, os.X_OK)):
+        return None
+    return interpreter
+
+
+def _pretooluse_settings_payload(
+    hook_script: str | Path, python_bin: str, shell_bin: str | None = None,
+) -> dict:
     """Build the Claude CLI ``--settings`` payload wiring the Bash gate hook.
 
     Returns a dict matching the Claude Code settings schema: a single
@@ -425,13 +526,55 @@ def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> di
     the failing check + reason on stderr) to block an unsafe command BEFORE
     the CLI executes it — the pre-execution half of the bash security story.
 
+    The payload also pins ``"disableAllHooks": false`` (RR-03). Agents can
+    write the user-scope ``~/.claude/settings.json``, and one
+    ``{"disableAllHooks": true}`` there would switch the gate off for every
+    later run; flag-scope settings (this file) outrank user scope. That is
+    the only hook switch the CLI reads outside managed policy
+    (``allowManagedHooksOnly`` is read from policy settings only). The
+    ``env`` block empties SETTINGS_ENV_NEUTRALISED, including the two
+    variables that turn hooks off, and pins ``CLAUDE_CODE_SHELL`` to an
+    absolute root-owned bash (RR3144-A): the CLI prefers it over ``SHELL``,
+    so a ``SHELL`` planted anywhere no longer chooses the shell that runs
+    the commands the gate judged.
+
+    The hook runs as ``<python> -I <hook>`` (RR3138-A). Without ``-I`` the
+    interpreter reads PYTHON* variables (``PYTHONHASHSEED=bogus`` or
+    ``PYTHONMALLOC=bogus`` from user-scope settings make it exit 1 at
+    startup) and the user site directory (a ``.pth`` file in the agent HOME
+    that calls ``os._exit(0)``). The CLI treats exit 1 as a non-blocking
+    error and exit 0 as allow, so either one ran the blocked command.
+    Isolated mode ignores both; the hook needs only the standard library.
+
     Args:
         hook_script: Absolute path to ``pretooluse_bash_gate.py``.
-        python_bin: Interpreter used to run the hook (normally the same
-            interpreter running the orchestrator, ``sys.executable``).
+        python_bin: Absolute path of the interpreter that runs the hook
+            (``_hook_interpreter()``, resolved when the settings file is
+            written).
+        shell_bin: Absolute bash for ``CLAUDE_CODE_SHELL``; default
+            ``trusted_bash()``. When no trusted bash exists the name stays
+            empty, as before.
+
+    Raises:
+        ValueError: ``python_bin``, ``hook_script`` or ``shell_bin`` is not
+            absolute; the CLI would look a bare name up on the agent's PATH.
     """
-    command = f"{shlex.quote(str(python_bin))} {shlex.quote(str(hook_script))}"
+    if not os.path.isabs(str(python_bin)) or not os.path.isabs(str(hook_script)):
+        raise ValueError(
+            f"the gate hook needs an absolute interpreter and script, got "
+            f"{python_bin!r} and {str(hook_script)!r}")
+    pinned_shell = trusted_bash() if shell_bin is None else shell_bin
+    if pinned_shell is not None and not os.path.isabs(pinned_shell):
+        raise ValueError(
+            f"CLAUDE_CODE_SHELL must be an absolute bash, got {pinned_shell!r}")
+    command = (f"{shlex.quote(str(python_bin))} -I "
+               f"{shlex.quote(str(hook_script))}")
+    settings_env = {name: "" for name in SETTINGS_ENV_NEUTRALISED}
+    if pinned_shell is not None:
+        settings_env[CLAUDE_CODE_SHELL_VAR] = pinned_shell
     return {
+        "disableAllHooks": False,
+        "env": settings_env,
         "hooks": {
             "PreToolUse": [
                 {
@@ -464,6 +607,9 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
     whole run). Anything unexpected returns None, and the reactive check then
     keeps the old kill-on-flag behaviour: fail closed.
     """
+    interpreter = _hook_interpreter()
+    if interpreter is None:
+        return None
     try:
         path = cmd[cmd.index("--settings") + 1]
         with open(path, encoding="utf-8") as fh:
@@ -474,7 +620,7 @@ def _pretooluse_hook_command(cmd: list[str]) -> str | None:
             for hook in entry.get("hooks", []):
                 command = hook.get("command", "")
                 expected = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3",
+                    PRETOOLUSE_HOOK_SCRIPT, interpreter,
                 )["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
                 if command == expected:
                     return command
@@ -550,11 +696,14 @@ def _gate_fingerprint() -> str | None:
     return h.hexdigest()
 
 
-def _gate_canary_ok(hook_command: str) -> bool:
+def _gate_canary_ok(hook_command: str, cwd: str | None = None) -> bool:
     """Run the hook on a command it must refuse; True only on a correct refusal.
 
     If the gate cannot load, crashes or allows the canary, it would also fail
     open for real commands, so the reactive check must keep killing on sight.
+    The canary runs with the agent's allowlisted environment and working
+    directory, the conditions the CLI runs the real hook under, so a pass
+    means the hook is active for THIS run (sandbox-04).
     """
     payload = json.dumps({
         "tool_name": "Bash",
@@ -564,11 +713,956 @@ def _gate_canary_ok(hook_command: str) -> bool:
     try:
         proc = subprocess.run(
             shlex.split(hook_command), input=payload, capture_output=True,
-            text=True, timeout=30,
+            text=True, timeout=30, env=_agent_subprocess_env(), cwd=cwd,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
     return proc.returncode == 2 and "BLOCKED" in (proc.stderr or "")
+
+
+# One persistent checker process per orchestrator (P2A-01). Tests replace it
+# with a ReactiveBashChecker that loads a fake checker file.
+_REACTIVE_CHECKER = ReactiveBashChecker()
+
+
+async def _reactive_bash_check(bash_cmd: str) -> Any | None:
+    """``check_bash_command`` in a separate process; None when it failed.
+
+    The check is regex-bound and ``re`` holds the GIL, so a worker thread
+    would still freeze the event loop that monitors every parallel agent
+    (sandbox-07 iii, P2A-01). It runs in a persistent worker process with a
+    ``_SLOW_CHECK_SECONDS`` deadline instead; a missed deadline kills and
+    recycles the worker. Past the deadline the hook (same check, same input)
+    may itself have timed out and let the command run, so the caller treats
+    None (timeout, crash or malformed verdict) as a block.
+    """
+    return await _REACTIVE_CHECKER.check(bash_cmd, _SLOW_CHECK_SECONDS)
+
+
+class AgentDispatchRefused(RuntimeError):
+    """The agent must not be started; the message says why and how to fix it."""
+
+
+def _cmd_option(cmd: list[str], flag: str) -> str | None:
+    """Value following the FIRST ``flag`` in ``cmd``, or None."""
+    try:
+        return cmd[cmd.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _check_mcp_servers(
+    mcp_config: str | os.PathLike[str],
+    project_dirs: Iterable[str | os.PathLike[str] | None] = (),
+) -> None:
+    """Refuse an MCP config unless every stdio server is on the allowlist.
+
+    The agent CLI runs in the project directory (sandbox-11), and the stdio
+    MCP servers it starts inherit that cwd. Anything a server resolves
+    relative to its cwd is therefore agent-writable: a relative
+    ``--db-path`` silently opens a different database, and a launcher that
+    loads code from its cwd runs agent-planted code holding the server's
+    credentials, such as the EQUIPA_MCP_TOKEN (P2A-02). A denylist of such
+    launchers kept missing some (``timeout python3 -m``, ``uv run``, ``node
+    -r``; IR-03), so this is an allowlist: only these shapes are accepted
+    (see _check_mcp_launch), and the command must exist:
+
+    * an absolute python with ``-I`` running an absolute script, or ``-I
+      -m`` with an absolute cwd outside every project directory;
+    * an absolute node running an absolute script, with no preload, loader
+      or eval option;
+    * an absolute uvx running a package, with its own options read from
+      uvx's option table (RR3138-B);
+    * an executable whose absolute path the operator listed under
+      ``mcp_trusted_executables`` (RR-02). Anything else is refused, and a
+      wrapper, shell or loader is refused even when listed.
+
+    The python, node and uvx commands must be the real program, not a
+    renamed copy of another one (RR3138-C, _is_real_interpreter). Nothing
+    may live inside a project directory (``project_dirs`` plus every
+    configured PROJECT_DIRS entry), and the server env may not set a
+    code-loading variable (NODE_OPTIONS, PYTHONPATH, LD_PRELOAD, UV_*, ...).
+    Fail closed rather than guess. A missing config is left to the CLI,
+    which reports it itself.
+
+    Raises:
+        AgentDispatchRefused: a server off the allowlist, or an unreadable
+            or malformed config.
+    """
+    path = Path(mcp_config)
+    if not path.is_file():
+        return
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise AgentDispatchRefused(
+            f"cannot read MCP config {path} to verify its servers: {exc}"
+        ) from exc
+    _check_mcp_config_data(config, path, project_dirs)
+
+
+def _check_mcp_config_value(value: str, cwd: str | None) -> None:
+    """Check one ``--mcp-config`` value: a file, or inline JSON (RR-05).
+
+    A relative file would be read from the CLI's cwd, the agent-writable
+    project directory, so it is refused. Inline JSON (the manager passes
+    ``{"mcpServers": {}}``) is checked like a file.
+    """
+    if value.lstrip().startswith("{"):
+        try:
+            config = json.loads(value)
+        except ValueError as exc:
+            raise AgentDispatchRefused(
+                f"inline --mcp-config is not valid JSON: {exc}") from exc
+        _check_mcp_config_data(config, "inline --mcp-config", (cwd,))
+        return
+    if not os.path.isabs(value):
+        raise AgentDispatchRefused(
+            f"--mcp-config {value!r} is a relative path, which the CLI reads "
+            f"from the project directory {cwd!r} that agents can write. Use "
+            f"an absolute path.")
+    _check_mcp_servers(value, (cwd,))
+
+
+def _check_mcp_config_data(
+    config: Any, source: Path | str,
+    project_dirs: Iterable[str | os.PathLike[str] | None],
+) -> None:
+    """Every server of one parsed MCP config (see _check_mcp_servers)."""
+    path = source
+    if not isinstance(config, dict):
+        raise AgentDispatchRefused(
+            f"cannot read MCP config {path} to verify its servers: it is not "
+            f"a JSON object")
+    servers = config.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise AgentDispatchRefused(
+            f"MCP config {path}: \"mcpServers\" must be a JSON object")
+    roots = _project_roots(project_dirs)
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            raise AgentDispatchRefused(
+                f"MCP server {name!r} in {path} is not a JSON object "
+                f"(R3127-07); fix or remove that entry")
+        _check_mcp_db_path(name, server, path)
+        _check_mcp_launch(name, server, path, roots)
+
+
+def _project_roots(
+    project_dirs: Iterable[str | os.PathLike[str] | None],
+) -> list[str]:
+    """Every agent-writable project root, lexically and with symlinks resolved."""
+    roots: set[str] = set()
+    for directory in [*project_dirs, *PROJECT_DIRS.values()]:
+        if not directory:
+            continue
+        expanded = os.path.expanduser(os.fspath(directory))
+        if os.path.isabs(expanded):
+            roots.update({os.path.normpath(expanded), os.path.realpath(expanded)})
+    return sorted(roots)
+
+
+def _project_root_holding(path: str, roots: list[str]) -> str | None:
+    """The project root ``path`` lies in (as written or resolved), or None."""
+    for candidate in {os.path.normpath(path), os.path.realpath(path)}:
+        for root in roots:
+            try:
+                if os.path.commonpath([candidate, root]) == root:
+                    return root
+            except ValueError:  # different drives (Windows)
+                continue
+    return None
+
+
+# Programs that run another program, shells, language runtimes other than
+# python and node, and package/task runners: each resolves code (or its
+# configuration) from its arguments, environment or cwd in ways the check
+# cannot follow, so none may start an MCP server (IR-03). Names are compared
+# without version suffixes (ruby3.1 -> ruby, python3-dbg -> python).
+_MCP_REFUSED_LAUNCHERS = frozenset({
+    "env", "timeout", "nice", "ionice", "stdbuf", "setsid", "nohup", "chrt",
+    "taskset", "unshare", "nsenter", "sudo", "doas", "su", "runuser", "xargs",
+    "watch", "script", "flock", "time", "strace", "ltrace", "gdb", "valgrind",
+    "firejail", "bwrap", "chroot", "busybox", "toybox", "exec",
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh", "pwsh",
+    "powershell", "cmd",
+    "uv", "poetry", "pipx", "pdm", "hatch", "rye", "pipenv", "conda", "mamba",
+    "micromamba", "tox", "nox", "ipython", "jupyter",
+    "npx", "pnpx", "bunx", "npm", "pnpm", "yarn", "bun", "corepack", "deno",
+    "tsx", "ts-node",
+    "go", "cargo", "rustup", "make", "gmake", "cmake", "ninja", "just", "rake",
+    "docker", "podman", "nerdctl", "kubectl",
+    "ruby", "irb", "perl", "php", "java", "jshell", "lua", "luajit", "tclsh",
+    "wish", "rscript", "julia", "osascript", "dotnet", "mono", "erl",
+    "elixir", "iex", "mix", "gradle", "mvn", "sbt", "scala", "kotlin",
+    "groovy", "swift",
+    # RR-02: more programs that run the program named in their arguments
+    # (setarch x86_64 python3 -m srv), and script interpreters (awk -f).
+    "setarch", "linux", "prlimit", "setpriv", "systemd-run", "sg", "newgrp",
+    "pkexec", "runcon", "capsh", "xvfb-run", "fakeroot", "fakechroot",
+    "eatmydata", "numactl", "catchsegv", "unbuffer", "expect", "faketime",
+    "torsocks", "proxychains", "chpst", "daemonize", "start-stop-daemon",
+    "cpulimit", "dbus-launch", "dbus-run-session", "screen", "tmux", "ssh",
+    "parallel", "entr", "find", "awk", "gawk", "mawk", "nawk", "sed",
+    "rbash", "ash", "yash", "posh", "lksh", "oksh", "loksh", "pdksh",
+    "elvish", "nu", "xonsh",
+})
+# Shells, named anywhere in the refused set above or in /etc/shells. A
+# renamed copy or hard link of one is found by comparing the binary itself
+# (_is_shell_binary).
+_ETC_SHELLS = Path("/etc/shells")
+_STANDARD_SHELL_PATHS = ("/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh",
+                         "/bin/ksh", "/usr/bin/zsh", "/usr/bin/fish",
+                         "/bin/busybox")
+# dispatch_config.json key: absolute paths of MCP server executables the
+# operator trusts, beyond python -I, node and uvx (RR-02).
+MCP_TRUSTED_EXECUTABLES_KEY = "mcp_trusted_executables"
+# uvx options that install local code: --with-editable always does.
+_UVX_REFUSED_OPTIONS = frozenset({"--with-editable"})
+# Server env variables that make an interpreter or the dynamic loader run
+# extra code (IR-03).
+_MCP_REFUSED_ENV = frozenset({
+    "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "PYTHONINSPECT", "PYTHONUSERBASE", "BASH_ENV", "ENV", "PERL5OPT",
+    "PERL5LIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+})
+# UV_*: uvx reads its options from the environment too (UV_FIND_LINKS,
+# UV_PYTHON, UV_INDEX_URL, UV_CONFIG_FILE ...), past the option check
+# (RR3138-B).
+_MCP_REFUSED_ENV_PREFIXES = ("LD_", "DYLD_", "UV_")
+# Python options accepted before the script or -m. -I is also required.
+# -W takes a value; -c, -m and -X are handled or refused separately.
+_PYTHON_ALLOWED_FLAGS = frozenset("IBbdEOPqRsSuvW")
+_PYTHON_VALUE_OPTIONS = frozenset("cmWX")
+# Node options accepted before the script: resource limits and diagnostics.
+# Anything else (-r, --require, --import, --loader, -e, -p, -i, --env-file,
+# --inspect ...) can load code or open a debugger and is refused.
+_NODE_ALLOWED_OPTIONS = frozenset({
+    "--max-old-space-size", "--max-semi-space-size", "--stack-size",
+    "--enable-source-maps", "--no-warnings", "--no-deprecation",
+    "--trace-warnings", "--trace-deprecation", "--trace-uncaught",
+    "--unhandled-rejections", "--dns-result-order",
+})
+# Suffixes that make a relative argument a script, module or config file.
+_SCRIPT_SUFFIXES = (".py", ".pyc", ".pyz", ".js", ".mjs", ".cjs", ".ts", ".mts",
+                    ".sh", ".bash", ".rb", ".pl", ".php", ".jar", ".toml",
+                    ".cfg", ".ini", ".json", ".yaml", ".yml", ".env", ".pth")
+
+
+def _launcher_stem(command: str) -> str:
+    """``command``'s basename, lower-case, without .exe and version suffixes."""
+    name = os.path.basename(command).lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        name = name.removesuffix(suffix)
+    return re.sub(r"[0-9.]*(?:-(?:dbg|debug))?$", "", name) or name
+
+
+@functools.lru_cache(maxsize=1)
+def _known_shell_binaries() -> tuple[str, ...]:
+    """Resolved paths of the shells installed here (/etc/shells + standard)."""
+    candidates = set(_STANDARD_SHELL_PATHS)
+    try:
+        for line in _ETC_SHELLS.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("/"):
+                candidates.add(line)
+    except OSError:
+        pass  # no /etc/shells: the standard paths still apply
+    return tuple(sorted({os.path.realpath(path) for path in candidates
+                         if os.path.isfile(path)}))
+
+
+def _is_shell_binary(path: str) -> bool:
+    """True when ``path`` is a shell: named like an installed shell, or the
+    same file as one, or a byte-identical copy (a renamed dash)."""
+    names = {os.path.basename(shell) for shell in _known_shell_binaries()}
+    if {os.path.basename(path), os.path.basename(os.path.realpath(path))} & names:
+        return True
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    for shell in _known_shell_binaries():
+        try:
+            if os.path.samefile(path, shell) or (
+                    os.path.getsize(shell) == size
+                    and filecmp.cmp(path, shell, shallow=False)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _is_dynamic_loader(path: str) -> bool:
+    """ld.so / ld-linux-x86-64.so.2 / ld-musl-*.so.1: runs its argument."""
+    return any(re.fullmatch(r"ld[\w.-]*\.so(?:\.\d+)*", os.path.basename(name))
+               for name in (path, os.path.realpath(path)))
+
+
+def _launcher_kind(command: str) -> str:
+    """"refused", "python", "node", "uvx" or "executable", judged on the name
+    as written AND the resolved target (a symlink named srv -> python3), and
+    for shells on the binary itself (a renamed copy of dash is a shell)."""
+    stems = {_launcher_stem(command), _launcher_stem(os.path.realpath(command))}
+    if (stems & _MCP_REFUSED_LAUNCHERS or _is_dynamic_loader(command)
+            or _is_shell_binary(command)):
+        return "refused"
+    if stems & {"python", "pypy"}:
+        return "python"
+    if stems & {"node", "nodejs"}:
+        return "node"
+    if "uvx" in stems:
+        return "uvx"
+    return "executable"
+
+
+# Where a python, node or uvx command must really be that program
+# (RR3138-C): the root-owned system command directories. The orchestrator's
+# PATH is not used: it usually holds the operator's ~/.local/bin, which an
+# agent sharing the operator UID can write.
+_SYSTEM_COMMAND_DIRS = ("/usr/local/bin", "/usr/bin", "/bin",
+                        "/usr/local/sbin", "/usr/sbin", "/sbin")
+_INTERPRETER_NAMES = {
+    "python": ("python3", "python"),
+    "node": ("node", "nodejs"),
+    "uvx": ("uvx",),
+}
+# Name stems (_launcher_stem) that are versioned names of each interpreter:
+# python3.12 and pypy3 are looked up under their own name too.
+_INTERPRETER_STEMS = {
+    "python": frozenset({"python", "pypy"}),
+    "node": frozenset({"node", "nodejs"}),
+    "uvx": frozenset({"uvx"}),
+}
+
+
+def _is_real_interpreter(command: str, kind: str) -> bool:
+    """True when ``command`` is the real python, node or uvx (RR3138-C).
+
+    The launch check picks its python/node/uvx rules by name, so a copy of
+    perl named python3 or of env named uvx passed as that interpreter. Now
+    the file itself must be the program its name says: the same file as
+    that name (the canonical one, or the command's own basename such as
+    python3.12) found in _SYSTEM_COMMAND_DIRS, the orchestrator's own
+    interpreter for python, or a path the operator listed under
+    mcp_trusted_executables (uv installs uvx in ~/.local/bin, which must be
+    listed).
+
+    Residual risk: the binary's content is not verified. A file at a
+    listed path is trusted as the program its name says, so whoever can
+    write that path (an agent sharing the operator UID, for a path in the
+    operator HOME) can replace it. Only agent isolation (a separate UID)
+    closes that; the system directories are root-owned.
+    """
+    names = set(_INTERPRETER_NAMES[kind])
+    if _launcher_stem(command) in _INTERPRETER_STEMS[kind]:
+        names.add(os.path.basename(command))
+    search_path = os.pathsep.join(_SYSTEM_COMMAND_DIRS)
+    candidates = {shutil.which(name, path=search_path) for name in names}
+    if kind == "python":
+        candidates.update({sys.executable,
+                           getattr(sys, "_base_executable", None)})
+    candidates.update(_trusted_mcp_executables())
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            if os.path.samefile(command, candidate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _trusted_mcp_executables() -> set[str]:
+    """Resolved paths listed under mcp_trusted_executables (RR-02).
+
+    An unreadable config or a malformed entry trusts nothing more.
+    """
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("cannot read %s from the dispatch config: %s",
+                       MCP_TRUSTED_EXECUTABLES_KEY, exc)
+        return set()
+    entries = config.get(MCP_TRUSTED_EXECUTABLES_KEY, [])
+    if not isinstance(entries, list):
+        logger.warning("%s must be a list of absolute paths; ignored",
+                       MCP_TRUSTED_EXECUTABLES_KEY)
+        return set()
+    return {os.path.realpath(entry) for entry in entries
+            if isinstance(entry, str) and os.path.isabs(entry)}
+
+
+def _arg_values(arg: str) -> list[str]:
+    """``arg``, plus the value of an ``--opt=value`` argument, so a path
+    hidden behind ``=`` is checked like a plain one (RR-02)."""
+    if arg.startswith("-") and "=" in arg:
+        return [arg, arg.split("=", 1)[1]]
+    return [arg]
+
+
+def _is_db_path_value(args: list[str], index: int) -> bool:
+    """The data file of --db-path, which _check_mcp_db_path owns."""
+    return (args[index].startswith("--db-path=")
+            or (index > 0 and args[index - 1] == "--db-path"))
+
+
+def _python_invocation(
+        args: list[str]) -> tuple[str, str | None, set[str], list[str]]:
+    """How ``python <args>`` picks its code.
+
+    Returns (mode, target, single-letter flags, refused options). mode is
+    "module" (-m), "code" (-c), "stdin" (no script, or ``-``) or "script".
+    Clustered short options (``-IBm mod``) are honoured.
+    """
+    flags: set[str] = set()
+    refused: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "-":
+            return "stdin", None, flags, refused
+        if arg == "--":
+            mode = "script" if following else "stdin"
+            return mode, following, flags, refused
+        if arg.startswith("--"):
+            refused.append(arg)  # --check-hash-based-pycs, --help, ...
+            index += 1
+            continue
+        if not arg.startswith("-"):
+            return "script", arg, flags, refused
+        cluster = arg[1:]
+        for position, letter in enumerate(cluster):
+            if letter not in _PYTHON_VALUE_OPTIONS:
+                flags.add(letter)
+                continue
+            attached = cluster[position + 1:]
+            value = attached or following
+            if letter == "m":
+                return "module", value, flags, refused
+            if letter == "c":
+                return "code", value, flags, refused
+            flags.add(letter)
+            if not attached:
+                index += 1  # -W / -X consumed the next argument
+            break
+        index += 1
+    return "stdin", None, flags, refused
+
+
+def _looks_like_relative_path(arg: str) -> bool:
+    if os.path.isabs(arg) or arg.startswith("-"):
+        return False
+    return (arg.startswith(("./", "../", "~")) or arg in (".", "..")
+            or arg.lower().endswith(_SCRIPT_SUFFIXES))
+
+
+def _check_mcp_launch(name: str, server: dict, config_path: Path,
+                      roots: list[str] | None = None) -> None:
+    """Refuse a stdio server that is not on the launch allowlist (IR-03)."""
+    if server.get("type") in ("http", "sse") or (
+            "url" in server and "command" not in server):
+        return  # remote server: nothing is started in the project directory
+    roots = roots if roots is not None else _project_roots(())
+
+    def refuse(problem: str, fix: str) -> AgentDispatchRefused:
+        return AgentDispatchRefused(
+            f"MCP server {name!r} in {config_path} {problem}. Agents run in "
+            f"the project directory and MCP servers inherit it, so this "
+            f"would run agent-writable code. {fix}"
+        )
+
+    def refuse_inside_project(what: str, value: str) -> None:
+        root = _project_root_holding(value, roots)
+        if root is not None:
+            raise refuse(f"has its {what} {value!r} inside the project "
+                         f"directory {root!r}, which agents can write",
+                         f"Install it outside every project directory.")
+
+    command = server.get("command")
+    args = server.get("args", [])
+    cwd = server.get("cwd")
+    env = server.get("env", {})
+    if not isinstance(command, str) or not os.path.isabs(command):
+        raise refuse(f"has a relative command {command!r}",
+                     "Use an absolute path to the executable.")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise refuse("has non-string args", "Use a list of strings.")
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
+        raise refuse(f"has a relative cwd {cwd!r}", "Use an absolute cwd.")
+    if not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in env.items()):
+        raise refuse("has an env that is not an object of strings",
+                     'Use "env": {"NAME": "value"}.')
+    for key in env:
+        if key in _MCP_REFUSED_ENV or key.startswith(_MCP_REFUSED_ENV_PREFIXES):
+            raise refuse(f"sets {key} in its env, which makes the server load "
+                         f"extra code (or uvx install from elsewhere)",
+                         f"Remove {key} from the env block.")
+    refuse_inside_project("command", command)
+    if cwd is not None:
+        refuse_inside_project("cwd", cwd)
+
+    kind = _launcher_kind(command)
+    if kind == "refused":
+        raise refuse(
+            f"is started through {os.path.basename(command)!r}, a wrapper, "
+            f"shell, loader, runtime or package runner that resolves code "
+            f"the check cannot verify",
+            "Run the server's own executable, an absolute python -I with an "
+            "absolute script, or an absolute node with an absolute script.")
+    # RR-02: a command that does not exist yet is whatever is put there
+    # later; none of the checks below could look at it.
+    if not os.path.exists(command):
+        raise refuse(f"has the command {command!r}, which does not exist",
+                     "Install the server first and point at its executable.")
+    if not (os.path.isfile(command) and os.access(command, os.X_OK)):
+        raise refuse(f"has the command {command!r}, which is not an "
+                     f"executable file", "Point it at the server executable.")
+    if kind != "executable" and not _is_real_interpreter(command, kind):
+        raise refuse(
+            f"runs {command!r} as {kind}, but that file is not the {kind} "
+            f"installed in {', '.join(_SYSTEM_COMMAND_DIRS[:3])} (a renamed "
+            f"copy of another program would pass by name)",
+            f"Point it at the system {kind}, or add its absolute path to "
+            f"\"{MCP_TRUSTED_EXECUTABLES_KEY}\" in dispatch_config.json if "
+            f"it is the real {kind} (uv installs uvx in ~/.local/bin).")
+    if kind == "python":
+        _check_python_launch(args, cwd, refuse, refuse_inside_project)
+    elif kind == "node":
+        _check_node_launch(args, refuse, refuse_inside_project)
+    elif kind == "uvx":
+        _check_uvx_launch(args, refuse, refuse_inside_project)
+    elif os.path.realpath(command) not in _trusted_mcp_executables():
+        # RR-02: a true allowlist. Any other program may run the program in
+        # its arguments (setarch, prlimit, ld.so, awk -f ...), and a list of
+        # such programs is never complete.
+        raise refuse(
+            f"runs {command!r}, which is not an allowlisted MCP server "
+            f"executable",
+            f"Run it as an absolute python -I or node script, through uvx, "
+            f"or add its absolute path to \"{MCP_TRUSTED_EXECUTABLES_KEY}\" "
+            f"in dispatch_config.json if it is the server's own program.")
+    for index, arg in enumerate(args):
+        for value in _arg_values(arg):
+            if _looks_like_relative_path(value):
+                raise refuse(f"has the relative path argument {arg!r}",
+                             "Use an absolute path.")
+            if os.path.isabs(value) and not _is_db_path_value(args, index):
+                refuse_inside_project("argument", value)
+
+
+def _check_python_launch(args: list[str], cwd: str | None, refuse: Any,
+                         refuse_inside_project: Any) -> None:
+    mode, target, flags, long_options = _python_invocation(args)
+    if long_options:
+        raise refuse(f"passes python the option {long_options[0]!r}",
+                     "Use only short isolation and warning flags (-I, -B, "
+                     "-u, -W ...).")
+    unknown = sorted(flags - _PYTHON_ALLOWED_FLAGS)
+    if unknown:
+        raise refuse(f"passes python the option -{unknown[0]}, which is not "
+                     f"allowed", "Use only -I and -B, -b, -d, -E, -O, -P, -q, "
+                     "-R, -s, -S, -u, -v, -W.")
+    shown = {"module": f"-m {target}", "code": "-c ...", "stdin": "(stdin)",
+             "script": str(target)}[mode]
+    if mode in ("code", "stdin"):
+        raise refuse(f"runs python {shown}, which cannot be verified",
+                     "Run an absolute script with python -I.")
+    if "I" not in flags:
+        raise refuse(
+            f"runs python {shown} without -I; Python would read PYTHON* "
+            f"variables and put the project directory first on sys.path",
+            'Add "-I" and run an absolute script (or -m with an absolute '
+            '"cwd" outside every project directory).')
+    if mode == "script":
+        if not target or not os.path.isabs(target):
+            raise refuse(f"runs the relative Python script {target!r}",
+                         "Use an absolute script path.")
+        refuse_inside_project("script", target)
+    elif cwd is None:
+        raise refuse(f"runs python {shown} without an absolute \"cwd\"; the "
+                     f"project directory would be its working directory "
+                     f"(sys.path)",
+                     'Add an absolute "cwd" outside every project directory, '
+                     "or run an absolute script.")
+
+
+def _check_node_launch(args: list[str], refuse: Any,
+                       refuse_inside_project: Any) -> None:
+    script = None
+    for index, arg in enumerate(args):
+        if arg == "--":
+            script = args[index + 1] if index + 1 < len(args) else None
+            break
+        if not arg.startswith("-") or arg == "-":
+            script = arg
+            break
+        option = arg.split("=", 1)[0]
+        if option not in _NODE_ALLOWED_OPTIONS:
+            raise refuse(f"passes node the option {arg!r}, which can load "
+                         f"code (preload, loader, eval, env file, debugger)",
+                         "Remove it; bundle what it loads into the server "
+                         "script.")
+    if script is None or script == "-":
+        raise refuse("runs node without a script", "Run an absolute script.")
+    if not os.path.isabs(script):
+        raise refuse(f"runs the relative node script {script!r}",
+                     "Use an absolute script path.")
+    refuse_inside_project("script", script)
+
+
+# uvx options whose value is a local file or directory (RR-02); a bare name
+# there (req.txt) is relative to the project directory too.
+_UVX_PATH_OPTIONS = frozenset({
+    "--directory", "--project", "--config-file", "--env-file",
+    "--with-requirements", "--constraints", "--overrides",
+    "--build-constraints", "--find-links", "--cache-dir",
+})
+# uvx options whose value is a package index: a URL, or a local directory
+# (``--index name=./dir`` too), where a bare name is relative as well.
+_UVX_INDEX_OPTIONS = frozenset({
+    "--index", "--default-index", "--index-url", "--extra-index-url",
+})
+# uvx options whose value is a path only when it looks like one: --python
+# 3.12 is a version, and the short aliases of path options (-c, -b, -f, -i)
+# are scanned in the tool's own arguments too, where they can mean other
+# things (-b 0.0.0.0).
+_UVX_MAYBE_PATH_OPTIONS = frozenset({"--python", "-p", "-c", "-b", "-f", "-i"})
+# uvx options whose value is a package: a name, or a local path or file: URL.
+_UVX_PACKAGE_OPTIONS = frozenset({"--from", "--with", "-w"})
+# Every short uvx option that takes a value, so an attached value (-w./pkg,
+# -w=./pkg) or a cluster of flags ending in one (-qw ./pkg) is read too.
+_UVX_SHORT_VALUE_LETTERS = frozenset("wcbifpPC")
+# A file: URL names a local path wherever it appears.
+_FILE_URL = re.compile(r"file:(?://(?:localhost)?)?([^\s#?]+)")
+
+# uvx's own option table (uv 0.10, ``uvx --help``), used to read uvx's
+# options up to the tool name (RR3138-B). Everything after the tool name is
+# the tool's own arguments. An option missing from both sets (an alias such
+# as --constraint, or a newer uv option) is refused: without the table it is
+# unknown whether it takes a value, so the tool name cannot be found.
+_UVX_FLAG_OPTIONS = frozenset({
+    "--isolated", "--no-env-file", "--lfs", "--version", "--no-index",
+    "--upgrade", "--no-sources", "--reinstall", "--compile-bytecode",
+    "--no-build-isolation", "--no-build", "--no-binary", "--no-cache",
+    "--refresh", "--managed-python", "--no-managed-python",
+    "--no-python-downloads", "--quiet", "--verbose", "--native-tls",
+    "--offline", "--no-progress", "--no-config", "--help", "--preview",
+    "--no-preview",
+})
+_UVX_VALUE_OPTIONS = frozenset({
+    "--from", "--with", "--with-editable", "--with-requirements",
+    "--constraints", "--build-constraints", "--overrides", "--env-file",
+    "--python-platform", "--torch-backend", "--index", "--default-index",
+    "--index-url", "--extra-index-url", "--find-links", "--index-strategy",
+    "--keyring-provider", "--upgrade-package", "--resolution", "--prerelease",
+    "--fork-strategy", "--exclude-newer", "--exclude-newer-package",
+    "--no-sources-package", "--reinstall-package", "--link-mode",
+    "--config-setting", "--config-settings-package",
+    "--no-build-isolation-package", "--no-build-package",
+    "--no-binary-package", "--cache-dir", "--refresh-package", "--python",
+    "--color", "--allow-insecure-host", "--directory", "--project",
+    "--config-file",
+})
+_UVX_SHORT_FLAG_LETTERS = frozenset("VUnqvh")
+_UVX_SHORT_ALIASES = {
+    "w": "--with", "c": "--constraints", "b": "--build-constraints",
+    "i": "--index-url", "f": "--find-links", "P": "--upgrade-package",
+    "C": "--config-setting", "p": "--python",
+}
+# uvx options before the tool name whose value uv reads as a local file or
+# directory, or fetches: index and find-links locations, requirement and
+# constraint files, and directory options. Each value must be an absolute
+# path outside every project directory, or an https URL the operator listed
+# under mcp_uvx_trusted_urls (RR3138-B). A bare name (``-f wheels``) is
+# relative to the agent-writable project directory. uv splits these values
+# on whitespace (they share the parser of the space-separated UV_* forms),
+# so every word is judged.
+_UVX_LOCATION_OPTIONS = frozenset({
+    "--index", "--default-index", "--index-url", "--extra-index-url",
+    "--find-links", "--with-requirements", "--constraints",
+    "--build-constraints", "--overrides", "--env-file", "--cache-dir",
+    "--directory", "--project", "--config-file",
+})
+# dispatch_config.json key: https URLs (index or find-links locations,
+# requirement files) that uvx options may name (RR3138-B).
+MCP_UVX_TRUSTED_URLS_KEY = "mcp_uvx_trusted_urls"
+
+
+def _is_path_like(value: str) -> bool:
+    return (value in (".", "..") or value.startswith(("/", "./", "../", "~"))
+            or "/" in value)
+
+
+def _uvx_option(args: list[str], index: int) -> tuple[str, str] | None:
+    """``(option, value)`` when ``args[index]`` is an option, else None.
+
+    Reads ``--opt value``, ``--opt=value``, ``-o value``, ``-ovalue``,
+    ``-o=value`` and a cluster of short flags ending in a value option
+    (``-qw value``). ``value`` is the next argument when none is attached,
+    whether or not the option takes one; callers only look at the value of
+    options they know take one.
+    """
+    arg = args[index]
+    following = args[index + 1] if index + 1 < len(args) else ""
+    if arg.startswith("--"):
+        option, has_value, attached = arg.partition("=")
+        return option, attached if has_value else following
+    if not arg.startswith("-") or len(arg) < 2:
+        return None
+    for position, letter in enumerate(arg[1:], start=1):
+        if letter in _UVX_SHORT_VALUE_LETTERS:
+            attached = arg[position + 1:]
+            attached = attached[1:] if attached.startswith("=") else attached
+            return f"-{letter}", attached or following
+        if not letter.isalpha():
+            break
+    return arg, following
+
+
+def _index_paths(value: str) -> list[str]:
+    """Local directories a uvx index option reads: ``./idx``, ``idx``,
+    ``/abs/idx``, ``name=./idx``. A remote URL gives none; a ``file:`` URL
+    is checked by the caller's file: URL scan."""
+    name, has_name, location = value.partition("=")
+    if has_name and re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        value = location
+    if not value or "://" in value or value.startswith("file:"):
+        return []
+    return [value]
+
+
+def _local_package_paths(spec: str) -> list[str]:
+    """Local paths a uvx package spec installs from: ``.``, ``./srv``,
+    ``/abs/dir``, ``srv @ ./dir``, ``file:///abs/dir``, ``x.whl``.
+
+    A package name (``mcp-server-sqlite==0.6``) or a remote URL gives none.
+    """
+    paths = [match.group(1) for match in _FILE_URL.finditer(spec)]
+    for part in spec.split("@"):
+        part = part.strip()
+        if part and "://" not in part and not part.startswith("file:") and (
+                _is_path_like(part)
+                or part.endswith((".whl", ".tar.gz", ".zip"))):
+            paths.append(part)
+    return paths
+
+
+def _check_uvx_launch(args: list[str], refuse: Any,
+                      refuse_inside_project: Any) -> None:
+    """uvx installs a package and runs it (RR-02).
+
+    Refused: ``--with-editable`` (it always installs a local directory), and
+    ``--from`` / ``--with`` / index / path options (long or short, value
+    attached or not) naming a relative path, which resolves in the
+    agent-writable project directory, or a path inside a project; so is a
+    ``file:`` URL anywhere that names one. Every argument is scanned, the
+    tool's own too: the tool name cannot be told from an option value
+    without uvx's option table.
+    """
+    for index, arg in enumerate(args):
+        checked: list[tuple[str, str, list[str]]] = [
+            ("file: URL", arg, [match.group(1)
+                                for match in _FILE_URL.finditer(arg)])]
+        parsed = _uvx_option(args, index)
+        if parsed is not None:
+            option, value = parsed
+            if option in _UVX_REFUSED_OPTIONS:
+                raise refuse(f"passes uvx {option}, which installs a local "
+                             f"directory an agent can write",
+                             "Install the server from a package index, or "
+                             "from an absolute path outside every project "
+                             "directory.")
+            if option in _UVX_PACKAGE_OPTIONS:
+                checked.append((option, value, _local_package_paths(value)))
+            elif option in _UVX_PATH_OPTIONS:
+                checked.append((option, value,
+                                [] if "://" in value else [value]))
+            elif option in _UVX_INDEX_OPTIONS:
+                checked.append((option, value, _index_paths(value)))
+            elif (option in _UVX_MAYBE_PATH_OPTIONS and _is_path_like(value)
+                  and "://" not in value):
+                checked.append((option, value, [value]))
+        for option, value, paths in checked:
+            for path in paths:
+                expanded = os.path.expanduser(path)
+                if not os.path.isabs(expanded):
+                    raise refuse(f"passes uvx {option} {value!r}, a path "
+                                 f"relative to the project directory",
+                                 "Use a package from an index, or an absolute "
+                                 "path outside every project directory.")
+                refuse_inside_project(f"uvx {option} path", expanded)
+    _check_uvx_options_before_tool(args, refuse, refuse_inside_project)
+
+
+def _uvx_trusted_urls() -> set[str]:
+    """https URLs listed under mcp_uvx_trusted_urls, without a trailing /.
+
+    An unreadable config or a malformed entry trusts nothing.
+    """
+    try:
+        config = get_active_dispatch_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("cannot read %s from the dispatch config: %s",
+                       MCP_UVX_TRUSTED_URLS_KEY, exc)
+        return set()
+    entries = config.get(MCP_UVX_TRUSTED_URLS_KEY, [])
+    if not isinstance(entries, list):
+        logger.warning("%s must be a list of https URLs; ignored",
+                       MCP_UVX_TRUSTED_URLS_KEY)
+        return set()
+    return {entry.rstrip("/") for entry in entries
+            if isinstance(entry, str) and entry.startswith("https://")
+            and not any(char.isspace() for char in entry)}
+
+
+def _uvx_options_before_tool(args: list[str]) -> list[tuple[str, str | None]]:
+    """``(long option, value)`` for each uvx option before the tool name.
+
+    Reads ``--opt value``, ``--opt=value``, ``-o value``, ``-ovalue``,
+    ``-o=value`` and clusters (``-qf value``) with uvx's option table. value
+    is None for a flag, and for a value option with nothing after it.
+
+    Raises:
+        ValueError: an option uvx's table does not list, or a flag given a
+            value; the message names it.
+    """
+    options: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        following = args[index + 1] if index + 1 < len(args) else None
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            break  # the tool name (after ``--``): its own arguments follow
+        if arg.startswith("--"):
+            option, has_value, attached = arg.partition("=")
+            if option in _UVX_FLAG_OPTIONS and not has_value:
+                options.append((option, None))
+                index += 1
+                continue
+            if option not in _UVX_VALUE_OPTIONS:
+                raise ValueError(arg)
+            options.append((option, attached if has_value else following))
+            index += 1 if has_value else 2
+            continue
+        cluster = arg[1:]
+        consumed = 1
+        for position, letter in enumerate(cluster):
+            if letter in _UVX_SHORT_FLAG_LETTERS:
+                options.append((f"-{letter}", None))
+                continue
+            if letter not in _UVX_SHORT_ALIASES:
+                raise ValueError(arg)
+            attached = cluster[position + 1:]
+            if attached:
+                value = attached[1:] if attached.startswith("=") else attached
+            else:
+                value, consumed = following, 2
+            options.append((_UVX_SHORT_ALIASES[letter], value))
+            break
+        index += consumed
+    return options
+
+
+def _check_uvx_options_before_tool(args: list[str], refuse: Any,
+                                   refuse_inside_project: Any) -> None:
+    """uvx's own options, read with uvx's option table (RR3138-B).
+
+    _check_uvx_launch judges a short option by whether its value looks like
+    a path, because it scans the tool's arguments too (``srv -f json``).
+    That let ``uvx -f wheels srv`` through: a bare name after -f is a
+    find-links directory in the project. Here only uvx's options are read,
+    up to the tool name, so a short option is judged exactly like its long
+    form: each location value must be an absolute path outside every
+    project directory or a listed https URL.
+    """
+    try:
+        options = _uvx_options_before_tool(args)
+    except ValueError as exc:
+        raise refuse(f"passes uvx the option {str(exc)!r}, which is not in "
+                     f"uvx's option table, so the tool name cannot be found",
+                     "Use the long form of a listed uvx option, or remove it."
+                     ) from exc
+    trusted_urls: set[str] | None = None
+    for option, value in options:
+        if option not in _UVX_LOCATION_OPTIONS:
+            continue
+        words = (value or "").split()
+        if not words:
+            raise refuse(f"passes uvx {option} without a value",
+                         "Give it an absolute path.")
+        for word in words:
+            name, has_name, location = word.partition("=")
+            if (option in ("--index", "--default-index") and has_name
+                    and re.fullmatch(r"[A-Za-z0-9_.-]+", name)):
+                word = location  # --index name=<location>
+            if os.path.isabs(word):
+                refuse_inside_project(f"uvx {option} path", word)
+                continue
+            if trusted_urls is None:
+                trusted_urls = _uvx_trusted_urls()
+            if word.startswith("https://") and word.rstrip("/") in trusted_urls:
+                continue
+            raise refuse(
+                f"passes uvx {option} {word!r}, which is neither an absolute "
+                f"path nor an https URL listed under "
+                f"\"{MCP_UVX_TRUSTED_URLS_KEY}\" (a bare name is relative to "
+                f"the project directory)",
+                f"Use an absolute path outside every project directory, or "
+                f"add the https URL to \"{MCP_UVX_TRUSTED_URLS_KEY}\" in "
+                f"dispatch_config.json.")
+
+
+_DB_PATH_PLACEHOLDER = "/absolute/path/to/theforge.db"
+
+
+def _check_mcp_db_path(name: str, server: dict, path: Path) -> None:
+    """Refuse a relative ``--db-path`` (sandbox-11), saying how to fix it."""
+    args = server.get("args")
+    if isinstance(args, list):
+        for index, arg in enumerate(args):
+            if arg == "--db-path":
+                db_path = args[index + 1] if index + 1 < len(args) else ""
+            elif isinstance(arg, str) and arg.startswith("--db-path="):
+                db_path = arg.split("=", 1)[1]
+            else:
+                continue
+            if not isinstance(db_path, str) or not os.path.isabs(db_path):
+                # IR-02: name the file and the exact edit. RR-04: suggest no
+                # path. Resolving the relative value from the orchestrator's
+                # cwd named a stale copy of the database on a real host, and
+                # an operator who pasted it would silently point every agent
+                # at it. Say where the live database is configured instead.
+                raise AgentDispatchRefused(
+                    f"MCP server {name!r} in {path} has a relative --db-path "
+                    f"{db_path!r}. Agents run in the project directory, so it "
+                    f"would open or create a different database there. Every "
+                    f"dispatch is refused until this is fixed. Fix: edit "
+                    f"{path} and set the --db-path argument of {name!r} to the "
+                    f"absolute path of the live TheForge database: "
+                    f"\"--db-path\", \"{_DB_PATH_PLACEHOLDER}\". EQUIPA does "
+                    f"not guess it (a copy found from the current directory "
+                    f"can be stale). Use the database the orchestrator itself "
+                    f"opens, equipa.constants.THEFORGE_DB: the \"theforge_db\" "
+                    f"entry of forge_config.json next to forge_orchestrator.py, "
+                    f"else the THEFORGE_DB environment variable, else "
+                    f"theforge.db beside the equipa package. Resolve symlinks "
+                    f"(realpath) so both name the same file."
+                )
+
+
+def _agent_subprocess_env() -> dict[str, str]:
+    """Allowlisted environment for an agent CLI (loop-03 / sandbox-03).
+
+    The passthrough list comes from the active dispatch config. If that
+    cannot be loaded, no names are added: fewer variables, never more.
+    """
+    return active_agent_env()
 
 
 @contextlib.contextmanager
@@ -614,6 +1708,8 @@ def build_cli_command(
         f"Execute the task described in your system prompt. Work in: {project_dir}"
     )
     claude_bin = shutil.which("claude") or "claude"
+    # sandbox-11: checked before any tempfile exists, so a refusal leaks none.
+    _check_mcp_servers(MCP_CONFIG, (project_dir,))
 
     # Write system prompt to a temp file to avoid Windows command-line length
     # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
@@ -639,6 +1735,12 @@ def build_cli_command(
             "--no-session-persistence",
             "--append-system-prompt-file", prompt_file.name,
             "--mcp-config", str(MCP_CONFIG),
+            # IR-01: the CLI runs in the agent-writable project directory, so
+            # load user settings only (a project .claude/settings.json could
+            # set disableAllHooks and switch off the Bash gate; CLAUDE.md
+            # would plant instructions) and only EQUIPA's MCP servers (no
+            # project .mcp.json). See equipa/cli_isolation.py.
+            *CLAUDE_CLI_ISOLATION_ARGS,
             "--add-dir", str(project_dir),
             "--permission-mode", "bypassPermissions",
         ]
@@ -670,9 +1772,16 @@ def build_cli_command(
         # The reactive stream check in the streaming loop stays on regardless
         # (defense-in-depth / belt-and-braces).
         if is_feature_enabled(_dc, "bash_security_pretooluse"):
-            if PRETOOLUSE_HOOK_SCRIPT.is_file():
+            hook_python = _hook_interpreter()
+            if hook_python is None:
+                logger.warning(
+                    "bash_security_pretooluse enabled but no absolute Python "
+                    "interpreter was found for the hook; skipping "
+                    "pre-execution gate",
+                )
+            elif PRETOOLUSE_HOOK_SCRIPT.is_file():
                 settings_payload = _pretooluse_settings_payload(
-                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3"
+                    PRETOOLUSE_HOOK_SCRIPT, hook_python
                 )
                 settings_file = tempfile.NamedTemporaryFile(
                     mode="w", suffix=".json", prefix="equipa_settings_",
@@ -707,7 +1816,9 @@ def build_cli_command(
         if skills_dir and skills_dir.exists():
             cmd.extend(["--add-dir", str(skills_dir)])
 
-        yield cmd
+        # R3136-03: with agent_isolation on, reviewer units run alone.
+        with isolation.unit_role(role):
+            yield cmd
     finally:
         # Idempotent: missing_ok=True means a second cleanup (or one after a
         # partial setup failure) does not raise.
@@ -1102,8 +2213,11 @@ def _terminate_live_agents_at_exit() -> None:
         try:
             agent.terminate_sync()
         except Exception:  # noqa: BLE001 - every remaining agent must be tried
-            logger.exception("[ProcessTree] failed to terminate agent "
-                             "launcher %d at exit", agent.pid)
+            # Also runs from the stop-signal handler, where a failing log
+            # call must not skip the remaining agents.
+            with contextlib.suppress(Exception):
+                logger.exception("[ProcessTree] failed to terminate agent "
+                                 "launcher %d at exit", agent.pid)
 
 
 def _track_live_agent(agent: _ContainedAgent) -> None:
@@ -1115,15 +2229,411 @@ def _track_live_agent(agent: _ContainedAgent) -> None:
 
 
 async def _spawn_agent_process(
-    cmd: list[str], **kwargs: Any,
+    cmd: list[str], project_dir: str | None = None, **kwargs: Any,
 ) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
     """Start the agent CLI with piped stdout/stderr, contained where possible.
 
+    The CLI (and the launcher in front of it) gets the allowlisted
+    environment and runs in the project directory: ``project_dir``, else the
+    first ``--add-dir`` of ``cmd`` (sandbox-03, sandbox-11).
+
     Returns the process to read from and its containment handle (None on
     platforms without the launcher). Raises FileNotFoundError when the
-    command is not on PATH, as a direct spawn would, and AgentContainmentError
-    when the launcher cannot be verified; the launcher is stopped first.
+    command is not on PATH, as a direct spawn would, AgentDispatchRefused
+    when the project directory is missing or the MCP config has a relative
+    --db-path, and AgentContainmentError when the launcher cannot be
+    verified; the launcher is stopped first.
     """
+    cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if cwd is not None and not os.path.isdir(cwd):
+        raise AgentDispatchRefused(f"project directory {cwd!r} does not exist")
+    if cmd and is_claude_cli(cmd[0]):
+        # IR-01 backstop for every caller (reflexion, manager, custom argv):
+        # whatever built the argv, project-scope settings, CLAUDE.md and
+        # .mcp.json in the cwd are never loaded.
+        try:
+            cmd = isolate_claude_argv(cmd)
+        except ValueError as exc:
+            raise AgentDispatchRefused(str(exc)) from exc
+    # RR-05: every --mcp-config value, both spellings, files and inline JSON.
+    for mcp_config in mcp_config_values(cmd):
+        _check_mcp_config_value(mcp_config, cwd)
+    # P2A-05: the scrubbed env below is pointless if the agent can read ours
+    # from /proc/<pid>/environ. build_agent_env() already tries; on Linux a
+    # failure refuses the dispatch instead of starting an agent anyway.
+    if (not protect_orchestrator_process()
+            and sys.platform.startswith("linux")):
+        raise AgentDispatchRefused(
+            "cannot make the orchestrator non-dumpable (PR_SET_DUMPABLE); "
+            "an agent could read its environment from /proc"
+        )
+    kwargs["env"] = _agent_subprocess_env()
+    kwargs["cwd"] = cwd
+
+    if isolation.isolation_enabled():
+        # Task 3135: separate agent UID, per-agent cgroup and clone; refused,
+        # never downgraded, when isolation cannot be established. The unit
+        # gets its own empty HOME and CLAUDE_CONFIG_DIR there; the shell pin
+        # and the shell-injection names are handled here, as below.
+        if cmd and is_claude_cli(cmd[0]):
+            kwargs["env"] = claude_cli_shell_env(kwargs["env"])
+        try:
+            return await isolation.spawn_isolated_agent(
+                cmd, cwd, kwargs["env"], limit=kwargs.get("limit"))
+        except isolation.AgentIsolationError as exc:
+            raise AgentDispatchRefused(f"agent isolation: {exc}") from exc
+
+    if not (cmd and is_claude_cli(cmd[0])):
+        return await _spawn_unisolated(cmd, kwargs)
+    # RR3144-A: without isolation the agent shares the operator's HOME and
+    # can write ~/.claude, whose user-scope env blocks and hooks bypassed the
+    # gate. Each CLI run reads only its own empty directory instead.
+    config_dir = _create_cli_config_dir()
+    kwargs["env"] = claude_cli_env(kwargs["env"], config_dir)
+    _warn_once_without_env_auth(kwargs["env"])
+    try:
+        process, agent = await _spawn_unisolated(cmd, kwargs)
+    except BaseException:
+        _remove_cli_config_dir(config_dir)
+        raise
+    _bind_cli_config_dir(process, config_dir)
+    return process, agent
+
+
+# Per-run CLAUDE_CONFIG_DIR of each live CLI process (RR3144-A). Removed by
+# _terminate_agent / _terminate_agent_sync, which every run path calls at its
+# end; the finalizer also runs when the process object is collected or the
+# orchestrator exits, so a caller that never terminates leaks nothing.
+_CLI_CONFIG_DIRS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# Process objects that cannot be weak-referenced (test doubles): by identity,
+# removed at termination or, failing that, when the orchestrator exits.
+_CLI_CONFIG_DIRS_BY_ID: dict[int, str] = {}
+# Every per-run directory created and not removed yet, with the PID that
+# created it. The stop-signal handler below removes only its own process's
+# entries: a forked child inherits this dict and the handler.
+_LIVE_CLI_CONFIG_DIRS: dict[str, int] = {}
+_env_auth_warning_logged = False
+
+# F-3 of the 3153 review: SIGTERM (systemctl stop, timeout) ends the process
+# without atexit, so neither the finalizers above nor
+# _remove_unreleased_cli_config_dirs ran, and a live run's directory stayed
+# behind until a later process swept it a day later. Same for a SIGINT whose
+# disposition is SIG_DFL.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# Marks a handler installed by _install_stop_signal_cleanup().
+_STOP_CLEANUP_MARKER = "_equipa_cli_config_dir_cleanup"
+# Set while a stop-signal handler cleans up; a second stop signal arriving
+# meanwhile returns at once, and the interrupted handler finishes.
+_stop_cleanup_running = False
+# R6 of the 3156 review: a stop signal between mkdtemp and the registration
+# below would miss the new directory. While a directory is being created
+# (by this PID: a forked child inherits these values), the handler only
+# records the signal, and it is re-sent once the directory is registered.
+_cli_config_dir_creator_pid: int | None = None
+_stop_signal_during_creation: int | None = None
+
+
+def _create_cli_config_dir() -> str:
+    """Create a per-run directory, registered before a stop signal sees it.
+
+    The handler is installed first, so the first run has it too; a stop
+    signal that arrives while the directory is created is deferred until
+    the directory is registered, then re-sent.
+    """
+    global _cli_config_dir_creator_pid, _stop_signal_during_creation
+    _install_stop_signal_cleanup()
+    _cli_config_dir_creator_pid = os.getpid()
+    try:
+        try:
+            config_dir = create_run_config_dir()
+        except RunConfigDirError as exc:
+            raise AgentDispatchRefused(str(exc)) from exc
+        _LIVE_CLI_CONFIG_DIRS[config_dir] = os.getpid()
+    finally:
+        _cli_config_dir_creator_pid = None
+        deferred_signum = _stop_signal_during_creation
+        _stop_signal_during_creation = None
+        if deferred_signum is not None:
+            signal.raise_signal(deferred_signum)
+    return config_dir
+
+
+def _install_stop_signal_cleanup() -> None:
+    """Make SIGTERM / SIGINT remove this process's live per-run directories.
+
+    Runs for every new directory, so a handler that was displaced (a merge
+    shield restores the handler it found, which may predate this one) is
+    put back. Only the main thread may install signal handlers; elsewhere
+    this is a no-op.
+
+    A signal is taken over when its disposition is SIG_DFL (the process
+    would end without atexit) and, for SIGTERM, when a Python handler is in
+    place, which is chained. SIG_IGN and handlers installed outside Python
+    are left alone. So is a Python SIGINT handler: KeyboardInterrupt or
+    asyncio's cancellation unwind normally and atexit runs, and asyncio.run
+    installs its own Ctrl-C handler only over signal.default_int_handler.
+
+    While a merge is shielded, the handler the shield restores when it ends
+    is wrapped the same way; otherwise a run started during the merge would
+    lose its cleanup when the merge ended.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in _STOP_SIGNALS:
+        handler = _stop_cleanup_replacing(signum, signal.getsignal(signum))
+        if handler is not None:
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError) as exc:
+                logger.warning("[Dispatch] cannot install the %s handler "
+                               "that removes per-run Claude config "
+                               "directories: %s",
+                               signal.Signals(signum).name, exc)
+        merge_safety.wrap_restored_handler(
+            signum,
+            lambda previous, signum=signum: _stop_cleanup_replacing(
+                signum, previous),
+        )
+
+
+def _stop_cleanup_replacing(signum: int, current: Any) -> Any:
+    """The cleanup handler to put in place of ``current``, or None to keep it
+    (already ours, SIG_IGN, a non-Python handler, a Python SIGINT handler).
+    """
+    if getattr(current, _STOP_CLEANUP_MARKER, False):
+        return None
+    if not (current == signal.SIG_DFL
+            or (signum == signal.SIGTERM and callable(current))):
+        return None
+    return _stop_signal_cleanup_handler(current)
+
+
+def _stop_signal_cleanup_handler(previous: Any) -> Any:
+    """A stop-signal handler that chains ``previous`` (SIG_DFL or callable).
+
+    SIG_DFL: terminate this process's live agents (a CLI still running
+    could write into its directory while it is removed), remove its live
+    per-run directories, then restore SIG_DFL and re-send the signal, so the
+    process still dies of it. A callable runs first and decides: when it
+    returns, the process carries on (a merge shield only records the
+    request) and its runs stay intact; when it raises (SystemExit,
+    KeyboardInterrupt) the directories are removed before the exception
+    unwinds, which a slow shutdown cut short by SIGKILL would skip.
+
+    The SIG_DFL path re-sends the signal in a ``finally``: whatever the
+    cleanup raises, the process still dies of the signal (R1 of the 3156
+    review).
+    """
+    def handler(signum: int, frame: FrameType | None) -> None:
+        global _stop_signal_during_creation
+        if _stop_cleanup_running:
+            return
+        if _cli_config_dir_creator_pid == os.getpid():
+            _stop_signal_during_creation = signum
+            return
+        if callable(previous):
+            try:
+                previous(signum, frame)
+            except BaseException:
+                _remove_live_cli_config_dirs_on_stop(terminate_agents=False)
+                raise
+            return
+        try:
+            with _stop_cleanup_watchdog():
+                _remove_live_cli_config_dirs_on_stop(terminate_agents=True)
+        finally:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    setattr(handler, _STOP_CLEANUP_MARKER, True)
+    return handler
+
+
+# Upper bound on the cleanup before the SIG_DFL path re-sends the signal:
+# agent termination is bounded by its own timeouts, plus slack for the
+# directory removal. Only a cleanup that hangs reaches it.
+_STOP_CLEANUP_BUDGET_SECONDS = (
+    _LAUNCHER_EXIT_TIMEOUT_SECONDS + _GROUP_KILL_TIMEOUT_SECONDS + 10.0)
+
+
+class _StopCleanupTimeout(BaseException):
+    """Raised by the SIGALRM watchdog into a stop-signal cleanup that hangs.
+
+    A BaseException, so the ``except Exception`` blocks of the cleanup and
+    of logging let it through to the handler's ``finally``.
+    """
+
+
+def _raise_stop_cleanup_timeout(signum: int,
+                                frame: FrameType | None) -> None:
+    raise _StopCleanupTimeout(
+        f"stop-signal cleanup still running after "
+        f"{_STOP_CLEANUP_BUDGET_SECONDS:.0f}s")
+
+
+@contextlib.contextmanager
+def _stop_cleanup_watchdog() -> Iterator[None]:
+    """Cut the SIG_DFL cleanup short once it runs past the budget.
+
+    A log line can block for good: the handler runs in the main thread,
+    which may itself be blocked in a large write to a full stderr pipe that
+    nobody drains, and then the handler's own write to that stderr waits
+    for the same space (seen on CPython 3.12). SIGALRM interrupts the
+    blocked write and raises _StopCleanupTimeout out of it; the handler's
+    ``finally`` then re-sends the stop signal.
+
+    Armed only when nothing else uses SIGALRM (default disposition, no
+    interval timer running); otherwise the cleanup runs unbounded, as
+    before. The SIGALRM handler is not restored afterwards: the caller
+    re-sends the stop signal and the process dies, and a SIGALRM already
+    pending would otherwise reach the default disposition (or a "signal
+    ignored" report written to the same stderr).
+    """
+    armed = False
+    try:
+        if (signal.getsignal(signal.SIGALRM) == signal.SIG_DFL
+                and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)):
+            signal.signal(signal.SIGALRM, _raise_stop_cleanup_timeout)
+            signal.setitimer(signal.ITIMER_REAL,
+                             _STOP_CLEANUP_BUDGET_SECONDS)
+            armed = True
+    except (ValueError, OSError):
+        armed = False  # not the main thread, or no timer: run unbounded
+    try:
+        yield
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+@contextlib.contextmanager
+def _logging_cannot_raise() -> Iterator[None]:
+    """Keep every log call in the block from raising.
+
+    The stop handler can interrupt the main thread inside a write to
+    stderr; a log line then fails with "reentrant call inside
+    <_io.BufferedWriter name='<stderr>'>" (RuntimeError), and logging's
+    error report, which writes to the same stderr, raises it again out of
+    the log call (R1 of the 3156 review). With ``raiseExceptions`` off,
+    ``Handler.handleError`` reports nothing, so a failing handler loses its
+    line instead of raising. That covers the log calls deep in agent
+    termination too; the direct ones use ``_log_on_stop``.
+    """
+    saved = logging.raiseExceptions
+    logging.raiseExceptions = False
+    try:
+        yield
+    finally:
+        logging.raiseExceptions = saved
+
+
+def _log_on_stop(level: int, message: str, *args: Any) -> None:
+    """Log from the stop path; a handler that raises (a closed, full or
+    busy stderr: BrokenPipeError, BlockingIOError, OSError, RuntimeError)
+    costs the line, never the signal."""
+    # Nothing can report the failure: the stream that failed is the report.
+    with contextlib.suppress(Exception):
+        logger.log(level, message, *args)
+
+
+def _remove_live_cli_config_dirs_on_stop(*, terminate_agents: bool) -> None:
+    """Remove every live per-run directory this process created.
+
+    Never raises an Exception, including from logging: the caller must
+    still re-send or re-raise the signal. Agents are terminated first, so a
+    CLI still running cannot write into a directory after its removal.
+    """
+    global _stop_cleanup_running
+    _stop_cleanup_running = True
+    try:
+        with _logging_cannot_raise():
+            if terminate_agents:
+                try:
+                    _terminate_live_agents_at_exit()
+                except Exception as exc:  # noqa: BLE001 - the signal goes on
+                    # A CLI that may still run could write into a directory
+                    # removed now; the stale-directory sweep takes them.
+                    _log_on_stop(logging.ERROR, "[Dispatch] terminating the "
+                                 "live agents on a stop signal failed, per-run"
+                                 " Claude config directories left: %r", exc)
+                    return
+            own_pid = os.getpid()
+            for config_dir, creator_pid in _LIVE_CLI_CONFIG_DIRS.copy().items():
+                if creator_pid == own_pid:
+                    _remove_cli_config_dir_on_stop(config_dir)
+    finally:
+        _stop_cleanup_running = False
+
+
+def _remove_cli_config_dir_on_stop(config_dir: str) -> None:
+    """``_remove_cli_config_dir`` for the stop path: never raises."""
+    try:
+        errors = remove_run_config_dir(config_dir)
+    except Exception as exc:  # noqa: BLE001 - the other dirs still go
+        errors = [repr(exc)]
+    _LIVE_CLI_CONFIG_DIRS.pop(config_dir, None)
+    if errors:
+        _log_on_stop(logging.WARNING, "[Dispatch] per-run Claude config "
+                     "directory %s not fully removed: %s", config_dir,
+                     "; ".join(errors[:5]))
+
+
+def _remove_cli_config_dir(config_dir: str) -> None:
+    errors = remove_run_config_dir(config_dir)
+    _LIVE_CLI_CONFIG_DIRS.pop(config_dir, None)
+    if errors:
+        logger.warning("[Dispatch] per-run Claude config directory %s not "
+                       "fully removed: %s", config_dir, "; ".join(errors[:5]))
+
+
+def _remove_unreleased_cli_config_dirs() -> None:
+    while _CLI_CONFIG_DIRS_BY_ID:
+        _remove_cli_config_dir(_CLI_CONFIG_DIRS_BY_ID.popitem()[1])
+
+
+def _bind_cli_config_dir(process: Any, config_dir: str) -> None:
+    try:
+        _CLI_CONFIG_DIRS[process] = weakref.finalize(
+            process, _remove_cli_config_dir, config_dir)
+    except TypeError:
+        if not _CLI_CONFIG_DIRS_BY_ID:
+            atexit.register(_remove_unreleased_cli_config_dirs)
+        _CLI_CONFIG_DIRS_BY_ID[id(process)] = config_dir
+
+
+def _release_cli_config_dir(process: Any) -> None:
+    """Remove the run's config directory, once; a no-op for other processes."""
+    config_dir = _CLI_CONFIG_DIRS_BY_ID.pop(id(process), None)
+    if config_dir is not None:
+        _remove_cli_config_dir(config_dir)
+        return
+    try:
+        finalizer = _CLI_CONFIG_DIRS.pop(process, None)
+    except TypeError:  # not weak-referenceable and not bound by identity
+        return
+    if finalizer is not None:
+        finalizer()
+
+
+def _warn_once_without_env_auth(env: Mapping[str, str]) -> None:
+    """The fresh config directory holds no login, so a CLI without an
+    environment credential cannot authenticate. Say so once, by name."""
+    global _env_auth_warning_logged
+    if _env_auth_warning_logged or has_env_auth(env):
+        return
+    _env_auth_warning_logged = True
+    logger.warning(
+        "[Dispatch] no CLAUDE_CODE_OAUTH_TOKEN in the agent environment: each "
+        "Claude CLI run uses a fresh, empty CLAUDE_CONFIG_DIR (RR3144-A), so "
+        "the login in ~/.claude is not used and the CLI cannot authenticate. "
+        "Create a token with `claude setup-token` and export it for the "
+        "orchestrator.")
+
+
+async def _spawn_unisolated(
+    cmd: list[str], kwargs: dict[str, Any],
+) -> tuple[asyncio.subprocess.Process, _ContainedAgent | None]:
+    """Start ``cmd`` directly, or behind the per-agent launcher."""
     if not _agent_containment_supported():
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
@@ -1183,24 +2693,31 @@ async def _terminate_agent(
     """Terminate the agent on a timeout, early termination or normal exit.
 
     Contained agents have their whole tree swept; without the launcher the
-    CLI is killed by pid if it is still running, as before.
+    CLI is killed by pid if it is still running, as before. The run's own
+    CLAUDE_CONFIG_DIR is removed afterwards (RR3144-A).
     """
-    if agent is not None:
-        await agent.terminate()
-    elif process.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+    try:
+        if agent is not None:
+            await agent.terminate()
+        elif process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+    finally:
+        _release_cli_config_dir(process)
 
 
 def _terminate_agent_sync(
     process: asyncio.subprocess.Process, agent: _ContainedAgent | None,
 ) -> None:
     """Blocking variant for cancellation and loop shutdown (PT-02)."""
-    if agent is not None:
-        agent.terminate_sync()
-    elif process.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+    try:
+        if agent is not None:
+            agent.terminate_sync()
+        elif process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+    finally:
+        _release_cli_config_dir(process)
 
 
 def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:
@@ -1215,6 +2732,19 @@ def _containment_failure_result(exc: AgentContainmentError) -> AgentResult:
     }
 
 
+def _dispatch_refused_result(exc: AgentDispatchRefused) -> AgentResult:
+    logger.error("[Dispatch] agent refused: %s", exc)
+    return {
+        "success": False,
+        "result_text": "",
+        "num_turns": 0,
+        "duration": 0,
+        "cost": None,
+        "errors": [f"Agent dispatch refused: {exc}"],
+        "files_changed_set": [],
+    }
+
+
 async def run_agent(
     cmd: list[str],
     timeout: int | None = None,
@@ -1222,6 +2752,7 @@ async def run_agent(
     persistent_retry: bool = False,
     abort_controller: AbortController | None = None,
     persistent_max_attempts: int | None = None,
+    project_dir: str | None = None,
 ) -> AgentResult:
     """Spawn claude -p with retry logic and exponential backoff.
 
@@ -1245,6 +2776,8 @@ async def run_agent(
         persistent_max_attempts: Ceiling on capacity-error retries in
             persistent mode. None reads dispatch config
             ``persistent_retry_max_attempts`` (default 36).
+        project_dir: Working directory for the CLI. None uses the first
+            ``--add-dir`` of ``cmd`` (what build_cli_command puts there).
 
     Returns:
         Result dict with success, result_text, num_turns, duration, cost, errors
@@ -1289,7 +2822,8 @@ async def run_agent(
             }
 
         try:
-            process, contained = await _spawn_agent_process(cmd)
+            process, contained = await _spawn_agent_process(
+                cmd, project_dir=project_dir)
 
             # Register abort handler to stop the agent's whole process tree
             def abort_handler(
@@ -1353,6 +2887,8 @@ async def run_agent(
             }
         except AgentContainmentError as exc:
             return _containment_failure_result(exc)
+        except AgentDispatchRefused as exc:
+            return _dispatch_refused_result(exc)
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -1375,6 +2911,11 @@ async def run_agent(
         if stderr_text:
             result["errors"].append(f"stderr: {stderr_text}")
 
+        # The CLI's own error message (an is_error result). With stderr it is
+        # all the retry classifiers below may read: the JSON stdout also holds
+        # the agent's text and token counts ("cache_read_input_tokens": 5029
+        # contains "502"), neither of which is an API error (F1).
+        api_error_text = ""
         if not stdout_text:
             result["errors"].append("No output from agent")
             last_error = "No output from agent"
@@ -1388,18 +2929,19 @@ async def run_agent(
                 # Check for error subtypes
                 subtype = data.get("subtype", "")
                 if subtype == "error_max_turns":
-                    # Agent ran out of turns but may have done useful work.
-                    # gate-07: the run did NOT finish, so a caller whose
-                    # output must be complete (the security reviewer) reads
-                    # ``hit_max_turns`` and treats the run as failed.
-                    result["success"] = True
+                    # The run was cut off, not finished (F8, as the streaming
+                    # path reports it): not a success, and ``hit_max_turns``
+                    # tells a caller that wants the partial work (the dev
+                    # loop) or needs complete output (a reviewer, gate-07).
+                    result["success"] = False
                     result["hit_max_turns"] = True
-                    result["errors"].append("Agent hit max turns limit")
+                    result["errors"].append(_MAX_TURNS_ERROR)
                 elif data.get("is_error"):
                     result["success"] = False
                     error_msg = data.get('result', 'unknown')
                     result["errors"].append(f"Agent error: {error_msg}")
                     last_error = error_msg
+                    api_error_text = str(error_msg)
                 else:
                     result["success"] = True
 
@@ -1413,9 +2955,13 @@ async def run_agent(
         # If successful, return immediately
         if result["success"]:
             return result
+        # A run cut off by its turn budget is never relaunched (F1/F8): a
+        # fresh agent with a full budget on a dirty worktree is not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, api_error_text)
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -1423,13 +2969,13 @@ async def run_agent(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, api_error_text):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, api_error_text)
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:
@@ -1518,8 +3064,21 @@ async def _run_agent_streaming_impl(
     #   (c) deferred commits caused stale-HEAD overrides of fresh edits
     # pre_head..post_head solves all three. None means "no commits yet" — the
     # later cross-check skips the override and trusts files_changed_set.
+    #
+    # R3166-01 (task #3168): in a project that was not git at dispatch any
+    # repository is one an agent made, and git run there by discovery
+    # executes the agent's clean filter in the orchestrator, outside agent
+    # containment. A caller that recorded nothing
+    # (equipa.monitoring.dispatched_without_git) gets the same treatment
+    # when there is no .git at or above project_dir as this run starts. Such
+    # a run starts no git at all (file changes come from the tool stream),
+    # and a repository that appears ends it.
+    non_git_run = bool(project_dir) and (
+        not git_checks_allowed(project_dir)
+        or _nearest_git_entry(Path(project_dir)) is None
+    )
     pre_head: str | None = None
-    if project_dir:
+    if project_dir and not non_git_run:
         pre_head = await _git_rev_parse_head(project_dir)
 
     # Create child abort controller if parent provided
@@ -1582,8 +3141,13 @@ async def _run_agent_streaming_impl(
     # judged by its tool_result (refused vs executed), not killed on sight.
     hook_command = _pretooluse_hook_command(cmd)
     gate_fingerprint = _gate_fingerprint() if hook_command else None
-    if hook_command and (gate_fingerprint is None
-                         or not _gate_canary_ok(hook_command)):
+    agent_cwd = project_dir or _cmd_option(cmd, "--add-dir")
+    if agent_cwd is not None and not os.path.isdir(agent_cwd):
+        agent_cwd = None  # the spawn below refuses it with a clear error
+    if hook_command and (
+        gate_fingerprint is None
+        or not await asyncio.to_thread(_gate_canary_ok, hook_command, agent_cwd)
+    ):
         log("  [BashSecurity] pre-execution gate failed its canary; flagged "
             "commands will be killed on sight", output)
         hook_command = None
@@ -1627,9 +3191,21 @@ async def _run_agent_streaming_impl(
             "files_changed_set": [],
         }
 
+    # N1 (task #3168): an earlier agent of this dispatch already made a
+    # repository here; no further agent runs in it.
+    appeared = _repository_appeared_reason(project_dir) if non_git_run else None
+    if appeared is not None:
+        log(f"  [EarlyTerm] Not starting the agent: {appeared}", output)
+        refused = _build_streaming_result(
+            0, time.time() - start_time, False, appeared, False, None, None, [],
+        )
+        refused["files_changed_set"] = []
+        return refused
+
     try:
         process, contained = await _spawn_agent_process(
             cmd,
+            project_dir=project_dir,
             limit=4 * 1024 * 1024,  # 4MB buffer for large file reads
         )
 
@@ -1653,6 +3229,8 @@ async def _run_agent_streaming_impl(
         }
     except AgentContainmentError as exc:
         return _containment_failure_result(exc)
+    except AgentDispatchRefused as exc:
+        return _dispatch_refused_result(exc)
 
     try:
         # Read stdout line-by-line with overall timeout
@@ -1733,18 +3311,17 @@ async def _run_agent_streaming_impl(
                         turn_count += 1
                         turn_has_tool_calls = True
 
-                        # Record action entry for action logging
-                        try:
-                            input_str = json.dumps(tool_input, default=str)
-                        except (TypeError, ValueError):
-                            input_str = str(tool_input)
+                        # Record action entry for action logging. Preview and
+                        # hash are persisted to agent_actions: string values
+                        # are redacted before serialising, and the hash is no
+                        # oracle for what was redacted (sandbox-12, P2A-04/08).
+                        input_preview, input_hash = redact_tool_input(
+                            tool_input, 200)
                         action_log.append({
                             "turn": turn_count,
                             "tool": tool_name,
-                            "input_preview": input_str[:200],
-                            "input_hash": hashlib.sha256(
-                                input_str.encode("utf-8", errors="replace")
-                            ).hexdigest(),
+                            "input_preview": input_preview,
+                            "input_hash": input_hash,
                             "timestamp": time.time(),
                         })
 
@@ -1767,27 +3344,37 @@ async def _run_agent_streaming_impl(
                         elif tool_name == "Bash":
                             bash_cmd = tool_input.get("command", "")
 
-                            # --- Bash security pre-execution filter ---
-                            _check_started = time.monotonic()
-                            sec_result = check_bash_command(bash_cmd)
-                            slow_check = (time.monotonic() - _check_started
-                                          > _SLOW_CHECK_SECONDS)
+                            # --- Bash security reactive check ---
+                            # Off the event loop, with a deadline (sandbox-07).
+                            # Commands and checker messages are redacted before
+                            # they reach a log line or a result (sandbox-12).
+                            sec_result = await _reactive_bash_check(bash_cmd)
+                            cmd_preview = redacted_preview(bash_cmd, 120)
                             tool_use_id = block.get("id")
-                            if (not sec_result.safe and hook_command and tool_use_id
-                                    and not slow_check):
+                            if sec_result is None:
+                                early_term_reason = (
+                                    f"Bash security: the reactive check did not "
+                                    f"finish within {_SLOW_CHECK_SECONDS:g}s; "
+                                    f"failing closed"
+                                )
+                                log(f"  [BashSecurity] BLOCKED: {early_term_reason} "
+                                    f"— cmd={cmd_preview}", output)
+                            elif not sec_result.safe and hook_command and tool_use_id:
                                 # The gate ran this same check before execution;
                                 # its tool_result says whether it was refused.
+                                check_msg = redact_secrets(sec_result.message)
                                 pending_flagged[tool_use_id] = (
-                                    sec_result.check_id, sec_result.message)
+                                    sec_result.check_id, check_msg)
                                 log(f"  [BashSecurity] flagged check={sec_result.check_id}: "
-                                    f"{sec_result.message} (awaiting pre-execution gate) "
-                                    f"— cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} (awaiting pre-execution gate) "
+                                    f"— cmd={cmd_preview}", output)
                             elif not sec_result.safe:
+                                check_msg = redact_secrets(sec_result.message)
                                 log(f"  [BashSecurity] BLOCKED check={sec_result.check_id}: "
-                                    f"{sec_result.message} — cmd={bash_cmd[:120]}", output)
+                                    f"{check_msg} — cmd={cmd_preview}", output)
                                 early_term_reason = (
                                     f"Bash security violation (check {sec_result.check_id}): "
-                                    f"{sec_result.message}"
+                                    f"{check_msg}"
                                 )
 
                             if any(kw in bash_cmd for kw in [
@@ -2166,17 +3753,19 @@ async def _run_agent_streaming_impl(
                                     if _t:
                                         tool_output_text_chunks.append(_t)
 
+                        # Error output often echoes the command; it is
+                        # persisted as agent_actions.error_summary (sandbox-12).
                         error_text = None
                         if is_error:
                             if isinstance(content, str):
-                                error_text = content[:200]
+                                error_text = redacted_preview(content, 200)
                             elif isinstance(content, list):
                                 texts = []
                                 for c in content:
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         texts.append(c.get("text", ""))
                                 if texts:
-                                    error_text = " ".join(texts)[:200]
+                                    error_text = redacted_preview(" ".join(texts), 200)
 
                         tool_errors.append(error_text)
 
@@ -2208,13 +3797,23 @@ async def _run_agent_streaming_impl(
                                 entry["error_summary"] = error_text[:200]
 
                             # After any tool completes, check git for file changes
-                            if project_dir:
+                            if project_dir and not non_git_run:
                                 if _check_git_changes(project_dir):
                                     has_any_file_change = True
                                     turns_without_file_change = 0
                                     tool_label = entry.get("tool", "unknown")
                                     log(f"  [FileDetect] Git detected file changes "
                                         f"via {tool_label}", output)
+
+                        # R3166-01 / N1 (task #3168): the tool may have made a
+                        # repository in a project that was not git at
+                        # dispatch. The run ends before the orchestrator, or
+                        # the agent's next step, can use it.
+                        if non_git_run and not early_term_reason:
+                            appeared = _repository_appeared_reason(project_dir)
+                            if appeared is not None:
+                                early_term_reason = appeared
+                                log(f"  [EarlyTerm] {early_term_reason}", output)
 
                 if early_term_reason:
                     break
@@ -2246,12 +3845,26 @@ async def _run_agent_streaming_impl(
     # Runs on every exit path. After a normal exit the launcher has already
     # swept whatever the agent left running; this confirms and releases.
     was_running = process.returncode is None
-    if was_running:
+    if was_running and early_term_reason:
         log(f"  [EarlyTerm] Killing agent process (reason: {early_term_reason})", output)
+    elif was_running:
+        # A normal finish: the stream ended (result event or EARLY_COMPLETE)
+        # while the CLI or the launcher's sweep was still winding down.
+        log("  [Cleanup] Agent stream finished; stopping the agent process "
+            "tree", output)
     await _terminate_agent(process, contained)
     if was_running:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, OSError):
             await asyncio.wait_for(process.communicate(), timeout=5)
+
+    # R3166-01 / N1 (task #3168): checked again once the agent's process
+    # tree is gone, for a repository its last step (or a process it left
+    # running) made after the last tool result. The attempt then reads as
+    # terminated, so the dev-test loop runs no git diff on it.
+    if non_git_run and not early_term_reason:
+        early_term_reason = _repository_appeared_reason(project_dir)
+        if early_term_reason is not None:
+            log(f"  [EarlyTerm] {early_term_reason}", output)
 
     duration = time.time() - start_time
 
@@ -2313,6 +3926,24 @@ async def _run_agent_streaming_impl(
                 result["files_changed_count"] = git_diff_count
 
     return result
+
+
+def _repository_appeared_reason(project_dir: str) -> str | None:
+    """Why a run in a project that was not git when it started must stop:
+    a ``.git`` is now at or above ``project_dir``. None while there is none.
+
+    R3166-01 / N1 (task #3168): found by a filesystem walk, never by asking
+    git. The wording matches none of the analysis-paralysis phrases
+    (``equipa.loops._is_analysis_paralysis``), so the dev-test loop ends
+    the attempt as terminated instead of retrying it in the same place.
+    """
+    git_entry = _nearest_git_entry(Path(project_dir))
+    if git_entry is None:
+        return None
+    return (
+        f"a git repository appeared at {git_entry} in a project that was not "
+        f"git at dispatch; the orchestrator runs no git there"
+    )
 
 
 async def _git_rev_parse_head(project_dir: str) -> str | None:
@@ -2392,6 +4023,10 @@ async def run_agent_with_retries(
         # overloaded failure to the caller instead (task #2994).
         if is_overloaded_result(result):
             print("  Not retrying: model overloaded (529) through every retry")
+            return result, attempt
+        # Out of turns is not a transient failure: never relaunch (F1).
+        if result.get("hit_max_turns"):
+            print("  Not retrying: agent hit its max turns")
             return result, attempt
 
         # Check if output is valid
@@ -2476,11 +4111,17 @@ async def run_agent_streaming_with_retry(
         # If successful, return immediately
         if result.get("success"):
             return result
+        # A run cut off by its turn budget is never relaunched (F1, indep
+        # review of 3122): the dev loop's continuation owns what happens
+        # next, and a fresh agent with a full budget on a dirty worktree is
+        # not a retry.
+        if result.get("hit_max_turns"):
+            return result
 
-        # Extract error info
-        stderr_text = " ".join(result.get("errors", []))
-        stdout_text = result.get("result_text", "")
-        last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+        # Extract error info. Only structured error fields are classified,
+        # never the agent's RESULT text (F1).
+        stderr_text = _structured_error_text(result)
+        last_error = (stderr_text or result.get("result_text", ""))[:200]
 
         # Non-retryable: analysis paralysis kills must fail fast, not retry.
         # Retrying after a paralysis kill restarts the exact same pattern
@@ -2497,7 +4138,7 @@ async def run_agent_streaming_with_retry(
                 return result
 
         # 529/overloaded: keep retrying on the SAME model. Never swap --model.
-        overloaded = is_overloaded_error(stderr_text, stdout_text)
+        overloaded = is_overloaded_error(stderr_text, "")
         if overloaded:
             consecutive_529_errors += 1
             _note_overloaded(cmd, consecutive_529_errors)
@@ -2505,13 +4146,13 @@ async def run_agent_streaming_with_retry(
             consecutive_529_errors = 0  # Reset on non-529 error
 
         # Check if error is retryable (529/overloaded is transient capacity)
-        if not overloaded and not is_retryable_error(stderr_text, stdout_text):
+        if not overloaded and not is_retryable_error(stderr_text, ""):
             # Non-retryable error, fail immediately
             return result
 
         # Persistent retry mode: retry 429/529 with high backoff, bounded by
         # persistent_ceiling so a sustained outage still fails loudly.
-        is_capacity_error = is_transient_capacity_error(stderr_text, stdout_text)
+        is_capacity_error = is_transient_capacity_error(stderr_text, "")
         if persistent_retry and is_capacity_error:
             persistent_attempt += 1
             if persistent_attempt >= persistent_ceiling:
@@ -2661,6 +4302,16 @@ async def dispatch_agent(
         provider = get_provider(role, dispatch_config)
 
     if provider == "ollama" and system_prompt and project_dir:
+        # R3136-01: Ollama tool calls run in-process as the orchestrator user,
+        # never through the isolated launcher, so the flag refuses them.
+        refusal = isolation.unisolated_spawn_refusal(
+            "Ollama agent", isolation.OLLAMA_REFUSAL_REMEDY,
+            action=isolation.OLLAMA_REFUSAL_ACTION)
+        if refusal:
+            refused = _dispatch_refused_result(AgentDispatchRefused(refusal))
+            refused["result"] = "blocked"
+            refused["result_text"] = f"RESULT: blocked\nBLOCKERS: {refusal}"
+            return refused
         from ollama_agent import run_ollama_agent
         model = get_ollama_model(role, dispatch_config)
         base_url = get_ollama_base_url(dispatch_config)
@@ -2727,4 +4378,4 @@ async def dispatch_agent(
             task_id=task_id, cycle_number=cycle, project_dir=project_dir,
             paralysis_retry_count=paralysis_retry_count)
     else:
-        return await run_agent(cmd)
+        return await run_agent(cmd, project_dir=project_dir)

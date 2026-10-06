@@ -29,7 +29,11 @@ from equipa.constants import (
     MONOLOGUE_EXEMPT_TURNS,
     MONOLOGUE_THRESHOLD,
 )
-from equipa.git_ops import git_run
+from equipa.git_ops import (  # noqa: F401  (re-exported)
+    dispatched_without_git,
+    git_checks_allowed,
+    git_run,
+)
 from equipa.hooks import fire as fire_hook_sync
 
 # --- Compaction Detection Constants ---
@@ -251,6 +255,15 @@ def _check_cost_limit(
     return None
 
 
+# --- Projects that were not git at dispatch (R3166-01, task #3168) ---
+#
+# ``dispatched_without_git`` and ``git_checks_allowed`` are imported from
+# equipa.git_ops above and re-exported here. IR73-02 (task #3176): the
+# record lives where git runs, so the process runners refuse every git call
+# in a recorded project; the checks below still ask first, for their own
+# "not git" answers.
+
+
 # --- Git Change Detection ---
 
 def _check_git_changes(project_dir: str | None) -> bool:
@@ -258,6 +271,8 @@ def _check_git_changes(project_dir: str | None) -> bool:
 
     Runs `git diff --stat` and `git status --short` in the project directory.
     Returns True if either command produces output (indicating file changes).
+    Runs no git, and returns False, in a project that was not git at
+    dispatch (R3166-01: see :func:`dispatched_without_git`).
 
     Args:
         project_dir: Path to the project directory (must be a git repo).
@@ -265,7 +280,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
     Returns:
         bool: True if file changes detected, False otherwise (including errors).
     """
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return False
 
     project_dir_str = str(project_dir)
@@ -295,7 +310,7 @@ def _check_git_changes(project_dir: str | None) -> bool:
 
 def get_starting_sha(project_dir: str | None) -> str | None:
     """Capture the current HEAD SHA at loop start for session-commit detection."""
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return None
     try:
         result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
@@ -315,7 +330,7 @@ def has_session_commits(
     finding a merge-base or remote branches. Works on main, isolation
     branches, and worktrees alike.
     """
-    if not project_dir or not starting_sha:
+    if not project_dir or not starting_sha or not git_checks_allowed(project_dir):
         return False
     try:
         result = git_run(["rev-parse", "HEAD"], str(project_dir), timeout=10)
@@ -340,7 +355,7 @@ def has_branch_commits(project_dir: str | None) -> bool:
     This is used by the no-progress guard to avoid false-positives when an
     agent committed work in early cycles but then idled in later cycles.
     """
-    if not project_dir:
+    if not project_dir or not git_checks_allowed(project_dir):
         return False
 
     project_dir_str = str(project_dir)
@@ -642,7 +657,11 @@ def _build_streaming_result(
 
         subtype = result_data.get("subtype", "")
         if subtype == "error_max_turns":
-            result["success"] = True
+            # The run was cut off, not finished: report it as incomplete and
+            # flag it, so a caller that needs complete output (a reviewer) can
+            # tell. The error text is what the dev loop's continuation keys on.
+            result["success"] = False
+            result["hit_max_turns"] = True
             result["errors"].append("Agent hit max turns limit")
         elif result_data.get("is_error"):
             result["errors"].append(

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import json
 import os
 import signal
 import subprocess
@@ -46,6 +47,14 @@ FAKE_CLAUDE_SOURCE = textwrap.dedent('''\
     import subprocess
     import sys
     import time
+
+    # The agent env is allowlisted (loop-03): the test's FAKE_* settings
+    # arrive through a control file next to this script, not inheritance.
+    _CONTROL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fake_env.json")
+    if os.path.exists(_CONTROL):
+        with open(_CONTROL, encoding="utf-8") as handle:
+            os.environ.update(json.load(handle))
 
     QUIET = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
              "stderr": subprocess.DEVNULL}
@@ -157,19 +166,27 @@ class _FakeClaude:
         self.env_path = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
         self._monkeypatch = monkeypatch
         self._seen: dict[int, int] = {}
+        self._control_file = bin_dir / "fake_env.json"
+        self._control: dict[str, str] = {}
         monkeypatch.setenv("PATH", self.env_path)
-        monkeypatch.setenv("FAKE_WATCHER_PIDFILE", str(self.watcher_pidfile))
+        self._setenv("FAKE_WATCHER_PIDFILE", str(self.watcher_pidfile))
         # A short grace keeps the SIGTERM-ignoring child's tests quick.
         # raising=False so that, run against pre-3114 code, these tests fail
         # on their assertions (the watcher is alive) rather than in setup.
         monkeypatch.setattr(agent_runner, "AGENT_TERMINATION_GRACE_SECONDS",
                             1.0, raising=False)
 
+    def _setenv(self, name: str, value: str) -> None:
+        """Set a FAKE_* control value for the fake CLI (see _CONTROL)."""
+        self._monkeypatch.setenv(name, value)
+        self._control[name] = value
+        self._control_file.write_text(json.dumps(self._control),
+                                      encoding="utf-8")
+
     def mode(self, mode: str, *, stubborn: bool = False) -> None:
-        self._monkeypatch.setenv("FAKE_CLAUDE_MODE", mode)
+        self._setenv("FAKE_CLAUDE_MODE", mode)
         if stubborn:
-            self._monkeypatch.setenv("FAKE_STUBBORN_PIDFILE",
-                                     str(self.stubborn_pidfile))
+            self._setenv("FAKE_STUBBORN_PIDFILE", str(self.stubborn_pidfile))
 
     def spawned_ready(self, stubborn: bool = False) -> bool:
         files = [self.watcher_pidfile]
@@ -639,7 +656,9 @@ def test_unsupported_platform_spawns_the_cli_directly(monkeypatch):
     result = asyncio.run(agent_runner.run_agent(
         ["claude", "-p", "x"], timeout=10, max_retries=1))
 
-    assert seen["argv"] == ["claude", "-p", "x"]
+    # IR-01 (task 3134): the direct path also ignores project-scope settings.
+    assert seen["argv"] == ["claude", "-p", "x", "--setting-sources", "",
+                            "--strict-mcp-config"]
     assert "start_new_session" not in seen["kwargs"]
     assert result["success"] is True
 

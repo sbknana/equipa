@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Task 3122: review-gate severity shapes left open by the 3117 review.
+
+Each shape below merged a finding behind an all-zero ``## Counts`` footer.
+It must now fail closed (count-mismatch). Next to each group sits benign
+prose of the same look, which must still merge. Lower-case "low" / "info"
+never count (PR #40), the footer is still cross-checked, an incomplete
+review still blocks, and a 200 KB adversarial review parses in under 2 s.
+
+Copyright 2026 Forgeborn
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+from equipa import loops
+from equipa.security_gate import review_complete_line, reviewer_nonce_line
+from tests.host_timing import assert_linear_time
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate,
+    production_seconds,
+)
+from tests.review_gate_timing import timing_test
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{loops.backstop_reason(severity)} at line "
+    for severity in loops.MERGE_BLOCKING_SEVERITIES
+)
+
+NONCE = "fedcba9876543210fedcba9876543210"
+ZERO = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+ONE_LOW = "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 1 | INFO: 0"
+ONE_HIGH = "CRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0"
+
+
+def review(summary: str, body: list[str], footer: str, low_heading: bool,
+           after_footer: list[str] | None = None) -> str:
+    lines = [reviewer_nonce_line(NONCE), "# Security Review", "",
+             "## Summary", summary, ""]
+    if low_heading:
+        lines += ["### [E1] LOW - verbose error message", "Details.", ""]
+    lines += body + ["", "## Files Reviewed", "- app.py", "- tests/test_app.py",
+                     "", "## Methodology", "Read the diff, ran semgrep.", "",
+                     "## Counts", footer]
+    lines += (after_footer or []) + [review_complete_line(NONCE)]
+    return "\n".join(lines) + "\n"
+
+
+def analyze(text: str) -> loops.ReviewCountAnalysis:
+    return loops._analyze_review_file(Path("SECURITY-REVIEW-1.md"), text=text)
+
+
+def blocked(text: str) -> loops.ReviewCountAnalysis:
+    """The parser's analysis of a review the merge gate blocks (task 3170,
+    IR67-02: every must-block case decides through the gate)."""
+    return blocked_by_the_gate(text, nonce=NONCE)
+
+
+def assert_blocks_behind_zero_footer(body: list[str]) -> None:
+    analysis = blocked(review("No findings.", body, ZERO, low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, (
+        body, analysis.detail)
+
+
+def assert_prose_merges(body: list[str]) -> None:
+    analysis = analyze(review("1 finding.", body, ONE_LOW, low_heading=True))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, (body, analysis.detail)
+    assert analysis.counts == {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0,
+                               "LOW": 1, "INFO": 0}
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+SEVERITY_TOKEN = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+# Task 3152: "HIGH: 0 and CRITICAL: 0 from semgrep." and "| semgrep | HIGH: 0
+# |" merged as written under the 3143 tally exemption. CRITICAL and HIGH have
+# no exemption now, so they block as written like every other prose row.
+
+
+def assert_compliant_prose_merges(body: list[str]) -> None:
+    """Task 3143: the reviewer prompt allows UPPER-case CRITICAL, HIGH and
+    MEDIUM only as a finding's label, so compliant prose is written in lower
+    case and merges. The UPPER-case original is still read as prose by every
+    rule: only the severity-token backstop blocks it."""
+    assert_prose_merges([
+        SEVERITY_TOKEN.sub(lambda match: match.group(1).lower(), line)
+        for line in body
+    ])
+    if any(SEVERITY_TOKEN.search(line) for line in body):
+        assert_only_the_backstop_blocks(body)
+
+
+def assert_only_the_backstop_blocks(body: list[str]) -> None:
+    """The merge gate blocks ``body`` next to a counted LOW finding (task
+    3170, IR67-02): the rules trusted it (the backstop runs only then) and
+    the severity-token backstop blocked it."""
+    analysis = blocked(review("1 finding.", body, ONE_LOW, low_heading=True))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, body
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
+        body, analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(finding):
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    assert_only_the_backstop_blocks([AS_WRITTEN_ONLY_FINDINGS[finding]])
+
+
+# --- 1. trailing-severity list items -----------------------------------------
+
+@pytest.mark.parametrize("line", [
+    "- SQL injection in login handler (HIGH)",
+    "- Missing CSRF token - Severity: Medium",
+    "- SQL injection in the search endpoint - HIGH",
+    "- SQL injection in the search endpoint: HIGH",
+    "- **Token leak in request logs** — CRITICAL",
+    "2. Open redirect after login, MEDIUM.",
+    "> - Open redirect in /login (HIGH)",
+])
+def test_trailing_severity_list_item_fails_closed(line):
+    assert_blocks_behind_zero_footer(["## Findings", line])
+
+
+@pytest.mark.parametrize("line", [
+    "- Confidence in the fix: high",
+    "- Performance impact of the change - Low",
+    "- Overall risk: LOW",
+    "- Test coverage for the parser is high.",
+])
+def test_trailing_prose_list_item_merges(line):
+    assert_prose_merges(["## Notes", line])
+
+
+# --- 2. Severity field in the middle of a line --------------------------------
+
+@pytest.mark.parametrize("line", [
+    "Finding 3: open redirect, severity HIGH, in auth.py",
+    "- SQL injection in search. Severity: HIGH.",
+    "The token check is missing (**Severity:** CRITICAL) in api.py.",
+    "Open redirect in /next; CVSS severity: High.",
+    "Stored XSS in comments, Severity (CVSS 3.1): HIGH",
+])
+def test_mid_line_severity_field_fails_closed(line):
+    assert_blocks_behind_zero_footer(["## Findings", line])
+
+
+@pytest.mark.parametrize("line", [
+    "Findings are ordered by severity, highest first.",
+    "No finding reached severity HIGH or above.",
+    "The severity of E1 is low because only admins reach it.",
+    "Severity ratings follow the CVSS 3.1 scale.",
+    "- Log severity: info for auth events.",
+])
+def test_mid_line_severity_prose_merges(line):
+    assert_compliant_prose_merges(["## Notes", line])
+
+
+# --- 3. bare "HIGH:" / "CRITICAL:" lines ----------------------------------------
+
+@pytest.mark.parametrize("line", [
+    "HIGH: SQL injection in the search endpoint",
+    "CRITICAL: remote code execution in upload",
+    "> HIGH: session fixation after login",
+    "S2 (HIGH): stored XSS in comments",
+    "S1: HIGH",
+])
+def test_bare_leading_severity_line_fails_closed(line):
+    assert_blocks_behind_zero_footer(["## Findings", "", line, ""])
+
+
+@pytest.mark.parametrize("line", [
+    "High-level design is unchanged.",
+    "Info: semgrep 1.176.0 found nothing new.",
+    "Low-risk refactor of the cache layer.",
+    "HIGH: 0 and CRITICAL: 0 from semgrep.",
+])
+def test_bare_leading_prose_merges(line):
+    assert_compliant_prose_merges(["## Notes", "", line, ""])
+
+
+# --- 4. HTML ------------------------------------------------------------------
+
+@pytest.mark.parametrize("body", [
+    ["<details><summary><b>HIGH</b> SQL injection in search</summary>", "",
+     "Details.", "</details>"],
+    ["<details>", "<summary><strong>CRITICAL</strong> RCE in upload</summary>",
+     "</details>"],
+    ["<p><b>Severity:</b> High</p>"],
+    ["Stored XSS in comments.", "", "<b>Severity:</b> High"],
+    ["<details>", "<summary>HIGH: stored XSS</summary>", "</details>"],
+    ["<ul><li>CRITICAL: RCE in upload</li></ul>"],
+    ["<table><tr><td>S1</td><td>HIGH</td><td>SQLi</td></tr></table>"],
+])
+def test_html_finding_fails_closed(body):
+    assert_blocks_behind_zero_footer(["## Findings", ""] + body)
+
+
+@pytest.mark.parametrize("body", [
+    ["<p>No <b>HIGH</b> or <b>CRITICAL</b> issues were found.</p>"],
+    ["<details><summary>Scan output</summary>", "semgrep: clean", "</details>"],
+    ["<p>Risk is low; more info below.</p>"],
+    ["<b>Note:</b> high test coverage on the parser."],
+])
+def test_html_prose_merges(body):
+    assert_compliant_prose_merges(["## Notes", ""] + body)
+
+
+# --- 5. Sev: / Risk: / Impact: aliases -----------------------------------------
+
+@pytest.mark.parametrize("line", [
+    "Risk: High",
+    "- **Risk:** HIGH",
+    "Impact: CRITICAL",
+    "- Sev: HIGH",
+    "**Impact**: High - account takeover",
+    "- Risk level: MEDIUM",
+])
+def test_severity_alias_field_fails_closed(line):
+    assert_blocks_behind_zero_footer(["## Findings", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "Overall risk: LOW",
+    "Risk: low, the endpoint is internal.",
+    "- **Impact:** an attacker could read other tenants' rows.",
+    "- **Impact:** High-value sessions could be hijacked.",
+    "- **Impact:** High if exploited, but not reachable",
+    "Risk-free change to the logging format.",
+])
+def test_severity_alias_prose_merges(line):
+    assert_prose_merges(["## Notes", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "Risk: HIGH because the session token never expires",
+    "- **Impact:** CRITICAL if the admin token leaks",
+    "Impact: High.",
+    "| S1 | SQL injection | Impact: HIGH if chained |",
+])
+def test_upper_case_alias_counts_mid_sentence(line):
+    """Only a non-UPPER value has to end the clause to count."""
+    assert_blocks_behind_zero_footer(["## Findings", "", line])
+
+
+@pytest.mark.parametrize("line", [
+    "**Severity:** HIGH",
+    "**HIGH — nonce reuse in the session cipher**",
+    "- HIGH: SQL injection - Severity: HIGH",
+    "<p><b>Severity:</b> HIGH</p>",
+])
+def test_one_finding_is_counted_once_in_the_mismatch_detail(line):
+    """A line several rules see still reports one finding, not two."""
+    analysis = blocked(review("No findings.", ["## Findings", "", line], ZERO,
+                              low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH
+    assert analysis.detail.endswith("HIGH=1"), analysis.detail
+
+
+# --- 6. table cells -------------------------------------------------------------
+
+@pytest.mark.parametrize("cell", [
+    "High risk",
+    "Critical impact",
+    "**High**",
+    "HIGH: SQL injection in search",
+    "Risk: HIGH",
+    "Sev: High",
+    "**Severity:** HIGH",
+    "Severity - HIGH",
+])
+def test_table_cell_finding_fails_closed(cell):
+    assert_blocks_behind_zero_footer([
+        "## Findings", "", "| ID | Issue | Rating |", "|---|---|---|",
+        f"| S1 | SQL injection | {cell} |",
+    ])
+
+
+@pytest.mark.parametrize("row", [
+    "| cache refactor | Low risk |",
+    "| cache refactor | High memory use under load |",
+    "| Overall risk | LOW |",
+    "| semgrep | HIGH: 0 |",
+    "| docs | more info in the README |",
+])
+def test_table_prose_cell_merges(row):
+    assert_compliant_prose_merges(["## Notes", "", "| Item | Note |", "|---|---|", row])
+
+
+# --- 7. lower-case prose, footer cross-check, incomplete, timing -------------------
+
+@pytest.mark.parametrize("line", [
+    "- more info: see the scan log",
+    "- risk: low",
+    "Impact: low, only admins can reach it.",
+    "info: the scan used the default rules",
+    "- Old logging is low - priority cleanup, info only",
+])
+def test_lower_case_low_and_info_never_count(line):
+    analysis = analyze(review("No findings.", ["## Notes", "", line], ZERO,
+                             low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, (line, analysis.detail)
+
+
+COUNTED_SHAPES = [
+    "- SQL injection in the search endpoint - HIGH",
+    "Finding 3: open redirect, severity HIGH, in auth.py",
+    "HIGH: SQL injection in the search endpoint",
+    "<details><summary><b>HIGH</b> SQL injection</summary></details>",
+    "Risk: High",
+    "| S1 | SQL injection | High risk |",
+]
+
+
+@pytest.mark.parametrize("line", COUNTED_SHAPES)
+def test_shape_counted_by_the_footer_merges_with_that_count(line):
+    """A candidate only fails closed when the footer does not count it.
+
+    Task 3152: an UPPER-case HIGH that is not the label of a counted finding
+    heading blocks whatever the footer counts (no footer-count exemption).
+    Those rows blocked the merge before too, by HIGH=1; now the review is
+    not trusted. Title-case shapes are still counted by the footer.
+    """
+    text = review("1 finding.", ["## Findings", "", line], ONE_HIGH,
+                  low_heading=False)
+    if SEVERITY_TOKEN.search(line):
+        analysis = blocked(text)
+        assert analysis.verdict == loops.REVIEW_VERDICT_COUNT_MISMATCH, line
+        assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS)
+        return
+    analysis = analyze(text)
+    assert analysis.verdict == loops.REVIEW_VERDICT_OK, (line, analysis.detail)
+    assert analysis.counts["HIGH"] == 1
+
+
+@pytest.mark.parametrize("line", COUNTED_SHAPES)
+def test_count_findings_returns_none_behind_zero_footer(line, monkeypatch):
+    """The gate entry point treats the review as missing (fail closed)."""
+    audit_lines = []
+    monkeypatch.setattr(loops, "_gate_audit_log",
+                        lambda message, **_kw: audit_lines.append(message))
+    text = review("No findings.", ["## Findings", "", line], ZERO,
+                  low_heading=False)
+    counts = loops._count_findings_in_review_file(
+        Path("SECURITY-REVIEW-1.md"), task_id=1, text=text)
+    assert counts is None
+    assert any("event=count-mismatch" in entry for entry in audit_lines)
+
+
+@pytest.mark.parametrize("line", COUNTED_SHAPES)
+def test_shape_after_the_footer_is_an_incomplete_review(line):
+    analysis = blocked(review("1 finding.", ["## Findings", "", line],
+                              ONE_HIGH, low_heading=False,
+                              after_footer=["", line]))
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, (
+        line, analysis.detail)
+
+
+def test_unfinished_summary_still_blocks_with_counted_shape():
+    analysis = blocked(review(
+        "IN PROGRESS - initial skeleton",
+        ["## Findings", "", "- SQL injection in the search endpoint - HIGH"],
+        ONE_HIGH, low_heading=False))
+    assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE
+
+
+REVIEW_BYTES = 200 * 1024
+
+
+def _padded_lines(rb: int, line: str) -> list[str]:
+    return [line] * (rb // (len(line) + 1) + 1)
+
+
+def adversarial_bodies(rb: int) -> dict[str, list[str]]:
+    """The adversarial bodies built at ``rb`` bytes: timed at REVIEW_BYTES
+    and a quarter of it (task 3171)."""
+    return {
+        "trailing-separators": ["- x" + " - a" * (rb // 4)],
+        "trailing-no-severity": _padded_lines(rb, "- a, b: c - d — e – f, HIGHx"),
+        "space-runs": ["- a" + " " * rb + "- HIGH x"],
+        "severity-words": ["severity " * (rb // 9)],
+        "severity-colon-runs": ["Severity" + ":" * rb],
+        "severity-paren-runs": ["severity (" * (rb // 10)],
+        "alias-lines": _padded_lines(rb, "Risk:" + " " * 7 + "*" * 3 + " maybe"),
+        "id-runs": ["S1 " * (rb // 3)],
+        "bare-no-separator": _padded_lines(rb, "HIGH HIGH HIGH HIGH HIGH"),
+        "html-tags": ["<b>" * (rb // 3)],
+        "html-open-brackets": ["<" * rb],
+        "html-long-tags": _padded_lines(rb, "<summary " + "a" * 190 + ">HIGH"),
+        "table-cells": ["| " + "High riskx | " * (rb // 13)],
+        "table-lines": _padded_lines(rb, "| S1 | Risk:" + " " * 8 + "x | HIGHx |"),
+        "paren-list": ["- " + "(" * rb + "HIGH"],
+        "blockquote-runs": _padded_lines(rb, "> > > > > - x (HIGHx"),
+    }
+
+
+ADVERSARIAL_BODIES = adversarial_bodies(REVIEW_BYTES)
+
+
+def _adversarial_review_seconds(name: str, rb: int) -> float:
+    text = review("No findings.", adversarial_bodies(rb)[name], ZERO,
+                  low_heading=False)
+    assert len(text.encode()) >= rb
+    return production_seconds(text, nonce=NONCE)
+
+
+@timing_test
+@pytest.mark.parametrize("name", sorted(ADVERSARIAL_BODIES))
+def test_200kb_adversarial_review_parses_under_two_seconds(name):
+    """Budget host-calibrated, growth from 50 KB to 200 KB linear (task
+    3171)."""
+    assert_linear_time(lambda rb: _adversarial_review_seconds(name, rb),
+                       REVIEW_BYTES, 2.0, name)

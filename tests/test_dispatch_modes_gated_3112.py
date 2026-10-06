@@ -46,6 +46,7 @@ from typing import Any
 import pytest
 
 import equipa.cli as cli_mod
+import equipa.constants as constants_mod
 import equipa.dispatch as dispatch_mod
 import equipa.manager as manager_mod
 
@@ -400,7 +401,7 @@ def _patch_auto_run(monkeypatch, repo: Path, task: dict, probe: GateProbe) -> No
         probe.agent_commits(project_dir, task["id"])
         return {"cost": 0.0, "duration": 0.0}, 1, "tests_passed"
 
-    monkeypatch.setattr(dispatch_mod, "PROJECT_DIRS", {"gatedproj": str(repo)})
+    monkeypatch.setitem(constants_mod.PROJECT_DIRS, "gatedproj", str(repo))
     monkeypatch.setattr(dispatch_mod, "fetch_task", lambda _id: dict(task))
     monkeypatch.setattr(dispatch_mod, "fetch_project_context", lambda _pid: {})
     monkeypatch.setattr(dispatch_mod, "fire_hook", fake_hook)

@@ -17,14 +17,27 @@ Copyright 2026 Forgeborn.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from equipa.loops import (
+    MERGE_BLOCKING_SEVERITIES,
     REVIEW_VERDICT_COUNT_MISMATCH,
     REVIEW_VERDICT_OK,
     _analyze_review_file,
+    backstop_reason,
+)
+from tests.review_gate_production import (
+    AS_WRITTEN_ONLY_FINDINGS,
+    blocked_by_the_gate_at,
+)
+
+# Task 3161: the backstop reason names the severity ("unaccounted HIGH token").
+BLOCKING_TOKEN_REASONS = tuple(
+    f"{backstop_reason(severity)} at line "
+    for severity in MERGE_BLOCKING_SEVERITIES
 )
 
 TITLE = "# Security Review — Task 9999\n\n"
@@ -39,6 +52,38 @@ def _write_review(tmp_path: Path, markdown: str) -> Path:
     path = tmp_path / "SECURITY-REVIEW-9999.md"
     path.write_text(markdown, encoding="utf-8")
     return path
+
+
+# Task 3143: a standalone UPPER-case severity word, as the backstop reads it.
+_SEVERITY_TOKEN_RE = re.compile(r"(?<![^\W_])(CRITICAL|HIGH|MEDIUM)(?![^\W_])")
+
+
+def _lowercase_severity_words(text: str) -> str:
+    return _SEVERITY_TOKEN_RE.sub(lambda match: match.group(1).lower(), text)
+
+
+def _assert_only_the_backstop_blocks(path: Path) -> None:
+    """Task 3143: the rules trusted the review (the backstop runs only then)
+    and the severity-token backstop blocked it: the reviewer prompt allows
+    UPPER-case CRITICAL, HIGH and MEDIUM only as a finding's label. Task
+    3170 (IR67-02): decided through the merge gate."""
+    analysis = blocked_by_the_gate_at(path)
+    assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH, analysis
+    assert analysis.detail.startswith(BLOCKING_TOKEN_REASONS), (
+        analysis.detail)
+
+
+@pytest.mark.parametrize("finding", sorted(AS_WRITTEN_ONLY_FINDINGS))
+def test_the_must_block_helpers_read_the_review_as_written(
+    tmp_path: Path, finding: str,
+) -> None:
+    """Task 3170 (IR67-02): a severity only the review as written shows
+    blocks through this suite's helper, so a gate that parsed the normalised
+    text (R3161-01) fails this suite too."""
+    _assert_only_the_backstop_blocks(_write_review(
+        tmp_path,
+        TITLE + BODY + AS_WRITTEN_ONLY_FINDINGS[finding] + "\n" + ZERO_FOOTER,
+    ))
 
 
 @pytest.mark.parametrize(
@@ -70,10 +115,15 @@ def test_uncounted_finding_form_blocks_under_zero_footer(
         TITLE + BODY + finding_line + "\nImpact paragraph.\n" + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
+
+
+# Task 3152: "**7 findings: 0 CRITICAL / 0 HIGH / ...**" and "**No CRITICAL
+# or HIGH findings.** ..." merged as written under the 3143 tally and
+# negation exemptions. CRITICAL and HIGH have none now: they block as written.
 
 
 @pytest.mark.parametrize(
@@ -90,8 +140,27 @@ def test_uncounted_finding_form_blocks_under_zero_footer(
 def test_bold_prose_mentioning_a_severity_does_not_hold_clean_review(
     tmp_path: Path, prose_line: str,
 ) -> None:
+    # Task 3143: in UPPER case the severity word labels no finding, so the
+    # backstop blocks; in lower case (reviewer prompt) it is prose.
+    if ("MEDIUM" in prose_line and "HIGH" not in prose_line
+          and "CRITICAL" not in prose_line):
+        # Task 3152: a MEDIUM-only unaccounted token blocks, as on main
+        # (task 3149, R3143-06, had counted it as a logged advisory).
+        blocked = blocked_by_the_gate_at(_write_review(
+            tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
+        ))
+        assert blocked.verdict == REVIEW_VERDICT_COUNT_MISMATCH, blocked
+        assert blocked.detail.startswith(
+            backstop_reason("MEDIUM") + " at line "), blocked.detail
+        assert "MEDIUM=1 at line " in blocked.detail, blocked.detail
+    elif _SEVERITY_TOKEN_RE.search(prose_line):
+        _assert_only_the_backstop_blocks(_write_review(
+            tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
+        ))
     review = _write_review(
-        tmp_path, TITLE + BODY + prose_line + "\n" + ZERO_FOOTER,
+        tmp_path,
+        TITLE + BODY + _lowercase_severity_words(prose_line) + "\n"
+        + ZERO_FOOTER,
     )
 
     assert _analyze_review_file(review).verdict == REVIEW_VERDICT_OK
@@ -114,7 +183,7 @@ def test_severity_field_under_zero_footer_now_fails_closed(
         + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
@@ -125,9 +194,16 @@ def test_fix_review_title_naming_upstream_finding_is_not_a_candidate(
 ) -> None:
     # cryptotrader-v2 SECURITY-REVIEW-2872.md shape: the title cites the
     # finding the task fixed; this review itself found nothing blocking.
-    review = _write_review(
+    # Task 3143: the cited severity in UPPER case labels no finding of this
+    # review, so the backstop blocks it; in lower case it is no candidate.
+    _assert_only_the_backstop_blocks(_write_review(
         tmp_path,
         "# Security Review: CT-FIX-F7 — phantom fill (D5-01 HIGH)\n\n"
+        + BODY + "No blocking findings.\n" + ZERO_FOOTER,
+    ))
+    review = _write_review(
+        tmp_path,
+        "# Security Review: CT-FIX-F7 — phantom fill (D5-01 high)\n\n"
         + BODY + "No blocking findings.\n" + ZERO_FOOTER,
     )
 
@@ -142,22 +218,30 @@ def test_title_exemption_covers_only_the_first_heading(tmp_path: Path) -> None:
         + BODY + ZERO_FOOTER,
     )
 
-    analysis = _analyze_review_file(review)
+    analysis = blocked_by_the_gate_at(review)
 
     assert analysis.verdict == REVIEW_VERDICT_COUNT_MISMATCH
     assert "HIGH=1" in analysis.detail
 
 
 def test_counted_untagged_bold_finding_is_trusted(tmp_path: Path) -> None:
+    """Task 3152: an UPPER-case HIGH that is no counted heading's label
+    blocks whatever the footer counts (it blocked the merge before as well,
+    by HIGH=1). Written in title case the footer counts it as before."""
+    footer = "\n## Counts\nCRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+    _assert_only_the_backstop_blocks(_write_review(
+        tmp_path,
+        TITLE + BODY
+        + "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**\n" + footer,
+    ))
     review = _write_review(
         tmp_path,
         TITLE + BODY
-        + "**HIGH — AES-GCM nonce (fixed at zero) allows forgery**\n"
-        + "\n## Counts\nCRITICAL: 0 | HIGH: 1 | MEDIUM: 0 | LOW: 0 | INFO: 0\n",
+        + "**High — AES-GCM nonce (fixed at zero) allows forgery**\n" + footer,
     )
 
     analysis = _analyze_review_file(review)
 
-    assert analysis.verdict == REVIEW_VERDICT_OK
+    assert analysis.verdict == REVIEW_VERDICT_OK, analysis
     assert analysis.counts is not None
     assert analysis.counts["HIGH"] == 1

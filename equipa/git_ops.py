@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
+import contextvars
+import errno
 import hashlib
 import logging
 import os
@@ -22,8 +25,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -33,7 +36,7 @@ from equipa.constants import (
     GITHUB_OWNER,
     PROJECT_DIRS,
 )
-from equipa.role_resolver import _GIT_SAFE_CONFIG
+from equipa.role_resolver import _GIT_SAFE_CONFIG, WORKTREE_BASE_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -307,9 +310,260 @@ def _git_identity_args() -> list[str]:
     return args
 
 
+class GitRepositoryUnreadableError(RuntimeError):
+    """A directory belongs to a git repository that git cannot read.
+
+    R3119-02 (task #3126): such a directory is neither "git" nor "not git".
+    A dispatch there is refused; it never runs ungated in the checkout.
+    """
+
+
+# git's answer for a directory outside every repository; read with LC_ALL=C.
+_NOT_A_REPOSITORY = "not a git repository"
+
+
+class GitNotRunnableError(OSError):
+    """The git executable could not be started (missing from PATH, ...)."""
+
+
+def _contained_root(path: str | Path, toplevel: str) -> tuple[Path | None, str]:
+    """``toplevel`` as the root of ``path``, or ``(None, why not)``.
+
+    IND-02 (task #3132): ``rev-parse --show-toplevel`` answers with an
+    agent-writable ``core.worktree``, which can name ANOTHER repository's
+    checkout. A root that does not contain ``path`` is never ``path``'s work
+    tree, so every gate, merge and cleanup refuses it.
+    """
+    root = Path(toplevel)
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except ValueError:
+        return None, (
+            f"git names {root} as the work-tree root of {path}, which does "
+            f"not contain it (core.worktree or a similar redirect)"
+        )
+    return root, ""
+
+
+# ``rev-parse`` prints one line per option, in the order given.
+_WORK_TREE_PROBE = ("rev-parse", "--absolute-git-dir", "--show-toplevel")
+_GIT_DIR_PROBE = ("rev-parse", "--absolute-git-dir")
+
+
+def _parse_work_tree_probe(stdout: str | None) -> tuple[str, str] | None:
+    """``(git dir, work-tree root)`` from :data:`_WORK_TREE_PROBE` output."""
+    lines = (stdout or "").splitlines()
+    if len(lines) != 2 or not all(line.strip() for line in lines):
+        return None
+    return lines[0].strip(), lines[1].strip()
+
+
+def _root_needs_repository_check(path: str | Path, root: Path) -> bool:
+    """True when ``root`` is an ancestor of ``path``, not ``path`` itself.
+
+    git run at ``path`` already answered for ``path``'s repository; only a
+    different directory can discover a different one.
+    """
+    return root.resolve() != Path(path).resolve()
+
+
+def _same_repository_problem(
+    path: str | Path, root: Path, git_dir: str, root_git_dir: str | None,
+) -> str | None:
+    """Why git run AT ``root`` would not work on ``path``'s repository.
+
+    IND-02 (task #3132): an agent-written ``core.worktree`` naming an
+    ANCESTOR directory passes the containment check. When that ancestor is
+    another repository's checkout, every orchestrator git call re-rooted
+    there (gate diff, merge, reset) discovers that repository instead.
+    """
+    if root_git_dir is None:
+        return (
+            f"git names {root} as the work-tree root of {path}, but git run "
+            f"there finds no repository (core.worktree or a similar redirect)"
+        )
+    if Path(root_git_dir).resolve() != Path(git_dir).resolve():
+        return (
+            f"git names {root} as the work-tree root of {path}, but git run "
+            f"there uses the repository at {root_git_dir}, not {git_dir} "
+            f"(core.worktree or a similar redirect)"
+        )
+    return None
+
+
+def _git_dir_at(directory: Path) -> str | None:
+    """Absolute git dir that git discovers from ``directory``, None if none."""
+    try:
+        result = git_run(list(_GIT_DIR_PROBE), directory, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[git] no git dir at %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    return printed if result.returncode == 0 and printed else None
+
+
+async def _git_dir_at_async(directory: Path) -> str | None:
+    """:func:`_git_dir_at` without blocking the event loop."""
+    try:
+        result = await git_run_async(list(_GIT_DIR_PROBE), directory, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("[git] no git dir at %s: %s", directory, exc)
+        return None
+    printed = (result.stdout or "").strip()
+    return printed if result.returncode == 0 and printed else None
+
+
+def _probe_work_tree(path: str | Path) -> tuple[Path | None, str]:
+    """``(work-tree root, "")``, or ``(None, why git named no root)``.
+
+    The root must contain ``path`` and, when it is an ancestor, git run
+    there must find the same repository (IND-02, task #3132).
+
+    Raises :class:`GitNotRunnableError` when the git executable itself
+    could not be started; every other failure is reported, not raised.
+    """
+    try:
+        result = git_run(
+            list(_WORK_TREE_PROBE), path, timeout=10, env={"LC_ALL": "C"},
+        )
+    except subprocess.SubprocessError as exc:
+        return None, f"git could not be run: {exc}"
+    except OSError as exc:
+        raise GitNotRunnableError(f"git could not be run: {exc}") from exc
+    probed = _parse_work_tree_probe(result.stdout) if result.returncode == 0 else None
+    if probed is None:
+        detail = (result.stderr or "").strip()[:300]
+        return None, detail or f"git rev-parse exited {result.returncode}"
+    git_dir, toplevel = probed
+    root, problem = _contained_root(path, toplevel)
+    if root is None or not _root_needs_repository_check(path, root):
+        return root, problem
+    problem = _same_repository_problem(path, root, git_dir, _git_dir_at(root))
+    return (None, problem) if problem else (root, "")
+
+
+def _nearest_git_entry(path: Path) -> Path | None:
+    """The first ``.git`` entry at ``path`` or above it, None if there is none.
+
+    Both the path as given and its symlink-resolved form are walked: git
+    itself discovers the repository from the resolved working directory.
+
+    S3168-04 (task 3172): a symlink loop at or above ``path`` made
+    ``Path.resolve`` raise (RuntimeError on Python 3.10 to 3.12), and the
+    error escaped every repository-appearance check. Such a path cannot be
+    walked, so nothing shows that no repository is reachable through it: the
+    looping path itself is returned (fail closed), and every caller treats
+    the project as holding a repository (N1 blocks the task). The loop is
+    found with ``os.stat`` (ELOOP), which every Python version reports the
+    same way; ``Path.resolve`` stopped raising for it in Python 3.13.
+    """
+    absolute = path.absolute()
+    try:
+        os.stat(absolute)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return absolute
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return absolute
+    for start in dict.fromkeys((absolute, resolved)):
+        for directory in (start, *start.parents):
+            entry = directory / ".git"
+            if os.path.lexists(entry):
+                return entry
+    return None
+
+
+def git_toplevel(path: str | Path) -> Path | None:
+    """Root of the git work tree that contains ``path``, or None.
+
+    None when ``path`` is not a directory inside a git work tree (a plain
+    directory, a bare repository, a ``.git`` directory itself), when git
+    names a root that does not contain ``path`` (IND-02, task #3132) or git
+    cannot be run there. Use :func:`_is_git_repo` to tell those apart.
+    """
+    if not Path(path).is_dir():
+        return None
+    try:
+        toplevel, problem = _probe_work_tree(path)
+    except GitNotRunnableError as exc:
+        toplevel, problem = None, str(exc)
+    if toplevel is None:
+        logger.debug("[git] no work tree for %s: %s", path, problem)
+    return toplevel
+
+
+async def git_toplevel_async(path: str | Path) -> Path | None:
+    """:func:`git_toplevel` without blocking the event loop."""
+    if not Path(path).is_dir():
+        return None
+    try:
+        result = await git_run_async(list(_WORK_TREE_PROBE), path, timeout=10)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("[git] could not locate the work tree of %s: %s", path, exc)
+        return None
+    probed = _parse_work_tree_probe(result.stdout) if result.returncode == 0 else None
+    if probed is None:
+        return None
+    git_dir, toplevel = probed
+    root, problem = _contained_root(path, toplevel)
+    if root is not None and _root_needs_repository_check(path, root):
+        problem = _same_repository_problem(
+            path, root, git_dir, await _git_dir_at_async(root),
+        ) or ""
+        if problem:
+            root = None
+    if root is None:
+        logger.warning("[git] refusing the work-tree root of %s: %s", path, problem)
+    return root
+
+
 def _is_git_repo(path: str | Path) -> bool:
-    """Check if a directory is a git repository."""
-    return (Path(path) / ".git").exists()
+    """True when ``path`` lies inside a git work tree.
+
+    Task #3119: a project nested in another repository has no ``.git`` of
+    its own, yet every commit made there lands on the enclosing repository.
+    Checking for a ``.git`` entry treated it as "not git", so it got no
+    worktree, no guard and no gate. ``git rev-parse --show-toplevel``
+    answers for the enclosing repository as well.
+
+    R3119-02 (task #3126): fails closed. False only for a missing
+    directory, or when git positively answers "not a git repository" and
+    there is no ``.git`` at ``path`` or above it. Any other failure (a
+    corrupted config, a broken ``.git`` file, a timeout, a work-tree root
+    that does not contain ``path``) raises
+    :class:`GitRepositoryUnreadableError`: an agent-broken repository must
+    not turn the next dispatch into an ungated one.
+
+    IND-03 (task #3132): with no ``git`` binary at all, a directory with no
+    ``.git`` at or above it is simply not git (it runs as before); one that
+    has a ``.git`` is refused.
+    """
+    directory = Path(path)
+    if not directory.is_dir():
+        return False
+    try:
+        toplevel, problem = _probe_work_tree(directory)
+    except GitNotRunnableError as exc:
+        git_entry = _nearest_git_entry(directory)
+        if git_entry is None:
+            return False
+        raise GitRepositoryUnreadableError(
+            f"{exc}, but {git_entry} exists. Refusing to treat {directory} "
+            "as a non-git project; install git before dispatching."
+        ) from exc
+    if toplevel is not None:
+        return True
+    git_entry = _nearest_git_entry(directory)
+    if git_entry is None and _NOT_A_REPOSITORY in problem.lower():
+        return False
+    raise GitRepositoryUnreadableError(
+        f"{directory} cannot be read by git ({problem})"
+        + (f"; {git_entry} exists" if git_entry is not None else "")
+        + ". Refusing to treat it as a non-git project; repair the "
+        "repository before dispatching."
+    )
 
 
 def detect_project_language(project_dir: str | Path) -> dict:
@@ -432,9 +686,9 @@ def detect_project_language(project_dir: str | Path) -> dict:
 # * passes ``--no-pager``, and ``--no-ext-diff --no-textconv`` to the
 #   diff-family subcommands.
 #
-# Programs named by the orchestrator's OWN environment (GIT_SSH_COMMAND,
-# GIT_EDITOR, GIT_ASKPASS, ...) still outrank these pins. That environment is
-# operator-controlled, not agent-writable.
+# Programs named by the orchestrator's OWN environment and kept by the IR-04
+# allowlist (GIT_SSH, GIT_SSH_COMMAND, GIT_ASKPASS, SSH_ASKPASS) still outrank
+# these pins. That environment is operator-controlled, not agent-writable.
 #
 # Residual, not neutralisable by a fixed argument list, because the driver
 # name is chosen by agent-writable .gitattributes / info/attributes:
@@ -445,6 +699,15 @@ def detect_project_language(project_dir: str | Path) -> dict:
 # credential.helper (an empty -c value would also discard the operator's
 # global helper), core.gitProxy (the first matching value wins, so a -c value
 # cannot override repo config) and remote.<name>.uploadpack/receivepack/vcs.
+#
+# FF-3155 (task #3158): "network operations only" does not hold in a partial
+# clone. With extensions.partialClone and a promisor remote in repo config
+# (an agent's plain `git config` in its worktree writes the shared config),
+# any local command that looks up a missing object (`rev-parse --verify`)
+# lazy-fetches it and runs that remote's uploadpack program, or its ext::
+# command. GIT_NO_LAZY_FETCH (below) stops the lazy fetch on every hardened
+# call; git on an agent's worktree also runs with no transport allowed at all
+# (_NO_TRANSPORT_ENV), which does not depend on the git version.
 
 _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
     # A non-directory, so no hook can be found under it. role_resolver's
@@ -469,12 +732,28 @@ _GIT_PROGRAM_CONFIG_PINS: tuple[tuple[str, str], ...] = (
     ("submodule.recurse", "false"),
 )
 
+# R3119-01 (task #3126): run from a sub-directory (a project nested in
+# another repository), repo config ``diff.relative=true`` makes git diff /
+# log / show drop every path outside that directory, so code elsewhere in
+# the repository read as a doc-only change. Paths are always reported from
+# the work-tree root, whatever the repo config says.
+#
+# IND-01 (task #3132): ``diff.ignoreSubmodules`` likewise drops a submodule
+# pointer bump from porcelain ``git diff``. The pin overrides repo config;
+# ``submodule.<name>.ignore`` (config or ``.gitmodules``) is only overridden
+# by the ``--ignore-submodules=none`` flag the gate diff passes.
+_GIT_PATH_SCOPE_PINS: tuple[tuple[str, str], ...] = (
+    ("diff.relative", "false"),
+    ("status.relativePaths", "false"),
+    ("diff.ignoreSubmodules", "none"),
+)
+
 GIT_HARDENING_ARGS: tuple[str, ...] = (
     "--no-pager",
     *_GIT_SAFE_CONFIG,
     *(
         flag
-        for key, value in _GIT_PROGRAM_CONFIG_PINS
+        for key, value in (*_GIT_PROGRAM_CONFIG_PINS, *_GIT_PATH_SCOPE_PINS)
         for flag in ("-c", f"{key}={value}")
     ),
 )
@@ -482,19 +761,33 @@ GIT_HARDENING_ARGS: tuple[str, ...] = (
 # GIT_CONFIG_NOSYSTEM / GIT_ATTR_NOSYSTEM (task #3116, MI-04): the system
 # config and attributes files are skipped; the global config is replaced by
 # the orchestrator's pre-dispatch snapshot (see pin_global_git_config).
+#
+# GIT_NO_LAZY_FETCH (FF-3155, task #3158): a missing object is an error,
+# never fetched from a promisor remote (see the residual note above).
+# EQUIPA's repositories are full clones, so nothing it reads is ever missing.
 GIT_HARDENING_ENV: Mapping[str, str] = MappingProxyType({
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_LAZY_FETCH": "1",
 })
+
+# FF-3155 (task #3158): an allow-list naming no protocol, so git refuses
+# every transport (file, ssh, ext::, remote helpers) whatever the repo config
+# allows. For git that only reads and writes local objects and refs: older
+# git ignores GIT_NO_LAZY_FETCH, but has honoured this since 2.6.
+_NO_TRANSPORT_ENV: Mapping[str, str] = MappingProxyType({"GIT_ALLOW_PROTOCOL": ""})
 
 # diff.external cannot be cleared with -c: git runs an empty value as a
 # command and every patch diff dies. Diff drivers are switched off per
 # subcommand instead. --no-ext-diff covers diff.external and
 # diff.<driver>.command; --no-textconv covers diff.<driver>.textconv, which
 # could also show the security reviewer a converted view that hides code.
+# --no-relative backs up the diff.relative pin (R3119-01, task #3126).
 _DIFF_DRIVER_SUBCOMMANDS = frozenset({"diff", "log", "show"})
-_DIFF_DRIVER_OFF_ARGS: tuple[str, ...] = ("--no-ext-diff", "--no-textconv")
+_DIFF_DRIVER_OFF_ARGS: tuple[str, ...] = (
+    "--no-ext-diff", "--no-textconv", "--no-relative",
+)
 
 # git global options whose value is the NEXT token (``-c k=v``, ``-C dir``).
 _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset({
@@ -519,18 +812,26 @@ def _operator_program_pins(env: Mapping[str, str]) -> tuple[str, ...]:
     )
 
 
-def _hardened_git_env(extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Process env, then the caller's ``extra_env``, then the hardening.
+def _hardened_git_env(
+    extra_env: Mapping[str, str] | None = None,
+    args: Sequence[str] = (),
+    repository: PinnedGitRepository | None = None,
+) -> dict[str, str]:
+    """Allowlisted env, push credentials for a push ``args``, the caller's
+    ``extra_env``, then the hardening and the pinned ``repository``.
 
     The hardening is applied last so no caller can switch it back off.
     """
     env = _get_repo_env()
+    env.update(_credential_env_for(args))
     if extra_env:
         env.update(extra_env)
     env.update(GIT_HARDENING_ENV)
     pin = _global_config_pin
     if pin is not None:
         env["GIT_CONFIG_GLOBAL"] = str(pin.path)
+    if repository is not None:
+        env.update(repository.env())
     return env
 
 
@@ -548,22 +849,393 @@ def _git_subcommand_index(args: Sequence[str]) -> int | None:
     return None
 
 
-def _hardened_git_argv(args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+def _hardened_git_argv(
+    args: Sequence[str],
+    env: Mapping[str, str],
+    pin: PinnedGitRepository | None = None,
+) -> list[str]:
     """Full argv for ``git <args>`` with the hardening flags in front.
 
     Diff-family subcommands also get ``_DIFF_DRIVER_OFF_ARGS`` directly after
-    the subcommand name, ahead of any ``--`` the caller passes.
+    the subcommand name, ahead of any ``--`` the caller passes. A ``pin``
+    adds its ``--git-dir`` / ``--work-tree`` options.
     """
     command = list(args)
     subcommand = _git_subcommand_index(command)
     if subcommand is not None and command[subcommand] in _DIFF_DRIVER_SUBCOMMANDS:
         command[subcommand + 1:subcommand + 1] = _DIFF_DRIVER_OFF_ARGS
-    return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *command]
+    pin_args = pin.argv() if pin is not None else []
+    return ["git", *GIT_HARDENING_ARGS, *_operator_program_pins(env), *pin_args, *command]
+
+
+# --- Pinned repositories (R3146-01, task #3151) --------------------------------
+#
+# git finds a repository through the ``.git`` entry it meets in its working
+# directory, and agents share the orchestrator's UID: between the guard's
+# identity check and ``git merge``, an agent can rename ``.git`` away and put a
+# symlink or ``gitdir:`` file to a clone of its own in its place. The merge then
+# runs in the clone, including the clone's filter drivers, inside the
+# orchestrator. A realpath does not help, since the same path now leads to the
+# clone. The merge path therefore opens the pinned git directories once, checks
+# their inodes against the snapshot and hands git the open descriptors
+# (``--git-dir=/proc/self/fd/N`` plus ``GIT_COMMON_DIR``). git keeps that path
+# as its git dir, so every later lookup goes through the descriptor, wherever
+# the directory has been renamed to and whatever now sits at ``.git``.
+
+_FD_DIRECTORY = "/proc/self/fd"
+
+
+class PinnedRepositoryError(Exception):
+    """A pinned git directory is not the one recorded at the snapshot."""
+
+
+@dataclass(frozen=True)
+class PinnedGitRepository:
+    """The repository every git call run in ``work_tree`` must use.
+
+    ``git_dir`` and ``common_dir`` are what git is given: descriptor paths
+    under ``/proc/self/fd`` for the open ``fds``, or plain realpaths on a
+    system without that directory (not rename-proof there).
+
+    ``path`` is the directory as the merge path names it, the key a git
+    call's ``cwd`` must equal (absolute, symlinks NOT resolved; defaults to
+    ``work_tree``). ``work_tree_id`` is that directory's (device, inode)
+    when it was pinned; :func:`git_repositories_pinned` records it when the
+    pin does not.
+
+    ``work_tree_fd`` (R3155-02, task #3158) is the work tree opened when it
+    was pinned. git then starts inside that directory
+    (``/proc/self/fd/N``) and is told the directory it stands in is the
+    work tree, so the inode checked is the inode git uses, not whatever a
+    rename put at ``path`` between the check and git's start. ``fds``
+    includes it.
+    """
+
+    work_tree: str
+    git_dir: str
+    common_dir: str
+    fds: tuple[int, ...] = ()
+    path: str = ""
+    work_tree_id: tuple[int, int] | None = None
+    work_tree_fd: int | None = None
+
+    @property
+    def key(self) -> str:
+        return _pin_key(self.path or self.work_tree)
+
+    def argv(self) -> list[str]:
+        work_tree = "." if self.work_tree_fd is not None else self.work_tree
+        return [f"--git-dir={self.git_dir}", f"--work-tree={work_tree}"]
+
+    def run_cwd(self, cwd: str | Path) -> str:
+        """Where git starts for a call whose ``cwd`` named this work tree."""
+        if self.work_tree_fd is None:
+            return str(cwd)
+        return f"{_FD_DIRECTORY}/{self.work_tree_fd}"
+
+    def env(self) -> dict[str, str]:
+        # Overrides the git dir's ``commondir`` file, which an agent can
+        # rewrite to point at another repository.
+        return {"GIT_COMMON_DIR": self.common_dir}
+
+
+_pinned_repositories: contextvars.ContextVar[Mapping[str, PinnedGitRepository]] = (
+    contextvars.ContextVar("equipa_pinned_git_repositories", default=MappingProxyType({}))
+)
+
+
+def fd_pinning_available() -> bool:
+    """True where git can be handed an open directory as ``/proc/self/fd/N``."""
+    return os.path.isdir(_FD_DIRECTORY)
+
+
+def _directory_id(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def check_pinned_directory(path: str, expected_id: tuple[int, int]) -> None:
+    """Refuse ``path`` unless it is the directory with ``expected_id``.
+
+    The check for systems without :func:`fd_pinning_available`, where git is
+    given the realpath itself. Raises :class:`PinnedRepositoryError`.
+    """
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the pinned git directory {path}: {exc.strerror}"
+        ) from exc
+    if (info.st_dev, info.st_ino) != tuple(expected_id):
+        raise PinnedRepositoryError(
+            f"{path} is no longer the git directory pinned at the snapshot "
+            f"(device/inode {tuple(expected_id)})"
+        )
+
+
+def open_pinned_directory(
+    path: str,
+    expected_id: tuple[int, int] | None,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    """Open the directory ``path`` (relative to ``dir_fd`` when given).
+
+    With ``expected_id`` the opened directory's (device, inode) must match,
+    so a directory renamed or swapped in after the snapshot is refused
+    before it is used. With ``dir_fd`` the last component must not be a
+    symlink. Raises :class:`PinnedRepositoryError`; the caller owns the fd.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if dir_fd is not None:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot open the pinned git directory {path}: {exc.strerror}"
+        ) from exc
+    if expected_id is not None and _directory_id(fd) != tuple(expected_id):
+        os.close(fd)
+        raise PinnedRepositoryError(
+            f"{path} is no longer the git directory pinned at the snapshot "
+            f"(device/inode {tuple(expected_id)})"
+        )
+    return fd
+
+
+def open_work_tree(path: str) -> int:
+    """Open the work-tree directory ``path`` the way git's ``chdir`` into it
+    would (symlinks followed). Raises :class:`PinnedRepositoryError`; the
+    caller owns the fd.
+    """
+    try:
+        return os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot open the work tree {path}: {exc.strerror}"
+        ) from exc
+
+
+def descriptor_path(fd: int) -> str:
+    """The path the open directory ``fd`` has now (its ``/proc/self/fd``
+    link). Raises :class:`PinnedRepositoryError`."""
+    try:
+        return os.readlink(f"{_FD_DIRECTORY}/{fd}")
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the path of descriptor {fd}: {exc.strerror}"
+        ) from exc
+
+
+def pinned_repository(
+    work_tree: str, git_dir_fd: int, common_dir_fd: int,
+    *, git_dir: str, common_dir: str, work_tree_fd: int | None = None,
+) -> PinnedGitRepository:
+    """A :class:`PinnedGitRepository` for open directory descriptors.
+
+    ``work_tree`` is the directory as the merge path names it: the pin is
+    keyed by that path. With ``work_tree_fd`` (from :func:`open_work_tree`)
+    the pin records that directory's (device, inode) and git starts in it;
+    without, the directory at ``work_tree`` now. ``git_dir`` /
+    ``common_dir`` are the realpaths, used only where ``/proc/self/fd``
+    does not exist.
+    """
+    if not fd_pinning_available():
+        return pinned_repository_by_path(work_tree, git_dir=git_dir, common_dir=common_dir)
+    path = _pin_key(work_tree)
+    fds = {git_dir_fd, common_dir_fd}
+    if work_tree_fd is None:
+        real_work_tree, work_tree_id = os.path.realpath(work_tree), _work_tree_id(path)
+    else:
+        real_work_tree = descriptor_path(work_tree_fd)
+        work_tree_id = _directory_id(work_tree_fd)
+        fds.add(work_tree_fd)
+    return PinnedGitRepository(
+        real_work_tree,
+        f"{_FD_DIRECTORY}/{git_dir_fd}",
+        f"{_FD_DIRECTORY}/{common_dir_fd}",
+        tuple(sorted(fds)),
+        path=path,
+        work_tree_id=work_tree_id,
+        work_tree_fd=work_tree_fd,
+    )
+
+
+def pinned_repository_by_path(
+    work_tree: str, *, git_dir: str, common_dir: str,
+) -> PinnedGitRepository:
+    """A :class:`PinnedGitRepository` that names the realpaths ``git_dir`` /
+    ``common_dir`` (systems without ``/proc/self/fd``), keyed by
+    ``work_tree`` as the merge path names it, with its (device, inode) now.
+    """
+    path = _pin_key(work_tree)
+    return PinnedGitRepository(
+        os.path.realpath(work_tree), git_dir, common_dir,
+        path=path, work_tree_id=_work_tree_id(path),
+    )
+
+
+# R3151-01 / F2 (task #3155): the pin used to be looked up by the realpath of
+# a git call's ``cwd``, and a ``cwd`` that matched no pin ran unpinned. An
+# agent that renamed the main checkout (or the task worktree) away and put a
+# symlink to its own clone at that path therefore sent every later merge-path
+# call through a fresh discovery into the clone, whose config and filter
+# drivers then ran inside the orchestrator. Now the pin is found by the path
+# exactly as the caller passes it, the directory there must still be the one
+# pinned (device and inode, so a real directory moved into place is refused
+# too), and inside a pinned block a ``cwd`` that names no pin is refused
+# instead of discovered. Each refusal is a PinnedRepositoryError, which the
+# merge path turns into a tripped guard.
+
+
+def _pin_key(path: str | os.PathLike) -> str:
+    """The lookup key of a work tree: absolute, symlinks NOT resolved."""
+    return os.path.abspath(os.fspath(path))
+
+
+def _work_tree_id(path: str) -> tuple[int, int]:
+    """(device, inode) of the directory at ``path``, following symlinks the
+    way git's ``chdir`` into it would. Raises :class:`PinnedRepositoryError`."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise PinnedRepositoryError(
+            f"cannot read the pinned work tree {path}: {exc.strerror}"
+        ) from exc
+    return info.st_dev, info.st_ino
+
+
+@contextlib.contextmanager
+def git_repositories_pinned(*repositories: PinnedGitRepository) -> Iterator[None]:
+    """Inside the block, every :func:`git_run` / :func:`git_run_async` runs
+    on a pinned repository: its ``cwd`` must be exactly the path of a pinned
+    work tree (as the caller names it, not its realpath) and still be that
+    directory, or :class:`PinnedRepositoryError` is raised; git never
+    discovers a repository here. Context-local, so a concurrent merge in
+    another task is unaffected. The caller keeps the descriptors open for
+    the whole block and closes them afterwards.
+    """
+    pins = dict(_pinned_repositories.get())
+    for repository in repositories:
+        if repository.work_tree_id is None:
+            repository = dataclass_replace(
+                repository, work_tree_id=_work_tree_id(repository.key),
+            )
+        pins[repository.key] = repository
+    token = _pinned_repositories.set(MappingProxyType(pins))
+    try:
+        yield
+    finally:
+        _pinned_repositories.reset(token)
+
+
+def _pinned_repository_for(cwd: str | Path) -> PinnedGitRepository | None:
+    """The pin a git call in ``cwd`` must use; None outside a pinned block.
+
+    Raises :class:`PinnedRepositoryError` inside one when ``cwd`` names no
+    pinned work tree, or names one whose directory has been swapped.
+    """
+    pins = _pinned_repositories.get()
+    if not pins:
+        return None
+    key = _pin_key(cwd)
+    pin = pins.get(key)
+    if pin is None:
+        raise PinnedRepositoryError(
+            f"git would run in {key}, which is not a work tree pinned for "
+            f"this merge; a pinned merge never discovers a repository"
+        )
+    if _work_tree_id(key) != pin.work_tree_id:
+        raise PinnedRepositoryError(
+            f"{key} is no longer the work tree pinned for this merge "
+            f"(device/inode {pin.work_tree_id}); it was swapped after the pin"
+        )
+    return pin
+
+
+def _check_work_tree_after_call(pin: PinnedGitRepository | None) -> None:
+    """R3155-02 (task #3158): the pinned work tree must still be at its path
+    once git has run. A swap made while git ran (and still in place) is
+    raised, so the merge path trips the guard instead of carrying on.
+    """
+    if pin is None:
+        return
+    if _work_tree_id(pin.key) != pin.work_tree_id:
+        raise PinnedRepositoryError(
+            f"{pin.key} is no longer the work tree pinned for this merge "
+            f"(device/inode {pin.work_tree_id}); it was swapped while git ran"
+        )
+
+
+# IR-04 (task #3132): agents share the orchestrator's UID, so any agent shell
+# can read /proc/<pid>/environ of every git / gh child the orchestrator
+# starts. Those children therefore get an allowlisted environment, never a
+# copy of the orchestrator's (which holds DATABASE_URL, API keys, tokens).
+# Kept: what git needs to run, find the operator's own config and identity,
+# and reach a remote over ssh. Dropped with everything else: GIT_DIR,
+# GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS and
+# friends, which would redirect or reconfigure the repository git works on.
+_GIT_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR",
+    "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "SSH_ASKPASS",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT", "GIT_CONFIG_GLOBAL",
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
+    # Windows: git for Windows and gh need these to start at all.
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "PROGRAMDATA",
+    # IND3132-04 (task #3146): only the locale variables git and gh read
+    # for text handling, not every LC_* name (an arbitrary LC_SECRET used to
+    # reach every child).
+    "LC_ALL", "LC_CTYPE",
+})
+
+# Given only to the calls that talk to GitHub (gh, git push): credentials,
+# gh's own config location and the proxy settings (a proxy URL can carry a
+# password too).
+GITHUB_CREDENTIAL_ENV_KEYS: tuple[str, ...] = (
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST", "GH_CONFIG_DIR",
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+)
+
+
+# git subcommands that talk to a remote and may need the credentials above.
+# EQUIPA only pushes; every other git call runs without them.
+_CREDENTIAL_SUBCOMMANDS = frozenset({"push"})
+
+
+def github_credential_env() -> dict[str, str]:
+    """The GitHub credential / proxy variables set in the orchestrator's env.
+
+    :func:`git_run` / :func:`git_run_async` add them to ``git push`` and
+    :func:`_gh_run` to every gh call; no other child receives them.
+    """
+    return {
+        key: os.environ[key] for key in GITHUB_CREDENTIAL_ENV_KEYS
+        if key in os.environ
+    }
+
+
+def _credential_env_for(args: Sequence[str]) -> dict[str, str]:
+    """GitHub credentials when ``git <args>`` is a push, else nothing."""
+    subcommand = _git_subcommand_index(args)
+    if subcommand is not None and args[subcommand] in _CREDENTIAL_SUBCOMMANDS:
+        return github_credential_env()
+    return {}
 
 
 def _get_repo_env() -> dict[str, str]:
-    """Build an environment dict with git and gh on the PATH."""
-    env = os.environ.copy()
+    """Allowlisted environment for a git / gh child, git and gh on the PATH."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if key in _GIT_ENV_ALLOWLIST
+    }
     extra_paths = []
     for candidate in [
         r"C:\Program Files\Git\cmd",
@@ -576,6 +1248,483 @@ def _get_repo_env() -> dict[str, str]:
     return env
 
 
+# --- Projects that were not git at dispatch (R3166-01, task #3168) ---
+
+# The given and the resolved form of every project directory a dispatch in
+# this context recorded as not git. A ContextVar, so each task of the
+# parallel loop (its own asyncio task) sees only the records of its own run.
+_NON_GIT_PROJECT_ROOTS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "equipa_non_git_project_roots", default=frozenset(),
+)
+
+# The environment variables that point git at a repository or work tree
+# other than the one it would discover from its working directory. git
+# reads config, hooks and info/attributes, so filters, from GIT_COMMON_DIR
+# even when its own repository lies elsewhere.
+_GIT_LOCATION_ENV_KEYS: tuple[str, ...] = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def _path_forms(directory: str | os.PathLike[str]) -> set[str]:
+    """The absolute and the symlink-resolved form of ``directory``."""
+    path = os.fspath(directory)
+    return {os.path.abspath(path), os.path.realpath(path)}
+
+
+@contextlib.contextmanager
+def dispatched_without_git(project_dir: str | os.PathLike[str]) -> Iterator[None]:
+    """Record, while the block runs, that ``project_dir`` was not a git
+    repository when its task was dispatched.
+
+    R3166-01 (task #3168): a ``.git`` found there later is one an agent
+    made. Git run there by discovery reads the agent's config and
+    attributes, so a work-tree ``git diff`` runs the agent's clean filter
+    as a child of the orchestrator, outside agent containment. While the
+    record is active, no git or gh process this module starts runs at or
+    under ``project_dir``, in its given or its resolved form (IR73-02, task
+    #3176: enforced in the process runners, so a helper that does not ask
+    :func:`git_checks_allowed` first still runs no git there). Nesting is
+    safe: an inner record only adds paths.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get() | _path_forms(project_dir)
+    token = _NON_GIT_PROJECT_ROOTS.set(frozenset(roots))
+    try:
+        yield
+    finally:
+        _NON_GIT_PROJECT_ROOTS.reset(token)
+
+
+def git_checks_allowed(directory: str | os.PathLike[str] | None) -> bool:
+    """False when ``directory`` lies in a project :func:`dispatched_without_git`
+    recorded; True otherwise, including when nothing is recorded.
+
+    Both forms of ``directory`` are compared with both recorded forms, so an
+    agent that swaps the project path for a symlink is still matched by the
+    path as given.
+    """
+    roots = _NON_GIT_PROJECT_ROOTS.get()
+    if not roots or not directory:
+        return True
+    for candidate in _path_forms(directory):
+        for root in roots:
+            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+                return False
+    return True
+
+
+# The programs the process runners exist for. While a project is recorded
+# as not git, any other program is refused: a wrapper (``env git -C P``,
+# ``sh -c "cd P && git diff"``, ``nice``, ``timeout``) decides by its own
+# arguments where the git it starts runs, and the guard reads only git's
+# options (IR76-09, task #3178).
+_GUARDED_PROGRAMS: frozenset[str] = frozenset({"git", "gh"})
+
+
+def _program_name(argv: Sequence[str]) -> str:
+    """The program ``argv`` starts, without its directory or a Windows
+    ``.exe`` suffix ("" for an empty argv)."""
+    if not argv:
+        return ""
+    name = os.path.basename(os.fspath(argv[0]))
+    if name.lower().endswith(".exe"):
+        name = name[: -len(".exe")]
+    return name
+
+
+# IR78-04 (task #3180): the other ways a git call names where it runs or
+# what it reads. Subcommands whose arguments name a repository opened
+# through a transport: a local path (or file://, or this host over ssh)
+# runs git-upload-pack or git-receive-pack INSIDE that repository, reading
+# its config.
+_TRANSPORT_SUBCOMMANDS: frozenset[str] = frozenset({
+    "fetch", "pull", "clone", "ls-remote", "remote", "submodule", "push",
+    "archive", "fetch-pack", "send-pack",
+})
+# Their options naming the program run on the other side: a wrapper whose
+# own arguments the guard cannot read, refused like one (IR76-09). ``-u`` is
+# --upload-pack only for these (``git push -u`` sets the upstream).
+_REMOTE_PROGRAM_OPTIONS: frozenset[str] = frozenset({
+    "--upload-pack", "--receive-pack", "--exec",
+})
+_SHORT_UPLOAD_PACK_SUBCOMMANDS: frozenset[str] = frozenset({"clone", "ls-remote"})
+# Environment variables naming a file or directory git reads: config files
+# (an agent's config carries filters), the index, object stores, the
+# programs of its exec path, and templates.
+_GIT_PATH_ENV_KEYS: tuple[str, ...] = (
+    "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+)
+# IR85-01 (task #3185): variables naming where git searches, whatever its
+# version: the ceiling of repository discovery, the HOME and
+# XDG_CONFIG_HOME its global config and attributes fall back to (which
+# variable wins, and when, has changed between git versions), and PATH,
+# where git and every program it starts are found. A list is split.
+_GIT_SEARCH_ENV_KEYS: tuple[str, ...] = (
+    "GIT_CEILING_DIRECTORIES", "HOME", "XDG_CONFIG_HOME", "PATH",
+)
+# Global options (``--name=value`` form) whose value is such a path.
+_GIT_PATH_OPTIONS: frozenset[str] = frozenset({"--git-dir", "--work-tree", "--exec-path"})
+# IR80-03 (task #3183): config keys and environment variables whose value is
+# a command line git runs (or a program it starts). Like an alias it can
+# carry ``cd P && git ...``, which the guard cannot read, so a call carrying
+# one is refused, except with a value that runs nothing (empty or a git
+# boolean) or with the value EQUIPA's own hardening pins it to.
+_COMMAND_CONFIG_KEYS: frozenset[str] = frozenset({
+    "core.sshcommand", "core.pager", "core.editor", "sequence.editor",
+    "core.askpass", "core.gitproxy", "core.fsmonitor",
+    "core.alternaterefscommand", "diff.external", "credential.helper",
+    "uploadpack.packobjectshook",
+})
+# ``<section>.<subsection>.<name>`` keys of the same kind, as (section, name);
+# ``pager.<command>`` is the one two-part family.
+_COMMAND_CONFIG_SUBSECTION_KEYS: frozenset[tuple[str, str]] = frozenset({
+    ("diff", "command"), ("diff", "textconv"),
+    ("filter", "clean"), ("filter", "smudge"), ("filter", "process"),
+    ("merge", "driver"), ("difftool", "cmd"), ("mergetool", "cmd"),
+    ("credential", "helper"),
+    ("remote", "uploadpack"), ("remote", "receivepack"),
+})
+_COMMAND_ENV_KEYS: tuple[str, ...] = (
+    "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND",
+)
+_GIT_BOOLEAN_VALUES: frozenset[str] = frozenset({
+    "", "true", "false", "yes", "no", "on", "off", "1", "0",
+})
+# A GIT_CONFIG_COUNT over this is not read: the call is refused instead.
+_MAX_ENVIRONMENT_CONFIG_PAIRS = 1024
+_WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+
+@dataclass(frozen=True)
+class _GitCallReading:
+    """Where a git or gh process runs and what it reads, as far as its argv
+    and environment tell (IR76-01, IR78-04): each directory, file or
+    repository location resolved as git resolves it; ``unreadable`` says
+    why they cannot tell (the call is then refused)."""
+
+    directories: tuple[str, ...]
+    unreadable: str | None = None
+    # Where git resolves a relative location: ``cwd`` after every ``-C``.
+    working_directory: str = ""
+
+
+def _repository_locations(text: str) -> list[str]:
+    """The local paths a repository argument or config value may name: the
+    text itself, the path of a URL (``file:///P``, ``ssh://localhost/P``)
+    and the path of an scp-like ``host:P``, so a transport into a project
+    on this host is seen whatever form names it."""
+    locations = [text]
+    if "://" in text:
+        rest = text.partition("://")[2]
+        slash = rest.find("/")
+        if slash >= 0:
+            locations.append(rest[slash:])
+    elif (":" in text.split("/", 1)[0]
+          and not _WINDOWS_DRIVE_PATH.match(text)):
+        locations.append(text.split(":", 1)[1])
+    if "=" in text:
+        # ``--reference=P``, ``core.worktree=P`` given to a subcommand.
+        locations.extend({text.split("=", 1)[1], text.rsplit("=", 1)[1]})
+    return locations
+
+
+def _environment_config_pairs(
+    env: Mapping[str, str],
+) -> tuple[list[tuple[str, str]], str | None]:
+    """The config pairs git reads from ``env`` (``GIT_CONFIG_COUNT`` with
+    ``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>``, and
+    ``GIT_CONFIG_PARAMETERS``, which carries every ``-c`` of a parent git),
+    and why they cannot be read when they cannot (fail closed)."""
+    pairs: list[tuple[str, str]] = []
+    raw_count = env.get("GIT_CONFIG_COUNT")
+    if raw_count:
+        try:
+            count = int(raw_count)
+        except ValueError:
+            return pairs, f"GIT_CONFIG_COUNT={raw_count!r} is not a number"
+        if not 0 <= count <= _MAX_ENVIRONMENT_CONFIG_PAIRS:
+            return pairs, f"GIT_CONFIG_COUNT={count} is out of range"
+        for number in range(count):
+            key = env.get(f"GIT_CONFIG_KEY_{number}")
+            if key is None:
+                return pairs, f"GIT_CONFIG_KEY_{number} is missing"
+            pairs.append((key, env.get(f"GIT_CONFIG_VALUE_{number}", "")))
+    parameters = env.get("GIT_CONFIG_PARAMETERS")
+    if parameters:
+        try:
+            items = shlex.split(parameters)
+        except ValueError:
+            return pairs, "GIT_CONFIG_PARAMETERS cannot be read"
+        pairs.extend((key, value) for key, _, value in
+                     (item.partition("=") for item in items))
+    return pairs, None
+
+
+def _config_locations(config: Sequence[tuple[str, str]]) -> list[str]:
+    """The local paths config pairs name: every value (``core.worktree``,
+    ``include.path``, ``remote.<name>.url``) and the base of
+    ``url.<base>.insteadOf``."""
+    locations: list[str] = []
+    for key, value in config:
+        locations.extend(_repository_locations(value))
+        lowered = key.lower()
+        if lowered.startswith("url.") and lowered.endswith((".insteadof", ".pushinsteadof")):
+            locations.extend(_repository_locations(key[len("url."):key.rfind(".")]))
+    return locations
+
+
+def _environment_variable_locations(env: Mapping[str, str]) -> list[str]:
+    """The paths ``env``'s location, path and search variables name, each
+    whole and split as a list (GIT_ALTERNATE_OBJECT_DIRECTORIES, PATH)."""
+    locations = [env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key)]
+    for key in (*_GIT_PATH_ENV_KEYS, *_GIT_SEARCH_ENV_KEYS):
+        if env.get(key):
+            locations.append(env[key])
+            locations.extend(path for path in env[key].split(os.pathsep) if path)
+    return locations
+
+
+def _is_command_config_key(lowered_key: str) -> bool:
+    """True if the (lower-case) config key's value is a command line."""
+    if lowered_key in _COMMAND_CONFIG_KEYS:
+        return True
+    section, _, rest = lowered_key.partition(".")
+    if not rest:
+        return False
+    if "." not in rest:
+        return section == "pager"
+    return (section, rest.rpartition(".")[2]) in _COMMAND_CONFIG_SUBSECTION_KEYS
+
+
+def _equipa_program_pins(env: Mapping[str, str]) -> frozenset[tuple[str, str]]:
+    """The (lower-case key, value) pairs EQUIPA's own hardening passes for
+    command keys: _GIT_PROGRAM_CONFIG_PINS and the operator program pins."""
+    operator = _operator_program_pins(env)
+    pairs = [*_GIT_PROGRAM_CONFIG_PINS,
+             *(pin.partition("=")[::2] for pin in operator[1::2])]
+    return frozenset((key.lower(), value) for key, value in pairs)
+
+
+def _command_carried(
+    config: Sequence[tuple[str, str]], env: Mapping[str, str],
+) -> str | None:
+    """Why the call carries a command line the guard cannot read (a config
+    pair or variable of the IR80-03 kind), None when it carries none."""
+    pins: frozenset[tuple[str, str]] | None = None
+    for key, value in config:
+        lowered = key.lower()
+        if not _is_command_config_key(lowered):
+            continue
+        if value.strip().lower() in _GIT_BOOLEAN_VALUES:
+            continue
+        if pins is None:
+            pins = _equipa_program_pins(env)
+        if (lowered, value) in pins:
+            continue
+        return (f"the config pair {key!r} carries a command line, which can "
+                f"run git where the guard cannot read")
+    for key in _COMMAND_ENV_KEYS:
+        if env.get(key):
+            return (f"{key} carries a command line, which can run git where "
+                    f"the guard cannot read")
+    return None
+
+
+def _environment_locations(
+    env: Mapping[str, str],
+) -> tuple[list[str], str | None]:
+    """The paths ``env`` names for git (its variables and every
+    ``GIT_CONFIG_*`` value), and why they cannot be read when they cannot."""
+    config, unreadable = _environment_config_pairs(env)
+    return [*_config_locations(config), *_environment_variable_locations(env)], unreadable
+
+
+def _read_git_call(
+    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
+) -> _GitCallReading:
+    """Every directory the process ``argv`` runs in or takes a repository,
+    config, index, object store or program from: ``cwd``; the program
+    itself when ``argv`` names it by path; for git each
+    ``-C`` applied in turn, every ``--git-dir`` / ``--work-tree`` /
+    ``--exec-path`` option, every config value given by ``-c`` or
+    ``--config-env`` (``core.worktree``, ``remote.<name>.url``,
+    ``include.path``, and the base of ``url.<base>.insteadOf``) and every
+    argument of a transport subcommand (``git fetch P``); and, for git and
+    gh (which passes its environment to the git it runs), every
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` variable, every
+    variable naming a config file, index, object store or exec path, and
+    every config value ``GIT_CONFIG_*`` carries. Each is resolved as git
+    resolves it.
+
+    git applies each ``-C`` as it reads it, but only records
+    ``--git-dir`` / ``--work-tree`` and resolves them once every option is
+    read, against the directory the last ``-C`` left, exactly like the
+    variables. So a relative ``--git-dir=P/.git`` given before ``-C <parent
+    of P>`` names P's repository (IR76-01, task #3178).
+
+    A config pair defining an alias (``alias.x=!cd P && git status`` is a
+    shell command line) and a transport option naming the program run on
+    the other side are wrappers the guard cannot read: the call is
+    unreadable (IR78-04, task #3180). So is a config pair or variable whose
+    value is a command line (``core.sshCommand``, ``diff.external``,
+    ``GIT_SSH_COMMAND`` ...), unless it runs nothing or is EQUIPA's own
+    hardening pin (IR80-03, task #3183).
+
+    The location and search variables include ``GIT_CEILING_DIRECTORIES``,
+    ``HOME``, ``XDG_CONFIG_HOME`` and ``PATH`` (IR85-01, task #3185)."""
+    directory = os.path.abspath(os.fspath(cwd))
+    directories = [directory]
+    program = os.fspath(argv[0]) if argv else ""
+    if os.sep in program or "/" in program:
+        # A program named by path is found from ``cwd``, before any ``-C``.
+        directories.append(os.path.join(directory, program))
+    options = (
+        [os.fspath(token) for token in argv[1:]] if _program_name(argv) == "git" else []
+    )
+    locations: list[str] = []
+    config: list[tuple[str, str]] = []
+    unreadable: str | None = None
+    index = 0
+    while index < len(options):
+        token = options[index]
+        name, separator, value = token.partition("=")
+        if separator and name in _GIT_PATH_OPTIONS:
+            locations.append(value)
+            index += 1
+        elif separator and name == "--config-env":
+            key, _, variable = value.partition("=")
+            config.append((key, env.get(variable, "")))
+            index += 1
+        elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            if index + 1 < len(options):
+                value = options[index + 1]
+                if token == "-C":
+                    directory = os.path.join(directory, value)
+                    directories.append(directory)
+                elif token in ("--git-dir", "--work-tree"):
+                    locations.append(value)
+                elif token == "-c":
+                    config.append(value.partition("=")[::2])
+                elif token == "--config-env":
+                    key, _, variable = value.partition("=")
+                    config.append((key, env.get(variable, "")))
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            break
+    subcommand = options[index] if index < len(options) else ""
+    if subcommand in _TRANSPORT_SUBCOMMANDS:
+        for token in options[index + 1:]:
+            name = token.partition("=")[0]
+            if name in _REMOTE_PROGRAM_OPTIONS or (
+                    subcommand in _SHORT_UPLOAD_PACK_SUBCOMMANDS
+                    and token.startswith("-") and not token.startswith("--")
+                    and "u" in token[1:]):
+                unreadable = unreadable or (
+                    f"git {subcommand} {name} names the program run on the other "
+                    f"side, whose own arguments the guard cannot read")
+            locations.extend(_repository_locations(token))
+    environment_config, unreadable_environment = _environment_config_pairs(env)
+    unreadable = unreadable or unreadable_environment
+    for key, _ in [*config, *environment_config]:
+        if key.lower().startswith("alias."):
+            unreadable = unreadable or (
+                f"the config pair {key!r} defines a git alias, which can run a "
+                f"command line the guard cannot read")
+    locations.extend(_config_locations([*config, *environment_config]))
+    unreadable = unreadable or _command_carried([*config, *environment_config], env)
+    locations.extend(_environment_variable_locations(env))
+    directories.extend(os.path.join(directory, location) for location in locations)
+    return _GitCallReading(tuple(directories), unreadable, directory)
+
+
+def _non_git_project_refusal(
+    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
+) -> str | None:
+    """Why the process runners must not start ``argv``, None when they may:
+    git or gh would run in a project :func:`dispatched_without_git`
+    recorded (IR73-02), or, while any project is recorded, the program is
+    not git or gh, so its own arguments could carry git there (IR76-09).
+
+    Decided before anything starts, from ``argv``, ``cwd``, the child's
+    ``env`` and the locations named by the orchestrator environment a git
+    child inherits (:func:`_get_repo_env`), even where ``env`` replaced a
+    variable of it (IR85-01, task #3185): never from which value a
+    particular git version lets win. Variables the allowlist drops never
+    reach git, whatever its version, and are not read (IR80-02)."""
+    if not _NON_GIT_PROJECT_ROOTS.get():
+        return None
+    program = _program_name(argv)
+    if program not in _GUARDED_PROGRAMS:
+        return (
+            f"equipa: refused to run {program or 'an empty command'} from "
+            f"{os.path.abspath(os.fspath(cwd))}: while a project that was not a git "
+            f"repository at dispatch is recorded, the git runners start only git "
+            f"or gh, whose options they can read"
+        )
+    # A child the runners start with no ``env`` gets _get_repo_env() (IR80-02).
+    inherited = _get_repo_env()
+    reading = _read_git_call(argv, cwd, inherited if env is None else env)
+    directories = list(reading.directories)
+    unreadable = reading.unreadable
+    if env is not None:
+        # IR85-01: what ``env`` replaced still names where git was meant to
+        # read (the global-config pin replaces GIT_CONFIG_GLOBAL).
+        locations, unreadable_inherited = _environment_locations(inherited)
+        unreadable = unreadable or unreadable_inherited
+        base = reading.working_directory or os.path.abspath(os.fspath(cwd))
+        directories.extend(os.path.join(base, location) for location in locations)
+    if unreadable is not None:
+        return (
+            f"equipa: refused to run {program} from "
+            f"{os.path.abspath(os.fspath(cwd))}: {unreadable}, while a "
+            f"project that was not a git repository at dispatch is recorded"
+        )
+    directory = next((directory for directory in directories
+                      if not git_checks_allowed(directory)), None)
+    if directory is None:
+        return None
+    return (
+        f"equipa: refused to run {program} at {directory}: "
+        f"it is in a project that was not a git repository at dispatch, so a "
+        f"repository there is an agent's"
+    )
+
+
+def _requested_git_call_refusal(
+    args: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
+) -> str | None:
+    """:func:`_non_git_project_refusal` for ``git <args>`` as the caller of
+    :func:`git_run` / :func:`git_run_async` asked for it (IR85-01, task
+    #3185): with ``env`` over the allowlisted environment, before the
+    hardening runs. The hardening replaces some variables (the global-config
+    pin replaces ``GIT_CONFIG_GLOBAL``), so the runners' own check of the
+    child's environment never sees a caller's ``GIT_CONFIG_GLOBAL={P}/x``
+    while a pin is set; the call is refused whether or not one is."""
+    if not _NON_GIT_PROJECT_ROOTS.get():
+        return None
+    requested = _get_repo_env()
+    requested.update(env or {})
+    return _non_git_project_refusal(["git", *args], cwd, requested)
+
+
+def _non_git_refused_result(
+    argv: Sequence[str], message: str, text: bool,
+) -> subprocess.CompletedProcess:
+    """The result of a process refused by IR73-02: git's own "not a git
+    repository" status, which is what EQUIPA knows the project to be, so a
+    caller reads it the way it reads a project that has no repository.
+    ``message`` is :func:`_non_git_project_refusal`'s reason."""
+    logger.warning("[git] %r", message)
+    return subprocess.CompletedProcess(
+        args=list(argv), returncode=_REFUSED_RETURNCODE,
+        stdout="" if text else b"",
+        stderr=f"{message}\n" if text else f"{message}\n".encode("utf-8", "replace"),
+    )
+
+
 def _run_with_env(
     args_list: list[str],
     cwd: str | Path,
@@ -583,15 +1732,27 @@ def _run_with_env(
     env: Mapping[str, str] | None = None,
     *,
     text: bool = True,
+    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess:
     """Low-level subprocess runner with Windows-PATH-fixed env. Internal use only.
 
     ``env`` replaces the default :func:`_get_repo_env` environment when given.
+    ``pass_fds`` are kept open, at the same numbers, in the child.
+    Starts nothing, and returns a failed result, when the process would run
+    in a project :func:`dispatched_without_git` recorded (IR73-02).
     """
+    # IR80-02 (task #3183): the guard reads the very environment the child
+    # gets. With ``env`` None that is _get_repo_env(), whose GIT_CONFIG_GLOBAL
+    # and GIT_SSH_COMMAND reach git, not the empty mapping it used to read.
+    child_env = dict(env) if env is not None else _get_repo_env()
+    refusal = _non_git_project_refusal(args_list, cwd, child_env)
+    if refusal is not None:
+        return _non_git_refused_result(args_list, refusal, text)
     return subprocess.run(
         args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
-        env=dict(env) if env is not None else _get_repo_env(),
+        env=child_env,
+        pass_fds=tuple(pass_fds),
     )
 
 
@@ -613,15 +1774,36 @@ def git_run(
     the gate-02/gate-03 hardening: replace refs are ignored and no hook or
     program named in repo config can run (see ``GIT_HARDENING_ARGS``).
 
-    ``env`` holds extra variables layered over the process environment; the
+    ``env`` holds extra variables layered over the allowlisted environment; the
     hardening variables are applied last and cannot be overridden.
     ``text=False`` returns stdout/stderr as bytes (e.g. ``cat-file blob``).
     ``CompletedProcess.args`` is the full argv that actually ran.
+    Inside :func:`git_repositories_pinned`, a ``cwd`` that is a pinned work
+    tree runs on the pinned repository (R3146-01, task #3151). Outside one,
+    a subcommand that reads work-tree files (``diff``, ``status``,
+    ``ls-files``, ...) whose ``cwd`` is in a task worktree runs where no
+    agent-planted driver is defined (FF-3155, task #3158; see
+    :func:`_git_run_in_worktree_view`).
     """
-    run_env = _hardened_git_env(env)
-    return _run_with_env(
-        _hardened_git_argv(args, run_env), cwd, timeout, run_env, text=text,
+    refusal = _requested_git_call_refusal(args, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(["git", *args], refusal, text)
+    pin = _pinned_repository_for(cwd)
+    if pin is None and _reads_work_tree(args):
+        location = _task_worktree_path(cwd)
+        if location is not None:
+            return _git_run_in_worktree_view(location, args, cwd, timeout, env, text)
+    run_env = _hardened_git_env(env, args, pin)
+    # Only a descriptor pin hands anything down; other calls keep the plain
+    # runner signature.
+    inherited = {"pass_fds": pin.fds} if pin is not None and pin.fds else {}
+    result = _run_with_env(
+        _hardened_git_argv(args, run_env, pin),
+        pin.run_cwd(cwd) if pin is not None else cwd,
+        timeout, run_env, text=text, **inherited,
     )
+    _check_work_tree_after_call(pin)
+    return result
 
 
 async def git_run_async(
@@ -630,6 +1812,8 @@ async def git_run_async(
     timeout: int = GIT_DEFAULT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     input: bytes | None = None,
+    *,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
     """Async equivalent of ``git_run`` — does NOT block the event loop.
 
@@ -640,19 +1824,62 @@ async def git_run_async(
     ``git_run`` so call sites can be migrated incrementally. Applies the
     same hardening and ``env`` merging as ``git_run``. ``input``, when
     given, is written to git's stdin (e.g. for ``git patch-id``).
+    ``text=False`` returns ``stdout`` and ``stderr`` as the exact bytes git
+    wrote (e.g. blob content from ``git cat-file --batch``).
 
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
-    run_env = _hardened_git_env(env)
-    argv = _hardened_git_argv(args, run_env)
+    refusal = _requested_git_call_refusal(args, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(["git", *args], refusal, text)
+    pin = _pinned_repository_for(cwd)
+    if pin is None and _reads_work_tree(args):
+        location = _task_worktree_path(cwd)
+        if location is not None:
+            return await _git_run_async_in_worktree_view(
+                location, args, cwd, timeout, env, input, text,
+            )
+    run_env = _hardened_git_env(env, args, pin)
+    result = await _run_git_process_async(
+        _hardened_git_argv(args, run_env, pin),
+        pin.run_cwd(cwd) if pin is not None else str(cwd),
+        run_env, timeout, input=input, text=text,
+        pass_fds=pin.fds if pin is not None else (),
+    )
+    _check_work_tree_after_call(pin)
+    return result
+
+
+async def _run_git_process_async(
+    argv: list[str],
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: int,
+    *,
+    input: bytes | None = None,
+    text: bool = True,
+    pass_fds: Sequence[int] = (),
+) -> subprocess.CompletedProcess:
+    """Run the full git ``argv`` without blocking the event loop.
+
+    The process half of :func:`git_run_async`, for callers that build their
+    own hardened argv and environment. Raises ``subprocess.TimeoutExpired``
+    (the child killed first) after ``timeout`` seconds. Starts nothing, and
+    returns a failed result, when git would run in a project
+    :func:`dispatched_without_git` recorded (IR73-02).
+    """
+    refusal = _non_git_project_refusal(argv, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(argv, refusal, text)
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        cwd=str(cwd),
-        env=run_env,
+        cwd=cwd,
+        env=dict(env),
         stdin=asyncio.subprocess.PIPE if input is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        pass_fds=tuple(pass_fds),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -665,12 +1892,858 @@ async def git_run_async(
         except ProcessLookupError:
             pass
         raise subprocess.TimeoutExpired(argv, timeout) from e
+    returncode = proc.returncode if proc.returncode is not None else -1
+    if not text:
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout_b, stderr=stderr_b,
+        )
     return subprocess.CompletedProcess(
         args=argv,
-        returncode=proc.returncode if proc.returncode is not None else -1,
+        returncode=returncode,
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
     )
+
+
+# --- git in an agent's task worktree (R3155-01, task #3158) --------------------
+#
+# Cleanup runs git in a task worktree after the agent stopped: is there
+# uncommitted work, and if so, stash it on the branch before the worktree is
+# removed. Run there by discovery, that git used whatever repository the
+# worktree's ``.git`` named, with that repository's config, and every command
+# that hashes or writes file content (``status`` on a stat-dirty file,
+# ``stash``) ran the filter driver the agent's attributes selected, inside the
+# orchestrator. Those commands now run on a private git dir the orchestrator
+# writes for the one sequence of calls:
+#
+# * its config is the only config git reads: no system config, no global
+#   config, neither the repository's config nor its ``config.worktree``. No
+#   filter, merge or diff driver, fsmonitor or hook is defined anywhere git
+#   looks, so none can run;
+# * attributes come from the empty tree (``GIT_ATTR_SOURCE``), the private
+#   dir's absent ``info/attributes`` and no global or system file, so the
+#   work tree's ``.gitattributes`` select nothing either;
+# * objects are the repository's own (``GIT_OBJECT_DIRECTORY``), HEAD is the
+#   commit the worktree's git dir names, and the index is a copy of the
+#   worktree's index;
+# * that git dir is the ``worktrees/<name>`` entry of the main repository
+#   whose ``gitdir`` file names this work tree, never what its ``.git`` says,
+#   and git starts inside the opened work-tree directory.
+#
+# A stash made there is copied to the repository's ``refs/stash``.
+
+
+class AgentWorktreeGitError(RuntimeError):
+    """The task worktree cannot be inspected without trusting agent files."""
+
+
+# The empty tree of each object format git supports.
+_EMPTY_TREES: Mapping[str, str] = MappingProxyType({
+    "sha1": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+})
+# A HEAD or gitdir file is one short line.
+_GIT_LINE_FILE_LIMIT = 4096
+# A worktree index can be large, but not unbounded.
+_INDEX_COPY_LIMIT = 1024 * 1024 * 1024
+# The only settings taken from the pinned global config: who commits the
+# stash and which files the operator ignores. None of them names a program.
+_PRIVATE_SETTINGS_FROM_GLOBAL = r"^(user\.name|user\.email|core\.excludesfile)$"
+# The only settings taken from the repository's own config file: how git
+# compares a file with its index entry (a share without exec bits sets
+# core.filemode=false). Booleans and stat options; none names a program.
+_PRIVATE_SETTINGS_FROM_REPOSITORY = (
+    r"^core\.(filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat)$"
+)
+# Used when neither the environment nor the global config names a committer.
+_FALLBACK_IDENTITY = (("user.name", "EQUIPA orchestrator"), ("user.email", "equipa@localhost"))
+# A branch the private HEAD may name as a plain file under refs/heads.
+_PLAIN_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
+_HEX_OBJECT_NAME_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def find_worktree_git_dir(common_dir: str, work_tree: str) -> str | None:
+    """The ``worktrees/<name>`` git dir of ``common_dir`` registered for the
+    work tree whose realpath is ``work_tree``; None unless exactly one is.
+
+    Read from the main repository, never through the work tree's ``.git``:
+    a git dir counts when its ``gitdir`` file names ``<work_tree>/.git``.
+    """
+    expected = os.path.join(work_tree, ".git")
+    matches: list[str] = []
+    try:
+        with os.scandir(os.path.join(common_dir, "worktrees")) as entries:
+            candidates = [
+                entry.path for entry in entries if entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            named = read_regular_file_bounded(
+                os.path.join(candidate, "gitdir"), _GIT_LINE_FILE_LIMIT,
+            ).decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        # git writes an absolute path; a relative one is relative to the entry.
+        if named and os.path.normpath(os.path.join(candidate, named)) == expected:
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _open_agent_work_tree(work_tree: str | os.PathLike) -> tuple[int | None, str]:
+    """``(fd, realpath)`` of the task work tree, whose last component must
+    not be a symlink. The fd is None where git cannot start in it."""
+    path = os.path.abspath(os.fspath(work_tree))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AgentWorktreeGitError(
+            f"cannot open the task worktree {path}: {exc.strerror}"
+        ) from exc
+    if not fd_pinning_available():
+        os.close(fd)
+        return None, os.path.realpath(path)
+    try:
+        return fd, os.readlink(f"{_FD_DIRECTORY}/{fd}")
+    except OSError as exc:
+        os.close(fd)
+        raise AgentWorktreeGitError(
+            f"cannot read the path of the task worktree {path}: {exc.strerror}"
+        ) from exc
+
+
+def _copy_regular_file(source: str, destination: str, limit: int) -> bool:
+    """Copy the regular file ``source`` (never a symlink or FIFO) with its
+    timestamps; False when it does not exist. Raises
+    :class:`AgentWorktreeGitError`.
+
+    The timestamps matter for an index: git re-hashes an entry whose file
+    is not older than the index itself ("racily clean"). A copy stamped now
+    would make a same-size edit made in the second of the checkout read as
+    unchanged.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(source, flags)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentWorktreeGitError(f"cannot open {source}: {exc.strerror}") from exc
+    with os.fdopen(fd, "rb") as reader:
+        info = os.fstat(reader.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise AgentWorktreeGitError(
+                f"{source} is not a regular file of at most {limit} bytes"
+            )
+        with open(destination, "wb") as writer:
+            copied = 0
+            while chunk := reader.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > limit:
+                    raise AgentWorktreeGitError(f"{source} grew past {limit} bytes")
+                writer.write(chunk)
+        os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
+    return True
+
+
+async def _run_in_main_repository(
+    common_dir: str, args: list[str], timeout: int,
+) -> subprocess.CompletedProcess:
+    """Hardened git on the main repository's git dir, named explicitly,
+    with no transport allowed (only local objects and refs are touched)."""
+    return await git_run_async(
+        [f"--git-dir={common_dir}", *args], common_dir, timeout=timeout,
+        env=_NO_TRANSPORT_ENV,
+    )
+
+
+async def remove_registered_worktree(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike, *, timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    """``git worktree remove --force <work_tree>`` on the repository whose git
+    common dir is ``common_dir``, named explicitly.
+
+    FF-3158 (task #3162): git is not started by discovery, neither in the
+    work tree nor in a checkout. It finds the ``worktrees/<name>`` entry
+    whose ``gitdir`` file names ``work_tree`` and reads the work tree's
+    ``.git`` only as data (a rewritten one makes it refuse). ``--force``
+    skips the clean check, which would run ``git status`` in the work tree.
+    """
+    return await _run_in_main_repository(
+        os.path.realpath(os.fspath(common_dir)),
+        ["worktree", "remove", "--force", os.path.abspath(os.fspath(work_tree))],
+        timeout,
+    )
+
+
+async def _worktree_head(common_dir: str, git_dir: str) -> tuple[str, str | None]:
+    """``(commit, branch)`` the worktree git dir's HEAD names (branch None
+    when detached), resolved in the main repository."""
+    try:
+        head = read_regular_file_bounded(
+            os.path.join(git_dir, "HEAD"), _GIT_LINE_FILE_LIMIT,
+        ).decode("utf-8", "replace").strip()
+    except OSError as exc:
+        raise AgentWorktreeGitError(f"cannot read {git_dir}/HEAD: {exc}") from exc
+    branch: str | None = None
+    if head.startswith("ref: refs/heads/"):
+        branch = head[len("ref: refs/heads/"):]
+        revision = f"refs/heads/{branch}"
+    elif _HEX_OBJECT_NAME_RE.fullmatch(head):
+        revision = head
+    else:
+        raise AgentWorktreeGitError(f"{git_dir}/HEAD names {head[:200]!r}")
+    resolved = await _run_in_main_repository(
+        common_dir, ["rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], 10,
+    )
+    commit = (resolved.stdout or "").strip()
+    if resolved.returncode != 0 or not _HEX_OBJECT_NAME_RE.fullmatch(commit):
+        raise AgentWorktreeGitError(f"HEAD of {git_dir} ({revision}) is not a commit")
+    return commit, branch
+
+
+async def read_worktree_head(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike,
+) -> tuple[str, str | None]:
+    """``(commit, branch)`` checked out in the task worktree ``work_tree`` of
+    the repository whose git common dir is ``common_dir``; branch is None
+    when HEAD is detached.
+
+    FF-3155 (task #3158): read from the repository's ``worktrees/<name>``
+    entry whose ``gitdir`` file names ``work_tree``, never by running git
+    through the work tree's ``.git``, so a repository the agent planted
+    there (and a promisor remote whose upload-pack is the agent's program)
+    is neither read nor run. Raises :class:`AgentWorktreeGitError`.
+    """
+    common = os.path.realpath(os.fspath(common_dir))
+    real_work_tree = os.path.realpath(os.fspath(work_tree))
+    git_dir = find_worktree_git_dir(common, real_work_tree)
+    if git_dir is None:
+        raise AgentWorktreeGitError(
+            f"{real_work_tree} is not a registered worktree of {common}"
+        )
+    return await _worktree_head(common, git_dir)
+
+
+async def _settings_from_file(config_file: Path, pattern: str) -> list[tuple[str, str | None]]:
+    """The entries of the one config file ``config_file`` (includes not
+    followed) whose key matches ``pattern``; none when it cannot be read."""
+    listing = await git_run_async(
+        ["config", "--file", str(config_file), "-z", "--get-regexp", pattern],
+        config_file.parent, timeout=10,
+    )
+    return parse_config_list_z(listing.stdout) if listing.returncode == 0 else []
+
+
+async def _operator_settings() -> list[tuple[str, str | None]]:
+    """The :data:`_PRIVATE_SETTINGS_FROM_GLOBAL` entries of the pinned
+    global config; none while it is not pinned or no longer verifies."""
+    pin = _global_config_pin
+    if pin is None or verify_global_git_config_pin() is not None:
+        return []
+    return await _settings_from_file(pin.path, _PRIVATE_SETTINGS_FROM_GLOBAL)
+
+
+@dataclass(frozen=True)
+class AgentWorktreeGit:
+    """git on one task worktree that reads nothing the agent can write but
+    the work tree's own files (see the section comment); made by
+    :func:`agent_worktree_git`."""
+
+    work_tree: str
+    common_dir: str
+    git_dir: str
+    head: str
+    branch: str | None
+    private_dir: str
+    empty_tree: str
+    work_tree_fd: int | None
+
+    def _env(self) -> dict[str, str]:
+        env = _hardened_git_env(_NO_TRANSPORT_ENV)
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),
+            "GIT_INDEX_FILE": os.path.join(self.private_dir, "index"),
+            "GIT_ATTR_SOURCE": self.empty_tree,
+        })
+        return env
+
+    async def run(
+        self, args: list[str], *, timeout: int,
+        input: bytes | None = None, text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        """``git <args>`` on the private git dir, inside the work tree."""
+        env = self._env()
+        command = [
+            "-c", f"core.attributesFile={os.devnull}",
+            f"--git-dir={self.private_dir}", "--work-tree=.", *args,
+        ]
+        if self.work_tree_fd is None:
+            cwd, pass_fds = self.work_tree, ()
+        else:
+            cwd = f"{_FD_DIRECTORY}/{self.work_tree_fd}"
+            pass_fds = (self.work_tree_fd,)
+        return await _run_git_process_async(
+            _hardened_git_argv(command, env), cwd, env, timeout,
+            input=input, text=text, pass_fds=pass_fds,
+        )
+
+    async def skip_submodule_work_trees(self) -> None:
+        """Mark every submodule entry (gitlink) of the private index
+        skip-worktree, so git never looks inside a submodule's directory.
+
+        git checks a checked-out submodule for local changes by starting git
+        inside it, by discovery. That git reads the submodule's own config
+        and ``info/attributes``, both the agent's, so the agent's filter
+        driver would run. ``diff.ignoreSubmodules`` cannot stop it, since the
+        agent's ``.gitmodules`` can set ``submodule.<name>.ignore`` back for
+        each submodule; git does not examine the work tree of a skip-worktree
+        entry at all. A stash still records each submodule entry as staged;
+        a submodule HEAD moved but not staged is not recorded.
+
+        Raises :class:`AgentWorktreeGitError` when the index cannot be read,
+        holds an unmerged submodule entry, or cannot be marked.
+        """
+        listing = await self.run(["ls-files", "--stage", "-z"], timeout=30, text=False)
+        if listing.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"cannot list the index of {self.work_tree} (rc={listing.returncode})"
+            )
+        submodules: list[bytes] = []
+        # Each record is "<mode> <object> <stage>\t<path>".
+        for record in listing.stdout.split(b"\0"):
+            entry, _, path = record.partition(b"\t")
+            fields = entry.split(b" ")
+            if len(fields) != 3 or fields[0] != b"160000":
+                continue
+            if fields[2] != b"0":
+                raise AgentWorktreeGitError(
+                    f"the submodule entry {path[:200]!r} of {self.work_tree} is unmerged"
+                )
+            submodules.append(path)
+        if not submodules:
+            return
+        marked = await self.run(
+            ["update-index", "-z", "--skip-worktree", "--stdin"], timeout=30,
+            input=b"".join(path + b"\0" for path in submodules),
+        )
+        if marked.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"cannot mark the submodule entries of {self.work_tree} "
+                f"(rc={marked.returncode}: {(marked.stderr or '').strip()[:200]})"
+            )
+
+    async def run_in_repository(
+        self, args: list[str], *, timeout: int,
+    ) -> subprocess.CompletedProcess:
+        """``git <args>`` on the main repository's git dir (refs, objects;
+        no work tree, so nothing that reads or writes file content)."""
+        return await _run_in_main_repository(self.common_dir, args, timeout)
+
+    async def current_head(self) -> tuple[str, str | None]:
+        """``(commit, branch)`` the worktree's own git dir names now."""
+        return await _worktree_head(self.common_dir, self.git_dir)
+
+    async def publish_reset(self, branch: str, new: str, old: str) -> None:
+        """After ``reset --hard`` here: move ``refs/heads/<branch>`` from
+        ``old`` to ``new`` in the repository (with a reflog entry; refused
+        if the branch moved meanwhile) and install the private index as
+        the worktree's index, timestamps kept."""
+        moved = await self.run_in_repository(
+            ["update-ref", "--create-reflog", "-m", f"reset: moving to {new}",
+             f"refs/heads/{branch}", new, old],
+            timeout=15,
+        )
+        if moved.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"could not move {branch} to {new[:12]} "
+                f"(rc={moved.returncode}: {(moved.stderr or '').strip()[:200]})"
+            )
+        # A fresh name created here (never through a planted symlink), then
+        # renamed over the index in one step.
+        staged = os.path.join(self.git_dir, f"index.equipa-{os.getpid()}-{time.monotonic_ns()}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(staged, flags, 0o644)
+            with os.fdopen(fd, "wb") as writer, open(
+                os.path.join(self.private_dir, "index"), "rb",
+            ) as reader:
+                shutil.copyfileobj(reader, writer)
+                info = os.fstat(reader.fileno())
+            os.utime(staged, ns=(info.st_atime_ns, info.st_mtime_ns))
+            os.replace(staged, os.path.join(self.git_dir, "index"))
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(staged)
+            raise AgentWorktreeGitError(
+                f"could not install the reset index in {self.git_dir}: {exc}"
+            ) from exc
+
+    async def store_stash(self) -> str:
+        """Copy the private ``refs/stash`` to the repository's, with the
+        stash's own message; returns the stash commit."""
+        top = await self.run(["log", "-1", "--format=%H%n%s", "refs/stash"], timeout=15)
+        commit, _, subject = (top.stdout or "").strip().partition("\n")
+        if top.returncode != 0 or not _HEX_OBJECT_NAME_RE.fullmatch(commit):
+            raise AgentWorktreeGitError(
+                f"no stash was made in the private git dir (rc={top.returncode})"
+            )
+        stored = await _run_in_main_repository(
+            self.common_dir,
+            ["update-ref", "--create-reflog", "-m", subject, "refs/stash", commit], 15,
+        )
+        if stored.returncode != 0:
+            raise AgentWorktreeGitError(
+                f"could not record stash {commit[:12]} in {self.common_dir} "
+                f"(rc={stored.returncode}: {(stored.stderr or '').strip()[:200]})"
+            )
+        return commit
+
+
+async def _write_private_git_dir(
+    private_dir: str, common_dir: str, git_dir: str,
+    head: str, branch: str | None, object_format: str,
+) -> bool:
+    """Lay out the private git dir; True when the worktree index was copied."""
+    for directory in ("refs/heads", "objects"):
+        os.makedirs(os.path.join(private_dir, directory))
+    if branch is not None and _PLAIN_BRANCH_RE.fullmatch(branch):
+        Path(private_dir, "refs", "heads", branch).write_text(f"{head}\n", encoding="ascii")
+        Path(private_dir, "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="ascii")
+    else:
+        Path(private_dir, "HEAD").write_text(f"{head}\n", encoding="ascii")
+    settings: list[tuple[str, str | None]] = [
+        ("core.repositoryformatversion", "0" if object_format == "sha1" else "1"),
+        ("core.bare", "false"),
+    ]
+    if object_format != "sha1":
+        settings.append(("extensions.objectformat", object_format))
+    settings.extend(await _settings_from_file(
+        Path(common_dir, "config"), _PRIVATE_SETTINGS_FROM_REPOSITORY,
+    ))
+    operator = await _operator_settings()
+    settings.extend(operator)
+    named = {key for key, _ in operator}
+    settings.extend(entry for entry in _FALLBACK_IDENTITY if entry[0] not in named)
+    Path(private_dir, "config").write_text(serialize_git_config(settings), encoding="utf-8")
+    return _copy_regular_file(
+        os.path.join(git_dir, "index"), os.path.join(private_dir, "index"),
+        _INDEX_COPY_LIMIT,
+    )
+
+
+@contextlib.asynccontextmanager
+async def agent_worktree_git(
+    common_dir: str | os.PathLike, work_tree: str | os.PathLike,
+) -> AsyncIterator[AgentWorktreeGit]:
+    """An :class:`AgentWorktreeGit` for the task worktree ``work_tree`` of
+    the repository whose git common dir is ``common_dir``.
+
+    Raises :class:`AgentWorktreeGitError` when the work tree is a symlink,
+    is not a registered worktree of that repository, or its HEAD or index
+    cannot be read; the private git dir is removed on the way out.
+    """
+    common = os.path.realpath(os.fspath(common_dir))
+    fd, real_work_tree = _open_agent_work_tree(work_tree)
+    private_dir: str | None = None
+    try:
+        git_dir = find_worktree_git_dir(common, real_work_tree)
+        if git_dir is None:
+            raise AgentWorktreeGitError(
+                f"{real_work_tree} is not a registered worktree of {common}"
+            )
+        formats = await _run_in_main_repository(
+            common, ["rev-parse", "--show-object-format"], 10,
+        )
+        object_format = (formats.stdout or "").strip()
+        if formats.returncode != 0 or object_format not in _EMPTY_TREES:
+            raise AgentWorktreeGitError(
+                f"cannot read the object format of {common} (rc={formats.returncode})"
+            )
+        head, branch = await _worktree_head(common, git_dir)
+        private_dir = tempfile.mkdtemp(prefix="equipa-worktree-git-")
+        index_copied = await _write_private_git_dir(
+            private_dir, common, git_dir, head, branch, object_format,
+        )
+        worktree_git = AgentWorktreeGit(
+            real_work_tree, common, git_dir, head, branch, private_dir,
+            _EMPTY_TREES[object_format], fd,
+        )
+        if not index_copied:
+            # No index: start from HEAD's tree, which leaves the files alone.
+            read_tree = await worktree_git.run(["read-tree", head], timeout=30)
+            if read_tree.returncode != 0:
+                raise AgentWorktreeGitError(
+                    f"cannot build an index for {real_work_tree} "
+                    f"(rc={read_tree.returncode})"
+                )
+        yield worktree_git
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if private_dir is not None:
+            shutil.rmtree(private_dir, ignore_errors=True)
+
+
+# --- Read-only git in a task worktree (FF-3155, task #3158) --------------------
+#
+# Cleanup is not the only git the orchestrator runs in an agent's worktree.
+# While the agent runs and right after, the dev-test loop (the tester's diff
+# context, the no-change check, the markdown scan), the claimed-file check,
+# the progress monitor and the reviewer's tree snapshot run ``git diff`` /
+# ``git status`` / ``git ls-files`` there through git_run / git_run_async.
+# Found by discovery, that git read the repository's config and the work
+# tree's attributes, so hashing a stat-dirty file (``git diff <rev>`` every
+# time, ``git status`` on a same-size edit) ran the clean filter the agent
+# had planted: a plain ``git config`` in its worktree writes the shared
+# config, and ``.gitattributes`` or ``info/attributes`` selects the driver.
+#
+# Those subcommands now run, when their cwd lies in
+# ``<project>/.forge-worktrees/<name>``, on the git dir the main repository
+# registered for that worktree (HEAD and index are the worktree's own), with
+# ``GIT_COMMON_DIR`` naming a private directory the orchestrator writes for
+# the one call. git reads config and ``info/attributes`` from the common dir,
+# so neither the repository's config, its ``config.worktree`` (the extension
+# is not copied) nor its ``info/attributes`` is read; the global config is
+# ``/dev/null`` and the system files are off. No driver is defined anywhere
+# git looks, so none runs; as defence in depth (FF-3158, task #3162) the
+# attributes come from the empty tree (``GIT_ATTR_SOURCE``) and no global
+# attributes file is read, so nothing selects one either. Objects are
+# the repository's (``GIT_OBJECT_DIRECTORY``); refs, reflogs and packed refs
+# are reached through links to the repository's own (data git reads, never
+# runs). Submodule work trees are not examined (``--ignore-submodules=dirty``,
+# or the caller's ``=all``): git would start inside each one, by discovery,
+# with that submodule's own config. A path under ``.forge-worktrees`` that is
+# not a registered worktree, or that leaves its work tree through a symlink,
+# is refused with a failed result rather than run by discovery.
+
+# Read-only subcommands that hash work-tree files (and so can run a clean
+# filter). Other subcommands keep running by discovery: location queries
+# must report the real repository, and cleanup writes go through
+# agent_worktree_git.
+_WORK_TREE_READING_SUBCOMMANDS = frozenset({
+    "diff", "diff-files", "diff-index", "grep", "ls-files", "status",
+})
+# The ones that check each checked-out submodule for local changes.
+_SUBMODULE_EXAMINING_SUBCOMMANDS = frozenset({"diff", "diff-files", "diff-index", "status"})
+# The repository settings the private config keeps: its format, and how git
+# compares a file with its index entry. None names a program.
+_VIEW_SETTINGS_FROM_REPOSITORY = (
+    r"^(core\.(repositoryformatversion|filemode|symlinks|ignorecase"
+    r"|precomposeunicode|trustctime|checkstat)|extensions\.(objectformat|refstorage))$"
+)
+# Linked from the repository's common dir into the private one.
+_VIEW_LINKED_ENTRIES = ("refs", "packed-refs", "logs", "shallow", "reftable")
+# git's exit status for "could not run"; what a refused call returns.
+_REFUSED_RETURNCODE = 128
+
+
+@dataclass(frozen=True)
+class _TaskWorktreePath:
+    """A cwd inside ``<project_root>/.forge-worktrees/<name>`` (``work_tree``)."""
+
+    project_root: str
+    work_tree: str
+
+
+def _reads_work_tree(args: Sequence[str]) -> bool:
+    subcommand = _git_subcommand_index(args)
+    return subcommand is not None and args[subcommand] in _WORK_TREE_READING_SUBCOMMANDS
+
+
+def _task_worktree_path(cwd: str | os.PathLike) -> _TaskWorktreePath | None:
+    """The task worktree ``cwd`` lies in, judged on the path as given and
+    on its realpath (a symlink into or out of a worktree counts); None for
+    any other directory."""
+    for candidate in (os.path.abspath(os.fspath(cwd)), os.path.realpath(cwd)):
+        parts = Path(candidate).parts
+        if WORKTREE_BASE_DIRNAME in parts[:-1]:
+            index = parts.index(WORKTREE_BASE_DIRNAME)
+            return _TaskWorktreePath(
+                project_root=str(Path(*parts[:index])),
+                work_tree=str(Path(*parts[:index + 2])),
+            )
+    return None
+
+
+def _checkout_common_dir(project_root: str) -> str:
+    """Realpath of the git common dir of the checkout at ``project_root``,
+    read as data (a ``.git`` directory, or the ``gitdir:`` file and the
+    ``commondir`` file of the git dir it names). Raises
+    :class:`AgentWorktreeGitError`."""
+    dot_git = os.path.join(project_root, ".git")
+    try:
+        if os.path.isdir(dot_git):
+            git_dir = dot_git
+        else:
+            named = read_regular_file_bounded(dot_git, _GIT_LINE_FILE_LIMIT)
+            text = named.decode("utf-8", "replace").strip()
+            if not text.startswith("gitdir:"):
+                raise AgentWorktreeGitError(f"{dot_git} names no git dir")
+            git_dir = os.path.join(project_root, text[len("gitdir:"):].strip())
+        try:
+            common = read_regular_file_bounded(
+                os.path.join(git_dir, "commondir"), _GIT_LINE_FILE_LIMIT,
+            ).decode("utf-8", "replace").strip()
+        except FileNotFoundError:
+            common = "."
+    except OSError as exc:
+        raise AgentWorktreeGitError(
+            f"cannot locate the repository of {project_root}: {exc}"
+        ) from exc
+    return os.path.realpath(os.path.join(git_dir, common))
+
+
+def _submodule_work_trees_unexamined(args: Sequence[str]) -> list[str]:
+    """``args`` with ``--ignore-submodules=dirty`` before any ``--``, for a
+    subcommand that examines submodules, unless the caller's own last
+    ``--ignore-submodules`` already ignores them all. The flag overrides
+    ``.gitmodules`` and config; ``dirty`` still reports a moved gitlink."""
+    command = list(args)
+    subcommand = _git_subcommand_index(command)
+    if subcommand is None or command[subcommand] not in _SUBMODULE_EXAMINING_SUBCOMMANDS:
+        return command
+    end = command.index("--") if "--" in command[subcommand:] else len(command)
+    chosen = [
+        token.partition("=")[2] or "all"
+        for token in command[subcommand + 1:end]
+        if token == "--ignore-submodules" or token.startswith("--ignore-submodules=")
+    ]
+    if chosen and chosen[-1] == "all":
+        return command
+    command.insert(end, "--ignore-submodules=dirty")
+    return command
+
+
+def _view_settings_commands(common_dir: str) -> list[list[str]]:
+    """``git config`` listings of the settings the private config keeps:
+    the repository's (:data:`_VIEW_SETTINGS_FROM_REPOSITORY`) and, while the
+    global config is pinned and verifies, the operator's identity and
+    ``core.excludesFile``."""
+    commands = [[
+        "config", "--file", os.path.join(common_dir, "config"), "-z",
+        "--get-regexp", _VIEW_SETTINGS_FROM_REPOSITORY,
+    ]]
+    pin = _global_config_pin
+    if pin is not None and verify_global_git_config_pin() is None:
+        commands.append([
+            "config", "--file", str(pin.path), "-z",
+            "--get-regexp", _PRIVATE_SETTINGS_FROM_GLOBAL,
+        ])
+    return commands
+
+
+@dataclass(frozen=True)
+class _WorktreeView:
+    """One read-only call's view of a task worktree; see the section comment."""
+
+    work_tree: str
+    relative: str
+    common_dir: str
+    git_dir: str
+    work_tree_fd: int | None
+    private_dir: str | None = None
+    empty_tree: str | None = None
+
+    @property
+    def _work_tree_path(self) -> str:
+        if self.work_tree_fd is None:
+            return self.work_tree
+        return f"{_FD_DIRECTORY}/{self.work_tree_fd}"
+
+    @property
+    def cwd(self) -> str:
+        """Where git starts: the caller's directory, below the opened work tree."""
+        return os.path.join(self._work_tree_path, self.relative)
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        return () if self.work_tree_fd is None else (self.work_tree_fd,)
+
+    def env(self, extra_env: Mapping[str, str] | None, args: Sequence[str]) -> dict[str, str]:
+        if self.private_dir is None or self.empty_tree is None:  # pragma: no cover
+            raise AgentWorktreeGitError("the private common dir was not written")
+        env = _hardened_git_env(extra_env, args)
+        env.update(_NO_TRANSPORT_ENV)
+        env.update({
+            "GIT_COMMON_DIR": self.private_dir,
+            "GIT_OBJECT_DIRECTORY": os.path.join(self.common_dir, "objects"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            # FF-3158 (task #3162), defence in depth: the work tree's
+            # .gitattributes select nothing either (git >= 2.40).
+            "GIT_ATTR_SOURCE": self.empty_tree,
+        })
+        return env
+
+    def argv(self, args: Sequence[str], env: Mapping[str, str]) -> list[str]:
+        return _hardened_git_argv(
+            ["-c", f"core.attributesFile={os.devnull}",
+             f"--git-dir={self.git_dir}", f"--work-tree={self._work_tree_path}",
+             *_submodule_work_trees_unexamined(args)],
+            env,
+        )
+
+    def close(self) -> None:
+        if self.work_tree_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.work_tree_fd)
+        if self.private_dir is not None:
+            shutil.rmtree(self.private_dir, ignore_errors=True)
+
+
+def _locate_worktree_view(location: _TaskWorktreePath, cwd: str | os.PathLike) -> _WorktreeView:
+    """Open the work tree of ``location`` and find its registered git dir.
+
+    Raises :class:`AgentWorktreeGitError` when the work tree is a symlink,
+    ``cwd`` leaves it, or the repository holding ``.forge-worktrees`` does
+    not register it. The caller owns the open descriptor.
+    """
+    common_dir = _checkout_common_dir(location.project_root)
+    fd, real_work_tree = _open_agent_work_tree(location.work_tree)
+    try:
+        real_cwd = os.path.realpath(cwd)
+        if real_cwd != real_work_tree and not real_cwd.startswith(real_work_tree + os.sep):
+            raise AgentWorktreeGitError(
+                f"{os.fspath(cwd)} leaves the task worktree {real_work_tree}"
+            )
+        git_dir = find_worktree_git_dir(common_dir, real_work_tree)
+        if git_dir is None:
+            raise AgentWorktreeGitError(
+                f"{real_work_tree} is not a registered worktree of {common_dir}"
+            )
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    return _WorktreeView(
+        work_tree=real_work_tree,
+        relative=os.path.relpath(real_cwd, real_work_tree),
+        common_dir=common_dir,
+        git_dir=git_dir,
+        work_tree_fd=fd,
+    )
+
+
+def _with_private_common_dir(
+    view: _WorktreeView, listings: Sequence[subprocess.CompletedProcess],
+) -> _WorktreeView:
+    """``view`` with its private common dir written: the settings parsed
+    from ``listings`` (the :func:`_view_settings_commands` results), the
+    links of :data:`_VIEW_LINKED_ENTRIES` and a copy of ``info/exclude``."""
+    settings: list[tuple[str, str | None]] = [("core.bare", "false")]
+    for listing in listings:
+        if listing.returncode == 0:
+            settings.extend(parse_config_list_z(listing.stdout))
+    object_format = next(
+        ((value or "").strip().lower() for key, value in reversed(settings)
+         if key.lower() == "extensions.objectformat"),
+        "sha1",
+    )
+    if object_format not in _EMPTY_TREES:
+        raise AgentWorktreeGitError(
+            f"{view.common_dir} uses the unknown object format {object_format[:40]!r}"
+        )
+    private_dir = tempfile.mkdtemp(prefix="equipa-worktree-view-")
+    try:
+        Path(private_dir, "config").write_text(serialize_git_config(settings), encoding="utf-8")
+        for name in _VIEW_LINKED_ENTRIES:
+            target = os.path.join(view.common_dir, name)
+            if os.path.lexists(target):
+                os.symlink(target, os.path.join(private_dir, name))
+        # Patterns only (nothing git runs); a planted FIFO or a huge file
+        # is skipped rather than read.
+        with contextlib.suppress(OSError):
+            exclude = read_regular_file_bounded(
+                os.path.join(view.common_dir, "info", "exclude"), MAX_TRUSTED_FILE_BYTES,
+            )
+            os.mkdir(os.path.join(private_dir, "info"))
+            Path(private_dir, "info", "exclude").write_bytes(exclude)
+    except OSError as exc:
+        shutil.rmtree(private_dir, ignore_errors=True)
+        raise AgentWorktreeGitError(f"cannot write a private common dir: {exc}") from exc
+    return dataclass_replace(
+        view, private_dir=private_dir, empty_tree=_EMPTY_TREES[object_format],
+    )
+
+
+def _refused_result(
+    args: Sequence[str], reason: AgentWorktreeGitError, text: bool,
+) -> subprocess.CompletedProcess:
+    """A failed result for a call that would have run git by discovery in
+    an agent-controlled directory. Callers already treat a failed git as
+    "could not tell", so none of them is left with an exception it does
+    not expect."""
+    message = f"equipa: refused to run git {list(args)!r} by discovery: {reason}"
+    logger.warning("[git] %r", message)
+    return subprocess.CompletedProcess(
+        args=["git", *args], returncode=_REFUSED_RETURNCODE,
+        stdout="" if text else b"",
+        stderr=f"{message}\n" if text else f"{message}\n".encode("utf-8", "replace"),
+    )
+
+
+def _git_run_in_worktree_view(
+    location: _TaskWorktreePath,
+    args: list[str],
+    cwd: str | Path,
+    timeout: int,
+    env: Mapping[str, str] | None,
+    text: bool,
+) -> subprocess.CompletedProcess:
+    """:func:`git_run` for a work-tree reading call inside a task worktree."""
+    try:
+        view = _locate_worktree_view(location, cwd)
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    try:
+        listings = [
+            git_run(command, view.common_dir, timeout=10)
+            for command in _view_settings_commands(view.common_dir)
+        ]
+        view = _with_private_common_dir(view, listings)
+        run_env = view.env(env, args)
+        return _run_with_env(
+            view.argv(args, run_env), view.cwd, timeout, run_env,
+            text=text, pass_fds=view.pass_fds,
+        )
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    finally:
+        view.close()
+
+
+async def _git_run_async_in_worktree_view(
+    location: _TaskWorktreePath,
+    args: list[str],
+    cwd: str | Path,
+    timeout: int,
+    env: Mapping[str, str] | None,
+    input: bytes | None,
+    text: bool,
+) -> subprocess.CompletedProcess:
+    """:func:`git_run_async` for a work-tree reading call inside a task worktree."""
+    try:
+        view = _locate_worktree_view(location, cwd)
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    try:
+        listings = [
+            await git_run_async(command, view.common_dir, timeout=10)
+            for command in _view_settings_commands(view.common_dir)
+        ]
+        view = _with_private_common_dir(view, listings)
+        run_env = view.env(env, args)
+        return await _run_git_process_async(
+            view.argv(args, run_env), view.cwd, run_env, timeout,
+            input=input, text=text, pass_fds=view.pass_fds,
+        )
+    except AgentWorktreeGitError as exc:
+        return _refused_result(args, exc, text)
+    finally:
+        view.close()
 
 
 # --- Pinned global git config (task #3116, MI-04) -----------------------------
@@ -913,7 +2986,7 @@ def verify_global_git_config_pin() -> str | None:
 def pinned_git_env() -> dict[str, str]:
     """Environment for a git call that cannot go through :func:`git_run`.
 
-    The process environment plus the hardening variables and, once pinned,
+    The allowlisted environment plus the hardening variables and, once pinned,
     ``GIT_CONFIG_GLOBAL`` pointing at the pre-dispatch copy — so a direct
     ``subprocess.run(["git", ...])`` in the orchestrator reads the same
     config as the hardened helper does (task #3116, MI-04).
@@ -936,8 +3009,11 @@ def _gh_run(
     cwd: str | Path,
     timeout: int = GIT_DEFAULT_TIMEOUT,
 ) -> subprocess.CompletedProcess:
-    """Run a gh (GitHub CLI) command with the same env as git_run."""
-    return _run_with_env(["gh", *args], cwd, timeout)
+    """Run a gh (GitHub CLI) command: git's allowlisted env plus the GitHub
+    credentials (IR-04, task #3132)."""
+    env = _get_repo_env()
+    env.update(github_credential_env())
+    return _run_with_env(["gh", *args], cwd, timeout, env)
 
 
 # Per-process cache of detected default branch, keyed by resolved repo path.
@@ -1110,7 +3186,7 @@ def configured_default_branch(repo_path: str | Path) -> str | None:
 
     Read from the dispatch config key ``project_default_branches``: a mapping
     of project root path to branch name, e.g.
-    ``{"/srv/forge-share/AI_Stuff/Equipa-repo": "main"}``. A path inside an
+    ``{"/srv/share/Equipa-repo": "main"}``. A path inside an
     agent worktree maps to its project root first. Returns None when the
     project has no entry.
 
@@ -1146,17 +3222,26 @@ def configured_default_branch(repo_path: str | Path) -> str | None:
     return None
 
 
-def _trusted_branch_exists(repo_path: str | Path, branch: str) -> bool:
+def _trusted_branch_exists(
+    repo_path: str | Path, branch: str, common_dir: str | os.PathLike | None = None,
+) -> bool:
     """True if ``refs/heads/<branch>`` names a commit; raises if git cannot run.
 
     A git failure must not read as "branch absent": that could turn an
-    ambiguous main+master repo into a single-candidate one.
+    ambiguous main+master repo into a single-candidate one. With
+    ``common_dir`` the lookup runs on that git dir, named explicitly, with
+    no transport allowed (no discovery from ``repo_path``).
     """
+    lookup = ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"]
     try:
-        result = git_run(
-            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"],
-            repo_path, timeout=10,
-        )
+        if common_dir is None:
+            result = git_run(lookup, repo_path, timeout=10)
+        else:
+            common = os.fspath(common_dir)
+            result = git_run(
+                [f"--git-dir={common}", *lookup], common, timeout=10,
+                env=_NO_TRANSPORT_ENV,
+            )
     except (subprocess.SubprocessError, OSError) as exc:
         raise UntrustedDefaultBranchError(
             f"could not check refs/heads/{branch} in {repo_path!s}: {exc}"
@@ -1164,12 +3249,20 @@ def _trusted_branch_exists(repo_path: str | Path, branch: str) -> bool:
     return result.returncode == 0
 
 
-def get_trusted_default_branch(repo_path: str | Path) -> str:
+def get_trusted_default_branch(
+    repo_path: str | Path, *, common_dir: str | os.PathLike | None = None,
+) -> str:
     """Default branch of ``repo_path`` from operator-controlled sources only.
 
     Never reads ``refs/remotes/origin/HEAD`` or the checked-out HEAD, and is
     never cached, so a symbolic ref repointed from an agent worktree has no
-    effect. Resolution:
+    effect.
+
+    ``common_dir`` (FF-3158, task #3162) is the git common dir of the
+    repository to look the branches up in, for a ``repo_path`` in an agent's
+    task worktree: git is then never started there by discovery, where the
+    worktree's ``.git`` (the agent's) could name another repository.
+    ``repo_path`` still selects the operator's configured entry. Resolution:
 
       1. The operator-named branch in ``project_default_branches``. It must be
          a plain branch name, must not be a ``forge-task-*`` agent branch, and
@@ -1188,7 +3281,7 @@ def get_trusted_default_branch(repo_path: str | Path) -> str:
                 f"configured default branch {configured!r} for {repo_path!s} is "
                 f"not an operator branch name"
             )
-        if not _trusted_branch_exists(repo_path, configured):
+        if not _trusted_branch_exists(repo_path, configured, common_dir):
             raise UntrustedDefaultBranchError(
                 f"configured default branch {configured!r} does not exist in "
                 f"{repo_path!s}"
@@ -1196,7 +3289,7 @@ def get_trusted_default_branch(repo_path: str | Path) -> str:
         return configured
     existing = [
         candidate for candidate in TRUSTED_DEFAULT_BRANCH_CANDIDATES
-        if _trusted_branch_exists(repo_path, candidate)
+        if _trusted_branch_exists(repo_path, candidate, common_dir)
     ]
     if len(existing) == 1:
         return existing[0]
@@ -1235,10 +3328,7 @@ def check_gh_installed() -> bool:
         return False
 
     try:
-        result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True, text=True, timeout=10,
-        )
+        result = _gh_run(["auth", "status"], Path.cwd(), timeout=10)
         if result.returncode != 0:
             print("ERROR: GitHub CLI is not authenticated.")
             print("Run: gh auth login")

@@ -43,7 +43,7 @@
 #     bash `sqlite3` CLI.
 #
 # Expected schedule (Claudinator, user `user`):
-#   0 5 * * 0 /srv/forge-share/AI_Stuff/Equipa-repo/scripts/athena_truth_sync.sh \
+#   0 5 * * 0 /srv/share/Equipa-repo/scripts/athena_truth_sync.sh \
 #       >> /var/log/athena-truth-sync.log 2>&1
 
 set -euo pipefail
@@ -51,8 +51,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration -- override via environment for testing.
 # ---------------------------------------------------------------------------
-EQUIPA_REPO="${EQUIPA_REPO:-/srv/forge-share/AI_Stuff/Equipa-repo}"
-ATHENA_DIR="${ATHENA_DIR:-/srv/forge-share/AI_Stuff/Athena}"
+# Defaults: the checkout holding this script, with Athena and TheForge in
+# sibling directories (e.g. /srv/share/Equipa-repo, /srv/share/Athena).
+EQUIPA_REPO="${EQUIPA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ATHENA_DIR="${ATHENA_DIR:-$(dirname "$EQUIPA_REPO")/Athena}"
 ATHENA_CLI="${ATHENA_CLI:-${ATHENA_DIR}/dist/cli.js}"
 ATHENA_MODEL="${ATHENA_MODEL:-quality}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -77,7 +79,7 @@ MODULE_DELTA_THRESHOLD="${MODULE_DELTA_THRESHOLD:-10}"
 BADGE_DELTA_THRESHOLD="${BADGE_DELTA_THRESHOLD:-50}"
 
 # TheForge for open_questions. Optional; absence is logged but not fatal.
-THEFORGE_DB="${THEFORGE_DB:-/srv/forge-share/AI_Stuff/TheForge/theforge.db}"
+THEFORGE_DB="${THEFORGE_DB:-$(dirname "$EQUIPA_REPO")/TheForge/theforge.db}"
 EQUIPA_PROJECT_ID="${EQUIPA_PROJECT_ID:-23}"
 
 # ---------------------------------------------------------------------------

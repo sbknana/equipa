@@ -42,7 +42,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-from equipa.git_ops import git_run_async
+from equipa.git_ops import git_run_async, git_toplevel_async
 
 logger = logging.getLogger(__name__)
 
@@ -99,17 +99,76 @@ REVIEW_COMPLETION_SENTINEL_MISSING_REASON = "review-completion-sentinel-missing"
 # the regex ``^``/``$`` anchors and splitlines() see the same lines. A CR-only
 # or U+2028 review otherwise hid a finding heading from the MULTILINE regexes
 # while splitlines() still split it.
-_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
-# gate-06: invisible characters that split a severity word ("HI​GH") so
-# no regex sees it, while the operator reading the rendered file does. Covers
-# the Unicode Cf (format) characters that occur in text, the combining
-# grapheme joiner, variation selectors and the Hangul fillers.
+_LINE_BREAK_RE = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# Task 3169: the ASCII line breaks of _LINE_BREAK_RE other than "\r\n", for
+# str.translate after "\r\n" is replaced (an ASCII review's whole
+# normalisation; one C pass where the regex built a piece per CR).
+_ASCII_LINE_BREAKS = str.maketrans(dict.fromkeys("\r\x0b\x0c\x1c\x1d\x1e", "\n"))
+# gate-06: invisible characters that split a severity word ("HI<U+200B>GH") so
+# no regex sees it, while the operator reading the rendered file does.
+# Task 3143 (I-04): every Default_Ignorable_Code_Point and every Unicode Cf
+# (format) character, not a hand-picked subset. The musical beam controls
+# (U+1D173-1D17A), the shorthand format controls (U+1BCA0-1BCA3) and the
+# Egyptian hieroglyph format controls (U+13430-1343F) split "HI?GH" too.
+# Escapes, not literal characters, so the list can be read and reviewed.
 _INVISIBLE_CHARS_RE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏"
-    "​-‏‪-‮⁠-⁤⁦-⁯ㅤ"
-    "︀-️﻿ﾠ￹-￻\U000e0000-\U000e007f"
-    "\U000e0100-\U000e01ef]"
+    "["
+    "\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2"
+    "\u115f\u1160\u17b4\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164"
+    "\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb"
+    "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff"
+    "]"
 )
+
+
+# Task 3149 (R3143-07): the bidi embeddings, overrides and isolates (LRE, RLE,
+# PDF, LRO, RLO, LRI, RLI, FSI, PDI). An override reverses what the reader
+# sees ("<RLO>HGIH<PDF>" shows as HIGH) while every parser reads the logical
+# order with the controls stripped, so a review holding one is rejected
+# outright instead of read. A review names such a character ("U+202E").
+_BIDI_CONTROL_RE = re.compile(
+    "[\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
+    "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
+)
+# A numeric character reference to one of them ("&#x202E;", "&#8238", with
+# or without ";" and leading zeros) decodes to the control when the review
+# is rendered, so it is rejected the same way. HTML5 names none of them.
+_BIDI_CONTROL_REFERENCE_RE = re.compile(
+    r"&#(?:[xX]0*(202[A-Ea-e]|206[6-9])(?![0-9A-Fa-f])"
+    r"|0*(823[4-8]|829[4-7])(?![0-9]))"
+)
+REVIEW_BIDI_CONTROL_REASON = "review-bidi-control"
+# Every line break normalize_review_text maps to "\n", and "\n" itself.
+_ANY_LINE_BREAK_RE = re.compile(
+    "\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85"
+    "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]"
+)
+
+
+def find_bidi_control(text: str) -> str | None:
+    """``"U+202E at line 3"`` for the first bidi control in ``text``, else None.
+
+    ``text`` is read as written (before :func:`normalize_review_text`, which
+    strips these characters); every line-break form counts as one break. A
+    character reference to a control is reported as
+    ``"U+202E reference at line 3"``, whichever comes first.
+    """
+    match = _BIDI_CONTROL_RE.search(text)
+    reference = (_BIDI_CONTROL_REFERENCE_RE.search(text)
+                 if "&#" in text else None)
+    if reference is not None and (match is None
+                                  or reference.start() < match.start()):
+        hexadecimal, decimal = reference.group(1), reference.group(2)
+        code_point = (int(hexadecimal, 16) if hexadecimal is not None
+                      else int(decimal))
+        line = len(_ANY_LINE_BREAK_RE.findall(text, 0, reference.start())) + 1
+        return f"U+{code_point:04X} reference at line {line}"
+    if match is None:
+        return None
+    line = len(_ANY_LINE_BREAK_RE.findall(text, 0, match.start())) + 1
+    return f"U+{ord(match.group(0)):04X} at line {line}"
 
 
 def normalize_review_text(text: str) -> str:
@@ -120,11 +179,44 @@ def normalize_review_text(text: str) -> str:
     ``\\n``. Idempotent, so a caller that already normalised can pass the
     result through again without changing it.
     """
-    text = _INVISIBLE_CHARS_RE.sub("", text)
-    text = unicodedata.normalize("NFKC", text)
-    # NFKC can itself produce invisible characters (U+3164 -> U+1160).
-    text = _INVISIBLE_CHARS_RE.sub("", text)
+    return _normalized(text, "")
+
+
+def _normalized(text: str, separator: str) -> str:
+    """``text`` with ``separator`` for each invisible character, in NFKC,
+    every line break mapped to ``\\n``.
+
+    Task 3169: an ASCII text holds no invisible character and NFKC keeps it
+    as it is, so only its line breaks change; and when NFKC changes nothing,
+    no invisible character is left for a second pass to find. The result is
+    the same as the three passes; Python 3.10 spent a tenth of a second per
+    200 KB review on the character-class scans the gate repeats."""
+    if text.isascii():
+        return text.replace("\r\n", "\n").translate(_ASCII_LINE_BREAKS)
+    stripped = _INVISIBLE_CHARS_RE.sub(separator, text)
+    text = unicodedata.normalize("NFKC", stripped)
+    if text != stripped:
+        # NFKC can itself produce invisible characters (U+3164 -> U+1160).
+        text = _INVISIBLE_CHARS_RE.sub(separator, text)
     return _LINE_BREAK_RE.sub("\n", text)
+
+
+def separated_review_text(text: str, separator: str) -> str:
+    """:func:`normalize_review_text`, with ``separator`` for each invisible
+    character instead of nothing.
+
+    Task 3154 (I3152-01): deleting a character can join two words. The
+    Hangul fillers draw a blank and many of the other characters draw
+    nothing or a box, so "Rated<U+3164>HIGH" shows two words while the
+    normalised text reads "RatedHIGH". The review gate reads the review
+    this way too, so a word is standalone when a deleted character separates
+    it. ``separator`` must be one character that NFKC keeps and that is no
+    line break, so every line keeps its number.
+    """
+    if (len(separator) != 1 or _ANY_LINE_BREAK_RE.match(separator)
+            or unicodedata.normalize("NFKC", separator) != separator):
+        raise ValueError(f"unusable separator {separator!r}")
+    return _normalized(text, separator)
 
 
 @dataclass(frozen=True)
@@ -335,6 +427,12 @@ class ProvenanceVerdict:
     ``text`` is the decoded content of the exact bytes ``fingerprint`` hashed
     (SR41-02): callers count findings from it rather than re-reading the
     path, so the verified bytes and the parsed bytes are the same bytes.
+
+    Task 3164 (R3161-01): ``text`` is the review AS WRITTEN, never its
+    normalised form. The finding parser normalises it itself, and some of its
+    views (the separated reading of task 3154, the fold-before-NFKC copy of
+    task 3143) are built from the characters normalisation deletes or folds,
+    so a normalised ``text`` would hide "Rated<U+3164>HIGH" from all of them.
     """
 
     trusted: bool
@@ -472,6 +570,8 @@ def verify_reviewer_provenance(
         run's ``<!-- EQUIPA-REVIEW-COMPLETE <nonce> -->`` sentinel, so the
         review was never finished (gate-07);
       * ``artifact-changed-after-review`` — edited after the reviewer ended.
+      * ``review-bidi-control-U+XXXX-at-line-N`` — the bytes hold a bidi
+        embedding, override or isolate (task 3149, R3143-07), checked first.
 
       * ``reviewer-record-missing`` — no reviewer run was recorded for the
         task in this process (SR41-03, task #3063). Both production gate
@@ -483,11 +583,13 @@ def verify_reviewer_provenance(
         pre-#3041 artifact-only trust (reason ``no-reviewer-run-recorded``).
 
     The artifact is read ONCE (SR41-02): the fingerprint, the nonce check and
-    the returned ``text`` all come from the same bytes. The text is
-    normalised ONCE here (gate-09 / gate-14) with
-    :func:`normalize_review_text`, so the nonce check, the completion
-    sentinel and the finding parser all see the same ``\\n``-separated lines
-    whatever line breaks or invisible characters the file used.
+    the returned ``text`` all come from the same bytes. The nonce check and
+    the completion sentinel read the text normalised with
+    :func:`normalize_review_text` (gate-09 / gate-14), so they see the same
+    ``\\n``-separated lines whatever line breaks or invisible characters the
+    file used. The returned ``text`` is the text as written (task 3164,
+    R3161-01): the finding parser normalises it itself, after reading the
+    characters normalisation would delete.
     """
     snapshot = snapshot_artifact(review_path)
     fingerprint = snapshot.fingerprint
@@ -497,9 +599,15 @@ def verify_reviewer_provenance(
 
     def verdict(trusted: bool, reason: str) -> ProvenanceVerdict:
         return ProvenanceVerdict(
-            trusted, reason, fingerprint, text=text, record=record,
+            trusted, reason, fingerprint, text=raw_text, record=record,
         )
 
+    # Task 3149 (R3143-07): the normalised text has lost its bidi controls,
+    # so they are looked for in the bytes as written, before anything else.
+    bidi = find_bidi_control(raw_text) if raw_text is not None else None
+    if bidi is not None:
+        return verdict(False, f"{REVIEW_BIDI_CONTROL_REASON}-"
+                              + bidi.replace(" ", "-"))
     if record is None:
         if unrecorded_reviewer_runs_permitted():
             return verdict(True, "no-reviewer-run-recorded")
@@ -818,9 +926,31 @@ def decide_merge_gate(
             reason="doc-only-diff",
             changed_files=list(changed_files),
         )
-    blocks, counts = security_review_blocks_merge(
-        project_dir, task_id, block_on_missing=block_on_missing,
-    )
+    try:
+        blocks, counts = security_review_blocks_merge(
+            project_dir, task_id, block_on_missing=block_on_missing,
+        )
+    except Exception as error:  # noqa: BLE001 - any failure blocks the merge
+        # Task 3149 (R3143-04): an exception while reading or parsing the
+        # review is a logged block with a verdict, never an exception that
+        # ends the task with no GATE-AUDIT line.
+        logger.exception("[security-gate] review check for task %s failed",
+                         task_id)
+        reason = f"review parse error: {type(error).__name__}"
+        _gate_audit_log(
+            f"task={task_id} event=review-parse-error reason={reason!r} "
+            f"action=block",
+            task_id=task_id,
+            event="review-parse-error",
+        )
+        return GateDecision(
+            blocks_merge=True,
+            doc_only=False,
+            expect_artifact=True,
+            counts=None,
+            reason=reason,
+            changed_files=list(changed_files),
+        )
     reason = "security-review-blocked" if blocks else "clean"
     return GateDecision(
         blocks_merge=blocks,
@@ -830,6 +960,30 @@ def decide_merge_gate(
         reason=reason,
         changed_files=list(changed_files),
     )
+
+
+def escape_audit_text(text: str) -> str:
+    """``text`` with every line-breaking or control character escaped.
+
+    Audit messages embed branch-authored text (file names, git output). A raw
+    CR, LF, other C0/C1 control or a Unicode line/paragraph separator in it
+    could start what reads as a second, forged ``[GATE-AUDIT]`` line, or
+    rewrite the current one on a terminal (N-01, task #3146). Each such
+    character becomes a visible ``\\xNN`` / ``\\uNNNN`` escape, so the line
+    stays one line whatever the embedded text holds.
+    """
+    if text.isprintable():
+        return text
+    escaped: list[str] = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            escaped.append(f"\\x{code:02x}")
+        elif char in "\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}":
+            escaped.append(f"\\u{code:04x}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
 
 
 def _gate_audit_log(
@@ -877,7 +1031,10 @@ def _gate_audit_log(
         counts: finding counts dict, passed through to the persistence layer.
     """
     if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") != "0":
-        print(f"[GATE-AUDIT] {message}", file=sys.stderr, flush=True)
+        print(
+            f"[GATE-AUDIT] {escape_audit_text(message)}",
+            file=sys.stderr, flush=True,
+        )
 
     resolved_task_id = task_id if task_id is not None else _parse_task_id(message)
     if resolved_task_id is None:
@@ -989,10 +1146,109 @@ def is_doc_only_diff(changed_files: list[str]) -> bool:
     (SR-2997 S3), and ``requirements*.txt`` / ``constraints*.txt`` /
     ``CMakeLists.txt`` / ``.gitattributes`` / ``.gitmodules``, which change
     what gets installed, built or checked out.
+
+    A submodule pointer (:class:`SubmodulePointerPath`, a gitlink in the
+    diff) is never doc-only whatever its name: it pulls in code the diff
+    does not show (IND-01, task #3132).
     """
     if not changed_files:
         return False
+    if any(isinstance(path, SubmodulePointerPath) for path in changed_files):
+        return False
     return all(is_doc_path(path) for path in changed_files)
+
+
+class SubmodulePointerPath(str):
+    """A changed path that is a submodule pointer (gitlink, mode 160000).
+
+    Returned by :func:`get_changed_files_for_branch`. It is an ordinary
+    ``str`` for every other purpose; :func:`is_doc_only_diff` refuses it.
+    ``old_sha`` / ``new_sha`` (task #3146) are the submodule commits the
+    pointer moves between (all zeros when it is added or removed).
+    """
+
+    old_sha: str
+    new_sha: str
+
+    def __new__(
+        cls, path: str, old_sha: str = "", new_sha: str = "",
+    ) -> SubmodulePointerPath:
+        instance = super().__new__(cls, path)
+        instance.old_sha = old_sha
+        instance.new_sha = new_sha
+        return instance
+
+
+def describe_submodule_pointer_changes(changed_files: list[str]) -> str | None:
+    """Reviewer note listing every submodule pointer change, or None.
+
+    IND3132-02 (task #3146): a committed ``.gitmodules`` ``ignore = all``
+    (or similar config) hides a gitlink bump from a plain ``git diff``, so
+    the reviewer must be told about it explicitly. Paths are branch-authored
+    and quoted; SHAs are git's hex output.
+    """
+    pointers = [
+        path for path in changed_files if isinstance(path, SubmodulePointerPath)
+    ]
+    if not pointers:
+        return None
+    lines = [
+        "ORCHESTRATOR NOTE (added by the merge gate, not part of the task): "
+        "this branch changes the following submodule pointer(s). A plain "
+        "`git diff` may hide them (`.gitmodules` `ignore = all` or "
+        "`diff.ignoreSubmodules`); `git diff --ignore-submodules=none` shows "
+        "them. The code they point at is outside this repository's diff. "
+        "Review every pointer change and report one you cannot verify as a "
+        "finding:",
+    ]
+    for path in pointers[:50]:
+        lines.append(
+            f"- {path[:200]!r}: {(path.old_sha or 'unknown')[:40]} -> "
+            f"{(path.new_sha or 'unknown')[:40]}"
+        )
+    if len(pointers) > 50:
+        lines.append(f"- ... and {len(pointers) - 50} more")
+    return "\n".join(lines)
+
+
+# git's file mode for a gitlink (a submodule pointer) in a tree.
+_GITLINK_MODE = "160000"
+
+
+def _parse_raw_diff_z(raw: str) -> list[str] | None:
+    """Changed paths from ``git diff --raw -z``, gitlinks marked.
+
+    Each record is ``:<old mode> <new mode> <old sha> <new sha> <status>``
+    followed by one path, or two for a rename / copy. None when the output
+    does not have that shape (callers then fail closed).
+    """
+    fields = raw.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    paths: list[str] = []
+    index = 0
+    while index < len(fields):
+        header = fields[index].split()
+        if len(header) != 5 or not header[0].startswith(":"):
+            return None
+        old_mode, new_mode, status = header[0][1:], header[1], header[4]
+        old_sha, new_sha = header[2], header[3]
+        path_count = 2 if status[:1] in ("R", "C") else 1
+        record_paths = fields[index + 1:index + 1 + path_count]
+        if len(record_paths) != path_count:
+            return None
+        gitlink = _GITLINK_MODE in (old_mode, new_mode)
+        for path in record_paths:
+            # IND3132-03 (task #3146): a name that is only whitespace (or
+            # otherwise odd) is still a changed file; is_doc_path judges it.
+            # git never prints an empty path, so one means malformed output.
+            if not path:
+                return None
+            paths.append(
+                SubmodulePointerPath(path, old_sha, new_sha) if gitlink else path
+            )
+        index += 1 + path_count
+    return paths
 
 
 class SecurityGateBypassError(RuntimeError):
@@ -1011,7 +1267,7 @@ async def get_changed_files_for_branch(
 ) -> list[str]:
     """Return file paths changed on ``head_ref`` vs ``base_ref``.
 
-    Uses ``git diff --name-only base_ref...head_ref`` (three-dot syntax) so
+    Uses ``git diff --raw base_ref...head_ref`` (three-dot syntax) so
     the comparison is against the merge base, not the literal tip of
     ``base_ref`` — this matches what the eventual ``git merge`` will
     actually examine.
@@ -1035,7 +1291,28 @@ async def get_changed_files_for_branch(
     doc-only-ness" — :func:`is_doc_only_diff` already returns False for
     an empty list precisely so a failed lookup never silently disables
     the gate.
+
+    R3119-01 (task #3126): the diff runs at the work-tree ROOT of
+    ``project_dir`` with ``--no-relative``. ``project_dir`` may be a
+    project nested in a sub-directory of its repository, and from there an
+    agent-written ``diff.relative=true`` hid every change outside it. Paths
+    are always relative to the work-tree root.
+
+    IND-01 / IND-02 (task #3132): ``--ignore-submodules=none`` overrides
+    every config that hides a submodule pointer bump (``diff.ignoreSubmodules``,
+    ``submodule.<name>.ignore`` in config or a committed ``.gitmodules``),
+    and ``--raw`` modes mark each gitlink as a :class:`SubmodulePointerPath`.
+    The work-tree root must contain ``project_dir``, so a ``core.worktree``
+    naming another checkout yields no list (fail closed), not that
+    checkout's diff.
     """
+    repo_root = await git_toplevel_async(project_dir)
+    if repo_root is None:
+        logger.warning(
+            "[security-gate] %s is not inside a readable git work tree", project_dir,
+        )
+        return []
+    project_dir = str(repo_root)
     if base_ref is None:
         # SR-2997 S1 sibling: the diff base is the operator-named branch,
         # never origin/HEAD — an agent that repoints origin/HEAD at its own
@@ -1054,8 +1331,8 @@ async def get_changed_files_for_branch(
         # must list the source path too, not only the destination (SR-2997
         # S4). -z: paths verbatim, never C-quoted (SR-2997 S6).
         result = await git_run_async(
-            ["diff", "--name-only", "--no-renames", "-z",
-             f"{base_ref}...{head_ref}"],
+            ["diff", "--raw", "--no-abbrev", "--no-renames", "--no-relative",
+             "--ignore-submodules=none", "-z", f"{base_ref}...{head_ref}"],
             project_dir,
             timeout=10,
         )
@@ -1071,4 +1348,16 @@ async def get_changed_files_for_branch(
             base_ref, result.returncode, (result.stderr or "")[:200],
         )
         return []
-    return [path for path in (result.stdout or "").split("\0") if path.strip()]
+    changed = _parse_raw_diff_z(result.stdout or "")
+    if changed is None:
+        logger.warning(
+            "[security-gate] unexpected git diff --raw output vs %s", base_ref,
+        )
+        return []
+    gitlinks = [path for path in changed if isinstance(path, SubmodulePointerPath)]
+    if gitlinks:
+        logger.warning(
+            "[security-gate] submodule pointer change(s) %s: never doc-only, "
+            "review required", ", ".join(gitlinks[:5]),
+        )
+    return changed

@@ -23,6 +23,8 @@ Exports:
     is_downgrade_model
     resolve_claude_model
     get_persistent_retry_max_attempts
+    configured_path_translations
+    translate_local_path
 
 Copyright 2026 Forgeborn
 """
@@ -30,10 +32,30 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from equipa.constants import DEFAULT_MODEL, THEFORGE_DB
+
+logger = logging.getLogger(__name__)
+
+# Strings accepted as flag values besides JSON booleans (see is_feature_enabled).
+_FLAG_TRUE_STRINGS = frozenset({"true", "1"})
+_FLAG_FALSE_STRINGS = frozenset({"false", "0"})
+
+# Key load_dispatch_config sets when the config file exists but cannot be read
+# or parsed. Its value is the error text. Consumers must not treat such a
+# config as "the operator chose the defaults".
+CONFIG_LOAD_ERROR_KEY = "_config_load_error"
+
+# Security gates that must stay ON when the config cannot be read: the file
+# might have enabled them, and a gate that silently turns off on a corrupt
+# config is fail-open (EQUIPA review 2026-09-29, sandbox-06).
+FAIL_CLOSED_FEATURE_FLAGS: frozenset[str] = frozenset({
+    "bash_security_pretooluse",
+    "agent_isolation",
+})
 
 
 DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
@@ -48,10 +70,18 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # spawned CLI subprocess (via a generated --settings file) so that
     # equipa.bash_security.check_bash_command runs BEFORE the Bash tool
     # executes — genuine pre-execution blocking, not the reactive
-    # detect-and-terminate that the stream observer provides. DEFAULT FALSE:
-    # the reactive stream check (agent_runner.py, defense-in-depth) is always
-    # on; this flag only adds the true pre-execution gate on top. See task 2703.
+    # detect-and-terminate that the stream observer provides. DEFAULT FALSE.
+    # The reactive stream check only covers streaming roles and runs after
+    # the command has executed, so it is not a substitute. An invalid value
+    # for this flag forces it ON (FAIL_CLOSED_FEATURE_FLAGS). See task 2703.
     "bash_security_pretooluse": False,
+    # When True, every agent CLI runs as the separate unprivileged user in
+    # dispatch_config["agent_isolation"], in its own cgroup and its own git
+    # clone, with a read-only TheForge view without api_keys (equipa.isolation,
+    # docs/AGENT_ISOLATION.md). DEFAULT FALSE: it needs host setup first. If
+    # it is on and isolation cannot be established the dispatch is refused;
+    # an invalid value or unreadable config forces it ON (fail-closed).
+    "agent_isolation": False,
     # When True (default), a missing SECURITY-REVIEW-NNNN.md artifact after
     # the security-review agent runs is treated as a gate-blocking failure
     # (fail-closed). Set to False only if your workflow accepts the
@@ -94,18 +124,111 @@ DEFAULT_DISPATCH_CONFIG: dict = {
 }
 
 
+def _parse_feature_flag(value: object) -> bool | None:
+    """Return the bool a configured flag value means, or None if invalid.
+
+    Accepts JSON booleans, the JSON integers 0 and 1, and the strings
+    "true"/"false"/"1"/"0" (case and surrounding whitespace ignored).
+    """
+    if isinstance(value, bool):
+        return value
+    # bool is an int subclass; it was handled above, so this is a real int.
+    if isinstance(value, int) and value in (0, 1):
+        return value == 1
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _FLAG_TRUE_STRINGS:
+            return True
+        if normalized in _FLAG_FALSE_STRINGS:
+            return False
+    return None
+
+
+def _invalid_flag_fallback(feature_name: str, problem: str, default: bool) -> bool:
+    """Resolve a flag whose configured value cannot be used.
+
+    Security gates in FAIL_CLOSED_FEATURE_FLAGS are treated like an
+    unreadable config: ERROR and ON (BS3121-02 - main read 1/"yes"/"on" as
+    ON, so strict parsing must not quietly switch the gate off). Every other
+    flag logs a warning and uses its documented default.
+    """
+    if feature_name in FAIL_CLOSED_FEATURE_FLAGS:
+        logger.error(
+            "%s; security feature %r is forced ON (fail-closed) instead of "
+            "silently turning off", problem, feature_name,
+        )
+        return True
+    logger.warning("%s; using default %s", problem, default)
+    return default
+
+
+def _coerce_feature_flag(value: object, feature_name: str, default: bool) -> bool:
+    """Strictly coerce a configured flag value to bool.
+
+    Valid values are listed in _parse_feature_flag. Anything else - "yes",
+    "off", 2, 1.0, null, a list - is a config mistake and never goes through
+    Python truthiness ("false" is truthy): see _invalid_flag_fallback.
+    """
+    parsed = _parse_feature_flag(value)
+    if parsed is not None:
+        return parsed
+    return _invalid_flag_fallback(
+        feature_name,
+        f"Feature flag {feature_name!r} has invalid value {value!r} (expected "
+        'true/false, 0/1 or "true"/"false"/"1"/"0")',
+        default,
+    )
+
+
 def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
     """Check if a feature flag is enabled.
 
     Reads from dispatch_config["features"][feature_name]. Falls back to
-    DEFAULT_FEATURE_FLAGS if the feature is not in the config.
+    DEFAULT_FEATURE_FLAGS if the feature is not in the config. Values are
+    coerced strictly (see _coerce_feature_flag); an invalid value logs a
+    warning and uses the default.
+
+    Security flags in FAIL_CLOSED_FEATURE_FLAGS resolve to True when the
+    dispatch config could not be read (load_dispatch_config marks it with
+    CONFIG_LOAD_ERROR_KEY), when dispatch_config itself or "features" is not
+    an object, or when their value is invalid: a config problem must never
+    switch a gate off silently, so an ERROR is logged and the gate stays on.
 
     Returns True/False. Unknown features default to False.
     """
+    default = DEFAULT_FEATURE_FLAGS.get(feature_name, False)
     if dispatch_config is None:
-        return DEFAULT_FEATURE_FLAGS.get(feature_name, False)
+        return default
+    if not isinstance(dispatch_config, dict):
+        # IND3128-05: the same fail-closed rule as every other malformed
+        # shape - a security gate stays ON, other flags use their default.
+        return _invalid_flag_fallback(
+            feature_name,
+            f"dispatch_config is {type(dispatch_config).__name__}, not a dict "
+            f"(feature {feature_name!r})",
+            default,
+        )
+
+    load_error = dispatch_config.get(CONFIG_LOAD_ERROR_KEY)
+    if load_error and feature_name in FAIL_CLOSED_FEATURE_FLAGS:
+        logger.error(
+            "dispatch config could not be loaded (%s); security feature %r "
+            "is forced ON (fail-closed) instead of silently turning off",
+            load_error, feature_name,
+        )
+        return True
+
     features = dispatch_config.get("features", {})
-    return features.get(feature_name, DEFAULT_FEATURE_FLAGS.get(feature_name, False))
+    if not isinstance(features, dict):
+        return _invalid_flag_fallback(
+            feature_name,
+            f"dispatch_config['features'] is {type(features).__name__}, not "
+            f"a dict (feature {feature_name!r})",
+            default,
+        )
+    if feature_name not in features:
+        return default
+    return _coerce_feature_flag(features[feature_name], feature_name, default)
 
 
 def is_security_review_enabled(args, dispatch_config: dict | None = None) -> bool:
@@ -143,31 +266,107 @@ def is_security_review_enabled(args, dispatch_config: dict | None = None) -> boo
     return bool(enabled)
 
 
+# Feature flag and settings section of agent isolation (equipa.isolation,
+# which imports this module, so the name is repeated here).
+AGENT_ISOLATION_KEY = "agent_isolation"
+
+
+def default_dispatch_config_path() -> Path:
+    """The dispatch_config.json a run without --dispatch-config loads."""
+    # Default location: alongside the TheForge DB (where the orchestrator
+    # script lives). Fall back to CWD-relative if that does not exist.
+    filepath = Path(THEFORGE_DB).parent / "dispatch_config.json"
+    if not filepath.exists():
+        filepath = Path("dispatch_config.json")
+    return filepath
+
+
+def host_dispatch_config_path() -> Path:
+    """The host's own dispatch config, whose agent isolation a per-run
+    config cannot switch off (see :func:`load_dispatch_config`)."""
+    return default_dispatch_config_path()
+
+
 def load_dispatch_config(filepath: str | Path | None) -> dict:
     """Load dispatch_config.json preferences.
 
     Returns a config dict with defaults for any missing keys.
     Falls back to defaults entirely if file not found.
+
+    A per-run ``filepath`` (``--dispatch-config``) is merged over the
+    defaults, not over the host's config, except for agent isolation: when
+    the host config (:func:`host_dispatch_config_path`) has it on, it stays
+    on, with the host's ``agent_isolation`` section unless the per-run file
+    has its own. A per-run config may turn isolation on, never off, and a
+    missing per-run file does not turn it off either (review F1).
+    """
+    if filepath is None:
+        return _read_dispatch_config(default_dispatch_config_path())
+    filepath = Path(filepath)
+    config = _read_dispatch_config(filepath)
+    _carry_host_isolation(config, filepath)
+    return config
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return first.resolve() == second.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: a link loop
+        return False
+
+
+def _carry_host_isolation(config: dict, per_run_path: Path) -> None:
+    """Keep the host config's agent isolation in a per-run config."""
+    host_path = host_dispatch_config_path()
+    if _same_file(host_path, per_run_path) or not host_path.exists():
+        return
+    host = _read_dispatch_config(host_path)
+    if not is_feature_enabled(host, AGENT_ISOLATION_KEY):
+        return
+    features = config.get("features")
+    # Features that are not an object already read every fail-closed flag
+    # as ON; replacing them would switch the other gates off.
+    if isinstance(features, dict):
+        if not is_feature_enabled(config, AGENT_ISOLATION_KEY):
+            logger.warning(
+                "dispatch config '%s' turns %s off, but the host config '%s' "
+                "has it on; a per-run config cannot turn agent isolation off",
+                per_run_path, AGENT_ISOLATION_KEY, host_path,
+            )
+        # A new dict: config["features"] may be the shared default flags.
+        config["features"] = {**features, AGENT_ISOLATION_KEY: True}
+    if AGENT_ISOLATION_KEY not in config and AGENT_ISOLATION_KEY in host:
+        config[AGENT_ISOLATION_KEY] = json.loads(
+            json.dumps(host[AGENT_ISOLATION_KEY]))
+
+
+def _read_dispatch_config(filepath: Path) -> dict:
+    """``filepath`` merged over the defaults (see load_dispatch_config).
+
+    A missing file quietly yields the defaults: this runs on every
+    get_active_dispatch_config() call without a registered config (the
+    repo-root file is usually absent), and stdout is the MCP server's
+    JSON-RPC channel. The CLI warns about a ``--dispatch-config`` path that
+    does not exist (equipa.cli.warn_missing_dispatch_config).
     """
     config = dict(DEFAULT_DISPATCH_CONFIG)
-
-    if filepath is None:
-        # Default location: alongside the TheForge DB (where the orchestrator
-        # script lives). Fall back to CWD-relative if that does not exist.
-        filepath = Path(THEFORGE_DB).parent / "dispatch_config.json"
-        if not filepath.exists():
-            filepath = Path("dispatch_config.json")
-    else:
-        filepath = Path(filepath)
 
     if not filepath.exists():
         return config
 
     try:
         data = json.loads(filepath.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"top-level JSON is {type(data).__name__}, expected an object"
+            )
+    except (OSError, ValueError) as e:
+        # ValueError covers JSONDecodeError and UnicodeDecodeError. Mark the
+        # config so fail-closed security flags stay on (is_feature_enabled).
+        logger.error("Could not load dispatch config '%s': %s", filepath, e)
         print(f"WARNING: Could not load dispatch config '{filepath}': {e}")
-        print("  Using defaults.")
+        print("  Using defaults; security gates fail closed.")
+        config[CONFIG_LOAD_ERROR_KEY] = f"{filepath}: {e}"
         return config
 
     # Merge loaded values over defaults
@@ -392,3 +591,111 @@ def get_persistent_retry_max_attempts(dispatch_config: dict | None = None) -> in
               f"{DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS}")
         return DEFAULT_PERSISTENT_RETRY_MAX_ATTEMPTS
     return raw
+
+
+# --- Local path translation (task #3183, IR80-05) ---------------------------
+#
+# A TheForge ``projects.local_path`` can be recorded from another host: a
+# Windows client that sees the project share as ``X:\share`` while the
+# orchestrator sees the same share mounted at ``/srv/share``. The operator
+# lists such prefixes in the dispatch config, e.g.
+#
+#     "path_translations": [{"from": "X:\\share", "to": "/srv/share"}]
+#
+# Empty by default: a path is then used as recorded. Every place that turns a
+# DB ``local_path`` into a directory goes through translate_local_path().
+
+PATH_TRANSLATIONS_KEY = "path_translations"
+_PATH_SEPARATORS = "/\\"
+
+
+def _has_parent_segment(path: str) -> bool:
+    """True if ``path`` has a ``..`` segment under either separator."""
+    return ".." in path.replace("\\", "/").split("/")
+
+
+def _valid_path_translation(entry: object) -> tuple[str, str] | None:
+    """``(from, to)`` of one configured entry, or None (logged) if unusable.
+
+    ``from`` loses its trailing separators and must not become empty (that
+    would match every path); ``to`` must be absolute on this host. Neither
+    may hold a ``..`` segment.
+    """
+    if not isinstance(entry, dict):
+        logger.error("dispatch config %r: ignoring entry %r (expected an "
+                     'object with "from" and "to")', PATH_TRANSLATIONS_KEY, entry)
+        return None
+    source, target = entry.get("from"), entry.get("to")
+    if not isinstance(source, str) or not isinstance(target, str):
+        logger.error('dispatch config %r: ignoring entry %r ("from" and "to" '
+                     "must be strings)", PATH_TRANSLATIONS_KEY, entry)
+        return None
+    source = source.strip().rstrip(_PATH_SEPARATORS)
+    target = target.strip()
+    if not source or not Path(target).is_absolute():
+        logger.error('dispatch config %r: ignoring entry %r ("from" must be a '
+                     'non-root prefix and "to" an absolute path)',
+                     PATH_TRANSLATIONS_KEY, entry)
+        return None
+    if _has_parent_segment(source) or _has_parent_segment(target):
+        logger.error("dispatch config %r: ignoring entry %r (a '..' segment)",
+                     PATH_TRANSLATIONS_KEY, entry)
+        return None
+    return source, target
+
+
+def configured_path_translations(
+    dispatch_config: dict | None = None,
+) -> list[tuple[str, str]]:
+    """The usable ``(from, to)`` prefixes from ``path_translations``.
+
+    Reads the orchestrator's registered config when none is passed (see
+    get_active_dispatch_config). Invalid entries are logged and skipped, so a
+    path they would have matched is used as recorded. Longest ``from`` first,
+    so ``X:\\share\\sub`` wins over ``X:\\share``.
+    """
+    config = (
+        dispatch_config if dispatch_config is not None
+        else get_active_dispatch_config()
+    )
+    raw = config.get(PATH_TRANSLATIONS_KEY, []) if isinstance(config, dict) else []
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.error("dispatch config %r must be a list of {\"from\", \"to\"} "
+                     "objects, got %r; no path is translated",
+                     PATH_TRANSLATIONS_KEY, raw)
+        return []
+    translations = [
+        pair for pair in map(_valid_path_translation, raw) if pair is not None
+    ]
+    return sorted(translations, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def translate_local_path(
+    local_path: str, dispatch_config: dict | None = None,
+) -> str:
+    """``local_path`` with its configured ``path_translations`` prefix mapped.
+
+    A prefix matches whole path segments only (``X:\\share`` does not match
+    ``X:\\shared``), case-sensitively, with ``\\`` and ``/`` read as the same
+    separator. The rest of a translated path has its ``\\`` turned into
+    ``/``. A path no prefix matches is returned unchanged.
+
+    This does not check where the result points: a caller that creates
+    directories must still run its own containment check on the result.
+    """
+    if not isinstance(local_path, str):
+        raise TypeError(
+            f"local_path must be a str, got {type(local_path).__name__}"
+        )
+    normalized = local_path.replace("\\", "/")
+    for source, target in configured_path_translations(dispatch_config):
+        prefix = source.replace("\\", "/")
+        if not normalized.startswith(prefix):
+            continue
+        rest = normalized[len(prefix):]
+        if rest and not rest.startswith("/"):
+            continue  # same leading letters, a different directory
+        return (target.rstrip(_PATH_SEPARATORS) + rest) or "/"
+    return local_path
