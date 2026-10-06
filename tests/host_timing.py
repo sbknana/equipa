@@ -504,12 +504,26 @@ class _GrownReadings:
     def __init__(self, measure: Callable[[int], dict[str, float]]) -> None:
         self._measure = measure
         self.readings: dict[int, dict[str, float]] = {}
+        # The wall time of the last call at each size, building the shape
+        # included: what one more repetition of it costs.
+        self.costs: dict[int, float] = {}
 
     def measure(self, size: int) -> dict[str, float]:
         """A new reading at ``size``, kept as its reading: the test's sizes
         are measured again under the load (``measure_under_load``)."""
+        started = time.monotonic()
         self.readings[size] = self._measure(size)
+        self.costs[size] = time.monotonic() - started
         return self.readings[size]
+
+    def repetitions(self, small_size: int, size: int) -> int:
+        """How many runs of each size the pair (``small_size``, ``size``)
+        takes (``growth_repetitions``): as many as its most suspicious part
+        needs, within what its calls cost."""
+        small, large = self.at(small_size), self.at(size)
+        pair_cost = self.costs[small_size] + self.costs[size]
+        return max((growth_repetitions(small[part], pair_cost, large[part])
+                    for part in large), default=1)
 
     def at(self, size: int) -> dict[str, float]:
         if size not in self.readings:
@@ -655,17 +669,7 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         small_size, large_size = size, size * GROWTH
     else:
         small_size, large_size = size // GROWTH, size
-    call_costs: dict[int, float] = {}
-
-    def costed(at_size: int) -> dict[str, float]:
-        """``seconds_at(at_size)``, keeping the wall time of the whole call
-        (building the shape included): what one more repetition costs."""
-        started = time.monotonic()
-        seconds_taken = seconds_at(at_size)
-        call_costs[at_size] = time.monotonic() - started
-        return {label: seconds_taken}
-
-    grown = _GrownReadings(costed)
+    grown = _GrownReadings(lambda at_size: {label: seconds_at(at_size)})
     small_seconds, small_factor = measure_under_load(
         lambda: grown.measure(small_size)[label], base_budget_seconds)
     _check_budget(label, small_seconds, small_size, base_budget_seconds,
@@ -677,12 +681,10 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         seconds, factor = measure_under_load(
             lambda: grown.measure(large_size)[label], base_budget_seconds)
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
-    repetitions = growth_repetitions(small_seconds, sum(call_costs.values()),
-                                     seconds)
     timings = _check_growth(
         grown, lambda at_size: {label: seconds_at(at_size)}, small_size,
         large_size, {label: label}, base_budget_seconds * factor, factor,
-        repetitions)
+        grown.repetitions(small_size, large_size))
     return timings[label]
 
 
@@ -737,7 +739,8 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
     check_budget(large, size, factor)
     return _check_growth(grown, measured, small_size, size,
                          {part: f"{label}: {part}" for part in large},
-                         base_budget_seconds * factor, factor)
+                         base_budget_seconds * factor, factor,
+                         grown.repetitions(small_size, size))
 
 
 def _check_growth(grown: _GrownReadings,

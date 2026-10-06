@@ -163,6 +163,29 @@ def test_superlinear_work_under_16_ms_fails_once_repeated(monkeypatch, shape,
                        match=r"at 1x the test's input over \d+ runs of each"):
         assert_linear_time(_built(clock, _shape(shape, reading), 0.0), SIZE,
                            10.0, shape)
+    # A part of cheap calls too: 16 ms is main's boundary (16 ms against
+    # its 2 ms floor), so readings of 15.6-16.0 ms passed there.
+    superlinear = _built(clock, _shape(shape, reading), 0.0)
+    with pytest.raises(TimingCheckFailed,
+                       match=rf"parts: {shape}: .* over \d+ runs of each"):
+        assert_linear_times(
+            lambda size: {"linear": 0.01 * size / SIZE,
+                          shape: superlinear(size)},
+            SIZE, 10.0, "parts")
+
+
+@pytest.mark.parametrize("reading", (0.006, 0.0159))
+def test_a_part_of_expensive_calls_is_not_repeated(monkeypatch, reading):
+    """A part timed by one child-process run per call (3139's families) is
+    repeated only as far as GROWTH_REPETITION_SECONDS pays for; past that,
+    main's 2 ms floor decides, as before."""
+    clock = _build_clock(monkeypatch)
+    calls: list[int] = []
+    quadratic = _built(clock, _shape("quadratic", reading), 2.0, calls)
+    timings = assert_linear_times(lambda size: {"q": quadratic(size)}, SIZE,
+                                  10.0, "parts")
+    assert calls == [SIZE // GROWTH, SIZE]
+    assert timings["q"].repetitions == 1
 
 
 @pytest.mark.parametrize("reading", (0.006, 0.008, 0.012, 0.0159))
