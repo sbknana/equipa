@@ -17,8 +17,9 @@ def _allow_tmp_paths(tmp_path, monkeypatch):
 
     Without ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` the allowlist is the ``to``
     prefixes of the dispatch config's ``path_translations`` (for example
-    ``/srv/share``); under pytest we must let tmp_path-rooted paths through. Tests that specifically exercise containment rejection
-    override this fixture by clearing the env var first.
+    ``/srv/share``); under pytest we must let tmp_path-rooted paths through.
+    Tests that specifically exercise containment rejection override this
+    fixture by clearing the env var first.
     """
     monkeypatch.setenv("EQUIPA_SCAFFOLD_ALLOWED_ROOTS", str(tmp_path.resolve()))
     yield
