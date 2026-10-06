@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,118 @@ def test_a_store_that_cannot_be_trusted_refuses_every_dispatch(
             dispatch_mod.refuse_agent_made_repository(str(directory))
         assert reason in str(refused.value)
         assert "Refusing to run git there" in str(refused.value)
+
+
+def _windows_reported_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: Any,
+) -> Path:
+    """A store as Windows reports it: no ``os.geteuid``, and a writable
+    directory reads mode 0o777 (CPython derives it from the read-only
+    attribute alone)."""
+    database = _real_database(tmp_path)
+    _use_database(monkeypatch, database)
+    store = database.parent / dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME
+    store.mkdir()
+    store.chmod(0o777)
+    monkeypatch.delattr(dispatch_mod.os, "geteuid")
+    monkeypatch.setattr(dispatch_mod, "_owned_by_this_windows_user", owner,
+                        raising=False)
+    return store
+
+
+def test_on_windows_a_store_of_this_user_is_trusted_whatever_its_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IR76-04 (task #3178): the mode test refused every Windows store, so
+    after the first N1 block every dispatch was refused. Windows reads the
+    owner from the security descriptor instead."""
+    asked: list[Path] = []
+    store = _windows_reported_store(
+        tmp_path, monkeypatch, lambda path: asked.append(path) or True)
+
+    dispatch_mod._check_refusal_store(store)
+
+    assert asked == [store]
+
+
+@pytest.mark.parametrize("owner_reading", ["another-owner", "unreadable"])
+def test_on_windows_a_store_not_shown_to_be_this_users_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_reading: str,
+) -> None:
+    def owner(path: Path) -> bool:
+        if owner_reading == "unreadable":
+            raise OSError(5, "access denied")
+        return False
+
+    store = _windows_reported_store(tmp_path, monkeypatch, owner)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError) as refused:
+        dispatch_mod._check_refusal_store(store)
+    assert ("is not owned by this user" if owner_reading == "another-owner"
+            else "its owner cannot be read") in str(refused.value)
+
+
+def test_the_windows_owner_check_fails_closed_without_the_windows_api(
+    tmp_path: Path,
+) -> None:
+    if hasattr(__import__("ctypes"), "WinDLL"):
+        pytest.fail("this host has the Windows API; run the other Windows tests")
+    with pytest.raises(OSError, match="no Windows security API"):
+        dispatch_mod._owned_by_this_windows_user(tmp_path)
+
+
+def test_a_posix_store_writable_by_others_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: on POSIX the owner check does not replace the mode check."""
+    database = _real_database(tmp_path)
+    _use_database(monkeypatch, database)
+    store = database.parent / dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME
+    store.mkdir()
+    store.chmod(0o777)
+    monkeypatch.setattr(dispatch_mod, "_owned_by_this_windows_user",
+                        lambda path: True, raising=False)
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match="writable by other users"):
+        dispatch_mod._check_refusal_store(store)
+
+
+RELATIVE_DATABASE_PROBE = """
+import os, sys
+from pathlib import Path
+import equipa.dispatch as dispatch
+before = dispatch._agent_repository_refusals_dir()
+os.chdir(sys.argv[1])
+after = dispatch._agent_repository_refusals_dir()
+print(before)
+print(after)
+"""
+
+
+def test_a_relative_database_keeps_its_store_after_a_chdir(tmp_path: Path) -> None:
+    """IR76-08 (task #3178): THEFORGE_DB is made absolute once, at import,
+    so a relative value keeps naming the same database and refusal store
+    after the process changes directory (a recorded refusal then read as
+    "allowed")."""
+    started_in = tmp_path / "started"
+    (started_in / "forge").mkdir(parents=True)
+    moved_to = tmp_path / "moved"
+    moved_to.mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ("DATABASE_URL", "PGPASSFILE")}
+    environment["THEFORGE_DB"] = os.path.join("forge", "theforge.db")
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+
+    probe = subprocess.run(
+        [sys.executable, "-c", RELATIVE_DATABASE_PROBE, str(moved_to)],
+        cwd=started_in, env=environment, capture_output=True, text=True,
+        timeout=120, check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    expected = Path(os.path.realpath(started_in / "forge")) / (
+        dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME)
+    assert probe.stdout.split("\n")[:2] == [str(expected), str(expected)]
 
 
 def test_a_store_of_this_user_is_used_and_kept_private(

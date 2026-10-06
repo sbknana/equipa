@@ -1175,7 +1175,21 @@ def _check_refusal_store(refusals_dir: Path) -> None:
         raise RefusalStoreError(f"{refusals_dir} is a symlink")
     if not stat.S_ISDIR(info.st_mode):
         raise RefusalStoreError(f"{refusals_dir} is not a directory")
-    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+    if not hasattr(os, "geteuid"):
+        # Windows: st_mode carries only the read-only attribute, so every
+        # writable directory reads 0o777 and the mode test refused every
+        # store; ownership is read from the directory's security descriptor
+        # instead (IR76-04, task #3178).
+        try:
+            owned = _owned_by_this_windows_user(refusals_dir)
+        except OSError as exc:
+            raise RefusalStoreError(
+                f"{refusals_dir}: its owner cannot be read ({exc})"
+            ) from exc
+        if not owned:
+            raise RefusalStoreError(f"{refusals_dir} is not owned by this user")
+        return
+    if info.st_uid != os.geteuid():
         raise RefusalStoreError(
             f"{refusals_dir} is owned by uid {info.st_uid}, not by this user"
         )
@@ -1184,6 +1198,69 @@ def _check_refusal_store(refusals_dir: Path) -> None:
             f"{refusals_dir} is writable by other users "
             f"(mode {stat.S_IMODE(info.st_mode):o})"
         )
+
+
+def _owned_by_this_windows_user(path: Path) -> bool:
+    """Whether the owner SID of ``path`` is this process's user, or the
+    owner this process's token gives the objects it creates (the
+    Administrators group for an elevated administrator). Windows only;
+    raises OSError when a security call fails or there is no Windows API.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    if not hasattr(ctypes, "WinDLL"):
+        raise OSError("no Windows security API on this platform")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    se_file_object, owner_security_information = 1, 0x1
+    token_query, token_user, token_owner = 0x0008, 1, 4
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    owner = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        os.fspath(path), se_file_object, owner_security_information,
+        ctypes.byref(owner), None, None, None, ctypes.byref(descriptor))
+    if status != 0:
+        raise OSError(status, f"GetNamedSecurityInfoW failed with {status}")
+    try:
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            for information_class in (token_user, token_owner):
+                needed = wintypes.DWORD()
+                advapi32.GetTokenInformation(
+                    token, information_class, None, 0, ctypes.byref(needed))
+                buffer = ctypes.create_string_buffer(needed.value)
+                if not advapi32.GetTokenInformation(
+                        token, information_class, buffer, needed,
+                        ctypes.byref(needed)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                # TOKEN_USER and TOKEN_OWNER both start with the SID pointer.
+                sid = ctypes.c_void_p.from_buffer(buffer)
+                if advapi32.EqualSid(owner, sid):
+                    return True
+            return False
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 def _refusal_record(refusals_dir: Path, location: str) -> Path:

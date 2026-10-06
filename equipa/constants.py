@@ -13,10 +13,13 @@ from pathlib import Path
 
 # --- Core Paths ---
 
-THEFORGE_DB = Path(os.environ.get(
+# Made absolute once, at import: a relative THEFORGE_DB then keeps naming
+# the database (and the refusal store beside it) after a later chdir
+# (IR76-08, task #3178).
+THEFORGE_DB = Path(os.path.abspath(os.environ.get(
     "THEFORGE_DB",
     Path(__file__).parent.parent / "theforge.db",
-))
+)))
 MCP_CONFIG = Path(__file__).parent.parent / "mcp_config.json"
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 STANDING_ORDERS_DIR = Path(__file__).parent.parent / "standing_orders"
