@@ -1294,9 +1294,15 @@ _WINDOWS_STORE_WRITE_RIGHTS = (
 _WINDOWS_ACCESS_ALLOWED_ACE = 0
 _WINDOWS_ACCESS_DENIED_ACE = 1
 # Accounts whose write access leaves the store trusted: SYSTEM, the
-# Administrators group (either can take any file over anyway), and CREATOR
-# OWNER (a placeholder for whoever creates a record: this user).
-_WINDOWS_TRUSTED_WRITER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-0"})
+# Administrators group (either can take any file over anyway), CREATOR
+# OWNER (a placeholder for whoever creates a record: this user) and OWNER
+# RIGHTS (the object's current owner, which the ownership check has already
+# proved is this user). ``os.mkdir(mode=0o700)`` on Windows grants OWNER
+# RIGHTS since the CVE-2024-4030 fix (3.13, 3.12.4+), so the store EQUIPA
+# makes itself carries it (IR80-01).
+_WINDOWS_TRUSTED_WRITER_SIDS = frozenset(
+    {"S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"}
+)
 
 
 @dataclass(frozen=True)

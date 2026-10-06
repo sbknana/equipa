@@ -263,6 +263,9 @@ FULL, READ_AND_EXECUTE = 0x001F01FF, 0x001200A9
     ([], []),
     ([(0, FULL, OWN), (0, FULL, "S-1-5-18"), (0, FULL, "S-1-5-32-544"),
       (0, FULL, "S-1-3-0"), (0, READ_AND_EXECUTE, USERS)], []),
+    # IR80-01: the access list os.mkdir(mode=0o700) gives on Windows since
+    # the CVE-2024-4030 fix: SYSTEM, Administrators and OWNER RIGHTS.
+    ([(0, FULL, "S-1-5-18"), (0, FULL, "S-1-5-32-544"), (0, FULL, "S-1-3-4")], []),
     ([(0, READ_AND_EXECUTE | 0x0002, USERS)], [USERS]),          # add a record
     ([(0, 0x0040, EVERYONE)], [EVERYONE]),                         # delete one
     ([(0, 0x0001_0000, USERS)], [USERS]),                          # DELETE
@@ -276,6 +279,42 @@ def test_the_windows_access_list_names_every_other_writer(entries: Any, writers:
     access = None if entries is None else [
         dispatch_mod.WindowsAccessEntry(*entry) for entry in entries]
     assert dispatch_mod._untrusted_windows_writers(access, [OWN]) == writers
+
+
+_MKDIR_0O700_WINDOWS_ACCESS = [
+    dispatch_mod.WindowsAccessEntry(0, FULL, "S-1-5-18"),
+    dispatch_mod.WindowsAccessEntry(0, FULL, "S-1-5-32-544"),
+    dispatch_mod.WindowsAccessEntry(0, FULL, "S-1-3-4"),
+]
+
+
+def test_on_windows_the_store_equipa_makes_itself_is_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IR80-01 (task #3183): the store ``mkdir(mode=0o700)`` makes carries
+    OWNER RIGHTS, which was read as another writer, so the first N1 record
+    failed and every later dispatch of every project was refused."""
+    store = _windows_reported_store(
+        tmp_path, monkeypatch, lambda path: True,
+        lambda path: dispatch_mod._untrusted_windows_writers(
+            _MKDIR_0O700_WINDOWS_ACCESS, [OWN]))
+
+    dispatch_mod._check_refusal_store(store)
+
+
+def test_on_windows_owner_rights_is_trusted_only_after_the_owner_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OWNER RIGHTS stands for the store's owner, so trusting it is only
+    safe because a store another account owns is refused first."""
+    asked: list[Path] = []
+    store = _windows_reported_store(
+        tmp_path, monkeypatch, lambda path: False,
+        lambda path: asked.append(path) or [])
+
+    with pytest.raises(dispatch_mod.RefusalStoreError, match="is not owned by this user"):
+        dispatch_mod._check_refusal_store(store)
+    assert asked == []
 
 
 def test_the_windows_access_list_check_fails_closed_without_the_windows_api(
