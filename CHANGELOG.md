@@ -6,6 +6,20 @@ All notable changes to EQUIPA are documented here.
 
 ### Changed
 
+- **Project path translation is configuration** (task #3183, IR80-05).
+  - **Change:** EQUIPA no longer carries a built-in mapping from one Windows share to one Linux mount.
+  - **New config key:** list the mappings under `path_translations` in `dispatch_config.json`, for example
+    `[{"from": "X:\\share", "to": "/srv/share"}]`. It is empty by default.
+  - **Where it applies:** `equipa.tasks.resolve_project_dir` and the scaffold bootstrap both use
+    `equipa.config.translate_local_path`. The bootstrap keeps its containment check after translation.
+  - **Scaffold:** auto-clone has no built-in location either.
+    - The source comes from `EQUIPA_FORGESCAFFOLD_DIR` or `forgescaffold_dir`.
+    - The allowed roots come from `EQUIPA_SCAFFOLD_ALLOWED_ROOTS`, or else from the `to` prefixes of `path_translations`.
+  - **Scripts:** their defaults now sit beside the checkout that holds them.
+  - **Docs:** see "Project Paths Recorded on Another Host" in `docs/DEPLOYMENT.md`.
+  - **Upgrading:** an install that relied on the built-in mapping must add its own `path_translations` entry and
+    `forgescaffold_dir` before it deploys.
+
 - **Review-agent output path** (task #2476) — security-reviewer,
   code-reviewer, and other review-style agents now write their output
   artifacts to `.equipa-artifacts/<TYPE>-<TASK_ID>.md` (e.g.
