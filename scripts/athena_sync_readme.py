@@ -29,7 +29,7 @@ the caller is expected to ``git diff`` and skip the commit in that case.
 Invoked directly as a CLI by ``scripts/athena_truth_sync.sh``::
 
     python3 scripts/athena_sync_readme.py \
-        --repo-root /srv/forge-share/AI_Stuff/Equipa-repo \
+        --repo-root /srv/share/Equipa-repo \
         --athena-readme /path/to/docs/README.md
 """
 

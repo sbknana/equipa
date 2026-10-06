@@ -70,10 +70,11 @@ ANCHOR_SETS: dict[str, list[str]] = {
 
 DEFAULT_ANCHOR = "swebench"
 
-# TheForge DB resolution (matches EQUIPA convention)
+# TheForge DB resolution: $THEFORGE_DB, else a TheForge checkout next to the
+# one holding this script (e.g. /srv/share/TheForge/theforge.db).
 THEFORGE_DB = os.environ.get(
     "THEFORGE_DB",
-    str(Path("/srv/forge-share/AI_Stuff/TheForge/theforge.db")),
+    str(Path(__file__).resolve().parent.parent.parent / "TheForge" / "theforge.db"),
 )
 EQUIPA_PROJECT_ID = 23
 

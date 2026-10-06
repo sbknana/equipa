@@ -47,9 +47,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# The checkout holding this script, then the directory its sibling
+# projects live in (e.g. /srv/share/Equipa-repo, then /srv/share).
+_SCRIPT_REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ROOTS: tuple[Path, ...] = (
-    Path("/srv/forge-share/AI_Stuff/Equipa-repo"),
-    Path("/srv/forge-share/AI_Stuff"),
+    _SCRIPT_REPO_ROOT,
+    _SCRIPT_REPO_ROOT.parent,
 )
 
 SKIP_DIR_NAMES: frozenset[str] = frozenset(

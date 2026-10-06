@@ -21,7 +21,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PROD_DIR="${EQUIPA_PROD_DIR:-/srv/forge-share/AI_Stuff/Equipa-prod}"
+# Default: an Equipa-prod checkout next to the Equipa-repo checkout holding
+# this script (e.g. /srv/share/Equipa-repo -> /srv/share/Equipa-prod).
+DEPLOY_SCRIPT_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROD_DIR="${EQUIPA_PROD_DIR:-$(dirname "${DEPLOY_SCRIPT_REPO}")/Equipa-prod}"
 SOURCE_REPO_MARKER="forge_orchestrator.py"   # file that must exist in source CWD
 UPSTREAM_REMOTE="${EQUIPA_UPSTREAM_REMOTE:-origin}"
 UPSTREAM_BRANCH="${EQUIPA_UPSTREAM_BRANCH:-main}"
