@@ -28,6 +28,7 @@ import equipa.db as equipa_db
 from equipa import loops
 from equipa.dispatch import _security_review_blocks_merge
 from equipa.security_gate import (
+    MAX_REVIEW_ARTIFACT_BYTES,
     REVIEW_BIDI_CONTROL_REASON,
     REVIEWER_STATUS_SUCCEEDED,
     ProvenanceVerdict,
@@ -39,6 +40,7 @@ from equipa.security_gate import (
     reviewer_nonce_line,
     verify_reviewer_provenance,
 )
+from tests.host_timing import InputTooLarge
 from tests.review_gate_timing import median_cpu_seconds
 
 # The nonce every review-gate test review carries in its provenance and
@@ -242,6 +244,13 @@ def production_seconds(text: str, *, nonce: str = NONCE,
     held to its budget for the parse."""
     project = gate_project()
     path = write_recorded_review(project, GATE_TASK_ID, text, nonce=nonce)
+    written_bytes = path.stat().st_size
+    if written_bytes > MAX_REVIEW_ARTIFACT_BYTES:
+        # A growth check grew the review past what the gate reads: the shape
+        # does not exist there (tests/host_timing.py stops growing).
+        raise InputTooLarge(
+            f"a {written_bytes}-byte review is over the gate's "
+            f"{MAX_REVIEW_ARTIFACT_BYTES}-byte artifact cap")
     provenance = verify_reviewer_provenance(GATE_TASK_ID, path)
     refused_before_parsing = (
         not provenance.trusted

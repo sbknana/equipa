@@ -27,6 +27,7 @@ import pytest
 
 from tests import host_timing
 from tests.host_timing import (
+    DETECTION_FLOOR_SECONDS,
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
@@ -37,6 +38,7 @@ from tests.host_timing import (
     HostCalibration,
     HostFactorError,
     HostTooSlowError,
+    InputTooLarge,
     TimingCheckFailed,
     assert_linear_time,
     assert_linear_times,
@@ -700,6 +702,96 @@ def test_real_linear_work_passes(target_seconds):
 
     timing = assert_linear_time(seconds_at, units, 30.0, "planted linear")
     assert timing.ratio < GROWTH_LIMIT
+
+
+def _capped(seconds_at, largest_size: int):
+    """``seconds_at`` of a shape that does not exist past ``largest_size``
+    (a review the gate's artifact cap refuses)."""
+    def capped(size: int):
+        if size > largest_size:
+            raise InputTooLarge(f"size {size} is over {largest_size}")
+        return seconds_at(size)
+
+    return capped
+
+
+# How far the input can grow: not at all, or one step (a 200 KB review
+# grows to 800 KB, not to 3.2 MB, under the gate's 2 MB cap).
+CAPPED_GROWTH = {"cannot-grow": 1, "grows-once": GROWTH}
+
+
+@pytest.mark.parametrize("growth", sorted(CAPPED_GROWTH))
+@pytest.mark.parametrize("reading", IR75_01_LARGE_READINGS)
+def test_quadratic_work_of_16_to_159_ms_fails_where_the_input_cannot_grow(
+        monkeypatch, reading, growth):
+    """Task 3178: under load the review-gate checks grew a 200 KB review
+    to 3.2 MB, which the gate does not read. A shape that stops growing is
+    decided at the sizes measured against main's 2 ms floor, so quadratic
+    work of 16-159 ms still fails (IR75-01)."""
+    clock = _build_clock(monkeypatch)
+    seconds_at = _capped(_planted(clock, reading, 0.3, 2),
+                         IR75_01_SIZE * CAPPED_GROWTH[growth])
+    with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
+        assert_linear_time(seconds_at, IR75_01_SIZE, 10.0, "quadratic")
+    if growth == "cannot-grow":
+        # Its quarter reads under 10 ms: growth was tried, and refused.
+        assert f"floor {DETECTION_FLOOR_SECONDS:g} s" in str(failure.value)
+
+
+@pytest.mark.parametrize("growth", sorted(CAPPED_GROWTH))
+@pytest.mark.parametrize("reading", (0.001, 0.005) + IR75_01_LARGE_READINGS)
+def test_linear_work_passes_where_the_input_cannot_grow(
+        monkeypatch, reading, growth):
+    clock = _build_clock(monkeypatch)
+    calls: list[int] = []
+    largest_size = IR75_01_SIZE * CAPPED_GROWTH[growth]
+    seconds_at = _capped(_planted(clock, reading, 0.3, 1, calls), largest_size)
+    timing = assert_linear_time(seconds_at, IR75_01_SIZE, 10.0, "linear")
+    assert timing.ratio < GROWTH_LIMIT
+    assert max(calls) <= largest_size
+    # Main's floor only where a growth step was tried and refused: the
+    # check then stopped at the largest size the shape exists at.
+    if timing.floor_seconds == DETECTION_FLOOR_SECONDS:
+        assert timing.size == largest_size
+    if reading == 0.016 and growth == "cannot-grow":
+        assert timing.floor_seconds == DETECTION_FLOOR_SECONDS
+
+
+@pytest.mark.parametrize("growth", sorted(CAPPED_GROWTH))
+@pytest.mark.parametrize("reading", IR75_01_LARGE_READINGS)
+def test_a_quadratic_part_fails_where_the_input_cannot_grow(
+        monkeypatch, reading, growth):
+    clock = _build_clock(monkeypatch)
+    quadratic = _planted(clock, reading, 0.3, 2)
+    largest_size = IR75_01_SIZE * CAPPED_GROWTH[growth]
+
+    def seconds_at(size: int) -> dict[str, float]:
+        if size > largest_size:
+            raise InputTooLarge(f"size {size} is over {largest_size}")
+        return {"linear": reading * size / IR75_01_SIZE,
+                "quadratic": quadratic(size)}
+
+    with pytest.raises(TimingCheckFailed, match="superlinear") as failure:
+        assert_linear_times(seconds_at, IR75_01_SIZE, 10.0, "parts")
+    assert "parts: quadratic" in str(failure.value)
+    assert "parts: linear" not in str(failure.value)
+
+
+def test_a_shape_too_large_at_the_tests_own_size_is_an_error(monkeypatch):
+    """Only growth stops at ``InputTooLarge``: a test whose own sizes do
+    not exist is broken, not passed."""
+    _build_clock(monkeypatch)
+    with pytest.raises(InputTooLarge):
+        assert_linear_time(_capped(lambda size: 0.001, IR75_01_SIZE // 2),
+                           IR75_01_SIZE, 10.0, "too large")
+
+
+def test_the_gate_helper_refuses_a_review_over_the_artifact_cap():
+    from equipa.security_gate import MAX_REVIEW_ARTIFACT_BYTES
+    from tests.review_gate_production import production_seconds
+
+    with pytest.raises(InputTooLarge, match="artifact cap"):
+        production_seconds("No findings.\n" + "a" * MAX_REVIEW_ARTIFACT_BYTES)
 
 
 def test_a_quarter_reading_at_the_floor_is_decided_without_growing():

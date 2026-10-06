@@ -41,11 +41,12 @@ import pytest
 
 from equipa import loops
 from equipa.security_gate import (
+    MAX_REVIEW_ARTIFACT_BYTES,
     normalize_review_text,
     review_complete_line,
     reviewer_nonce_line,
 )
-from tests.host_timing import assert_linear_time
+from tests.host_timing import InputTooLarge, assert_linear_time
 from tests.review_gate_production import (
     decision_and_analysis,
     production_seconds,
@@ -775,11 +776,33 @@ LARGER_ONLY_FAMILIES = frozenset({"distinct_code_points"})
 
 def family_review_seconds(name, rb):
     """The merge gate's time on the review holding family ``name`` built at
-    ``rb`` bytes."""
+    ``rb`` bytes. A growth check that grows ``rb`` past the gate's artifact
+    cap gets ``InputTooLarge`` before the families are built (the code-point
+    families run out of code points past it)."""
+    if rb > MAX_REVIEW_ARTIFACT_BYTES:
+        raise InputTooLarge(f"{rb} bytes is over the gate's artifact cap")
     body = {**reviewer_families(rb), **backstop_families(rb)}[name]
     text = review("No findings.", body, ZERO)
     assert len(text.encode()) >= rb * 0.99, name
     return production_seconds(text)
+
+
+def test_a_family_grown_past_the_gate_cap_is_decided_at_the_last_size():
+    """Task 3178: under load the growth check grew a 200 KB family to 3.2 MB,
+    where the code-point families raised ValueError (chr() out of range)
+    and the gate refused the artifact. Readings fixed to force that growth:
+    the check stops at 800 KB and decides there."""
+    readings = {RB // 4: 0.004, RB: 0.016, RB * 4: 0.064}
+
+    def seconds_at(rb):
+        if rb in readings:
+            return readings[rb]
+        return family_review_seconds("high_nl", rb)
+
+    timing = assert_linear_time(seconds_at, RB, 0.5, "high_nl")
+    assert (timing.small_size, timing.size) == (RB, RB * 4)
+    with pytest.raises(InputTooLarge):
+        family_review_seconds("distinct_code_points", RB * 16)
 
 
 @timing_test

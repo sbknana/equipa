@@ -140,6 +140,14 @@ class HostFactorError(ValueError):
     at most ``MAX_HOST_FACTOR``."""
 
 
+class InputTooLarge(Exception):
+    """Raised by a ``seconds_at`` asked for a size its shape does not exist
+    at: the code under test refuses it (the merge gate reads no review
+    artifact over ``MAX_REVIEW_ARTIFACT_BYTES``) or it cannot be built. The
+    input then stops growing, and the growth is decided at the sizes
+    measured against ``DETECTION_FLOOR_SECONDS`` (task 3178)."""
+
+
 class TimingCheckFailed(AssertionError):
     """A timing check failed. Raised explicitly, never by ``assert``, so
     ``python -O`` cannot strip it."""
@@ -355,14 +363,25 @@ def budget(seconds: float) -> float:
     return seconds * host_factor()
 
 
-def growth_ratio(small_seconds: float, seconds: float) -> float:
+def growth_ratio(small_seconds: float, seconds: float,
+                 floor_seconds: float = GROWTH_FLOOR_SECONDS) -> float:
     """How much longer the larger size took than the smaller one, the
-    smaller time raised to ``GROWTH_FLOOR_SECONDS`` first. A scan over many
+    smaller time raised to ``floor_seconds`` first. A scan over many
     shapes compares this with ``GROWTH_LIMIT`` itself rather than asserting
     per shape through ``assert_linear_time``; it must grow its input until
     the smaller time reaches ``GROWTH_FLOOR_SECONDS`` (``grows_further``),
     or the raised floor hides quadratic work (IR75-01)."""
-    return seconds / max(small_seconds, GROWTH_FLOOR_SECONDS)
+    return seconds / max(small_seconds, floor_seconds)
+
+
+def _grown_further(grown: _GrownReadings, size: int) -> bool:
+    """Measure ``size``, the next larger size of a growth check; False
+    when the shape does not exist at it (``InputTooLarge``)."""
+    try:
+        grown.at(size)
+    except InputTooLarge:
+        return False
+    return True
 
 
 def grows_further(small_seconds: float, seconds: float,
@@ -424,18 +443,21 @@ class LinearTiming:
     budget_seconds: float
     factor: float = 1.0
     input_growth: int = 1
+    # ``DETECTION_FLOOR_SECONDS`` when the shape did not exist at the next
+    # larger size (``InputTooLarge``).
+    floor_seconds: float = GROWTH_FLOOR_SECONDS
 
     @property
     def ratio(self) -> float:
-        return growth_ratio(self.small_seconds, self.seconds)
+        return growth_ratio(self.small_seconds, self.seconds, self.floor_seconds)
 
     def describe(self) -> str:
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth}x the "
-                f"test's input, limit {GROWTH_LIMIT}x; budget "
-                f"{self.budget_seconds:.4f} s at host factor "
-                f"{self.factor:.2f})")
+                f"test's input, floor {self.floor_seconds:g} s, limit "
+                f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
+                f"factor {self.factor:.2f})")
 
 
 def _check_budget(label: str, seconds: float, size: int,
@@ -487,14 +509,22 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
         seconds, factor = measure_under_load(lambda: grown.at(large_size),
                                              base_budget_seconds)
         _check_budget(label, seconds, large_size, base_budget_seconds, factor)
-    input_growth = 1
+    input_growth, floor_seconds = 1, GROWTH_FLOOR_SECONDS
     while grows_further(grown.at(small_size), grown.at(large_size),
                         input_growth):
+        if not _grown_further(grown, large_size * GROWTH):
+            # The shape does not exist at the next size (a 200 KB review
+            # grown 16x passes the gate's 2 MB artifact cap): decided here
+            # with main's floor, under which a larger reading of 16 ms
+            # that grew 16x fails (IR75-01 without growing).
+            floor_seconds = DETECTION_FLOOR_SECONDS
+            break
         input_growth *= GROWTH
         small_size, large_size = large_size, large_size * GROWTH
     timing = LinearTiming(label, small_size, grown.at(small_size),
                           large_size, grown.at(large_size),
-                          base_budget_seconds * factor, factor, input_growth)
+                          base_budget_seconds * factor, factor, input_growth,
+                          floor_seconds)
     for _ in range(GROWTH_RETRIES):
         if timing.ratio < GROWTH_LIMIT:
             break
@@ -559,12 +589,17 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
         return any(grows_further(small_times[part], large_times[part],
                                  input_growth) for part in large)
 
+    floor_seconds = GROWTH_FLOOR_SECONDS
     while any_part_grows():
+        if not _grown_further(grown, large_size * GROWTH):
+            # As in assert_linear_time: no larger shape, main's floor.
+            floor_seconds = DETECTION_FLOOR_SECONDS
+            break
         input_growth *= GROWTH
         small_size, large_size = large_size, large_size * GROWTH
     small, large = dict(grown.at(small_size)), dict(grown.at(large_size))
     for _ in range(GROWTH_RETRIES):
-        if all(growth_ratio(small[part], large[part]) < GROWTH_LIMIT
+        if all(growth_ratio(small[part], large[part], floor_seconds) < GROWTH_LIMIT
                for part in large):
             break
         for part, seconds in seconds_at(small_size).items():
@@ -574,7 +609,7 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
     timings = {part: LinearTiming(f"{label}: {part}", small_size, small[part],
                                   large_size, large[part],
                                   base_budget_seconds * factor, factor,
-                                  input_growth)
+                                  input_growth, floor_seconds)
                for part in large}
     superlinear = [timing.describe() for timing in timings.values()
                    if not timing.ratio < GROWTH_LIMIT]
