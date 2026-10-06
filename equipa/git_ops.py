@@ -1354,6 +1354,14 @@ _GIT_PATH_ENV_KEYS: tuple[str, ...] = (
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_EXEC_PATH",
     "GIT_TEMPLATE_DIR",
 )
+# IR85-01 (task #3185): variables naming where git searches, whatever its
+# version: the ceiling of repository discovery, the HOME and
+# XDG_CONFIG_HOME its global config and attributes fall back to (which
+# variable wins, and when, has changed between git versions), and PATH,
+# where git and every program it starts are found. A list is split.
+_GIT_SEARCH_ENV_KEYS: tuple[str, ...] = (
+    "GIT_CEILING_DIRECTORIES", "HOME", "XDG_CONFIG_HOME", "PATH",
+)
 # Global options (``--name=value`` form) whose value is such a path.
 _GIT_PATH_OPTIONS: frozenset[str] = frozenset({"--git-dir", "--work-tree", "--exec-path"})
 # IR80-03 (task #3183): config keys and environment variables whose value is
@@ -1397,6 +1405,8 @@ class _GitCallReading:
 
     directories: tuple[str, ...]
     unreadable: str | None = None
+    # Where git resolves a relative location: ``cwd`` after every ``-C``.
+    working_directory: str = ""
 
 
 def _repository_locations(text: str) -> list[str]:
@@ -1451,6 +1461,30 @@ def _environment_config_pairs(
     return pairs, None
 
 
+def _config_locations(config: Sequence[tuple[str, str]]) -> list[str]:
+    """The local paths config pairs name: every value (``core.worktree``,
+    ``include.path``, ``remote.<name>.url``) and the base of
+    ``url.<base>.insteadOf``."""
+    locations: list[str] = []
+    for key, value in config:
+        locations.extend(_repository_locations(value))
+        lowered = key.lower()
+        if lowered.startswith("url.") and lowered.endswith((".insteadof", ".pushinsteadof")):
+            locations.extend(_repository_locations(key[len("url."):key.rfind(".")]))
+    return locations
+
+
+def _environment_variable_locations(env: Mapping[str, str]) -> list[str]:
+    """The paths ``env``'s location, path and search variables name, each
+    whole and split as a list (GIT_ALTERNATE_OBJECT_DIRECTORIES, PATH)."""
+    locations = [env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key)]
+    for key in (*_GIT_PATH_ENV_KEYS, *_GIT_SEARCH_ENV_KEYS):
+        if env.get(key):
+            locations.append(env[key])
+            locations.extend(path for path in env[key].split(os.pathsep) if path)
+    return locations
+
+
 def _is_command_config_key(lowered_key: str) -> bool:
     """True if the (lower-case) config key's value is a command line."""
     if lowered_key in _COMMAND_CONFIG_KEYS:
@@ -1497,11 +1531,21 @@ def _command_carried(
     return None
 
 
+def _environment_locations(
+    env: Mapping[str, str],
+) -> tuple[list[str], str | None]:
+    """The paths ``env`` names for git (its variables and every
+    ``GIT_CONFIG_*`` value), and why they cannot be read when they cannot."""
+    config, unreadable = _environment_config_pairs(env)
+    return [*_config_locations(config), *_environment_variable_locations(env)], unreadable
+
+
 def _read_git_call(
     argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
 ) -> _GitCallReading:
     """Every directory the process ``argv`` runs in or takes a repository,
-    config, index, object store or program from: ``cwd``; for git each
+    config, index, object store or program from: ``cwd``; the program
+    itself when ``argv`` names it by path; for git each
     ``-C`` applied in turn, every ``--git-dir`` / ``--work-tree`` /
     ``--exec-path`` option, every config value given by ``-c`` or
     ``--config-env`` (``core.worktree``, ``remote.<name>.url``,
@@ -1525,9 +1569,16 @@ def _read_git_call(
     unreadable (IR78-04, task #3180). So is a config pair or variable whose
     value is a command line (``core.sshCommand``, ``diff.external``,
     ``GIT_SSH_COMMAND`` ...), unless it runs nothing or is EQUIPA's own
-    hardening pin (IR80-03, task #3183)."""
+    hardening pin (IR80-03, task #3183).
+
+    The location and search variables include ``GIT_CEILING_DIRECTORIES``,
+    ``HOME``, ``XDG_CONFIG_HOME`` and ``PATH`` (IR85-01, task #3185)."""
     directory = os.path.abspath(os.fspath(cwd))
     directories = [directory]
+    program = os.fspath(argv[0]) if argv else ""
+    if os.sep in program or "/" in program:
+        # A program named by path is found from ``cwd``, before any ``-C``.
+        directories.append(os.path.join(directory, program))
     options = (
         [os.fspath(token) for token in argv[1:]] if _program_name(argv) == "git" else []
     )
@@ -1577,24 +1628,16 @@ def _read_git_call(
             locations.extend(_repository_locations(token))
     environment_config, unreadable_environment = _environment_config_pairs(env)
     unreadable = unreadable or unreadable_environment
-    for key, value in [*config, *environment_config]:
-        lowered = key.lower()
-        if lowered.startswith("alias."):
+    for key, _ in [*config, *environment_config]:
+        if key.lower().startswith("alias."):
             unreadable = unreadable or (
                 f"the config pair {key!r} defines a git alias, which can run a "
                 f"command line the guard cannot read")
-        locations.extend(_repository_locations(value))
-        if lowered.startswith("url.") and lowered.endswith((".insteadof", ".pushinsteadof")):
-            locations.extend(_repository_locations(key[len("url."):key.rfind(".")]))
+    locations.extend(_config_locations([*config, *environment_config]))
     unreadable = unreadable or _command_carried([*config, *environment_config], env)
-    locations.extend(env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key))
-    for key in _GIT_PATH_ENV_KEYS:
-        if env.get(key):
-            # Whole, and split as a list (GIT_ALTERNATE_OBJECT_DIRECTORIES).
-            locations.append(env[key])
-            locations.extend(path for path in env[key].split(os.pathsep) if path)
+    locations.extend(_environment_variable_locations(env))
     directories.extend(os.path.join(directory, location) for location in locations)
-    return _GitCallReading(tuple(directories), unreadable)
+    return _GitCallReading(tuple(directories), unreadable, directory)
 
 
 def _non_git_project_refusal(
@@ -1603,7 +1646,14 @@ def _non_git_project_refusal(
     """Why the process runners must not start ``argv``, None when they may:
     git or gh would run in a project :func:`dispatched_without_git`
     recorded (IR73-02), or, while any project is recorded, the program is
-    not git or gh, so its own arguments could carry git there (IR76-09)."""
+    not git or gh, so its own arguments could carry git there (IR76-09).
+
+    Decided before anything starts, from ``argv``, ``cwd``, the child's
+    ``env`` and the locations named by the orchestrator environment a git
+    child inherits (:func:`_get_repo_env`), even where ``env`` replaced a
+    variable of it (IR85-01, task #3185): never from which value a
+    particular git version lets win. Variables the allowlist drops never
+    reach git, whatever its version, and are not read (IR80-02)."""
     if not _NON_GIT_PROJECT_ROOTS.get():
         return None
     program = _program_name(argv)
@@ -1615,14 +1665,24 @@ def _non_git_project_refusal(
             f"or gh, whose options they can read"
         )
     # A child the runners start with no ``env`` gets _get_repo_env() (IR80-02).
-    reading = _read_git_call(argv, cwd, _get_repo_env() if env is None else env)
-    if reading.unreadable is not None:
+    inherited = _get_repo_env()
+    reading = _read_git_call(argv, cwd, inherited if env is None else env)
+    directories = list(reading.directories)
+    unreadable = reading.unreadable
+    if env is not None:
+        # IR85-01: what ``env`` replaced still names where git was meant to
+        # read (the global-config pin replaces GIT_CONFIG_GLOBAL).
+        locations, unreadable_inherited = _environment_locations(inherited)
+        unreadable = unreadable or unreadable_inherited
+        base = reading.working_directory or os.path.abspath(os.fspath(cwd))
+        directories.extend(os.path.join(base, location) for location in locations)
+    if unreadable is not None:
         return (
             f"equipa: refused to run {program} from "
-            f"{os.path.abspath(os.fspath(cwd))}: {reading.unreadable}, while a "
+            f"{os.path.abspath(os.fspath(cwd))}: {unreadable}, while a "
             f"project that was not a git repository at dispatch is recorded"
         )
-    directory = next((directory for directory in reading.directories
+    directory = next((directory for directory in directories
                       if not git_checks_allowed(directory)), None)
     if directory is None:
         return None
@@ -1631,6 +1691,23 @@ def _non_git_project_refusal(
         f"it is in a project that was not a git repository at dispatch, so a "
         f"repository there is an agent's"
     )
+
+
+def _requested_git_call_refusal(
+    args: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
+) -> str | None:
+    """:func:`_non_git_project_refusal` for ``git <args>`` as the caller of
+    :func:`git_run` / :func:`git_run_async` asked for it (IR85-01, task
+    #3185): with ``env`` over the allowlisted environment, before the
+    hardening runs. The hardening replaces some variables (the global-config
+    pin replaces ``GIT_CONFIG_GLOBAL``), so the runners' own check of the
+    child's environment never sees a caller's ``GIT_CONFIG_GLOBAL={P}/x``
+    while a pin is set; the call is refused whether or not one is."""
+    if not _NON_GIT_PROJECT_ROOTS.get():
+        return None
+    requested = _get_repo_env()
+    requested.update(env or {})
+    return _non_git_project_refusal(["git", *args], cwd, requested)
 
 
 def _non_git_refused_result(
@@ -1708,6 +1785,9 @@ def git_run(
     agent-planted driver is defined (FF-3155, task #3158; see
     :func:`_git_run_in_worktree_view`).
     """
+    refusal = _requested_git_call_refusal(args, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(["git", *args], refusal, text)
     pin = _pinned_repository_for(cwd)
     if pin is None and _reads_work_tree(args):
         location = _task_worktree_path(cwd)
@@ -1750,6 +1830,9 @@ async def git_run_async(
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
+    refusal = _requested_git_call_refusal(args, cwd, env)
+    if refusal is not None:
+        return _non_git_refused_result(["git", *args], refusal, text)
     pin = _pinned_repository_for(cwd)
     if pin is None and _reads_work_tree(args):
         location = _task_worktree_path(cwd)
