@@ -1537,7 +1537,8 @@ def _non_git_project_refusal(
             f"repository at dispatch is recorded, the git runners start only git "
             f"or gh, whose options they can read"
         )
-    reading = _read_git_call(argv, cwd, env or {})
+    # A child the runners start with no ``env`` gets _get_repo_env() (IR80-02).
+    reading = _read_git_call(argv, cwd, _get_repo_env() if env is None else env)
     if reading.unreadable is not None:
         return (
             f"equipa: refused to run {program} from "
@@ -1586,13 +1587,17 @@ def _run_with_env(
     Starts nothing, and returns a failed result, when the process would run
     in a project :func:`dispatched_without_git` recorded (IR73-02).
     """
-    refusal = _non_git_project_refusal(args_list, cwd, env)
+    # IR80-02 (task #3183): the guard reads the very environment the child
+    # gets. With ``env`` None that is _get_repo_env(), whose GIT_CONFIG_GLOBAL
+    # and GIT_SSH_COMMAND reach git, not the empty mapping it used to read.
+    child_env = dict(env) if env is not None else _get_repo_env()
+    refusal = _non_git_project_refusal(args_list, cwd, child_env)
     if refusal is not None:
         return _non_git_refused_result(args_list, refusal, text)
     return subprocess.run(
         args_list, capture_output=True, text=text,
         cwd=str(cwd), timeout=timeout,
-        env=dict(env) if env is not None else _get_repo_env(),
+        env=child_env,
         pass_fds=tuple(pass_fds),
     )
 
