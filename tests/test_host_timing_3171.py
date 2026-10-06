@@ -1172,8 +1172,17 @@ CLOCK_MODULES = {"time", "datetime", "os", "resource"}
 # a Timer's ``timeit``/``autorange``.
 TIMEIT_METHODS = {"timeit", "autorange"}
 # A test is calibrated when it reaches a growth check (IR71-02: only a
-# call counts, not a mention of a name such as GROWTH_LIMIT).
-GROWTH_CHECKS = {"assert_linear_time", "assert_linear_times", "growth_ratio"}
+# call counts, not a mention of a name such as GROWTH_LIMIT) that settles
+# its readings under contention (task 3185).
+GROWTH_CHECKS = {"assert_linear_time", "assert_linear_times",
+                 "assert_linear_per_unit", "settled_growth"}
+# Growth checks whose result the test compares itself: a discarded one
+# calibrates nothing (IR75-03).
+COMPARED_GROWTH_CHECKS = {"settled_growth"}
+# A ratio compared by hand on the test's own readings: one reading of each
+# size, decided by the load it ran under (task 3185: CI read a linear scan
+# at 0.067 s per MB at 50 KB and 0.137 s at 200 KB, and failed).
+HAND_GROWTH_CHECKS = {"growth_ratio"}
 BUDGETS = {"budget", "host_factor", "measure_under_load"}
 # Modules whose functions are followed when a test calls them.
 HELPER_MODULES = {"review_gate_timing", "review_gate_production"}
@@ -1519,6 +1528,7 @@ class _Reach:
     measures: bool
     growth_checked: bool
     budgeted: bool
+    hand_growth: bool = False
 
     @property
     def verdict(self) -> str:
@@ -1526,6 +1536,8 @@ class _Reach:
             return "not timing"
         if self.growth_checked:
             return "calibrated"
+        if self.hand_growth:
+            return "unsettled growth"
         return "budget only" if self.budgeted else "unscaled"
 
 
@@ -1537,7 +1549,7 @@ def _reach(modules: dict[str, _Module], module: _Module,
     Also followed (IR75-03, task 3178): the fixtures a function requests
     (from its module, its class or conftest.py) and, in a method of
     ``class_name``, the ``self.<method>`` it calls or passes on."""
-    measures = growth_checked = budgeted = False
+    measures = growth_checked = budgeted = hand_growth = False
     seen: set[int] = {id(node)}
     pending = [(module, node, class_name)]
     conftest = modules.get("conftest")
@@ -1578,8 +1590,11 @@ def _reach(modules: dict[str, _Module], module: _Module,
                 name = _called_name(child)
                 growth_checked = growth_checked or (
                     name in GROWTH_CHECKS and (
-                        name != "growth_ratio"
+                        name not in COMPARED_GROWTH_CHECKS
                         or _result_is_compared(child, parents, function)))
+                hand_growth = hand_growth or (
+                    name in HAND_GROWTH_CHECKS
+                    and _result_is_compared(child, parents, function))
                 budgeted = budgeted or name in BUDGETS
                 if name in current.imports:
                     referenced = name
@@ -1599,7 +1614,7 @@ def _reach(modules: dict[str, _Module], module: _Module,
             if target:
                 callee = modules[target[0]]
                 follow(callee, callee.functions.get(target[1]), None)
-    return _Reach(measures, growth_checked, budgeted)
+    return _Reach(measures, growth_checked, budgeted, hand_growth)
 
 
 def _reach_test(modules: dict[str, _Module], module: _Module, test: str) -> _Reach:
@@ -1627,6 +1642,18 @@ def test_every_timing_test_is_calibrated_or_a_listed_deadline(timing_reach):
         "these tests time work without tests/host_timing.py (use "
         "assert_linear_time, or list a deadline in DEADLINE_TESTS): "
         f"{uncalibrated}")
+
+
+def test_every_growth_check_is_settled_under_contention(timing_reach):
+    """Task 3185: a test comparing ``growth_ratio`` by hand decides on one
+    reading of each size, at the mercy of the load it ran under."""
+    unsettled = sorted(key for key, reach in timing_reach.items()
+                       if reach.verdict == "unsettled growth")
+    assert not unsettled, (
+        "these tests compare growth_ratio by hand on readings "
+        "tests/host_timing.py does not settle under contention (use "
+        "assert_linear_time, assert_linear_per_unit or settled_growth): "
+        f"{unsettled}")
 
 
 def test_a_budget_without_a_growth_check_is_a_listed_corpus_cap(timing_reach):
@@ -1660,7 +1687,14 @@ def test_the_fence_sees_the_shapes_it_must(timing_reach):
             "test_a_200kb_heading_status_is_read_in_one_pass",
             "test_redaction_linear_3138.py::"
             "test_redact_secrets_on_64kb_adversarial_input_is_fast",
-            "test_sanitizer_3163.py::test_the_tail_judge_stays_linear"]:
+            "test_sanitizer_3163.py::test_the_tail_judge_stays_linear",
+            # Task 3185: the per-unit check and the settled scan pairs.
+            "test_review_gate_polish_3170.py::"
+            "test_the_ci_shape_is_linear_from_50kb_to_2mb",
+            "test_review_gate_polish_3170.py::"
+            "test_no_loops_regex_grows_faster_than_linear",
+            "test_review_gate_linear_3167.py::"
+            "test_no_loops_regex_is_slow_on_a_bracket_run"]:
         assert timing_reach[key].verdict == "calibrated", key
     # The event-loop heartbeats (``now - last``) are seen, and listed.
     for key in [
@@ -2027,7 +2061,8 @@ def test_shape():
     work()
     assert time.process_time() - start < 0.5
 """),
-    "compared-growth-ratio": ("calibrated", """
+    # Task 3185: a ratio compared by hand is not settled under contention.
+    "compared-growth-ratio": ("unsettled growth", """
 import time
 from tests.host_timing import GROWTH_LIMIT, growth_ratio
 def seconds_at(size):
@@ -2037,6 +2072,67 @@ def seconds_at(size):
 def test_shape():
     ratio = growth_ratio(seconds_at(1024), seconds_at(4096))
     assert ratio < GROWTH_LIMIT
+"""),
+    # The CI-shape test as it was before task 3185 (CI run 37447348074
+    # failed it at {50: 0.067, 200: 0.137}): a budget and retries of the
+    # larger size only, then growth_ratio by hand.
+    "pre-3185-ci-shape": ("unsettled growth", """
+import statistics
+import time
+from tests.host_timing import GROWTH_RETRIES, budget, growth_ratio
+LIMIT = 2.0
+def per_megabyte(kilobytes):
+    runs = []
+    for _ in range(3):
+        started = time.process_time()
+        scan(kilobytes)
+        runs.append(time.process_time() - started)
+    return statistics.median(runs) / (kilobytes / 1024)
+def test_shape():
+    per = {}
+    for kilobytes in (50, 200, 2048):
+        seconds = per_megabyte(kilobytes)
+        assert seconds < budget(0.5), (kilobytes, seconds)
+        smallest = per.setdefault(50, seconds)
+        for _ in range(GROWTH_RETRIES):
+            if growth_ratio(smallest, seconds) < LIMIT:
+                break
+            seconds = min(seconds, per_megabyte(kilobytes))
+        per[kilobytes] = seconds
+        assert growth_ratio(smallest, seconds) < LIMIT, per
+"""),
+    "per-unit-check": ("calibrated", """
+import time
+from tests.host_timing import assert_linear_per_unit
+def per_megabyte(kilobytes):
+    started = time.process_time()
+    scan(kilobytes)
+    return (time.process_time() - started) / (kilobytes / 1024)
+def test_shape():
+    assert_linear_per_unit(per_megabyte, (50, 200, 2048), 0.5)
+"""),
+    "compared-settled-growth": ("calibrated", """
+import time
+from tests.host_timing import GROWTH_LIMIT, settled_growth
+def seconds_at(size):
+    start = time.process_time()
+    work(size)
+    return time.process_time() - start
+def test_shape():
+    growth = settled_growth(seconds_at, 1024, 4096, seconds_at(1024),
+                            seconds_at(4096))
+    assert growth.ratio < GROWTH_LIMIT
+"""),
+    "discarded-settled-growth": ("unscaled", """
+import time
+from tests.host_timing import settled_growth
+def seconds_at(size):
+    start = time.process_time()
+    work(size)
+    return time.process_time() - start
+def test_shape():
+    settled_growth(seconds_at, 1024, 4096, 0.1, 0.4)
+    assert seconds_at(4096) < 0.5
 """),
     "a-datetime-cutoff-is-not-timing": ("not timing", """
 from datetime import datetime, timedelta
