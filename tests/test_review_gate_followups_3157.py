@@ -47,7 +47,7 @@ from equipa.severity_confusables import (
     CONFUSABLES_LETTER_MAPPINGS,
     SEVERITY_LETTER_CONFUSABLES,
 )
-from tests.host_timing import assert_linear_time
+from tests.host_timing import InputTooLarge, assert_linear_time
 from tests.review_gate_production import production_seconds
 from tests.review_gate_timing import timing_test
 from tests.test_review_gate_no_exemptions_3152 import (
@@ -462,6 +462,31 @@ def _distinct_review(first: int, count: int) -> str:
     return build_review(lines, "zero")
 
 
+# The last code point of the tertiary ideographic plane. The distinct review
+# of CJK Extension B onwards exists up to it; grown past it (244,000 code
+# points from U+20000 end at U+5B91F) three quarters of the review are code
+# points of planes Unicode never assigned, which the gate refuses as
+# characters outside its Unicode data: another shape, 8.4x slower for 4x the
+# input where the test's own sizes grow 4.1x (task 3178).
+DISTINCT_REVIEW_LAST_CODE_POINT = 0x3FFFF
+
+
+def _check_distinct_review_count(count: int) -> None:
+    """``InputTooLarge`` for a count past the tertiary ideographic plane."""
+    last = 0x20000 + count - 1
+    if last > DISTINCT_REVIEW_LAST_CODE_POINT:
+        raise InputTooLarge(
+            f"{count} distinct code points from U+20000 end at U+{last:X}, "
+            f"past U+{DISTINCT_REVIEW_LAST_CODE_POINT:X}")
+
+
+def _distinct_review_seconds(count: int) -> float:
+    """The gate's time on ``_distinct_review(0x20000, count)``; a count
+    past the tertiary ideographic plane is not that shape."""
+    _check_distinct_review_count(count)
+    return production_seconds(_distinct_review(0x20000, count))
+
+
 # Task 3161: a review of more than 4,096 distinct characters is not parsed,
 # so the shared tables are filled by fifteen reviews just under that cap
 # (60,000 distinct code points of CJK Extension B onwards, as one review of
@@ -547,9 +572,20 @@ def test_a_review_of_too_many_distinct_characters_fails_closed_fast():
     assert analysis.verdict == loops.REVIEW_VERDICT_INCOMPLETE, analysis
     assert not analysis.trusted
     assert 61_000 // 4 > loops._REVIEW_MAX_DISTINCT_CHARACTERS
-    assert_linear_time(
-        lambda count: production_seconds(_distinct_review(0x20000, count)),
-        61_000, 0.25, "distinct code points")
+    timing = assert_linear_time(_distinct_review_seconds, 61_000, 0.25,
+                                "distinct code points")
+    # 4 x 61,000 passes the tertiary ideographic plane: the growth is decided
+    # at the test's own sizes, against main's 2 ms floor.
+    assert (timing.small_size, timing.size) == (61_000 // 4, 61_000)
+
+
+def test_the_distinct_review_shape_ends_at_the_tertiary_ideographic_plane():
+    plane_count = DISTINCT_REVIEW_LAST_CODE_POINT - 0x20000 + 1
+    _check_distinct_review_count(plane_count)
+    with pytest.raises(InputTooLarge, match=r"U\+40000"):
+        _check_distinct_review_count(plane_count + 1)
+    with pytest.raises(InputTooLarge, match=r"U\+5B91F"):
+        _check_distinct_review_count(4 * 61_000)
 
 
 # --- R3154-06: the confusables table against independent properties --------------
