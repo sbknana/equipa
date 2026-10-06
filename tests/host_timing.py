@@ -78,7 +78,12 @@ timing test checks two things through this module:
    during a full parallel suite at host load 20, and passed). So a pair
    reading from ``BORDERLINE_GROWTH`` up to the limit, on a quarter reading
    over its floor, is measured again ``BORDERLINE_RETRIES`` times before it
-   is decided. Every reading taken again alternates between the two sizes
+   is decided, and any other pair whose quarter reading is over its floor
+   (and whose larger reading is at least ``GROWTH_LIMIT`` floors, so a
+   quieter quarter could fail it) ``SETTLE_RETRIES`` time before it
+   passes: a burst on that one reading
+   could push a 9.3x regression to 4.9x, under the band (task 3187,
+   R3184-01). Every reading taken again alternates between the two sizes
    (quarter, larger, quarter, larger, ...; the own pair's repetitions too),
    so a burst falls on both sizes rather than on one size's whole run, and
    each size keeps its fastest reading: the minimum is the estimate of the
@@ -181,6 +186,15 @@ GROWTH_RETRIES = 2
 # reading (``_settled_readings``).
 BORDERLINE_GROWTH = 5.0
 BORDERLINE_RETRIES = 4
+# A quarter reading over its pair's floor may itself be inflated, and a
+# burst on it alone can push a regression under the band: a true 9.3x pair
+# whose quarter read 1.9x its cost read 4.9x and passed on one reading of
+# each size (task 3187, R3184-01). So such a pair is measured again at least
+# this many times, both sizes interleaved, before it passes: each size's
+# reading is then the fastest of two or more, whatever the first ratio.
+# (A quarter reading under the floor is raised to it, so a burst there
+# cannot lower the ratio.)
+SETTLE_RETRIES = 1
 # Work timed per unit of input reads the same at every size when linear.
 # ``assert_linear_per_unit`` holds it to the limit of one GROWTH step, per
 # unit: GROWTH_LIMIT for GROWTH times the input is this much per unit.
@@ -645,11 +659,16 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     both sizes are measured again (all parts, ``pair.repetitions`` runs
     each, the quarter size and the larger one interleaved) while a part is
     over the limit, up to ``pair.over_retries`` times (``GROWTH_RETRIES``
-    as main did, unless the check settles more), and, once
+    as main did, unless the check settles more); once
     any part has read a borderline ratio (``BORDERLINE_GROWTH`` up to the
     limit) on a quarter reading over the pair's floor,
-    ``BORDERLINE_RETRIES`` times in all, however it reads after. (A ratio
-    taken against the floor cannot rise when measured again: only a
+    ``BORDERLINE_RETRIES`` times in all, however it reads after; and
+    otherwise, when any part's quarter reading is over the pair's floor
+    and its larger reading could reach the limit against a quieter one
+    (at least ``GROWTH_LIMIT`` floors), ``SETTLE_RETRIES`` times before it
+    passes (a burst on that one quarter reading can push a regression's
+    ratio under the band, R3184-01). (A
+    ratio taken against the floor cannot rise when measured again: only a
     quarter reading over the floor can hide growth.) Each part keeps its
     fastest reading of each size: the minimum is the
     estimate of the work's cost the load inflated least, so a burst that
@@ -659,6 +678,7 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     of each size the minimum was taken over."""
     small, large = dict(small), dict(large)
     borderline_seen = False
+    over_floor_seen = False
     retries_done = samples - 1
     while True:
         ratios = {part: growth_ratio(small[part], large[part],
@@ -667,7 +687,19 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
         borderline_seen = borderline_seen or any(
             BORDERLINE_GROWTH <= ratios[part] < GROWTH_LIMIT
             and small[part] > pair.floor_seconds for part in parts)
-        retries = BORDERLINE_RETRIES if borderline_seen else 0
+        # A quarter reading over the floor may be inflated; it matters only
+        # when a quieter one could carry the ratio to the limit, which a
+        # larger reading under GROWTH_LIMIT floors never reaches.
+        over_floor_seen = over_floor_seen or any(
+            small[part] > pair.floor_seconds
+            and large[part] >= GROWTH_LIMIT * pair.floor_seconds
+            for part in parts)
+        if borderline_seen:
+            retries = BORDERLINE_RETRIES
+        elif over_floor_seen:
+            retries = SETTLE_RETRIES
+        else:
+            retries = 0
         if over:
             retries = max(retries, pair.over_retries)
         if retries_done >= retries:

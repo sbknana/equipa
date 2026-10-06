@@ -426,11 +426,19 @@ def _model(per_unit: float, power: int, calls: list[int] | None = None):
     return seconds_at
 
 
+# Readings of each size a pair whose quarter reading is over its floor (and
+# whose larger reading could reach the limit against a quieter quarter) is
+# decided on: task 3187 (R3184-01) measures it again before it passes.
+SETTLED_READINGS = 1 + host_timing.SETTLE_RETRIES
+
+
 def test_linear_work_passes_and_reports_both_sizes():
-    # 0.04 s at the quarter size: over the floor, so each size runs once.
+    # 0.04 s at the quarter size: over the floor, so each size runs once,
+    # then once more, interleaved, before the pair passes (R3184-01).
     calls: list[int] = []
     timing = assert_linear_time(_model(4e-6, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS
+    assert timing.samples == SETTLED_READINGS
     assert (timing.small_size, timing.size) == (10_000, 40_000)
     assert timing.ratio == pytest.approx(4.0)
     assert "growth 4.0x" in timing.describe()
@@ -494,10 +502,12 @@ def test_linear_work_under_the_floor_is_not_repeated():
     """Linear work whose quarter size takes under the floor is not measured
     again at the same sizes: its input grows until the quarter size takes
     the floor (the 20 ms reading of 40,000 becomes the quarter of 160,000),
-    and 20 ms against 80 ms is decided as read."""
+    and 20 ms against 80 ms is decided as read. (The test's own pair, a
+    5 ms quarter over main's 2 ms floor, is settled first: R3184-01.)"""
     calls: list[int] = []
     timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000, 160_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS + [160_000]
+    assert timing.repetitions == 1
     assert (timing.small_size, timing.size) == (40_000, 160_000)
     assert timing.input_growth == 4
     assert timing.ratio == pytest.approx(4.0)
@@ -515,11 +525,12 @@ def test_a_larger_reading_under_the_floor_grows_the_input_in_one_step():
     timing = assert_linear_time(_model(per_byte, 1, calls), size, 0.5, "pat")
     quarter = math.ceil(size * host_timing.GROWTH_STEP_MARGIN
                         * GROWTH_FLOOR_SECONDS / 0.0165)
-    assert calls == [size // GROWTH, size, quarter, quarter * GROWTH]
+    own_pair_calls = [size // GROWTH, size] * SETTLED_READINGS
+    assert calls == own_pair_calls + [quarter, quarter * GROWTH]
     assert timing.small_seconds >= GROWTH_FLOOR_SECONDS
     assert timing.input_growth == pytest.approx(quarter / (size // GROWTH))
     assert timing.ratio == pytest.approx(4.0)
-    assert sum(calls[2:]) < 0.4 * (4 + 16) * size
+    assert sum(calls[len(own_pair_calls):]) < 0.4 * (4 + 16) * size
 
 
 @pytest.mark.parametrize("larger_reading", (0.0161, 0.017, 0.0199, 0.04))
@@ -556,7 +567,8 @@ def test_the_growing_part_with_the_smallest_reading_sets_the_step():
                 "fast": 0.001 * at_size / size}
 
     timings = assert_linear_times(seconds_at, size, 0.5, "parts")
-    assert len(calls) == 4
+    # The own pair (settled, R3184-01), then one scaled growth step.
+    assert len(calls) == 2 * SETTLED_READINGS + 2
     assert timings["a"].small_seconds >= GROWTH_FLOOR_SECONDS
     assert all(timing.ratio == pytest.approx(4.0)
                for name, timing in timings.items() if name != "fast")
@@ -578,12 +590,13 @@ def test_the_ci_reading_is_measured_again_and_passes():
     sizes run 32 times and their means (0.6 ms against 2.5 ms) are linear;
     5.2 ms is under the 16 ms that quadratic work main caught reads at, so
     the input does not grow. The same spike over a 5 ms quarter reading
-    (24 ms) cannot reach the limit when repeated, so it runs once, and it
-    grows the input: at 4 times it the spike (now the quarter) against 80
-    ms is linear."""
+    (24 ms) cannot reach the limit when repeated, so it is not repeated;
+    its quarter reading is over main's 2 ms floor, so the pair is read once
+    more before it passes (R3184-01), and it grows the input: at 4 times it
+    the fastest reading (20 ms, now the quarter) against 80 ms is linear."""
     for quarter, spike, runs, grown in (
             (0.0006, 0.0052, MAX_GROWTH_REPETITIONS, 1),
-            (0.005, 0.024, 1, 4)):
+            (0.005, 0.024, SETTLED_READINGS, 4)):
         calls: list[int] = []
         spikes = iter([spike])
 
@@ -951,7 +964,7 @@ def test_the_gate_helper_refuses_a_review_over_the_artifact_cap():
 def test_a_quarter_reading_at_the_floor_is_decided_without_growing():
     calls: list[int] = []
     timing = assert_linear_time(_model(2e-6, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS
     assert timing.input_growth == 1
 
 
@@ -959,7 +972,7 @@ def test_compare_with_larger_times_the_size_and_four_times_it():
     calls: list[int] = []
     assert_linear_time(_model(1e-6, 1, calls), 40_000, 0.5, "cap",
                        compare_with_larger=True)
-    assert calls == [40_000, 160_000]
+    assert calls == [40_000, 160_000] * SETTLED_READINGS
 
 
 def test_a_size_without_a_quarter_is_refused():

@@ -127,13 +127,17 @@ def test_linear_work_read_borderline_passes_on_its_fastest_readings(
 
 
 def test_linear_work_out_of_the_band_is_measured_once():
+    """Under the band, a quarter reading over the floor is measured again
+    once (``SETTLE_RETRIES``, task 3187), not ``BORDERLINE_RETRIES``
+    times: 4.97x on one reading of each size is what a 9.3x regression
+    whose quarter reading a burst inflated 1.9x reads too (R3184-01)."""
     calls: list[int] = []
     timing = assert_linear_time(
         _scripted({QUARTER: (0.03,), SIZE: (0.149,)}, calls), SIZE, 10.0,
         "linear")
     assert timing.ratio < BORDERLINE_GROWTH
-    assert timing.samples == 1
-    assert calls == [QUARTER, SIZE]
+    assert timing.samples == 1 + host_timing.SETTLE_RETRIES
+    assert calls == [QUARTER, SIZE] * (1 + host_timing.SETTLE_RETRIES)
 
 
 def test_quadratic_work_over_the_limit_is_measured_again_as_often_as_before():
@@ -181,18 +185,20 @@ def test_the_own_pairs_repetitions_alternate_between_the_sizes():
 
 # A quarter reading under the 20 ms floor and a larger one over it grow the
 # input 4x (task 3178): the grown pair is (SIZE, GROWN), its quarter reading
-# the one the test's own pair took at SIZE.
+# the one the test's own pair took at SIZE. The own pair's 10 ms quarter
+# reading is over main's 2 ms floor, so it is read twice first (task 3187).
 GROWN = SIZE * GROWTH
-GROWN_PAIR_CALLS = [QUARTER, SIZE, GROWN] + [SIZE, GROWN] * BORDERLINE_RETRIES
+GROWN_PAIR_CALLS = ([QUARTER, SIZE] * (1 + host_timing.SETTLE_RETRIES)
+                    + [GROWN] + [SIZE, GROWN] * BORDERLINE_RETRIES)
 
 
 def test_a_grown_pair_hidden_by_a_loaded_quarter_fails():
     """Linear at the test's sizes, superlinear past them: the reading at
-    SIZE that the grown pair reuses was taken under load (0.04 s, quietly
-    0.025 s), so the grown pair reads 6.5x once (main passed it) and
-    10.4x on each size's fastest reading."""
+    SIZE that the grown pair reuses was taken under load (0.04 s on both
+    of the own pair's readings, quietly 0.025 s), so the grown pair reads
+    6.5x once (main passed it) and 10.4x on each size's fastest reading."""
     calls: list[int] = []
-    seconds_at = _scripted({QUARTER: (0.010,), SIZE: (0.040, 0.025),
+    seconds_at = _scripted({QUARTER: (0.010,), SIZE: (0.040, 0.040, 0.025),
                             GROWN: (0.260,)}, calls)
     with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
         assert_linear_time(seconds_at, SIZE, 10.0, "grown")
