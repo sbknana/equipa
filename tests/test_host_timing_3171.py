@@ -20,6 +20,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,9 +29,10 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
+    GROWTH_INPUT_SECONDS,
     HOST_FACTOR_ENVIRONMENT_VARIABLE,
-    MAX_GROWTH_REPETITIONS,
     MAX_HOST_FACTOR,
+    MAX_INPUT_GROWTH,
     REFERENCE_SECONDS,
     HostCalibration,
     HostFactorError,
@@ -414,9 +416,9 @@ def test_one_descheduled_run_is_measured_again():
 
 
 def test_work_below_the_floor_passes_the_growth_check():
-    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. Even
-    # MAX_GROWTH_REPETITIONS runs of the larger size (19.2 ms) could not
-    # reach the limit against the floor, so neither size is repeated.
+    # 0.0001 s and 0.0006 s: 6x, but both are mostly clock noise. The calls
+    # cost nothing, so the input grows as far as it may; the quarter
+    # reading never reaches the floor and is raised to it there.
     calls: list[int] = []
 
     def seconds_at(size: int) -> float:
@@ -424,60 +426,179 @@ def test_work_below_the_floor_passes_the_growth_check():
         return 0.0001 if size < 40_000 else 0.0006
 
     timing = assert_linear_time(seconds_at, 40_000, 0.5, "tiny")
-    assert calls == [10_000, 40_000]
-    assert timing.repetitions == 1
+    assert calls == [10_000, 40_000, 20_000, 80_000, 160_000, 320_000,
+                     640_000]
+    assert timing.input_growth == MAX_INPUT_GROWTH
     assert timing.ratio == pytest.approx(0.0006 / GROWTH_FLOOR_SECONDS)
 
 
 def test_linear_work_under_the_floor_is_not_repeated():
-    """Repeated until the quarter size took the floor, linear work totals
-    about 4 floors at the larger size: it cannot reach the limit, so 5 ms
-    against 20 ms is decided as read (20 ms against the 20 ms floor)."""
+    """Linear work whose quarter size takes under the floor is not measured
+    again at the same sizes: its input grows until the quarter size takes
+    the floor (5 ms, 10 ms, then 20 ms; the 40,000 reading is reused as the
+    quarter of 160,000), and 20 ms against 80 ms is decided as read."""
     calls: list[int] = []
     timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000]
-    assert timing.repetitions == 1
-    assert timing.ratio == pytest.approx(1.0)
+    assert calls == [10_000, 40_000, 20_000, 80_000, 160_000]
+    assert sorted(calls) == sorted(set(calls))
+    assert (timing.small_size, timing.size) == (40_000, 160_000)
+    assert timing.input_growth == 4
+    assert timing.ratio == pytest.approx(4.0)
 
 
 def test_the_ci_reading_is_measured_again_and_passes():
     """Task 3175: CI read a linear regex at 0.0006 s against 0.0052 s, a
-    sub-millisecond ratio of 8.7x. That larger reading could reach the
-    limit once repeated, so both sizes run 32 times and the totals (19.2 ms
-    raised to 20 ms, against 80 ms of linear work) are compared."""
+    sub-millisecond ratio of 8.7x. The input grows instead (the spike stays
+    the reading of 40,000, reused as a quarter size on the way), and at 16
+    times the input 9.6 ms (raised to the floor) against 38.4 ms passes."""
     calls: list[int] = []
-    readings = iter([0.0052])
+    spikes = iter([0.0052])
 
     def seconds_at(size: int) -> float:
         calls.append(size)
-        if size < 40_000:
-            return 0.0006
-        return next(readings, 0.0024)
+        linear = 0.0006 * size / 10_000
+        if size == 40_000:
+            return next(spikes, linear)
+        return linear
 
     timing = assert_linear_time(seconds_at, 40_000, 0.5, "ci")
-    assert timing.repetitions == MAX_GROWTH_REPETITIONS
-    assert calls.count(10_000) == calls.count(40_000) == MAX_GROWTH_REPETITIONS
-    assert timing.ratio == pytest.approx(
-        (0.0052 + 0.0024 * 31) / GROWTH_FLOOR_SECONDS)
+    assert calls.count(40_000) == 1
+    assert timing.input_growth == MAX_INPUT_GROWTH
+    assert timing.seconds == pytest.approx(0.0006 * 64)
     assert timing.ratio < 4.1
 
 
 def test_repetitions_are_bounded_by_what_a_call_costs():
-    """A call that builds an expensive shape around a 5 ms measurement is
-    repeated only as far as GROWTH_REPETITION_SECONDS pays for."""
-    budget_seconds = host_timing.GROWTH_REPETITION_SECONDS
-    assert host_timing.growth_repetitions(0.005) == 4
-    assert host_timing.growth_repetitions(0.005, budget_seconds / 2) == 3
-    assert host_timing.growth_repetitions(0.005, budget_seconds * 4) == 1
-    assert host_timing.growth_repetitions(0.0001) == MAX_GROWTH_REPETITIONS
-    assert host_timing.growth_repetitions(0.05, budget_seconds * 4) == 1
+    """Growing the input is bounded by what the calls cost, except while
+    the larger reading could be quadratic work main's 2 ms floor caught:
+    GROWTH_DETECTION_SECONDS (16 ms) grows the input whatever it costs."""
+    grows = host_timing.grows_further
+    assert host_timing.GROWTH_DETECTION_SECONDS == pytest.approx(0.016)
+    # Under the detection reading: only within GROWTH_INPUT_SECONDS.
+    assert grows(0.001, 0.004, 1)
+    assert grows(0.001, 0.004, 1, 0.0, GROWTH_INPUT_SECONDS / 2)
+    assert not grows(0.001, 0.004, 1, 0.0, GROWTH_INPUT_SECONDS * 2)
+    assert not grows(0.001, 0.004, 1, GROWTH_INPUT_SECONDS / 2,
+                     GROWTH_INPUT_SECONDS)
+    # At or over it: whatever the calls cost, up to MAX_INPUT_GROWTH.
+    assert grows(0.001, 0.016, 1, 100.0, 100.0)
+    assert grows(0.005, 0.08, MAX_INPUT_GROWTH // 2, 100.0, 100.0)
+    assert not grows(0.005, 0.08, MAX_INPUT_GROWTH)
+    # Decided as read: the quarter at the floor, or over the limit already.
+    assert not grows(GROWTH_FLOOR_SECONDS, 0.5, 1)
+    assert not grows(0.001, GROWTH_LIMIT * GROWTH_FLOOR_SECONDS, 1)
 
 
 def test_quadratic_work_under_the_floor_fails_once_repeated():
-    """5 ms then 80 ms: one 5 ms reading raised to the 20 ms floor would
-    read 4x; four of each (20 ms against 320 ms) read 16x."""
-    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+    """5 ms then 80 ms: the 5 ms reading raised to the 20 ms floor would
+    read 4x. The input grows instead: 20 ms against 320 ms reads 16x."""
+    with pytest.raises(TimingCheckFailed,
+                       match=r"superlinear growth.*at 2x the test's input"):
         assert_linear_time(_model(5e-11, 2), 40_000, 0.5, "quad")
+
+
+class _BuildClock:
+    """The wall clock ``tests/host_timing.py`` reads, advanced only by the
+    shape building a fake ``seconds_at`` declares, so a model of an
+    expensive build costs no real time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _build_clock(monkeypatch) -> _BuildClock:
+    clock = _BuildClock()
+    monkeypatch.setattr(host_timing, "time", SimpleNamespace(
+        monotonic=clock.monotonic, process_time=time.process_time))
+    return clock
+
+
+# IR75-01: readings at the test's larger size, and the wall time building
+# the shape takes per call at that size (the 200 KB review-gate tests build
+# for 0.1-0.3 s around a 10 ms measurement).
+IR75_01_LARGE_READINGS = (0.016, 0.02, 0.04, 0.08, 0.12, 0.159)
+IR75_01_BUILD_SECONDS = (0.0, 0.1, 0.3, 2.0)
+IR75_01_SIZE = 200_000
+
+
+def _planted(clock: _BuildClock, reading: float, build_seconds: float,
+             power: int, calls: list[int] | None = None):
+    """``reading`` seconds at IR75_01_SIZE growing as size ** power, after
+    a build of ``build_seconds`` (linear in the size) on the wall clock."""
+    def seconds_at(size: int) -> float:
+        if calls is not None:
+            calls.append(size)
+        clock.now += build_seconds * size / IR75_01_SIZE
+        return reading * (size / IR75_01_SIZE) ** power
+
+    return seconds_at
+
+
+@pytest.mark.parametrize("build_seconds", IR75_01_BUILD_SECONDS)
+@pytest.mark.parametrize("reading", IR75_01_LARGE_READINGS)
+def test_quadratic_work_of_16_to_159_ms_fails_whatever_a_call_costs(
+        monkeypatch, reading, build_seconds):
+    """IR75-01: a 20 ms floor at unchanged sizes passed quadratic work
+    reading 16-159 ms at the larger size (main failed it from 16 ms on).
+    The budget (10 s) cannot decide: only the growth does."""
+    clock = _build_clock(monkeypatch)
+    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+        assert_linear_time(_planted(clock, reading, build_seconds, 2),
+                           IR75_01_SIZE, 10.0, "quadratic")
+
+
+@pytest.mark.parametrize("build_seconds", IR75_01_BUILD_SECONDS)
+@pytest.mark.parametrize("reading", IR75_01_LARGE_READINGS)
+def test_a_quadratic_part_of_16_to_159_ms_fails_whatever_a_run_costs(
+        monkeypatch, reading, build_seconds):
+    """IR75-01 for ``assert_linear_times`` (the 22 tests of 3139's 1 MB
+    whitespace families): the quadratic part fails, the linear one is
+    named nowhere in the failure."""
+    clock = _build_clock(monkeypatch)
+    quadratic = _planted(clock, reading, build_seconds, 2)
+
+    def seconds_at(size: int) -> dict[str, float]:
+        return {"linear": 0.001 * size / IR75_01_SIZE,
+                "quadratic": quadratic(size)}
+
+    with pytest.raises(TimingCheckFailed, match="superlinear") as failure:
+        assert_linear_times(seconds_at, IR75_01_SIZE, 10.0, "parts")
+    assert "parts: quadratic" in str(failure.value)
+    assert "parts: linear" not in str(failure.value)
+
+
+@pytest.mark.parametrize("build_seconds", IR75_01_BUILD_SECONDS)
+@pytest.mark.parametrize("reading",
+                         (0.00005, 0.001, 0.005) + IR75_01_LARGE_READINGS)
+def test_linear_work_passes_whatever_a_call_costs(monkeypatch, reading,
+                                                  build_seconds):
+    """The other side of IR75-01: linear work of any reading passes both
+    helpers, and an expensive build only grows the input while the reading
+    requires it (a sub-detection reading stays at the test's sizes)."""
+    clock = _build_clock(monkeypatch)
+    calls: list[int] = []
+    timing = assert_linear_time(
+        _planted(clock, reading, build_seconds, 1, calls), IR75_01_SIZE,
+        10.0, "linear")
+    assert timing.ratio < GROWTH_LIMIT
+    assert timing.size <= IR75_01_SIZE * MAX_INPUT_GROWTH
+    if reading < host_timing.GROWTH_DETECTION_SECONDS and build_seconds >= 0.3:
+        assert calls == [IR75_01_SIZE // GROWTH, IR75_01_SIZE]
+    linear = _planted(clock, reading, build_seconds, 1)
+    timings = assert_linear_times(
+        lambda size: {"a": linear(size), "b": reading * size / IR75_01_SIZE},
+        IR75_01_SIZE, 10.0, "linear parts")
+    assert all(part.ratio < GROWTH_LIMIT for part in timings.values())
+
+
+def test_a_quarter_reading_at_the_floor_is_decided_without_growing():
+    calls: list[int] = []
+    timing = assert_linear_time(_model(2e-6, 1, calls), 40_000, 0.5, "lin")
+    assert calls == [10_000, 40_000]
+    assert timing.input_growth == 1
 
 
 def test_compare_with_larger_times_the_size_and_four_times_it():
@@ -526,9 +647,9 @@ def test_a_heap_sized_collection_pause_does_not_fail_linear_work():
 
     timing = assert_linear_time(seconds_at, 16_384, 1.0, "scan")
     assert calls_with_the_collector_enabled == []
-    # Linear readings under the floor are taken once (0.0129 s raised to it).
-    assert timing.repetitions == 1
-    assert timing.ratio == pytest.approx(0.0516 / GROWTH_FLOOR_SECONDS)
+    # 0.0129 s is under the floor: the input doubles once (0.0258 s).
+    assert timing.input_growth == 2
+    assert timing.ratio == pytest.approx(4.0)
 
 
 def test_the_collector_is_paused_only_inside_each_timed_call():
