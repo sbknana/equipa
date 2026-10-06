@@ -526,6 +526,9 @@ class _GrownReadings:
         # The wall time of the last call at each size, building the shape
         # included: what one more repetition of it costs.
         self.costs: dict[int, float] = {}
+        # How many readings of each size its reading is the fastest of
+        # (``_settled_readings``).
+        self.samples: dict[int, int] = {}
 
     def measure(self, size: int) -> dict[str, float]:
         """A new reading at ``size``, kept as its reading: the test's sizes
@@ -533,7 +536,16 @@ class _GrownReadings:
         started = time.monotonic()
         self.readings[size] = self._measure(size)
         self.costs[size] = time.monotonic() - started
+        self.samples[size] = 1
         return self.readings[size]
+
+    def settle(self, size: int, readings: Mapping[str, float],
+               samples: int) -> None:
+        """Keep ``readings``, each part's fastest of ``samples`` readings at
+        ``size``, as its reading: a later pair at the size starts from it
+        instead of measuring the size again from its first reading."""
+        self.readings[size] = dict(readings)
+        self.samples[size] = samples
 
     def repetitions(self, small_size: int, size: int) -> int:
         """How many runs of each size the pair (``small_size``, ``size``)
@@ -586,13 +598,15 @@ class _Pair:
 
 def _settled_readings(measure: Callable[[int], Mapping[str, float]],
                       pair: _Pair, small: Mapping[str, float],
-                      large: Mapping[str, float], parts: list[str]
+                      large: Mapping[str, float], parts: list[str],
+                      samples: int = 1
                       ) -> tuple[dict[str, float], dict[str, float],
                                  list[str], int]:
     """The parts over the growth limit at ``pair`` once its readings have
     settled.
 
-    ``small`` and ``large`` are each part's reading at the pair's sizes.
+    ``small`` and ``large`` are each part's reading at the pair's sizes,
+    each already the fastest of ``samples`` readings of its size.
     One reading of each size is at the mercy of the load it ran under, so
     both sizes are measured again (all parts, ``pair.repetitions`` runs
     each, the quarter size and the larger one interleaved) while a part is
@@ -610,7 +624,7 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     of each size the minimum was taken over."""
     small, large = dict(small), dict(large)
     borderline_seen = False
-    retries_done = 0
+    retries_done = samples - 1
     while True:
         ratios = {part: growth_ratio(small[part], large[part],
                                      pair.floor_seconds) for part in parts}
@@ -839,10 +853,27 @@ def _check_growth(grown: _GrownReadings,
                                    samples)
                 for part in at_parts}
 
-    def held(pair: _Pair, small: Mapping[str, float],
-             large: Mapping[str, float]) -> dict[str, LinearTiming]:
-        small, large, over, samples = _settled_readings(measure, pair, small,
-                                                        large, parts)
+    def held(pair: _Pair, means: tuple[Mapping[str, float],
+                                       Mapping[str, float]] | None = None
+             ) -> dict[str, LinearTiming]:
+        """``pair`` held to the limit on ``means`` (the means of its
+        repetitions), or on the readings ``grown`` keeps at its sizes; those
+        are then replaced by the settled ones, so a later pair at the same
+        sizes (the pair the growth stopped at) starts from them."""
+        if means is not None:
+            small, large = means
+            first_samples = 1
+        else:
+            small, large = grown.at(pair.small_size), grown.at(pair.size)
+            first_samples = min(grown.samples[pair.small_size],
+                                grown.samples[pair.size])
+        small, large, over, samples = _settled_readings(
+            measure, pair, small, large, parts, first_samples)
+        if means is None:
+            for at_size, readings in ((pair.small_size, small),
+                                      (pair.size, large)):
+                grown.settle(at_size, readings, grown.samples[at_size]
+                             + samples - first_samples)
         if over:
             fail("superlinear growth: " + "; ".join(
                 timing.describe() for timing in timings_at(
@@ -850,10 +881,14 @@ def _check_growth(grown: _GrownReadings,
         return timings_at(pair, small, large, parts, samples)
 
     # 1. The test's own pair, its repetitions interleaved.
-    held(_Pair(test_small_size, test_size, 1.0, own_pair_floor(repetitions),
-               repetitions),
-         *_interleaved_means(measure, test_small_size, test_size, repetitions,
-                             (grown.at(test_small_size), grown.at(test_size))))
+    own_pair = _Pair(test_small_size, test_size, 1.0,
+                     own_pair_floor(repetitions), repetitions)
+    if repetitions == 1:
+        held(own_pair)
+    else:
+        held(own_pair, _interleaved_means(
+            measure, test_small_size, test_size, repetitions,
+            (grown.at(test_small_size), grown.at(test_size))))
 
     # 2. Growth (task 3178), every grown pair held to the growth limit.
     small_size, size, input_growth = test_small_size, test_size, 1.0
@@ -885,9 +920,7 @@ def _check_growth(grown: _GrownReadings,
         # steadier than at the test's sizes (3138's pattern 22 read 5.9 ms
         # then 75.5 ms at 5.5 times its input under a full xdist run, where
         # 3178 grew on and passed it).
-        held(_Pair(small_size, size, input_growth, GROWTH_FLOOR_SECONDS),
-             grown.at(small_size), grown.at(size))
+        held(_Pair(small_size, size, input_growth, GROWTH_FLOOR_SECONDS))
 
     # 3. The pair the growth stopped at, as task 3178 decided it.
-    return held(_Pair(small_size, size, input_growth, floor_seconds),
-                grown.at(small_size), grown.at(size))
+    return held(_Pair(small_size, size, input_growth, floor_seconds))
