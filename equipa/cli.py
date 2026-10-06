@@ -220,7 +220,10 @@ def load_config() -> None:
         return
 
     if "theforge_db" in cfg:
-        _equipa_constants.THEFORGE_DB = Path(cfg["theforge_db"])
+        # Absolute once, here, as constants does for the environment value:
+        # a relative path keeps naming the database (and the refusal store
+        # beside it) after a later chdir (R3178-01, task #3180).
+        _equipa_constants.THEFORGE_DB = Path(os.path.abspath(cfg["theforge_db"]))
     if "project_dirs" in cfg:
         # Support PROJECT_BASE_DIR env var: if a project path starts with
         # $PROJECT_BASE_DIR/, resolve it against the env var value.

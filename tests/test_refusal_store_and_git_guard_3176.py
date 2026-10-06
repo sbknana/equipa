@@ -300,6 +300,37 @@ def test_a_relative_database_keeps_its_store_after_a_chdir(tmp_path: Path) -> No
     assert probe.stdout.split("\n")[:2] == [str(expected), str(expected)]
 
 
+def test_a_relative_database_in_the_dispatch_config_keeps_its_store_after_a_chdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3178-01 (task #3180): the forge_config.json ``theforge_db`` replaces
+    THEFORGE_DB after import; it is made absolute there too."""
+    import equipa.cli as cli_mod
+    import equipa.constants as constants
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "forge_config.json").write_text(
+        '{"theforge_db": "forge/theforge.db"}', encoding="utf-8")
+    started_in = tmp_path / "started"
+    (started_in / "forge").mkdir(parents=True)
+    moved_to = tmp_path / "moved"
+    moved_to.mkdir()
+    monkeypatch.setattr(constants, "THEFORGE_DB", constants.THEFORGE_DB)
+    monkeypatch.setattr(cli_mod, "__file__", str(checkout / "equipa" / "cli.py"))
+    monkeypatch.chdir(started_in)
+
+    cli_mod.load_config()
+    before = dispatch_mod._agent_repository_refusals_dir()
+    monkeypatch.chdir(moved_to)
+    after = dispatch_mod._agent_repository_refusals_dir()
+
+    expected = Path(os.path.realpath(started_in / "forge")) / (
+        dispatch_mod.AGENT_REPOSITORY_REFUSALS_DIRNAME)
+    assert constants.THEFORGE_DB.is_absolute()
+    assert (before, after) == (expected, expected)
+
+
 def test_a_store_of_this_user_is_used_and_kept_private(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, audit: list[str],
 ) -> None:
