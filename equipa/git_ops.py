@@ -1356,6 +1356,33 @@ _GIT_PATH_ENV_KEYS: tuple[str, ...] = (
 )
 # Global options (``--name=value`` form) whose value is such a path.
 _GIT_PATH_OPTIONS: frozenset[str] = frozenset({"--git-dir", "--work-tree", "--exec-path"})
+# IR80-03 (task #3183): config keys and environment variables whose value is
+# a command line git runs (or a program it starts). Like an alias it can
+# carry ``cd P && git ...``, which the guard cannot read, so a call carrying
+# one is refused, except with a value that runs nothing (empty or a git
+# boolean) or with the value EQUIPA's own hardening pins it to.
+_COMMAND_CONFIG_KEYS: frozenset[str] = frozenset({
+    "core.sshcommand", "core.pager", "core.editor", "sequence.editor",
+    "core.askpass", "core.gitproxy", "core.fsmonitor",
+    "core.alternaterefscommand", "diff.external", "credential.helper",
+    "uploadpack.packobjectshook",
+})
+# ``<section>.<subsection>.<name>`` keys of the same kind, as (section, name);
+# ``pager.<command>`` is the one two-part family.
+_COMMAND_CONFIG_SUBSECTION_KEYS: frozenset[tuple[str, str]] = frozenset({
+    ("diff", "command"), ("diff", "textconv"),
+    ("filter", "clean"), ("filter", "smudge"), ("filter", "process"),
+    ("merge", "driver"), ("difftool", "cmd"), ("mergetool", "cmd"),
+    ("credential", "helper"),
+    ("remote", "uploadpack"), ("remote", "receivepack"),
+})
+_COMMAND_ENV_KEYS: tuple[str, ...] = (
+    "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND",
+)
+_GIT_BOOLEAN_VALUES: frozenset[str] = frozenset({
+    "", "true", "false", "yes", "no", "on", "off", "1", "0",
+})
 # A GIT_CONFIG_COUNT over this is not read: the call is refused instead.
 _MAX_ENVIRONMENT_CONFIG_PAIRS = 1024
 _WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
@@ -1424,6 +1451,52 @@ def _environment_config_pairs(
     return pairs, None
 
 
+def _is_command_config_key(lowered_key: str) -> bool:
+    """True if the (lower-case) config key's value is a command line."""
+    if lowered_key in _COMMAND_CONFIG_KEYS:
+        return True
+    section, _, rest = lowered_key.partition(".")
+    if not rest:
+        return False
+    if "." not in rest:
+        return section == "pager"
+    return (section, rest.rpartition(".")[2]) in _COMMAND_CONFIG_SUBSECTION_KEYS
+
+
+def _equipa_program_pins(env: Mapping[str, str]) -> frozenset[tuple[str, str]]:
+    """The (lower-case key, value) pairs EQUIPA's own hardening passes for
+    command keys: _GIT_PROGRAM_CONFIG_PINS and the operator program pins."""
+    operator = _operator_program_pins(env)
+    pairs = [*_GIT_PROGRAM_CONFIG_PINS,
+             *(pin.partition("=")[::2] for pin in operator[1::2])]
+    return frozenset((key.lower(), value) for key, value in pairs)
+
+
+def _command_carried(
+    config: Sequence[tuple[str, str]], env: Mapping[str, str],
+) -> str | None:
+    """Why the call carries a command line the guard cannot read (a config
+    pair or variable of the IR80-03 kind), None when it carries none."""
+    pins: frozenset[tuple[str, str]] | None = None
+    for key, value in config:
+        lowered = key.lower()
+        if not _is_command_config_key(lowered):
+            continue
+        if value.strip().lower() in _GIT_BOOLEAN_VALUES:
+            continue
+        if pins is None:
+            pins = _equipa_program_pins(env)
+        if (lowered, value) in pins:
+            continue
+        return (f"the config pair {key!r} carries a command line, which can "
+                f"run git where the guard cannot read")
+    for key in _COMMAND_ENV_KEYS:
+        if env.get(key):
+            return (f"{key} carries a command line, which can run git where "
+                    f"the guard cannot read")
+    return None
+
+
 def _read_git_call(
     argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
 ) -> _GitCallReading:
@@ -1449,7 +1522,10 @@ def _read_git_call(
     A config pair defining an alias (``alias.x=!cd P && git status`` is a
     shell command line) and a transport option naming the program run on
     the other side are wrappers the guard cannot read: the call is
-    unreadable (IR78-04, task #3180)."""
+    unreadable (IR78-04, task #3180). So is a config pair or variable whose
+    value is a command line (``core.sshCommand``, ``diff.external``,
+    ``GIT_SSH_COMMAND`` ...), unless it runs nothing or is EQUIPA's own
+    hardening pin (IR80-03, task #3183)."""
     directory = os.path.abspath(os.fspath(cwd))
     directories = [directory]
     options = (
@@ -1510,6 +1586,7 @@ def _read_git_call(
         locations.extend(_repository_locations(value))
         if lowered.startswith("url.") and lowered.endswith((".insteadof", ".pushinsteadof")):
             locations.extend(_repository_locations(key[len("url."):key.rfind(".")]))
+    unreadable = unreadable or _command_carried([*config, *environment_config], env)
     locations.extend(env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key))
     for key in _GIT_PATH_ENV_KEYS:
         if env.get(key):
