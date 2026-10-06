@@ -38,8 +38,14 @@ A test gets ``TEST_DEADLINE_SECONDS``, a test of a module that imports
 run past its deadline, every later phase of that process gets at most
 ``AFTER_A_HANG_DEADLINE_SECONDS``: a regression that hangs every test of a
 module costs one full deadline, then that much per test, and the run still
-ends in named failures. Deadlines nest: the earliest one active is
-enforced. ``tests/conftest.py`` registers this
+ends in named failures. A hard stop ends the worker with that record, so
+each process also keeps the phase it is running in a file of a directory
+the whole session shares (``SESSION_DIRECTORY_VARIABLE``); a phase left
+there by a process that no longer runs was stopped mid-run, and every
+later phase of the session is cut the same way (IR75-02, task 3178: under
+heavy load the replacement worker gave the next hung test a full deadline
+again). The run's summary names such phases. Deadlines nest: the earliest
+one active is enforced. ``tests/conftest.py`` registers this
 plugin; ``-p tests.deadline_watchdog`` loads it into any other run.
 
 Copyright 2026 Forgeborn
@@ -51,8 +57,10 @@ import contextlib
 import ctypes
 import faulthandler
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -103,6 +111,10 @@ HARD_STOP_MIN_GRACE_SECONDS = 60.0
 # again this many CPU seconds later.
 RETRY_SECONDS = 0.01
 TIMING_HELPER_MODULE = "tests.host_timing"
+# "<controller pid>:<directory>" of the session's shared phase records, set
+# by the process that starts the xdist workers (they inherit it).
+SESSION_DIRECTORY_VARIABLE = "EQUIPA_DEADLINE_SESSION"
+PHASE_FILE_PREFIX = "phase-"
 
 
 class DeadlineExceeded(BaseException):
@@ -335,6 +347,112 @@ class _Deadlines:
 _deadlines: _Deadlines | None = None
 
 
+# --- The phases of the session (IR75-02) ------------------------------------------
+
+
+def _process_runs(pid: int) -> bool:
+    """Whether ``pid`` still runs. A worker the hard stop ended stays a
+    zombie until xdist's controller reaps it, which can be after the
+    replacement worker starts; ``kill(pid, 0)`` succeeds on a zombie, so
+    its state is read from /proc where there is one."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            state = stat_file.read().rsplit(b")", 1)[-1].split()[:1]
+        return state not in ([b"Z"], [b"X"])
+    except FileNotFoundError:
+        if os.path.isdir("/proc/self"):
+            return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class SessionPhases:
+    """The phase each process of a pytest session is running, one file per
+    process (``phase-<pid>``) in a directory they share: written before a
+    phase's deadline is armed, emptied when the phase ends. A hard stop
+    ends a worker mid-phase, so its file keeps that phase."""
+
+    def __init__(self, directory: str) -> None:
+        self.directory = directory
+        # A forked child inherits this object; only the process that made
+        # the record writes or removes it.
+        self._owner_pid = os.getpid()
+        self._path = os.path.join(directory, f"{PHASE_FILE_PREFIX}{self._owner_pid}")
+        self._fd: int | None = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                           | getattr(os, "O_CLOEXEC", 0), 0o600)
+
+    def _writable(self) -> bool:
+        return self._fd is not None and os.getpid() == self._owner_pid
+
+    def running(self, label: str) -> None:
+        if self._writable():
+            os.ftruncate(self._fd, 0)
+            os.pwrite(self._fd, label.encode("utf-8", "replace"), 0)
+
+    def finished(self) -> None:
+        if self._writable():
+            os.ftruncate(self._fd, 0)
+
+    def stopped_mid_phase(self) -> list[str]:
+        """The phases that processes no longer running were in when they
+        ended, oldest file first."""
+        stopped: list[tuple[float, str]] = []
+        try:
+            names = os.listdir(self.directory)
+        except FileNotFoundError:
+            return []
+        for name in names:
+            pid_text = name[len(PHASE_FILE_PREFIX):]
+            if not name.startswith(PHASE_FILE_PREFIX) or not pid_text.isdigit():
+                continue
+            pid = int(pid_text)
+            if pid == os.getpid() or _process_runs(pid):
+                continue
+            path = os.path.join(self.directory, name)
+            try:
+                with open(path, "rb") as phase_file:
+                    label = phase_file.read().decode("utf-8", "replace")
+                modified = os.stat(path).st_mtime
+            except FileNotFoundError:
+                continue
+            if label:
+                stopped.append((modified, label))
+        return [label for _, label in sorted(stopped)]
+
+    def close(self) -> None:
+        """A process that ends normally leaves no record. Closed, the
+        record writes nothing (its descriptor number may be reused)."""
+        if self._fd is None:
+            return
+        owner = os.getpid() == self._owner_pid
+        os.close(self._fd)
+        self._fd = None
+        if owner:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self._path)
+
+
+_session_phases: SessionPhases | None = None
+
+
+def _inherited_session_directory() -> str | None:
+    """The directory the process that started this one (the xdist
+    controller) shares, or None when it is not this process's parent (a
+    pytest run started by a test inherits the variable too)."""
+    owner, separator, directory = os.environ.get(
+        SESSION_DIRECTORY_VARIABLE, "").partition(":")
+    if separator and owner.isdigit() and int(owner) == os.getppid():
+        return directory if os.path.isdir(directory) else None
+    return None
+
+
 def _on_deadline_signal(signum: int, frame: object) -> None:
     if _deadlines is not None:
         _deadlines.on_signal(signum, frame)
@@ -408,26 +526,86 @@ def deadline_seconds(item: pytest.Item) -> float:
 # --- Plugin hooks -------------------------------------------------------------
 
 
+# The shared directory this process made (and removes), as the controller.
+_owned_session_directory: str | None = None
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    global _owned_session_directory
     config.addinivalue_line(
         "markers",
         "deadline(seconds): fail the test (DeadlineExceeded) when a phase "
         "uses more CPU time; tests/deadline_watchdog.py")
+    if hasattr(config, "workerinput") or _owned_session_directory is not None:
+        return
+    # Before xdist starts its workers (at session start), so they inherit it.
+    _owned_session_directory = tempfile.mkdtemp(prefix="equipa-deadlines-")
+    os.environ[SESSION_DIRECTORY_VARIABLE] = (
+        f"{os.getpid()}:{_owned_session_directory}")
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    global _session_phases
     # Output capture is suspended between conftest loading and the first
     # test, so descriptor 2 is the session's real stderr here.
     install(hard_stop_fd=os.dup(2))
+    directory = (_owned_session_directory
+                 if not hasattr(session.config, "workerinput")
+                 else _inherited_session_directory())
+    if directory is not None and _session_phases is None:
+        _session_phases = SessionPhases(directory)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus: int,
+                            config: pytest.Config) -> None:
+    """Name the phases a hard stop (or any crash) ended mid-run."""
+    if _session_phases is None or hasattr(config, "workerinput"):
+        return
+    stopped = _session_phases.stopped_mid_phase()
+    if stopped:
+        terminalreporter.section("deadline watchdog: stopped mid-phase")
+        for label in stopped:
+            terminalreporter.line(
+                f"{label}: its process ended before the phase did (the hard "
+                f"stop of tests/deadline_watchdog.py, or a crash)")
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    global _session_phases, _owned_session_directory
+    if _session_phases is not None:
+        _session_phases.close()
+        _session_phases = None
+    if _owned_session_directory is not None and not hasattr(config, "workerinput"):
+        shutil.rmtree(_owned_session_directory, ignore_errors=True)
+        if os.environ.get(SESSION_DIRECTORY_VARIABLE, "").endswith(
+                f":{_owned_session_directory}"):
+            del os.environ[SESSION_DIRECTORY_VARIABLE]
+        _owned_session_directory = None
+
+
+def _session_hang() -> str | None:
+    """The first phase of this session a process ended mid-run (cached as
+    this process's own first hang once found)."""
+    if _deadlines is None or _session_phases is None:
+        return None
+    stopped = _session_phases.stopped_mid_phase()
+    if not stopped:
+        return None
+    _deadlines.first_hung_phase = (
+        f"{stopped[0]}, ended by the hard stop or a crash,")
+    return _deadlines.first_hung_phase
 
 
 def phase_deadline(item: pytest.Item, phase: str) -> tuple[float, str]:
     """The deadline and label of one test phase: ``deadline_seconds``, cut
     to ``AFTER_A_HANG_DEADLINE_SECONDS`` once a phase of this process has
-    run past its own (the label then names that one)."""
+    run past its own, or a phase of this session was stopped mid-run (the
+    label then names that one)."""
     seconds = deadline_seconds(item)
     label = f"{item.nodeid} ({phase})"
     hung = None if _deadlines is None else _deadlines.first_hung_phase
+    if hung is None and seconds > AFTER_A_HANG_DEADLINE_SECONDS:
+        hung = _session_hang()
     if hung is not None and seconds > AFTER_A_HANG_DEADLINE_SECONDS:
         seconds = AFTER_A_HANG_DEADLINE_SECONDS
         label = (f"{item.nodeid} ({phase}; cut to {seconds:g} s because "
@@ -441,12 +619,19 @@ def _phase(item: pytest.Item, phase: str) -> Iterator[None]:
         yield
         return
     seconds, label = phase_deadline(item, phase)
-    with deadline(seconds, label) as armed:
-        try:
-            yield
-        finally:
-            if armed.raised and _deadlines.first_hung_phase is None:
-                _deadlines.first_hung_phase = f"{item.nodeid} ({phase})"
+    phases = _session_phases
+    if phases is not None:
+        phases.running(f"{item.nodeid} ({phase})")
+    try:
+        with deadline(seconds, label) as armed:
+            try:
+                yield
+            finally:
+                if armed.raised and _deadlines.first_hung_phase is None:
+                    _deadlines.first_hung_phase = f"{item.nodeid} ({phase})"
+    finally:
+        if phases is not None:
+            phases.finished()
 
 
 @pytest.hookimpl(hookwrapper=True)

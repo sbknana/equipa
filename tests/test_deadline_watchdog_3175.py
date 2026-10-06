@@ -427,6 +427,108 @@ def test_under_xdist_a_swallowed_deadline_is_a_named_crash(tmp_path):
     assert "1 failed, 1 passed" in output, output
 
 
+HARD_STOP_SCRATCH_TESTS = '''
+import pytest
+
+from tests import deadline_watchdog
+
+deadline_watchdog.HARD_STOP_MIN_GRACE_SECONDS = 1.0
+
+
+@pytest.mark.deadline(0.3)
+def test_0_is_hard_stopped():
+    try:
+        while True:
+            pass
+    except deadline_watchdog.DeadlineExceeded:
+        while True:
+            pass
+
+
+@pytest.mark.deadline(200)
+def test_1_runs_on_the_replacement_worker():
+    armed = deadline_watchdog.active_deadlines()
+    assert [deadline.seconds for deadline in armed] == [30.0], armed
+    assert "because test_scratch.py::test_0_is_hard_stopped (call)" in armed[0].label
+'''
+
+
+def test_a_hard_stop_cuts_the_next_phases_of_the_replacement_worker(tmp_path):
+    """IR75-02: the after-a-hang cut lived in the worker a hard stop ended,
+    so xdist's replacement worker gave the next hung test the full deadline
+    again. The phase the stopped worker was in is kept in the session's
+    shared directory, cuts the replacement's phases, and is named at the
+    end of the run."""
+    completed = _run_scratch(tmp_path, "-n", "1", "-rA",
+                             source=HARD_STOP_SCRATCH_TESTS)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 1, output
+    assert "crashed while running 'test_scratch.py::test_0_is_hard_stopped'" in output
+    assert "PASSED test_scratch.py::test_1_runs_on_the_replacement_worker" in output
+    assert "1 failed, 1 passed" in output, output
+    assert "deadline watchdog: stopped mid-phase" in output, output
+    assert "test_scratch.py::test_0_is_hard_stopped (call): its process ended" in output
+
+
+def test_a_phase_left_by_a_process_that_ended_cuts_later_phases(
+        request, tmp_path, monkeypatch):
+    ended = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"],
+                           capture_output=True, text=True, check=True)
+    (tmp_path / f"phase-{ended.stdout.strip()}").write_text(
+        "tests/test_x.py::test_hard_stopped[param-7] (call)", encoding="utf-8")
+    (tmp_path / f"phase-{os.getppid()}").write_text(
+        "tests/test_x.py::test_still_running (call)", encoding="utf-8")
+    phases = deadline_watchdog.SessionPhases(str(tmp_path))
+    monkeypatch.setattr(deadline_watchdog, "_session_phases", phases)
+    monkeypatch.setattr(deadline_watchdog._deadlines, "first_hung_phase", None)
+    try:
+        seconds, label = deadline_watchdog.phase_deadline(request.node, "call")
+        assert phases.stopped_mid_phase() == [
+            "tests/test_x.py::test_hard_stopped[param-7] (call)"]
+    finally:
+        monkeypatch.undo()
+        phases.close()
+    assert seconds == AFTER_A_HANG_DEADLINE_SECONDS
+    assert "test_hard_stopped[param-7] (call), ended by the hard stop" in label
+    assert not (tmp_path / f"phase-{os.getpid()}").exists()
+
+
+def test_a_forked_child_neither_rewrites_nor_removes_the_parents_phase(tmp_path):
+    phases = deadline_watchdog.SessionPhases(str(tmp_path))
+    record = tmp_path / f"phase-{os.getpid()}"
+    try:
+        phases.running("tests/test_x.py::test_forks (call)")
+        child = os.fork()
+        if child == 0:
+            try:
+                phases.finished()
+                phases.close()
+            finally:
+                os._exit(0)
+        os.waitpid(child, 0)
+        assert record.read_text(encoding="utf-8") == "tests/test_x.py::test_forks (call)"
+    finally:
+        phases.close()
+    assert not record.exists()
+
+
+def test_a_phase_that_finished_is_not_a_hang(request, tmp_path, monkeypatch):
+    ended = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"],
+                           capture_output=True, text=True, check=True)
+    (tmp_path / f"phase-{ended.stdout.strip()}").write_text("", encoding="utf-8")
+    phases = deadline_watchdog.SessionPhases(str(tmp_path))
+    phases.running("tests/test_x.py::test_runs (call)")
+    phases.finished()
+    monkeypatch.setattr(deadline_watchdog, "_session_phases", phases)
+    monkeypatch.setattr(deadline_watchdog._deadlines, "first_hung_phase", None)
+    try:
+        seconds, _ = deadline_watchdog.phase_deadline(request.node, "call")
+    finally:
+        monkeypatch.undo()
+        phases.close()
+    assert seconds == deadline_watchdog.deadline_seconds(request.node)
+
+
 @pytest.mark.parametrize("seconds, grace", [
     (0.3, 60.0), (1, 60.0), (2, 60.0), (30, 120.0),
     (TIMING_TEST_DEADLINE_SECONDS, 300.0), (TEST_DEADLINE_SECONDS, 300.0),
