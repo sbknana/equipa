@@ -477,7 +477,60 @@ def _forgetful_async_wrapper(project: Path, tmp_path: Path) -> subprocess.Comple
     ))
 
 
+# IR78-04 (task #3180): a location carried by config, a repository named to
+# a transport subcommand, and an alias (a wrapper inside git).
+def _forgetful_config(*config: str, env: dict[str, str] | None = None,
+                      subcommand: tuple[str, ...] = ("status", "--short")):
+    def helper(project: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+        values = [part.format(project=project) for part in config]
+        variables = {key: value.format(project=project)
+                     for key, value in (env or {}).items()}
+        return git_run(
+            [*values, *(part.format(project=project) for part in subcommand)],
+            _elsewhere(tmp_path), env=variables or None,
+        )
+
+    return helper
+
+
+IR78_04_HELPERS = {
+    "git_run-c-core.worktree": _forgetful_config("-c", "core.worktree={project}"),
+    "git_run-config-env-core.worktree": _forgetful_config(
+        "--config-env=core.worktree=PLANTED_WORK_TREE",
+        env={"PLANTED_WORK_TREE": "{project}"}),
+    "git_run-GIT_CONFIG_COUNT-core.worktree": _forgetful_config(env={
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": "{project}"}),
+    "git_run-GIT_CONFIG_PARAMETERS-core.worktree": _forgetful_config(
+        env={"GIT_CONFIG_PARAMETERS": "'core.worktree'='{project}'"}),
+    "git_run-GIT_CONFIG_GLOBAL-in-the-project": _forgetful_config(
+        env={"GIT_CONFIG_GLOBAL": "{project}/.git/config"}),
+    "git_run-fetch-the-project": _forgetful_config(subcommand=("fetch", "{project}")),
+    "git_run-fetch-a-file-url": _forgetful_config(
+        subcommand=("fetch", "file://{project}/.git")),
+    "git_run-ls-remote-localhost": _forgetful_config(
+        subcommand=("ls-remote", "localhost:{project}")),
+    "git_run-clone-the-project": _forgetful_config(
+        subcommand=("clone", "--no-checkout", "{project}", "{project}-copy")),
+    "git_run-remote-url-config": _forgetful_config(
+        "-c", "remote.planted.url={project}", subcommand=("fetch", "planted")),
+    "git_run-url-insteadOf": _forgetful_config(
+        "-c", "url.{project}.insteadOf=planted:", subcommand=("fetch", "planted:x")),
+    "git_run-shell-alias": _forgetful_config(
+        "-c", "alias.z=!cd {project} && git diff --stat", subcommand=("z",)),
+    "git_run-GIT_CONFIG_COUNT-alias": _forgetful_config(
+        env={"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "alias.z",
+             "GIT_CONFIG_VALUE_0": "!git -C {project} diff"},
+        subcommand=("z",)),
+    "git_run-upload-pack-wrapper": _forgetful_config(subcommand=(
+        "ls-remote", "--upload-pack=sh -c 'cd {project} && git diff' #", "/tmp")),
+    "git_run-unreadable-GIT_CONFIG_COUNT": _forgetful_config(
+        env={"GIT_CONFIG_COUNT": "many"}),
+}
+
+
 FORGETFUL_HELPERS = {
+    **IR78_04_HELPERS,
     "git_run": _forgetful_sync,
     "git_run-relative-git-dir-before-dash-C":
         _forgetful_relative_git_dir_before_change_directory,
@@ -521,6 +574,29 @@ def test_a_helper_that_does_not_ask_still_runs_no_git_in_a_non_git_project(
     assert result.returncode == NOT_A_REPOSITORY
     assert result.stdout == ""
     assert "not a git repository at dispatch" in result.stderr
+
+
+IR78_04_ALLOWED = {
+    "config-elsewhere": ["git", "-c", "core.worktree={elsewhere}", "status"],
+    "config-of-no-location": ["git", "-c", "user.name=t", "-c", "core.hooksPath=", "log"],
+    "fetch-a-remote-name": ["git", "fetch", "origin"],
+    "fetch-another-repository": ["git", "fetch", "{elsewhere}"],
+    "push-set-upstream": ["git", "push", "-u", "origin", "main"],
+    "diff-of-a-path-named-like-the-project": ["git", "diff", "--", "project"],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(IR78_04_ALLOWED))
+def test_config_and_transport_shapes_elsewhere_are_allowed(tmp_path: Path, shape: str) -> None:
+    """Control for IR78-04: only a location in the recorded project (or an
+    alias, or a remote-side program) is refused, never config or transport
+    as such."""
+    project = tmp_path / "project"
+    project.mkdir()
+    elsewhere = _elsewhere(tmp_path)
+    argv = [part.format(elsewhere=elsewhere) for part in IR78_04_ALLOWED[shape]]
+    with dispatched_without_git(project):
+        assert git_ops._non_git_project_refusal(argv, elsewhere, {}) is None
 
 
 def test_a_wrapper_runs_while_no_project_is_recorded(tmp_path: Path) -> None:

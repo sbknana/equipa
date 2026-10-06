@@ -1330,32 +1330,144 @@ def _program_name(argv: Sequence[str]) -> str:
     return name
 
 
-def _git_call_directories(
+# IR78-04 (task #3180): the other ways a git call names where it runs or
+# what it reads. Subcommands whose arguments name a repository opened
+# through a transport: a local path (or file://, or this host over ssh)
+# runs git-upload-pack or git-receive-pack INSIDE that repository, reading
+# its config.
+_TRANSPORT_SUBCOMMANDS: frozenset[str] = frozenset({
+    "fetch", "pull", "clone", "ls-remote", "remote", "submodule", "push",
+    "archive", "fetch-pack", "send-pack",
+})
+# Their options naming the program run on the other side: a wrapper whose
+# own arguments the guard cannot read, refused like one (IR76-09). ``-u`` is
+# --upload-pack only for these (``git push -u`` sets the upstream).
+_REMOTE_PROGRAM_OPTIONS: frozenset[str] = frozenset({
+    "--upload-pack", "--receive-pack", "--exec",
+})
+_SHORT_UPLOAD_PACK_SUBCOMMANDS: frozenset[str] = frozenset({"clone", "ls-remote"})
+# Environment variables naming a file or directory git reads: config files
+# (an agent's config carries filters), the index, object stores, the
+# programs of its exec path, and templates.
+_GIT_PATH_ENV_KEYS: tuple[str, ...] = (
+    "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+)
+# Global options (``--name=value`` form) whose value is such a path.
+_GIT_PATH_OPTIONS: frozenset[str] = frozenset({"--git-dir", "--work-tree", "--exec-path"})
+# A GIT_CONFIG_COUNT over this is not read: the call is refused instead.
+_MAX_ENVIRONMENT_CONFIG_PAIRS = 1024
+_WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+
+@dataclass(frozen=True)
+class _GitCallReading:
+    """Where a git or gh process runs and what it reads, as far as its argv
+    and environment tell (IR76-01, IR78-04): each directory, file or
+    repository location resolved as git resolves it; ``unreadable`` says
+    why they cannot tell (the call is then refused)."""
+
+    directories: tuple[str, ...]
+    unreadable: str | None = None
+
+
+def _repository_locations(text: str) -> list[str]:
+    """The local paths a repository argument or config value may name: the
+    text itself, the path of a URL (``file:///P``, ``ssh://localhost/P``)
+    and the path of an scp-like ``host:P``, so a transport into a project
+    on this host is seen whatever form names it."""
+    locations = [text]
+    if "://" in text:
+        rest = text.partition("://")[2]
+        slash = rest.find("/")
+        if slash >= 0:
+            locations.append(rest[slash:])
+    elif (":" in text.split("/", 1)[0]
+          and not _WINDOWS_DRIVE_PATH.match(text)):
+        locations.append(text.split(":", 1)[1])
+    if "=" in text:
+        # ``--reference=P``, ``core.worktree=P`` given to a subcommand.
+        locations.extend({text.split("=", 1)[1], text.rsplit("=", 1)[1]})
+    return locations
+
+
+def _environment_config_pairs(
+    env: Mapping[str, str],
+) -> tuple[list[tuple[str, str]], str | None]:
+    """The config pairs git reads from ``env`` (``GIT_CONFIG_COUNT`` with
+    ``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>``, and
+    ``GIT_CONFIG_PARAMETERS``, which carries every ``-c`` of a parent git),
+    and why they cannot be read when they cannot (fail closed)."""
+    pairs: list[tuple[str, str]] = []
+    raw_count = env.get("GIT_CONFIG_COUNT")
+    if raw_count:
+        try:
+            count = int(raw_count)
+        except ValueError:
+            return pairs, f"GIT_CONFIG_COUNT={raw_count!r} is not a number"
+        if not 0 <= count <= _MAX_ENVIRONMENT_CONFIG_PAIRS:
+            return pairs, f"GIT_CONFIG_COUNT={count} is out of range"
+        for number in range(count):
+            key = env.get(f"GIT_CONFIG_KEY_{number}")
+            if key is None:
+                return pairs, f"GIT_CONFIG_KEY_{number} is missing"
+            pairs.append((key, env.get(f"GIT_CONFIG_VALUE_{number}", "")))
+    parameters = env.get("GIT_CONFIG_PARAMETERS")
+    if parameters:
+        try:
+            items = shlex.split(parameters)
+        except ValueError:
+            return pairs, "GIT_CONFIG_PARAMETERS cannot be read"
+        pairs.extend((key, value) for key, _, value in
+                     (item.partition("=") for item in items))
+    return pairs, None
+
+
+def _read_git_call(
     argv: Sequence[str], cwd: str | Path, env: Mapping[str, str],
-) -> list[str]:
-    """Every directory the process ``argv`` runs in or takes a repository
-    from: ``cwd``; for git each ``-C`` applied in turn and every
-    ``--git-dir`` / ``--work-tree`` option; and every ``GIT_DIR`` /
-    ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` variable (gh passes them to the
-    git it runs), resolved as git resolves them.
+) -> _GitCallReading:
+    """Every directory the process ``argv`` runs in or takes a repository,
+    config, index, object store or program from: ``cwd``; for git each
+    ``-C`` applied in turn, every ``--git-dir`` / ``--work-tree`` /
+    ``--exec-path`` option, every config value given by ``-c`` or
+    ``--config-env`` (``core.worktree``, ``remote.<name>.url``,
+    ``include.path``, and the base of ``url.<base>.insteadOf``) and every
+    argument of a transport subcommand (``git fetch P``); and, for git and
+    gh (which passes its environment to the git it runs), every
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` variable, every
+    variable naming a config file, index, object store or exec path, and
+    every config value ``GIT_CONFIG_*`` carries. Each is resolved as git
+    resolves it.
 
     git applies each ``-C`` as it reads it, but only records
     ``--git-dir`` / ``--work-tree`` and resolves them once every option is
     read, against the directory the last ``-C`` left, exactly like the
     variables. So a relative ``--git-dir=P/.git`` given before ``-C <parent
-    of P>`` names P's repository (IR76-01, task #3178)."""
+    of P>`` names P's repository (IR76-01, task #3178).
+
+    A config pair defining an alias (``alias.x=!cd P && git status`` is a
+    shell command line) and a transport option naming the program run on
+    the other side are wrappers the guard cannot read: the call is
+    unreadable (IR78-04, task #3180)."""
     directory = os.path.abspath(os.fspath(cwd))
     directories = [directory]
     options = (
         [os.fspath(token) for token in argv[1:]] if _program_name(argv) == "git" else []
     )
     locations: list[str] = []
+    config: list[tuple[str, str]] = []
+    unreadable: str | None = None
     index = 0
     while index < len(options):
         token = options[index]
         name, separator, value = token.partition("=")
-        if separator and name in ("--git-dir", "--work-tree"):
+        if separator and name in _GIT_PATH_OPTIONS:
             locations.append(value)
+            index += 1
+        elif separator and name == "--config-env":
+            key, _, variable = value.partition("=")
+            config.append((key, env.get(variable, "")))
             index += 1
         elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
             if index + 1 < len(options):
@@ -1365,29 +1477,47 @@ def _git_call_directories(
                     directories.append(directory)
                 elif token in ("--git-dir", "--work-tree"):
                     locations.append(value)
+                elif token == "-c":
+                    config.append(value.partition("=")[::2])
+                elif token == "--config-env":
+                    key, _, variable = value.partition("=")
+                    config.append((key, env.get(variable, "")))
             index += 2
         elif token.startswith("-"):
             index += 1
         else:
             break
+    subcommand = options[index] if index < len(options) else ""
+    if subcommand in _TRANSPORT_SUBCOMMANDS:
+        for token in options[index + 1:]:
+            name = token.partition("=")[0]
+            if name in _REMOTE_PROGRAM_OPTIONS or (
+                    subcommand in _SHORT_UPLOAD_PACK_SUBCOMMANDS
+                    and token.startswith("-") and not token.startswith("--")
+                    and "u" in token[1:]):
+                unreadable = unreadable or (
+                    f"git {subcommand} {name} names the program run on the other "
+                    f"side, whose own arguments the guard cannot read")
+            locations.extend(_repository_locations(token))
+    environment_config, unreadable_environment = _environment_config_pairs(env)
+    unreadable = unreadable or unreadable_environment
+    for key, value in [*config, *environment_config]:
+        lowered = key.lower()
+        if lowered.startswith("alias."):
+            unreadable = unreadable or (
+                f"the config pair {key!r} defines a git alias, which can run a "
+                f"command line the guard cannot read")
+        locations.extend(_repository_locations(value))
+        if lowered.startswith("url.") and lowered.endswith((".insteadof", ".pushinsteadof")):
+            locations.extend(_repository_locations(key[len("url."):key.rfind(".")]))
     locations.extend(env[key] for key in _GIT_LOCATION_ENV_KEYS if env.get(key))
+    for key in _GIT_PATH_ENV_KEYS:
+        if env.get(key):
+            # Whole, and split as a list (GIT_ALTERNATE_OBJECT_DIRECTORIES).
+            locations.append(env[key])
+            locations.extend(path for path in env[key].split(os.pathsep) if path)
     directories.extend(os.path.join(directory, location) for location in locations)
-    return directories
-
-
-def _directory_in_non_git_project(
-    argv: Sequence[str], cwd: str | Path, env: Mapping[str, str] | None,
-) -> str | None:
-    """The first directory of the process ``argv`` that lies in a project
-    :func:`dispatched_without_git` recorded, None when there is none (or
-    nothing is recorded, the common case, decided without touching
-    ``argv``)."""
-    if not _NON_GIT_PROJECT_ROOTS.get():
-        return None
-    for directory in _git_call_directories(argv, cwd, env or {}):
-        if not git_checks_allowed(directory):
-            return directory
-    return None
+    return _GitCallReading(tuple(directories), unreadable)
 
 
 def _non_git_project_refusal(
@@ -1407,7 +1537,15 @@ def _non_git_project_refusal(
             f"repository at dispatch is recorded, the git runners start only git "
             f"or gh, whose options they can read"
         )
-    directory = _directory_in_non_git_project(argv, cwd, env)
+    reading = _read_git_call(argv, cwd, env or {})
+    if reading.unreadable is not None:
+        return (
+            f"equipa: refused to run {program} from "
+            f"{os.path.abspath(os.fspath(cwd))}: {reading.unreadable}, while a "
+            f"project that was not a git repository at dispatch is recorded"
+        )
+    directory = next((directory for directory in reading.directories
+                      if not git_checks_allowed(directory)), None)
     if directory is None:
         return None
     return (
