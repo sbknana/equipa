@@ -45,13 +45,14 @@ from equipa.security_gate import (
     normalize_review_text,
 )
 from tests.host_timing import (
+    BORDERLINE_GROWTH,
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
-    GROWTH_RETRIES,
+    SettledGrowth,
     assert_linear_time,
     budget,
-    growth_ratio,
+    settled_growth,
 )
 from tests.review_gate_production import (
     gate_blocks,
@@ -276,13 +277,22 @@ def _median_scan_seconds(pattern, anchored, text, runs=SCAN_RUNS):
 
 @dataclasses.dataclass(frozen=True)
 class ScanGrowth:
+    """The pair of unit counts a scan chose, and its settled readings."""
+
     quarter_count: int
-    quarter_seconds: float
-    seconds: float
+    settled: SettledGrowth
+
+    @property
+    def quarter_seconds(self):
+        return self.settled.small_seconds
+
+    @property
+    def seconds(self):
+        return self.settled.seconds
 
     @property
     def ratio(self):
-        return growth_ratio(self.quarter_seconds, self.seconds)
+        return self.settled.ratio
 
 
 def scan_growth(pattern, anchored, prefix, unit, count):
@@ -304,7 +314,12 @@ def scan_growth(pattern, anchored, prefix, unit, count):
     256K newlines reached the floor under contention while their median was
     0.013 s, so the pair straddled that step and read 12x (task 3175). On
     the median, the quarter size passes the step before it takes the floor,
-    and both sizes are measured on the same side of it."""
+    and both sizes are measured on the same side of it.
+
+    The pair is settled under contention by the shared helper
+    (``settled_growth``, task 3185): over the limit or borderline, both
+    sizes are measured again interleaved, each keeping its fastest median,
+    so a burst on the quarter size cannot hide quadratic growth."""
     quarter_count = count
     while True:
         quarter_text = prefix + unit * quarter_count
@@ -314,19 +329,12 @@ def scan_growth(pattern, anchored, prefix, unit, count):
                 > MAX_GROWTH_SCAN_CHARACTERS):
             break
         quarter_count *= 2
-    text = prefix + unit * (quarter_count * GROWTH)
-    growth = ScanGrowth(quarter_count,
-                        _median_scan_seconds(pattern, anchored, quarter_text),
-                        _median_scan_seconds(pattern, anchored, text))
-    for _ in range(GROWTH_RETRIES):
-        if growth.ratio < GROWTH_LIMIT:
-            break
-        growth = ScanGrowth(
-            quarter_count,
-            min(growth.quarter_seconds,
-                _median_scan_seconds(pattern, anchored, quarter_text)),
-            min(growth.seconds, _median_scan_seconds(pattern, anchored, text)))
-    return growth
+    def median_at(units):
+        return _median_scan_seconds(pattern, anchored, prefix + unit * units)
+
+    return ScanGrowth(quarter_count, settled_growth(
+        median_at, quarter_count, quarter_count * GROWTH,
+        median_at(quarter_count), median_at(quarter_count * GROWTH)))
 
 
 def superlinear_scan(pattern, anchored, prefix, unit, count, seconds):
@@ -334,10 +342,12 @@ def superlinear_scan(pattern, anchored, prefix, unit, count, seconds):
     ``seconds`` is the pair's time at ``count`` units (a best of three, over
     a screening floor of milliseconds). A first look times one scan of four
     times as many units: linear work reads about 4x and passes. A pair that
-    reads ``GROWTH_LIMIT`` or more there is decided by ``scan_growth``, on
-    scans of at least ``GROWTH_FLOOR_SECONDS``, never by the first look."""
+    reads ``BORDERLINE_GROWTH`` or more there is decided by ``scan_growth``,
+    on settled scans of at least ``GROWTH_FLOOR_SECONDS``, never by the
+    first look: a burst that inflated ``seconds`` compresses quadratic
+    work's 16x toward linear's 4x, as it did a growth pair's (task 3184)."""
     larger = prefix + unit * (count * GROWTH)
-    if _scan_seconds(pattern, anchored, larger) < seconds * GROWTH_LIMIT:
+    if _scan_seconds(pattern, anchored, larger) < seconds * BORDERLINE_GROWTH:
         return None
     growth = scan_growth(pattern, anchored, prefix, unit, count)
     return growth if growth.ratio >= GROWTH_LIMIT else None
