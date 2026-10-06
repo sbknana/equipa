@@ -3,7 +3,7 @@
 A *flow* is a multi-step orchestration that spans one or more child tasks
 (for example a ``developer -> [security-reviewer, code-reviewer,
 integration-tester]`` fanout). Flows are stored in TheForge alongside the
-tasks they manage so they survive a Claudinator restart.
+tasks they manage so they survive an orchestrator host restart.
 
 Key properties (inspired by the OpenClaw Task Flow design):
 
@@ -709,7 +709,7 @@ def get_revisions(flow_id: int, limit: int | None = None) -> list[dict[str, Any]
 
 
 def reconcile_after_restart(flow_id: int) -> Flow:
-    """Recovery hook used after a Claudinator restart.
+    """Recovery hook used after an orchestrator host restart.
 
     Inspects each child task's underlying ``tasks.status``:
       * if every child is in a terminal state, the flow transitions to

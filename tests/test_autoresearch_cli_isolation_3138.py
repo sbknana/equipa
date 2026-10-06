@@ -73,7 +73,7 @@ def test_mutate_prompt_runs_claude_isolated(autoresearch, monkeypatch, local):
         return subprocess.CompletedProcess(argv, 0, stdout="NEW PROMPT",
                                            stderr="")
 
-    monkeypatch.setattr(autoresearch, "is_on_claudinator", lambda: local)
+    monkeypatch.setattr(autoresearch, "is_on_orchestrator_host", lambda: local)
     monkeypatch.setattr(autoresearch.subprocess, "run", fake_run)
 
     result = autoresearch.mutate_prompt(

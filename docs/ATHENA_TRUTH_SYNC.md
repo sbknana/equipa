@@ -110,7 +110,7 @@ The script does **not** generate the key. Generation/installation is
 operator-driven:
 
 ```bash
-# One-time, on Claudinator, as `user`:
+# One-time, on the orchestrator host, as `user`:
 gpg --quick-gen-key 'EQUIPA truth-sync bot <athena-bot@forgeborn.dev>' \
     ed25519 sign 2y
 
@@ -137,7 +137,7 @@ with a clear log line -- it never falls back to an unsigned commit.
 
 When the bot key reaches expiry or is suspected of compromise:
 
-1. **Generate a replacement key** on Claudinator as `user`:
+1. **Generate a replacement key** on the orchestrator host as `user`:
    ```bash
    gpg --quick-gen-key 'EQUIPA truth-sync bot <athena-bot@forgeborn.dev>' \
        ed25519 sign 2y
@@ -173,7 +173,7 @@ When the bot key reaches expiry or is suspected of compromise:
     >> /var/log/athena-truth-sync.log 2>&1
 ```
 
-Installed on Claudinator as user `user`. The schedule is weekly (not
+Installed on the orchestrator host as user `user`. The schedule is weekly (not
 daily) because drift accumulates slowly and noisy cron commits add no
 value.
 
@@ -213,7 +213,7 @@ Override env vars:
 
 ## Disabling temporarily
 
-Comment out the crontab line on Claudinator:
+Comment out the crontab line on the orchestrator host:
 
 ```bash
 crontab -e

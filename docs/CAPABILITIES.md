@@ -388,7 +388,7 @@ Autoresearch is the automated prompt optimization loop. It takes agent prompts, 
 | `scripts/autoresearch_loop.py` | The full optimization loop — mutate, deploy, benchmark, evaluate, commit/revert |
 | `scripts/autoresearch_prompts.py` | Standalone prompt mutation generator with tiered LLM support (Ollama → Sonnet → Opus) |
 
-`scripts/autoresearch_loop.py` is the production system. It runs end-to-end on Claudinator, dispatching real agents on real tasks and measuring actual outcomes. `scripts/autoresearch_prompts.py` is the lighter tool for generating prompt mutations without running the full benchmark loop.
+`scripts/autoresearch_loop.py` is the production system. It runs end-to-end on the orchestrator host, dispatching real agents on real tasks and measuring actual outcomes. `scripts/autoresearch_prompts.py` is the lighter tool for generating prompt mutations without running the full benchmark loop.
 
 ### Current Results
 

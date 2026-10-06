@@ -205,6 +205,15 @@ machine, for example a Windows client that sees the project share as
   prefixes of `path_translations`. With neither, auto-clone is refused.
 - **Scaffold source:** it comes from `EQUIPA_FORGESCAFFOLD_DIR` or the
   `forgescaffold_dir` config key. There is no built-in location.
+- **Scaffold paths:** only an absolute path on this host is created. A relative
+  path, or a Windows drive or backslash path no entry maps, is refused rather
+  than created under the working directory. A drive-letter `local_path` that no
+  entry maps is logged once as a warning.
+- **Per-run configs:** a `--dispatch-config` file keeps the host config's
+  `path_translations` (it may add prefixes the host does not map, but not
+  re-point one the host maps) and its `forgescaffold_dir` when it sets none.
+  Put the mapping in the host `dispatch_config.json` before the orchestrator
+  restarts.
 
 ---
 

@@ -6,6 +6,23 @@ All notable changes to EQUIPA are documented here.
 
 ### Changed
 
+- **A per-run dispatch config keeps the host's settings** (task #3187, IR83-01).
+  - **Change:** a `--dispatch-config` file is still merged over the defaults, but it now keeps the host
+    `dispatch_config.json`'s `path_translations`, `forgescaffold_dir` and fail-closed gates. Before, a per-run file
+    dropped `path_translations`, so every project recorded with a Windows drive path stopped resolving.
+  - **path_translations:** the host's entries always apply. A per-run file may add prefixes the host does not map;
+    an entry that re-points a host prefix (or a folder under one) is ignored with a warning.
+  - **Gates:** `bash_security_pretooluse`, like `agent_isolation`, stays on when the host has it on. A per-run file
+    may turn it on, never off.
+  - **Warning:** a drive-letter `local_path` that no translation maps is logged once.
+- **Scaffold containment refuses relative paths** (task #3187, IR83-02): only an absolute path of this host may be
+  created. A relative path, or (on POSIX) an unmapped drive-letter or backslash path, is refused instead of being
+  created under the working directory.
+- **Host-neutral names** (task #3187, IR83-04): docs, comments, the schema and scripts say "the orchestrator host"
+  instead of the operator's host names. **Operator note:** `scripts/autoresearch_loop.py` and
+  `scripts/autoresearch_prompts.py` read the remote host from `ORCHESTRATOR_HOST`; set it in place of the old
+  host-named variable.
+
 - **Project path translation is configuration** (task #3183, IR80-05).
   - **Change:** EQUIPA no longer carries a built-in mapping from one Windows share to one Linux mount.
   - **New config key:** list the mappings under `path_translations` in `dispatch_config.json`, for example

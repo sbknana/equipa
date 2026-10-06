@@ -8,7 +8,7 @@ Covers:
 * optimistic-concurrency CAS via expected_revision
 * sticky cancel: refuses transitions, refuses add_child, propagates to
   ``tasks.status`` and to non-terminal ``flow_tasks`` rows
-* survives a simulated Claudinator restart (close + reopen DB) with
+* survives a simulated orchestrator host restart (close + reopen DB) with
   reconcile_after_restart()
 
 Copyright 2026 Forgeborn

@@ -472,7 +472,7 @@ def _autoresearch(monkeypatch):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts"))
     import autoresearch_loop
 
-    monkeypatch.setattr(autoresearch_loop, "is_on_claudinator", lambda: True)
+    monkeypatch.setattr(autoresearch_loop, "is_on_orchestrator_host", lambda: True)
     return autoresearch_loop
 
 

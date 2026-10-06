@@ -496,7 +496,7 @@ def run_gepa_for_role(role, episodes, cfg, dry_run=False):
             log(f"WARNING: Using Anthropic API — this costs real money! Model: {model_name}")
             # H2: Do NOT log key or key length — only confirm it was loaded from env
         elif model_name.startswith("ollama"):
-            # Local model via Ollama on forge-inference (free)
+            # Local model via Ollama on the inference host (free)
             ollama_base = os.environ.get("OLLAMA_URL", "http://localhost:11434")
             lm = dspy.LM(model_name, api_base=ollama_base)
             reflection_lm = dspy.LM(reflection_model, api_base=ollama_base)
