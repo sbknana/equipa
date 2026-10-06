@@ -646,10 +646,21 @@ PROCESS_STARTERS = frozenset({
         "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp",
         "spawnlpe",
     )),
+    # IR78-03 (task #3180).
+    "pty.spawn",
 })
 # Event-loop methods, called on a loop object whose name the source does
 # not fix.
 LOOP_PROCESS_STARTERS = frozenset({"subprocess_exec", "subprocess_shell"})
+# The modules a starter is an attribute of: ``getattr(subprocess, name)``
+# with a name the fence cannot resolve may be any of their starters.
+PROCESS_MODULES = frozenset(starter.rsplit(".", 1)[0] for starter in PROCESS_STARTERS)
+# A starter the fence cannot name (an unresolved ``getattr`` of a process
+# module, a container of different starters): its start is unproven.
+UNRESOLVED_STARTER = "<a starter the fence cannot name>"
+# List methods that add items to an argv a name holds (IR78-03:
+# ``cmd = ["nice"]; cmd.extend(["git", "diff"])``).
+ARGV_MUTATORS = frozenset({"extend", "append", "insert"})
 
 
 def _imported_names(tree: ast.Module) -> dict[str, str]:
@@ -724,6 +735,7 @@ STARTER_ARGUMENTS: dict[str, tuple[tuple[str, int], ...]] = {
        for name in ("spawnl", "spawnle", "spawnlp", "spawnlpe")},
     "subprocess_exec": ((_PROGRAM, 1), (_REST, 2)),
     "subprocess_shell": ((_COMMAND_LINE, 1),),
+    "pty.spawn": ((_ARGV, 0),),
 }
 # Keyword arguments that hand a starter its argv or its program.
 _ARGV_KEYWORDS = frozenset({"args"})
@@ -773,17 +785,48 @@ class _ProcessStartFence:
     def __init__(self, tree: ast.Module, imported: dict[str, str]) -> None:
         self._imported = imported
         self._bindings: dict[str, list[ast.expr]] = {}
+        # Items added to the argv a name holds, in source order: (True when
+        # they may land first, the items as an argv node).
+        self._additions: dict[str, list[tuple[bool, ast.expr]]] = {}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                self._note_argv_mutation(node)
+                continue
             if isinstance(node, ast.Assign):
                 targets, value = node.targets, node.value
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value:
                 targets, value = [node.target], node.value
+                if (isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add)
+                        and isinstance(node.target, ast.Name)):
+                    self._additions.setdefault(node.target.id, []).append((False, value))
             else:
                 continue
             for target in targets:
                 if isinstance(target, ast.Name):
                     self._bindings.setdefault(target.id, []).append(value)
         self._resolving: set[str] = set()
+
+    def _note_argv_mutation(self, call: ast.Call) -> None:
+        """Record ``name.extend(items)``, ``name.append(item)`` and
+        ``name.insert(index, item)`` as items added to ``name``'s argv; an
+        insert at index 0, or at an index the source does not fix, may put
+        its item first."""
+        function = call.func
+        if not (isinstance(function, ast.Attribute) and function.attr in ARGV_MUTATORS
+                and isinstance(function.value, ast.Name) and call.args):
+            return
+        name = function.value.id
+        if function.attr == "extend":
+            self._additions.setdefault(name, []).append((False, call.args[0]))
+        elif function.attr == "append":
+            self._additions.setdefault(name, []).append(
+                (False, ast.List(elts=[call.args[0]], ctx=ast.Load())))
+        elif len(call.args) >= 2:
+            index = call.args[0]
+            later = (isinstance(index, ast.Constant) and isinstance(index.value, int)
+                     and not isinstance(index.value, bool) and index.value > 0)
+            self._additions.setdefault(name, []).append(
+                (not later, ast.List(elts=[call.args[1]], ctx=ast.Load())))
 
     # --- what a call starts -------------------------------------------------------
 
@@ -807,12 +850,62 @@ class _ProcessStartFence:
             return called
         if called is not None and called.rsplit(".", 1)[-1] in LOOP_PROCESS_STARTERS:
             return called.rsplit(".", 1)[-1]
-        if isinstance(function, ast.Name) and depth < 8:
+        if depth >= 8:
+            return None
+        if isinstance(function, ast.Name):
             for value in self._bindings.get(function.id, []):
                 found = self._starter_name(value, depth + 1)
                 if found is not None:
                     return found
+        if isinstance(function, ast.Call):
+            return self._starter_got(function)
+        if isinstance(function, ast.Subscript):
+            # ``STARTERS["run"](...)``: any starter the container holds.
+            found = {name for element in self._elements(function.value, depth)
+                     if (name := self._starter_name(element, depth + 1)) is not None}
+            if len(found) == 1:
+                return found.pop()
+            if found:
+                return UNRESOLVED_STARTER
         return None
+
+    def _starter_got(self, call: ast.Call) -> str | None:
+        """The starter ``getattr(<process module>, name)`` gets, an
+        unresolved one when the name is not known, or the one a
+        container's ``.get`` returns (IR78-03)."""
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "get":
+            container = call.func.value
+            found = {name for element in self._elements(container, 0)
+                     if (name := self._starter_name(element, 1)) is not None}
+            if len(found) == 1:
+                return found.pop()
+            return UNRESOLVED_STARTER if found else None
+        if (_called_name(call.func, self._imported) not in ("getattr", "builtins.getattr")
+                or len(call.args) < 2):
+            return None
+        owner = _called_name(call.args[0], self._imported)
+        for attribute in self.strings(call.args[1]):
+            if attribute is UNKNOWN:
+                if owner in PROCESS_MODULES:
+                    return UNRESOLVED_STARTER
+                continue
+            if f"{owner}.{attribute}" in PROCESS_STARTERS:
+                return f"{owner}.{attribute}"
+            if attribute in LOOP_PROCESS_STARTERS:
+                return attribute
+        return None
+
+    def _elements(self, container: ast.expr, depth: int) -> list[ast.expr]:
+        """The values a dict, list, tuple or set (or a name bound to one)
+        holds."""
+        if isinstance(container, ast.Dict):
+            return list(container.values)
+        if isinstance(container, (ast.List, ast.Tuple, ast.Set)):
+            return list(container.elts)
+        if isinstance(container, ast.Name) and depth < 8:
+            return [element for value in self._bindings.get(container.id, [])
+                    for element in self._elements(value, depth + 1)]
+        return []
 
     # --- values -------------------------------------------------------------------
 
@@ -857,8 +950,32 @@ class _ProcessStartFence:
                 and _called_name(node.func, self._imported) in ("list", "tuple")):
             return self.argvs(node.args[0])
         if isinstance(node, ast.Name):
-            return self._through_name(node.id, self.argvs, [[UNKNOWN]])
+            return self._with_additions(
+                node.id, self._through_name(node.id, self.argvs, [[UNKNOWN]]))
         return [[UNKNOWN]]
+
+    def _with_additions(self, name: str,
+                        argvs: list[list[str | None]]) -> list[list[str | None]]:
+        """``argvs`` (what ``name`` is bound to), and each of them with every
+        item the source adds to ``name`` (``extend``, ``append``, ``insert``,
+        ``+=``): appended in source order, or put first where an insert may
+        put it there. A program the additions change is judged as started
+        (IR78-03: ``cmd = ["nice"]; cmd.extend(["git", "diff"])``)."""
+        additions = self._additions.get(name)
+        if not additions or name in self._resolving:
+            return argvs
+        self._resolving.add(name)
+        try:
+            added = argvs
+            for first, items in additions:
+                options = self.argvs(items)
+                added = _combined(options, added) if first else _combined(added, options)
+        finally:
+            self._resolving.discard(name)
+        combined = argvs + added
+        if len(combined) > MAX_ARGVS:
+            return combined[:MAX_ARGVS] + [[UNKNOWN]]
+        return combined
 
     def _through_name(self, name: str, resolve, unknown):
         values = self._bindings.get(name)
@@ -895,6 +1012,8 @@ class _ProcessStartFence:
     def verdict(self, called: str, args: list[ast.expr],
                 keywords: dict[str, ast.expr]) -> str:
         """The worst verdict over every value the start could be given."""
+        if called == UNRESOLVED_STARTER:
+            return "unproven"
         layout = dict(STARTER_ARGUMENTS.get(called, ((_ARGV, 0),)))
         candidates: list[list[str | None]] = []
         command_lines: list[str | None] = []
@@ -1102,6 +1221,27 @@ HELPERS_THAT_START_GIT_THEMSELVES = {
         'import asyncio\nawait asyncio.create_subprocess_exec("env", "git", "status")\n',
     "posix_spawn": 'import os\nos.posix_spawn("/usr/bin/git", ["git", "gc"], env)\n',
     "spawnv": 'import os\nos.spawnv(os.P_WAIT, "/usr/bin/git", ["git", "gc"])\n',
+    # IR78-03 (task #3180): the shapes the IR76-02 fence did not see.
+    "argv-extended":
+        'import subprocess\ncmd = ["nice"]\ncmd.extend(["git", "diff"])\nsubprocess.run(cmd)\n',
+    "argv-appended": 'import subprocess\ncmd = ["env"]\ncmd.append("gh")\nsubprocess.run(cmd)\n',
+    "argv-inserted-first":
+        'import subprocess\ncmd = ["status"]\ncmd.insert(0, "git")\nsubprocess.run(cmd)\n',
+    "argv-inserted-anywhere":
+        'import subprocess\ncmd = ["status"]\ncmd.insert(i, "git")\nsubprocess.run(cmd)\n',
+    "argv-added-after-an-assignment-word":
+        'import subprocess\ncmd = ["env"]\ncmd += ["LANG=C", "git", "diff"]\nsubprocess.run(cmd)\n',
+    "getattr-starter": 'import subprocess\ngetattr(subprocess, "run")(["git", "diff"])\n',
+    "getattr-starter-bound-to-a-name":
+        'import subprocess\nstart = getattr(subprocess, "Popen")\nstart(["git", "log"])\n',
+    "getattr-of-an-unknown-name": 'import subprocess\ngetattr(subprocess, name)(["x"])\n',
+    "pty.spawn": 'import pty\npty.spawn(["git", "log"])\n',
+    "dict-of-starters":
+        'import subprocess\nSTARTERS = {"run": subprocess.run}\nSTARTERS["run"](["git", "diff"])\n',
+    "dict-of-starters-get":
+        'import subprocess\nSTARTERS = {"run": subprocess.run}\n'
+        'STARTERS.get("run")(["git", "status"])\n',
+    "list-of-starters": 'import os, subprocess\n[subprocess.run, os.system][i](argv)\n',
 }
 
 
@@ -1133,6 +1273,13 @@ CODE_THAT_DOES_NOT_START_GIT = {
         'import subprocess, sys\nsubprocess.run([sys.executable, "-c", "pass"])\n',
     "os.spawnv-of-another-program":
         'import os\nos.spawnv(os.P_WAIT, "/usr/bin/nft", ["nft", "list"])\n',
+    "an-argv-of-another-program-extended":
+        'import subprocess\ncmd = ["nft"]\ncmd.extend(["list", "ruleset"])\n'
+        'cmd.append("-j")\nsubprocess.run(cmd)\n',
+    "a-dict-of-other-callables": 'HANDLERS = {"a": print}\nHANDLERS["a"]("git")\n',
+    "getattr-of-another-object": 'getattr(logger, "info")(["git", "diff"])\n',
+    "getattr-of-another-starter-name":
+        'import subprocess\ngetattr(subprocess, "DEVNULL")\n',
 }
 
 
@@ -1156,6 +1303,39 @@ def test_the_fence_finds_git_started_in_a_real_module() -> None:
     assert calls > 0
     assert _git_started_outside_the_runners(source, module.name) == []
     assert len(_git_started_outside_the_runners(started_itself, module.name)) == calls
+
+
+PLANTED_FORGETFUL_HELPERS = {
+    "extended-argv": (
+        "def _planted_forgetful_status(project):\n"
+        "    cmd = [\"nice\"]\n"
+        "    cmd.extend([\"git\", \"status\"])\n"
+        "    return subprocess.run(cmd, cwd=project)\n"),
+    "getattr-starter": (
+        "def _planted_forgetful_status(project):\n"
+        "    return getattr(subprocess, \"run\")([\"git\", \"status\"], cwd=project)\n"),
+    "pty-spawn": (
+        "import pty\n\n\n"
+        "def _planted_forgetful_status(project):\n"
+        "    return pty.spawn([\"git\", \"-C\", project, \"status\"])\n"),
+    "dict-of-starters": (
+        "_PLANTED_STARTERS = {\"run\": subprocess.run}\n\n\n"
+        "def _planted_forgetful_status(project):\n"
+        "    return _PLANTED_STARTERS[\"run\"]([\"git\", \"status\"], cwd=project)\n"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(PLANTED_FORGETFUL_HELPERS))
+def test_the_fence_finds_an_ir78_03_helper_planted_in_a_real_module(shape: str) -> None:
+    """IR78-03: the reviewer planted the ``extend`` shape in a scratch copy
+    of monitoring.py and the scan passed; each shape is found there now."""
+    module = REPO_ROOT / "equipa" / "monitoring.py"
+    source = module.read_text(encoding="utf-8")
+    planted = source + "\n\n" + PLANTED_FORGETFUL_HELPERS[shape]
+
+    assert _git_started_outside_the_runners(source, module.name) == []
+    found = _git_started_outside_the_runners(planted, module.name)
+    assert len(found) == 1 and "_planted_forgetful_status" in found[0], found
 
 
 def test_no_orchestrator_module_starts_git_outside_the_runners() -> None:
