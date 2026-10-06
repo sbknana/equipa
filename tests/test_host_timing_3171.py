@@ -648,6 +648,59 @@ def test_linear_work_passes_whatever_a_call_costs(monkeypatch, reading,
     assert all(part.ratio < GROWTH_LIMIT for part in timings.values())
 
 
+def _pair_work(units: int) -> int:
+    """Pure-Python work over every pair of ``units`` items: quadratic."""
+    total = 0
+    for row in range(units):
+        for column in range(units):
+            total ^= row + column
+    return total
+
+
+def _units_reading(target_seconds: float) -> int:
+    """How many units ``_pair_work`` takes ``target_seconds`` of CPU time on
+    here (measured, so the planted reading is what this host reads)."""
+    started = time.process_time()
+    _pair_work(400)
+    per_pair = (time.process_time() - started) / 400 ** 2
+    return max(GROWTH, round(math.sqrt(target_seconds / per_pair)))
+
+
+@pytest.mark.parametrize("build_seconds", (0.0, 0.3))
+@pytest.mark.parametrize("target_seconds", (0.02, 0.12))
+def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
+                                                   build_seconds):
+    """IR75-01 on real work and the real clock: quadratic work reading
+    about 20 ms or 120 ms at the test's size fails, also when building the
+    shape takes 0.3 s of wall time per call (3175 then measured each size
+    once and raised the quarter reading to the 20 ms floor)."""
+    units = _units_reading(target_seconds)
+
+    def seconds_at(size: int) -> float:
+        time.sleep(build_seconds * size / units)
+        started = time.process_time()
+        _pair_work(size)
+        return time.process_time() - started
+
+    with pytest.raises(TimingCheckFailed, match="superlinear growth"):
+        assert_linear_time(seconds_at, units, 30.0, "planted quadratic")
+
+
+@pytest.mark.parametrize("target_seconds", (0.005, 0.05))
+def test_real_linear_work_passes(target_seconds):
+    units = _units_reading(target_seconds) ** 2
+
+    def seconds_at(size: int) -> float:
+        started = time.process_time()
+        total = 0
+        for value in range(size):
+            total ^= value
+        return time.process_time() - started
+
+    timing = assert_linear_time(seconds_at, units, 30.0, "planted linear")
+    assert timing.ratio < GROWTH_LIMIT
+
+
 def test_a_quarter_reading_at_the_floor_is_decided_without_growing():
     calls: list[int] = []
     timing = assert_linear_time(_model(2e-6, 1, calls), 40_000, 0.5, "lin")
