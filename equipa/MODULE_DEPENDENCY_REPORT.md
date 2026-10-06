@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **61 Python modules** totaling **58,315 lines** of code across **14 dependency layers** (L0–L13). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **61 Python modules** totaling **58,322 lines** of code across **14 dependency layers** (L0–L13). 34 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -31,7 +31,7 @@ The `equipa/` package contains **61 Python modules** totaling **58,315 lines** o
 | `mcp_health.py` | 112 | L0 | — | — | 5 |
 | `plugins.py` | 69 | L0 | — | — | 3 |
 | `reactive_check.py` | 376 | L0 | — | `bash_security.py` | 6 |
-| `redact.py` | 528 | L0 | — | — | 8 |
+| `redact.py` | 535 | L0 | — | — | 8 |
 | `severity_confusables.py` | 105 | L0 | — | — | 5 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 400 | L1 | `constants.py` | `parsing.py` | 10 |
@@ -76,7 +76,7 @@ The `equipa/` package contains **61 Python modules** totaling **58,315 lines** o
 | `__init__.py` | 58 | L13 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L13 | `cli.py` | — | 0 |
 
-**Total:** 58,315 lines | 993 public exports
+**Total:** 58,322 lines | 993 public exports
 
 ## Modules by Layer
 

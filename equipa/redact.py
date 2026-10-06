@@ -211,7 +211,14 @@ class _CommandScoped:
             start = found.end()
         tail = rest[start:]
         for pattern, replacement in self.flags:
-            tail = pattern.sub(replacement, tail, count=self.count)
+            # search() first: on Python 3.10 every sub() call builds its
+            # ``\1`` replacement template in Python, even on a tail with
+            # nothing to replace, and text repeating the command word
+            # (``curl;`` x 13 000) makes one call per flag per repeat: 0.09 s
+            # on 64 KB for curl's three flags (task 3182). A sub() with no
+            # match returns its input, so skipping it changes nothing.
+            if pattern.search(tail) is not None:
+                tail = pattern.sub(replacement, tail, count=self.count)
         return head + rest[:start] + tail
 
 
