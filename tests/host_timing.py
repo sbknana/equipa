@@ -54,7 +54,16 @@ timing test checks two things through this module:
    the test's sizes (quadratic work that small passed main's floor too),
    so a test timing thousands of fast shapes does not grow each one.
    Grown sizes are held to the growth limit, not to the budget (it holds
-   at the test's sizes). Each timed call (and each reference run) runs
+   at the test's sizes). The grown sizes never replace the test's own
+   (task 3180, IR78-01): work superlinear up to the test's size and
+   cheaper past it (a window, or an input cap the larger size reaches)
+   grows linearly there. So the test's own pair is also held to main's
+   rule (``GROWTH_LIMIT`` against ``DETECTION_FLOOR_SECONDS``), measured
+   again first, as b81777b did, when it could reach the limit once
+   repeated (``growth_repetitions``), and every grown pair is held to
+   main's rule too: a part fails at the first pair it is over at, so
+   another part still growing cannot carry it to 16 times the test's input
+   (IR78-02). Each timed call (and each reference run) runs
    with the garbage collector paused, as ``timeit`` does: a full collection
    walks the whole heap a long xdist worker has built up, so it paused the
    larger size far more than its input could (task 3175: 0.0129 s against
@@ -397,9 +406,9 @@ def growth_ratio(small_seconds: float, seconds: float,
 
 def growth_repetitions(small_seconds: float, pair_cost_seconds: float = 0.0,
                        seconds: float | None = None) -> int:
-    """How many times ``assert_linear_time`` measures each size of the
-    test's own pair (the rule of b81777b) so that the quarter size's total
-    reaches ``GROWTH_FLOOR_SECONDS``: at most ``MAX_GROWTH_REPETITIONS``,
+    """How many times a growth check measures each size of the test's own
+    pair (the rule of b81777b) so that the quarter size's total reaches
+    ``GROWTH_FLOOR_SECONDS``: at most ``MAX_GROWTH_REPETITIONS``,
     and no more extra pairs than ``GROWTH_REPETITION_SECONDS`` of wall time
     pays for when one call of each size took ``pair_cost_seconds``.
 
@@ -661,7 +670,8 @@ def assert_linear_time(seconds_at: Callable[[int], float], size: int,
     with the input then fails at the larger size too. While the smaller
     reading is under ``GROWTH_FLOOR_SECONDS``, the input grows
     (``grows_further``, ``next_quarter_size``); the grown sizes are held to
-    the growth limit only."""
+    the growth limit only. The test's own sizes are held to it as well, as
+    main and b81777b held them (``_check_growth``, IR78-01)."""
     if size < GROWTH:
         raise ValueError(f"size {size} has no quarter to compare against")
     seconds_at = _collector_paused_calls(seconds_at)
@@ -698,9 +708,11 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
     part's smaller reading is under the floor and ``grows_further`` says
     so, the input grows for every part (one call times them all; the
     growing part with the smallest larger reading sets the step); the
-    parts are decided at the sizes the growth stopped at. A part over the
-    growth limit is measured again (all parts, keeping each part's fastest
-    time) before it counts."""
+    parts are decided at the test's own sizes, at every grown pair (a part
+    fails at the first one it is over at, IR78-02) and at the sizes the
+    growth stopped at (``_check_growth``). A part over the growth limit is
+    measured again (all parts, keeping each part's fastest time) before it
+    counts."""
     if size < GROWTH:
         raise ValueError(f"size {size} has no quarter to compare against")
     small_size = size // GROWTH
@@ -756,9 +768,9 @@ def _check_growth(grown: _GrownReadings,
     1. The test's own pair (``test_small_size``, ``test_size``) breaks
        main's rule: growth of ``GROWTH_LIMIT`` against
        ``DETECTION_FLOOR_SECONDS`` (pre-3175 main, 883c9f2). With
-       ``repetitions`` (one ``seconds_at``, ``growth_repetitions``), both
-       sizes are means of that many runs against ``own_pair_floor``: also
-       the rule of b81777b. Grown sizes are no substitute for these:
+       ``repetitions`` (``growth_repetitions`` of the most suspicious
+       part, within what a call costs), both sizes are means of that many
+       runs against ``own_pair_floor``: also the rule of b81777b. Grown sizes are no substitute for these:
        superlinear work that gets cheaper past the test's size (a window,
        an input cap or truncation the larger size reaches) grows linearly
        there (IR78-01: 3129's ``sanitize`` truncates at 64,000 characters,
