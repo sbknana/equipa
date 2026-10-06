@@ -239,9 +239,9 @@ def test_real_quadratic_work_read_under_a_burst_fails():
 
 def test_real_linear_work_read_under_a_burst_passes():
     """Real linear work, its first larger reading inflated into the band,
-    passes on its fastest readings. About 120 ms at the test's size, so
-    the quarter reading takes the floor and the input does not grow."""
-    units = _units_reading(0.12) ** 2
+    passes on its fastest readings. About 160 ms at the test's size, so
+    the quarter reading (about 40 ms) is well over the floor."""
+    units = _units_reading(0.16) ** 2
     readings: dict[int, list[float]] = {}
 
     def seconds_at(size: int) -> float:
@@ -258,9 +258,10 @@ def test_real_linear_work_read_under_a_burst_passes():
 
     timing = assert_linear_time(seconds_at, units, 30.0, "linear under a burst")
     assert readings[units][0] / readings[units // GROWTH][0] >= 6.0
-    # The test's own pair was settled on 1 + BORDERLINE_RETRIES readings of
-    # each size. (Under load its fastest quarter reading can drop under the
-    # floor, and the input then grows: ``timing`` is the pair it stopped at.)
-    assert len(readings[units]) >= 1 + BORDERLINE_RETRIES
-    assert len(readings[units // GROWTH]) == 1 + BORDERLINE_RETRIES
+    # Both sizes were measured again before the pair passed. How often
+    # depends on the load (the band's retries, or the limit's when the load
+    # pushed the first ratio over it, and repetitions when a quarter reading
+    # fell under the floor); the scripted tests above pin the counts.
+    assert len(readings[units]) > 1
+    assert len(readings[units // GROWTH]) > 1
     assert timing.ratio < GROWTH_LIMIT
