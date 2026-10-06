@@ -194,9 +194,12 @@ def test_scan_pairs_keep_each_sizes_fastest_reading():
         1_000, 4_000, LATE_QUIET_QUARTER, LATE_LARGE)
     assert quarter_late_burst.small_seconds == pytest.approx(LATE_QUIET_QUARTER)
     assert quarter_late_burst.ratio >= GROWTH_LIMIT
+    # Linear (4x), its larger reading able to reach the limit against a
+    # quieter quarter, so it is read again: the later readings are a burst.
     larger_late_burst = settled_growth(
-        _series({1_000: (0.03,), 4_000: (0.40,)}), 1_000, 4_000, 0.03, 0.12)
-    assert larger_late_burst.seconds == pytest.approx(0.12)
+        _series({1_000: (0.05,), 4_000: (0.50,)}), 1_000, 4_000, 0.05, 0.20)
+    assert larger_late_burst.samples > 1
+    assert larger_late_burst.seconds == pytest.approx(0.20)
     assert larger_late_burst.ratio < GROWTH_LIMIT
 
 
