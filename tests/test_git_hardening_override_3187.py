@@ -205,12 +205,17 @@ def test_a_non_command_submodule_setting_is_not_a_command_key() -> None:
 def test_an_included_file_still_reads_while_no_project_is_recorded(
     repository: Path, tmp_path: Path,
 ) -> None:
-    """Control: outside a non-git dispatch an include is read as before."""
+    """Control: outside a non-git dispatch an include is read as before.
+
+    Task #3189 (IR87-02) refuses an include given as a caller's ``-c``
+    pair (tests/test_git_hardening_include_3189.py), so the include here is
+    the repository's own, which no caller pair names."""
     included = tmp_path / "plain.cfg"
     included.write_text("[equipa3187]\n\tvalue = included\n", encoding="utf-8")
+    with (repository / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write(f"[include]\n\tpath = {included}\n")
 
-    result = git_run(["-c", f"include.path={included}", "config",
-                      "equipa3187.value"], repository)
+    result = git_run(["config", "equipa3187.value"], repository)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "included"

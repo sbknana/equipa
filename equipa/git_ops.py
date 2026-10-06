@@ -1743,26 +1743,28 @@ def _hardening_config_pins(env: Mapping[str, str]) -> dict[str, str]:
 
 def _caller_config_pairs(
     args: Sequence[str], env: Mapping[str, str],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     """The config pairs the global options of ``git <args>`` set: each
-    ``-c key=value`` and ``--config-env key=VAR`` before the subcommand."""
-    pairs: list[tuple[str, str]] = []
+    ``-c key=value`` and ``--config-env key=VAR`` before the subcommand, as
+    ``(key, value, option)``; ``value`` of a ``--config-env`` pair is read
+    from ``env``."""
+    pairs: list[tuple[str, str, str]] = []
     index = 0
     while index < len(args):
         token = os.fspath(args[index])
         name, separator, value = token.partition("=")
         if separator and name == "--config-env":
             key, _, variable = value.partition("=")
-            pairs.append((key, env.get(variable, "")))
+            pairs.append((key, env.get(variable, ""), "--config-env"))
             index += 1
         elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
             value = os.fspath(args[index + 1]) if index + 1 < len(args) else ""
             if token == "-c":
                 key, _, pair_value = value.partition("=")
-                pairs.append((key, pair_value))
+                pairs.append((key, pair_value, "-c"))
             elif token == "--config-env":
                 key, _, variable = value.partition("=")
-                pairs.append((key, env.get(variable, "")))
+                pairs.append((key, env.get(variable, ""), "--config-env"))
             index += 2
         elif token.startswith("-"):
             index += 1
@@ -1782,7 +1784,17 @@ def _hardening_override_refusal(
     the pins, so ``-c protocol.ext.allow=always`` or ``-c
     core.hooksPath=<dir>`` would switch that piece of hardening off.
     ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_PARAMETERS`` pairs in ``env`` are
-    read the same way. A pair that repeats the pinned value is allowed."""
+    read the same way. A ``-c`` or environment pair that repeats the pinned
+    value is allowed.
+
+    IR87-02 (task #3189): a pair that includes a config file or names a
+    trailer command (:func:`_refused_caller_config_key`) is refused whatever
+    its value: git reads an included file where its ``include.path`` stands,
+    after the pins, so a pinned key set in that file won although no pair
+    this check sees named it. A ``--config-env`` pair for a pinned key is
+    refused too: git reads its variable from the child's environment, which
+    the hardening rewrites after this check (``core.hooksPath=VAR`` naming a
+    variable the hardening sets to ``1`` ran ``<repo>/1/pre-commit``)."""
     requested = _get_repo_env()
     requested.update(env or {})
     environment_pairs, unreadable = _environment_config_pairs(env or {})
@@ -1790,13 +1802,31 @@ def _hardening_override_refusal(
         return (f"equipa: refused to run git: {unreadable}, so it cannot be "
                 f"checked against EQUIPA's hardening pins")
     pins = _hardening_config_pins(requested)
-    for key, value in [*_caller_config_pairs(args, requested), *environment_pairs]:
+    pairs = [*_caller_config_pairs(args, requested),
+             *((key, value, "environment") for key, value in environment_pairs)]
+    for key, value, option in pairs:
         pinned = pins.get(key.lower())
-        if pinned is not None and value != pinned:
+        if pinned is not None and (value != pinned or option == "--config-env"):
             return (f"equipa: refused to run git: the config pair {key!r} "
                     f"would override EQUIPA's hardening pin "
                     f"{key.lower()}={pinned!r}")
+        if _refused_caller_config_key(key):
+            return (f"equipa: refused to run git: the config pair {key!r} "
+                    f"includes a config file or names a command, which "
+                    f"could override EQUIPA's hardening pins")
     return None
+
+
+def _refused_caller_config_key(key: str) -> bool:
+    """True for a config key no caller pair may set, whatever its value
+    (IR87-02, task #3189): ``include.*`` and ``includeIf.*`` read another
+    file after EQUIPA's pins, and ``trailer.<token>.cmd`` / ``.command`` run
+    a command line on ``commit --trailer`` and ``interpret-trailers``."""
+    parts = key.lower().split(".")
+    section, name = parts[0], parts[-1]
+    if section in ("include", "includeif"):
+        return True
+    return section == "trailer" and len(parts) > 2 and name in ("cmd", "command")
 
 
 def _non_git_refused_result(
