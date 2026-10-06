@@ -286,6 +286,38 @@ def test_another_ssh_command_than_the_operators_pin_is_refused(
     assert refusal is not None and COMMAND_LINE in refusal
 
 
+@pytest.mark.parametrize(("variable", "value", "refused"), [
+    ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes", True),
+    ("GIT_SSH", "/usr/bin/ssh", False),
+])
+def test_an_operator_ssh_setting_while_a_project_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    variable: str, value: str, refused: bool,
+) -> None:
+    """The operator note in CHANGELOG, end to end: GIT_SSH_COMMAND in the
+    orchestrator's environment reaches git as a command line, so every git
+    call is refused while a project is recorded, even a benign one. GIT_SSH
+    names a program, which the core.sshCommand pin carries, so git runs."""
+    project, _ = _project_and_elsewhere(tmp_path)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True,
+                   capture_output=True)
+    for name in ("GIT_SSH_COMMAND", "GIT_SSH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, value)
+
+    with dispatched_without_git(project):
+        result = git_run(["rev-parse", "--is-inside-work-tree"], repository)
+
+    if refused:
+        assert result.returncode == git_ops._REFUSED_RETURNCODE
+        assert f"{variable} {COMMAND_LINE}" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+
+
 def test_real_git_still_runs_elsewhere_while_a_project_is_recorded(tmp_path: Path) -> None:
     """End to end: the hardened argv with its pins starts real git."""
     project, _ = _project_and_elsewhere(tmp_path)
