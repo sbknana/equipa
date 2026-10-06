@@ -70,6 +70,21 @@ timing test checks two things through this module:
    larger size far more than its input could (task 3175: 0.0129 s against
    0.1341 s for a linear scan).
 
+4. **Contention.** One reading of each size is at the mercy of the load it
+   ran under. A burst that inflates the larger reading fakes growth, so a
+   pair over the limit is measured again (``GROWTH_RETRIES``) before it
+   fails; one that inflates the quarter reading hides it (task 3184: a
+   regression planted in ``sanitize`` read 0.0228 s then 0.1486 s, 6.5x,
+   during a full parallel suite at host load 20, and passed). So a pair
+   reading from ``BORDERLINE_GROWTH`` up to the limit, on a quarter reading
+   over its floor, is measured again ``BORDERLINE_RETRIES`` times before it
+   is decided. Every reading taken again alternates between the two sizes
+   (quarter, larger, quarter, larger, ...; the own pair's repetitions too),
+   so a burst falls on both sizes rather than on one size's whole run, and
+   each size keeps its fastest reading: the minimum is the estimate of the
+   work's cost the load inflated least. A later pair at the same sizes
+   starts from those readings (``_GrownReadings.settle``).
+
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
 ``EQUIPA_TIMING_HOST_FACTOR=2.0`` to simulate a runner twice as slow as the
