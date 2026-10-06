@@ -304,6 +304,8 @@ def load_dispatch_config(filepath: str | Path | None) -> dict:
       per-run file does not turn it off either (review F1);
     * the host's ``path_translations`` stay, and a per-run file may only add
       prefixes the host does not map (IR83-01);
+    * the host's MCP trust lists (``HOST_TRUST_LIST_KEYS``) stay, and a
+      per-run file may only add entries (IR87-01);
     * host layout keys (``HOST_LAYOUT_KEYS``) the per-run file does not set
       keep the host's value.
     """
@@ -326,6 +328,16 @@ def _same_file(first: Path, second: Path) -> bool:
 # config which does not set them keeps from the host (task #3187): without
 # the host's scaffold source every scaffold clone is refused.
 HOST_LAYOUT_KEYS: tuple[str, ...] = ("forgescaffold_dir",)
+
+# Host-config lists of what an agent's MCP servers may launch and fetch from
+# (equipa.agent_runner, which imports this module, so the names are repeated
+# here). A per-run config keeps the host's entries and may only add its own
+# (IR87-01, task #3189): prod's uvx lives outside the system directories, so
+# without the host's list every dispatch under a per-run config was refused.
+HOST_TRUST_LIST_KEYS: tuple[str, ...] = (
+    "mcp_trusted_executables",
+    "mcp_uvx_trusted_urls",
+)
 
 # How a carried fail-closed gate is named in the warning a per-run config
 # that turns it off gets.
@@ -357,9 +369,38 @@ def _carry_host_settings(config: dict, per_run_path: Path) -> None:
             and AGENT_ISOLATION_KEY in host):
         config[AGENT_ISOLATION_KEY] = _json_copy(host[AGENT_ISOLATION_KEY])
     _carry_host_path_translations(config, host, per_run_path, host_path)
+    for key in HOST_TRUST_LIST_KEYS:
+        _carry_host_list(config, host, key, per_run_path)
     for key in HOST_LAYOUT_KEYS:
         if key not in config and key in host:
             config[key] = _json_copy(host[key])
+
+
+def _carry_host_list(config: dict, host: dict, key: str,
+                     per_run_path: Path) -> None:
+    """The host's ``key`` entries, then the per-run file's own new ones.
+
+    A per-run value that is not a list is logged and ignored; the host's
+    entries stay either way. A host value that is not a list carries
+    nothing (the reader logs and ignores it, as before).
+    """
+    host_entries = host.get(key)
+    if not isinstance(host_entries, list) or not host_entries:
+        return
+    own = config.get(key)
+    if own is None:
+        own = []
+    elif not isinstance(own, list):
+        logger.error(
+            "dispatch config '%s': %r must be a list, got %r; using only the "
+            "host config's", per_run_path, key, own,
+        )
+        own = []
+    carried = _json_copy(host_entries)
+    for entry in own:
+        if entry not in carried:
+            carried.append(_json_copy(entry))
+    config[key] = carried
 
 
 def _carry_host_gate(config: dict, host: dict, gate: str,
