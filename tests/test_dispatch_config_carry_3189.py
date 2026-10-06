@@ -378,7 +378,7 @@ def test_a_per_run_prefix_maps_paths_but_adds_no_scaffold_root(
 
     _run_under(per_run)
 
-    assert translate_local_path("Q:\\etc\\x") == "/etc/x"
+    assert translate_local_path("Q:\\tmp\\x") == "/tmp/x"
     assert scaffold._allowed_roots() == (mount.resolve(),)
     with pytest.raises(scaffold.ScaffoldCloneError, match="allowlisted"):
         scaffold.assert_contained_path("/etc/equipa-3189-probe")
@@ -424,7 +424,7 @@ def test_a_per_run_prefix_adds_no_root_when_the_host_maps_nothing(
 
     _run_under(per_run)
 
-    assert translate_local_path("Q:\\srv\\x") == "/srv/x"
+    assert translate_local_path("Q:\\temp\\x") == "/temp/x"
     assert scaffold._allowed_roots() == ()
 
 

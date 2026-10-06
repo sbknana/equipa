@@ -3,6 +3,9 @@
 forge_config.json
 mcp_config.json
 .mcp.json
+# The operator's private markers for tests/test_no_operator_paths_3183.py
+# (host names, share paths, addresses); never part of the public repository
+.equipa-private-markers
 
 # Databases
 *.db

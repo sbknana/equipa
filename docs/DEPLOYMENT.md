@@ -15,6 +15,7 @@
     - [5. Start talking to Claude](#5-start-talking-to-claude)
   - [Environment Variables](#environment-variables)
   - [Project Paths Recorded on Another Host](#project-paths-recorded-on-another-host)
+    - [What a per-run config keeps from the host config](#what-a-per-run-config-keeps-from-the-host-config)
   - [How It Actually Works](#how-it-actually-works)
     - [The Conversational Model (Primary)](#the-conversational-model-primary)
     - [The CLI (For Automation / Scripting)](#the-cli-for-automation-scripting)
@@ -34,6 +35,7 @@
   - [Running Tests](#running-tests)
 - [Run a specific test file](#run-a-specific-test-file)
 - [Run with coverage (if you have pytest-cov installed)](#run-with-coverage-if-you-have-pytest-cov-installed)
+    - [Keeping your own host details out of the repository](#keeping-your-own-host-details-out-of-the-repository)
   - [Key Features Worth Knowing About](#key-features-worth-knowing-about)
   - [Troubleshooting](#troubleshooting)
     - ["ANTHROPIC_API_KEY not set"](#anthropic_api_key-not-set)
@@ -212,8 +214,29 @@ machine, for example a Windows client that sees the project share as
 - **Per-run configs:** a `--dispatch-config` file keeps the host config's
   `path_translations` (it may add prefixes the host does not map, but not
   re-point one the host maps) and its `forgescaffold_dir` when it sets none.
-  Put the mapping in the host `dispatch_config.json` before the orchestrator
-  restarts.
+  A prefix a per-run file adds still maps paths, but its `to` is never a
+  scaffold root: only the host config (or `EQUIPA_SCAFFOLD_ALLOWED_ROOTS`)
+  decides where auto-clone may create directories. Put the mapping in the
+  host `dispatch_config.json` before the orchestrator restarts.
+
+### What a per-run config keeps from the host config
+
+A `--dispatch-config` file is merged over the defaults, not over the host
+`dispatch_config.json`. These host settings stay in force anyway:
+
+- **Fail-closed gates** (`agent_isolation`, `bash_security_pretooluse`): on
+  when the host has them on. With isolation on, the host's `agent_isolation`
+  section is used unless the per-run file has a section with settings of its
+  own; an empty section (`{}`) or a non-object does not replace it.
+- **Security review:** on when the host has it on. A per-run file cannot turn
+  it off with `"security_review": false` or `features.security_review`; the
+  CLI's `--no-security-review` still decides for its own run.
+- **MCP trust lists** (`mcp_trusted_executables`, `mcp_uvx_trusted_urls`): the
+  host's entries stay and a per-run file may only add entries. A uvx installed
+  in `~/.local/bin` needs to be listed once, in the host config.
+- **`path_translations`** and **`forgescaffold_dir`**: as described above.
+
+Without a host config, a per-run file is used as written.
 
 ---
 
@@ -394,6 +417,38 @@ python3 -m pytest tests/test_early_termination.py -v
 # Run with coverage (if you have pytest-cov installed)
 python3 -m pytest tests/ --cov=equipa --cov-report=term-missing
 ```
+
+### Keeping your own host details out of the repository
+
+`tests/test_no_operator_paths_3183.py` scans every file of the public tree.
+Its generic checks always run: private IPv4 host addresses (RFC 1918 and the
+100.64.0.0/10 tailnet range), Windows drive-letter share paths and home
+directories, each apart from a short list of placeholders the tree uses on
+purpose.
+
+Your own host names, share paths and addresses cannot be listed in a public
+test, so the test reads them from a local file that is never committed:
+
+1. Create `.equipa-private-markers` in the repository root (it is listed in
+   `.gitignore`), or any file outside the repository, and set
+   `EQUIPA_PRIVATE_MARKERS_FILE` to its path. The environment variable wins.
+2. Put one marker per line: a host name, a folder of your share, an address.
+   Matching ignores case. Blank lines and lines starting with `#` are
+   skipped. A marker must be at least 4 characters long.
+3. Run `python3 -m pytest tests/test_no_operator_paths_3183.py`.
+
+```text
+# my hosts and share (example values)
+buildbox-7
+media_share
+192.0.2.10
+```
+
+The test also finds a marker split into string literals that are joined with
+`+` or written side by side. Without the file only the generic checks run.
+If `EQUIPA_PRIVATE_MARKERS_FILE` names a file that is missing, unreadable or
+holds no marker, the test fails, so a typo cannot read as a clean tree. Set
+the variable in your own CI to make the check mandatory there.
 
 ---
 
