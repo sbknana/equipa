@@ -81,7 +81,8 @@ timeout 540 python3 -m pytest -q -p no:cacheprovider -n auto --dist loadfile
   is also held to main's rule (8x against a 2 ms floor), and a pair of
   cheap calls that could reach the limit is measured again until the
   quarter size totals 20 ms (b81777b's rule); every grown pair is held to
-  main's rule too, and a part fails at the first pair it is over at.
+  the growth limit against the 20 ms floor (as task 3178 held the pair the
+  growth stopped at), and a part fails at the first pair it is over at.
   Never raise a base budget. Build the input
   before the clock starts: allocating a multi-megabyte string is page
   faults, which grew 32x from 1 MB to 4 MB under load. `assert_linear_time`

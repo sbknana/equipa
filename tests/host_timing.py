@@ -61,7 +61,8 @@ timing test checks two things through this module:
    rule (``GROWTH_LIMIT`` against ``DETECTION_FLOOR_SECONDS``), measured
    again first, as b81777b did, when it could reach the limit once
    repeated (``growth_repetitions``), and every grown pair is held to
-   main's rule too: a part fails at the first pair it is over at, so
+   the growth limit against the 20 ms floor (as task 3178 held the pair
+   the growth stopped at): a part fails at the first pair it is over at, so
    another part still growing cannot carry it to 16 times the test's input
    (IR78-02). Each timed call (and each reference run) runs
    with the garbage collector paused, as ``timeit`` does: a full collection
@@ -618,8 +619,8 @@ class LinearTiming:
     factor: float = 1.0
     input_growth: float = 1.0
     # ``DETECTION_FLOOR_SECONDS`` when the shape did not exist at the next
-    # larger size (``InputTooLarge``), and at every pair held to main's
-    # rule; ``own_pair_floor`` for the test's own pair when repeated.
+    # larger size (``InputTooLarge``) and at the test's own pair, or
+    # ``own_pair_floor`` there when repeated.
     floor_seconds: float = GROWTH_FLOOR_SECONDS
     # Each reading is the mean of this many runs (the test's own pair,
     # ``growth_repetitions``).
@@ -775,10 +776,11 @@ def _check_growth(grown: _GrownReadings,
        an input cap or truncation the larger size reaches) grows linearly
        there (IR78-01: 3129's ``sanitize`` truncates at 64,000 characters,
        just over its 60,000-character test size).
-    2. A pair of grown sizes breaks main's rule, for any part. A part
-       over the limit fails at the first pair it is over at, so another
-       part still growing cannot carry it to 16 times the test's input
-       (IR78-02: 2 minutes for a 159 ms quadratic part).
+    2. A pair of grown sizes reaches ``GROWTH_LIMIT`` against
+       ``GROWTH_FLOOR_SECONDS`` (the floor task 3178 held grown sizes to),
+       for any part. A part over the limit fails at the first pair it is
+       over at, so another part still growing cannot carry it to 16 times
+       the test's input (IR78-02: 2 minutes for a 159 ms quadratic part).
     3. The pair the growth stopped at breaks the growth check of task 3178
        (``grows_further``): against ``GROWTH_FLOOR_SECONDS``, or main's
        floor where the shape does not exist at the next size.
@@ -813,7 +815,7 @@ def _check_growth(grown: _GrownReadings,
                         grown.at(test_small_size)),
          _mean_readings(measure, test_size, repetitions, grown.at(test_size)))
 
-    # 2. Growth (task 3178), every grown pair held to main's rule.
+    # 2. Growth (task 3178), every grown pair held to the growth limit.
     small_size, size, input_growth = test_small_size, test_size, 1.0
     floor_seconds = GROWTH_FLOOR_SECONDS
 
@@ -838,7 +840,12 @@ def _check_growth(grown: _GrownReadings,
             break
         small_size, size = quarter_size, quarter_size * GROWTH
         input_growth = small_size / test_small_size
-        held(_Pair(small_size, size, input_growth, DETECTION_FLOOR_SECONDS),
+        # Against the floor task 3178 held grown sizes to: main never
+        # measured them, and a quarter reading under 20 ms there is no
+        # steadier than at the test's sizes (3138's pattern 22 read 5.9 ms
+        # then 75.5 ms at 5.5 times its input under a full xdist run, where
+        # 3178 grew on and passed it).
+        held(_Pair(small_size, size, input_growth, GROWTH_FLOOR_SECONDS),
              grown.at(small_size), grown.at(size))
 
     # 3. The pair the growth stopped at, as task 3178 decided it.

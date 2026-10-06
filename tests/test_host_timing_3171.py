@@ -635,13 +635,15 @@ def test_quadratic_work_under_the_floor_fails_once_repeated():
 
 def test_quadratic_work_past_the_tests_size_fails_on_the_grown_input():
     """Linear up to the test's size and quadratic past it: the test's own
-    pair reads 4x, so only the grown input (task 3178) sees the growth."""
+    pair reads 4x, so only the grown input (task 3178) sees the growth: it
+    fails at the first grown pair (40,000 then 160,000 units: 20 ms then
+    320 ms), against the 20 ms floor 3178 held grown sizes to."""
     def seconds_at(size: int) -> float:
         return 0.02 * size / 40_000 * max(1.0, size / 40_000)
 
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*at [\d.]+x the test's input"
-                             r", floor 0\.002 s"):
+                       match=r"superlinear growth.*at 4x the test's input"
+                             r", floor 0\.02 s"):
         assert_linear_time(seconds_at, 40_000, 10.0, "late")
 
 

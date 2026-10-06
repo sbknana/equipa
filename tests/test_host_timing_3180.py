@@ -12,8 +12,8 @@ floor) and the default branch b81777b (repetitions) failed it (IR78-01):
 carried a quadratic part to 16 times the test's input (IR78-02).
 
 ``tests/host_timing.py`` now holds the test's own pair to main's rule and,
-for one ``seconds_at``, to b81777b's repetitions; every grown pair to
-main's rule as well. These tests plant each shape (modelled, real work on
+for one ``seconds_at``, to b81777b's repetitions; every grown pair to the
+growth limit against the 20 ms floor. These tests plant each shape (modelled, real work on
 the real clock, and a regression in the real ``sanitize`` behind its real
 test) and pin the verdict.
 
@@ -253,6 +253,66 @@ def test_a_fast_part_never_carries_a_quadratic_part_past_its_sizes(reading):
             assert_linear_times(seconds_at, SIZE, 10.0, "parts")
         assert "parts: fast" not in str(failure.value)
         assert max(calls) <= largest
+
+
+CLIFF_TEST_SIZE = 65_536
+CLIFF_SIZE = 100_000
+
+
+def _cliff_seconds_at(spikes: list[float], steepness: float = 3.2,
+                      calls: list[int] | None = None
+                      ) -> Callable[[int], float]:
+    """3138's pattern 22 on a full xdist run: linear (5.9 ms at 90,503
+    units), its cost per unit ``steepness`` times higher past CLIFF_SIZE (a
+    cache cliff, not an algorithm), and the test's size reading ``spikes``
+    first, as one descheduled call read 17.4 ms against about 4.3 ms."""
+    pending = list(spikes)
+
+    def seconds_at(size: int) -> float:
+        if calls is not None:
+            calls.append(size)
+        if size == CLIFF_TEST_SIZE and pending:
+            return pending.pop(0)
+        return (0.0059 * size / 90_503
+                * (steepness if size > CLIFF_SIZE else 1.0))
+
+    return seconds_at
+
+
+def test_a_constant_factor_step_past_the_tests_size_is_not_growth():
+    """The spike grows the input; the first grown pair reads 5.9 ms then
+    75.5 ms (12.7x against main's 2 ms floor). 883c9f2, b81777b and
+    292395d all pass this work; held to main's floor at a size main never
+    measured, the full suite failed it once in four runs. Grown pairs are
+    held against the 20 ms floor, as task 3178 held them."""
+    def decided_at_the_cliff(timing: host_timing.LinearTiming) -> bool:
+        # The pair of CI's readings: a quarter under the floor, 12.7x raw.
+        return (timing.small_size < CLIFF_SIZE < timing.size
+                and timing.small_seconds < host_timing.GROWTH_FLOOR_SECONDS
+                and timing.seconds / timing.small_seconds
+                >= host_timing.GROWTH_LIMIT)
+
+    timing = assert_linear_time(_cliff_seconds_at([0.0174]), CLIFF_TEST_SIZE,
+                                0.1, "cliff")
+    assert decided_at_the_cliff(timing), timing
+    timings = assert_linear_times(
+        lambda size, part=_cliff_seconds_at([0.0174]): {
+            "cliff": part(size), "fast": 0.001 * size / CLIFF_TEST_SIZE},
+        CLIFF_TEST_SIZE, 0.1, "parts")
+    assert decided_at_the_cliff(timings["cliff"]), timings
+
+
+def test_a_grown_pair_over_the_limit_against_the_growth_floor_still_fails():
+    """The control: the same cliff 8 times steep is over the limit at the
+    first grown pair even against the 20 ms floor, and fails there."""
+    calls: list[int] = []
+    with pytest.raises(TimingCheckFailed,
+                       match=r"superlinear growth.*floor 0\.02 s"):
+        assert_linear_time(_cliff_seconds_at([0.0174], 40.0, calls),
+                           CLIFF_TEST_SIZE, 10.0, "steep cliff")
+    assert max(calls) <= GROWTH * host_timing.next_quarter_size(
+        CLIFF_TEST_SIZE, 0.0174, CLIFF_TEST_SIZE // GROWTH
+        * host_timing.MAX_INPUT_GROWTH)
 
 
 # --- Real work on the real clock -------------------------------------------------
