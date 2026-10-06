@@ -526,34 +526,43 @@ def deadline_seconds(item: pytest.Item) -> float:
 # --- Plugin hooks -------------------------------------------------------------
 
 
-# The shared directory this process made (and removes), as the controller.
+# The shared directory this process made (and removes), as the controller,
+# and the configs that made it and ``_session_phases``: only those undo
+# them, so a pytest run started in-process by a test leaves both alone.
 _owned_session_directory: str | None = None
+_directory_config: pytest.Config | None = None
+_phases_config: pytest.Config | None = None
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _owned_session_directory
+    global _owned_session_directory, _directory_config
     config.addinivalue_line(
         "markers",
         "deadline(seconds): fail the test (DeadlineExceeded) when a phase "
         "uses more CPU time; tests/deadline_watchdog.py")
-    if hasattr(config, "workerinput") or _owned_session_directory is not None:
+    if (hasattr(config, "workerinput") or _owned_session_directory is not None
+            or _session_phases is not None):
         return
     # Before xdist starts its workers (at session start), so they inherit it.
     _owned_session_directory = tempfile.mkdtemp(prefix="equipa-deadlines-")
+    _directory_config = config
     os.environ[SESSION_DIRECTORY_VARIABLE] = (
         f"{os.getpid()}:{_owned_session_directory}")
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    global _session_phases
+    global _session_phases, _phases_config
     # Output capture is suspended between conftest loading and the first
     # test, so descriptor 2 is the session's real stderr here.
     install(hard_stop_fd=os.dup(2))
+    if _session_phases is not None:
+        return
     directory = (_owned_session_directory
                  if not hasattr(session.config, "workerinput")
                  else _inherited_session_directory())
-    if directory is not None and _session_phases is None:
+    if directory is not None:
         _session_phases = SessionPhases(directory)
+        _phases_config = session.config
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus: int,
@@ -571,16 +580,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus: int,
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    global _session_phases, _owned_session_directory
-    if _session_phases is not None:
+    global _session_phases, _phases_config
+    global _owned_session_directory, _directory_config
+    if _session_phases is not None and config is _phases_config:
         _session_phases.close()
-        _session_phases = None
-    if _owned_session_directory is not None and not hasattr(config, "workerinput"):
+        _session_phases = _phases_config = None
+    if _owned_session_directory is not None and config is _directory_config:
         shutil.rmtree(_owned_session_directory, ignore_errors=True)
         if os.environ.get(SESSION_DIRECTORY_VARIABLE, "").endswith(
                 f":{_owned_session_directory}"):
             del os.environ[SESSION_DIRECTORY_VARIABLE]
-        _owned_session_directory = None
+        _owned_session_directory = _directory_config = None
 
 
 def _session_hang() -> str | None:

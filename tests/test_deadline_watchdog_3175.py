@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -510,6 +511,31 @@ def test_a_forked_child_neither_rewrites_nor_removes_the_parents_phase(tmp_path)
     finally:
         phases.close()
     assert not record.exists()
+
+
+def test_a_pytest_run_inside_a_test_leaves_the_session_record_alone(
+        tmp_path, monkeypatch):
+    """A pytest run a test starts in-process configures and unconfigures
+    the plugin again; only the config that made the record may close it."""
+    phases = deadline_watchdog.SessionPhases(str(tmp_path))
+    record = tmp_path / f"phase-{os.getpid()}"
+    monkeypatch.setattr(deadline_watchdog, "_session_phases", phases)
+    monkeypatch.setattr(deadline_watchdog, "_phases_config", object(), raising=False)
+    monkeypatch.setattr(deadline_watchdog, "_owned_session_directory", None)
+    monkeypatch.setattr(deadline_watchdog, "_directory_config", None, raising=False)
+    monkeypatch.delenv(deadline_watchdog.SESSION_DIRECTORY_VARIABLE, raising=False)
+    nested = SimpleNamespace(addinivalue_line=lambda *args: None)
+    try:
+        deadline_watchdog.pytest_configure(nested)
+        made = deadline_watchdog._owned_session_directory
+        deadline_watchdog.pytest_unconfigure(nested)
+        assert made is None
+        assert deadline_watchdog._session_phases is phases
+        phases.running("tests/test_x.py::test_outer (call)")
+        assert record.read_text(encoding="utf-8") == "tests/test_x.py::test_outer (call)"
+    finally:
+        monkeypatch.undo()
+        phases.close()
 
 
 def test_a_phase_that_finished_is_not_a_hang(request, tmp_path, monkeypatch):
