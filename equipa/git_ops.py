@@ -3021,7 +3021,7 @@ def configured_default_branch(repo_path: str | Path) -> str | None:
 
     Read from the dispatch config key ``project_default_branches``: a mapping
     of project root path to branch name, e.g.
-    ``{"/srv/forge-share/AI_Stuff/Equipa-repo": "main"}``. A path inside an
+    ``{"/srv/share/Equipa-repo": "main"}``. A path inside an
     agent worktree maps to its project root first. Returns None when the
     project has no entry.
 
