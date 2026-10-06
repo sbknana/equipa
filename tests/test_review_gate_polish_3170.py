@@ -36,11 +36,14 @@ from tests.host_timing import (
     GROWTH,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
-    GROWTH_RETRIES,
+    HOST_FACTOR_ENVIRONMENT_VARIABLE,
+    PER_UNIT_GROWTH_LIMIT,
+    TimingCheckFailed,
+    assert_linear_per_unit,
     assert_linear_time,
     budget,
     collector_paused,
-    growth_ratio,
+    host_calibration,
 )
 from tests.review_gate_production import blocked_by_the_gate
 from tests.review_gate_timing import median_cpu_seconds, timing_test
@@ -392,7 +395,8 @@ CI_SHAPE_RUN_BYTES = 1024 * 1024
 # on 3.10, at every size from 50 KB to 8 MB.
 CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE = 0.5
 # Linear work costs the same per megabyte at every size; the shared growth
-# check allows GROWTH_LIMIT for GROWTH times the input, so 2x per unit.
+# check allows GROWTH_LIMIT for GROWTH times the input, so 2x per unit
+# (``assert_linear_per_unit`` holds every size to it).
 CI_SHAPE_PER_MEGABYTE_LIMIT = GROWTH_LIMIT / GROWTH
 
 
@@ -415,28 +419,102 @@ def _ci_shape_seconds_per_megabyte(pattern, anchored, text):
     return statistics.median(runs) / (scans * megabytes)
 
 
+def _ci_shape_per_megabyte_at(pattern, anchored):
+    """``_ci_shape_seconds_per_megabyte`` of the CI shape at a size in KB."""
+    def seconds_per_megabyte(kilobytes):
+        text = CI_PREFIX + "`" * (kilobytes * 1024)
+        return _ci_shape_seconds_per_megabyte(pattern, anchored, text)
+    return seconds_per_megabyte
+
+
 @timing_test
 def test_the_ci_shape_is_linear_from_50kb_to_2mb():
     """_INLINE_CODE_RE on the shape CI flagged costs the same per megabyte
     at 50 KB, 200 KB and 2 MB (a quadratic regex costs 4x and 41x as much
     per megabyte at the larger sizes), within a host-calibrated budget.
-    Sizes run smallest first, each checked before the next is scanned; one
-    over the growth limit is measured again (keeping the faster time)
-    before it counts."""
+    Sizes run smallest first, each checked before the next is scanned.
+    Each pair (50 KB and a larger size) is settled under contention by the
+    shared helper: CI read 0.067 s per MB at 50 KB and 0.137 s at 200 KB
+    (2.04x) on Python 3.10 when only the larger size was measured again
+    (task 3185)."""
     pattern = loops._INLINE_CODE_RE
     anchored = _called_anchored_only("_INLINE_CODE_RE")
-    per_megabyte = {}
-    for kilobytes in CI_SHAPE_KILOBYTES:
-        text = CI_PREFIX + "`" * (kilobytes * 1024)
-        seconds = _ci_shape_seconds_per_megabyte(pattern, anchored, text)
-        assert seconds < budget(CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE), (
-            kilobytes, seconds)
-        smallest = per_megabyte.setdefault(CI_SHAPE_KILOBYTES[0], seconds)
-        for _ in range(GROWTH_RETRIES):
-            if growth_ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT:
-                break
-            seconds = min(seconds, _ci_shape_seconds_per_megabyte(
-                pattern, anchored, text))
-        per_megabyte[kilobytes] = seconds
-        assert growth_ratio(smallest, seconds) < CI_SHAPE_PER_MEGABYTE_LIMIT, (
-            per_megabyte)
+    assert_linear_per_unit(
+        _ci_shape_per_megabyte_at(pattern, anchored), CI_SHAPE_KILOBYTES,
+        CI_SHAPE_BUDGET_SECONDS_PER_MEGABYTE, "_INLINE_CODE_RE on the CI shape")
+
+
+def test_the_ci_shape_is_held_to_the_same_per_megabyte_limit():
+    """The shared per-unit check holds the CI shape to the 2x per megabyte
+    the hand-written check held it to: not weaker."""
+    assert PER_UNIT_GROWTH_LIMIT == CI_SHAPE_PER_MEGABYTE_LIMIT == 2.0
+
+
+class ScriptedPerUnit:
+    """``per_unit_at`` returning scripted readings per size, in order,
+    then the last one again; records the sizes in the order read."""
+
+    def __init__(self, readings):
+        self.readings = {size: list(values) for size, values in readings.items()}
+        self.calls = []
+
+    def __call__(self, size):
+        self.calls.append(size)
+        values = self.readings[size]
+        return values.pop(0) if len(values) > 1 else values[0]
+
+
+@pytest.fixture
+def unloaded(monkeypatch):
+    """A host that never needs its budget loosened: every reading here is
+    under its base budget, so the reference never decides."""
+    monkeypatch.setenv(HOST_FACTOR_ENVIRONMENT_VARIABLE, "1.0")
+    host_calibration.cache_clear()
+    yield
+    host_calibration.cache_clear()
+
+
+def test_the_ci_reading_is_settled_on_both_sizes_and_passes(unloaded):
+    """CI's readings (task 3185): 50 KB read 0.067 s per MB, 200 KB read
+    0.137 s three times. Measured again interleaved, a quieter 200 KB run
+    settles the pair as linear; the old check never measured 50 KB again
+    and failed at 2.04x."""
+    work = ScriptedPerUnit({50: [0.067], 200: [0.137, 0.137, 0.066],
+                            2048: [0.068]})
+
+    settled = assert_linear_per_unit(work, (50, 200, 2048), 0.5, "ci")
+
+    assert settled == {50: 0.067, 200: 0.066, 2048: 0.068}
+    assert work.calls[:2] == [50, 200]
+    assert work.calls[2:6] == [50, 200, 50, 200]
+
+
+@pytest.mark.parametrize("quarter_burst", [1.0, 2.0, 2.5, 3.0])
+def test_quadratic_work_per_unit_fails_whatever_burst_hides_it(
+        unloaded, quarter_burst):
+    """Quadratic work reads 4x per unit at 4 times the input. A burst that
+    inflated the first 50 KB reading 2.5-3x read 1.6x and 1.3x per unit,
+    under the 2x the hand-written check failed at; settled, the quieter
+    50 KB readings outrun it and the pair still fails."""
+    work = ScriptedPerUnit({50: [0.05 * quarter_burst, 0.05], 200: [0.2],
+                            2048: [2.0]})
+
+    with pytest.raises(TimingCheckFailed, match="superlinear per unit"):
+        assert_linear_per_unit(work, (50, 200, 2048), 10.0, "quadratic")
+
+    assert 2048 not in work.calls
+
+
+def test_a_size_over_its_budget_per_unit_fails_before_the_next_is_read(unloaded):
+    work = ScriptedPerUnit({50: [0.1], 200: [0.6], 2048: [0.1]})
+
+    with pytest.raises(TimingCheckFailed, match="over the budget"):
+        assert_linear_per_unit(work, (50, 200, 2048), 0.5, "budget")
+
+    assert work.calls == [50, 200]
+
+
+@pytest.mark.parametrize("sizes", [(50,), (200, 50), (50, 50, 200)])
+def test_per_unit_sizes_are_at_least_two_smallest_first(sizes):
+    with pytest.raises(ValueError):
+        assert_linear_per_unit(lambda size: 0.0, sizes, 0.5)

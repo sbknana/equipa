@@ -83,7 +83,13 @@ timing test checks two things through this module:
    so a burst falls on both sizes rather than on one size's whole run, and
    each size keeps its fastest reading: the minimum is the estimate of the
    work's cost the load inflated least. A later pair at the same sizes
-   starts from those readings (``_GrownReadings.settle``).
+   starts from those readings (``_GrownReadings.settle``). Tests that
+   choose their own sizes settle their pairs the same way: work timed per
+   unit of input at several sizes (``assert_linear_per_unit``) and scans
+   collecting every slow shape (``settled_growth``). A ratio compared by
+   hand on one reading of each size is decided by the load it ran under
+   (task 3185: CI read a linear scan at 0.067 s per MB at 50 KB and
+   0.137 s at 200 KB), and the timing meta-test flags it.
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
@@ -115,7 +121,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, Mapping, TypeVar
+from typing import Callable, Iterator, Mapping, Sequence, TypeVar
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
 
@@ -175,6 +181,10 @@ GROWTH_RETRIES = 2
 # reading (``_settled_readings``).
 BORDERLINE_GROWTH = 5.0
 BORDERLINE_RETRIES = 4
+# Work timed per unit of input reads the same at every size when linear.
+# ``assert_linear_per_unit`` holds it to the limit of one GROWTH step, per
+# unit: GROWTH_LIMIT for GROWTH times the input is this much per unit.
+PER_UNIT_GROWTH_LIMIT = GROWTH_LIMIT / GROWTH
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -822,6 +832,113 @@ def assert_linear_times(seconds_at: Callable[[int], Mapping[str, float]],
                          {part: f"{label}: {part}" for part in large},
                          base_budget_seconds * factor, factor,
                          grown.repetitions(small_size, size))
+
+
+@dataclass(frozen=True)
+class SettledGrowth:
+    """One pair of sizes a test measured itself, its readings settled under
+    contention (``settled_growth``): each the fastest of ``samples``
+    readings of its size, taken interleaved with the other size's."""
+
+    small_size: int
+    small_seconds: float
+    size: int
+    seconds: float
+    samples: int = 1
+    floor_seconds: float = GROWTH_FLOOR_SECONDS
+
+    @property
+    def ratio(self) -> float:
+        return growth_ratio(self.small_seconds, self.seconds, self.floor_seconds)
+
+
+def settled_growth(seconds_at: Callable[[int], float], small_size: int,
+                   size: int, small_seconds: float, seconds: float,
+                   floor_seconds: float = GROWTH_FLOOR_SECONDS
+                   ) -> SettledGrowth:
+    """The growth from ``small_size`` to ``size`` of work a test times at
+    sizes it chose itself (a scan of many shapes that collects every slow
+    one rather than failing at the first), settled the way every pair of
+    ``assert_linear_time`` is (``_settled_readings``, task 3184): over
+    ``GROWTH_LIMIT`` it is measured again ``GROWTH_RETRIES`` times, and
+    borderline ``BORDERLINE_RETRIES`` times, both sizes interleaved, each
+    keeping its fastest reading.
+
+    ``seconds_at(n)`` times the work at size ``n`` as the test does;
+    ``small_seconds`` and ``seconds`` are the readings the test already
+    took. The caller compares the result's ``ratio`` with ``GROWTH_LIMIT``
+    (task 3185: a ratio compared by hand on one reading of each size is the
+    load's verdict, not the work's)."""
+    part = "growth"
+    small, large, _, samples = _settled_readings(
+        _collector_paused_calls(lambda at_size: {part: seconds_at(at_size)}),
+        _Pair(small_size, size, 1.0, floor_seconds),
+        {part: small_seconds}, {part: seconds}, [part])
+    return SettledGrowth(small_size, small[part], size, large[part], samples,
+                         floor_seconds)
+
+
+def assert_linear_per_unit(per_unit_at: Callable[[int], float],
+                           sizes: Sequence[int], base_budget_seconds: float,
+                           label: str = "") -> dict[int, float]:
+    """Assert that the work ``per_unit_at`` times costs the same per unit of
+    input at every one of ``sizes`` (smallest first), within its
+    host-calibrated budget per unit; returns each size's settled reading.
+
+    ``per_unit_at(n)`` builds the shape at size ``n`` and returns the
+    seconds per unit of input its work took, measured so that every reading
+    is a run of the same length whatever the size (task 3175's CI shape: a
+    median of runs that each scan about a megabyte, over the megabytes
+    scanned), never one sub-millisecond call. Linear work reads the same at
+    every size; quadratic work reads ``n / sizes[0]`` times as much.
+
+    Each size is held to the budget at the factor measured around it
+    (``measure_under_load``), then, before the next size is read, to
+    ``PER_UNIT_GROWTH_LIMIT`` against the smallest size: the per-unit form
+    of one ``GROWTH`` step's ``GROWTH_LIMIT``. That pair is settled as every
+    growth pair is (``_settled_readings``): over the limit or borderline,
+    both sizes are measured again, interleaved, each keeping its fastest
+    reading, so a burst on either size does not decide alone (task 3185:
+    CI read 0.067 s per MB at 50 KB and 0.137 s at 200 KB on linear work,
+    the larger size measured again three times, the smaller never). The
+    smallest size keeps its settled reading for the next pair."""
+    if len(sizes) < 2 or list(sizes) != sorted(set(sizes)):
+        raise ValueError(
+            f"sizes {list(sizes)!r}: at least two, smallest first, each once")
+    per_unit_at = _collector_paused_calls(per_unit_at)
+
+    def read(at_size: int) -> float:
+        seconds, factor = measure_under_load(lambda: per_unit_at(at_size),
+                                             base_budget_seconds)
+        _check_budget(f"{label} (seconds per unit)", seconds, at_size,
+                      base_budget_seconds, factor)
+        return seconds
+
+    def as_one_step(larger_size: int) -> Callable[[int], dict[str, float]]:
+        """Readings with the larger size's scaled by GROWTH: linear work
+        then reads as one GROWTH step, held to GROWTH_LIMIT."""
+        def measure(at_size: int) -> dict[str, float]:
+            reading = per_unit_at(at_size)
+            return {label: reading * GROWTH if at_size == larger_size
+                    else reading}
+        return measure
+
+    smallest = sizes[0]
+    settled = {smallest: read(smallest)}
+    for size in sizes[1:]:
+        seconds = read(size)
+        small, large, over, samples = _settled_readings(
+            as_one_step(size),
+            _Pair(smallest, size, size / smallest, GROWTH_FLOOR_SECONDS),
+            {label: settled[smallest]}, {label: seconds * GROWTH}, [label])
+        settled[smallest], settled[size] = small[label], large[label] / GROWTH
+        if over:
+            fail(f"{label}: superlinear per unit: {settled[size]:.4f} s per "
+                 f"unit at size {size}, {settled[smallest]:.4f} s at size "
+                 f"{smallest} ({settled[size] / settled[smallest]:.2f}x, "
+                 f"limit {PER_UNIT_GROWTH_LIMIT}x; each the fastest of "
+                 f"{samples} interleaved readings): {settled}")
+    return settled
 
 
 def _check_growth(grown: _GrownReadings,
