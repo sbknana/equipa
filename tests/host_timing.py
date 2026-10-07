@@ -970,6 +970,13 @@ def _exponent_judged(grown: _GrownReadings,
     across 1 to 4 MB on a linear pattern). A step of GROWTH times or more
     per byte (a cliff, not a cache) still fails.
 
+    Three sizes cannot tell a cache step from superlinear work that stops
+    growing just past the pair: quadratic work capped (a window, an input
+    cap) under twice the pair's larger size reads 16x and then under
+    GROWTH, as a cache step does. A cap near the test's size is what the
+    test's own pair is held for, never on an exponent (IR78-01); only a
+    part that pair and every smaller grown pair passed reaches this.
+
     Without the third size (the shape does not exist there,
     ``InputTooLarge``) no exponent is measured and every part stays over:
     the pair decides alone, as before. Returns the parts still over and
