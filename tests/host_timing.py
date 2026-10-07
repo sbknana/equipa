@@ -127,7 +127,9 @@ timing test checks two things through this module:
    and passes. The test's own pair (IR78-01) and the pair the growth
    stopped at, at the test's sizes, never go by an exponent; nor does a
    pair whose third size does not exist (``InputTooLarge``): it decides
-   alone, as before.
+   alone, as before. The outer pair is read again only within
+   ``EXPONENT_SECONDS`` of the third size's first reading (superlinear
+   work makes it expensive); a part still over then stays over.
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
