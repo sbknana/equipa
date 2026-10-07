@@ -108,7 +108,11 @@ timing test checks two things through this module:
    fake growth) and holds it against the quarter size's fastest reading so
    far (a quieter quarter only raises the ratio). Superlinear work reads
    over the limit in every round and fails after ``CONFIRM_MAJORITY`` of
-   them; no floor, limit or budget moves.
+   them; no floor, limit or budget moves. A part the rounds clear keeps
+   its fastest round, the reading the next grown pair starts from
+   (R3188-02), and growth a first ratio over the limit stopped goes on
+   when the stop pair's settled readings would have grown it (R3188-01):
+   work superlinear only past the test's size is read there.
 
 6. **Growth exponent.** A GROWN pair still over the limit once confirmed
    is judged on its growth exponent over three sizes before it fails
@@ -1369,7 +1373,10 @@ def _check_growth(grown: _GrownReadings,
     3. The pair the growth stopped at breaks the growth check of task 3178
        (``grows_further``): against ``GROWTH_FLOOR_SECONDS``, or main's
        floor where the shape does not exist at the next size; at grown
-       sizes its exponent decides as in 2.
+       sizes its exponent decides as in 2. When it passes on settled
+       readings that ``grows_further`` would grow from (its first ratio
+       over the limit stopped the growth), the growth goes on from them
+       (R3188-01) and 2 and 3 apply to the pairs past it.
 
     Each pair over the limit is measured again before it fails, and a
     borderline one before it passes (``_settled_readings``); one still over
