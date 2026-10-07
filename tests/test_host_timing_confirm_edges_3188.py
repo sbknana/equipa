@@ -248,11 +248,11 @@ def _series(readings: Mapping[int, list[float]],
     return seconds_at
 
 
-def test_the_stop_pair_decides_on_the_cleared_pairs_median_round():
+def test_the_stop_pair_decides_on_the_cleared_pairs_fastest_round():
     """Two of five rounds over the limit clear the own pair, which writes
-    its median round back. The pair the growth stops at (the same sizes
-    here) decides on those readings: linear, with no measurement and no
-    confirmation of its own."""
+    its fastest round back (task 3191, R3188-02). The pair the growth stops
+    at (the same sizes here) decides on those readings: linear, with no
+    measurement and no confirmation of its own."""
     quiet_quarter, quadratic, linear = 0.03, 0.48, 0.12
     rounds = [True, False, True, False, False]
     assert len(rounds) == CONFIRM_ROUNDS

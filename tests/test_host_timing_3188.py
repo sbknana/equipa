@@ -208,7 +208,7 @@ def test_a_pair_fails_only_when_most_rounds_read_over_the_limit(
     if confirmed:
         assert pair.seconds == pytest.approx(QUADRATIC_LARGE)
     else:
-        # The median round's reading: linear, as most rounds read.
+        # The fastest round's reading: linear, as most rounds read.
         assert pair.seconds == pytest.approx(LINEAR_LARGE)
 
 
