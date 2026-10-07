@@ -874,9 +874,12 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     after it: with no round read a part stays over (fail closed).
 
     A part over the limit in a majority of the rounds stays over, on its
-    settled readings; any other is kept on the reading of its median round,
-    which is under the limit. Returns the readings, the parts still over and
-    each confirmed part's ``Confirmation``."""
+    settled readings; any other is kept on the reading of its fastest
+    round, which is under the limit as most rounds read (R3188-02: the
+    median round handed the next grown pair an inflated quarter reading,
+    and a later pair 9.5x over the fastest reading passed at 7.1x). Returns
+    the readings, the parts still over and each confirmed part's
+    ``Confirmation``."""
     small, large = dict(small), dict(large)
     quarter_total = pair.repetitions * max(min(small[part] for part in over),
                                            1e-6)
@@ -922,9 +925,9 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     still_over = [part for part in over if confirmations[part].confirmed]
     for part in over:
         if part not in still_over:
-            # The median round: under the limit, as most rounds read.
-            ordered = sorted(larger_by_round[part])
-            large[part] = ordered[len(ordered) // 2]
+            # The fastest round: under the limit, as most rounds read, and
+            # the estimate the load inflated least (R3188-02).
+            large[part] = min(larger_by_round[part])
     return small, large, still_over, confirmations
 
 
@@ -1076,7 +1079,7 @@ class LinearTiming:
     # interleaved with the other size's (``_settled_readings``).
     samples: int = 1
     # The confirming rounds when the settled readings were over the limit
-    # (``_confirmed``); a part they did not confirm keeps its median round.
+    # (``_confirmed``); a part they did not confirm keeps its fastest round.
     confirmation: Confirmation | None = None
     # The growth exponent over three sizes of a grown pair the confirming
     # rounds kept over the limit (``_exponent_judged``): a part it does not
@@ -1252,7 +1255,7 @@ def settled_growth(seconds_at: Callable[[int], float], small_size: int,
     borderline ``BORDERLINE_RETRIES`` times, both sizes interleaved, each
     keeping its fastest reading; still over, it is confirmed
     (``_confirmed``), and the readings of a pair a majority of the
-    confirming rounds did not read over the limit are its median round's.
+    confirming rounds did not read over the limit are its fastest round's.
 
     ``seconds_at(n)`` times the work at size ``n`` as the test does;
     ``small_seconds`` and ``seconds`` are the readings the test already
@@ -1444,6 +1447,8 @@ def _check_growth(grown: _GrownReadings,
     # 2. Growth (task 3178), every grown pair held to the growth limit.
     small_size, size, input_growth = test_small_size, test_size, 1.0
     floor_seconds = GROWTH_FLOOR_SECONDS
+    # The shape does not exist at the next size: the input never grows again.
+    exhausted = False
 
     def growing_parts() -> list[str]:
         small_times, large_times = grown.at(small_size), grown.at(size)
@@ -1451,32 +1456,43 @@ def _check_growth(grown: _GrownReadings,
                 if grows_further(small_times[part], large_times[part],
                                  input_growth)]
 
-    while growing := growing_parts():
-        # The step every growing part needs: the one whose larger reading
-        # is smallest sets it.
-        quarter_size = _grow_step(grown, size, next_quarter_size(
-            size, min(grown.at(size)[part] for part in growing),
-            test_small_size * MAX_INPUT_GROWTH))
-        if quarter_size is None:
-            # The shape does not exist at the next size (a 200 KB review
-            # grown 16x passes the gate's 2 MB artifact cap): decided here
-            # with main's floor, under which a larger reading of 16 ms
-            # that grew 16x fails (IR75-01 without growing).
-            floor_seconds = DETECTION_FLOOR_SECONDS
-            break
-        small_size, size = quarter_size, quarter_size * GROWTH
-        input_growth = small_size / test_small_size
-        # Against the floor task 3178 held grown sizes to: main never
-        # measured them, and a quarter reading under 20 ms there is no
-        # steadier than at the test's sizes (3138's pattern 22 read 5.9 ms
-        # then 75.5 ms at 5.5 times its input under a full xdist run, where
-        # 3178 grew on and passed it). Over the limit there, the growth
-        # exponent over three sizes decides (task 3191).
-        held(_Pair(small_size, size, input_growth, GROWTH_FLOOR_SECONDS),
-             grown_sizes=True)
+    while True:
+        while not exhausted and (growing := growing_parts()):
+            # The step every growing part needs: the one whose larger
+            # reading is smallest sets it.
+            quarter_size = _grow_step(grown, size, next_quarter_size(
+                size, min(grown.at(size)[part] for part in growing),
+                test_small_size * MAX_INPUT_GROWTH))
+            if quarter_size is None:
+                # The shape does not exist at the next size (a 200 KB
+                # review grown 16x passes the gate's 2 MB artifact cap):
+                # decided here with main's floor, under which a larger
+                # reading of 16 ms that grew 16x fails (IR75-01 without
+                # growing).
+                floor_seconds = DETECTION_FLOOR_SECONDS
+                exhausted = True
+                break
+            small_size, size = quarter_size, quarter_size * GROWTH
+            input_growth = small_size / test_small_size
+            # Against the floor task 3178 held grown sizes to: main never
+            # measured them, and a quarter reading under 20 ms there is no
+            # steadier than at the test's sizes (3138's pattern 22 read
+            # 5.9 ms then 75.5 ms at 5.5 times its input under a full xdist
+            # run, where 3178 grew on and passed it). Over the limit there,
+            # the growth exponent over three sizes decides (task 3191).
+            held(_Pair(small_size, size, input_growth, GROWTH_FLOOR_SECONDS),
+                 grown_sizes=True)
 
-    # 3. The pair the growth stopped at, as task 3178 decided it; at the
-    # test's own sizes (no growth) exactly as before, never on an exponent.
-    return held(_Pair(small_size, size, input_growth, floor_seconds),
-                grown_sizes=(small_size, size) != (test_small_size,
-                                                   test_size))
+        # 3. The pair the growth stopped at, as task 3178 decided it; at the
+        # test's own sizes (no growth) exactly as before, never on an
+        # exponent.
+        stopped = held(_Pair(small_size, size, input_growth, floor_seconds),
+                       grown_sizes=(small_size, size) != (test_small_size,
+                                                          test_size))
+        # Growth that stopped on a first ratio over the limit ("the retries
+        # decide it") goes on when the stop pair's settled readings, or the
+        # fastest round of a pair its confirming rounds cleared, would have
+        # grown (R3188-01): work superlinear only past that pair is read
+        # there, not passed on the readings that cleared it.
+        if exhausted or not growing_parts():
+            return stopped

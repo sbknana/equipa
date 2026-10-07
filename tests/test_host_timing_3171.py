@@ -476,10 +476,15 @@ def test_one_descheduled_run_is_measured_again():
     def seconds_at(size: int) -> float:
         if size == 40_000:
             return next(spikes, 0.04)
-        return 0.01
+        return 0.01 * size / 10_000     # linear work
 
     timing = assert_linear_time(seconds_at, 40_000, 0.5, "spike")
-    assert timing.seconds == pytest.approx(0.04)
+    # The spike is measured again and settles at 0.04 s; the input then
+    # grows from that reading as it would have without the spike (task
+    # 3191, R3188-01), and linear work grows 4x there.
+    assert (timing.small_size, timing.small_seconds) == (
+        40_000, pytest.approx(0.04))
+    assert timing.ratio == pytest.approx(GROWTH)
 
 
 def test_work_below_the_floor_passes_the_growth_check():
