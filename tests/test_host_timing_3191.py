@@ -395,13 +395,18 @@ def _linear_units(target_seconds: float) -> int:
     return units
 
 
-def _real_stepped(step_from: int, step: int) -> Callable[[int], float]:
+def _real_stepped(step_from: int, step: int,
+                  quadratic_over: int = 0) -> Callable[[int], float]:
     """CPU seconds of real linear work, each unit ``step`` times as costly
-    past ``step_from`` units (the loop run ``step`` times): a cache step."""
+    past ``step_from`` units (the loop run ``step`` times): a cache step.
+    With ``quadratic_over`` the work at ``units`` is ``units ** 2 /
+    quadratic_over`` units instead: the same step on quadratic work, which
+    reads the same as the linear work at ``quadratic_over`` units."""
     def seconds_at(units: int) -> float:
+        work = units * units // quadratic_over if quadratic_over else units
         started = time.process_time()
         for _ in range(step if units > step_from else 1):
-            _linear_work(units)
+            _linear_work(work)
         return time.process_time() - started
 
     return seconds_at
@@ -421,3 +426,16 @@ def test_real_linear_work_with_a_3x_step_passes(monkeypatch, judged):
         assert failure is None, str(failure)
     else:
         assert failure is not None and "superlinear growth" in str(failure)
+
+
+def test_real_quadratic_work_with_the_same_step_fails():
+    """The same real work made quadratic (about 25 ms at the test's size,
+    under 2 ms at its quarter, the same 3x step past twice the size) fails
+    at the test's own pair as before (IR78-01), never on an exponent."""
+    units = _linear_units(0.025)
+    with pytest.raises(TimingCheckFailed,
+                       match=r"superlinear growth: real quadratic step: .* "
+                             r"at 1x the test's input") as failure:
+        assert_linear_time(_real_stepped(2 * units, 3, quadratic_over=units),
+                           units, 30.0, "real quadratic step")
+    assert "growth exponent" not in str(failure.value)
