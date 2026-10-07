@@ -102,7 +102,8 @@ def _wall_clock(monkeypatch: pytest.MonkeyPatch) -> _WallClock:
 
 def _without_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
     """The check before task 3188: a pair still over once settled fails."""
-    def unconfirmed(measure, pair, small, large, over):
+    def unconfirmed(measure, pair, small, large, over, deadline=None,
+                    reread_seconds=0.0):
         return dict(small), dict(large), list(over), {}
 
     monkeypatch.setattr(host_timing, "_confirmed", unconfirmed)

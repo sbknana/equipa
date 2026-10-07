@@ -335,6 +335,76 @@ def test_a_burst_on_the_third_size_is_settled(monkeypatch):
     assert not burst["left"]
 
 
+# --- What reading the third size may cost --------------------------------------
+
+
+def _taking_wall_time(clock, seconds_at: Callable[[int], float]
+                      ) -> Callable[[int], float]:
+    """``seconds_at`` whose every call also takes its reading of wall time
+    on the scripted clock (``_build_clock``)."""
+    def timed(size: int) -> float:
+        seconds = seconds_at(size)
+        clock.now += seconds
+        return seconds
+
+    return timed
+
+
+def test_a_burst_on_a_third_size_of_seconds_is_settled_within_the_budget(
+        monkeypatch):
+    """CI's case on the wall clock: a third size reading 1.44 s (a 3x step
+    past the pair), its first reading inflated 2x by a burst. Reading it
+    again fits ``EXPONENT_SECONDS``, so the fastest reading decides and
+    the cache step passes."""
+    clock = _build_clock(monkeypatch)
+    step_from = _step_inside_the_first_grown_pair(0.03)
+    quiet = _stepped(0.03, SIZE, step_from, 3.0)
+    third = GROWTH ** 2 * _first_grown_quarter(SIZE, 0.03)
+    assert quiet(third) == pytest.approx(1.44)
+    burst = {"left": 1}
+
+    def seconds_at(size: int) -> float:
+        if size == third and burst["left"]:
+            burst["left"] -= 1
+            return 2 * quiet(size)
+        return quiet(size)
+
+    timing = assert_linear_time(_taking_wall_time(clock, seconds_at), SIZE,
+                                BUDGET_SECONDS, "burst")
+    assert timing.exponent is not None and not timing.exponent.superlinear
+    assert timing.exponent.larger_seconds == pytest.approx(quiet(third))
+
+
+@pytest.mark.parametrize("budgeted", (True, False),
+                         ids=["3191", "without-budget"])
+def test_an_expensive_third_size_is_not_read_past_the_budget(monkeypatch,
+                                                            budgeted):
+    """Work quadratic past the test's size reads 7.68 s at the third size:
+    one more reading would end past ``EXPONENT_SECONDS``, so it is read
+    once and the part fails closed with no confirming round; without the
+    budget it is read again to settle and confirm."""
+    clock = _build_clock(monkeypatch)
+    if not budgeted:
+        monkeypatch.setattr(host_timing, "EXPONENT_SECONDS", math.inf)
+    calls: list[int] = []
+    late = _stepped(0.03, SIZE, SIZE, 1.0, power=2, power_from=SIZE,
+                    calls=calls)
+    third = GROWTH ** 2 * _first_grown_quarter(SIZE, 0.03)
+    assert late(third) == pytest.approx(7.68)
+    calls.clear()
+    with pytest.raises(TimingCheckFailed,
+                       match=r"growth exponent .*: superlinear") as failure:
+        assert_linear_time(_taking_wall_time(clock, late), SIZE,
+                           BUDGET_SECONDS, "late quadratic")
+    if budgeted:
+        assert calls.count(third) == 1
+        assert ("no confirming round fitted the time left, so the pair "
+                "stays over the limit (fail closed)" in str(failure.value))
+    else:
+        assert calls.count(third) > 1
+        assert "fail closed" not in str(failure.value)
+
+
 # --- The test's own pair, and no third size ----------------------------------
 
 

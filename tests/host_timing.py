@@ -268,6 +268,14 @@ CONFIRM_ROUND_SECONDS = 1.0
 # least GROWTH_LIMIT ** 2 (the limit of both steps, an exponent of 1.5).
 GROWTH_EXPONENT_LIMIT = math.log(GROWTH_LIMIT) / math.log(GROWTH)
 EXPONENT_STEPS = 2
+# The outer pair is read again (settled and confirmed) only while one more
+# re-reading ends within this many seconds of the third size's first
+# reading; a part still over the limit when it does not stays over (fail
+# closed, as before task 3191). Work quadratic past the test's size read
+# about 10 s at its third size and took 69 s to fail on six readings of it
+# (6 s without the exponent); a cache step's third size (CI's 16 MB, about
+# 1 s) is read again in full.
+EXPONENT_SECONDS = 15.0
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -710,6 +718,9 @@ class Confirmation:
         return self.rounds == 0 or 2 * self.rounds_over > self.rounds
 
     def describe(self) -> str:
+        if self.rounds == 0:
+            return ("confirmed: no confirming round fitted the time left, "
+                    "so the pair stays over the limit (fail closed)")
         verdict = "confirmed" if self.confirmed else "not confirmed"
         return (f"{verdict}: over the limit in {self.rounds_over} of "
                 f"{self.rounds} confirming rounds of {self.readings} "
@@ -742,10 +753,18 @@ class _Pair:
         return BORDERLINE_GROWTH ** self.steps
 
 
+def _within(deadline: float | None, reread_seconds: float) -> bool:
+    """Whether one more re-reading of a pair, taking ``reread_seconds`` as
+    the last one did, ends by ``deadline`` (``time.monotonic``; None: the
+    pair has no deadline)."""
+    return deadline is None or time.monotonic() + reread_seconds <= deadline
+
+
 def _settled_readings(measure: Callable[[int], Mapping[str, float]],
                       pair: _Pair, small: Mapping[str, float],
                       large: Mapping[str, float], parts: list[str],
-                      samples: int = 1
+                      samples: int = 1, deadline: float | None = None,
+                      reread_seconds: float = 0.0
                       ) -> tuple[dict[str, float], dict[str, float],
                                  list[str], int, dict[str, Confirmation]]:
     """The parts over the growth limit at ``pair`` (``pair.limit``:
@@ -776,6 +795,10 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
     A part still over the limit then is confirmed (``_confirmed``) and
     counts as over only when a majority of the confirming rounds read over
     the limit too.
+    With a ``deadline`` (the outer pair of a growth exponent,
+    ``EXPONENT_SECONDS``) no re-reading starts that would end after it,
+    ``reread_seconds`` being what reading both sizes once last took; a part
+    still over then stays over (``_confirmed`` reads no round: fail closed).
     Returns the readings kept, the parts still over, how many readings of
     each size the minimum was taken over and the confirmation of each part
     that was confirmed."""
@@ -805,14 +828,17 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
             retries = 0
         if over:
             retries = max(retries, pair.over_retries)
-        if retries_done >= retries:
+        if retries_done >= retries or not _within(deadline, reread_seconds):
             confirmations: dict[str, Confirmation] = {}
             if over:
                 small, large, over, confirmations = _confirmed(
-                    measure, pair, small, large, over)
+                    measure, pair, small, large, over, deadline,
+                    reread_seconds)
             return small, large, over, 1 + retries_done, confirmations
+        started = time.monotonic()
         small_again, large_again = _interleaved_means(
             measure, pair.small_size, pair.size, pair.repetitions)
+        reread_seconds = time.monotonic() - started
         for part in small:
             small[part] = min(small[part], small_again[part])
             large[part] = min(large[part], large_again[part])
@@ -821,7 +847,8 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
 
 def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
                small: Mapping[str, float], large: Mapping[str, float],
-               over: list[str]
+               over: list[str], deadline: float | None = None,
+               reread_seconds: float = 0.0
                ) -> tuple[dict[str, float], dict[str, float], list[str],
                           dict[str, Confirmation]]:
     """Confirm the parts ``over`` the limit at ``pair`` on their settled
@@ -840,7 +867,9 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     afresh; the quarter keeps its fastest reading through the rounds, since
     a quieter quarter can only raise the ratio, and a round deciding on a
     quarter it read loaded would clear a regression (R3184-03). The rounds
-    stop once every part has a majority either way.
+    stop once every part has a majority either way, and with a
+    ``deadline`` (``_settled_readings``) before a round that would end
+    after it: with no round read a part stays over (fail closed).
 
     A part over the limit in a majority of the rounds stays over, on its
     settled readings; any other is kept on the reading of its median round,
@@ -865,17 +894,18 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
         return max(read_over, read_under) >= CONFIRM_MAJORITY
 
     rounds = 0
-    while rounds < CONFIRM_ROUNDS and not all(map(decided, over)):
+    while (rounds < CONFIRM_ROUNDS and not all(map(decided, over))
+           and _within(deadline, reread_seconds)):
         round_large = {part: math.inf for part in over}
         reading = 0
         while reading < readings:
             started = time.monotonic()
             small_again, large_again = _interleaved_means(
                 measure, pair.small_size, pair.size, pair.repetitions)
+            reread_seconds = max(time.monotonic() - started, 1e-9)
             if rounds == 0 and reading == 0:
-                cost = max(time.monotonic() - started, 1e-9)
                 readings = max(1, min(
-                    wanted, 1 + int(CONFIRM_ROUND_SECONDS / cost)))
+                    wanted, 1 + int(CONFIRM_ROUND_SECONDS / reread_seconds)))
             for part in over:
                 small[part] = min(small[part], small_again[part])
                 round_large[part] = min(round_large[part], large_again[part])
@@ -970,6 +1000,11 @@ def _exponent_judged(grown: _GrownReadings,
     across 1 to 4 MB on a linear pattern). A step of GROWTH times or more
     per byte (a cliff, not a cache) still fails.
 
+    The outer pair is read again only within ``EXPONENT_SECONDS`` of the
+    third size's first reading, which work superlinear past the test's
+    size makes expensive: a part still over when no more fits stays over
+    (fail closed), as it would without the third size.
+
     Three sizes cannot tell a cache step from superlinear work that stops
     growing just past the pair: quadratic work capped (a window, an input
     cap) under twice the pair's larger size reads 16x and then under
@@ -983,6 +1018,7 @@ def _exponent_judged(grown: _GrownReadings,
     each judged part's ``GrowthExponent``; the readings settled at the
     outer pair's sizes are kept in ``grown``."""
     larger_size = pair.size * GROWTH
+    started = time.monotonic()
     if not _grown_further(grown, larger_size):
         return over, {}
     outer = _Pair(pair.small_size, larger_size, pair.input_growth,
@@ -992,7 +1028,9 @@ def _exponent_judged(grown: _GrownReadings,
                         grown.samples[larger_size])
     outer_small, outer_large, still_over, samples, confirmations = (
         _settled_readings(measure, outer, small, grown.at(larger_size),
-                          over, first_samples))
+                          over, first_samples, started + EXPONENT_SECONDS,
+                          grown.costs[pair.small_size]
+                          + grown.costs[larger_size]))
     for at_size, readings in ((pair.small_size, outer_small),
                               (larger_size, outer_large)):
         grown.settle(at_size, readings,
