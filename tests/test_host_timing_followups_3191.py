@@ -80,14 +80,17 @@ def _chain(past_the_test: float, calls: list[int]) -> Callable[[int], float]:
 
 def test_work_quadratic_past_a_cleared_stop_pair_fails():
     """Before the fix this passed at the test's sizes (3.0x against the
-    floor once the burst settled) with no grown size read."""
+    floor once the burst settled) with no grown size read. It fails at the
+    grown pair, 16x: over what a cache step reads, so the size past it is
+    not read for an exponent (R3191-03)."""
     calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
                        match=r"superlinear growth: chain: 0\.9600 s at size "
-                             rf"{GROWN}.*growth exponent .*: superlinear"):
+                             rf"{GROWN}") as failure:
         assert_linear_time(_chain(GROWTH ** 2, calls), SIZE, BUDGET_SECONDS,
                            "chain")
-    assert GROWN in calls and THIRD in calls
+    assert "growth exponent" not in str(failure.value)
+    assert GROWN in calls and THIRD not in calls
 
 
 def test_linear_work_past_a_cleared_stop_pair_passes():

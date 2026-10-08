@@ -306,17 +306,17 @@ def test_a_constant_factor_step_past_the_tests_size_is_not_growth():
 
 def test_a_grown_pair_over_the_limit_against_the_growth_floor_still_fails():
     """The control: the same cliff 40 times steep is over the limit at the
-    first grown pair even against the 20 ms floor, and fails there. Its
-    growth exponent over that pair and the size 4 times past it (task 3191)
-    is superlinear too: a step of 4 times or more per unit is a cliff, not
-    a cache."""
+    first grown pair even against the 20 ms floor, and fails there. A step
+    of 4 times or more per unit is a cliff, not a cache: its first step is
+    over what a cache step reads (``EXPONENT_MAX_FIRST_STEP``), so the size
+    4 times past the pair is never read for an exponent (R3191-03)."""
     calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth.*floor 0\.02 s.*"
-                             r"growth exponent .*: superlinear"):
+                       match=r"superlinear growth.*floor 0\.02 s") as failure:
         assert_linear_time(_cliff_seconds_at([0.0174], 40.0, calls),
                            CLIFF_TEST_SIZE, 10.0, "steep cliff")
-    assert max(calls) <= GROWTH * GROWTH * host_timing.next_quarter_size(
+    assert "growth exponent" not in str(failure.value)
+    assert max(calls) <= GROWTH * host_timing.next_quarter_size(
         CLIFF_TEST_SIZE, 0.0174, CLIFF_TEST_SIZE // GROWTH
         * host_timing.MAX_INPUT_GROWTH)
 
