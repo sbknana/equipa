@@ -434,6 +434,82 @@ def test_a_settling_reading_is_inflated_over_the_limit_of_its_quarter(
         quarter_seconds, host_timing.DETECTION_FLOOR_SECONDS)
 
 
+# Scripted readings of the settling burst (task 3208): linear work reading
+# 3 ms at the quarter size and 4x that per GROWTH step, each call paying
+# BURST_CALL_WALL_SECONDS on the wall clock.
+BURST_QUARTER_SECONDS = 0.003
+BURST_CALL_WALL_SECONDS = 0.01
+
+
+def _settling_burst(monkeypatch: pytest.MonkeyPatch,
+                    inflation: Callable[[float, float], float],
+                    quiet_at: int, quiet_share: float
+                    ) -> tuple[TimingCheckFailed | None, bool]:
+    """The check on scripted linear work whose ``quiet_at``-th quarter
+    reading reads ``quiet_share`` of its cost (a quiet spell), every larger
+    reading raised to ``inflation(last, fastest)`` of the quarter readings
+    so far until confirmation starts. Returns the check's failure (None
+    when it passed) and whether it reached its confirming rounds."""
+    clock = _wall_clock(monkeypatch)
+    state = {"confirming": False, "quarters": 0, "last": 0.0,
+             "fastest": float("inf")}
+    original = host_timing._confirmed
+
+    def confirm(*args, **kwargs):
+        state["confirming"] = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_timing, "_confirmed", confirm)
+
+    def seconds_at(size: int) -> float:
+        clock.now += BURST_CALL_WALL_SECONDS
+        if size == QUARTER:
+            state["quarters"] += 1
+            reading = BURST_QUARTER_SECONDS * (
+                quiet_share if state["quarters"] == quiet_at else 1.0)
+            state["last"] = reading
+            state["fastest"] = min(state["fastest"], reading)
+            return reading
+        linear = BURST_QUARTER_SECONDS * size / QUARTER
+        if state["confirming"]:
+            return linear
+        return max(linear, inflation(state["last"], state["fastest"]))
+
+    failure = timing_failure(lambda: assert_linear_time(
+        seconds_at, SIZE, 30.0, "scripted settling burst"))
+    return failure, state["confirming"]
+
+
+@pytest.mark.parametrize("quiet_share", (1.0, 0.4, 0.25))
+@pytest.mark.parametrize("quiet_at", (1, 2, 4))
+def test_a_quiet_quarter_reading_still_reaches_the_confirming_rounds(
+        monkeypatch, quiet_at, quiet_share):
+    """Task 3208, scripted: each larger reading inflated to
+    ``_settling_delay`` of the quarter reading right before it reads
+    GROWTH ** 2 over that pair, so a quarter read short at any point of
+    the settling leaves the own pair over the limit: the check reaches its
+    confirming rounds and passes the linear work there."""
+    failure, confirming = _settling_burst(
+        monkeypatch, lambda last, fastest: _settling_delay(last), quiet_at,
+        quiet_share)
+    assert confirming
+    assert failure is None, str(failure)
+
+
+@pytest.mark.parametrize("quiet_at", (1, 2, 4))
+def test_inflating_over_the_fastest_quarter_misses_the_confirming_rounds(
+        monkeypatch, quiet_at):
+    """The control, CI's premise-guard failure: inflated to GROWTH ** 2
+    times the quarter's FASTEST reading (the proof before task 3208), one
+    quarter read at a quarter of its cost lowers every later larger
+    reading, and the own pair settles under the limit unconfirmed."""
+    failure, confirming = _settling_burst(
+        monkeypatch, lambda last, fastest: GROWTH ** 2 * fastest, quiet_at,
+        0.25)
+    assert not confirming
+    assert failure is None, str(failure)
+
+
 @pytest.mark.parametrize("confirming", (True, False),
                          ids=["confirmed", "before-3188"])
 def test_real_linear_work_with_every_settling_reading_inflated(
