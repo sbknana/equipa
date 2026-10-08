@@ -409,19 +409,37 @@ def _spin_cpu_until(started: float, seconds: float) -> None:
         pass
 
 
+def _settling_delay(quarter_seconds: float) -> float:
+    """The CPU time a larger reading is spun out to before confirmation
+    starts: GROWTH ** 2 times the quarter reading taken right before it,
+    and never under GROWTH ** 2 times main's floor, the most the test's
+    own pair raises a quarter reading to (``own_pair_floor``)."""
+    return GROWTH ** 2 * max(quarter_seconds,
+                             host_timing.DETECTION_FLOOR_SECONDS)
+
+
 @pytest.mark.parametrize("confirming", (True, False),
                          ids=["confirmed", "before-3188"])
 def test_real_linear_work_with_every_settling_reading_inflated(
         monkeypatch, confirming):
     """Real linear work reading about 3 ms at the quarter size, every
-    larger reading inflated to 16 times the quarter's fastest until
-    confirmation starts (the CI shape: a burst over the first reading and
-    both retries of the limit, here wide enough that a loaded quarter
-    cannot hide it). The check before task 3188 fails it; confirmed, it
-    passes."""
+    larger reading inflated until confirmation starts (the CI shape: a
+    burst over the first reading and both retries of the limit, here wide
+    enough that a loaded quarter cannot hide it). The check before task
+    3188 fails it; confirmed, it passes.
+
+    The inflation is a real, timed delay (task 3208): each larger reading
+    spins out to ``_settling_delay`` of the quarter reading taken right
+    before it. Every reading and every mean the check settles on pairs a
+    quarter reading with the larger one after it (``_interleaved_means``),
+    so each settled pair reads at least GROWTH ** 2 times over and the own
+    pair reaches its confirming rounds on any runner. Inflating to 16
+    times the quarter's FASTEST reading did not: on CI one quiet-spell
+    quarter reading dragged the inflation under the limit of the means,
+    the pair passed unconfirmed and the premise guard tripped."""
     units = _linear_units(0.012)
     quarter = units // GROWTH
-    state = {"confirming": False, "quarter": float("inf")}
+    state = {"confirming": False, "quarter": 0.0, "inflated": 0}
     if confirming:
         original = host_timing._confirmed
 
@@ -438,14 +456,19 @@ def test_real_linear_work_with_every_settling_reading_inflated(
         _linear_work(size)
         if size == quarter:
             elapsed = time.process_time() - started
-            state["quarter"] = min(state["quarter"], elapsed)
+            state["quarter"] = elapsed
             return elapsed
         if not state["confirming"]:
-            _spin_cpu_until(started, GROWTH ** 2 * state["quarter"])
+            delay = _settling_delay(state["quarter"])
+            _spin_cpu_until(started, delay)
+            elapsed = time.process_time() - started
+            state["inflated"] += 1
+            return elapsed
         return time.process_time() - started
 
     failure = timing_failure(lambda: assert_linear_time(
         seconds_at, units, 30.0, "linear under a settling burst"))
+    assert state["inflated"], "no larger reading was inflated"
     if confirming:
         assert failure is None, str(failure)
         assert state["confirming"]
