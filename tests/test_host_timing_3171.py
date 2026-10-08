@@ -814,6 +814,43 @@ def planted_band(target_seconds: float) -> tuple[float, float]:
             min(0.159, target_seconds * 4 / 3))
 
 
+# The fastest reading at the test's size a planted proof must reach: clearly
+# above the GROWTH_FLOOR_SECONDS noise floor (task 3208). CI run 1 of PR #44
+# planted 0.0190 s and 0.0181 s at the 20 ms target, their fastest readings
+# 14 ms (under the 16 ms main's floor catches), and the check rightly left
+# them unjudged: the proofs failed on a plant, not on the check.
+PLANT_FLOOR_SECONDS = 1.1 * GROWTH_FLOOR_SECONDS
+# The lowest target a plant calibrates to, so that its readings land above
+# PLANT_FLOOR_SECONDS on a runner whose fastest reading is a quarter under
+# its median; and the highest a plant re-calibrates up to, the top proof's
+# target (the band then stays inside 16-159 ms).
+PLANT_LOWEST_TARGET = 1.5 * GROWTH_FLOOR_SECONDS
+PLANT_HIGHEST_TARGET = 0.12
+
+
+def plant_target(target_seconds: float,
+                 fastest_seconds: float | None = None) -> float:
+    """The target a proof aiming at ``target_seconds`` calibrates its plant
+    to (task 3208): at least PLANT_LOWEST_TARGET. After a plant whose
+    fastest reading at the test's size, ``fastest_seconds``, missed
+    PLANT_FLOOR_SECONDS, re-calibrated up by the share that reading fell
+    short of PLANT_LOWEST_TARGET, never past PLANT_HIGHEST_TARGET."""
+    target = max(target_seconds, PLANT_LOWEST_TARGET)
+    if fastest_seconds is not None and fastest_seconds < PLANT_FLOOR_SECONDS:
+        target = max(target, min(PLANT_HIGHEST_TARGET, target
+                                 * PLANT_LOWEST_TARGET
+                                 / max(fastest_seconds, 1e-6)))
+    return target
+
+
+def planted_over_the_floor(fastest_seconds: float, units: int) -> str:
+    """The message of a plant whose fastest reading at ``units`` units
+    stayed under PLANT_FLOOR_SECONDS (``plant_target``)."""
+    return (f"the fastest planted reading {fastest_seconds:.4f} s at {units} "
+            f"units stayed under the {PLANT_FLOOR_SECONDS:.4f} s a plant must "
+            f"clear on this host")
+
+
 def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
     """The ``TimingCheckFailed`` ``check()`` raised, or None if it passed."""
     try:
@@ -835,10 +872,16 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
     Task 3180: the proof must plant what it claims on any host. The size
     is calibrated on the work itself, the reading at the test's size is
     recorded, and the test asserts it landed in the band (re-planted up to
-    three times) before asserting the check failed on it."""
-    lower, upper = planted_band(target_seconds)
+    three times) before asserting the check failed on it.
+
+    Task 3208: the plant clears the noise floor. The 20 ms proof plants at
+    ``plant_target`` (30 ms), and every reading at the test's size, the
+    fastest the check settles on included, must reach PLANT_FLOOR_SECONDS;
+    a plant under it is re-calibrated up within the three plants."""
+    target = plant_target(target_seconds)
     for _ in range(3):
-        units = _units_reading(target_seconds)
+        lower, upper = planted_band(target)
+        units = _units_reading(target)
         readings: dict[int, list[float]] = {}
 
         def seconds_at(size: int, units=units, readings=readings) -> float:
@@ -851,14 +894,44 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
 
         failure = timing_failure(lambda: assert_linear_time(
             seconds_at, units, 30.0, "planted quadratic"))
-        planted = readings[units][0]
-        if lower <= planted <= upper:
+        planted, fastest = readings[units][0], min(readings[units])
+        if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
+        target = plant_target(target, fastest)
     assert lower <= planted <= upper, (
         f"the planted reading {planted:.4f} s at {units} units missed the "
         f"{lower:.4f}-{upper:.4f} s band on this host")
+    assert fastest >= PLANT_FLOOR_SECONDS, planted_over_the_floor(fastest,
+                                                                 units)
     assert failure is not None and "superlinear growth" in str(failure), (
         f"quadratic work reading {planted:.4f} s passed: {readings}")
+
+
+@pytest.mark.parametrize("target_seconds, fastest_seconds, planted", [
+    # The 20 ms proof plants at 30 ms; the 120 ms one as aimed.
+    (0.02, None, PLANT_LOWEST_TARGET),
+    (0.12, None, 0.12),
+    # A plant whose fastest reading cleared the floor is planted again as
+    # aimed; one under it is re-calibrated up by the share it fell short.
+    (0.03, 0.025, 0.03),
+    (0.03, 0.019, 0.03 * PLANT_LOWEST_TARGET / 0.019),
+    # Never past the top proof's target.
+    (0.12, 0.015, PLANT_HIGHEST_TARGET),
+])
+def test_a_plant_under_the_floor_is_recalibrated_up(target_seconds,
+                                                    fastest_seconds, planted):
+    assert plant_target(target_seconds, fastest_seconds) == pytest.approx(
+        planted)
+
+
+def test_every_planted_band_clears_the_floor():
+    """Task 3208: CI planted 0.0190 s at the 20 ms target, under the noise
+    floor; a plant in the band of any proof's target now reads over
+    PLANT_FLOOR_SECONDS, which is over it."""
+    assert PLANT_FLOOR_SECONDS > GROWTH_FLOOR_SECONDS > 0.0190
+    for target_seconds in (0.02, 0.12):
+        lower, upper = planted_band(plant_target(target_seconds))
+        assert PLANT_FLOOR_SECONDS <= lower < upper <= 0.159
 
 
 @pytest.mark.parametrize("target_seconds", (0.005, 0.05))

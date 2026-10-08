@@ -26,7 +26,9 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import math
+import re
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import pytest
@@ -34,16 +36,22 @@ import pytest
 from tests import host_timing
 from tests.host_timing import (
     CONFIRM_MAJORITY,
+    EXPONENT_MAX_FIRST_STEP,
+    EXPONENT_MIN_SECOND_STEP,
+    EXPONENT_SECONDS,
     EXPONENT_STEPS,
     GROWTH,
     GROWTH_EXPONENT_LIMIT,
     GROWTH_FLOOR_SECONDS,
     GROWTH_LIMIT,
+    GROWTH_RETRIES,
     GrowthExponent,
     InputTooLarge,
+    LinearTiming,
     TimingCheckFailed,
     assert_linear_time,
     assert_linear_times,
+    growth_ratio,
 )
 from tests.test_host_timing_3171 import _build_clock, timing_failure
 
@@ -525,23 +533,285 @@ def _host_step(units: int, step: float,
     return step / skew
 
 
+# --- The real cache step, measured (task 3208) ---------------------------------
+#
+# CI's runners read the planted step far steeper than ``_host_step`` sized it
+# (12.7x-21x over the first grown pair, 3 of 3 runs of PR #44): a call of a
+# few tens of ms runs whole inside a quiet spell that a longer one never
+# fits, so the fastest of the many quarter readings the check takes reads
+# under the fastest of the three ``_host_step`` takes. The proof now
+# measures the step it planted, as the check reads it, and holds the
+# check's verdict to what that measurement says.
+
+# The test's size reads about this much: well over the GROWTH_DETECTION_
+# SECONDS the input grows from, so the check reads past the step.
+PROOF_TARGET_SECONDS = 0.03
+# The fastest of how many readings of the quarter size the measurement
+# keeps (the check reads it in its settling, confirming rounds and outer
+# pair, 13-17 times), and of each larger size (the first reading and
+# GROWTH_RETRIES, as the check settles them).
+SHAPE_QUARTER_READINGS = 16
+SHAPE_READINGS = 1 + GROWTH_RETRIES
+# How far either way the measured steps are read for the verdicts they
+# allow: the check reads the same work at other moments.
+SHAPE_MARGIN = 1.15
+# The first step the planted step is calibrated to read: the middle of the
+# window a cache step is cleared in (over GROWTH_LIMIT, at most
+# EXPONENT_MAX_FIRST_STEP), a step of about 2.7x per unit.
+TARGET_FIRST_STEP = math.sqrt(GROWTH_LIMIT * EXPONENT_MAX_FIRST_STEP)
+STEP_CALIBRATIONS = 4
+# Plants of longer work when the check never read past the step.
+PROOF_PLANTS = 3
+
+PASSED = "passed"
+PASSED_ON_ITS_EXPONENT = "passed on its exponent"
+FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _MeasuredShape:
+    """The planted work measured independently of the check: the fastest
+    readings at a quarter size, GROWTH times it and (for the exponent)
+    GROWTH ** 2 times it, each step against the GROWTH_FLOOR_SECONDS floor
+    every grown pair is held to."""
+
+    quarter_size: int
+    quarter_seconds: float
+    seconds: float
+    larger_seconds: float | None = None
+
+    @property
+    def first_step(self) -> float:
+        return growth_ratio(self.quarter_seconds, self.seconds)
+
+    @property
+    def second_step(self) -> float:
+        if self.larger_seconds is None:
+            return math.nan
+        return growth_ratio(self.seconds, self.larger_seconds)
+
+    @property
+    def outer_step(self) -> float:
+        if self.larger_seconds is None:
+            return math.nan
+        return growth_ratio(self.quarter_seconds, self.larger_seconds)
+
+    def describe(self) -> str:
+        larger = (f", {self.larger_seconds:.4f} s at "
+                  f"{GROWTH ** 2 * self.quarter_size}; steps "
+                  f"{self.first_step:.1f}x then {self.second_step:.1f}x, "
+                  f"outer {self.outer_step:.1f}x"
+                  if self.larger_seconds is not None
+                  else f"; first step {self.first_step:.1f}x")
+        return (f"measured {self.quarter_seconds:.4f} s at "
+                f"{self.quarter_size}, {self.seconds:.4f} s at "
+                f"{GROWTH * self.quarter_size}{larger}")
+
+
+def _measured_shape(seconds_at: Callable[[int], float], quarter_size: int,
+                    third: bool) -> _MeasuredShape:
+    """The work ``seconds_at`` measured at ``quarter_size`` and GROWTH
+    times it (and GROWTH ** 2 times it when ``third``), interleaved, each
+    the fastest of as many readings as the check settles it on."""
+    sizes = [GROWTH * quarter_size] + ([GROWTH ** 2 * quarter_size]
+                                       if third else [])
+    fastest = dict.fromkeys([quarter_size, *sizes], math.inf)
+    with host_timing.collector_paused():
+        for reading in range(SHAPE_QUARTER_READINGS):
+            fastest[quarter_size] = min(fastest[quarter_size],
+                                        seconds_at(quarter_size))
+            if reading < SHAPE_READINGS:
+                for size in sizes:
+                    fastest[size] = min(fastest[size], seconds_at(size))
+    return _MeasuredShape(quarter_size, fastest[quarter_size],
+                          fastest[sizes[0]],
+                          fastest[sizes[1]] if third else None)
+
+
+def _calibrated_step(units: int) -> float:
+    """The step to plant past twice ``units`` so that this host reads the
+    first grown pair at about TARGET_FIRST_STEP: measured
+    (``_measured_shape``) and rescaled at most STEP_CALIBRATIONS times
+    until it reads inside the window by SHAPE_MARGIN. The step a runner
+    keeps reading outside it is planted as last rescaled; the verdict is
+    then held to what the measurement after the run says."""
+    step = TARGET_FIRST_STEP / GROWTH
+    for _ in range(STEP_CALIBRATIONS):
+        first_step = _measured_shape(_real_stepped(2 * units, step), units,
+                                     third=False).first_step
+        if (GROWTH_LIMIT * SHAPE_MARGIN <= first_step
+                <= EXPONENT_MAX_FIRST_STEP / SHAPE_MARGIN):
+            break
+        step *= TARGET_FIRST_STEP / first_step
+    return step
+
+
+def _expected_verdict(first_step: float, second_step: float,
+                      outer_step: float, judged: bool,
+                      clearing_seconds: float) -> str:
+    """The verdict the check owes readings of these steps (R3191-01,
+    R3191-03): a pair under the limit passes; over it, the check before
+    task 3191 fails it, and the check after clears it on its exponent only
+    when its steps are a cache step inside the window, the outer pair
+    under its limit and the third size within EXPONENT_SECONDS
+    (``clearing_seconds``, at this first step)."""
+    if first_step < GROWTH_LIMIT:
+        return PASSED
+    if (not judged or first_step > EXPONENT_MAX_FIRST_STEP
+            or second_step < EXPONENT_MIN_SECOND_STEP
+            or outer_step >= GROWTH_LIMIT ** EXPONENT_STEPS
+            or clearing_seconds > EXPONENT_SECONDS):
+        return FAILED
+    return PASSED_ON_ITS_EXPONENT
+
+
+def _allowed_verdicts(shape: _MeasuredShape, judged: bool,
+                      grown_call_seconds: float) -> set[str]:
+    """Every verdict the measured shape owes with each of its steps read
+    up to SHAPE_MARGIN either way: one verdict for a shape clear of every
+    edge of the window, the verdicts on both sides of an edge it is
+    near. ``grown_call_seconds`` is the wall time the check's first call
+    at GROWTH times the quarter size took: the third size costs it about
+    the outer limit over the first step (``_exponent_judged``)."""
+    shares = (1 / SHAPE_MARGIN, 1.0, SHAPE_MARGIN)
+    outer_limit = GROWTH_LIMIT ** EXPONENT_STEPS
+    return {_expected_verdict(
+                shape.first_step * first, shape.second_step * second,
+                shape.outer_step * outer, judged,
+                grown_call_seconds * outer_limit / (shape.first_step * first))
+            for first in shares for second in shares for outer in shares}
+
+
+def _check_verdict(check: Callable[[], LinearTiming]
+                   ) -> tuple[str, LinearTiming | None, TimingCheckFailed | None]:
+    """The verdict of ``check()``, its timing when it passed and its
+    failure when it failed."""
+    try:
+        timing = check()
+    except TimingCheckFailed as failure:
+        return FAILED, None, failure
+    verdict = PASSED if timing.exponent is None else PASSED_ON_ITS_EXPONENT
+    return verdict, timing, None
+
+
+def _assert_the_verdict_reads_the_window(timing: LinearTiming | None,
+                                         failure: TimingCheckFailed | None,
+                                         judged: bool,
+                                         grown_call_seconds: float) -> None:
+    """What holds of the check's verdict on this work whatever the runner
+    reads: linear at the test's size, it never fails the test's own pair
+    or its budget; a pass on an exponent read a cache step over the limit,
+    inside the window, and any other pass a pair under the limit; a
+    failure reads a grown pair over the limit and, ``judged``, gives the
+    window's reason (an exponent read, a first step over
+    EXPONENT_MAX_FIRST_STEP, or a third size costing over
+    EXPONENT_SECONDS)."""
+    if failure is None:
+        assert timing is not None
+        if timing.exponent is not None:
+            assert timing.exponent.cache_step, timing.exponent.describe()
+            assert not timing.exponent.superlinear, timing.exponent.describe()
+            assert timing.exponent.first_step >= GROWTH_LIMIT, timing
+        else:
+            assert timing.ratio < GROWTH_LIMIT, timing.describe()
+        return
+    message = str(failure)
+    assert message.startswith("superlinear growth: real cache step: "), message
+    assert "at 1x the test's input" not in message, message
+    if judged and "growth exponent" in message:
+        return
+    read = re.search(r"\(growth ([\d.]+)x at", message)
+    assert read is not None, message
+    growth = float(read.group(1))
+    assert growth >= GROWTH_LIMIT, message
+    if judged:
+        assert (growth > EXPONENT_MAX_FIRST_STEP or grown_call_seconds
+                * GROWTH_LIMIT ** EXPONENT_STEPS / growth
+                > EXPONENT_SECONDS), message
+
+
 @pytest.mark.parametrize("judged", (True, False), ids=["3191", "before-3191"])
 def test_real_linear_work_with_a_3x_step_passes(monkeypatch, judged):
-    """Real linear work reading about 25 ms at the test's size whose cost
-    per unit, as this host reads it, triples past twice the test's size:
-    12x over the first grown pair (the check before task 3191 fails it), 4x
-    past it. The step is calibrated on this host (``_host_step``), so the
-    proof plants the step it claims on any runner (task 3204)."""
-    units = _linear_units(0.025)
-    step = _host_step(units, 3.0)
+    """Real linear work reading about 30 ms at the test's size whose cost
+    per unit, as this host reads it, steps up about 3x (2.7x: the middle of
+    the window) past twice the test's size: about 11x over the first grown
+    pair (the check before task 3191 fails it), 4x past it.
+
+    Task 3208: the step is calibrated on its measured growth
+    (``_calibrated_step``), the check runs, and the step is measured again
+    at the sizes the check read, as the check reads them
+    (``_measured_shape``). The check's verdict must be the one that
+    measurement owes (``_allowed_verdicts``): passed on its exponent for a
+    cache step inside the window, failed outside it. Within SHAPE_MARGIN
+    of an edge of the window either verdict on that edge is allowed, and
+    what holds of every verdict is asserted
+    (``_assert_the_verdict_reads_the_window``)."""
     if not judged:
         _before_3191(monkeypatch)
-    failure = timing_failure(lambda: assert_linear_time(
-        _real_stepped(2 * units, step), units, 30.0, "real cache step"))
-    if judged:
-        assert failure is None, f"{failure} (planted step {step:.2f}x)"
-    else:
-        assert failure is not None and "superlinear growth" in str(failure)
+    target_seconds = PROOF_TARGET_SECONDS
+    for _ in range(PROOF_PLANTS):
+        units = _linear_units(target_seconds)
+        stepped = _real_stepped(2 * units, _calibrated_step(units))
+        calls: list[tuple[int, float]] = []
+
+        def seconds_at(size: int, stepped=stepped, calls=calls) -> float:
+            started = time.monotonic()
+            seconds = stepped(size)
+            calls.append((size, time.monotonic() - started))
+            return seconds
+
+        verdict, timing, failure = _check_verdict(lambda: assert_linear_time(
+            seconds_at, units, 30.0, "real cache step"))
+        if max(size for size, _ in calls) > 2 * units:
+            break
+        target_seconds *= 1.5
+    # The premise: the check read the pair the step is in.
+    assert max(size for size, _ in calls) > 2 * units, (
+        f"the check never read past the step at {2 * units} units: {calls}")
+    quarter_size = max(size for size, _ in calls if size <= 2 * units)
+    grown_call_seconds = next(seconds for size, seconds in calls
+                              if size == GROWTH * quarter_size)
+    shape = _measured_shape(stepped, quarter_size, third=judged)
+    allowed = _allowed_verdicts(shape, judged, grown_call_seconds)
+    assert verdict in allowed, (
+        f"the check {verdict} the planted step, {shape.describe()}, which "
+        f"owes {sorted(allowed)}: {failure if failure else timing}")
+    _assert_the_verdict_reads_the_window(timing, failure, judged,
+                                         grown_call_seconds)
+
+
+def _shape_reading(first_step: float, second_step: float) -> _MeasuredShape:
+    """A measured shape whose steps read ``first_step`` then
+    ``second_step``, its quarter over the floor."""
+    quarter = 1.5 * GROWTH_FLOOR_SECONDS
+    return _MeasuredShape(1000, quarter, quarter * first_step,
+                          quarter * first_step * second_step)
+
+
+@pytest.mark.parametrize("first_step, second_step, judged, allowed", [
+    # The middle of the window: the proof's calibrated step.
+    (11.0, 4.0, True, {PASSED_ON_ITS_EXPONENT}),
+    (11.0, 4.0, False, {FAILED}),
+    # A cliff, and work flat past the pair (a cap or a window).
+    (20.0, 4.0, True, {FAILED}),
+    (11.0, 2.0, True, {FAILED}),
+    # Near an edge: the verdicts on both sides of it.
+    (14.5, 4.0, True, {PASSED_ON_ITS_EXPONENT, FAILED}),
+    (8.5, 4.0, True, {PASSED, PASSED_ON_ITS_EXPONENT}),
+    (6.0, 4.0, True, {PASSED}),
+])
+def test_a_measured_shape_owes_the_verdicts_of_the_window(
+        first_step, second_step, judged, allowed):
+    shape = _shape_reading(first_step, second_step)
+    assert shape.first_step == pytest.approx(first_step)
+    assert _allowed_verdicts(shape, judged, 0.3) == allowed
+
+
+def test_a_measured_shape_whose_third_size_costs_too_much_owes_a_failure():
+    """R3191-03: a 3 s call at the pair's larger size makes the third size
+    cost about 17 s at an 11x first step, over EXPONENT_SECONDS: the check
+    fails the pair closed without reading it."""
+    assert _allowed_verdicts(_shape_reading(11.0, 4.0), True, 3.0) == {FAILED}
 
 
 def test_real_quadratic_work_with_the_same_step_fails():
