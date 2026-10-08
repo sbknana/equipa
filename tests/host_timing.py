@@ -164,7 +164,7 @@ import math
 import os
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Mapping, Sequence, TypeVar
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
@@ -1006,6 +1006,29 @@ class GrowthExponent:
                            self.floor_seconds,
                            self.larger_size / self.small_size)
 
+    @property
+    def first_step(self) -> float:
+        """The growth over the pair (its smaller reading raised to the
+        floor first)."""
+        return growth_ratio(self.small_seconds, self.seconds,
+                            self.floor_seconds)
+
+    @property
+    def second_step(self) -> float:
+        """The growth from the pair's larger size to the third size."""
+        return growth_ratio(self.seconds, self.larger_seconds,
+                            self.floor_seconds)
+
+    @property
+    def cache_step(self) -> bool:
+        """The three readings look like a cache step (R3191-01): a first
+        step of at most ``EXPONENT_MAX_FIRST_STEP`` and a second of at least
+        ``EXPONENT_MIN_SECOND_STEP``. Work superlinear up to an input cap
+        or a window just past the pair reads a larger first step, or a flat
+        second one, and is not cleared on its exponent."""
+        return (self.first_step <= EXPONENT_MAX_FIRST_STEP
+                and self.second_step >= EXPONENT_MIN_SECOND_STEP)
+
     def describe(self) -> str:
         first_step = self._slope(self.small_seconds, self.seconds,
                                  self.floor_seconds,
@@ -1013,8 +1036,15 @@ class GrowthExponent:
         second_step = self._slope(self.seconds, self.larger_seconds,
                                   self.floor_seconds,
                                   self.larger_size / self.size)
-        verdict = ("superlinear" if self.superlinear
-                   else "a constant-factor step, not growth")
+        if not self.cache_step:
+            verdict = (f"not a cache step (steps {self.first_step:.1f}x "
+                       f"then {self.second_step:.1f}x; a cache step reads "
+                       f"at most {EXPONENT_MAX_FIRST_STEP:g}x then at least "
+                       f"{EXPONENT_MIN_SECOND_STEP:.2f}x)")
+        elif self.superlinear:
+            verdict = "superlinear"
+        else:
+            verdict = "a constant-factor step, not growth"
         confirmed = (f"; {self.confirmation.describe()}"
                      if self.confirmation is not None else "")
         return (f"growth exponent {self.exponent:.2f} over sizes "
@@ -1059,11 +1089,33 @@ def _exponent_judged(grown: _GrownReadings,
     test's own pair is held for, never on an exponent (IR78-01); only a
     part that pair and every smaller grown pair passed reaches this.
 
+    So only a part whose readings look like a cache step is cleared
+    (R3191-01, ``GrowthExponent.cache_step``): a part whose first step is
+    over ``EXPONENT_MAX_FIRST_STEP`` stays over without the third size
+    being read (R3191-03: it cannot be cleared, and superlinear work makes
+    the third size expensive), and one whose second step is under
+    ``EXPONENT_MIN_SECOND_STEP`` stays over on its exponent (a cap or a
+    window flattened it). The third size is not read either when reading
+    it would take more than ``EXPONENT_SECONDS`` were the part one it could
+    clear: one whose outer pair reads under the outer limit, so at most
+    that limit over its first step times the pair's larger reading.
+
     Without the third size (the shape does not exist there,
     ``InputTooLarge``) no exponent is measured and every part stays over:
     the pair decides alone, as before. Returns the parts still over and
     each judged part's ``GrowthExponent``; the readings settled at the
     outer pair's sizes are kept in ``grown``."""
+    first_steps = {part: growth_ratio(small[part], large[part],
+                                      pair.floor_seconds) for part in over}
+    judged = [part for part in over
+              if first_steps[part] <= EXPONENT_MAX_FIRST_STEP]
+    if not judged:
+        return over, {}
+    outer_limit = GROWTH_LIMIT ** EXPONENT_STEPS
+    clearing_cost = grown.costs[pair.size] * outer_limit / min(
+        first_steps[part] for part in judged)
+    if clearing_cost > EXPONENT_SECONDS:
+        return over, {}
     larger_size = pair.size * GROWTH
     started = time.monotonic()
     if not _grown_further(grown, larger_size):
@@ -1073,19 +1125,25 @@ def _exponent_judged(grown: _GrownReadings,
                   EXPONENT_STEPS)
     first_samples = min(grown.samples[pair.small_size],
                         grown.samples[larger_size])
-    outer_small, outer_large, still_over, samples, confirmations = (
+    outer_small, outer_large, outer_over, samples, confirmations = (
         _settled_readings(measure, outer, small, grown.at(larger_size),
-                          over, first_samples, started + EXPONENT_SECONDS,
+                          judged, first_samples, started + EXPONENT_SECONDS,
                           grown.costs[pair.small_size]
                           + grown.costs[larger_size]))
     for at_size, readings in ((pair.small_size, outer_small),
                               (larger_size, outer_large)):
         grown.settle(at_size, readings,
                      grown.samples[at_size] + samples - first_samples)
-    exponents = {part: GrowthExponent(
-        pair.small_size, outer_small[part], pair.size, large[part],
-        larger_size, outer_large[part], pair.floor_seconds,
-        part in still_over, confirmations.get(part)) for part in over}
+    exponents: dict[str, GrowthExponent] = {}
+    for part in judged:
+        shape = GrowthExponent(
+            pair.small_size, outer_small[part], pair.size, large[part],
+            larger_size, outer_large[part], pair.floor_seconds, False,
+            confirmations.get(part))
+        exponents[part] = replace(
+            shape, superlinear=part in outer_over or not shape.cache_step)
+    still_over = [part for part in over
+                  if part not in exponents or exponents[part].superlinear]
     return still_over, exponents
 
 
