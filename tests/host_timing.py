@@ -1593,10 +1593,15 @@ def _check_growth(grown: _GrownReadings,
         are decided there, ``sub_floor`` keeping the readings read again
         from (task 3204). Any other part over the limit fails as before, at
         once, and the parts beside it over only on such a reading are named
-        as not judged, never as growth."""
-        if pair in cleared:
-            return cleared[pair]
+        as not judged, never as growth.
+
+        A pair cleared before (``cleared``) is not held again only when that
+        verdict covers every part judged now: a pair read again for some
+        parts can equal a later pair over other parts, and a verdict on the
+        first parts must not pass the others (R3204-I-01)."""
         judged = parts if judged is None else judged
+        if pair in cleared and cleared[pair].keys() >= set(judged):
+            return cleared[pair]
         sub_floor = {} if sub_floor is None else sub_floor
         if means is not None:
             small, large = means
