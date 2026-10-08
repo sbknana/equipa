@@ -30,6 +30,7 @@ from tests.host_timing import (
     BORDERLINE_RETRIES,
     CONFIRM_MAJORITY,
     CONFIRM_READINGS,
+    CONFIRM_ROUNDS,
     GROWTH,
     GROWTH_LIMIT,
     GROWTH_RETRIES,
@@ -87,9 +88,11 @@ READ_AGAIN_RUNS = host_timing.sub_floor_repetitions([QUIET_QUARTER], 1, 0.0)
 def _read_again(small_size: int, size: int, repetitions: int) -> list[int]:
     """The calls of a pair read again over ``repetitions`` runs of each
     size and over the limit in every reading: its first reading, both
-    retries of the limit and its confirming rounds (task 3204)."""
+    retries of the limit (task 3204) and one confirming round of
+    ``CONFIRM_READINGS`` readings, since a pair read again keeps a part
+    over at its first round over the limit (task 3207, R3204-I-02)."""
     return ([small_size, size] * (repetitions * (1 + GROWTH_RETRIES))
-            + _confirming(small_size, size, repetitions))
+            + [small_size, size] * (repetitions * CONFIRM_READINGS))
 
 
 def test_the_quiet_quarter_is_read_again_over_three_runs():
@@ -119,8 +122,12 @@ def test_the_regression_ci_read_under_load_fails_on_its_fastest_readings():
     assert (f"each the fastest of {1 + GROWTH_RETRIES} interleaved "
             f"readings" in message)
     assert f"{QUIET_QUARTER:.4f} s at size {QUARTER}" in message
-    assert (f"confirmed: over the limit in {CONFIRM_MAJORITY} of "
-            f"{CONFIRM_MAJORITY} confirming rounds" in message)
+    # Read again, the first confirming round over the limit decides
+    # (task 3207: every round must read under for the pair to clear it).
+    assert (f"confirmed: over the limit in 1 of 1 confirming rounds of "
+            f"{CONFIRM_READINGS} interleaved readings of each size (read "
+            f"again: cleared only when every one of {CONFIRM_ROUNDS} rounds "
+            f"reads under the limit)" in message)
     assert (f"read again over {READ_AGAIN_RUNS} runs of each size: the "
             f"smaller reading over the limit was {QUIET_QUARTER:.4f} s"
             in message)
