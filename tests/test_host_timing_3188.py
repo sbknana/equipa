@@ -450,9 +450,11 @@ def test_real_linear_work_with_every_settling_reading_inflated(
     quarter reading with the larger one after it (``_interleaved_means``),
     so each settled pair reads at least GROWTH ** 2 times over and the own
     pair reaches its confirming rounds on any runner. Inflating to 16
-    times the quarter's FASTEST reading did not: on CI one quiet-spell
-    quarter reading dragged the inflation under the limit of the means,
-    the pair passed unconfirmed and the premise guard tripped."""
+    times the quarter's FASTEST reading did not guarantee that: one quarter
+    read short (a quiet spell) lowers the inflation of every later reading,
+    while the own pair settles on means of the quarter's readings, so it
+    could settle under the limit unconfirmed. CI (2 of 2 runs since task
+    3207) passed it unconfirmed and the premise guard tripped."""
     units = _linear_units(0.012)
     quarter = units // GROWTH
     state = {"confirming": False, "quarter": 0.0, "inflated": 0}
