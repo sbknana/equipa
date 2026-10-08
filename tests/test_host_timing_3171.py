@@ -1156,7 +1156,8 @@ def test_quadratic_work_is_replanted_by_the_square_root():
     assert CI_PLANTED_SECONDS * ratio ** 2 > upper
     replanted = replanted_units(CI_PLANT_UNITS, CI_PLANTED_SECONDS,
                                 CI_PLANT_TARGET)
-    assert lower <= CI_PLANTED_SECONDS * (replanted / CI_PLANT_UNITS) ** 2 <= upper
+    reading = CI_PLANTED_SECONDS * (replanted / CI_PLANT_UNITS) ** 2
+    assert lower <= reading <= upper
 
 
 @pytest.mark.parametrize("plant_seconds, plants_again", [

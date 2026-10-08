@@ -428,14 +428,14 @@ def test_a_proof_planted_outside_its_band_fails_loudly(
         return real_replanted_units(units, planted_seconds,
                                     target_seconds * miscalibration)
 
-    module = host_timing_3171 if proof == "quadratic" else sys.modules[
-        __name__]
-    monkeypatch.setattr(module, "_units_reading", miscalibrated)
-    monkeypatch.setattr(module, "replanted_units", misreplanted)
     if proof == "quadratic":
+        proof_module = host_timing_3171
         run = host_timing_3171.test_real_quadratic_work_of_22_5_to_159_ms_fails
     else:
+        proof_module = sys.modules[__name__]
         run = test_real_windowed_work_of_22_5_to_159_ms_fails
+    monkeypatch.setattr(proof_module, "_units_reading", miscalibrated)
+    monkeypatch.setattr(proof_module, "replanted_units", misreplanted)
     with pytest.raises(AssertionError, match=r"missed the [\d.]+-[\d.]+ s "
                                              r"band on this host"):
         run(target_seconds, 0.0)
