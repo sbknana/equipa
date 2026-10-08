@@ -42,11 +42,14 @@ from tests.test_host_timing_3171 import (
     IR75_01_LARGE_READINGS,
     IR75_01_SIZE,
     PLANT_FLOOR_SECONDS,
+    PLANT_LOWEST_TARGET,
     _build_clock,
     _units_reading,
+    another_plant,
     plant_target,
     planted_band,
     planted_over_the_floor,
+    replanted_units,
     timing_failure,
 )
 
@@ -338,20 +341,29 @@ def _windowed_pair_work(units: int, window: int) -> int:
 
 
 @pytest.mark.parametrize("build_seconds", (0.0, 0.3))
-@pytest.mark.parametrize("target_seconds", (0.02, 0.12))
-def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
-                                                  build_seconds):
+@pytest.mark.parametrize("target_seconds", (PLANT_LOWEST_TARGET, 0.12))
+def test_real_windowed_work_of_22_5_to_159_ms_fails(target_seconds,
+                                                    build_seconds):
     """IR78-01 on real work: quadratic up to the test's size and linear
-    past it, reading about 20 ms or 120 ms at the test's size. The size is
-    calibrated on this host and the reading asserted inside the band, and
-    every reading at the test's size over PLANT_FLOOR_SECONDS: the 20 ms
-    proof plants at ``plant_target`` (30 ms), re-calibrated up within the
-    three plants when its fastest reading there falls under it (task
-    3208)."""
+    past it, planted at 30 ms (a 22.5-40 ms band) or 120 ms (90-159 ms) at
+    the test's size; 16.5-22.5 ms is proved on the scripted clock
+    (``test_superlinear_work_of_16_to_159_ms_fails_at_the_tests_own_
+    sizes``). The size is calibrated on this host and the reading asserted
+    inside the band, and every reading at the test's size over
+    PLANT_FLOOR_SECONDS: the lowest proof plants at PLANT_LOWEST_TARGET
+    (30 ms, ``plant_target`` of the 20 ms aim), re-calibrated up to a
+    higher target when its fastest reading there falls under it (task
+    3208). A plant that misses its band, under or over it, runs again at
+    units re-scaled from its own reading at the test's size
+    (``replanted_units``, task 3209), as ``another_plant`` allows."""
     target = plant_target(target_seconds)
-    for _ in range(3):
+    units = _units_reading(target)
+    plant_seconds: list[float] = []
+    while not plant_seconds or another_plant(plant_seconds):
+        if plant_seconds:
+            target = plant_target(target, fastest)
+            units = replanted_units(units, planted, target)
         lower, upper = planted_band(target)
-        units = _units_reading(target)
         readings: dict[int, list[float]] = {}
 
         def seconds_at(size: int, units=units, readings=readings) -> float:
@@ -362,12 +374,13 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
             readings.setdefault(size, []).append(elapsed)
             return elapsed
 
+        plant_started = time.monotonic()
         failure = timing_failure(lambda: assert_linear_time(
             seconds_at, units, 30.0, "planted windowed"))
+        plant_seconds.append(time.monotonic() - plant_started)
         planted, fastest = readings[units][0], min(readings[units])
         if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
-        target = plant_target(target, fastest)
     assert lower <= planted <= upper, (
         f"the planted reading {planted:.4f} s at {units} units missed the "
         f"{lower:.4f}-{upper:.4f} s band on this host")
@@ -380,14 +393,14 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
 # --- The proofs plant what they claim on any host (CI run 37404143426) -----------
 
 
-# A runner whose calibration is off, simulated: (target, share of it the
+# A runner whose calibration is off, simulated: (target, share of it every
 # plant reads). An eighth of the 120 ms target (the CI case) reads 15 ms,
 # under the 16 ms main caught, so the check rightly passes it (and no
 # re-calibration up past the 120 ms target reaches the band); twice the
-# 20 ms proof's 30 ms plant target (``plant_target``, task 3208) reads
+# lowest proof's 30 ms plant target (PLANT_LOWEST_TARGET, task 3208) reads
 # 60 ms, over the band, so it proves nothing about the 22.5-40 ms it
 # claims.
-MISCALIBRATIONS = ((0.12, 1 / 8), (0.02, 2.0))
+MISCALIBRATIONS = ((0.12, 1 / 8), (PLANT_LOWEST_TARGET, 2.0))
 
 
 @pytest.mark.parametrize("target_seconds, miscalibration", MISCALIBRATIONS)
@@ -398,22 +411,61 @@ def test_a_proof_planted_outside_its_band_fails_loudly(
     did not read what the proof claimed, and nothing said so. A runner that
     plants outside the band now fails the proof on the band, naming the
     reading, instead of passing (a plant under 16 ms) or proving nothing
-    about the band it claims (a plant over it)."""
+    about the band it claims (a plant over it).
+
+    Task 3209: a plant is re-scaled from its own reading, which corrects a
+    calibration that is off once. The runner here stays off: the first
+    plant's calibration and every re-scaling aim at ``miscalibration``
+    times the target, so every plant misses and the band fails it."""
     real_units_reading = host_timing_3171._units_reading
+    real_replanted_units = host_timing_3171.replanted_units
 
     def miscalibrated(target_seconds: float) -> int:
         return real_units_reading(target_seconds * miscalibration)
 
+    def misreplanted(units: int, planted_seconds: float,
+                     target_seconds: float) -> int:
+        return real_replanted_units(units, planted_seconds,
+                                    target_seconds * miscalibration)
+
     if proof == "quadratic":
-        monkeypatch.setattr(host_timing_3171, "_units_reading", miscalibrated)
-        run = host_timing_3171.test_real_quadratic_work_of_16_to_159_ms_fails
+        proof_module = host_timing_3171
+        run = host_timing_3171.test_real_quadratic_work_of_22_5_to_159_ms_fails
     else:
-        monkeypatch.setattr(sys.modules[__name__], "_units_reading",
-                            miscalibrated)
-        run = test_real_windowed_work_of_16_to_159_ms_fails
+        proof_module = sys.modules[__name__]
+        run = test_real_windowed_work_of_22_5_to_159_ms_fails
+    monkeypatch.setattr(proof_module, "_units_reading", miscalibrated)
+    monkeypatch.setattr(proof_module, "replanted_units", misreplanted)
     with pytest.raises(AssertionError, match=r"missed the [\d.]+-[\d.]+ s "
                                              r"band on this host"):
         run(target_seconds, 0.0)
+
+
+def test_the_windowed_proof_replants_the_ci_plant_into_its_band(monkeypatch):
+    """Task 3209 on the windowed proof's own loop: CI run 4's plant (0.0330
+    s at 860 units against a 0.0381-0.0677 s band) is re-scaled from that
+    reading, and the next plant lands in the band (the scripted clock of
+    ``test_host_timing_3171.scripted_runner``)."""
+    runner = host_timing_3171.scripted_runner(
+        monkeypatch, sys.modules[__name__], "_windowed_pair_work")
+    target = host_timing_3171.CI_PLANT_TARGET
+    test_real_windowed_work_of_22_5_to_159_ms_fails(target, 0.0)
+    lower, upper = planted_band(target)
+    (first_units, first), (units, planted) = runner.planted()
+    assert (first_units, units) == (host_timing_3171.CI_PLANT_UNITS, 1067)
+    assert first < lower <= planted <= upper
+
+
+@pytest.mark.parametrize("drift", host_timing_3171.NEVER_LANDING_DRIFTS)
+def test_a_windowed_proof_that_never_lands_still_fails_loudly(monkeypatch,
+                                                              drift):
+    runner = host_timing_3171.scripted_runner(
+        monkeypatch, sys.modules[__name__], "_windowed_pair_work", drift)
+    with pytest.raises(AssertionError,
+                       match=host_timing_3171.CI_BAND_MISSED):
+        test_real_windowed_work_of_22_5_to_159_ms_fails(
+            host_timing_3171.CI_PLANT_TARGET, 0.0)
+    assert len(runner.planted()) == host_timing_3171.PLANTS
 
 
 # The reviewer's plant (IR78-01): quadratic work in ``sanitize`` right after
