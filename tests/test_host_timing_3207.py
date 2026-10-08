@@ -1,6 +1,19 @@
-"""A pair cleared on a sub-floor re-read never passes a part it did not
-judge (task 3207, R3204-I-01 of the independent 3204 review).
+"""A pair read again on a sub-floor reading is no looser than the check
+before task 3204 (task 3207, R3204-I-01 and R3204-I-02 of the independent
+3204 review).
 
+R3204-I-02: a pair is read again only for parts its confirming rounds kept
+over the limit on the fastest readings. cbba569 then cleared a part on one
+settle pass over means of several runs, and a mean is far likelier to carry
+a burst than the fastest single reading: in the review's seeded noise
+simulation (38,400 trials) 365 regressions that 6ef24c6 failed passed (479
+escapes against ea2bf69's verdicts, 115 on 6ef24c6). A pair read again now
+confirms every part it judges and clears one only when every one of
+``CONFIRM_ROUNDS`` rounds reads it under the limit (``Confirmation
+.unanimous``): 114 escapes, none that 6ef24c6 failed, linear false failures
+unchanged at 10 of 4,800; CI's quiet-spell readings still pass.
+
+R3204-I-01:
 ``_check_growth`` caches the verdict of a pair it read again (``cleared``)
 so the pair the growth stopped at, when it is that pair again, is not
 confirmed twice. On cbba569 the cache was keyed on the pair alone. A pair
@@ -31,17 +44,28 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import itertools
 from typing import Callable, Mapping
 
 import pytest
 
 from tests import host_timing
 from tests.host_timing import (
+    CONFIRM_MAJORITY,
+    CONFIRM_ROUNDS,
+    Confirmation,
     InputTooLarge,
     TimingCheckFailed,
+    assert_linear_time,
     assert_linear_times,
 )
 from tests.test_host_timing_3188 import _WallClock, _wall_clock
+from tests.test_host_timing_3204 import (
+    CI_BUDGET_SECONDS,
+    CI_LABEL,
+    CI_SIZE,
+    _quiet_spells,
+)
 
 N = 64 * 1024
 Q = N // 4
@@ -146,3 +170,123 @@ def test_the_nested_re_read_judges_b_alone_before_the_stop_pair(
     assert len(asked) >= 3
     assert asked[1][0] == asked[0][1] and asked[1][1] > asked[1][0]
     assert ["B"] in judged and ["A"] in judged
+
+
+# --- R3204-I-02: every round of a pair read again must clear a part ----------
+
+
+@pytest.mark.parametrize("rounds, rounds_over, confirmed", [
+    (CONFIRM_ROUNDS, 0, False),
+    (CONFIRM_ROUNDS, 1, True),
+    (1, 1, True),
+    # A majority under is not enough, and neither is a cut-short run of
+    # rounds that all read under.
+    (CONFIRM_MAJORITY, 0, True),
+    (CONFIRM_ROUNDS - 1, 0, True),
+    (0, 0, True),
+])
+def test_unanimous_rounds_clear_only_when_every_round_reads_under(
+        rounds: int, rounds_over: int, confirmed: bool) -> None:
+    confirmation = Confirmation(rounds, rounds_over, 3, unanimous=True)
+    assert confirmation.confirmed is confirmed
+    if rounds:
+        assert (f"cleared only when every one of {CONFIRM_ROUNDS} rounds "
+                f"reads under the limit" in confirmation.describe())
+
+
+def test_the_majority_rule_is_unchanged_for_every_other_pair() -> None:
+    # Two of five rounds over: the majority clears it, unanimity does not.
+    assert not Confirmation(CONFIRM_ROUNDS, 2, 3).confirmed
+    assert Confirmation(CONFIRM_ROUNDS, 2, 3, unanimous=True).confirmed
+
+
+# A 12x regression timed on a runner whose calls take 0.12 s of wall time:
+# one run of each size decides the own pair (b81777b), whose quarter is
+# under the noise floor, so the pair is read again over the four runs a
+# second pays for.
+REGRESSION_QUARTER = 0.0015
+REGRESSION_LARGE = 0.018
+CALL_WALL_SECONDS = 0.12
+READ_AGAIN_RUNS = 4
+# The review's burst model runs a quarter of the calls up to 10x their cost.
+BURST = 10.0
+
+
+def _burst_hidden_regression(clock: _WallClock, asked: list[tuple[int, int]]
+                             ) -> Callable[[int], float]:
+    """``seconds_at`` of the regression. Once the pair is read again (once
+    ``sub_floor_repetitions`` was asked), the first two means of the quarter
+    (its first reading and its settle retry) each carry one burst run, the
+    review's example (both quarter means held a burst, the ratio read 3.7x,
+    under the borderline band); every later call is quiet. Sizes past the
+    test's do not exist (growth is exhausted)."""
+    quarter_calls_read_again = itertools.count()
+
+    def seconds_at(size: int) -> float:
+        clock.now += CALL_WALL_SECONDS
+        if size == N:
+            return REGRESSION_LARGE
+        if size != Q:
+            raise InputTooLarge(size)
+        if not asked:
+            return REGRESSION_QUARTER
+        index = next(quarter_calls_read_again)
+        if (index < 2 * READ_AGAIN_RUNS
+                and index % READ_AGAIN_RUNS == READ_AGAIN_RUNS - 1):
+            return REGRESSION_QUARTER * BURST
+        return REGRESSION_QUARTER
+
+    return seconds_at
+
+
+def test_a_regression_whose_re_read_means_carry_a_burst_still_fails(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """cbba569 passed it on the settle pass (two means of 4.9 ms against
+    18 ms: 3.7x). Confirmed in unanimous rounds, the first round reads the
+    quarter's cost and fails it at 9x."""
+    monkeypatch.setenv(host_timing.HOST_FACTOR_ENVIRONMENT_VARIABLE, "1.0")
+    clock = _wall_clock(monkeypatch)
+    asked = _asked_sub_floor_repetitions(monkeypatch)
+
+    with pytest.raises(TimingCheckFailed,
+                       match="superlinear growth") as failure:
+        assert_linear_time(_burst_hidden_regression(clock, asked), N, 10.0,
+                           "regression")
+
+    # Read again over four runs; still over there, no more runs fit.
+    assert asked[0] == (1, READ_AGAIN_RUNS)
+    assert all(before == after for before, after in asked[1:])
+    message = str(failure.value)
+    assert (f"regression: {REGRESSION_LARGE:.4f} s at size {N}, "
+            f"{REGRESSION_QUARTER:.4f} s at size {Q} (growth 9.0x at 1x the "
+            f"test's input over {READ_AGAIN_RUNS} runs of each" in message)
+    assert ("confirmed: over the limit in 1 of 1 confirming rounds" in message
+            and f"every one of {CONFIRM_ROUNDS} rounds" in message)
+
+
+def test_ci_readings_read_again_clear_only_after_every_round(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """CI's linear pattern on the quiet-spell runner (task 3204's replay)
+    still passes, and the pair read again cleared it only after all
+    ``CONFIRM_ROUNDS`` rounds read it under the limit."""
+    clock = _wall_clock(monkeypatch)
+    verdicts: list[Confirmation] = []
+    real_confirmed = host_timing._confirmed
+
+    def confirmed(measure, pair, small, large, over, *args, **kwargs):
+        result = real_confirmed(measure, pair, small, large, over, *args,
+                                **kwargs)
+        if pair.read_again:
+            verdicts.extend(result[3].values())
+        return result
+
+    monkeypatch.setattr(host_timing, "_confirmed", confirmed)
+
+    timing = assert_linear_time(_quiet_spells(clock), CI_SIZE,
+                                CI_BUDGET_SECONDS, CI_LABEL)
+
+    assert timing.ratio < host_timing.GROWTH_LIMIT
+    assert len(verdicts) == 1
+    verdict = verdicts[0]
+    assert verdict.unanimous and not verdict.confirmed
+    assert (verdict.rounds, verdict.rounds_over) == (CONFIRM_ROUNDS, 0)
