@@ -744,19 +744,31 @@ class Confirmation:
     readings: int
 
     @property
+    def cut_short(self) -> bool:
+        """Fewer rounds than a majority were read: a deadline stopped them
+        (``_confirmed``) before either verdict could have a majority."""
+        return self.rounds < CONFIRM_MAJORITY
+
+    @property
     def confirmed(self) -> bool:
         """A majority of the rounds read over the limit, or no round was
-        read (fail closed: no evidence clears a pair)."""
-        return self.rounds == 0 or 2 * self.rounds_over > self.rounds
+        read (fail closed: no evidence clears a pair). Rounds cut short
+        clear a pair only when every one of them read under the limit
+        (R3191-02: one round under, or a tie of two, is no majority)."""
+        if self.cut_short:
+            return self.rounds == 0 or self.rounds_over > 0
+        return 2 * self.rounds_over > self.rounds
 
     def describe(self) -> str:
         if self.rounds == 0:
             return ("confirmed: no confirming round fitted the time left, "
                     "so the pair stays over the limit (fail closed)")
         verdict = "confirmed" if self.confirmed else "not confirmed"
+        short = (f" (cut short under {CONFIRM_MAJORITY} rounds: any round "
+                 f"over keeps the pair over)" if self.cut_short else "")
         return (f"{verdict}: over the limit in {self.rounds_over} of "
                 f"{self.rounds} confirming rounds of {self.readings} "
-                f"interleaved readings of each size")
+                f"interleaved readings of each size{short}")
 
 
 @dataclass(frozen=True)
