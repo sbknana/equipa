@@ -808,7 +808,9 @@ def planted_band(target_seconds: float) -> tuple[float, float]:
     """The readings a planted proof aiming at ``target_seconds`` must land
     in at the test's size: inside 16.5-159 ms (quadratic work main's 2 ms
     floor caught, up to the 159 ms of IR75-01), within a quarter (-) or a
-    third (+) of the target."""
+    third (+) of the target. The real-clock proofs aim at ``plant_target``
+    (30 ms and up, task 3208), so they plant 22.5-159 ms; 16.5-22.5 ms is
+    proved on the scripted clock."""
     return (max(1.03 * host_timing.GROWTH_DETECTION_SECONDS,
                 0.75 * target_seconds),
             min(0.159, target_seconds * 4 / 3))
@@ -851,6 +853,31 @@ def planted_over_the_floor(fastest_seconds: float, units: int) -> str:
             f"clear on this host")
 
 
+# How many times a real-clock proof plants its work before its band and
+# floor assertions decide (task 3209): the first plant at the units
+# ``_units_reading`` calibrates, every later one at the units
+# ``replanted_units`` re-scales from the plant before it.
+PLANTS = 4
+
+
+def replanted_units(units: int, planted_seconds: float,
+                    target_seconds: float) -> int:
+    """The units the next plant runs at, after a plant of ``units`` units
+    read ``planted_seconds`` at the test's size (the reading its band check
+    reads): re-scaled from that reading to ``target_seconds`` (task 3209).
+    The planted work is quadratic in its units at the test's size, so the
+    units scale by the square root of the ratio, as ``_units_reading``
+    scales them, and by at most GROWTH either way.
+
+    CI run 4 of PR #44: a plant calibrated to 50.8 ms read 0.0330 s at 860
+    units, under its 0.0381-0.0677 s band. Calibrating again on the same
+    target can return the same units, and that plant can miss the same
+    way. Re-scaled from its own reading, the next plant runs at 1067 units,
+    which read 50.8 ms on that runner."""
+    scale = math.sqrt(target_seconds / max(planted_seconds, 1e-6))
+    return max(GROWTH, round(units * min(max(scale, 1 / GROWTH), GROWTH)))
+
+
 def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
     """The ``TimingCheckFailed`` ``check()`` raised, or None if it passed."""
     try:
@@ -861,27 +888,39 @@ def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
 
 
 @pytest.mark.parametrize("build_seconds", (0.0, 0.3))
-@pytest.mark.parametrize("target_seconds", (0.02, 0.12))
-def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
-                                                   build_seconds):
-    """IR75-01 on real work and the real clock: quadratic work reading
-    about 20 ms or 120 ms at the test's size fails, also when building the
-    shape takes 0.3 s of wall time per call (3175 then measured each size
-    once and raised the quarter reading to the 20 ms floor).
+@pytest.mark.parametrize("target_seconds", (PLANT_LOWEST_TARGET, 0.12))
+def test_real_quadratic_work_of_22_5_to_159_ms_fails(target_seconds,
+                                                     build_seconds):
+    """IR75-01 on real work and the real clock: quadratic work planted at
+    30 ms (a 22.5-40 ms band) or 120 ms (90-159 ms) at the test's size
+    fails, also when building the shape takes 0.3 s of wall time per call
+    (3175 then measured each size once and raised the quarter reading to
+    the 20 ms floor). Readings of 16.5-22.5 ms are proved on the scripted
+    clock (``test_quadratic_work_of_16_to_159_ms_fails_whatever_a_call_
+    costs``): the real clock cannot plant them over the noise floor.
 
     Task 3180: the proof must plant what it claims on any host. The size
     is calibrated on the work itself, the reading at the test's size is
     recorded, and the test asserts it landed in the band (re-planted up to
-    three times) before asserting the check failed on it.
+    PLANTS times) before asserting the check failed on it.
 
-    Task 3208: the plant clears the noise floor. The 20 ms proof plants at
-    ``plant_target`` (30 ms), and every reading at the test's size, the
-    fastest the check settles on included, must reach PLANT_FLOOR_SECONDS;
-    a plant under it is re-calibrated up within the three plants."""
+    Task 3208: the plant clears the noise floor. The lowest proof plants
+    at PLANT_LOWEST_TARGET (30 ms, ``plant_target`` of the 20 ms aim), and
+    every reading at the test's size, the fastest the check settles on
+    included, must reach PLANT_FLOOR_SECONDS; a plant under it is
+    re-calibrated up to a higher target.
+
+    Task 3209: a plant that misses its band, under or over it, runs again
+    at units re-scaled from its own reading at the test's size
+    (``replanted_units``), so the plants converge on the band; one that
+    still misses after PLANTS plants fails on the band assertion."""
     target = plant_target(target_seconds)
-    for _ in range(3):
+    units = _units_reading(target)
+    for plant in range(PLANTS):
+        if plant:
+            target = plant_target(target, fastest)
+            units = replanted_units(units, planted, target)
         lower, upper = planted_band(target)
-        units = _units_reading(target)
         readings: dict[int, list[float]] = {}
 
         def seconds_at(size: int, units=units, readings=readings) -> float:
@@ -897,7 +936,6 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
         planted, fastest = readings[units][0], min(readings[units])
         if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
-        target = plant_target(target, fastest)
     assert lower <= planted <= upper, (
         f"the planted reading {planted:.4f} s at {units} units missed the "
         f"{lower:.4f}-{upper:.4f} s band on this host")
