@@ -282,6 +282,32 @@ EXPONENT_STEPS = 2
 # (6 s without the exponent); a cache step's third size (CI's 16 MB, about
 # 1 s) is read again in full.
 EXPONENT_SECONDS = 15.0
+# The exponent clears only what looks like a cache step (R3191-01): a first
+# step of at most this much (a cost per byte stepping up under 3.75 times;
+# CI's 8.1x and 2x-3.5x steps read 8-14x)...
+EXPONENT_MAX_FIRST_STEP = GROWTH * 3.75
+# ...and a second step of at least this much (linear past the step). Work
+# superlinear up to an input cap or a window just past the pair reads up to
+# 58x and then under GROWTH, under the outer limit; it stays over.
+EXPONENT_MIN_SECOND_STEP = GROWTH / 1.5
+# A part is never failed on a smaller reading under the noise floor (task
+# 3204): CI read redaction pattern 24 at 0.0020 s at 16 KB, the fastest of
+# 36 calls of a pattern taking 3.7-4.6 ms there on two interpreters here,
+# against 0.0182 s at 64 KB: 9.1x against the own pair's 2 ms floor on work
+# that grows 4.0x. A call of a few milliseconds can run whole inside a
+# quiet spell of its runner (a turbo clock, an idle SMT sibling) that a
+# call several times longer never fits, so the fastest of many short calls
+# reads under their cost (the same runner read real linear work at 1.28x
+# the cost per unit over 0.3 s that it read over 25 ms). So a part over the
+# limit whose smaller reading totals under GROWTH_FLOOR_SECONDS over its
+# runs is read again at the same sizes, each reading the mean of enough
+# interleaved runs that the smaller size's total reaches this many times
+# GROWTH_FLOOR_SECONDS, and is decided there (``_sub_floor_repetitions``)...
+SUB_FLOOR_MARGIN = 2.0
+# ...within MAX_GROWTH_REPETITIONS runs and what this much wall time per
+# reading (the runs of both sizes) pays for. A part still under the floor
+# when no more runs fit is decided as before (fail closed).
+SUB_FLOOR_READING_SECONDS = 1.0
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
