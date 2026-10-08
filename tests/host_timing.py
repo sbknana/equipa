@@ -597,6 +597,33 @@ def own_pair_floor(repetitions: int) -> float:
     return min(DETECTION_FLOOR_SECONDS, GROWTH_FLOOR_SECONDS / repetitions)
 
 
+def under_the_noise_floor(small_seconds: float, repetitions: int = 1) -> bool:
+    """Whether a smaller reading, the mean of ``repetitions`` runs, totals
+    under ``GROWTH_FLOOR_SECONDS`` over them: too short to be compared as
+    the work's cost when it fails a pair (task 3204)."""
+    return repetitions * small_seconds < GROWTH_FLOOR_SECONDS
+
+
+def sub_floor_repetitions(small_seconds: Sequence[float], repetitions: int,
+                          pair_cost_seconds: float) -> int:
+    """How many runs of each size a pair takes when it is read again
+    because a part over the limit had a smaller reading (the mean of
+    ``repetitions`` runs; one per such part in ``small_seconds``) under the
+    noise floor (task 3204): enough that every such reading totals
+    ``SUB_FLOOR_MARGIN`` times ``GROWTH_FLOOR_SECONDS``, at most
+    ``MAX_GROWTH_REPETITIONS`` and no more than one reading of
+    ``SUB_FLOOR_READING_SECONDS`` of wall time pays for when one run of
+    each size took ``pair_cost_seconds``. ``repetitions`` (read again: no)
+    when no more runs fit."""
+    target = SUB_FLOOR_MARGIN * GROWTH_FLOOR_SECONDS
+    needed = max((math.ceil(target / max(seconds, 1e-6))
+                  for seconds in small_seconds), default=repetitions)
+    affordable = MAX_GROWTH_REPETITIONS
+    if pair_cost_seconds > 0:
+        affordable = int(SUB_FLOOR_READING_SECONDS / pair_cost_seconds)
+    return max(repetitions, min(MAX_GROWTH_REPETITIONS, needed, affordable))
+
+
 def _grown_further(grown: _GrownReadings, *sizes: int) -> bool:
     """Measure ``sizes``, the next sizes of a growth check (the quarter
     first); False when the shape does not exist at one (``InputTooLarge``)."""
@@ -1186,6 +1213,10 @@ class LinearTiming:
     # find superlinear passes on a ratio over the limit, a constant-factor
     # step.
     exponent: GrowthExponent | None = None
+    # The smaller reading (the total of its runs) under the noise floor that
+    # the pair, over the limit on it, was read again from over
+    # ``repetitions`` runs of each size (task 3204): never compared itself.
+    sub_floor_seconds: float | None = None
 
     @property
     def ratio(self) -> float:
@@ -1200,12 +1231,18 @@ class LinearTiming:
                      if self.confirmation is not None else "")
         exponent = (f"; {self.exponent.describe()}"
                     if self.exponent is not None else "")
+        read_again = (f"; read again over {self.repetitions} runs of each "
+                      f"size: the smaller reading over the limit was "
+                      f"{self.sub_floor_seconds:.4f} s, under the "
+                      f"{GROWTH_FLOOR_SECONDS:g} s noise floor"
+                      if self.sub_floor_seconds is not None else "")
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth:.3g}x the "
                 f"test's input{runs}, floor {self.floor_seconds:g} s, limit "
                 f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
-                f"factor {self.factor:.2f}{fastest}{confirmed}{exponent})")
+                f"factor {self.factor:.2f}{fastest}{confirmed}{exponent}"
+                f"{read_again})")
 
 
 def _check_budget(label: str, seconds: float, size: int,
@@ -1487,27 +1524,42 @@ def _check_growth(grown: _GrownReadings,
     def timings_at(pair: _Pair, small: Mapping[str, float],
                    large: Mapping[str, float], at_parts: list[str],
                    samples: int, confirmations: Mapping[str, Confirmation],
-                   exponents: Mapping[str, GrowthExponent]
+                   exponents: Mapping[str, GrowthExponent],
+                   sub_floor: Mapping[str, float]
                    ) -> dict[str, LinearTiming]:
         return {part: LinearTiming(labels[part], pair.small_size, small[part],
                                    pair.size, large[part], budget_seconds,
                                    factor, pair.input_growth,
                                    pair.floor_seconds, pair.repetitions,
                                    samples, confirmations.get(part),
-                                   exponents.get(part))
+                                   exponents.get(part), sub_floor.get(part))
                 for part in at_parts}
 
     def held(pair: _Pair, means: tuple[Mapping[str, float],
                                        Mapping[str, float]] | None = None,
-             *, grown_sizes: bool = False) -> dict[str, LinearTiming]:
+             *, grown_sizes: bool = False, judged: list[str] | None = None,
+             sub_floor: Mapping[str, float] | None = None
+             ) -> dict[str, LinearTiming]:
         """``pair`` held to the limit on ``means`` (the means of its
         repetitions), or on the readings ``grown`` keeps at its sizes; those
         are then replaced by the settled ones, so a later pair at the same
         sizes (the pair the growth stopped at) starts from them. A pair of
         ``grown_sizes`` still over the limit once confirmed is judged on
-        its growth exponent over three sizes (``_exponent_judged``)."""
+        its growth exponent over three sizes (``_exponent_judged``).
+
+        Only the ``judged`` parts are held (every part by default). When
+        every part over the limit had its smaller reading under the noise
+        floor (``under_the_noise_floor``), none of them fails on it: the
+        pair is held again on means of more runs of each size
+        (``sub_floor_repetitions``), interleaved, its floor spread over the
+        runs as the own pair's is (``own_pair_floor``), and those parts are
+        decided there, ``sub_floor`` keeping the readings read again from
+        (task 3204). A part with a smaller reading over the floor fails on
+        it as before, at once."""
         if pair in cleared:
             return cleared[pair]
+        judged = parts if judged is None else judged
+        sub_floor = {} if sub_floor is None else sub_floor
         if means is not None:
             small, large = means
             first_samples = 1
@@ -1516,12 +1568,30 @@ def _check_growth(grown: _GrownReadings,
             first_samples = min(grown.samples[pair.small_size],
                                 grown.samples[pair.size])
         small, large, over, samples, confirmations = _settled_readings(
-            measure, pair, small, large, parts, first_samples)
+            measure, pair, small, large, judged, first_samples)
         if means is None:
             for at_size, readings in ((pair.small_size, small),
                                       (pair.size, large)):
                 grown.settle(at_size, readings, grown.samples[at_size]
                              + samples - first_samples)
+        read_again: dict[str, LinearTiming] = {}
+        if over and all(under_the_noise_floor(small[part], pair.repetitions)
+                        for part in over):
+            repetitions = sub_floor_repetitions(
+                [small[part] for part in over], pair.repetitions,
+                grown.costs[pair.small_size] + grown.costs[pair.size])
+            if repetitions > pair.repetitions:
+                again = replace(pair, repetitions=repetitions,
+                                floor_seconds=min(
+                                    pair.floor_seconds,
+                                    GROWTH_FLOOR_SECONDS / repetitions))
+                read_again = held(
+                    again, _interleaved_means(measure, pair.small_size,
+                                              pair.size, repetitions),
+                    grown_sizes=grown_sizes, judged=over,
+                    sub_floor={part: pair.repetitions * small[part]
+                               for part in over})
+                over = []
         exponents: dict[str, GrowthExponent] = {}
         if over and grown_sizes:
             over, exponents = _exponent_judged(grown, measure, pair, small,
@@ -1530,10 +1600,11 @@ def _check_growth(grown: _GrownReadings,
             fail("superlinear growth: " + "; ".join(
                 timing.describe() for timing in timings_at(
                     pair, small, large, over, samples, confirmations,
-                    exponents).values()))
-        timings = timings_at(pair, small, large, parts, samples,
-                             confirmations, exponents)
-        if exponents:
+                    exponents, sub_floor).values()))
+        timings = timings_at(pair, small, large, judged, samples,
+                             confirmations, exponents, sub_floor)
+        timings.update(read_again)
+        if exponents or read_again:
             cleared[pair] = timings
         return timings
 
