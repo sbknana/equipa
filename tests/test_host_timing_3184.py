@@ -19,12 +19,14 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Callable, Mapping, Sequence
 
 import pytest
 
 from tests import host_timing
+from tests import test_host_timing_3171 as host_timing_3171
 from tests.host_timing import (
     BORDERLINE_GROWTH,
     BORDERLINE_RETRIES,
@@ -39,9 +41,12 @@ from tests.host_timing import (
     assert_linear_times,
 )
 from tests.test_host_timing_3171 import (
+    Plant,
     _pair_work,
     _units_reading,
+    another_plant,
     planted_band,
+    replanted_units,
     timing_failure,
 )
 
@@ -313,13 +318,26 @@ BURST_RATIO = 6.5
 def test_real_quadratic_work_read_under_a_burst_fails():
     """Real quadratic work, its first quarter reading inflated by CPU time
     so that the first pair reads inside the band (as CI's did): one
-    reading of each size passes it; the fastest of each fails it."""
+    reading of each size passes it; the fastest of each fails it.
+
+    Task 3210 (R3209-I-06): a plant that misses its band or its first
+    ratio runs again at units re-scaled from a damped estimate of the
+    runner's bias over every plant so far, as the 3171/3180 proofs do
+    (``replanted_units``, ``another_plant``). Calibrated again on the same
+    target, a runner whose plants read 0.65 of their calibration (CI run 4
+    of PR #44) planted 91 ms at the same units every time, under the
+    105-159 ms band."""
     target_seconds = BURST_TARGET_SECONDS
     burst_seconds = target_seconds / BURST_RATIO
     assert burst_seconds > host_timing.GROWTH_FLOOR_SECONDS
     lower, upper = planted_band(target_seconds)
-    for _ in range(3):
-        units = _units_reading(target_seconds)
+    units = _units_reading(target_seconds)
+    calibration = (units, target_seconds)
+    plants: list[Plant] = []
+    plant_seconds: list[float] = []
+    while not plant_seconds or another_plant(plant_seconds):
+        if plant_seconds:
+            units = replanted_units(calibration, plants, target_seconds)
         quarter = units // GROWTH
         readings: dict[int, list[float]] = {}
 
@@ -333,10 +351,13 @@ def test_real_quadratic_work_read_under_a_burst_fails():
             readings.setdefault(size, []).append(elapsed)
             return elapsed
 
+        plant_started = time.monotonic()
         failure = timing_failure(lambda: assert_linear_time(
             seconds_at, units, 30.0, "quadratic under a burst"))
+        plant_seconds.append(time.monotonic() - plant_started)
         planted = readings[units][0]
         first_ratio = planted / readings[quarter][0]
+        plants.append((units, planted))
         if (lower <= planted <= upper
                 and BORDERLINE_GROWTH <= first_ratio < GROWTH_LIMIT):
             break
@@ -348,6 +369,77 @@ def test_real_quadratic_work_read_under_a_burst_fails():
     assert failure is not None and "superlinear growth" in str(failure), (
         f"quadratic work read {first_ratio:.1f}x under a burst and passed: "
         f"{readings}")
+
+
+# --- Task 3210: the burst proof re-plants as the 3171/3180 proofs do ----------
+
+
+def _scripted_burst_runner(monkeypatch, drift: float = 1.0):
+    """CI run 4 of PR #44's runner under the burst proof, on the scripted
+    clock of ``test_host_timing_3171.scripted_runner``: its plants read
+    0.65 of what their calibration reads (each later plant ``drift`` times
+    the one before), and the burst is spent on that clock."""
+    runner = host_timing_3171.scripted_runner(
+        monkeypatch, sys.modules[__name__], "_pair_work", drift)
+    monkeypatch.setattr(sys.modules[__name__], "_spin_cpu_until",
+                        runner.spin_until)
+    return runner
+
+
+# CI's runner under the burst proof: calibrated to 0.14 s at 1428 units, its
+# first plant there reads 0.65 of that, under the 105-159 ms band.
+BURST_CI_UNITS = 1428
+BURST_BAND_MISSED = r"missed the 0\.1050-0\.1590 s band on this host"
+
+
+def test_the_burst_proof_replants_a_biased_plant_into_its_band(monkeypatch):
+    """R3209-I-06: on CI run 4's runner, the burst proof's first plant
+    reads 91 ms at the 1428 units calibrated to 0.14 s. That is under its
+    105-159 ms band, and its first ratio (4.2x) is under BORDERLINE_GROWTH.
+    Re-scaled from the damped estimate of that reading, the next plant runs
+    at 1631 units and reads 118.6 ms, inside the band at 5.5x. The check
+    then fails the quadratic work on each size's fastest reading."""
+    runner = _scripted_burst_runner(monkeypatch)
+    test_real_quadratic_work_read_under_a_burst_fails()
+    lower, upper = planted_band(BURST_TARGET_SECONDS)
+    (first_units, first), (units, planted) = runner.planted()
+    assert (first_units, f"{first:.4f}") == (BURST_CI_UNITS, "0.0909")
+    assert first < lower
+    assert first / (BURST_TARGET_SECONDS / BURST_RATIO) < BORDERLINE_GROWTH
+    assert (units, f"{planted:.4f}") == (1631, "0.1186")
+    assert lower <= planted <= upper
+
+
+def test_the_burst_proof_calibrated_again_misses_again(monkeypatch):
+    """The control: calibrated again on the same 0.14 s target, as every
+    burst plant was before task 3210, each plant runs at 1428 units again
+    on CI's runner and reads 91 ms. The proof fails on the band after its
+    last plant."""
+    runner = _scripted_burst_runner(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "replanted_units",
+                        lambda calibration, plants, target:
+                        _units_reading(target))
+    with pytest.raises(AssertionError,
+                       match=r"the planted reading 0\.0909 s at 1428 units "
+                             + BURST_BAND_MISSED):
+        test_real_quadratic_work_read_under_a_burst_fails()
+    assert ([units for units, _ in runner.planted()]
+            == [BURST_CI_UNITS] * host_timing_3171.PLANTS)
+
+
+@pytest.mark.parametrize("drift", host_timing_3171.NEVER_LANDING_DRIFTS)
+def test_a_burst_proof_that_never_lands_still_fails_loudly(monkeypatch,
+                                                           drift):
+    """A runner whose every plant reads ``drift`` times the CPU time per
+    pair of the one before misses each band. The burst proof plants as
+    often as ``another_plant`` allows, then fails on the band."""
+    runner = _scripted_burst_runner(monkeypatch, drift)
+    with pytest.raises(AssertionError, match=BURST_BAND_MISSED):
+        test_real_quadratic_work_read_under_a_burst_fails()
+    lower, upper = planted_band(BURST_TARGET_SECONDS)
+    planted = runner.planted()
+    assert len(planted) == host_timing_3171.PLANTS
+    assert not any(lower <= reading <= upper for _, reading in planted)
 
 
 def test_real_linear_work_read_under_a_burst_passes():
