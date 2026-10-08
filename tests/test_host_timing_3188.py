@@ -418,6 +418,22 @@ def _settling_delay(quarter_seconds: float) -> float:
                              host_timing.DETECTION_FLOOR_SECONDS)
 
 
+@pytest.mark.parametrize("quarter_seconds, delay", [
+    (0.003, GROWTH ** 2 * 0.003),
+    # A quarter read under main's floor is inflated against the floor.
+    (0.0005, GROWTH ** 2 * host_timing.DETECTION_FLOOR_SECONDS),
+    (0.0, GROWTH ** 2 * host_timing.DETECTION_FLOOR_SECONDS),
+])
+def test_a_settling_reading_is_inflated_over_the_limit_of_its_quarter(
+        quarter_seconds, delay):
+    """Task 3208: the delay carries the larger reading GROWTH ** 2 times
+    over its quarter reading (against the own pair's floor), twice the
+    limit, so no mean of such pairs reads under the limit."""
+    assert _settling_delay(quarter_seconds) == pytest.approx(delay)
+    assert _settling_delay(quarter_seconds) >= 2 * GROWTH_LIMIT * max(
+        quarter_seconds, host_timing.DETECTION_FLOOR_SECONDS)
+
+
 @pytest.mark.parametrize("confirming", (True, False),
                          ids=["confirmed", "before-3188"])
 def test_real_linear_work_with_every_settling_reading_inflated(

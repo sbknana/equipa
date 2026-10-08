@@ -907,6 +907,33 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
         f"quadratic work reading {planted:.4f} s passed: {readings}")
 
 
+@pytest.mark.parametrize("target_seconds, fastest_seconds, planted", [
+    # The 20 ms proof plants at 30 ms; the 120 ms one as aimed.
+    (0.02, None, PLANT_LOWEST_TARGET),
+    (0.12, None, 0.12),
+    # A plant whose fastest reading cleared the floor is planted again as
+    # aimed; one under it is re-calibrated up by the share it fell short.
+    (0.03, 0.025, 0.03),
+    (0.03, 0.019, 0.03 * PLANT_LOWEST_TARGET / 0.019),
+    # Never past the top proof's target.
+    (0.12, 0.015, PLANT_HIGHEST_TARGET),
+])
+def test_a_plant_under_the_floor_is_recalibrated_up(target_seconds,
+                                                    fastest_seconds, planted):
+    assert plant_target(target_seconds, fastest_seconds) == pytest.approx(
+        planted)
+
+
+def test_every_planted_band_clears_the_floor():
+    """Task 3208: CI planted 0.0190 s at the 20 ms target, under the noise
+    floor; a plant in the band of any proof's target now reads over
+    PLANT_FLOOR_SECONDS, which is over it."""
+    assert PLANT_FLOOR_SECONDS > GROWTH_FLOOR_SECONDS > 0.0190
+    for target_seconds in (0.02, 0.12):
+        lower, upper = planted_band(plant_target(target_seconds))
+        assert PLANT_FLOOR_SECONDS <= lower < upper <= 0.159
+
+
 @pytest.mark.parametrize("target_seconds", (0.005, 0.05))
 def test_real_linear_work_passes(target_seconds):
     units = _units_reading(target_seconds) ** 2

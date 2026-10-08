@@ -780,6 +780,40 @@ def test_real_linear_work_with_a_3x_step_passes(monkeypatch, judged):
                                          grown_call_seconds)
 
 
+def _shape_reading(first_step: float, second_step: float) -> _MeasuredShape:
+    """A measured shape whose steps read ``first_step`` then
+    ``second_step``, its quarter over the floor."""
+    quarter = 1.5 * GROWTH_FLOOR_SECONDS
+    return _MeasuredShape(1000, quarter, quarter * first_step,
+                          quarter * first_step * second_step)
+
+
+@pytest.mark.parametrize("first_step, second_step, judged, allowed", [
+    # The middle of the window: the proof's calibrated step.
+    (11.0, 4.0, True, {PASSED_ON_ITS_EXPONENT}),
+    (11.0, 4.0, False, {FAILED}),
+    # A cliff, and work flat past the pair (a cap or a window).
+    (20.0, 4.0, True, {FAILED}),
+    (11.0, 2.0, True, {FAILED}),
+    # Near an edge: the verdicts on both sides of it.
+    (14.5, 4.0, True, {PASSED_ON_ITS_EXPONENT, FAILED}),
+    (8.5, 4.0, True, {PASSED, PASSED_ON_ITS_EXPONENT}),
+    (6.0, 4.0, True, {PASSED}),
+])
+def test_a_measured_shape_owes_the_verdicts_of_the_window(
+        first_step, second_step, judged, allowed):
+    shape = _shape_reading(first_step, second_step)
+    assert shape.first_step == pytest.approx(first_step)
+    assert _allowed_verdicts(shape, judged, 0.3) == allowed
+
+
+def test_a_measured_shape_whose_third_size_costs_too_much_owes_a_failure():
+    """R3191-03: a 3 s call at the pair's larger size makes the third size
+    cost about 17 s at an 11x first step, over EXPONENT_SECONDS: the check
+    fails the pair closed without reading it."""
+    assert _allowed_verdicts(_shape_reading(11.0, 4.0), True, 3.0) == {FAILED}
+
+
 def test_real_quadratic_work_with_the_same_step_fails():
     """The same real work made quadratic (about 25 ms at the test's size,
     under 2 ms at its quarter, the same 3x step past twice the size) fails
