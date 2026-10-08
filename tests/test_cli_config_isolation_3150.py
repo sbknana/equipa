@@ -553,7 +553,7 @@ def _standalone_call(name: str, monkeypatch):
     else:
         module = _load_script("autoresearch_loop_3150", "autoresearch_loop.py",
                               monkeypatch)
-        monkeypatch.setattr(module, "is_on_claudinator", lambda: True)
+        monkeypatch.setattr(module, "is_on_orchestrator_host", lambda: True)
 
         def call():
             module.mutate_prompt("developer", "old", "none",
@@ -619,7 +619,7 @@ def test_autoresearch_ssh_command_gets_a_fresh_config_dir(monkeypatch):
     """The remote shell command creates, uses and removes its own directory
     and pins the shell; on base it ran ``claude ... < file`` as is."""
     module, call = _standalone_call("autoresearch-ssh", monkeypatch)
-    monkeypatch.setattr(module, "is_on_claudinator", lambda: False)
+    monkeypatch.setattr(module, "is_on_orchestrator_host", lambda: False)
     commands: list[str] = []
 
     def fake_run(argv, **kwargs):

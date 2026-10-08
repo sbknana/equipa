@@ -1374,6 +1374,9 @@ _COMMAND_CONFIG_KEYS: frozenset[str] = frozenset({
     "core.askpass", "core.gitproxy", "core.fsmonitor",
     "core.alternaterefscommand", "diff.external", "credential.helper",
     "uploadpack.packobjectshook",
+    # IR83-03 (task #3187): further keys real git ran a command line from.
+    "gpg.ssh.defaultkeycommand", "interactive.difffilter",
+    "sendemail.tocmd", "sendemail.cccmd", "sendemail.headercmd",
 })
 # ``<section>.<subsection>.<name>`` keys of the same kind, as (section, name);
 # ``pager.<command>`` is the one two-part family.
@@ -1383,6 +1386,13 @@ _COMMAND_CONFIG_SUBSECTION_KEYS: frozenset[tuple[str, str]] = frozenset({
     ("merge", "driver"), ("difftool", "cmd"), ("mergetool", "cmd"),
     ("credential", "helper"),
     ("remote", "uploadpack"), ("remote", "receivepack"),
+    # IR83-03 (task #3187): ``trailer.<token>.cmd`` runs on commit --trailer
+    # and interpret-trailers, ``submodule.<name>.update=!cmd`` on submodule
+    # update, ``remote.<name>.vcs`` names a remote-helper program, and
+    # ``sendemail.<identity>.toCmd`` runs on send-email.
+    ("trailer", "cmd"), ("trailer", "command"), ("submodule", "update"),
+    ("remote", "vcs"),
+    ("sendemail", "tocmd"), ("sendemail", "cccmd"), ("sendemail", "headercmd"),
 })
 _COMMAND_ENV_KEYS: tuple[str, ...] = (
     "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EDITOR",
@@ -1629,10 +1639,17 @@ def _read_git_call(
     environment_config, unreadable_environment = _environment_config_pairs(env)
     unreadable = unreadable or unreadable_environment
     for key, _ in [*config, *environment_config]:
-        if key.lower().startswith("alias."):
+        lowered = key.lower()
+        if lowered.startswith("alias."):
             unreadable = unreadable or (
                 f"the config pair {key!r} defines a git alias, which can run a "
                 f"command line the guard cannot read")
+        elif lowered.startswith(("include.", "includeif.")):
+            # IR83-03 (task #3187): the included file can define an alias
+            # or a command key the guard never sees.
+            unreadable = unreadable or (
+                f"the config pair {key!r} includes a config file, which can "
+                f"carry a command line the guard cannot read")
     locations.extend(_config_locations([*config, *environment_config]))
     unreadable = unreadable or _command_carried([*config, *environment_config], env)
     locations.extend(_environment_variable_locations(env))
@@ -1710,6 +1727,108 @@ def _requested_git_call_refusal(
     return _non_git_project_refusal(["git", *args], cwd, requested)
 
 
+def _hardening_config_pins(env: Mapping[str, str]) -> dict[str, str]:
+    """The value EQUIPA's hardening gives each config key it pins on the
+    command line (``GIT_HARDENING_ARGS`` and the operator program pins),
+    by lower-case key; for a key pinned twice, the later value, as git
+    reads it."""
+    tokens = [*GIT_HARDENING_ARGS, *_operator_program_pins(env)]
+    pins: dict[str, str] = {}
+    for flag, pair in zip(tokens, tokens[1:]):
+        if flag == "-c":
+            key, _, value = pair.partition("=")
+            pins[key.lower()] = value
+    return pins
+
+
+def _caller_config_pairs(
+    args: Sequence[str], env: Mapping[str, str],
+) -> list[tuple[str, str, str]]:
+    """The config pairs the global options of ``git <args>`` set: each
+    ``-c key=value`` and ``--config-env key=VAR`` before the subcommand, as
+    ``(key, value, option)``; ``value`` of a ``--config-env`` pair is read
+    from ``env``."""
+    pairs: list[tuple[str, str, str]] = []
+    index = 0
+    while index < len(args):
+        token = os.fspath(args[index])
+        name, separator, value = token.partition("=")
+        if separator and name == "--config-env":
+            key, _, variable = value.partition("=")
+            pairs.append((key, env.get(variable, ""), "--config-env"))
+            index += 1
+        elif token in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            value = os.fspath(args[index + 1]) if index + 1 < len(args) else ""
+            if token == "-c":
+                key, _, pair_value = value.partition("=")
+                pairs.append((key, pair_value, "-c"))
+            elif token == "--config-env":
+                key, _, variable = value.partition("=")
+                pairs.append((key, env.get(variable, ""), "--config-env"))
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            break
+    return pairs
+
+
+def _hardening_override_refusal(
+    args: Sequence[str], env: Mapping[str, str] | None,
+) -> str | None:
+    """Why ``git <args>`` with the caller's ``env`` must not run: a config
+    pair it sets would override one of EQUIPA's hardening pins (IR83-03,
+    task #3187), None when it sets none.
+
+    git lets the last pair of a key win, and a caller's ``-c`` comes after
+    the pins, so ``-c protocol.ext.allow=always`` or ``-c
+    core.hooksPath=<dir>`` would switch that piece of hardening off.
+    ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_PARAMETERS`` pairs in ``env`` are
+    read the same way. A ``-c`` or environment pair that repeats the pinned
+    value is allowed.
+
+    IR87-02 (task #3189): a pair that includes a config file or names a
+    trailer command (:func:`_refused_caller_config_key`) is refused whatever
+    its value: git reads an included file where its ``include.path`` stands,
+    after the pins, so a pinned key set in that file won although no pair
+    this check sees named it. A ``--config-env`` pair for a pinned key is
+    refused too: git reads its variable from the child's environment, which
+    the hardening rewrites after this check (``core.hooksPath=VAR`` naming a
+    variable the hardening sets to ``1`` ran ``<repo>/1/pre-commit``)."""
+    requested = _get_repo_env()
+    requested.update(env or {})
+    environment_pairs, unreadable = _environment_config_pairs(env or {})
+    if unreadable is not None:
+        return (f"equipa: refused to run git: {unreadable}, so it cannot be "
+                f"checked against EQUIPA's hardening pins")
+    pins = _hardening_config_pins(requested)
+    pairs = [*_caller_config_pairs(args, requested),
+             *((key, value, "environment") for key, value in environment_pairs)]
+    for key, value, option in pairs:
+        pinned = pins.get(key.lower())
+        if pinned is not None and (value != pinned or option == "--config-env"):
+            return (f"equipa: refused to run git: the config pair {key!r} "
+                    f"would override EQUIPA's hardening pin "
+                    f"{key.lower()}={pinned!r}")
+        if _refused_caller_config_key(key):
+            return (f"equipa: refused to run git: the config pair {key!r} "
+                    f"includes a config file or names a command, which "
+                    f"could override EQUIPA's hardening pins")
+    return None
+
+
+def _refused_caller_config_key(key: str) -> bool:
+    """True for a config key no caller pair may set, whatever its value
+    (IR87-02, task #3189): ``include.*`` and ``includeIf.*`` read another
+    file after EQUIPA's pins, and ``trailer.<token>.cmd`` / ``.command`` run
+    a command line on ``commit --trailer`` and ``interpret-trailers``."""
+    parts = key.lower().split(".")
+    section, name = parts[0], parts[-1]
+    if section in ("include", "includeif"):
+        return True
+    return section == "trailer" and len(parts) > 2 and name in ("cmd", "command")
+
+
 def _non_git_refused_result(
     argv: Sequence[str], message: str, text: bool,
 ) -> subprocess.CompletedProcess:
@@ -1784,8 +1903,12 @@ def git_run(
     ``ls-files``, ...) whose ``cwd`` is in a task worktree runs where no
     agent-planted driver is defined (FF-3155, task #3158; see
     :func:`_git_run_in_worktree_view`).
+
+    A call whose own config pairs would override a hardening pin is refused
+    (IR83-03, task #3187; see :func:`_hardening_override_refusal`).
     """
-    refusal = _requested_git_call_refusal(args, cwd, env)
+    refusal = (_requested_git_call_refusal(args, cwd, env)
+               or _hardening_override_refusal(args, env))
     if refusal is not None:
         return _non_git_refused_result(["git", *args], refusal, text)
     pin = _pinned_repository_for(cwd)
@@ -1830,7 +1953,8 @@ async def git_run_async(
     A ``TimeoutError`` is raised if the command exceeds ``timeout`` seconds;
     the child process is killed before the error propagates.
     """
-    refusal = _requested_git_call_refusal(args, cwd, env)
+    refusal = (_requested_git_call_refusal(args, cwd, env)
+               or _hardening_override_refusal(args, env))
     if refusal is not None:
         return _non_git_refused_result(["git", *args], refusal, text)
     pin = _pinned_repository_for(cwd)

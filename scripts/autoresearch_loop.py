@@ -72,7 +72,7 @@ CLAUDE_MUTATE_COMMAND = shlex.join(
     ["claude", "--print", "--model", "opus", *CLAUDE_CLI_ISOLATION_ARGS])
 
 
-def is_on_claudinator() -> bool:
+def is_on_orchestrator_host() -> bool:
     """Detect if we're running on the primary server (EQUIPA_BASE exists)."""
     equipa_base = os.environ.get("EQUIPA_BASE", str(Path(__file__).resolve().parent))
     return Path(equipa_base).exists()
@@ -82,7 +82,7 @@ def is_on_claudinator() -> bool:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 BACKUP_DIR = SCRIPT_DIR / ".autoresearch-backups"
-CLAUDINATOR = os.environ.get("SSH_USER", "user") + "@" + os.environ.get("CLAUDINATOR_HOST", "YOUR_HOST")
+ORCHESTRATOR_SSH_TARGET = os.environ.get("SSH_USER", "user") + "@" + os.environ.get("ORCHESTRATOR_HOST", "YOUR_HOST")
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY_PATH", "~/.ssh/id_ed25519"))
 REMOTE_PROMPTS = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR)) + "/prompts"
 REMOTE_ORCHESTRATOR = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR)) + "/forge_orchestrator.py"
@@ -207,11 +207,11 @@ POLL_INTERVAL = 30  # Check every 30s
 
 
 def ssh_cmd(cmd: str, timeout: int = 60) -> str:
-    """Run a command on Claudinator (via SSH or locally if already there)."""
-    if is_on_claudinator():
+    """Run a command on the orchestrator host (via SSH or locally if already there)."""
+    if is_on_orchestrator_host():
         full_cmd = ["bash", "-c", cmd]
     else:
-        full_cmd = ["ssh", "-i", SSH_KEY, CLAUDINATOR, cmd]
+        full_cmd = ["ssh", "-i", SSH_KEY, ORCHESTRATOR_SSH_TARGET, cmd]
     try:
         result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
         return result.stdout.strip()
@@ -222,12 +222,12 @@ def ssh_cmd(cmd: str, timeout: int = 60) -> str:
 
 
 def db_query(sql: str, timeout: int = 30) -> list[dict]:
-    """Run a SQL query against TheForge DB (always on Claudinator).
+    """Run a SQL query against TheForge DB (always on the orchestrator host).
 
-    Returns list of dicts. Uses sqlite3 directly if on Claudinator,
+    Returns list of dicts. Uses sqlite3 directly if on the orchestrator host,
     or SSH + sqlite3 CLI if remote.
     """
-    if is_on_claudinator():
+    if is_on_orchestrator_host():
         conn = sqlite3.connect(THEFORGE_DB)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql).fetchall()
@@ -246,8 +246,8 @@ def db_query(sql: str, timeout: int = 30) -> list[dict]:
 
 
 def db_execute(sql: str, timeout: int = 30) -> bool:
-    """Run an INSERT/UPDATE/DELETE against TheForge DB (always on Claudinator)."""
-    if is_on_claudinator():
+    """Run an INSERT/UPDATE/DELETE against TheForge DB (always on the orchestrator host)."""
+    if is_on_orchestrator_host():
         conn = sqlite3.connect(THEFORGE_DB)
         conn.execute(sql)
         conn.commit()
@@ -404,13 +404,13 @@ Output the raw prompt text only."""
     # Write meta_prompt to a temp file to avoid shell quoting issues
     import tempfile
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
-                                      dir="/tmp" if is_on_claudinator() else None)
+                                      dir="/tmp" if is_on_orchestrator_host() else None)
     tmp.write(meta_prompt)
     tmp.close()
     tmp_path = tmp.name
 
     try:
-        if is_on_claudinator():
+        if is_on_orchestrator_host():
             # The argv runs directly (no shell) with the prompt on stdin, and
             # never loads project settings or MCP servers (IR-01) or the
             # agent-writable ~/.claude (RR3144-A: fresh CLAUDE_CONFIG_DIR).
@@ -426,11 +426,11 @@ Output the raw prompt text only."""
             # Running on Windows — SCP the prompt file, then SSH to run claude
             remote_tmp = f"/tmp/autoresearch_prompt_{role}.txt"
             subprocess.run(
-                ["scp", "-i", SSH_KEY, tmp_path, f"{CLAUDINATOR}:{remote_tmp}"],
+                ["scp", "-i", SSH_KEY, tmp_path, f"{ORCHESTRATOR_SSH_TARGET}:{remote_tmp}"],
                 capture_output=True, timeout=30
             )
             result = subprocess.run(
-                ["ssh", "-i", SSH_KEY, CLAUDINATOR,
+                ["ssh", "-i", SSH_KEY, ORCHESTRATOR_SSH_TARGET,
                  f'{REMOTE_RUN_CONFIG_DIR_PREFIX}{CLAUDE_MUTATE_COMMAND} '
                  f'< "{remote_tmp}"'],
                 capture_output=True, text=True, timeout=300
@@ -457,15 +457,15 @@ Output the raw prompt text only."""
 
 
 def deploy_prompt(role: str, content: str):
-    """Write prompt to file (locally if on Claudinator, or sync via SSH)."""
+    """Write prompt to file (locally if on the orchestrator host, or sync via SSH)."""
     prompt_file = PROMPTS_DIR / f"{role}.md"
     prompt_file.write_text(content)
 
-    if not is_on_claudinator():
+    if not is_on_orchestrator_host():
         cmd = [
             "scp", "-i", SSH_KEY,
             str(prompt_file),
-            f"{CLAUDINATOR}:{REMOTE_PROMPTS}/{role}.md",
+            f"{ORCHESTRATOR_SSH_TARGET}:{REMOTE_PROMPTS}/{role}.md",
         ]
         subprocess.run(cmd, capture_output=True, timeout=30)
 
@@ -492,7 +492,7 @@ def create_test_tasks(role: str, round_num: int) -> list:
 
 
 def dispatch_tasks(task_ids: list) -> int:
-    """Dispatch tasks via orchestrator on Claudinator. Returns PID."""
+    """Dispatch tasks via orchestrator on the orchestrator host. Returns PID."""
     id_range = f"{min(task_ids)}-{max(task_ids)}"
     cmd = (
         f"nohup python3 -u {REMOTE_ORCHESTRATOR} "

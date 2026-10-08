@@ -5106,7 +5106,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
 
     When ``args.use_flow`` is true (or the parallel fanout has more than
     one task), a row in the ``flows`` table tracks the orchestration so
-    the run survives a Claudinator restart and supports sticky cancel.
+    the run survives an orchestrator host restart and supports sticky cancel.
     """
     # dispatch-15 (task #3112): de-duplicate, and refuse (exit non-zero)
     # rather than silently running a subset when an id does not exist.

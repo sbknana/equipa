@@ -488,22 +488,22 @@ def rollback_all():
             print(f"No backup for {role}")
 
 
-def sync_to_claudinator():
+def sync_to_orchestrator_host():
     """Rsync updated prompts to the primary server."""
     ssh_user = os.environ.get("SSH_USER", "user")
-    claudinator_host = os.environ.get("CLAUDINATOR_HOST")
+    orchestrator_host = os.environ.get("ORCHESTRATOR_HOST")
     ssh_key = os.environ.get("SSH_KEY_PATH", "~/.ssh/id_ed25519")
     remote_base = os.environ.get("EQUIPA_BASE", str(SCRIPT_DIR))
 
-    if not claudinator_host:
-        print("\n  SKIP: CLAUDINATOR_HOST not set, cannot sync remotely")
+    if not orchestrator_host:
+        print("\n  SKIP: ORCHESTRATOR_HOST not set, cannot sync remotely")
         return False
 
-    print(f"\nSyncing prompts to {claudinator_host}...")
+    print(f"\nSyncing prompts to {orchestrator_host}...")
     cmd = [
         "rsync", "-avz",
         str(PROMPTS_DIR) + "/",
-        f"{ssh_user}@{claudinator_host}:{remote_base}/prompts/",
+        f"{ssh_user}@{orchestrator_host}:{remote_base}/prompts/",
         "-e", f"ssh -i {os.path.expanduser(ssh_key)}"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -521,13 +521,13 @@ def main():
                        help="LLM tier: 1=Ollama, 2=Opus, 3=Opus (no sonnet tier)")
     parser.add_argument("--dry-run", action="store_true", help="Show proposals without writing")
     parser.add_argument("--rollback", action="store_true", help="Restore from backups")
-    parser.add_argument("--no-sync", action="store_true", help="Skip rsync to Claudinator")
+    parser.add_argument("--no-sync", action="store_true", help="Skip rsync to the orchestrator host")
     args = parser.parse_args()
 
     if args.rollback:
         rollback_all()
         if not args.no_sync:
-            sync_to_claudinator()
+            sync_to_orchestrator_host()
         return
 
     roles = [args.role] if args.role else TARGET_AGENTS
@@ -551,7 +551,7 @@ def main():
         print(f"  {role}: {status}")
 
     if not args.dry_run and any(results.values()) and not args.no_sync:
-        sync_to_claudinator()
+        sync_to_orchestrator_host()
 
     print("\nDone. Dispatch test tasks to evaluate the new prompts.")
 

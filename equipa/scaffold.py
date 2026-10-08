@@ -38,7 +38,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
-from equipa.config import configured_path_translations
+from equipa.config import is_drive_letter_path, scaffold_root_targets
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,9 @@ def _is_placeholder_name(name: str) -> bool:
 # ``mkdir(parents=True)`` into materialising ``/etc/evil``. The roots are the
 # ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` env var (colon-separated) when set,
 # otherwise the ``to`` prefixes of ``path_translations`` (the share mounts
-# DB paths are translated into). With neither, every clone is refused.
+# DB paths are translated into), without the entries a per-run dispatch
+# config added over the host's (IR87-04, equipa.config.scaffold_root_targets).
+# With neither, every clone is refused.
 
 
 class ScaffoldCloneError(RuntimeError):
@@ -104,7 +106,7 @@ def _allowed_roots() -> tuple[Path, ...]:
             return parsed
     return tuple(
         Path(target).resolve(strict=False)
-        for _source, target in configured_path_translations()
+        for target in scaffold_root_targets()
     )
 
 
@@ -128,6 +130,18 @@ def assert_contained_path(candidate: str | Path) -> Path:
     if any(part == ".." for part in posix_parts):
         raise ScaffoldCloneError(
             f"Refusing scaffold clone: path contains traversal segment ({raw!r})"
+        )
+    # A relative path resolves against the process cwd, and on this host a
+    # Windows path no ``path_translations`` entry maps (``C:\x``) is one: an
+    # allowlisted root holding the cwd would then get a junk directory such
+    # as ``<cwd>/C:\x`` (IR83-02). Only an absolute path of this host may be
+    # created; a translated path never keeps a backslash.
+    if not Path(raw).is_absolute() or (
+            os.name != "nt" and ("\\" in raw or is_drive_letter_path(raw))):
+        raise ScaffoldCloneError(
+            f"Refusing scaffold clone: {raw!r} is not an absolute path on "
+            "this host (a relative path, or a Windows path that no "
+            "path_translations entry maps)"
         )
     resolved = Path(raw).resolve(strict=False)
     roots = _allowed_roots()

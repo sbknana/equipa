@@ -426,11 +426,19 @@ def _model(per_unit: float, power: int, calls: list[int] | None = None):
     return seconds_at
 
 
+# Readings of each size a pair whose quarter reading is over its floor (and
+# whose larger reading could reach the limit against a quieter quarter) is
+# decided on: task 3187 (R3184-01) measures it again before it passes.
+SETTLED_READINGS = 1 + host_timing.SETTLE_RETRIES
+
+
 def test_linear_work_passes_and_reports_both_sizes():
-    # 0.04 s at the quarter size: over the floor, so each size runs once.
+    # 0.04 s at the quarter size: over the floor, so each size runs once,
+    # then once more, interleaved, before the pair passes (R3184-01).
     calls: list[int] = []
     timing = assert_linear_time(_model(4e-6, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS
+    assert timing.samples == SETTLED_READINGS
     assert (timing.small_size, timing.size) == (10_000, 40_000)
     assert timing.ratio == pytest.approx(4.0)
     assert "growth 4.0x" in timing.describe()
@@ -468,10 +476,15 @@ def test_one_descheduled_run_is_measured_again():
     def seconds_at(size: int) -> float:
         if size == 40_000:
             return next(spikes, 0.04)
-        return 0.01
+        return 0.01 * size / 10_000     # linear work
 
     timing = assert_linear_time(seconds_at, 40_000, 0.5, "spike")
-    assert timing.seconds == pytest.approx(0.04)
+    # The spike is measured again and settles at 0.04 s; the input then
+    # grows from that reading as it would have without the spike (task
+    # 3191, R3188-01), and linear work grows 4x there.
+    assert (timing.small_size, timing.small_seconds) == (
+        40_000, pytest.approx(0.04))
+    assert timing.ratio == pytest.approx(GROWTH)
 
 
 def test_work_below_the_floor_passes_the_growth_check():
@@ -494,10 +507,12 @@ def test_linear_work_under_the_floor_is_not_repeated():
     """Linear work whose quarter size takes under the floor is not measured
     again at the same sizes: its input grows until the quarter size takes
     the floor (the 20 ms reading of 40,000 becomes the quarter of 160,000),
-    and 20 ms against 80 ms is decided as read."""
+    and 20 ms against 80 ms is decided as read. (The test's own pair, a
+    5 ms quarter over main's 2 ms floor, is settled first: R3184-01.)"""
     calls: list[int] = []
     timing = assert_linear_time(_model(5e-7, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000, 160_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS + [160_000]
+    assert timing.repetitions == 1
     assert (timing.small_size, timing.size) == (40_000, 160_000)
     assert timing.input_growth == 4
     assert timing.ratio == pytest.approx(4.0)
@@ -515,11 +530,12 @@ def test_a_larger_reading_under_the_floor_grows_the_input_in_one_step():
     timing = assert_linear_time(_model(per_byte, 1, calls), size, 0.5, "pat")
     quarter = math.ceil(size * host_timing.GROWTH_STEP_MARGIN
                         * GROWTH_FLOOR_SECONDS / 0.0165)
-    assert calls == [size // GROWTH, size, quarter, quarter * GROWTH]
+    own_pair_calls = [size // GROWTH, size] * SETTLED_READINGS
+    assert calls == own_pair_calls + [quarter, quarter * GROWTH]
     assert timing.small_seconds >= GROWTH_FLOOR_SECONDS
     assert timing.input_growth == pytest.approx(quarter / (size // GROWTH))
     assert timing.ratio == pytest.approx(4.0)
-    assert sum(calls[2:]) < 0.4 * (4 + 16) * size
+    assert sum(calls[len(own_pair_calls):]) < 0.4 * (4 + 16) * size
 
 
 @pytest.mark.parametrize("larger_reading", (0.0161, 0.017, 0.0199, 0.04))
@@ -556,7 +572,8 @@ def test_the_growing_part_with_the_smallest_reading_sets_the_step():
                 "fast": 0.001 * at_size / size}
 
     timings = assert_linear_times(seconds_at, size, 0.5, "parts")
-    assert len(calls) == 4
+    # The own pair (settled, R3184-01), then one scaled growth step.
+    assert len(calls) == 2 * SETTLED_READINGS + 2
     assert timings["a"].small_seconds >= GROWTH_FLOOR_SECONDS
     assert all(timing.ratio == pytest.approx(4.0)
                for name, timing in timings.items() if name != "fast")
@@ -578,12 +595,13 @@ def test_the_ci_reading_is_measured_again_and_passes():
     sizes run 32 times and their means (0.6 ms against 2.5 ms) are linear;
     5.2 ms is under the 16 ms that quadratic work main caught reads at, so
     the input does not grow. The same spike over a 5 ms quarter reading
-    (24 ms) cannot reach the limit when repeated, so it runs once, and it
-    grows the input: at 4 times it the spike (now the quarter) against 80
-    ms is linear."""
+    (24 ms) cannot reach the limit when repeated, so it is not repeated;
+    its quarter reading is over main's 2 ms floor, so the pair is read once
+    more before it passes (R3184-01), and it grows the input: at 4 times it
+    the fastest reading (20 ms, now the quarter) against 80 ms is linear."""
     for quarter, spike, runs, grown in (
             (0.0006, 0.0052, MAX_GROWTH_REPETITIONS, 1),
-            (0.005, 0.024, 1, 4)):
+            (0.005, 0.024, SETTLED_READINGS, 4)):
         calls: list[int] = []
         spikes = iter([spike])
 
@@ -790,10 +808,91 @@ def planted_band(target_seconds: float) -> tuple[float, float]:
     """The readings a planted proof aiming at ``target_seconds`` must land
     in at the test's size: inside 16.5-159 ms (quadratic work main's 2 ms
     floor caught, up to the 159 ms of IR75-01), within a quarter (-) or a
-    third (+) of the target."""
+    third (+) of the target. The real-clock proofs aim at ``plant_target``
+    (30 ms and up, task 3208), so they plant 22.5-159 ms; 16.5-22.5 ms is
+    proved on the scripted clock."""
     return (max(1.03 * host_timing.GROWTH_DETECTION_SECONDS,
                 0.75 * target_seconds),
             min(0.159, target_seconds * 4 / 3))
+
+
+# The fastest reading at the test's size a planted proof must reach: clearly
+# above the GROWTH_FLOOR_SECONDS noise floor (task 3208). CI run 1 of PR #44
+# planted 0.0190 s and 0.0181 s at the 20 ms target, their fastest readings
+# 14 ms (under the 16 ms main's floor catches), and the check rightly left
+# them unjudged: the proofs failed on a plant, not on the check.
+PLANT_FLOOR_SECONDS = 1.1 * GROWTH_FLOOR_SECONDS
+# The lowest target a plant calibrates to, so that its readings land above
+# PLANT_FLOOR_SECONDS on a runner whose fastest reading is a quarter under
+# its median; and the highest a plant re-calibrates up to, the top proof's
+# target (the band then stays inside 16-159 ms).
+PLANT_LOWEST_TARGET = 1.5 * GROWTH_FLOOR_SECONDS
+PLANT_HIGHEST_TARGET = 0.12
+
+
+def plant_target(target_seconds: float,
+                 fastest_seconds: float | None = None) -> float:
+    """The target a proof aiming at ``target_seconds`` calibrates its plant
+    to (task 3208): at least PLANT_LOWEST_TARGET. After a plant whose
+    fastest reading at the test's size, ``fastest_seconds``, missed
+    PLANT_FLOOR_SECONDS, re-calibrated up by the share that reading fell
+    short of PLANT_LOWEST_TARGET, never past PLANT_HIGHEST_TARGET."""
+    target = max(target_seconds, PLANT_LOWEST_TARGET)
+    if fastest_seconds is not None and fastest_seconds < PLANT_FLOOR_SECONDS:
+        target = max(target, min(PLANT_HIGHEST_TARGET, target
+                                 * PLANT_LOWEST_TARGET
+                                 / max(fastest_seconds, 1e-6)))
+    return target
+
+
+def planted_over_the_floor(fastest_seconds: float, units: int) -> str:
+    """The message of a plant whose fastest reading at ``units`` units
+    stayed under PLANT_FLOOR_SECONDS (``plant_target``)."""
+    return (f"the fastest planted reading {fastest_seconds:.4f} s at {units} "
+            f"units stayed under the {PLANT_FLOOR_SECONDS:.4f} s a plant must "
+            f"clear on this host")
+
+
+# How many times a real-clock proof plants its work before its band and
+# floor assertions decide (task 3209): the first plant at the units
+# ``_units_reading`` calibrates, every later one at the units
+# ``replanted_units`` re-scales from the plant before it. A proof always
+# has the PLANTS_KEPT plants it had before re-scaling, and plants up to
+# PLANTS times while the next plant fits in the test's 30 s budget
+# (PLANT_SECONDS of wall time). A plant takes 4.5-6 s here, 9 s with the
+# 0.3 s build, and CI ran three in 18 s.
+PLANTS_KEPT = 3
+PLANTS = 5
+PLANT_SECONDS = 30.0
+
+
+def another_plant(plant_seconds: list[float]) -> bool:
+    """Whether a proof whose plants so far each took ``plant_seconds`` of
+    wall time, the last one off its band, plants again: always up to
+    PLANTS_KEPT plants; past them, up to PLANTS while one more plant as
+    long as the longest so far still ends within PLANT_SECONDS."""
+    if len(plant_seconds) < PLANTS_KEPT:
+        return True
+    return (len(plant_seconds) < PLANTS
+            and sum(plant_seconds) + max(plant_seconds) <= PLANT_SECONDS)
+
+
+def replanted_units(units: int, planted_seconds: float,
+                    target_seconds: float) -> int:
+    """The units the next plant runs at, after a plant of ``units`` units
+    read ``planted_seconds`` at the test's size (the reading its band check
+    reads): re-scaled from that reading to ``target_seconds`` (task 3209).
+    The planted work is quadratic in its units at the test's size, so the
+    units scale by the square root of the ratio, as ``_units_reading``
+    scales them, and by at most GROWTH either way.
+
+    CI run 4 of PR #44: a plant calibrated to 50.8 ms read 0.0330 s at 860
+    units, under its 0.0381-0.0677 s band. Calibrating again on the same
+    target can return the same units, and that plant can miss the same
+    way. Re-scaled from its own reading, the next plant runs at 1067 units,
+    which read 50.8 ms on that runner."""
+    scale = math.sqrt(target_seconds / max(planted_seconds, 1e-6))
+    return max(GROWTH, round(units * min(max(scale, 1 / GROWTH), GROWTH)))
 
 
 def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
@@ -806,21 +905,41 @@ def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
 
 
 @pytest.mark.parametrize("build_seconds", (0.0, 0.3))
-@pytest.mark.parametrize("target_seconds", (0.02, 0.12))
-def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
-                                                   build_seconds):
-    """IR75-01 on real work and the real clock: quadratic work reading
-    about 20 ms or 120 ms at the test's size fails, also when building the
-    shape takes 0.3 s of wall time per call (3175 then measured each size
-    once and raised the quarter reading to the 20 ms floor).
+@pytest.mark.parametrize("target_seconds", (PLANT_LOWEST_TARGET, 0.12))
+def test_real_quadratic_work_of_22_5_to_159_ms_fails(target_seconds,
+                                                     build_seconds):
+    """IR75-01 on real work and the real clock: quadratic work planted at
+    30 ms (a 22.5-40 ms band) or 120 ms (90-159 ms) at the test's size
+    fails, also when building the shape takes 0.3 s of wall time per call
+    (3175 then measured each size once and raised the quarter reading to
+    the 20 ms floor). Readings of 16.5-22.5 ms are proved on the scripted
+    clock (``test_quadratic_work_of_16_to_159_ms_fails_whatever_a_call_
+    costs``): the real clock cannot plant them over the noise floor.
 
     Task 3180: the proof must plant what it claims on any host. The size
     is calibrated on the work itself, the reading at the test's size is
-    recorded, and the test asserts it landed in the band (re-planted up to
-    three times) before asserting the check failed on it."""
-    lower, upper = planted_band(target_seconds)
-    for _ in range(3):
-        units = _units_reading(target_seconds)
+    recorded, and the test asserts it landed in the band (re-planted as
+    ``another_plant`` allows) before asserting the check failed on it.
+
+    Task 3208: the plant clears the noise floor. The lowest proof plants
+    at PLANT_LOWEST_TARGET (30 ms, ``plant_target`` of the 20 ms aim), and
+    every reading at the test's size, the fastest the check settles on
+    included, must reach PLANT_FLOOR_SECONDS; a plant under it is
+    re-calibrated up to a higher target.
+
+    Task 3209: a plant that misses its band, under or over it, runs again
+    at units re-scaled from its own reading at the test's size
+    (``replanted_units``), so the plants converge on the band; one that
+    still misses at its last plant (``another_plant``) fails on the band
+    assertion."""
+    target = plant_target(target_seconds)
+    units = _units_reading(target)
+    plant_seconds: list[float] = []
+    while not plant_seconds or another_plant(plant_seconds):
+        if plant_seconds:
+            target = plant_target(target, fastest)
+            units = replanted_units(units, planted, target)
+        lower, upper = planted_band(target)
         readings: dict[int, list[float]] = {}
 
         def seconds_at(size: int, units=units, readings=readings) -> float:
@@ -831,16 +950,231 @@ def test_real_quadratic_work_of_16_to_159_ms_fails(target_seconds,
             readings.setdefault(size, []).append(elapsed)
             return elapsed
 
+        plant_started = time.monotonic()
         failure = timing_failure(lambda: assert_linear_time(
             seconds_at, units, 30.0, "planted quadratic"))
-        planted = readings[units][0]
-        if lower <= planted <= upper:
+        plant_seconds.append(time.monotonic() - plant_started)
+        planted, fastest = readings[units][0], min(readings[units])
+        if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
     assert lower <= planted <= upper, (
         f"the planted reading {planted:.4f} s at {units} units missed the "
         f"{lower:.4f}-{upper:.4f} s band on this host")
+    assert fastest >= PLANT_FLOOR_SECONDS, planted_over_the_floor(fastest,
+                                                                 units)
     assert failure is not None and "superlinear growth" in str(failure), (
         f"quadratic work reading {planted:.4f} s passed: {readings}")
+
+
+@pytest.mark.parametrize("target_seconds, fastest_seconds, planted", [
+    # The 20 ms proof plants at 30 ms; the 120 ms one as aimed.
+    (0.02, None, PLANT_LOWEST_TARGET),
+    (0.12, None, 0.12),
+    # A plant whose fastest reading cleared the floor is planted again as
+    # aimed; one under it is re-calibrated up by the share it fell short.
+    (0.03, 0.025, 0.03),
+    (0.03, 0.019, 0.03 * PLANT_LOWEST_TARGET / 0.019),
+    # Never past the top proof's target.
+    (0.12, 0.015, PLANT_HIGHEST_TARGET),
+])
+def test_a_plant_under_the_floor_is_recalibrated_up(target_seconds,
+                                                    fastest_seconds, planted):
+    assert plant_target(target_seconds, fastest_seconds) == pytest.approx(
+        planted)
+
+
+def test_every_planted_band_clears_the_floor():
+    """Task 3208: CI planted 0.0190 s at the 20 ms target, under the noise
+    floor; a plant in the band of any proof's target now reads over
+    PLANT_FLOOR_SECONDS, which is over it."""
+    assert PLANT_FLOOR_SECONDS > GROWTH_FLOOR_SECONDS > 0.0190
+    for target_seconds in (0.02, 0.12):
+        lower, upper = planted_band(plant_target(target_seconds))
+        assert PLANT_FLOOR_SECONDS <= lower < upper <= 0.159
+
+
+# --- Task 3209: a plant that misses its band is re-scaled from its reading ---
+
+
+# CI run 4 of PR #44 (3.12 runner): the 30 ms proof's target had been raised
+# to 50.8 ms (band 0.0381-0.0677 s), and its plant, calibrated at 860
+# units, read 0.0330 s there in the check.
+CI_PLANT_TARGET = 0.0380904614035782 / 0.75
+CI_PLANT_UNITS = 860
+CI_PLANTED_SECONDS = 0.03297001700000024
+
+
+class _ScriptedRunner:
+    """A runner on a scripted CPU clock, replaying a real-clock proof (task
+    3209). ``_pair_work_seconds``, which ``_units_reading`` calibrates on,
+    reads ``calibrated_seconds`` at ``units`` units. The first plant (the
+    first ``assert_linear_time`` call) reads ``planted_seconds`` there, and
+    every later plant reads ``drift`` times the CPU time per pair of the
+    plant before it. ``plants`` keeps each plant's size and its readings by
+    size; the build sleeps advance ``wall``, the clock host_timing reads."""
+
+    def __init__(self, wall: _BuildClock, units: int,
+                 calibrated_seconds: float, planted_seconds: float,
+                 drift: float) -> None:
+        self.wall = wall
+        self.calibrated_per_pair = calibrated_seconds / units ** 2
+        self.per_pair = planted_seconds / units ** 2 / drift
+        self.drift = drift
+        self.now = 0.0
+        self.plants: list[tuple[int, dict[int, list[float]]]] = []
+
+    def calibration_reading(self, units: int) -> float:
+        return self.calibrated_per_pair * units ** 2
+
+    def process_time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.wall.now += seconds
+
+    def work(self, size: int, window: int | None = None) -> int:
+        """``_pair_work(size)`` or ``_windowed_pair_work(size, window)``:
+        min(size, window) x size pairs of scripted CPU time."""
+        seconds = self.per_pair * min(size, window or size) * size
+        self.now += seconds
+        self.plants[-1][1].setdefault(size, []).append(seconds)
+        return 0
+
+    def start_plant(self, size: int) -> None:
+        self.per_pair *= self.drift
+        self.plants.append((size, {}))
+
+    def planted(self) -> list[tuple[int, float]]:
+        """Each plant's units and its first reading there."""
+        return [(size, readings[size][0]) for size, readings in self.plants]
+
+
+def scripted_runner(monkeypatch, proof_module, work_name: str,
+                    drift: float = 1.0) -> _ScriptedRunner:
+    """A ``_ScriptedRunner`` replaying CI run 4 of PR #44 under the real-
+    clock proof in ``proof_module`` whose work is ``work_name``: calibrated
+    at CI_PLANT_UNITS for CI_PLANT_TARGET, its first plant reading
+    CI_PLANTED_SECONDS there."""
+    runner = _ScriptedRunner(_build_clock(monkeypatch), CI_PLANT_UNITS,
+                             CI_PLANT_TARGET, CI_PLANTED_SECONDS, drift)
+    monkeypatch.setattr(sys.modules[__name__], "_pair_work_seconds",
+                        runner.calibration_reading)
+    monkeypatch.setattr(proof_module, "time", SimpleNamespace(
+        process_time=runner.process_time, sleep=runner.sleep,
+        monotonic=runner.wall.monotonic))
+    monkeypatch.setattr(proof_module, work_name, runner.work)
+    check = proof_module.assert_linear_time
+
+    def planted_check(seconds_at, size, *args, **kwargs):
+        runner.start_plant(size)
+        return check(seconds_at, size, *args, **kwargs)
+
+    monkeypatch.setattr(proof_module, "assert_linear_time", planted_check)
+    return runner
+
+
+CI_BAND_MISSED = r"missed the 0\.0381-0\.0677 s band on this host"
+
+
+def test_the_ci_plant_under_its_band_lands_in_it_once_replanted(monkeypatch):
+    """CI run 4 of PR #44: the plant read 0.0330 s at 860 units against
+    its 0.0381-0.0677 s band. Re-scaled from that reading, the next plant
+    runs at 1067 units, reads 50.8 ms, inside the band, and the proof's
+    check fails the quadratic work there."""
+    runner = scripted_runner(monkeypatch, sys.modules[__name__],
+                             "_pair_work")
+    test_real_quadratic_work_of_22_5_to_159_ms_fails(CI_PLANT_TARGET, 0.0)
+    lower, upper = planted_band(CI_PLANT_TARGET)
+    (first_units, first), (units, planted) = runner.planted()
+    assert (first_units, f"{first:.4f}") == (CI_PLANT_UNITS, "0.0330")
+    assert first < lower
+    assert units == 1067
+    assert lower <= planted <= upper
+
+
+def test_the_ci_plant_calibrated_again_misses_again(monkeypatch):
+    """The control: a plant calibrated again on the same target, as every
+    plant was before task 3209, runs at 860 units again on CI's runner,
+    and the proof fails with CI's message after its last plant."""
+    runner = scripted_runner(monkeypatch, sys.modules[__name__],
+                             "_pair_work")
+    monkeypatch.setattr(sys.modules[__name__], "replanted_units",
+                        lambda units, planted, target: _units_reading(target))
+    with pytest.raises(AssertionError,
+                       match=r"the planted reading 0\.0330 s at 860 units "
+                             + CI_BAND_MISSED):
+        test_real_quadratic_work_of_22_5_to_159_ms_fails(CI_PLANT_TARGET, 0.0)
+    assert [units for units, _ in runner.planted()] == [860] * PLANTS
+
+
+# Every plant of a runner that never lands reads this share of the CPU time
+# per pair of the plant before it: CI's 0.65 keeps each plant under its
+# band; 1.5 puts every re-scaled plant over it.
+NEVER_LANDING_DRIFTS = (CI_PLANTED_SECONDS / CI_PLANT_TARGET, 1.5)
+
+
+@pytest.mark.parametrize("drift", NEVER_LANDING_DRIFTS)
+def test_a_runner_whose_plants_never_land_still_fails_loudly(monkeypatch,
+                                                             drift):
+    """Re-scaling converges only on a runner that holds still: one whose
+    every plant reads off by ``drift`` again misses each band, plants as
+    often as ``another_plant`` allows, then fails on the band, naming the
+    last plant's reading."""
+    runner = scripted_runner(monkeypatch, sys.modules[__name__],
+                             "_pair_work", drift)
+    with pytest.raises(AssertionError, match=CI_BAND_MISSED):
+        test_real_quadratic_work_of_22_5_to_159_ms_fails(CI_PLANT_TARGET, 0.0)
+    lower, upper = planted_band(CI_PLANT_TARGET)
+    planted = runner.planted()
+    assert len(planted) == PLANTS
+    assert not any(lower <= reading <= upper for _, reading in planted)
+
+
+@pytest.mark.parametrize("units, planted_seconds, target_seconds, replanted", [
+    # CI run 4: under the band, re-scaled up.
+    (CI_PLANT_UNITS, CI_PLANTED_SECONDS, CI_PLANT_TARGET, 1067),
+    # Over the band, re-scaled down.
+    (1000, 0.06, 0.03, 707),
+    # In the band but under the floor: re-scaled to the raised target.
+    (800, 0.03, 0.05, 1033),
+    # At most GROWTH times either way, never under GROWTH units.
+    (1000, 0.0, 0.03, 4000),
+    (1000, 10.0, 0.03, 250),
+    (GROWTH, 1.0, 0.03, GROWTH),
+])
+def test_a_plant_is_replanted_from_its_own_reading(
+        units, planted_seconds, target_seconds, replanted):
+    assert replanted_units(units, planted_seconds, target_seconds) == replanted
+
+
+def test_quadratic_work_is_replanted_by_the_square_root():
+    """Scaling the units by the ratio itself (units x target / reading)
+    squares it on quadratic work: CI's plant would then read 78 ms, over
+    its band, where the square root plants it at the target."""
+    lower, upper = planted_band(CI_PLANT_TARGET)
+    ratio = CI_PLANT_TARGET / CI_PLANTED_SECONDS
+    assert CI_PLANTED_SECONDS * ratio ** 2 > upper
+    replanted = replanted_units(CI_PLANT_UNITS, CI_PLANTED_SECONDS,
+                                CI_PLANT_TARGET)
+    reading = CI_PLANTED_SECONDS * (replanted / CI_PLANT_UNITS) ** 2
+    assert lower <= reading <= upper
+
+
+@pytest.mark.parametrize("plant_seconds, plants_again", [
+    # The first PLANTS_KEPT plants, however long they take.
+    ([], True),
+    ([20.0, 20.0], True),
+    # Past them, another plant only while it fits in PLANT_SECONDS: five
+    # 6 s plants (CI's), three 9 s ones (the 0.3 s build).
+    ([6.0] * 4, True),
+    ([6.0, 6.0, 6.0, 6.1], False),
+    ([9.0] * 3, False),
+    # Never past PLANTS.
+    ([1.0] * 5, False),
+])
+def test_a_proof_plants_again_within_its_budget(plant_seconds, plants_again):
+    assert another_plant(plant_seconds) is plants_again
+    assert PLANTS_KEPT == 3 and PLANT_SECONDS == 30.0
 
 
 @pytest.mark.parametrize("target_seconds", (0.005, 0.05))
@@ -951,7 +1285,7 @@ def test_the_gate_helper_refuses_a_review_over_the_artifact_cap():
 def test_a_quarter_reading_at_the_floor_is_decided_without_growing():
     calls: list[int] = []
     timing = assert_linear_time(_model(2e-6, 1, calls), 40_000, 0.5, "lin")
-    assert calls == [10_000, 40_000]
+    assert calls == [10_000, 40_000] * SETTLED_READINGS
     assert timing.input_growth == 1
 
 
@@ -959,7 +1293,7 @@ def test_compare_with_larger_times_the_size_and_four_times_it():
     calls: list[int] = []
     assert_linear_time(_model(1e-6, 1, calls), 40_000, 0.5, "cap",
                        compare_with_larger=True)
-    assert calls == [40_000, 160_000]
+    assert calls == [40_000, 160_000] * SETTLED_READINGS
 
 
 def test_a_size_without_a_quarter_is_refused():

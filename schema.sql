@@ -337,9 +337,9 @@ CREATE TABLE model_registry (
     above_50_pct REAL,
     top_symbol TEXT,
     top_da REAL,
-    trained_on TEXT,                  -- pc_wsl, forge-inference, claudinator
+    trained_on TEXT,                  -- e.g. workstation, inference-host, orchestrator-host
     model_path TEXT,                  -- where the models live
-    synced_to TEXT,                   -- comma-separated: claudinator, forge-inference
+    synced_to TEXT,                   -- comma-separated, e.g. orchestrator-host, inference-host
     trained_at DATETIME,
     logged_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     notes TEXT,
@@ -518,7 +518,7 @@ CREATE INDEX IF NOT EXISTS idx_lesson_graph_dst ON lesson_graph_edges(dst_id);
 -- A `flow` represents a multi-step orchestration spanning one or more child
 -- tasks (e.g. developer -> [security-reviewer, code-reviewer, tester] fanout).
 -- Each flow has an integer revision counter that is bumped on every state
--- transition; this lets the orchestrator survive a Claudinator restart and
+-- transition; this lets the orchestrator survive an orchestrator host restart and
 -- detect interleaved updates from concurrent dispatchers (optimistic
 -- concurrency).
 --

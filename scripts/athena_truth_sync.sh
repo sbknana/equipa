@@ -42,7 +42,7 @@
 #   * open_question insert via parameterized Python helper, not the
 #     bash `sqlite3` CLI.
 #
-# Expected schedule (Claudinator, user `user`):
+# Expected schedule (the orchestrator host, user `user`):
 #   0 5 * * 0 /srv/share/Equipa-repo/scripts/athena_truth_sync.sh \
 #       >> /var/log/athena-truth-sync.log 2>&1
 

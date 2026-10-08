@@ -6,6 +6,53 @@ All notable changes to EQUIPA are documented here.
 
 ### Changed
 
+- **A per-run dispatch config keeps more host settings** (task #3189).
+  - **MCP trust lists (IR87-01):** `mcp_trusted_executables` and `mcp_uvx_trusted_urls` from the host
+    `dispatch_config.json` stay in a per-run `--dispatch-config`; a per-run file may only add entries. Before, a uvx
+    listed only in the host config (prod's `~/.local/bin/uvx`) made every dispatch under a per-run config refuse.
+  - **Security review (IR87-05):** a per-run file cannot turn off the review the host config has on (top-level
+    `security_review` or `features.security_review`). The CLI's `--no-security-review` still decides its own run.
+  - **Scaffold roots (IR87-04):** a `path_translations` prefix a per-run file adds still maps paths, but its `to`
+    is no longer a scaffold mkdir root (a per-run `{"from": "Q:", "to": "/"}` allowed any absolute path).
+  - **Isolation settings (IR87-07):** an empty or non-object per-run `agent_isolation` section no longer replaces
+    the host's section.
+- **Caller git includes are refused** (task #3189, IR87-02): `git_run` / `git_run_async` refuse a caller's
+  `include.*` / `includeIf.*` pair and `trailer.<token>.cmd` / `.command` from `-c`, `--config-env` or
+  `GIT_CONFIG_*`, whatever the value. An included file's pairs land after EQUIPA's pins, so `-c include.path=<file>`
+  whose file set `core.hooksPath` ran the caller's hook. A `--config-env` pair for a pinned key is refused too: git
+  read its variable after the hardening rewrote it. A `-c` pair repeating a pinned value still runs.
+- **Private-marker scan reads the operator's markers from a local file** (task #3189, IR87-06): the public test no
+  longer spells host names or share paths, not even in fragments. Generic checks (private IPv4 host addresses,
+  drive-letter share paths, home directories) always run; the operator's own markers come from
+  `EQUIPA_PRIVATE_MARKERS_FILE` or the git-ignored `.equipa-private-markers` (docs/DEPLOYMENT.md). A configured file
+  that is missing or empty fails the test.
+
+- **A per-run dispatch config keeps the host's settings** (task #3187, IR83-01).
+  - **Change:** a `--dispatch-config` file is still merged over the defaults, but it now keeps the host
+    `dispatch_config.json`'s `path_translations`, `forgescaffold_dir` and fail-closed gates. Before, a per-run file
+    dropped `path_translations`, so every project recorded with a Windows drive path stopped resolving.
+  - **path_translations:** the host's entries always apply. A per-run file may add prefixes the host does not map;
+    an entry that re-points a host prefix (or a folder under one) is ignored with a warning.
+  - **Gates:** `bash_security_pretooluse`, like `agent_isolation`, stays on when the host has it on. A per-run file
+    may turn it on, never off.
+  - **Warning:** a drive-letter `local_path` that no translation maps is logged once.
+- **Scaffold containment refuses relative paths** (task #3187, IR83-02): only an absolute path of this host may be
+  created. A relative path, or (on POSIX) an unmapped drive-letter or backslash path, is refused instead of being
+  created under the working directory.
+- **Host-neutral names** (task #3187, IR83-04): docs, comments, the schema and scripts say "the orchestrator host"
+  instead of the operator's host names. **Operator note:** `scripts/autoresearch_loop.py` and
+  `scripts/autoresearch_prompts.py` read the remote host from `ORCHESTRATOR_HOST`; set it in place of the old
+  host-named variable.
+- **A caller cannot switch git hardening off** (task #3187, IR83-03).
+  - **Change:** `git_run` / `git_run_async` refuse a call whose own `-c` / `--config-env` pairs, or whose
+    `GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS` variables, give a key EQUIPA pins (`core.hooksPath`,
+    `protocol.ext.allow`, `core.pager`, `gpg.program`, `submodule.recurse`, ...) another value. git lets the last
+    pair win and the caller's come after the pins, so `-c protocol.ext.allow=always` re-enabled `ext::` commands.
+    A pair that repeats the pinned value still runs.
+  - **Non-git dispatch:** an `include.path` / `includeIf.<condition>.path` pair is refused like an alias (the
+    included file can define one), and so are `trailer.<token>.cmd`, `submodule.<name>.update`,
+    `remote.<name>.vcs`, `gpg.ssh.defaultKeyCommand`, `interactive.diffFilter` and the send-email command keys.
+
 - **Project path translation is configuration** (task #3183, IR80-05).
   - **Change:** EQUIPA no longer carries a built-in mapping from one Windows share to one Linux mount.
   - **New config key:** list the mappings under `path_translations` in `dispatch_config.json`, for example
