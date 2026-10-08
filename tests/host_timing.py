@@ -1592,7 +1592,8 @@ def _check_growth(grown: _GrownReadings,
         the runs as the own pair's is (``own_pair_floor``), and those parts
         are decided there, ``sub_floor`` keeping the readings read again
         from (task 3204). Any other part over the limit fails as before, at
-        once."""
+        once, and the parts beside it over only on such a reading are named
+        as not judged, never as growth."""
         if pair in cleared:
             return cleared[pair]
         judged = parts if judged is None else judged
@@ -1612,9 +1613,9 @@ def _check_growth(grown: _GrownReadings,
                 grown.settle(at_size, readings, grown.samples[at_size]
                              + samples - first_samples)
         read_again: dict[str, LinearTiming] = {}
-        if over and all(over_on_a_sub_floor_reading(
-                small[part], large[part], pair.repetitions, pair.limit)
-                for part in over):
+        sub_floor_over = [part for part in over if over_on_a_sub_floor_reading(
+            small[part], large[part], pair.repetitions, pair.limit)]
+        if over and len(sub_floor_over) == len(over):
             repetitions = sub_floor_repetitions(
                 [small[part] for part in over], pair.repetitions,
                 grown.costs[pair.small_size] + grown.costs[pair.size])
@@ -1635,10 +1636,23 @@ def _check_growth(grown: _GrownReadings,
             over, exponents = _exponent_judged(grown, measure, pair, small,
                                                large, over)
         if over:
+            # Beside a part over on readings that are its cost, a part over
+            # only on a sub-floor reading is not read again (the check fails
+            # anyway) and is never reported as growth itself: it is named
+            # as not judged. Alone, unread for want of runs, it fails as
+            # before (fail closed).
+            failing = [part for part in over
+                       if part not in sub_floor_over] or over
+            not_judged = [labels[part] for part in over
+                          if part not in failing]
+            unjudged = (f"; not judged, over the limit only on a smaller "
+                        f"reading under the {GROWTH_FLOOR_SECONDS:g} s noise "
+                        f"floor (task 3204): {', '.join(not_judged)}"
+                        if not_judged else "")
             fail("superlinear growth: " + "; ".join(
                 timing.describe() for timing in timings_at(
-                    pair, small, large, over, samples, confirmations,
-                    exponents, sub_floor).values()))
+                    pair, small, large, failing, samples, confirmations,
+                    exponents, sub_floor).values()) + unjudged)
         timings = timings_at(pair, small, large, judged, samples,
                              confirmations, exponents, sub_floor)
         timings.update(read_again)

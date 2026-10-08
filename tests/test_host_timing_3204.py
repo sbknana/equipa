@@ -311,6 +311,66 @@ def test_a_regression_read_again_says_so(monkeypatch):
             "the limit was" in message)
 
 
+def _beside_ci_pattern(clock, quadratic_reading: float,
+                       wall_seconds: float = CI_CALL_WALL_SECONDS
+                       ) -> Callable[[int], dict[str, float]]:
+    """``seconds_at`` of two parts timed on CI's runner: CI's linear pattern
+    (its quarter read short in quiet spells) and quadratic work reading
+    ``quadratic_reading`` at CI_SIZE (its quarter read short too when under
+    QUIET_SPELL_SECONDS), a call of both taking ``wall_seconds``."""
+    pattern = _quiet_spells(clock, wall_seconds=wall_seconds)
+    quadratic = _quiet_spells(clock, power=2, reading=quadratic_reading,
+                              wall_seconds=0.0)
+
+    def seconds_at(size: int) -> dict[str, float]:
+        return {"pattern": pattern(size), "quadratic": quadratic(size)}
+
+    return seconds_at
+
+
+def test_a_sub_floor_part_beside_a_regression_is_not_reported_as_growth(
+        monkeypatch):
+    """Quadratic work of 0.4 s at the test's size (its quarter 25 ms, over
+    the noise floor) beside CI's pattern: the check fails at once on the
+    quadratic part, without reading the pair again, and names the pattern,
+    over the limit only on its sub-floor quarter, as not judged, never as
+    growth."""
+    clock = _wall_clock(monkeypatch)
+    handed_out = _spied_repetitions(monkeypatch)
+    with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
+        host_timing.assert_linear_times(_beside_ci_pattern(clock, 0.4),
+                                        CI_SIZE, 10.0, "parts")
+    message = str(failure.value)
+    assert message.count("parts: quadratic: ") == 1
+    assert "parts: pattern: " not in message
+    assert message.endswith(
+        f"; not judged, over the limit only on a smaller reading under the "
+        f"{GROWTH_FLOOR_SECONDS:g} s noise floor (task 3204): parts: pattern")
+    assert handed_out == []
+
+
+def test_sub_floor_parts_read_again_name_only_the_regression(monkeypatch):
+    """Quadratic work of 18.2 ms at the test's size beside CI's pattern,
+    both quarters under the noise floor and read short in quiet spells, the
+    own pair decided on one run of each size (0.12 s of wall time a call):
+    the pair is read again over the four runs a second pays for, for both
+    parts, and only the quadratic part fails there."""
+    clock = _wall_clock(monkeypatch)
+    handed_out = _spied_repetitions(monkeypatch)
+    with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
+        host_timing.assert_linear_times(
+            _beside_ci_pattern(clock, CI_LARGE_SECONDS, wall_seconds=0.12),
+            CI_SIZE, 10.0, "parts")
+    message = str(failure.value)
+    assert handed_out[0] == 4
+    assert (f"parts: quadratic: 0.0182 s at size {CI_SIZE}" in message
+            and "at 1x the test's input over 4 runs of each" in message)
+    assert ("read again over 4 runs of each size: the smaller reading over "
+            "the limit was" in message)
+    assert "parts: pattern" not in message
+    assert "not judged" not in message
+
+
 # --- Real work on the real clock, read short in quiet spells -----------------
 
 
