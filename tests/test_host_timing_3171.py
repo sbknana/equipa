@@ -1344,7 +1344,8 @@ def test_a_proof_replants_only_after_a_first_plant():
     ([], True),
     ([20.0, 20.0], True),
     # Past them, another plant only while it fits in PLANT_SECONDS: five
-    # 6 s plants (CI's), three 9 s ones (the 0.3 s build).
+    # 6 s plants (CI's, and a 0.3 s-build plant less its sleep, task
+    # 3210), three 9 s ones.
     ([6.0] * 4, True),
     ([6.0, 6.0, 6.0, 6.1], False),
     ([9.0] * 3, False),
