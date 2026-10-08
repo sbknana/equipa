@@ -1192,8 +1192,8 @@ def _exponent_judged(grown: _GrownReadings,
     outer_small, outer_large, outer_over, samples, confirmations = (
         _settled_readings(measure, outer, small, grown.at(larger_size),
                           judged, first_samples, started + EXPONENT_SECONDS,
-                          grown.costs[pair.small_size]
-                          + grown.costs[larger_size]))
+                          outer.repetitions * (grown.costs[pair.small_size]
+                                               + grown.costs[larger_size])))
     for at_size, readings in ((pair.small_size, outer_small),
                               (larger_size, outer_large)):
         grown.settle(at_size, readings,
