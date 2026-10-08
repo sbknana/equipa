@@ -856,21 +856,21 @@ def planted_over_the_floor(fastest_seconds: float, units: int) -> str:
 
 # How many times a real-clock proof plants its work before its band and
 # floor assertions decide (task 3209): the first plant at the units
-# ``_units_reading`` calibrates, every later one at the units
-# ``replanted_units`` re-scales from the plants before it (a damped
-# estimate of the runner's bias over all of them, task 3210). A proof always
-# has the PLANTS_KEPT plants it had before re-scaling, and plants up to
-# PLANTS times while the next plant fits in the test's 30 s budget
-# (PLANT_SECONDS of wall time). A plant takes 4.5-6 s here, 9 s with the
-# 0.3 s build, and CI ran three in 18 s.
+# ``_units_reading`` calibrates, every later one calibrated afresh and at
+# the units ``replanted_units`` re-scales from the plants before it (a
+# damped estimate of the runner's bias over all of them, task 3210). A
+# proof always has the PLANTS_KEPT plants it had before re-scaling, and
+# plants up to PLANTS times while the next plant fits in the test's 30 s
+# budget (PLANT_SECONDS of wall time). A plant takes 4.5-6 s here, 9 s with
+# the 0.3 s build, and CI ran three in 18 s.
 #
 # Task 3210 (R3209-I-04): the budget counts a plant's wall time less the
-# sleep that models building the shape. That sleep is about 3 s of each
-# 0.3 s-build plant, and it is the same on every plant. Counted, it left
-# those proofs 3 plants where the others get 5. With 3 plants, no
-# re-scaling can match the old loop's independent re-calibrations on an
-# unbiased noisy runner. Every plant must also clear its band, so a plant
-# that keeps missing ends only at PLANTS (about 45 s with the build).
+# sleep that models building the shape. That sleep was 3.4-8.2 s of each
+# 0.3 s-build plant here, which left 0.8-2.3 s to count. Counted, the sleep
+# left those proofs 3 plants where the others get 5, and with 3 plants
+# the re-scaling false-failed more often than the old loop on an unbiased
+# noisy runner. Every plant must also clear its band, so a plant that
+# keeps missing ends only at PLANTS (about 45 s with the build).
 PLANTS_KEPT = 3
 PLANTS = 5
 PLANT_SECONDS = 30.0
@@ -1404,8 +1404,8 @@ def test_a_proof_replants_only_after_a_first_plant():
     ([], True),
     ([20.0, 20.0], True),
     # Past them, another plant only while it fits in PLANT_SECONDS: five
-    # 6 s plants (CI's, and a 0.3 s-build plant less its sleep, task
-    # 3210), three 9 s ones.
+    # 6 s plants (CI's; a 0.3 s-build plant less its sleep counts 1-2.5 s,
+    # task 3210), three 9 s ones.
     ([6.0] * 4, True),
     ([6.0, 6.0, 6.0, 6.1], False),
     ([9.0] * 3, False),
