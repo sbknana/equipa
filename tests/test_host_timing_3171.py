@@ -1262,6 +1262,22 @@ def test_a_runner_whose_plants_never_land_still_fails_loudly(monkeypatch,
     assert never_landed(planted)
 
 
+def test_a_runner_drifting_half_again_lands_on_its_second_plant(monkeypatch):
+    """Task 3210 replaced 1.5 in NEVER_LANDING_DRIFTS: under the damped
+    estimate such a runner is no longer one that never lands. Its second
+    plant reads 1.5 x 0.65 = 0.97 of its calibration, at the 982 units the
+    first plant's 0.65 re-scales to, inside the band, and the proof's
+    check fails the quadratic work there."""
+    runner = scripted_runner(monkeypatch, sys.modules[__name__],
+                             "_pair_work", 1.5)
+    test_real_quadratic_work_of_22_5_to_159_ms_fails(CI_PLANT_TARGET, 0.0)
+    lower, upper = planted_band(CI_PLANT_TARGET)
+    (_, first), (units, planted) = runner.planted()
+    assert first < lower
+    assert units == 982
+    assert lower <= planted <= upper
+
+
 # The calibration of the scripted plants below: 1000 units read 30 ms.
 CALIBRATED_30_MS = (1000, 0.03)
 
