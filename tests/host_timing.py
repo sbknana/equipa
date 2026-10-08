@@ -299,10 +299,12 @@ EXPONENT_MIN_SECOND_STEP = GROWTH / 1.5
 # call several times longer never fits, so the fastest of many short calls
 # reads under their cost (the same runner read real linear work at 1.28x
 # the cost per unit over 0.3 s that it read over 25 ms). So a part over the
-# limit whose smaller reading totals under GROWTH_FLOOR_SECONDS over its
-# runs is read again at the same sizes, each reading the mean of enough
-# interleaved runs that the smaller size's total reaches this many times
-# GROWTH_FLOOR_SECONDS, and is decided there (``_sub_floor_repetitions``)...
+# limit only on a smaller reading totalling under GROWTH_FLOOR_SECONDS over
+# its runs (it would pass were that reading raised to the noise floor,
+# ``over_on_a_sub_floor_reading``) is read again at the same sizes, each
+# reading the mean of enough interleaved runs that the smaller size's total
+# reaches this many times GROWTH_FLOOR_SECONDS, and is decided there
+# (``sub_floor_repetitions``)...
 SUB_FLOOR_MARGIN = 2.0
 # ...within MAX_GROWTH_REPETITIONS runs and what this much wall time per
 # reading (the runs of both sizes) pays for. A part still under the floor
@@ -597,11 +599,20 @@ def own_pair_floor(repetitions: int) -> float:
     return min(DETECTION_FLOOR_SECONDS, GROWTH_FLOOR_SECONDS / repetitions)
 
 
-def under_the_noise_floor(small_seconds: float, repetitions: int = 1) -> bool:
-    """Whether a smaller reading, the mean of ``repetitions`` runs, totals
-    under ``GROWTH_FLOOR_SECONDS`` over them: too short to be compared as
-    the work's cost when it fails a pair (task 3204)."""
-    return repetitions * small_seconds < GROWTH_FLOOR_SECONDS
+def over_on_a_sub_floor_reading(small_seconds: float, seconds: float,
+                                repetitions: int = 1,
+                                limit: float = GROWTH_LIMIT) -> bool:
+    """Whether a pair over ``limit`` is over only on a smaller reading under
+    the noise floor (task 3204): the smaller reading (the mean of
+    ``repetitions`` runs) totals under ``GROWTH_FLOOR_SECONDS`` over its
+    runs, and the larger one's total is under ``limit`` times that floor,
+    so the pair would pass were the smaller reading raised to the floor.
+    Such a reading is never the work's cost: the pair is read again
+    (``sub_floor_repetitions``). A grown pair's floor is the noise floor,
+    so it never is; the test's own pair's (main's 2 ms) is under it."""
+    small_total = repetitions * small_seconds
+    return (small_total < GROWTH_FLOOR_SECONDS
+            and growth_ratio(small_total, repetitions * seconds) < limit)
 
 
 def sub_floor_repetitions(small_seconds: Sequence[float], repetitions: int,
@@ -1548,14 +1559,14 @@ def _check_growth(grown: _GrownReadings,
         its growth exponent over three sizes (``_exponent_judged``).
 
         Only the ``judged`` parts are held (every part by default). When
-        every part over the limit had its smaller reading under the noise
-        floor (``under_the_noise_floor``), none of them fails on it: the
-        pair is held again on means of more runs of each size
-        (``sub_floor_repetitions``), interleaved, its floor spread over the
-        runs as the own pair's is (``own_pair_floor``), and those parts are
-        decided there, ``sub_floor`` keeping the readings read again from
-        (task 3204). A part with a smaller reading over the floor fails on
-        it as before, at once."""
+        every part over the limit is over only on a smaller reading under
+        the noise floor (``over_on_a_sub_floor_reading``), none of them
+        fails on it: the pair is held again on means of more runs of each
+        size (``sub_floor_repetitions``), interleaved, its floor spread over
+        the runs as the own pair's is (``own_pair_floor``), and those parts
+        are decided there, ``sub_floor`` keeping the readings read again
+        from (task 3204). Any other part over the limit fails as before, at
+        once."""
         if pair in cleared:
             return cleared[pair]
         judged = parts if judged is None else judged
@@ -1575,8 +1586,9 @@ def _check_growth(grown: _GrownReadings,
                 grown.settle(at_size, readings, grown.samples[at_size]
                              + samples - first_samples)
         read_again: dict[str, LinearTiming] = {}
-        if over and all(under_the_noise_floor(small[part], pair.repetitions)
-                        for part in over):
+        if over and all(over_on_a_sub_floor_reading(
+                small[part], large[part], pair.repetitions, pair.limit)
+                for part in over):
             repetitions = sub_floor_repetitions(
                 [small[part] for part in over], pair.repetitions,
                 grown.costs[pair.small_size] + grown.costs[pair.size])
