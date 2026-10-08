@@ -148,8 +148,12 @@ def _ci_replay(monkeypatch: pytest.MonkeyPatch, calls: list[int]
 
 def test_the_ci_failure_replays_on_the_check_before_confirmation(monkeypatch):
     """The replay is faithful: without confirmation it fails with the CI
-    message (own pair, one run of each size, 2 ms floor, 8.3x)."""
+    message (own pair, one run of each size, 2 ms floor, 8.3x). (Nor is
+    its quarter, under the noise floor, read again over more runs: the
+    check before task 3204.)"""
     _without_confirmation(monkeypatch)
+    monkeypatch.setattr(host_timing, "sub_floor_repetitions",
+                        lambda small_seconds, repetitions, cost: repetitions)
     calls: list[int] = []
     with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
         assert_linear_time(_ci_replay(monkeypatch, calls), CI_SIZE,
