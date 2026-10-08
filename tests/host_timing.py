@@ -159,7 +159,14 @@ timing test checks two things through this module:
    ``SUB_FLOOR_MARGIN`` times the floor (``sub_floor_repetitions``), and
    decided there; when no more runs fit ``SUB_FLOOR_READING_SECONDS`` it
    is decided as before (fail closed). A grown pair's floor is the noise
-   floor, so a grown pair is never read again for it.
+   floor, so a grown pair is never read again for it. A pair is read again
+   only for parts its confirming rounds kept over the limit, and a mean of
+   several runs is far likelier to carry a burst than the fastest single
+   reading was: so a pair read again clears a part only when EVERY one of
+   ``CONFIRM_ROUNDS`` confirming rounds reads it under the limit, and fails
+   it at the first round over (task 3207, R3204-I-02: in the 3204 review's
+   seeded noise simulation one settle pass on such means passed 365
+   regressions that 6ef24c6 failed).
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
@@ -330,7 +337,8 @@ EXPONENT_MIN_SECOND_STEP = GROWTH / 1.5
 # ``over_on_a_sub_floor_reading``) is read again at the same sizes, each
 # reading the mean of enough interleaved runs that the smaller size's total
 # reaches this many times GROWTH_FLOOR_SECONDS, and is decided there
-# (``sub_floor_repetitions``)...
+# (``sub_floor_repetitions``), a part cleared only when every confirming
+# round reads it under the limit (``Confirmation.unanimous``, task 3207)...
 SUB_FLOOR_MARGIN = 2.0
 # ...within MAX_GROWTH_REPETITIONS runs and what this much wall time per
 # reading (the runs of both sizes) pays for. A part still under the floor
@@ -806,6 +814,10 @@ class Confirmation:
     rounds: int
     rounds_over: int
     readings: int
+    # The rounds of a pair read again over more runs (``_Pair.read_again``,
+    # task 3207): they clear a part only when every one of CONFIRM_ROUNDS
+    # rounds reads it under the limit, and the first round over decides.
+    unanimous: bool = False
 
     @property
     def cut_short(self) -> bool:
@@ -818,7 +830,11 @@ class Confirmation:
         """A majority of the rounds read over the limit, or no round was
         read (fail closed: no evidence clears a pair). Rounds cut short
         clear a pair only when every one of them read under the limit
-        (R3191-02: one round under, or a tie of two, is no majority)."""
+        (R3191-02: one round under, or a tie of two, is no majority).
+        ``unanimous`` rounds confirm a part unless all ``CONFIRM_ROUNDS``
+        of them read under the limit (R3204-I-02)."""
+        if self.unanimous:
+            return self.rounds_over > 0 or self.rounds < CONFIRM_ROUNDS
         if self.cut_short:
             return self.rounds == 0 or self.rounds_over > 0
         return 2 * self.rounds_over > self.rounds
@@ -828,6 +844,12 @@ class Confirmation:
             return ("confirmed: no confirming round fitted the time left, "
                     "so the pair stays over the limit (fail closed)")
         verdict = "confirmed" if self.confirmed else "not confirmed"
+        if self.unanimous:
+            return (f"{verdict}: over the limit in {self.rounds_over} of "
+                    f"{self.rounds} confirming rounds of {self.readings} "
+                    f"interleaved readings of each size (read again: "
+                    f"cleared only when every one of {CONFIRM_ROUNDS} "
+                    f"rounds reads under the limit)")
         short = (f" (cut short under {CONFIRM_MAJORITY} rounds: any round "
                  f"over keeps the pair over)" if self.cut_short else "")
         return (f"{verdict}: over the limit in {self.rounds_over} of "
@@ -851,6 +873,10 @@ class _Pair:
     # the outer pair of a growth exponent (``_exponent_judged``). The limit
     # and the borderline band hold the same exponent over every step.
     steps: int = 1
+    # A pair read again over more runs because its parts were over the
+    # limit only on a sub-floor reading (task 3204): every part it judges
+    # is confirmed, in unanimous rounds (``Confirmation.unanimous``).
+    read_again: bool = False
 
     @property
     def limit(self) -> float:
@@ -938,6 +964,11 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
             retries = max(retries, pair.over_retries)
         if retries_done >= retries or not _within(deadline, reread_seconds):
             confirmations: dict[str, Confirmation] = {}
+            if pair.read_again:
+                # Its parts were confirmed over the limit, on the fastest
+                # readings; the means read again clear none of them on a
+                # settle pass alone (R3204-I-02).
+                over = list(parts)
             if over:
                 small, large, over, confirmations = _confirmed(
                     measure, pair, small, large, over, deadline,
@@ -983,9 +1014,14 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     settled readings; any other is kept on the reading of its fastest
     round, which is under the limit as most rounds read (R3188-02: the
     median round handed the next grown pair an inflated quarter reading,
-    and a later pair 9.5x over the fastest reading passed at 7.1x). Returns
-    the readings, the parts still over and each confirmed part's
-    ``Confirmation``."""
+    and a later pair 9.5x over the fastest reading passed at 7.1x).
+
+    A pair read again (``_Pair.read_again``) confirms every part it judges
+    and holds them to a stricter verdict (``Confirmation.unanimous``): a
+    part stays over at its first round over the limit and is cleared only
+    when all ``CONFIRM_ROUNDS`` rounds read it under (task 3207,
+    R3204-I-02). Returns the readings, the parts still over and each
+    confirmed part's ``Confirmation``."""
     small, large = dict(small), dict(large)
     quarter_total = pair.repetitions * max(min(small[part] for part in over),
                                            1e-6)
@@ -1002,6 +1038,8 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     def decided(part: str) -> bool:
         read_over = rounds_over(part)
         read_under = len(larger_by_round[part]) - read_over
+        if pair.read_again:
+            return read_over > 0 or read_under >= CONFIRM_ROUNDS
         return max(read_over, read_under) >= CONFIRM_MAJORITY
 
     rounds = 0
@@ -1026,7 +1064,8 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
         rounds += 1
 
     confirmations = {part: Confirmation(len(larger_by_round[part]),
-                                        rounds_over(part), readings)
+                                        rounds_over(part), readings,
+                                        pair.read_again)
                      for part in over}
     still_over = [part for part in over if confirmations[part].confirmed]
     for part in over:
@@ -1591,7 +1630,9 @@ def _check_growth(grown: _GrownReadings,
         size (``sub_floor_repetitions``), interleaved, its floor spread over
         the runs as the own pair's is (``own_pair_floor``), and those parts
         are decided there, ``sub_floor`` keeping the readings read again
-        from (task 3204). Any other part over the limit fails as before, at
+        from (task 3204): each is confirmed and cleared only when every
+        confirming round reads it under the limit (``_Pair.read_again``,
+        task 3207). Any other part over the limit fails as before, at
         once, and the parts beside it over only on such a reading are named
         as not judged, never as growth.
 
@@ -1626,7 +1667,7 @@ def _check_growth(grown: _GrownReadings,
                 grown.costs[pair.small_size] + grown.costs[pair.size])
             if repetitions > pair.repetitions:
                 again = replace(pair, repetitions=repetitions,
-                                floor_seconds=min(
+                                read_again=True, floor_seconds=min(
                                     pair.floor_seconds,
                                     GROWTH_FLOOR_SECONDS / repetitions))
                 read_again = held(
