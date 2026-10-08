@@ -41,9 +41,12 @@ from tests.host_timing import (
 from tests.test_host_timing_3171 import (
     IR75_01_LARGE_READINGS,
     IR75_01_SIZE,
+    PLANT_FLOOR_SECONDS,
     _build_clock,
     _units_reading,
+    plant_target,
     planted_band,
+    planted_over_the_floor,
     timing_failure,
 )
 
@@ -340,10 +343,15 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
                                                   build_seconds):
     """IR78-01 on real work: quadratic up to the test's size and linear
     past it, reading about 20 ms or 120 ms at the test's size. The size is
-    calibrated on this host and the reading asserted inside the band."""
-    lower, upper = planted_band(target_seconds)
+    calibrated on this host and the reading asserted inside the band, and
+    every reading at the test's size over PLANT_FLOOR_SECONDS: the 20 ms
+    proof plants at ``plant_target`` (30 ms), re-calibrated up within the
+    three plants when its fastest reading there falls under it (task
+    3208)."""
+    target = plant_target(target_seconds)
     for _ in range(3):
-        units = _units_reading(target_seconds)
+        lower, upper = planted_band(target)
+        units = _units_reading(target)
         readings: dict[int, list[float]] = {}
 
         def seconds_at(size: int, units=units, readings=readings) -> float:
@@ -356,12 +364,15 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
 
         failure = timing_failure(lambda: assert_linear_time(
             seconds_at, units, 30.0, "planted windowed"))
-        planted = readings[units][0]
-        if lower <= planted <= upper:
+        planted, fastest = readings[units][0], min(readings[units])
+        if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
+        target = plant_target(target, fastest)
     assert lower <= planted <= upper, (
         f"the planted reading {planted:.4f} s at {units} units missed the "
         f"{lower:.4f}-{upper:.4f} s band on this host")
+    assert fastest >= PLANT_FLOOR_SECONDS, planted_over_the_floor(fastest,
+                                                                 units)
     assert failure is not None and "superlinear growth" in str(failure), (
         f"windowed work reading {planted:.4f} s passed: {readings}")
 
@@ -371,9 +382,11 @@ def test_real_windowed_work_of_16_to_159_ms_fails(target_seconds,
 
 # A runner whose calibration is off, simulated: (target, share of it the
 # plant reads). An eighth of the 120 ms target (the CI case) reads 15 ms,
-# under the 16 ms main caught, so the check rightly passes it; twice the
-# 20 ms target reads 40 ms, over the band, so it proves nothing about the
-# 16-26.7 ms it claims.
+# under the 16 ms main caught, so the check rightly passes it (and no
+# re-calibration up past the 120 ms target reaches the band); twice the
+# 20 ms proof's 30 ms plant target (``plant_target``, task 3208) reads
+# 60 ms, over the band, so it proves nothing about the 22.5-40 ms it
+# claims.
 MISCALIBRATIONS = ((0.12, 1 / 8), (0.02, 2.0))
 
 
