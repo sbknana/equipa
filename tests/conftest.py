@@ -173,6 +173,18 @@ _TEST_DB_DIR = Path(tempfile.mkdtemp(
 TEST_DB_PATH = _TEST_DB_DIR / "theforge-test.db"
 os.environ["THEFORGE_DB"] = str(TEST_DB_PATH)
 
+# --- Inherited bash options (task 3204) ---
+#
+# An exported SHELLOPTS/BASHOPTS switches its options on in every bash this
+# suite starts. The Claude CLI's Bash tool exports SHELLOPTS with "onecmd",
+# so under an agent every script a test runs (scripts/verify_agent_isolation.sh,
+# the 3183 script defaults) exited after its first command and printed
+# nothing: 32 tests failed in the tester's run and passed in a plain shell.
+# The tests' scripts must run as they do on a real host, so neither name is
+# passed on, as equipa.cli_isolation already drops both from CLI runs.
+for _shell_options_name in ("SHELLOPTS", "BASHOPTS"):
+    os.environ.pop(_shell_options_name, None)
+
 
 def _is_safe_test_db(path) -> bool:
     """True only for a DB path that cannot be a real TheForge database.

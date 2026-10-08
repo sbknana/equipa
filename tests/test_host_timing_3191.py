@@ -56,7 +56,7 @@ BUDGET_SECONDS = 10.0
 
 
 def _stepped(reading: float, size: int, step_from: int, step: float,
-             power: int = 1, power_from: int = 0,
+             power: float = 1, power_from: int = 0,
              calls: list[int] | None = None) -> Callable[[int], float]:
     """Seconds at ``n`` of work reading ``reading`` at ``size``: growing as
     ``n ** power`` past ``power_from`` and linearly below it, its cost per
@@ -258,8 +258,9 @@ def test_linear_work_with_a_cache_step_passes(monkeypatch, reading, step):
 def test_the_same_work_made_quadratic_fails(monkeypatch, reading, step):
     """The same cache step on quadratic work fails at the test's own pair,
     as before (IR78-01), never reading past the test's size; quadratic only
-    past the test's size, it fails at the first grown pair on its exponent
-    (16x on every step, times the cache step)."""
+    past the test's size, it fails at the first grown pair (16x times the
+    cache step), never reading the size past it: no cache step reads a
+    first step over ``EXPONENT_MAX_FIRST_STEP`` (R3191-01, R3191-03)."""
     _build_clock(monkeypatch)
     step_from = _step_inside_the_first_grown_pair(reading)
     calls: list[int] = []
@@ -272,29 +273,33 @@ def test_the_same_work_made_quadratic_fails(monkeypatch, reading, step):
     assert max(calls) == SIZE
     calls.clear()
     with pytest.raises(TimingCheckFailed,
-                       match=r"superlinear growth: late quadratic: .*growth "
-                             r"exponent .*: superlinear") as failure:
+                       match=r"superlinear growth: late quadratic: ") as failure:
         assert_linear_time(
             _stepped(reading, SIZE, step_from, step, power=2,
                      power_from=SIZE, calls=calls),
             SIZE, BUDGET_SECONDS, "late quadratic")
     assert "at 1x the test's input" not in str(failure.value)
+    assert "growth exponent" not in str(failure.value)
     first_grown_size = GROWTH * _first_grown_quarter(SIZE, reading)
-    assert max(calls) == GROWTH * first_grown_size
+    assert max(calls) == first_grown_size
 
 
 @pytest.mark.parametrize("step", (4.0, 8.0, 40.0))
 def test_a_step_of_growth_times_or_more_per_unit_is_a_cliff(monkeypatch,
                                                            step):
     """A cost per unit GROWTH times higher past a size reads GROWTH ** 2
-    over the pair it falls in, as quadratic work does: no cache does that,
-    and the exponent (at least 1.5) fails it."""
+    over the pair it falls in, as quadratic work does: no cache does that.
+    Its first step is over ``EXPONENT_MAX_FIRST_STEP``, so it fails on the
+    pair without the size past it being read (R3191-03)."""
     _build_clock(monkeypatch)
     step_from = _step_inside_the_first_grown_pair(0.03)
+    calls: list[int] = []
     with pytest.raises(TimingCheckFailed,
-                       match=r"growth exponent .*: superlinear"):
-        assert_linear_time(_stepped(0.03, SIZE, step_from, step), SIZE,
-                           BUDGET_SECONDS, "cliff")
+                       match=r"superlinear growth: cliff: ") as failure:
+        assert_linear_time(_stepped(0.03, SIZE, step_from, step, calls=calls),
+                           SIZE, BUDGET_SECONDS, "cliff")
+    assert "growth exponent" not in str(failure.value)
+    assert max(calls) == GROWTH * _first_grown_quarter(SIZE, 0.03)
 
 
 def test_a_cache_step_beside_a_quadratic_part_names_only_the_quadratic(
@@ -379,18 +384,21 @@ def test_a_burst_on_a_third_size_of_seconds_is_settled_within_the_budget(
                          ids=["3191", "without-budget"])
 def test_an_expensive_third_size_is_not_read_past_the_budget(monkeypatch,
                                                             budgeted):
-    """Work quadratic past the test's size reads 7.68 s at the third size:
-    one more reading would end past ``EXPONENT_SECONDS``, so it is read
-    once and the part fails closed with no confirming round; without the
-    budget it is read again to settle and confirm."""
+    """Work growing as size ** 1.9 past the test's size reads 13.9x over
+    the first grown pair (under ``EXPONENT_MAX_FIRST_STEP``, so its
+    exponent is read: quadratic work's 16x is not, R3191-03) and 11.6 s at
+    the third size: one more reading would end past ``EXPONENT_SECONDS``,
+    so it is read once and the part fails closed with no confirming round;
+    without the budget it is read again to settle and confirm."""
     clock = _build_clock(monkeypatch)
     if not budgeted:
         monkeypatch.setattr(host_timing, "EXPONENT_SECONDS", math.inf)
     calls: list[int] = []
-    late = _stepped(0.03, SIZE, SIZE, 1.0, power=2, power_from=SIZE,
+    late = _stepped(0.06, SIZE, SIZE, 1.0, power=1.9, power_from=SIZE,
                     calls=calls)
-    third = GROWTH ** 2 * _first_grown_quarter(SIZE, 0.03)
-    assert late(third) == pytest.approx(7.68)
+    third = GROWTH ** 2 * _first_grown_quarter(SIZE, 0.06)
+    assert late(GROWTH * SIZE) / late(SIZE) == pytest.approx(13.93, abs=0.01)
+    assert late(third) == pytest.approx(11.64, abs=0.01)
     calls.clear()
     with pytest.raises(TimingCheckFailed,
                        match=r"growth exponent .*: superlinear") as failure:
@@ -465,35 +473,73 @@ def _linear_units(target_seconds: float) -> int:
     return units
 
 
-def _real_stepped(step_from: int, step: int,
+def _real_stepped(step_from: int, step: float,
                   quadratic_over: int = 0) -> Callable[[int], float]:
     """CPU seconds of real linear work, each unit ``step`` times as costly
-    past ``step_from`` units (the loop run ``step`` times): a cache step.
+    past ``step_from`` units (``step`` times the units run): a cache step.
     With ``quadratic_over`` the work at ``units`` is ``units ** 2 /
     quadratic_over`` units instead: the same step on quadratic work, which
     reads the same as the linear work at ``quadratic_over`` units."""
     def seconds_at(units: int) -> float:
         work = units * units // quadratic_over if quadratic_over else units
+        if units > step_from:
+            work = round(work * step)
         started = time.process_time()
-        for _ in range(step if units > step_from else 1):
-            _linear_work(work)
+        _linear_work(work)
         return time.process_time() - started
 
     return seconds_at
 
 
+# Interleaved readings of each call length ``_host_step`` keeps the fastest of.
+HOST_STEP_READINGS = 3
+
+
+def _linear_seconds(units: int) -> float:
+    """The CPU time of one ``_linear_work(units)`` call, collector paused."""
+    with host_timing.collector_paused():
+        started = time.process_time()
+        _linear_work(units)
+        return time.process_time() - started
+
+
+def _host_step(units: int, step: float,
+               seconds_of: Callable[[int], float] = _linear_seconds) -> float:
+    """The step to plant past twice the test's size so that THIS host reads
+    real linear work's cost per unit ``step`` times higher there (task
+    3204): ``step`` over the ratio of the cost per unit this host reads
+    over a stepped call at the first grown pair's larger size (``GROWTH *
+    step`` times ``units``) to the one it reads over ``units``, each the
+    fastest of HOST_STEP_READINGS interleaved readings, as the check keeps
+    its readings. The CI runner of run 37729154851 read that ratio at
+    1.28: three times the units read 15.4x over the first grown pair, a
+    steeper step than the proof claims and over the 15x a cache step may
+    read (R3191-01). ``seconds_of(count)`` reads the work over ``count``
+    units (this host's CPU time by default)."""
+    stepped_units = round(units * GROWTH * step)
+    fastest = {units: math.inf, stepped_units: math.inf}
+    for _ in range(HOST_STEP_READINGS):
+        for count in fastest:
+            fastest[count] = min(fastest[count], seconds_of(count))
+    skew = (fastest[stepped_units] / stepped_units) / (fastest[units] / units)
+    return step / skew
+
+
 @pytest.mark.parametrize("judged", (True, False), ids=["3191", "before-3191"])
 def test_real_linear_work_with_a_3x_step_passes(monkeypatch, judged):
     """Real linear work reading about 25 ms at the test's size whose cost
-    per unit triples past twice the test's size: 12x over the first grown
-    pair (the check before task 3191 fails it), 4x past it."""
+    per unit, as this host reads it, triples past twice the test's size:
+    12x over the first grown pair (the check before task 3191 fails it), 4x
+    past it. The step is calibrated on this host (``_host_step``), so the
+    proof plants the step it claims on any runner (task 3204)."""
     units = _linear_units(0.025)
+    step = _host_step(units, 3.0)
     if not judged:
         _before_3191(monkeypatch)
     failure = timing_failure(lambda: assert_linear_time(
-        _real_stepped(2 * units, 3), units, 30.0, "real cache step"))
+        _real_stepped(2 * units, step), units, 30.0, "real cache step"))
     if judged:
-        assert failure is None, str(failure)
+        assert failure is None, f"{failure} (planted step {step:.2f}x)"
     else:
         assert failure is not None and "superlinear growth" in str(failure)
 

@@ -30,6 +30,7 @@ from tests.host_timing import (
     BORDERLINE_RETRIES,
     CONFIRM_MAJORITY,
     CONFIRM_READINGS,
+    CONFIRM_ROUNDS,
     GROWTH,
     GROWTH_LIMIT,
     GROWTH_RETRIES,
@@ -77,6 +78,28 @@ def _confirming(small_size: int, size: int, repetitions: int = 1) -> list[int]:
             * (repetitions * CONFIRM_READINGS * CONFIRM_MAJORITY))
 
 
+# The quiet quarter (15 ms) is under the noise floor, and the pair would
+# pass were it raised to it (7x): a pair over the limit on it is read again
+# over enough runs of each size that the quarter totals twice the floor
+# (task 3204), three here.
+READ_AGAIN_RUNS = host_timing.sub_floor_repetitions([QUIET_QUARTER], 1, 0.0)
+
+
+def _read_again(small_size: int, size: int, repetitions: int) -> list[int]:
+    """The calls of a pair read again over ``repetitions`` runs of each
+    size and over the limit in every reading: its first reading, both
+    retries of the limit (task 3204) and one confirming round of
+    ``CONFIRM_READINGS`` readings, since a pair read again keeps a part
+    over at its first round over the limit (task 3207, R3204-I-02)."""
+    return ([small_size, size] * (repetitions * (1 + GROWTH_RETRIES))
+            + [small_size, size] * (repetitions * CONFIRM_READINGS))
+
+
+def test_the_quiet_quarter_is_read_again_over_three_runs():
+    assert host_timing.over_on_a_sub_floor_reading(QUIET_QUARTER, QUIET_LARGE)
+    assert READ_AGAIN_RUNS == 3
+
+
 def test_the_band_lies_between_linear_and_quadratic_growth():
     assert GROWTH < BORDERLINE_GROWTH < GROWTH_LIMIT < GROWTH ** 2
     assert BORDERLINE_RETRIES > GROWTH_RETRIES
@@ -87,23 +110,33 @@ def test_the_band_lies_between_linear_and_quadratic_growth():
 def test_the_regression_ci_read_under_load_fails_on_its_fastest_readings():
     """The readings of the failed CI run: 6.5x on one reading of each size
     (main passed it). Measured again, the quieter quarter reading shows the
-    9.3x the regression grows."""
+    9.3x the regression grows; read again over three runs of each size (its
+    quarter is under the noise floor, task 3204), it still does."""
     calls: list[int] = []
     seconds_at = _scripted({QUARTER: (LOADED_QUARTER, QUIET_QUARTER),
                             SIZE: (LOADED_LARGE, QUIET_LARGE)}, calls)
     with pytest.raises(TimingCheckFailed, match="superlinear growth") as failure:
         assert_linear_time(seconds_at, SIZE, 10.0, "planted sanitize")
     message = str(failure.value)
-    assert "at 1x the test's input" in message
-    assert (f"each the fastest of {1 + BORDERLINE_RETRIES} interleaved "
+    assert f"at 1x the test's input over {READ_AGAIN_RUNS} runs" in message
+    assert (f"each the fastest of {1 + GROWTH_RETRIES} interleaved "
             f"readings" in message)
     assert f"{QUIET_QUARTER:.4f} s at size {QUARTER}" in message
-    assert (f"confirmed: over the limit in {CONFIRM_MAJORITY} of "
-            f"{CONFIRM_MAJORITY} confirming rounds" in message)
+    # Read again, the first confirming round over the limit decides
+    # (task 3207: every round must read under for the pair to clear it).
+    assert (f"confirmed: over the limit in 1 of 1 confirming rounds of "
+            f"{CONFIRM_READINGS} interleaved readings of each size (read "
+            f"again: cleared only when every one of {CONFIRM_ROUNDS} rounds "
+            f"reads under the limit)" in message)
+    assert (f"read again over {READ_AGAIN_RUNS} runs of each size: the "
+            f"smaller reading over the limit was {QUIET_QUARTER:.4f} s"
+            in message)
     # Each size measured again, the quarter first, the two alternating;
-    # then the confirming rounds, alternating the same way.
+    # then the confirming rounds, alternating the same way; then the same
+    # over three runs of each size.
     assert calls == ([QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
-                     + _confirming(QUARTER, SIZE))
+                     + _confirming(QUARTER, SIZE)
+                     + _read_again(QUARTER, SIZE, READ_AGAIN_RUNS))
 
 
 def test_a_part_hidden_by_a_loaded_quarter_fails_beside_a_linear_part():
@@ -121,7 +154,8 @@ def test_a_part_hidden_by_a_loaded_quarter_fails_beside_a_linear_part():
         assert_linear_times(seconds_at, SIZE, 10.0, "parts")
     assert "parts: linear" not in str(failure.value)
     assert calls == ([QUARTER, SIZE] * (1 + BORDERLINE_RETRIES)
-                     + _confirming(QUARTER, SIZE))
+                     + _confirming(QUARTER, SIZE)
+                     + _read_again(QUARTER, SIZE, READ_AGAIN_RUNS))
 
 
 @pytest.mark.parametrize("larger_readings", (

@@ -133,7 +133,40 @@ timing test checks two things through this module:
    pair whose third size does not exist (``InputTooLarge``): it decides
    alone, as before. The outer pair is read again only within
    ``EXPONENT_SECONDS`` of the third size's first reading (superlinear
-   work makes it expensive); a part still over then stays over.
+   work makes it expensive); a part still over then stays over, and so
+   does one whose confirming rounds the deadline cut short with any round
+   over (R3191-02). Only readings shaped like a cache step are cleared
+   (R3191-01): a first step of at most ``EXPONENT_MAX_FIRST_STEP`` (15x)
+   and a second of at least ``EXPONENT_MIN_SECOND_STEP``; work superlinear
+   up to an input cap or a window just past the pair reads a steeper first
+   step or a flat second one and fails, as main failed it. A first step
+   over the window, or a third size too dear to read for a part it could
+   clear, is not read at all (R3191-03).
+
+7. **Sub-floor readings.** A pair is never failed on a smaller reading
+   under the noise floor (task 3204): CI read redaction pattern 24 at
+   0.0020 s at 16 KB (the fastest of 36 calls of a linear pattern taking
+   3.7-4.6 ms here) against 0.0182 s at 64 KB, 9.1x against the own pair's
+   2 ms floor. A call of a few milliseconds can run whole inside a quiet
+   spell of its runner that a call four times longer never fits, so the
+   fastest of many short calls reads under their cost, and main's floor
+   is a tenth of the noise floor. A pair over the limit only on a smaller
+   reading totalling under ``GROWTH_FLOOR_SECONDS`` (it would pass were
+   the reading raised to that floor, ``over_on_a_sub_floor_reading``) is
+   read again at the same sizes (the own pair is what catches work
+   superlinear only up to the test's size, IR78-01), each reading the mean
+   of enough interleaved runs that the smaller size totals
+   ``SUB_FLOOR_MARGIN`` times the floor (``sub_floor_repetitions``), and
+   decided there; when no more runs fit ``SUB_FLOOR_READING_SECONDS`` it
+   is decided as before (fail closed). A grown pair's floor is the noise
+   floor, so a grown pair is never read again for it. A pair is read again
+   only for parts its confirming rounds kept over the limit, and a mean of
+   several runs is far likelier to carry a burst than the fastest single
+   reading was: so a pair read again clears a part only when EVERY one of
+   ``CONFIRM_ROUNDS`` confirming rounds reads it under the limit, and fails
+   it at the first round over (task 3207, R3204-I-02: in the 3204 review's
+   seeded noise simulation one settle pass on such means passed 365
+   regressions that 6ef24c6 failed).
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
@@ -164,7 +197,7 @@ import math
 import os
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Mapping, Sequence, TypeVar
 
 HOST_FACTOR_ENVIRONMENT_VARIABLE = "EQUIPA_TIMING_HOST_FACTOR"
@@ -282,6 +315,35 @@ EXPONENT_STEPS = 2
 # (6 s without the exponent); a cache step's third size (CI's 16 MB, about
 # 1 s) is read again in full.
 EXPONENT_SECONDS = 15.0
+# The exponent clears only what looks like a cache step (R3191-01): a first
+# step of at most this much (a cost per byte stepping up under 3.75 times;
+# CI's 8.1x and 2x-3.5x steps read 8-14x)...
+EXPONENT_MAX_FIRST_STEP = GROWTH * 3.75
+# ...and a second step of at least this much (linear past the step). Work
+# superlinear up to an input cap or a window just past the pair reads up to
+# 58x and then under GROWTH, under the outer limit; it stays over.
+EXPONENT_MIN_SECOND_STEP = GROWTH / 1.5
+# A part is never failed on a smaller reading under the noise floor (task
+# 3204): CI read redaction pattern 24 at 0.0020 s at 16 KB, the fastest of
+# 36 calls of a pattern taking 3.7-4.6 ms there on two interpreters here,
+# against 0.0182 s at 64 KB: 9.1x against the own pair's 2 ms floor on work
+# that grows 4.0x. A call of a few milliseconds can run whole inside a
+# quiet spell of its runner (a turbo clock, an idle SMT sibling) that a
+# call several times longer never fits, so the fastest of many short calls
+# reads under their cost (the same runner read real linear work at 1.28x
+# the cost per unit over 0.3 s that it read over 25 ms). So a part over the
+# limit only on a smaller reading totalling under GROWTH_FLOOR_SECONDS over
+# its runs (it would pass were that reading raised to the noise floor,
+# ``over_on_a_sub_floor_reading``) is read again at the same sizes, each
+# reading the mean of enough interleaved runs that the smaller size's total
+# reaches this many times GROWTH_FLOOR_SECONDS, and is decided there
+# (``sub_floor_repetitions``), a part cleared only when every confirming
+# round reads it under the limit (``Confirmation.unanimous``, task 3207)...
+SUB_FLOOR_MARGIN = 2.0
+# ...within MAX_GROWTH_REPETITIONS runs and what this much wall time per
+# reading (the runs of both sizes) pays for. A part still under the floor
+# when no more runs fit is decided as before (fail closed).
+SUB_FLOOR_READING_SECONDS = 1.0
 # The test's own pair of sizes is held to main's floor and, for one
 # ``seconds_at``, to the rule of b81777b (the default branch before task
 # 3178): a quarter reading under GROWTH_FLOOR_SECONDS whose larger reading
@@ -571,6 +633,42 @@ def own_pair_floor(repetitions: int) -> float:
     return min(DETECTION_FLOOR_SECONDS, GROWTH_FLOOR_SECONDS / repetitions)
 
 
+def over_on_a_sub_floor_reading(small_seconds: float, seconds: float,
+                                repetitions: int = 1,
+                                limit: float = GROWTH_LIMIT) -> bool:
+    """Whether a pair over ``limit`` is over only on a smaller reading under
+    the noise floor (task 3204): the smaller reading (the mean of
+    ``repetitions`` runs) totals under ``GROWTH_FLOOR_SECONDS`` over its
+    runs, and the larger one's total is under ``limit`` times that floor,
+    so the pair would pass were the smaller reading raised to the floor.
+    Such a reading is never the work's cost: the pair is read again
+    (``sub_floor_repetitions``). A grown pair's floor is the noise floor,
+    so it never is; the test's own pair's (main's 2 ms) is under it."""
+    small_total = repetitions * small_seconds
+    return (small_total < GROWTH_FLOOR_SECONDS
+            and growth_ratio(small_total, repetitions * seconds) < limit)
+
+
+def sub_floor_repetitions(small_seconds: Sequence[float], repetitions: int,
+                          pair_cost_seconds: float) -> int:
+    """How many runs of each size a pair takes when it is read again
+    because a part over the limit had a smaller reading (the mean of
+    ``repetitions`` runs; one per such part in ``small_seconds``) under the
+    noise floor (task 3204): enough that every such reading totals
+    ``SUB_FLOOR_MARGIN`` times ``GROWTH_FLOOR_SECONDS``, at most
+    ``MAX_GROWTH_REPETITIONS`` and no more than one reading of
+    ``SUB_FLOOR_READING_SECONDS`` of wall time pays for when one run of
+    each size took ``pair_cost_seconds``. ``repetitions`` (read again: no)
+    when no more runs fit."""
+    target = SUB_FLOOR_MARGIN * GROWTH_FLOOR_SECONDS
+    needed = max((math.ceil(target / max(seconds, 1e-6))
+                  for seconds in small_seconds), default=repetitions)
+    affordable = MAX_GROWTH_REPETITIONS
+    if pair_cost_seconds > 0:
+        affordable = int(SUB_FLOOR_READING_SECONDS / pair_cost_seconds)
+    return max(repetitions, min(MAX_GROWTH_REPETITIONS, needed, affordable))
+
+
 def _grown_further(grown: _GrownReadings, *sizes: int) -> bool:
     """Measure ``sizes``, the next sizes of a growth check (the quarter
     first); False when the shape does not exist at one (``InputTooLarge``)."""
@@ -716,21 +814,47 @@ class Confirmation:
     rounds: int
     rounds_over: int
     readings: int
+    # The rounds of a pair read again over more runs (``_Pair.read_again``,
+    # task 3207): they clear a part only when every one of CONFIRM_ROUNDS
+    # rounds reads it under the limit, and the first round over decides.
+    unanimous: bool = False
+
+    @property
+    def cut_short(self) -> bool:
+        """Fewer rounds than a majority were read: a deadline stopped them
+        (``_confirmed``) before either verdict could have a majority."""
+        return self.rounds < CONFIRM_MAJORITY
 
     @property
     def confirmed(self) -> bool:
         """A majority of the rounds read over the limit, or no round was
-        read (fail closed: no evidence clears a pair)."""
-        return self.rounds == 0 or 2 * self.rounds_over > self.rounds
+        read (fail closed: no evidence clears a pair). Rounds cut short
+        clear a pair only when every one of them read under the limit
+        (R3191-02: one round under, or a tie of two, is no majority).
+        ``unanimous`` rounds confirm a part unless all ``CONFIRM_ROUNDS``
+        of them read under the limit (R3204-I-02)."""
+        if self.unanimous:
+            return self.rounds_over > 0 or self.rounds < CONFIRM_ROUNDS
+        if self.cut_short:
+            return self.rounds == 0 or self.rounds_over > 0
+        return 2 * self.rounds_over > self.rounds
 
     def describe(self) -> str:
         if self.rounds == 0:
             return ("confirmed: no confirming round fitted the time left, "
                     "so the pair stays over the limit (fail closed)")
         verdict = "confirmed" if self.confirmed else "not confirmed"
+        if self.unanimous:
+            return (f"{verdict}: over the limit in {self.rounds_over} of "
+                    f"{self.rounds} confirming rounds of {self.readings} "
+                    f"interleaved readings of each size (read again: "
+                    f"cleared only when every one of {CONFIRM_ROUNDS} "
+                    f"rounds reads under the limit)")
+        short = (f" (cut short under {CONFIRM_MAJORITY} rounds: any round "
+                 f"over keeps the pair over)" if self.cut_short else "")
         return (f"{verdict}: over the limit in {self.rounds_over} of "
                 f"{self.rounds} confirming rounds of {self.readings} "
-                f"interleaved readings of each size")
+                f"interleaved readings of each size{short}")
 
 
 @dataclass(frozen=True)
@@ -749,6 +873,10 @@ class _Pair:
     # the outer pair of a growth exponent (``_exponent_judged``). The limit
     # and the borderline band hold the same exponent over every step.
     steps: int = 1
+    # A pair read again over more runs because its parts were over the
+    # limit only on a sub-floor reading (task 3204): every part it judges
+    # is confirmed, in unanimous rounds (``Confirmation.unanimous``).
+    read_again: bool = False
 
     @property
     def limit(self) -> float:
@@ -836,6 +964,11 @@ def _settled_readings(measure: Callable[[int], Mapping[str, float]],
             retries = max(retries, pair.over_retries)
         if retries_done >= retries or not _within(deadline, reread_seconds):
             confirmations: dict[str, Confirmation] = {}
+            if pair.read_again:
+                # Its parts were confirmed over the limit, on the fastest
+                # readings; the means read again clear none of them on a
+                # settle pass alone (R3204-I-02).
+                over = list(parts)
             if over:
                 small, large, over, confirmations = _confirmed(
                     measure, pair, small, large, over, deadline,
@@ -881,9 +1014,14 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     settled readings; any other is kept on the reading of its fastest
     round, which is under the limit as most rounds read (R3188-02: the
     median round handed the next grown pair an inflated quarter reading,
-    and a later pair 9.5x over the fastest reading passed at 7.1x). Returns
-    the readings, the parts still over and each confirmed part's
-    ``Confirmation``."""
+    and a later pair 9.5x over the fastest reading passed at 7.1x).
+
+    A pair read again (``_Pair.read_again``) confirms every part it judges
+    and holds them to a stricter verdict (``Confirmation.unanimous``): a
+    part stays over at its first round over the limit and is cleared only
+    when all ``CONFIRM_ROUNDS`` rounds read it under (task 3207,
+    R3204-I-02). Returns the readings, the parts still over and each
+    confirmed part's ``Confirmation``."""
     small, large = dict(small), dict(large)
     quarter_total = pair.repetitions * max(min(small[part] for part in over),
                                            1e-6)
@@ -900,6 +1038,8 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
     def decided(part: str) -> bool:
         read_over = rounds_over(part)
         read_under = len(larger_by_round[part]) - read_over
+        if pair.read_again:
+            return read_over > 0 or read_under >= CONFIRM_ROUNDS
         return max(read_over, read_under) >= CONFIRM_MAJORITY
 
     rounds = 0
@@ -924,7 +1064,8 @@ def _confirmed(measure: Callable[[int], Mapping[str, float]], pair: _Pair,
         rounds += 1
 
     confirmations = {part: Confirmation(len(larger_by_round[part]),
-                                        rounds_over(part), readings)
+                                        rounds_over(part), readings,
+                                        pair.read_again)
                      for part in over}
     still_over = [part for part in over if confirmations[part].confirmed]
     for part in over:
@@ -968,6 +1109,29 @@ class GrowthExponent:
                            self.floor_seconds,
                            self.larger_size / self.small_size)
 
+    @property
+    def first_step(self) -> float:
+        """The growth over the pair (its smaller reading raised to the
+        floor first)."""
+        return growth_ratio(self.small_seconds, self.seconds,
+                            self.floor_seconds)
+
+    @property
+    def second_step(self) -> float:
+        """The growth from the pair's larger size to the third size."""
+        return growth_ratio(self.seconds, self.larger_seconds,
+                            self.floor_seconds)
+
+    @property
+    def cache_step(self) -> bool:
+        """The three readings look like a cache step (R3191-01): a first
+        step of at most ``EXPONENT_MAX_FIRST_STEP`` and a second of at least
+        ``EXPONENT_MIN_SECOND_STEP``. Work superlinear up to an input cap
+        or a window just past the pair reads a larger first step, or a flat
+        second one, and is not cleared on its exponent."""
+        return (self.first_step <= EXPONENT_MAX_FIRST_STEP
+                and self.second_step >= EXPONENT_MIN_SECOND_STEP)
+
     def describe(self) -> str:
         first_step = self._slope(self.small_seconds, self.seconds,
                                  self.floor_seconds,
@@ -975,8 +1139,15 @@ class GrowthExponent:
         second_step = self._slope(self.seconds, self.larger_seconds,
                                   self.floor_seconds,
                                   self.larger_size / self.size)
-        verdict = ("superlinear" if self.superlinear
-                   else "a constant-factor step, not growth")
+        if not self.cache_step:
+            verdict = (f"not a cache step (steps {self.first_step:.1f}x "
+                       f"then {self.second_step:.1f}x; a cache step reads "
+                       f"at most {EXPONENT_MAX_FIRST_STEP:g}x then at least "
+                       f"{EXPONENT_MIN_SECOND_STEP:.2f}x)")
+        elif self.superlinear:
+            verdict = "superlinear"
+        else:
+            verdict = "a constant-factor step, not growth"
         confirmed = (f"; {self.confirmation.describe()}"
                      if self.confirmation is not None else "")
         return (f"growth exponent {self.exponent:.2f} over sizes "
@@ -1021,11 +1192,33 @@ def _exponent_judged(grown: _GrownReadings,
     test's own pair is held for, never on an exponent (IR78-01); only a
     part that pair and every smaller grown pair passed reaches this.
 
+    So only a part whose readings look like a cache step is cleared
+    (R3191-01, ``GrowthExponent.cache_step``): a part whose first step is
+    over ``EXPONENT_MAX_FIRST_STEP`` stays over without the third size
+    being read (R3191-03: it cannot be cleared, and superlinear work makes
+    the third size expensive), and one whose second step is under
+    ``EXPONENT_MIN_SECOND_STEP`` stays over on its exponent (a cap or a
+    window flattened it). The third size is not read either when reading
+    it would take more than ``EXPONENT_SECONDS`` were the part one it could
+    clear: one whose outer pair reads under the outer limit, so at most
+    that limit over its first step times the pair's larger reading.
+
     Without the third size (the shape does not exist there,
     ``InputTooLarge``) no exponent is measured and every part stays over:
     the pair decides alone, as before. Returns the parts still over and
     each judged part's ``GrowthExponent``; the readings settled at the
     outer pair's sizes are kept in ``grown``."""
+    first_steps = {part: growth_ratio(small[part], large[part],
+                                      pair.floor_seconds) for part in over}
+    judged = [part for part in over
+              if first_steps[part] <= EXPONENT_MAX_FIRST_STEP]
+    if not judged:
+        return over, {}
+    outer_limit = GROWTH_LIMIT ** EXPONENT_STEPS
+    clearing_cost = grown.costs[pair.size] * outer_limit / min(
+        first_steps[part] for part in judged)
+    if clearing_cost > EXPONENT_SECONDS:
+        return over, {}
     larger_size = pair.size * GROWTH
     started = time.monotonic()
     if not _grown_further(grown, larger_size):
@@ -1035,19 +1228,25 @@ def _exponent_judged(grown: _GrownReadings,
                   EXPONENT_STEPS)
     first_samples = min(grown.samples[pair.small_size],
                         grown.samples[larger_size])
-    outer_small, outer_large, still_over, samples, confirmations = (
+    outer_small, outer_large, outer_over, samples, confirmations = (
         _settled_readings(measure, outer, small, grown.at(larger_size),
-                          over, first_samples, started + EXPONENT_SECONDS,
-                          grown.costs[pair.small_size]
-                          + grown.costs[larger_size]))
+                          judged, first_samples, started + EXPONENT_SECONDS,
+                          outer.repetitions * (grown.costs[pair.small_size]
+                                               + grown.costs[larger_size])))
     for at_size, readings in ((pair.small_size, outer_small),
                               (larger_size, outer_large)):
         grown.settle(at_size, readings,
                      grown.samples[at_size] + samples - first_samples)
-    exponents = {part: GrowthExponent(
-        pair.small_size, outer_small[part], pair.size, large[part],
-        larger_size, outer_large[part], pair.floor_seconds,
-        part in still_over, confirmations.get(part)) for part in over}
+    exponents: dict[str, GrowthExponent] = {}
+    for part in judged:
+        shape = GrowthExponent(
+            pair.small_size, outer_small[part], pair.size, large[part],
+            larger_size, outer_large[part], pair.floor_seconds, False,
+            confirmations.get(part))
+        exponents[part] = replace(
+            shape, superlinear=part in outer_over or not shape.cache_step)
+    still_over = [part for part in over
+                  if part not in exponents or exponents[part].superlinear]
     return still_over, exponents
 
 
@@ -1090,6 +1289,10 @@ class LinearTiming:
     # find superlinear passes on a ratio over the limit, a constant-factor
     # step.
     exponent: GrowthExponent | None = None
+    # The smaller reading (the total of its runs) under the noise floor that
+    # the pair, over the limit on it, was read again from over
+    # ``repetitions`` runs of each size (task 3204): never compared itself.
+    sub_floor_seconds: float | None = None
 
     @property
     def ratio(self) -> float:
@@ -1104,12 +1307,18 @@ class LinearTiming:
                      if self.confirmation is not None else "")
         exponent = (f"; {self.exponent.describe()}"
                     if self.exponent is not None else "")
+        read_again = (f"; read again over {self.repetitions} runs of each "
+                      f"size: the smaller reading over the limit was "
+                      f"{self.sub_floor_seconds:.4f} s, under the "
+                      f"{GROWTH_FLOOR_SECONDS:g} s noise floor"
+                      if self.sub_floor_seconds is not None else "")
         return (f"{self.label}: {self.seconds:.4f} s at size {self.size}, "
                 f"{self.small_seconds:.4f} s at size {self.small_size} "
                 f"(growth {self.ratio:.1f}x at {self.input_growth:.3g}x the "
                 f"test's input{runs}, floor {self.floor_seconds:g} s, limit "
                 f"{GROWTH_LIMIT}x; budget {self.budget_seconds:.4f} s at host "
-                f"factor {self.factor:.2f}{fastest}{confirmed}{exponent})")
+                f"factor {self.factor:.2f}{fastest}{confirmed}{exponent}"
+                f"{read_again})")
 
 
 def _check_budget(label: str, seconds: float, size: int,
@@ -1391,27 +1600,50 @@ def _check_growth(grown: _GrownReadings,
     def timings_at(pair: _Pair, small: Mapping[str, float],
                    large: Mapping[str, float], at_parts: list[str],
                    samples: int, confirmations: Mapping[str, Confirmation],
-                   exponents: Mapping[str, GrowthExponent]
+                   exponents: Mapping[str, GrowthExponent],
+                   sub_floor: Mapping[str, float]
                    ) -> dict[str, LinearTiming]:
         return {part: LinearTiming(labels[part], pair.small_size, small[part],
                                    pair.size, large[part], budget_seconds,
                                    factor, pair.input_growth,
                                    pair.floor_seconds, pair.repetitions,
                                    samples, confirmations.get(part),
-                                   exponents.get(part))
+                                   exponents.get(part), sub_floor.get(part))
                 for part in at_parts}
 
     def held(pair: _Pair, means: tuple[Mapping[str, float],
                                        Mapping[str, float]] | None = None,
-             *, grown_sizes: bool = False) -> dict[str, LinearTiming]:
+             *, grown_sizes: bool = False, judged: list[str] | None = None,
+             sub_floor: Mapping[str, float] | None = None
+             ) -> dict[str, LinearTiming]:
         """``pair`` held to the limit on ``means`` (the means of its
         repetitions), or on the readings ``grown`` keeps at its sizes; those
         are then replaced by the settled ones, so a later pair at the same
         sizes (the pair the growth stopped at) starts from them. A pair of
         ``grown_sizes`` still over the limit once confirmed is judged on
-        its growth exponent over three sizes (``_exponent_judged``)."""
-        if pair in cleared:
+        its growth exponent over three sizes (``_exponent_judged``).
+
+        Only the ``judged`` parts are held (every part by default). When
+        every part over the limit is over only on a smaller reading under
+        the noise floor (``over_on_a_sub_floor_reading``), none of them
+        fails on it: the pair is held again on means of more runs of each
+        size (``sub_floor_repetitions``), interleaved, its floor spread over
+        the runs as the own pair's is (``own_pair_floor``), and those parts
+        are decided there, ``sub_floor`` keeping the readings read again
+        from (task 3204): each is confirmed and cleared only when every
+        confirming round reads it under the limit (``_Pair.read_again``,
+        task 3207). Any other part over the limit fails as before, at
+        once, and the parts beside it over only on such a reading are named
+        as not judged, never as growth.
+
+        A pair cleared before (``cleared``) is not held again only when that
+        verdict covers every part judged now: a pair read again for some
+        parts can equal a later pair over other parts, and a verdict on the
+        first parts must not pass the others (R3204-I-01)."""
+        judged = parts if judged is None else judged
+        if pair in cleared and cleared[pair].keys() >= set(judged):
             return cleared[pair]
+        sub_floor = {} if sub_floor is None else sub_floor
         if means is not None:
             small, large = means
             first_samples = 1
@@ -1420,24 +1652,57 @@ def _check_growth(grown: _GrownReadings,
             first_samples = min(grown.samples[pair.small_size],
                                 grown.samples[pair.size])
         small, large, over, samples, confirmations = _settled_readings(
-            measure, pair, small, large, parts, first_samples)
+            measure, pair, small, large, judged, first_samples)
         if means is None:
             for at_size, readings in ((pair.small_size, small),
                                       (pair.size, large)):
                 grown.settle(at_size, readings, grown.samples[at_size]
                              + samples - first_samples)
+        read_again: dict[str, LinearTiming] = {}
+        sub_floor_over = [part for part in over if over_on_a_sub_floor_reading(
+            small[part], large[part], pair.repetitions, pair.limit)]
+        if over and len(sub_floor_over) == len(over):
+            repetitions = sub_floor_repetitions(
+                [small[part] for part in over], pair.repetitions,
+                grown.costs[pair.small_size] + grown.costs[pair.size])
+            if repetitions > pair.repetitions:
+                again = replace(pair, repetitions=repetitions,
+                                read_again=True, floor_seconds=min(
+                                    pair.floor_seconds,
+                                    GROWTH_FLOOR_SECONDS / repetitions))
+                read_again = held(
+                    again, _interleaved_means(measure, pair.small_size,
+                                              pair.size, repetitions),
+                    grown_sizes=grown_sizes, judged=over,
+                    sub_floor={part: pair.repetitions * small[part]
+                               for part in over})
+                over = []
         exponents: dict[str, GrowthExponent] = {}
         if over and grown_sizes:
             over, exponents = _exponent_judged(grown, measure, pair, small,
                                                large, over)
         if over:
+            # Beside a part over on readings that are its cost, a part over
+            # only on a sub-floor reading is not read again (the check fails
+            # anyway) and is never reported as growth itself: it is named
+            # as not judged. Alone, unread for want of runs, it fails as
+            # before (fail closed).
+            failing = [part for part in over
+                       if part not in sub_floor_over] or over
+            not_judged = [labels[part] for part in over
+                          if part not in failing]
+            unjudged = (f"; not judged, over the limit only on a smaller "
+                        f"reading under the {GROWTH_FLOOR_SECONDS:g} s noise "
+                        f"floor (task 3204): {', '.join(not_judged)}"
+                        if not_judged else "")
             fail("superlinear growth: " + "; ".join(
                 timing.describe() for timing in timings_at(
-                    pair, small, large, over, samples, confirmations,
-                    exponents).values()))
-        timings = timings_at(pair, small, large, parts, samples,
-                             confirmations, exponents)
-        if exponents:
+                    pair, small, large, failing, samples, confirmations,
+                    exponents, sub_floor).values()) + unjudged)
+        timings = timings_at(pair, small, large, judged, samples,
+                             confirmations, exponents, sub_floor)
+        timings.update(read_again)
+        if exponents or read_again:
             cleared[pair] = timings
         return timings
 
