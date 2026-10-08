@@ -133,7 +133,33 @@ timing test checks two things through this module:
    pair whose third size does not exist (``InputTooLarge``): it decides
    alone, as before. The outer pair is read again only within
    ``EXPONENT_SECONDS`` of the third size's first reading (superlinear
-   work makes it expensive); a part still over then stays over.
+   work makes it expensive); a part still over then stays over, and so
+   does one whose confirming rounds the deadline cut short with any round
+   over (R3191-02). Only readings shaped like a cache step are cleared
+   (R3191-01): a first step of at most ``EXPONENT_MAX_FIRST_STEP`` (15x)
+   and a second of at least ``EXPONENT_MIN_SECOND_STEP``; work superlinear
+   up to an input cap or a window just past the pair reads a steeper first
+   step or a flat second one and fails, as main failed it. A first step
+   over the window, or a third size too dear to read for a part it could
+   clear, is not read at all (R3191-03).
+
+7. **Sub-floor readings.** A pair is never failed on a smaller reading
+   under the noise floor (task 3204): CI read redaction pattern 24 at
+   0.0020 s at 16 KB (the fastest of 36 calls of a linear pattern taking
+   3.7-4.6 ms here) against 0.0182 s at 64 KB, 9.1x against the own pair's
+   2 ms floor. A call of a few milliseconds can run whole inside a quiet
+   spell of its runner that a call four times longer never fits, so the
+   fastest of many short calls reads under their cost, and main's floor
+   is a tenth of the noise floor. A pair over the limit only on a smaller
+   reading totalling under ``GROWTH_FLOOR_SECONDS`` (it would pass were
+   the reading raised to that floor, ``over_on_a_sub_floor_reading``) is
+   read again at the same sizes (the own pair is what catches work
+   superlinear only up to the test's size, IR78-01), each reading the mean
+   of enough interleaved runs that the smaller size totals
+   ``SUB_FLOOR_MARGIN`` times the floor (``sub_floor_repetitions``), and
+   decided there; when no more runs fit ``SUB_FLOOR_READING_SECONDS`` it
+   is decided as before (fail closed). A grown pair's floor is the noise
+   floor, so a grown pair is never read again for it.
 
 Set ``EQUIPA_TIMING_HOST_FACTOR`` (a finite number > 0, at most
 ``MAX_HOST_FACTOR``) to force the factor, for example
