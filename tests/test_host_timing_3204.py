@@ -353,6 +353,72 @@ def test_real_quadratic_work_read_short_in_quiet_spells_fails():
                            30.0, "real quadratic")
 
 
+# --- The 3191 real-clock proof, calibrated -----------------------------------
+
+# CI's runner (run 37729154851, attempt 2) read the 3191 proof's linear work
+# at 0.0250 s over its 713,381 units, 0.3849 s over 12 times them (three
+# loops at 4x) and 1.6711 s over 48 times them: these costs per unit
+# relative to the first, by how many times the test's units a call ran.
+PROOF_UNITS = 713_381
+CI_RUNNER_SKEW = {1: 1.0, 12: 0.3849 / (12 * 0.025),
+                  48: 1.6711 / (48 * 0.025)}
+
+
+def _ci_runner_seconds(count: int) -> float:
+    """CPU seconds CI's runner read for linear work over ``count`` units:
+    25 ms over PROOF_UNITS, its cost per unit rising with the call's length
+    between CI_RUNNER_SKEW's points (log-linear)."""
+    scale = count / PROOF_UNITS
+    skewed = max(scale, 1.0)
+    points = sorted(CI_RUNNER_SKEW.items())
+    for (low, low_skew), (high, high_skew) in zip(points, points[1:]):
+        if skewed <= high or high == points[-1][0]:
+            share = math.log(skewed / low) / math.log(high / low)
+            return 0.025 * scale * (low_skew + share * (high_skew - low_skew))
+    raise AssertionError("unreachable")
+
+
+def _ci_runner_stepped(step: float, calls: list[int]) -> Callable[[int], float]:
+    """The 3191 proof's work (linear, ``step`` times the units past twice
+    the test's size) as CI's runner reads it."""
+    def seconds_at(units: int) -> float:
+        calls.append(units)
+        return _ci_runner_seconds(
+            round(units * step) if units > 2 * PROOF_UNITS else units)
+
+    return seconds_at
+
+
+@pytest.mark.parametrize("calibrated", (True, False),
+                         ids=["3204", "before-3204"])
+def test_the_3191_proof_plants_its_step_on_cis_runner(monkeypatch,
+                                                      calibrated):
+    """Three times the units read 15.4x over the first grown pair and
+    66.8x over the outer pair on CI's runner: CI's failure, a steeper step
+    than the proof claims. Calibrated on that runner (``_host_step``) the
+    planted step reads 12x then about 4x, and passes."""
+    from tests.test_host_timing_3191 import _host_step
+
+    _build_clock(monkeypatch)
+    step = _host_step(PROOF_UNITS, 3.0, _ci_runner_seconds) if calibrated \
+        else 3.0
+    calls: list[int] = []
+    failure = timing_failure(lambda: assert_linear_time(
+        _ci_runner_stepped(step, calls), PROOF_UNITS, 30.0,
+        "real cache step"))
+    if not calibrated:
+        assert failure is not None
+        assert ("0.3849 s at size 2853524, 0.0250 s at size 713381 (growth "
+                "15.4x at 4x the test's input" in str(failure))
+        return
+    assert step == pytest.approx(3.0 / 1.28, abs=0.01)
+    assert failure is None, str(failure)
+    timing = assert_linear_time(_ci_runner_stepped(step, calls), PROOF_UNITS,
+                                30.0, "real cache step")
+    assert timing.exponent is not None and timing.exponent.cache_step
+    assert timing.exponent.first_step == pytest.approx(12.0, rel=0.03)
+
+
 # --- R3191-01: only a cache step is cleared on its exponent ------------------
 
 SIZE = 40_000

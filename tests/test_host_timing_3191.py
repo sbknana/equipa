@@ -473,35 +473,73 @@ def _linear_units(target_seconds: float) -> int:
     return units
 
 
-def _real_stepped(step_from: int, step: int,
+def _real_stepped(step_from: int, step: float,
                   quadratic_over: int = 0) -> Callable[[int], float]:
     """CPU seconds of real linear work, each unit ``step`` times as costly
-    past ``step_from`` units (the loop run ``step`` times): a cache step.
+    past ``step_from`` units (``step`` times the units run): a cache step.
     With ``quadratic_over`` the work at ``units`` is ``units ** 2 /
     quadratic_over`` units instead: the same step on quadratic work, which
     reads the same as the linear work at ``quadratic_over`` units."""
     def seconds_at(units: int) -> float:
         work = units * units // quadratic_over if quadratic_over else units
+        if units > step_from:
+            work = round(work * step)
         started = time.process_time()
-        for _ in range(step if units > step_from else 1):
-            _linear_work(work)
+        _linear_work(work)
         return time.process_time() - started
 
     return seconds_at
 
 
+# Interleaved readings of each call length ``_host_step`` keeps the fastest of.
+HOST_STEP_READINGS = 3
+
+
+def _linear_seconds(units: int) -> float:
+    """The CPU time of one ``_linear_work(units)`` call, collector paused."""
+    with host_timing.collector_paused():
+        started = time.process_time()
+        _linear_work(units)
+        return time.process_time() - started
+
+
+def _host_step(units: int, step: float,
+               seconds_of: Callable[[int], float] = _linear_seconds) -> float:
+    """The step to plant past twice the test's size so that THIS host reads
+    real linear work's cost per unit ``step`` times higher there (task
+    3204): ``step`` over the ratio of the cost per unit this host reads
+    over a stepped call at the first grown pair's larger size (``GROWTH *
+    step`` times ``units``) to the one it reads over ``units``, each the
+    fastest of HOST_STEP_READINGS interleaved readings, as the check keeps
+    its readings. The CI runner of run 37729154851 read that ratio at
+    1.28: three times the units read 15.4x over the first grown pair, a
+    steeper step than the proof claims and over the 15x a cache step may
+    read (R3191-01). ``seconds_of(count)`` reads the work over ``count``
+    units (this host's CPU time by default)."""
+    stepped_units = round(units * GROWTH * step)
+    fastest = {units: math.inf, stepped_units: math.inf}
+    for _ in range(HOST_STEP_READINGS):
+        for count in fastest:
+            fastest[count] = min(fastest[count], seconds_of(count))
+    skew = (fastest[stepped_units] / stepped_units) / (fastest[units] / units)
+    return step / skew
+
+
 @pytest.mark.parametrize("judged", (True, False), ids=["3191", "before-3191"])
 def test_real_linear_work_with_a_3x_step_passes(monkeypatch, judged):
     """Real linear work reading about 25 ms at the test's size whose cost
-    per unit triples past twice the test's size: 12x over the first grown
-    pair (the check before task 3191 fails it), 4x past it."""
+    per unit, as this host reads it, triples past twice the test's size:
+    12x over the first grown pair (the check before task 3191 fails it), 4x
+    past it. The step is calibrated on this host (``_host_step``), so the
+    proof plants the step it claims on any runner (task 3204)."""
     units = _linear_units(0.025)
+    step = _host_step(units, 3.0)
     if not judged:
         _before_3191(monkeypatch)
     failure = timing_failure(lambda: assert_linear_time(
-        _real_stepped(2 * units, 3), units, 30.0, "real cache step"))
+        _real_stepped(2 * units, step), units, 30.0, "real cache step"))
     if judged:
-        assert failure is None, str(failure)
+        assert failure is None, f"{failure} (planted step {step:.2f}x)"
     else:
         assert failure is not None and "superlinear growth" in str(failure)
 
