@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 
@@ -886,47 +887,61 @@ def another_plant(plant_seconds: list[float]) -> bool:
             and sum(plant_seconds) + max(plant_seconds) <= PLANT_SECONDS)
 
 
-# A plant: the units it ran at and its first reading at the test's size (the
-# reading its band check reads). A proof's calibration is kept the same way:
-# the units ``_units_reading`` returned and the target it calibrated them to.
-Plant = tuple[int, float]
+# A proof's calibration: the units ``_units_reading`` returned and the
+# target it calibrated them to.
+Calibration = tuple[int, float]
+
+
+class Plant(NamedTuple):
+    """A plant: the calibration it ran from, the units it ran at and its
+    first reading at the test's size (the reading its band check reads).
+    Every plant is calibrated afresh on its target, as before task 3209,
+    and its bias is read against its own calibration (task 3210)."""
+
+    calibration: Calibration
+    units: int
+    reading: float
+
+    def log_bias(self) -> float:
+        """The log of the plant's reading over what its calibration
+        predicts at its units. The calibrated units read the calibrated
+        target there, and the planted work is quadratic in its units, so
+        the prediction is the target x (units / calibrated units) ** 2."""
+        calibrated_units, calibrated_seconds = self.calibration
+        if calibrated_units <= 0 or calibrated_seconds <= 0:
+            raise ValueError(f"a calibration of {calibrated_units} units for "
+                             f"{calibrated_seconds} s predicts no reading")
+        predicted = calibrated_seconds * (self.units / calibrated_units) ** 2
+        return math.log(max(self.reading, 1e-6) / predicted)
+
 
 # How the runner's bias is estimated (task 3210, R3209-I-04). A plant's bias
-# is its reading over what the calibration predicts at its units. Each plant
-# reads the runner's bias off by its own noise, a log normal of PLANT_NOISE.
-# The estimate is the posterior mean of the log bias over every plant so far,
-# under a prior that the runner is unbiased with probability
-# PLANT_UNBIASED_SHARE and is otherwise biased by a log normal of
-# PLANT_BIAS_SPREAD. So a single miss of the size noise explains barely moves
-# the next plant. A miss as large as CI's 0.65 moves it most of the way, and
-# plants that agree pull the estimate to their geometric mean.
+# is its reading over what its calibration predicts at its units. Each plant
+# reads the runner's bias off by its own noise (its calibration's included),
+# a log normal of PLANT_NOISE. The estimate is the posterior mean of the log
+# bias over every plant so far, under a prior that the runner is unbiased
+# with probability PLANT_UNBIASED_SHARE and is otherwise biased by a log
+# normal of PLANT_BIAS_SPREAD. So a single miss of the size noise explains
+# barely moves the next plant. A miss as large as CI's 0.65 moves it most of
+# the way, and plants that agree pull the estimate to their geometric mean.
 PLANT_NOISE = 0.15
 PLANT_BIAS_SPREAD = 0.4
 PLANT_UNBIASED_SHARE = 0.85
 
 
-def runner_bias(calibration: Plant, plants: Sequence[Plant]) -> float:
+def runner_bias(plants: Sequence[Plant]) -> float:
     """The damped estimate of how much this runner's readings at the test's
-    size differ from what ``calibration`` predicts (task 3210), 1.0 before
-    any plant. The calibrated units read the calibrated target there, and
-    the planted work is quadratic in its units, so a plant of ``units``
-    units is predicted to read the target x (units / calibrated units) ** 2.
+    size differ from what their calibrations predict (task 3210), 1.0
+    before any plant.
 
     Task 3209 re-scaled each plant from the one reading before it. On an
     unbiased runner, a plant that missed on noise was then re-scaled by
     that noise, and the next one tended to miss the other way: the proofs
     whose 0.3 s build fits only 3 plants false-failed more often than the
     old re-calibrate loop at noise 0.10-0.15 (R3209-I-04)."""
-    calibrated_units, calibrated_seconds = calibration
-    if calibrated_units <= 0 or calibrated_seconds <= 0:
-        raise ValueError(f"a calibration of {calibrated_units} units for "
-                         f"{calibrated_seconds} s predicts no reading")
     if not plants:
         return 1.0
-    log_biases = [
-        math.log(max(planted, 1e-6) / (
-            calibrated_seconds * (units / calibrated_units) ** 2))
-        for units, planted in plants]
+    log_biases = [plant.log_bias() for plant in plants]
     mean = statistics.fmean(log_biases)
     noise_variance = PLANT_NOISE ** 2 / len(log_biases)
     biased_variance = PLANT_BIAS_SPREAD ** 2 + noise_variance
@@ -941,30 +956,39 @@ def runner_bias(calibration: Plant, plants: Sequence[Plant]) -> float:
                     * PLANT_BIAS_SPREAD ** 2 / biased_variance)
 
 
-def replanted_units(calibration: Plant, plants: Sequence[Plant],
+def replanted_units(calibration: Calibration, plants: Sequence[Plant],
                     target_seconds: float) -> int:
     """The units the next plant runs at, after ``plants`` (task 3209): the
-    units the calibration predicts read ``target_seconds`` on a runner of
-    ``runner_bias`` (task 3210). The planted work is quadratic in its
-    units at the test's size, so the units scale by the square root, as
+    units its own ``calibration`` predicts read ``target_seconds`` on a
+    runner of ``runner_bias`` (task 3210). The planted work is quadratic in
+    its units at the test's size, so the units scale by the square root, as
     ``_units_reading`` scales them, and by at most GROWTH either way from
-    the last plant's.
+    the calibrated units.
 
     CI run 4 of PR #44: a plant calibrated to 50.8 ms at 860 units read
     0.0330 s, under its 0.0381-0.0677 s band. Calibrating again on the same
     target can return the same units, and that plant can miss the same
-    way. Re-scaled from the damped estimate of that reading, the next plant
+    way. Re-scaled by the damped estimate of that reading, the next plant
     lands in the band, and a later one moves closer to the 50.8 ms target
-    as the plants agree."""
+    as the plants agree.
+
+    Each plant is calibrated afresh, as the old loop calibrated it. Task
+    3210 first kept the first plant's calibration for every plant. Its
+    error was then the same on each plant, and the estimate damps a small
+    shared error like noise. The burst proof (``test_host_timing_3184``)
+    aims at 0.14 s, a ninth under its band's upper edge, and lost the old
+    loop's fresh calibrations: in the reviewer's model it never landed 9
+    times as often as the old loop on an unbiased runner at noise 0.05."""
     if not plants:
         raise ValueError("a plant is re-planted only after a first plant")
     calibrated_units, calibrated_seconds = calibration
-    last_units = plants[-1][0]
+    if calibrated_units <= 0 or calibrated_seconds <= 0:
+        raise ValueError(f"a calibration of {calibrated_units} units for "
+                         f"{calibrated_seconds} s predicts no reading")
     units = calibrated_units * math.sqrt(
-        target_seconds / (calibrated_seconds * runner_bias(calibration,
-                                                           plants)))
-    return max(GROWTH, round(min(max(units, last_units / GROWTH),
-                                 last_units * GROWTH)))
+        target_seconds / (calibrated_seconds * runner_bias(plants)))
+    return max(GROWTH, round(min(max(units, calibrated_units / GROWTH),
+                                 calibrated_units * GROWTH)))
 
 
 def timing_failure(check: Callable[[], object]) -> TimingCheckFailed | None:
@@ -1003,18 +1027,18 @@ def test_real_quadratic_work_of_22_5_to_159_ms_fails(target_seconds,
     at units re-scaled from the readings at the test's size
     (``replanted_units``), so the plants converge on the band; one that
     still misses at its last plant (``another_plant``) fails on the band
-    assertion. Task 3210: re-scaled from a damped estimate of the runner's
-    bias over every plant so far (``runner_bias``), not from the last
-    reading alone."""
+    assertion. Task 3210: every plant is calibrated afresh, then re-scaled
+    by a damped estimate of the runner's bias over every plant so far
+    (``runner_bias``), not from the last reading alone."""
     target = plant_target(target_seconds)
-    units = _units_reading(target)
-    calibration = (units, target)
     plants: list[Plant] = []
     plant_seconds: list[float] = []
     while not plant_seconds or another_plant(plant_seconds):
         if plant_seconds:
             target = plant_target(target, fastest)
-            units = replanted_units(calibration, plants, target)
+        calibration = (_units_reading(target), target)
+        units = (replanted_units(calibration, plants, target) if plants
+                 else calibration[0])
         lower, upper = planted_band(target)
         readings: dict[int, list[float]] = {}
         built: list[float] = []
@@ -1034,7 +1058,7 @@ def test_real_quadratic_work_of_22_5_to_159_ms_fails(target_seconds,
             seconds_at, units, 30.0, "planted quadratic"))
         plant_seconds.append(time.monotonic() - plant_started - sum(built))
         planted, fastest = readings[units][0], min(readings[units])
-        plants.append((units, planted))
+        plants.append(Plant(calibration, units, planted))
         if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
     assert lower <= planted <= upper, (
@@ -1182,14 +1206,15 @@ def test_the_ci_plant_under_its_band_lands_in_it_once_replanted(monkeypatch):
 
 
 def test_the_ci_plant_calibrated_again_misses_again(monkeypatch):
-    """The control: a plant calibrated again on the same target, as every
-    plant was before task 3209, runs at 860 units again on CI's runner,
-    and the proof fails with CI's message after its last plant."""
+    """The control: a plant calibrated again on the same target and run at
+    its calibrated units, as every plant was before task 3209 (task 3210
+    keeps the calibration and drops only the re-scaling), runs at 860
+    units again on CI's runner, and the proof fails with CI's message
+    after its last plant."""
     runner = scripted_runner(monkeypatch, sys.modules[__name__],
                              "_pair_work")
     monkeypatch.setattr(sys.modules[__name__], "replanted_units",
-                        lambda calibration, plants, target:
-                        _units_reading(target))
+                        lambda calibration, plants, target: calibration[0])
     with pytest.raises(AssertionError,
                        match=r"the planted reading 0\.0330 s at 860 units "
                              + CI_BAND_MISSED):
@@ -1207,7 +1232,7 @@ NEVER_LANDING_DRIFTS = (CI_PLANTED_SECONDS / CI_PLANT_TARGET, 2.0)
 BAND_MISSED = r"missed the [\d.]+-[\d.]+ s band on this host"
 
 
-def never_landed(plants: Sequence[Plant]) -> bool:
+def never_landed(plants: Sequence[tuple[int, float]]) -> bool:
     """Whether every plant of a scripted CI replay missed its own band.
     Each plant's band is the band of CI_PLANT_TARGET unless a plant before
     it read under the floor, which only raises the target and the band
@@ -1237,24 +1262,47 @@ def test_a_runner_whose_plants_never_land_still_fails_loudly(monkeypatch,
     assert never_landed(planted)
 
 
+# The calibration of the scripted plants below: 1000 units read 30 ms.
+CALIBRATED_30_MS = (1000, 0.03)
+
+
+def calibrated_plant(reading: float, units: int = 1000,
+                     calibration: Calibration = CALIBRATED_30_MS) -> Plant:
+    """A scripted plant of ``units`` units reading ``reading`` at the
+    test's size, calibrated to ``calibration`` (1000 units read 30 ms)."""
+    return Plant(calibration, units, reading)
+
+
+CI_PLANT = Plant((CI_PLANT_UNITS, CI_PLANT_TARGET), CI_PLANT_UNITS,
+                 CI_PLANTED_SECONDS)
+
+
 @pytest.mark.parametrize("calibration, plants, target_seconds, replanted", [
     # CI run 4: under the band, re-scaled up by the damped estimate (a bias
     # of 0.77 where the reading says 0.65).
-    ((CI_PLANT_UNITS, CI_PLANT_TARGET), [(CI_PLANT_UNITS, CI_PLANTED_SECONDS)],
-     CI_PLANT_TARGET, 982),
+    ((CI_PLANT_UNITS, CI_PLANT_TARGET), [CI_PLANT], CI_PLANT_TARGET, 982),
     # Twice the calibration: over the band, re-scaled down (a bias of 1.83).
-    ((1000, 0.03), [(1000, 0.06)], 0.03, 738),
+    (CALIBRATED_30_MS, [calibrated_plant(0.06)], 0.03, 738),
     # 1.4 times it, a miss noise of PLANT_NOISE can explain: barely moved.
-    ((1000, 0.03), [(1000, 0.042)], 0.03, 948),
+    (CALIBRATED_30_MS, [calibrated_plant(0.042)], 0.03, 948),
     # Readings on both sides of the calibration: no bias, back to it.
-    ((1000, 0.03), [(1000, 0.042), (1000, 0.03 / 1.4)], 0.03, 1000),
-    # In the band but under the floor: re-scaled to the raised target.
-    ((800, 0.03), [(800, 0.03)], 0.05, 1033),
-    # At most GROWTH times either way from the last plant, never under
-    # GROWTH units.
-    ((1000, 0.03), [(1000, 0.0)], 0.03, 4000),
-    ((1000, 0.03), [(1000, 10.0)], 0.03, 250),
-    ((GROWTH, 0.03), [(GROWTH, 1.0)], 0.03, GROWTH),
+    (CALIBRATED_30_MS, [calibrated_plant(0.042),
+                        calibrated_plant(0.03 / 1.4)], 0.03, 1000),
+    # In the band but under the floor: calibrated afresh on the raised
+    # target, and re-scaled to it from a stale calibration as well.
+    ((1033, 0.05), [calibrated_plant(0.03, 800, (800, 0.03))], 0.05, 1033),
+    ((800, 0.03), [calibrated_plant(0.03, 800, (800, 0.03))], 0.05, 1033),
+    # The next plant follows its own calibration, not the last plant's
+    # units; each plant's bias is read against the calibration it ran from.
+    ((1100, 0.03), [calibrated_plant(0.03)], 0.03, 1100),
+    ((900, 0.03), [calibrated_plant(0.03 * CI_PLANTED_SECONDS
+                                    / CI_PLANT_TARGET)], 0.03, 1028),
+    # At most GROWTH times either way from the calibrated units, never
+    # under GROWTH units.
+    (CALIBRATED_30_MS, [calibrated_plant(0.0)], 0.03, 4000),
+    (CALIBRATED_30_MS, [calibrated_plant(10.0)], 0.03, 250),
+    ((GROWTH, 0.03), [calibrated_plant(1.0, GROWTH, (GROWTH, 0.03))], 0.03,
+     GROWTH),
 ])
 def test_a_plant_is_replanted_from_the_plants_before_it(
         calibration, plants, target_seconds, replanted):
@@ -1271,8 +1319,7 @@ def test_quadratic_work_is_replanted_by_the_square_root():
     ratio = CI_PLANT_TARGET / CI_PLANTED_SECONDS
     assert CI_PLANTED_SECONDS * ratio ** 2 > upper
     replanted = replanted_units((CI_PLANT_UNITS, CI_PLANT_TARGET),
-                                [(CI_PLANT_UNITS, CI_PLANTED_SECONDS)],
-                                CI_PLANT_TARGET)
+                                [CI_PLANT], CI_PLANT_TARGET)
     reading = CI_PLANTED_SECONDS * (replanted / CI_PLANT_UNITS) ** 2
     assert lower <= reading <= upper
 
@@ -1288,9 +1335,8 @@ def test_one_miss_noise_explains_barely_moves_the_next_plant():
     calibration on an unbiased runner was scaled down by 1.35, and the
     next plant, reading true, missed under the band. The damped estimate
     moves it by under a tenth of that; CI's 0.65 moves it most of the way."""
-    calibration = (1000, 0.03)
-    noisy = runner_bias(calibration, [(1000, 0.03 * 1.35)])
-    biased = runner_bias(calibration, [(1000, 0.03 * CI_BIAS)])
+    noisy = runner_bias([calibrated_plant(0.03 * 1.35)])
+    biased = runner_bias([calibrated_plant(0.03 * CI_BIAS)])
     assert 1.0 < noisy < 1.1
     assert CI_BIAS < biased < 0.8
     lower, _ = planted_band(0.03)
@@ -1301,13 +1347,12 @@ def test_one_miss_noise_explains_barely_moves_the_next_plant():
 def test_plants_that_agree_pull_the_estimate_to_their_bias():
     """The more plants read CI's bias, the closer the estimate comes to it;
     readings on both sides of the calibration cancel."""
-    calibration = (1000, 0.03)
-    estimates = [runner_bias(calibration, [(1000, 0.03 * CI_BIAS)] * count)
+    estimates = [runner_bias([calibrated_plant(0.03 * CI_BIAS)] * count)
                  for count in range(1, PLANTS + 1)]
     assert estimates == sorted(estimates, reverse=True)
     assert estimates[-1] == pytest.approx(CI_BIAS, rel=0.02)
-    assert runner_bias(calibration, [(1000, 0.03 * 1.35),
-                                     (1000, 0.03 / 1.35)]) == pytest.approx(1.0)
+    assert runner_bias([calibrated_plant(0.03 * 1.35),
+                        calibrated_plant(0.03 / 1.35)]) == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bias", (CI_BIAS, 1.35, 4.0, 1e-3))
@@ -1315,28 +1360,43 @@ def test_the_estimate_is_the_same_either_way_of_the_calibration(bias):
     """The bias is estimated on its logarithm: a runner reading ``bias``
     times its calibration and one reading its inverse are damped alike,
     and a reading far off (or none) cannot overflow the estimate."""
-    calibration = (1000, 0.03)
-    over = runner_bias(calibration, [(1000, 0.03 * bias)])
-    under = runner_bias(calibration, [(1000, 0.03 / bias)])
+    over = runner_bias([calibrated_plant(0.03 * bias)])
+    under = runner_bias([calibrated_plant(0.03 / bias)])
     assert over * under == pytest.approx(1.0)
 
 
 def test_the_estimate_reads_every_plant_at_its_own_units():
     """A plant at twice the calibrated units is predicted to read four
     times the calibrated target (quadratic work): reading that is no bias."""
-    assert runner_bias((1000, 0.03), [(2000, 0.12)]) == pytest.approx(1.0)
-    assert runner_bias((1000, 0.03), []) == 1.0
+    assert runner_bias([calibrated_plant(0.12, 2000)]) == pytest.approx(1.0)
+    assert runner_bias([]) == 1.0
+
+
+def test_the_estimate_reads_every_plant_against_its_own_calibration():
+    """Each plant is calibrated afresh (task 3210), so two plants of the
+    same units and reading can carry different calibrations. Read against
+    its own, a plant whose calibration halved its units for the same
+    target predicts 120 ms at 1000 units: reading it is no bias. Read
+    against the first plant's calibration, it would read 4 times its
+    prediction, and the estimate over both plants nearly 2."""
+    first = calibrated_plant(0.03)
+    recalibrated = calibrated_plant(0.12, 1000, (500, 0.03))
+    assert recalibrated.log_bias() == pytest.approx(0.0)
+    assert runner_bias([first, recalibrated]) == pytest.approx(1.0)
+    assert runner_bias([first, calibrated_plant(0.12)]) > 1.8
 
 
 @pytest.mark.parametrize("calibration", ((0, 0.03), (1000, 0.0), (-5, -1.0)))
 def test_a_calibration_that_predicts_nothing_is_refused(calibration):
     with pytest.raises(ValueError, match="predicts no reading"):
-        runner_bias(calibration, [(1000, 0.03)])
+        runner_bias([calibrated_plant(0.03, 1000, calibration)])
+    with pytest.raises(ValueError, match="predicts no reading"):
+        replanted_units(calibration, [calibrated_plant(0.03)], 0.03)
 
 
 def test_a_proof_replants_only_after_a_first_plant():
     with pytest.raises(ValueError, match="only after a first plant"):
-        replanted_units((1000, 0.03), [], 0.03)
+        replanted_units(CALIBRATED_30_MS, [], 0.03)
 
 
 @pytest.mark.parametrize("plant_seconds, plants_again", [

@@ -43,6 +43,7 @@ from tests.test_host_timing_3171 import (
     IR75_01_SIZE,
     PLANT_FLOOR_SECONDS,
     PLANT_LOWEST_TARGET,
+    Calibration,
     Plant,
     _build_clock,
     _units_reading,
@@ -356,18 +357,18 @@ def test_real_windowed_work_of_22_5_to_159_ms_fails(target_seconds,
     higher target when its fastest reading there falls under it (task
     3208). A plant that misses its band, under or over it, runs again at
     units re-scaled from the readings at the test's size
-    (``replanted_units``, task 3209), as ``another_plant`` allows: from a
-    damped estimate of the runner's bias over every plant so far (task
-    3210)."""
+    (``replanted_units``, task 3209), as ``another_plant`` allows: each
+    plant calibrated afresh, then re-scaled by a damped estimate of the
+    runner's bias over every plant so far (task 3210)."""
     target = plant_target(target_seconds)
-    units = _units_reading(target)
-    calibration = (units, target)
     plants: list[Plant] = []
     plant_seconds: list[float] = []
     while not plant_seconds or another_plant(plant_seconds):
         if plant_seconds:
             target = plant_target(target, fastest)
-            units = replanted_units(calibration, plants, target)
+        calibration = (_units_reading(target), target)
+        units = (replanted_units(calibration, plants, target) if plants
+                 else calibration[0])
         lower, upper = planted_band(target)
         readings: dict[int, list[float]] = {}
         built: list[float] = []
@@ -387,7 +388,7 @@ def test_real_windowed_work_of_22_5_to_159_ms_fails(target_seconds,
             seconds_at, units, 30.0, "planted windowed"))
         plant_seconds.append(time.monotonic() - plant_started - sum(built))
         planted, fastest = readings[units][0], min(readings[units])
-        plants.append((units, planted))
+        plants.append(Plant(calibration, units, planted))
         if lower <= planted <= upper and fastest >= PLANT_FLOOR_SECONDS:
             break
     assert lower <= planted <= upper, (
@@ -423,16 +424,17 @@ def test_a_proof_planted_outside_its_band_fails_loudly(
     about the band it claims (a plant over it).
 
     Task 3209: a plant is re-scaled from its own reading, which corrects a
-    calibration that is off once. The runner here stays off: the first
-    plant's calibration and every re-scaling aim at ``miscalibration``
-    times the target, so every plant misses and the band fails it."""
+    calibration that is off once. The runner here stays off: every plant's
+    calibration (each plant is calibrated afresh, task 3210) and every
+    re-scaling aim at ``miscalibration`` times the target, so every plant
+    misses and the band fails it."""
     real_units_reading = host_timing_3171._units_reading
     real_replanted_units = host_timing_3171.replanted_units
 
     def miscalibrated(target_seconds: float) -> int:
         return real_units_reading(target_seconds * miscalibration)
 
-    def misreplanted(calibration: Plant, plants: list[Plant],
+    def misreplanted(calibration: Calibration, plants: list[Plant],
                      target_seconds: float) -> int:
         return real_replanted_units(calibration, plants,
                                     target_seconds * miscalibration)

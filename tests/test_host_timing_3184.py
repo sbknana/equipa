@@ -321,23 +321,22 @@ def test_real_quadratic_work_read_under_a_burst_fails():
     reading of each size passes it; the fastest of each fails it.
 
     Task 3210 (R3209-I-06): a plant that misses its band or its first
-    ratio runs again at units re-scaled from a damped estimate of the
-    runner's bias over every plant so far, as the 3171/3180 proofs do
-    (``replanted_units``, ``another_plant``). Calibrated again on the same
-    target, a runner whose plants read 0.65 of their calibration (CI run 4
-    of PR #44) planted 91 ms at the same units every time, under the
-    105-159 ms band."""
+    ratio is calibrated again on the same target, as before, and then runs
+    at units re-scaled by a damped estimate of the runner's bias over
+    every plant so far, as the 3171/3180 proofs do (``replanted_units``,
+    ``another_plant``). Only calibrated again, a runner whose plants read
+    0.65 of their calibration (CI run 4 of PR #44) planted 91 ms at the
+    same units every time, under the 105-159 ms band."""
     target_seconds = BURST_TARGET_SECONDS
     burst_seconds = target_seconds / BURST_RATIO
     assert burst_seconds > host_timing.GROWTH_FLOOR_SECONDS
     lower, upper = planted_band(target_seconds)
-    units = _units_reading(target_seconds)
-    calibration = (units, target_seconds)
     plants: list[Plant] = []
     plant_seconds: list[float] = []
     while not plant_seconds or another_plant(plant_seconds):
-        if plant_seconds:
-            units = replanted_units(calibration, plants, target_seconds)
+        calibration = (_units_reading(target_seconds), target_seconds)
+        units = (replanted_units(calibration, plants, target_seconds)
+                 if plants else calibration[0])
         quarter = units // GROWTH
         readings: dict[int, list[float]] = {}
 
@@ -357,7 +356,7 @@ def test_real_quadratic_work_read_under_a_burst_fails():
         plant_seconds.append(time.monotonic() - plant_started)
         planted = readings[units][0]
         first_ratio = planted / readings[quarter][0]
-        plants.append((units, planted))
+        plants.append(Plant(calibration, units, planted))
         if (lower <= planted <= upper
                 and BORDERLINE_GROWTH <= first_ratio < GROWTH_LIMIT):
             break
@@ -411,14 +410,14 @@ def test_the_burst_proof_replants_a_biased_plant_into_its_band(monkeypatch):
 
 
 def test_the_burst_proof_calibrated_again_misses_again(monkeypatch):
-    """The control: calibrated again on the same 0.14 s target, as every
-    burst plant was before task 3210, each plant runs at 1428 units again
-    on CI's runner and reads 91 ms. The proof fails on the band after its
-    last plant."""
+    """The control: calibrated again on the same 0.14 s target and run at
+    the calibrated units, as every burst plant was before task 3210 (which
+    keeps the calibration and drops only the re-scaling), each plant runs
+    at 1428 units again on CI's runner and reads 91 ms. The proof fails on
+    the band after its last plant."""
     runner = _scripted_burst_runner(monkeypatch)
     monkeypatch.setattr(sys.modules[__name__], "replanted_units",
-                        lambda calibration, plants, target:
-                        _units_reading(target))
+                        lambda calibration, plants, target: calibration[0])
     with pytest.raises(AssertionError,
                        match=r"the planted reading 0\.0909 s at 1428 units "
                              + BURST_BAND_MISSED):
